@@ -19874,7 +19874,8 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         Ok(whole.clone()),
     ));
     assert_chat_copy_task_writes(task, &whole);
-    let request = text_copy::Request::for_test(handle, excerpted).with_prefix("cargo build");
+    let request =
+        text_copy::Request::for_test(handle, excerpted).for_step(CopyPart::Text, "cargo build");
     let task = app.handle_chat_ui(Action::MessageCopied(
         target,
         "long".into(),
@@ -20348,43 +20349,48 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             request,
             Ok(body),
         )));
-        let task = if change == "rewrite" {
-            // The rewritten source is retried once. This fixture has no
-            // responding peer, so end its read before observing completion.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none());
+        if change == "rewrite" {
+            // The rewritten item is read again; only that read reaches the
+            // clipboard.
+            assert!(runtime.error.is_none());
             handle.disconnect_for_test();
             let executor = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
                 .unwrap();
             let completion = executor.block_on(async {
-                let mut effects = iced::runtime::task::into_stream(task).expect("rewrite retries");
+                let mut effects =
+                    iced::runtime::task::into_stream(task).expect("a rewrite reads again");
                 tokio::time::timeout(Duration::from_secs(1), effects.next())
                     .await
                     .unwrap()
                     .unwrap()
             });
-            let iced::runtime::Action::Output(cosmic::Action::App(message)) = completion else {
-                panic!("a rewrite must retry without writing stale text");
+            let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MessageCopied(target, id, reread, _),
+            ))) = completion
+            else {
+                panic!("a rewrite reads again before it writes");
             };
-            let Message::ChatUi(Action::MessageCopied(_, _, _, Err(error))) = &message else {
-                panic!("retry must report its canonical read failure");
-            };
-            assert_eq!(error, "Chat is disconnected; text copy is unavailable");
-            app.update(message)
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                id,
+                reread,
+                Ok("replacement".into()),
+            )));
+            assert_chat_copy_task_writes(task, "replacement");
         } else {
-            task
-        };
-        assert_chat_copy_task_has_no_effects(task, change);
-        let runtime = app.chat_runtime_mut(target).unwrap();
-        assert!(runtime.copied.is_none());
-        assert_eq!(
-            runtime.error.as_deref(),
-            Some(if change == "rewrite" {
-                "Chat is disconnected; text copy is unavailable"
-            } else {
-                "Changed while copying; copy again"
-            })
-        );
+            assert_chat_copy_task_has_no_effects(task, change);
+            assert!(
+                runtime
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("unavailable")),
+                "{change}"
+            );
+        }
     }
 }
 

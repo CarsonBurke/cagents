@@ -148,7 +148,7 @@ impl Store {
             return Err("The full text is no longer available in the owned cache".into());
         };
         if revision != source.revision || source.bytes > total {
-            return Err("This text changed; copy it again".into());
+            return Err(crate::chat::TEXT_COPY_CHANGED.into());
         }
         if offset > source.bytes {
             return Err("Invalid text copy range".into());
