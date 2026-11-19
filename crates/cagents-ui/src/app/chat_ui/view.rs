@@ -5727,7 +5727,7 @@ impl Runtime {
             widget::row::with_children(vec![
                 design::caption(notice)
                     .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .wrapping(iced::widget::text::Wrapping::None)
+                    .wrapping(iced::widget::text::Wrapping::Word)
                     .width(Length::Fill)
                     .into(),
                 small_icon(
@@ -5737,7 +5737,7 @@ impl Runtime {
                 ),
             ])
             .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
+            .align_y(Alignment::Start)
             .padding([0, step::GAP_M as u16])
             .into(),
         )
