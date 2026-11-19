@@ -245,3 +245,28 @@ fn rows_say_what_stopped_in_plain_words() {
         "Stopped a reply in progress; 2 queued messages weren't delivered"
     );
 }
+
+#[test]
+fn windows_keep_what_each_other_recorded_of_the_same_update() {
+    let one = TerminalId::new();
+    let two = TerminalId::new();
+    let mine = Record {
+        job: "update-1".into(),
+        handled: vec![one],
+        dismissed: false,
+    };
+    let theirs = Record {
+        job: "update-1".into(),
+        handled: vec![two, one],
+        dismissed: true,
+    };
+    let merged = mine.clone().merged(Some(theirs));
+    assert_eq!(merged.handled, vec![one, two]);
+    assert!(merged.dismissed);
+    let earlier = Record {
+        job: "update-0".into(),
+        handled: vec![two],
+        dismissed: true,
+    };
+    assert_eq!(mine.clone().merged(Some(earlier)), mine);
+}

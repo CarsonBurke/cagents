@@ -21,7 +21,6 @@ pub(super) struct State {
     record: Option<Record>,
     /// The terminal update job the offer is for, until its record is read.
     job: Option<UpdateJob>,
-    loading: bool,
     /// What is still on offer, in the update's order.
     offers: Vec<Outcome>,
 }
@@ -45,6 +44,21 @@ pub enum Action {
     Resume(TerminalId),
     ResumeAll,
     Dismiss,
+}
+
+impl Record {
+    /// This window's record, with what `stored` says of the same update.
+    fn merged(mut self, stored: Option<Record>) -> Self {
+        if let Some(stored) = stored.filter(|stored| stored.job == self.job) {
+            self.dismissed |= stored.dismissed;
+            for id in stored.handled {
+                if !self.handled.contains(&id) {
+                    self.handled.push(id);
+                }
+            }
+        }
+        self
+    }
 }
 
 impl State {
@@ -170,14 +184,10 @@ impl Cagents {
         if state.job.as_ref().is_some_and(|known| known.id == job.id) {
             return Task::none();
         }
+        // Read afresh for each update: another window may have taken up its
+        // offer since this one last read the record.
         state.job = Some(job.clone());
-        if state.record.is_some() {
-            state.rebuild();
-            return Task::none();
-        }
-        if state.loading {
-            return Task::none();
-        }
+        state.offers.clear();
         let Some(store) = self
             .session
             .as_ref()
@@ -188,7 +198,6 @@ impl Cagents {
             state.rebuild();
             return Task::none();
         };
-        state.loading = true;
         let id = job.id.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -207,7 +216,6 @@ impl Cagents {
         match action {
             Action::Loaded(job, result) => {
                 let state = &mut self.update_resume;
-                state.loading = false;
                 let record = match result {
                     Ok(value) => value
                         .and_then(|value| {
@@ -223,8 +231,9 @@ impl Cagents {
                         Record::default()
                     }
                 };
-                state.record = Some(record);
+                // An answer for an update since replaced is for nothing shown.
                 if state.job.as_ref().is_some_and(|known| known.id == job) {
+                    state.record = Some(record);
                     state.rebuild();
                 }
                 Task::none()
@@ -301,7 +310,15 @@ impl Cagents {
         };
         iced::Task::future(async move {
             let saved = tokio::task::spawn_blocking(move || {
-                let value = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+                // Each window resumes the conversations it holds, so what the
+                // others recorded for the same update is kept.
+                let stored = store
+                    .load_update_resume()
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_str::<Record>(&value).ok());
+                let value = serde_json::to_string(&record.merged(stored))
+                    .map_err(|error| error.to_string())?;
                 store
                     .save_update_resume(&value)
                     .map_err(|error| error.to_string())
@@ -344,8 +361,8 @@ impl Cagents {
         }
         let enabled = !self.modal_is_open();
         let heading = match offered.len() {
-            1 => "The update stopped work in progress in 1 conversation".to_owned(),
-            count => format!("The update stopped work in progress in {count} conversations"),
+            1 => "The update stopped work in 1 conversation".to_owned(),
+            count => format!("The update stopped work in {count} conversations"),
         };
         let mut header = widget::row::with_children(vec![
             widget::column::with_children(vec![
