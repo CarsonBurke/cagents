@@ -45,9 +45,15 @@ fn launch(launch: &Launch) -> Result<Startup, String> {
             "--model" => settings.model = Some(value()?),
             "--effort" => settings.reasoning = Some(value()?),
             "--mode" => settings.mode = Some(value()?),
-            // The conversation comes from the launch's session ID.
+            // The conversation is loaded by the launch's session ID, which
+            // the command must name, so neither can open a different one.
             "--conversation" => {
-                value()?;
+                let named = value()?;
+                if launch.session_id.as_deref() != Some(named.as_str()) {
+                    return Err(format!(
+                        "Antigravity's native chat cannot resume conversation {named}: it is not the conversation this chat holds."
+                    ));
+                }
             }
             "--continue" | "-c" => {
                 return Err(
@@ -159,5 +165,14 @@ mod tests {
                 "{arguments:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_conversation_the_chat_does_not_hold_is_never_opened_in_its_place() {
+        let named = ["--conversation", "98608bab-5eb6-4cf5-8f9b-46019bf29df7"];
+        for session in [None, Some("4b1f2c56-0d1e-4f4c-9a55-0f1e2d3c4b5a")] {
+            assert!(launch(&launch_of(&named, session)).is_err(), "{session:?}");
+        }
+        assert!(launch(&launch_of(&named, Some(named[1]))).is_ok());
     }
 }
