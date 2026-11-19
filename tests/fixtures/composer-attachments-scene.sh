@@ -6,12 +6,16 @@
 #   CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/3259-tray \
 #     tests/fixtures/composer-attachments-scene.sh open
 #   tests/fixtures/composer-attachments-scene.sh paste 3 'Compare '
+#   tests/fixtures/composer-attachments-scene.sh paste 2
 #
 # `open` starts an offline Claude chat and waits for its first turn to finish.
-# `paste N [TEXT]` clicks the composer, types TEXT, then pastes N invented
-# images, one at a time, through the nested compositor's private clipboard,
-# as a person pasting screenshots would; each paste inserts its [Image N]
-# reference at the caret. `composer` prints the composer input's centre as
+# `paste N TEXT` clicks the composer, replaces any draft with TEXT, then
+# pastes N invented images, one at a time, through the nested compositor's
+# private clipboard, as a person pasting screenshots would; each paste
+# inserts its [Image N] reference at the caret. `paste N` without TEXT
+# continues at the caret, leaving focus where the last paste left it, since
+# a click into wrapped text would move the caret. Each image shows its own
+# number, counted across the session, so the tiles can be told apart. `composer` prints the composer input's centre as
 # X,Y. The images are synthetic gradients made with ImageMagick on the
 # session's host; no model, network or host clipboard is used.
 set -euo pipefail
@@ -56,20 +60,26 @@ open)
 paste)
     count=${2:?paste needs a count}
     text=${3:-}
-    at=$(composer)
-    [ -n "$at" ] || { echo 'Could not locate the native chat composer.' >&2; exit 1; }
-    "$ne" drive click "$at" >/dev/null
-    "$ne" drive key ctrl+End >/dev/null
-    [ -z "$text" ] || "$ne" drive type "$text" >/dev/null
-    for index in $(seq 1 "$count"); do
-        # Each image is distinct, so the tiles can be told apart.
-        hue=$(( (index * 47) % 360 ))
+    if [ -n "$text" ]; then
+        at=$(composer)
+        [ -n "$at" ] || { echo 'Could not locate the native chat composer.' >&2; exit 1; }
+        "$ne" drive click "$at" >/dev/null
+        "$ne" drive key ctrl+a BackSpace >/dev/null
+        "$ne" drive type "$text" >/dev/null
+    fi
+    for _ in $(seq 1 "$count"); do
         "$ne" nested sh -c '
-            image=$XDG_RUNTIME_DIR/composer-scene-$1.png
-            magick -size 960x600 "gradient:hsl($2,70%,35%)-hsl($(( ($2 + 60) % 360 )),70%,60%)" \
-                -fill white -pointsize 220 -gravity center -annotate +0+0 "$1" "$image"
-            wl-copy --type image/png <"$image"
-        ' sh "$index" "$hue"
+            counter=$XDG_RUNTIME_DIR/composer-scene-count
+            number=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
+            echo "$number" >"$counter"
+            hue=$(( (number * 47) % 360 ))
+            image=$XDG_RUNTIME_DIR/composer-scene-$number.png
+            magick -size 960x600 "gradient:hsl($hue,70%,35%)-hsl($(( (hue + 60) % 360 )),70%,60%)" \
+                -fill white -pointsize 220 -gravity center -annotate +0+0 "$number" "$image"
+            # wl-copy stays behind to serve the clipboard; it must not keep
+            # the output of this command open, or the paste never returns.
+            wl-copy --type image/png <"$image" >/dev/null 2>&1
+        '
         "$ne" drive key ctrl+v >/dev/null
         sleep 1
         "$ne" drive type ' ' >/dev/null
