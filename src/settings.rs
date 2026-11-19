@@ -3943,6 +3943,8 @@ mod tests {
 
         let mut a = base.clone();
         a.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        // An unrelated binding of A's must survive B winning the chord.
+        a.keyboard_shortcuts.cycle_pane_width = vec!["Alt+Shift+R".into()];
         save_merged(&path, &base, &a).unwrap();
 
         let mut b = base.clone();
@@ -3954,6 +3956,10 @@ mod tests {
         assert_eq!(
             restored.keyboard_shortcuts.command_palette,
             base.keyboard_shortcuts.command_palette
+        );
+        assert_eq!(
+            restored.keyboard_shortcuts.cycle_pane_width,
+            ["Alt+Shift+R"]
         );
     }
 
