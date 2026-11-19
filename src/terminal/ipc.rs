@@ -1115,6 +1115,7 @@ pub enum ServerResponse {
     },
     AgentActivity {
         terminal_id: TerminalId,
+        #[serde(serialize_with = "crate::agent::absent_where_unknown")]
         activity: Option<crate::agent::Activity>,
     },
     UpgradePrepared {
@@ -1462,6 +1463,7 @@ pub struct TerminalDescriptor {
     pub attached: bool,
     pub transcript: Option<TranscriptMetadata>,
     pub activity: Option<TerminalOutputActivity>,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub agent_activity: Option<crate::agent::Activity>,
     /// Authenticated former daemon identities retained by durable upgrade restore.
     #[serde(default)]
@@ -1993,6 +1995,7 @@ pub enum WireTerminalEvent {
         message: String,
     },
     AgentActivityChanged {
+        #[serde(serialize_with = "crate::agent::absent_where_unknown")]
         activity: Option<crate::agent::Activity>,
     },
     Completed {

@@ -150,7 +150,9 @@ const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
 
 /// Variants a later protocol appended that a client from before it is never
 /// sent: the enum's type name, the variant, and the protocol that added it.
-/// A reply naming one is refused and a notification naming one withheld,
+/// An optional value naming one reaches the client as absent (see
+/// `crate::agent::absent_where_unknown`), such as a terminal's agent activity;
+/// a reply naming one anywhere else is refused and a notification withheld,
 /// since nothing the client knows could stand for it. The wire format proof
 /// accepts exactly these.
 ///
@@ -281,12 +283,7 @@ impl OlderClient {
         if index >= self.server_messages {
             return false;
         }
-        // A value with no encoding for this client, such as a provider it
-        // predates, refuses to encode for it (see `WITHHELD_VARIANTS`).
-        if encoding_for(self.protocol, || postcard::to_io(message, std::io::sink())).is_err() {
-            return false;
-        }
-        match message {
+        let known = match message {
             ServerMessage::Response { response } => {
                 let nested = match response {
                     ServerResponse::Work(work) => {
@@ -312,7 +309,11 @@ impl OlderClient {
             ServerMessage::WorkBoard { .. } => self.protocol >= WORK_CHECK_COUNTS,
             ServerMessage::WorkspaceModelEdited { .. } => self.protocol >= MODEL_EDGES_WITH_EFFECTS,
             _ => true,
-        }
+        };
+        // Last, as the costliest: a value with no encoding for this client,
+        // such as a provider it predates, refuses to encode for it (see
+        // `WITHHELD_VARIANTS`).
+        known && encoding_for(self.protocol, || postcard::to_io(message, std::io::sink())).is_ok()
     }
 
     /// Answers a request this client may not make, or whose reply it cannot
@@ -864,44 +865,81 @@ mod tests {
     }
 
     /// A client from before a provider was appended cannot decode a value
-    /// naming it, so it is never sent one, while the messages it already
-    /// knows still reach it and a current client receives everything.
+    /// naming it. Where absence means something it understands, as a
+    /// terminal's agent activity does, it is sent nothing in that place;
+    /// any other message naming the provider is refused. A current client
+    /// receives everything.
     #[test]
     fn older_clients_are_never_sent_a_provider_they_predate() {
-        use crate::agent::Provider;
-        use crate::terminal_ipc::{ChatCapacity, ChatCapacityResident};
-        let capacity = |provider| ServerMessage::Response {
-            response: ServerResponse::ChatCapacity {
-                capacity: ChatCapacity {
-                    used: 1,
-                    resident: 1,
-                    spawning: 0,
-                    limit: 8,
-                    residents: vec![ChatCapacityResident {
-                        chat_id: crate::model::TerminalId::new(),
-                        provider,
-                        status: "idle".into(),
-                        release_blocked: None,
-                    }],
-                    omitted_residents: 0,
-                },
-                persistence_warning: None,
-            },
-        };
+        use crate::agent::{Activity, ActivityState, Provider};
+        use crate::terminal_ipc::{ChatCapacity, ChatCapacityResident, TerminalDescriptor};
         let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
         assert!(client.protocol < ANTIGRAVITY_AND_MUSE);
         let current = OlderClient {
-            protocol: ANTIGRAVITY_AND_MUSE,
+            protocol: PROTOCOL_VERSION,
             ..client
         };
+        let encode = |protocol, message: &ServerMessage| {
+            encoding_for(protocol, || postcard::to_allocvec(message)).unwrap()
+        };
         for provider in Provider::ALL {
-            let message = capacity(provider);
-            assert!(current.admits_message(&message), "{provider:?}");
+            let known = !matches!(provider, Provider::Antigravity | Provider::Muse);
+            let activity = Some(Activity {
+                provider,
+                state: ActivityState::Working,
+            });
+            let mut terminal = TerminalDescriptor::relaunchable(
+                crate::model::TerminalId::new(),
+                crate::model::LaunchRecipe {
+                    program: provider.executable().into(),
+                    arguments: Vec::new(),
+                    working_directory: "/repo".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
+            terminal.agent_activity = activity;
+            let listed = ServerMessage::Response {
+                response: ServerResponse::Listed {
+                    terminals: vec![terminal],
+                },
+            };
+            assert!(client.admits_message(&listed), "{provider:?}");
+            assert!(current.admits_message(&listed), "{provider:?}");
+            let read = |bytes: Vec<u8>| match postcard::from_bytes(&bytes).unwrap() {
+                ServerMessage::Response {
+                    response: ServerResponse::Listed { mut terminals },
+                } => terminals.remove(0).agent_activity,
+                other => panic!("{other:?}"),
+            };
             assert_eq!(
-                client.admits_message(&message),
-                !matches!(provider, Provider::Antigravity | Provider::Muse),
+                read(encode(client.protocol, &listed)),
+                activity.filter(|_| known),
                 "{provider:?}"
             );
+            assert_eq!(read(encode(PROTOCOL_VERSION, &listed)), activity);
+            // Nothing stands in for a chat's provider.
+            let capacity = ServerMessage::Response {
+                response: ServerResponse::ChatCapacity {
+                    capacity: ChatCapacity {
+                        used: 1,
+                        resident: 1,
+                        spawning: 0,
+                        limit: 8,
+                        residents: vec![ChatCapacityResident {
+                            chat_id: crate::model::TerminalId::new(),
+                            provider,
+                            status: "idle".into(),
+                            release_blocked: None,
+                        }],
+                        omitted_residents: 0,
+                    },
+                    persistence_warning: None,
+                },
+            };
+            assert!(current.admits_message(&capacity), "{provider:?}");
+            assert_eq!(client.admits_message(&capacity), known, "{provider:?}");
         }
     }
 

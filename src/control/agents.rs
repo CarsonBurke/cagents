@@ -1354,15 +1354,26 @@ pub(super) fn execute_with_context(
                 });
             let (placement, placement_warning) = spawn_placement(explicit, caller.as_ref(), owner);
             let caller_view = caller.as_ref().and_then(|caller| caller.view_scope.clone());
-            // A caller running a provider cagents has no native chat for
-            // cannot lend it to the agent, which runs as one.
-            let provider = provider
-                .or(caller
-                    .and_then(|caller| caller.provider)
-                    .filter(|provider| provider.has_native_chat()))
-                .ok_or_else(|| {
-                    AppError::new("agent_request", "Choose --provider claude, codex, or omp")
-                })?;
+            // The agent runs as a native conversation, so a provider cagents
+            // has no native chat for, named or the caller's own, is refused.
+            let provider = match provider.or(caller.and_then(|caller| caller.provider)) {
+                Some(provider) if provider.has_native_chat() => provider,
+                Some(provider) => {
+                    return Err(AppError::new(
+                        "agent_request",
+                        format!(
+                            "{} Choose --provider claude, codex, or omp",
+                            provider.native_chat_refusal()
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(AppError::new(
+                        "agent_request",
+                        "Choose --provider claude, codex, or omp",
+                    ));
+                }
+            };
             let request = Submit {
                 name,
                 destination: Destination::New(Spec {

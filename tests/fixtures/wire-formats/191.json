@@ -9000,6 +9000,19 @@
               ]
             ]
           }
+        ],
+        [
+          "ListPage",
+          {
+            "Struct": [
+              [
+                "after",
+                {
+                  "Option": "Bytes"
+                }
+              ]
+            ]
+          }
         ]
       ]
     },
@@ -10157,6 +10170,25 @@
             "Newtype": {
               "Container": "cagents::workspace_model::views::TerminalRemovalBasis"
             }
+          }
+        ],
+        [
+          "listed_page",
+          {
+            "Struct": [
+              [
+                "terminals",
+                {
+                  "Seq": {
+                    "Container": "cagents::terminal::ipc::TerminalDescriptor"
+                  }
+                }
+              ],
+              [
+                "complete",
+                "Bool"
+              ]
+            ]
           }
         ]
       ]

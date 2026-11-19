@@ -564,12 +564,8 @@ fn selection(launch: &crate::model::LaunchRecipe) -> Selection {
             .map_or((argument.as_str(), None), |(flag, value)| {
                 (flag, Some(value))
             });
-        let latest = match provider {
-            Provider::Codex => flag == "--last",
-            // A pull request's linked session is one the provider picks too.
-            _ => matches!(flag, "--continue" | "-c" | "--from-pr"),
-        };
-        if latest {
+        // A pull request's linked session is one the provider picks too.
+        if provider.is_latest_selector(flag) || flag == "--from-pr" {
             return Selection::Unknown;
         }
         if provider.is_identity_option(flag) {

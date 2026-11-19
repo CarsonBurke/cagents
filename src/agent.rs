@@ -48,15 +48,15 @@ pub enum Provider {
 /// Encoded as the derived implementation would, except to a client from
 /// before the provider existed, which has no encoding for it: there the value
 /// refuses to encode, and the daemon refuses or withholds the message holding
-/// it rather than send that client something it cannot decode.
+/// it rather than send that client something it cannot decode. An optional
+/// value marked with [`absent_where_unknown`] reaches that client as absent
+/// instead.
 impl Serialize for Provider {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if let Some(since) = self
-            .since()
-            .filter(|&since| crate::terminal_ipc::encoding_before(since))
-        {
+        if !self.is_encodable() {
             return Err(serde::ser::Error::custom(format!(
-                "a client before protocol {since} cannot name {}",
+                "a client before protocol {} cannot name {}",
+                self.since().unwrap_or_default(),
                 self.label()
             )));
         }
@@ -69,6 +69,41 @@ impl Serialize for Provider {
         };
         serializer.serialize_unit_variant("Provider", *self as u32, name)
     }
+}
+
+/// A value that names a provider.
+pub(crate) trait NamesProvider {
+    fn provider(&self) -> Provider;
+}
+
+impl NamesProvider for Provider {
+    fn provider(&self) -> Provider {
+        *self
+    }
+}
+
+impl NamesProvider for Activity {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+}
+
+/// Serializes an optional value naming a provider as absent for a client from
+/// before that provider, which could not decode it, so the rest of the message
+/// still reaches that client. Use with `#[serde(serialize_with)]` where absence
+/// is something the client already understands.
+pub(crate) fn absent_where_unknown<T, S>(
+    value: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    T: NamesProvider + Serialize,
+    S: serde::Serializer,
+{
+    value
+        .as_ref()
+        .filter(|value| value.provider().is_encodable())
+        .serialize(serializer)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +242,13 @@ impl Provider {
             Self::Omp | Self::Claude | Self::Codex => None,
             Self::Antigravity | Self::Muse => Some(crate::terminal_ipc::ANTIGRAVITY_AND_MUSE),
         }
+    }
+
+    /// Whether the client being encoded for, if any, knows this provider.
+    fn is_encodable(self) -> bool {
+        !self
+            .since()
+            .is_some_and(crate::terminal_ipc::encoding_before)
     }
 
     /// Every provider in declaration order, for menus and for recognizing the
