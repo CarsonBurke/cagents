@@ -563,8 +563,8 @@ pub struct Editor {
     /// order; the loser is dropped instead of resurrecting stale values.
     preference_lane: Arc<std::sync::Mutex<PreferenceLanes>>,
     preference_generation: u64,
-    /// The capture generation of the newest Reset all, or 0 when none.
-    settings_reset: u64,
+    /// How many times this editor has confirmed Reset all.
+    settings_resets: u64,
 }
 
 /// One write-ordering lane per preference file ceditor owns.
@@ -582,10 +582,57 @@ impl PreferenceFile {
 
 struct PreferenceLanes {
     applied: [u64; PreferenceFile::COUNT],
+    /// The settings this editor last wrote successfully, which a merged save
+    /// compares against to find this editor's own changes.
     settings_base: AppSettings,
-    /// The generation of the newest Reset all a successful settings write has
-    /// carried to disk, or 0.
-    reset_written: u64,
+    /// How many Reset all actions a successful settings write has carried to
+    /// disk.
+    resets_written: u64,
+}
+
+impl PreferenceLanes {
+    /// Claims `file`'s lane for `generation`, or reports that a newer capture
+    /// of it already ran.
+    fn claim(&mut self, file: PreferenceFile, generation: u64) -> bool {
+        let applied = &mut self.applied[file as usize];
+        if *applied >= generation {
+            return false;
+        }
+        *applied = generation;
+        true
+    }
+
+    /// Writes settings.toml unless a newer capture of it, from either kind of
+    /// write that carries it, already ran.
+    fn write_settings(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        SettingsWrite { settings, resets }: SettingsWrite,
+    ) -> Result<(), String> {
+        if !self.claim(PreferenceFile::Settings, generation) {
+            return Ok(());
+        }
+        if self.resets_written < resets {
+            settings::save(path, &settings)
+        } else {
+            settings::save_merged(path, &self.settings_base, &settings)
+        }
+        .map_err(|error| error.to_string())?;
+        self.resets_written = resets;
+        self.settings_base = settings;
+        Ok(())
+    }
+}
+
+/// One capture of settings.toml.
+struct SettingsWrite {
+    settings: AppSettings,
+    /// The Reset all actions confirmed before this capture. Until a write
+    /// carrying the newest one succeeds, settings writes replace the file
+    /// whole: a newer capture supersedes the reset and carries its defaults,
+    /// so merging it against the old base would undo the reset.
+    resets: u64,
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -595,16 +642,12 @@ struct PreferenceLanes {
 /// The settings writer takes a blocking `flock` shared with other editors and
 /// fsyncs twice. None of that belongs on the thread driving the compositor frame.
 enum PreferenceWrite {
-    Settings {
-        settings: AppSettings,
-        /// The generation of the newest Reset all captured so far, or 0.
-        /// Until a write carrying that reset succeeds, settings writes
-        /// replace the file whole: a newer capture supersedes the reset and carries its
-        /// defaults, so merging it against the old base would undo the reset.
-        reset: u64,
-    },
+    Settings(SettingsWrite),
+    /// The assistance flag, with settings.toml, which the shared settings
+    /// writer creates and validates the directory for. That part shares the
+    /// settings lane, so an older capture cannot overwrite newer settings.
     Assistance {
-        settings: AppSettings,
+        settings: SettingsWrite,
         enabled: bool,
     },
     Shortcuts(crate::preferences::EditorShortcuts),
@@ -614,7 +657,7 @@ enum PreferenceWrite {
 impl PreferenceWrite {
     const fn file(&self) -> PreferenceFile {
         match self {
-            Self::Settings { .. } => PreferenceFile::Settings,
+            Self::Settings(_) => PreferenceFile::Settings,
             Self::Assistance { .. } => PreferenceFile::Assistance,
             Self::Shortcuts(_) => PreferenceFile::Shortcuts,
             Self::Session(_) => PreferenceFile::Session,
@@ -631,35 +674,24 @@ struct PreferenceSave {
 
 impl PreferenceSave {
     fn run(self) -> Result<(), String> {
-        let file = self.write.file();
         let mut lanes = self
             .lane
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let applied = &mut lanes.applied[file as usize];
-        if *applied >= self.generation {
+        // The lanes stay locked across the write so two captures of one file
+        // land in capture order rather than blocking-pool completion order.
+        // A settings write claims its lane itself, as an assistance write's
+        // settings part does.
+        let file = self.write.file();
+        if !matches!(file, PreferenceFile::Settings) && !lanes.claim(file, self.generation) {
             return Ok(());
         }
-        *applied = self.generation;
-        // The lane stays locked across the write so two captures of one file
-        // land in capture order rather than blocking-pool completion order.
         match self.write {
-            PreferenceWrite::Settings { settings, reset } => {
-                let replace = lanes.reset_written < reset;
-                if replace {
-                    settings::save(&self.path, &settings)
-                } else {
-                    settings::save_merged(&self.path, &lanes.settings_base, &settings)
-                }
-                .map_err(|error| error.to_string())?;
-                lanes.reset_written = reset;
-                lanes.settings_base = settings;
-                Ok(())
+            PreferenceWrite::Settings(write) => {
+                lanes.write_settings(&self.path, self.generation, write)
             }
             PreferenceWrite::Assistance { settings, enabled } => {
-                settings::save_merged(&self.path, &lanes.settings_base, &settings)
-                    .map_err(|error| error.to_string())?;
-                lanes.settings_base = settings;
+                lanes.write_settings(&self.path, self.generation, settings)?;
                 crate::preferences::save_language_server_assistance(&self.path, enabled)
             }
             PreferenceWrite::Shortcuts(shortcuts) => {
@@ -2225,15 +2257,18 @@ impl Editor {
     /// Captures the settings to write; `reset` marks a Reset all, which
     /// replaces the file whole.
     fn capture_settings(&mut self, reset: bool) -> PreferenceSave {
-        let settings = self.settings.clone();
-        let mut save = self.capture_preference(PreferenceWrite::Settings { settings, reset: 0 });
         if reset {
-            self.settings_reset = save.generation;
+            self.settings_resets += 1;
         }
-        if let PreferenceWrite::Settings { reset, .. } = &mut save.write {
-            *reset = self.settings_reset;
+        let write = self.settings_write();
+        self.capture_preference(PreferenceWrite::Settings(write))
+    }
+
+    fn settings_write(&self) -> SettingsWrite {
+        SettingsWrite {
+            settings: self.settings.clone(),
+            resets: self.settings_resets,
         }
-        save
     }
 
     fn set_language_server_assistance(&mut self, enabled: bool) -> Task<Message> {
@@ -2264,7 +2299,7 @@ impl Editor {
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
-            let settings = self.settings.clone();
+            let settings = self.settings_write();
             tasks.push(preference_task(self.capture_preference(
                 PreferenceWrite::Assistance { settings, enabled },
             )));
@@ -3148,10 +3183,10 @@ impl Application for Editor {
             preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
                 applied: [0; PreferenceFile::COUNT],
                 settings_base: settings,
-                reset_written: 0,
+                resets_written: 0,
             })),
             preference_generation: 0,
-            settings_reset: 0,
+            settings_resets: 0,
         };
         match cagents::notifications::ui::Observer::bind_editor(flags.notification_window.clone()) {
             Ok(mut observer) => {
@@ -6823,10 +6858,10 @@ mod tests {
             preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
                 applied: [0; PreferenceFile::COUNT],
                 settings_base: AppSettings::default(),
-                reset_written: 0,
+                resets_written: 0,
             })),
             preference_generation: 0,
-            settings_reset: 0,
+            settings_resets: 0,
         }
     }
 
@@ -8013,17 +8048,11 @@ mod tests {
     /// tests have no executor to drain a `Task`, and the persisted bytes are
     /// the contract under test.
     fn flush_settings(app: &mut Editor) {
-        let settings = app.settings.clone();
-        app.capture_preference(PreferenceWrite::Settings {
-            settings,
-            reset: 0,
-        })
-        .run()
-        .unwrap();
+        app.capture_settings(false).run().unwrap();
     }
 
     fn flush_assistance(app: &mut Editor) {
-        let settings = app.settings.clone();
+        let settings = app.settings_write();
         let enabled = app.language_server_assistance;
         app.capture_preference(PreferenceWrite::Assistance { settings, enabled })
             .run()
@@ -8103,15 +8132,7 @@ mod tests {
         let path = app.settings_path.clone();
         app.settings_path = directory.path().join("blocked");
         std::fs::create_dir(&app.settings_path).unwrap();
-        let settings = app.settings.clone();
-        assert!(
-            app.capture_preference(PreferenceWrite::Settings {
-                settings,
-                reset: 0,
-            })
-            .run()
-            .is_err()
-        );
+        assert!(app.capture_settings(false).run().is_err());
         app.settings_path = path;
         flush_settings(&mut app);
         assert_eq!(
@@ -8207,6 +8228,63 @@ mod tests {
             persisted.editor_syntax_theme,
             settings::EditorSyntaxTheme::Mocha
         );
+    }
+
+    #[test]
+    fn an_assistance_save_after_a_failed_reset_completes_the_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        let path = first.settings_path.clone();
+        first.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&first.settings_path).unwrap();
+        first.settings = AppSettings::default();
+        assert!(first.capture_settings(true).run().is_err());
+        first.settings_path = path;
+        // Storage recovers and the next write this editor makes is the
+        // assistance preference, which also carries settings.toml.
+        first.language_server_assistance = true;
+        flush_assistance(&mut first);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(
+            toml::Value::try_from(persisted).unwrap(),
+            toml::Value::try_from(defaults).unwrap()
+        );
+        assert!(
+            crate::preferences::load_language_server_assistance(&first.settings_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_older_assistance_capture_keeps_newer_settings_and_writes_its_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut app = loaded(&directory);
+
+        app.language_server_assistance = true;
+        let settings = app.settings_write();
+        let older = app.capture_preference(PreferenceWrite::Assistance {
+            settings,
+            enabled: true,
+        });
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        let newer = app.capture_settings(false);
+        // The blocking pool finishes the newer settings capture first.
+        newer.run().unwrap();
+        older.run().unwrap();
+
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+        assert!(crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
     }
 
     #[test]
