@@ -1995,7 +1995,9 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Claude, _) => &["auth", "login", "--claudeai"],
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
-        (Provider::Omp | Provider::Antigravity | Provider::Muse, _) => return None,
+        // A device code shown in the terminal, approved in any browser.
+        (Provider::Muse, _) => &["login"],
+        (Provider::Omp | Provider::Antigravity, _) => return None,
     })
 }
 
@@ -2041,7 +2043,14 @@ fn login_launch_with_path(
             .iter()
             .map(|name| (*name).into())
             .collect(),
-        program: program.to_str()?.to_owned(),
+        // Muse's `muse` may be a wrapper that cannot run `login`.
+        program: account.provider.subcommand_program(
+            program.to_str()?,
+            &home,
+            search_path
+                .and_then(|path| path.to_str())
+                .unwrap_or_default(),
+        ),
         arguments: command
             .iter()
             .map(|argument| (*argument).to_owned())

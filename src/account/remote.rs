@@ -734,12 +734,20 @@ fn login_recipe_with_path(
     if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.into());
     }
+    let program = program.to_str().ok_or("Provider path is not UTF-8")?;
+    let path = search_path
+        .and_then(|path| path.to_str())
+        .unwrap_or_default();
     let mut recipe = crate::model::LaunchRecipe {
-        program: program.to_str().ok_or("Provider path is not UTF-8")?.into(),
+        // Muse's `muse` may be a wrapper that cannot run `login`.
+        program: account
+            .provider
+            .subcommand_program(program, std::path::Path::new("/"), path),
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
             Provider::Codex => vec!["login".into(), "--device-auth".into()],
-            Provider::Omp | Provider::Antigravity | Provider::Muse => {
+            Provider::Muse => vec!["login".into()],
+            Provider::Omp | Provider::Antigravity => {
                 return Err(format!(
                     "{} manages its own sign-in",
                     account.provider.label()

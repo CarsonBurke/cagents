@@ -218,6 +218,20 @@ pub fn expand_linked_home(value: &str, home: Option<&std::ffi::OsStr>) -> Result
     Ok(path)
 }
 
+/// Where Muse keeps its login: `$XDG_CONFIG_HOME/muse`, by the base
+/// directory spec, which ignores a relative value.
+fn muse_config(environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    environment("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|config| config.is_absolute())
+        .or_else(|| {
+            environment("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| Path::new(&home).join(".config"))
+        })
+        .map(|config| config.join("muse"))
+}
+
 /// The environment variable a provider's CLI reads its home from.
 pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
@@ -502,11 +516,13 @@ impl Account {
 
     /// The system accounts, which every installation reports on whether or
     /// not it added any account of its own. Omp brokers its own accounts,
-    /// which are found in its usage record rather than listed here.
-    pub fn system_accounts() -> [Self; 2] {
+    /// which are found in its usage record rather than listed here. Muse
+    /// has only its system sign-in.
+    pub fn system_accounts() -> [Self; 3] {
         [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
+            Self::system(Provider::Muse),
         ]
     }
 
@@ -515,7 +531,12 @@ impl Account {
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
     /// The providers whose usage is reported, in the order they are listed.
-    pub const REPORTED: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+    pub const REPORTED: [Provider; 4] = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Muse,
+        Provider::Omp,
+    ];
 
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
@@ -598,6 +619,9 @@ impl Account {
             | AccountHome::Managed { path, .. }
             | AccountHome::Linked { path, .. } => Some(path.clone()),
             AccountHome::System => {
+                if self.provider == Provider::Muse {
+                    return muse_config(environment);
+                }
                 let variable = home_variable(self.provider)?;
                 if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
                     && !inherited_selections(environment).contains(&variable)
@@ -641,6 +665,8 @@ impl Account {
 
     /// [`Self::launch_home`] against `environment`.
     pub fn launch_home_in(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+        // A CLI with no home variable is never told where its home is.
+        home_variable(self.provider)?;
         let home = self.home_directory(environment)?;
         if !matches!(self.home, AccountHome::System) || self.provider != Provider::Claude {
             return Some(home);
@@ -1689,6 +1715,23 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
+        // Muse keeps its login in its XDG configuration and is told nothing.
+        let muse = Account::system(Provider::Muse);
+        assert_eq!(
+            muse.home_directory(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.config/muse"))
+        );
+        assert_eq!(
+            muse.home_directory(&environment(&[
+                ("HOME", "/home/a"),
+                ("XDG_CONFIG_HOME", "/config")
+            ])),
+            Some(PathBuf::from("/config/muse"))
+        );
+        assert_eq!(
+            muse.launch_home_in(&environment(&[("HOME", "/home/a")])),
+            None
+        );
         assert_eq!(claude.probe_environment(), None);
         // The system Claude login exports no home of its own, so the CLI
         // reads `~/.claude.json` as in the reader's shell: an explicit

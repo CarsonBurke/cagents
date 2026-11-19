@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 mod config;
 mod history;
+pub mod muse;
 mod prompt;
 mod rpc;
 #[cfg(test)]

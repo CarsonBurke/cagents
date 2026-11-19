@@ -21,6 +21,8 @@ pub(crate) use codex::archived_rollout as codex_archived_rollout;
 pub use codex::rollout as codex_rollout;
 mod antigravity;
 mod muse;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) use muse::offers_model as muse_offers_model;
 mod omp;
 
 #[cfg(feature = "host")]
@@ -329,6 +331,18 @@ impl Provider {
             .iter()
             .map(|adapter| adapter.provider)
             .find(|provider| provider.programs().any(|program| program == name))
+    }
+
+    /// The executable that runs one of this provider's subcommands, such as
+    /// its ACP server or its login, for `program`, the one its terminal runs.
+    /// They differ only where `program` is a wrapper that puts options before
+    /// any subcommand: Muse's `muse`. A relative `program` or `path` entry is
+    /// taken from `directory`.
+    pub fn subcommand_program(self, program: &str, directory: &Path, path: &str) -> String {
+        match self {
+            Self::Muse => muse::subcommand_program(program, directory, path),
+            _ => program.to_owned(),
+        }
     }
 
     /// Whether cagents can run this provider's conversations as native chat.
