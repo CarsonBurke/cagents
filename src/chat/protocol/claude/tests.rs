@@ -4745,8 +4745,7 @@ fn a_helpers_saved_skill_instructions_are_its_steps_output() {
             Event::SubagentItem { id, item } if id == "agent-call" => Some(item),
             _ => None,
         }))
-        .filter(|item| item.id == "child-skill")
-        .next_back()
+        .rfind(|item| item.id == "child-skill")
         .unwrap_or_else(|| panic!("{events}"));
     assert!(
         matches!(&shown.content, ItemContent::Tool { name, output, .. } if name == "Skill" && output == SKILL_BODY),

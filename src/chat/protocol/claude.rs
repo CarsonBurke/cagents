@@ -2262,13 +2262,12 @@ impl Claude {
                             .iter()
                             .position(|(known, _)| *known == call)
                             && let Some(load) = self.skill_loads.remove(index)
-                        {
-                            if matches!(
+                            && matches!(
                                 item.content.status(),
                                 Some(ToolStatus::Running | ToolStatus::Succeeded)
-                            ) {
-                                self.skill_loads.push_back(load);
-                            }
+                            )
+                        {
+                            self.skill_loads.push_back(load);
                         }
                         if let Some(task) = structured["backgroundTaskId"].as_str() {
                             self.foreground_tasks.retain(|known| known != task);
