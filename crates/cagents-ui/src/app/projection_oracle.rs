@@ -417,6 +417,7 @@ impl Cagents {
                     | Message::TerminalWake { .. }
                     | Message::WorkspaceModelObserved(_)
                     | Message::KeyEvent { .. }
+                    | Message::LifecycleSweep
                     | Message::ChromeUi(chrome_ui::Action::HoverTab(_))
                     | Message::Frame(_)
                     | Message::Viewport { .. }

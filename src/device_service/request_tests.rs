@@ -167,9 +167,12 @@ fn user_request_keeps_readiness_and_authenticates_before_one_device_operation() 
                 false,
                 remote,
                 || panic!("ordinary User retains the existing readiness/start path"),
+                // Readiness hands over the connection its handshake proved;
+                // `finished` shows the request needed no other (#3127).
                 || {
                     starts.set(starts.get() + 1);
-                    Ok(socket)
+                    crate::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())
                 },
             )
             .unwrap(),

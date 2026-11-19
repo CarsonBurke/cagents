@@ -1,5 +1,10 @@
 use super::*;
 
+const BOTH: Pages = Pages {
+    earlier: true,
+    later: true,
+};
+
 #[test]
 fn a_pane_inspector_keeps_modifier_releases_without_scrolling_covered_history() {
     struct Position {
@@ -61,6 +66,7 @@ fn a_pane_inspector_keeps_modifier_releases_without_scrolling_covered_history() 
                 false,
                 HashSet::new(),
                 None,
+                History::default(),
             ),
             covered.then(|| {
                 widget::container(widget::Space::new())
@@ -297,6 +303,7 @@ fn a_reader_at_the_end_follows_growth_whose_estimate_is_corrected_by_measurement
             false,
             HashSet::new(),
             None,
+            History::default(),
         )
     }
     let renderer = crate::app::tests::headless_renderer();
@@ -372,6 +379,7 @@ fn cold_reader_draw_waits_for_more_than_four_actual_virtual_viewport_passes() {
         false,
         HashSet::new(),
         None,
+        History::default(),
     );
     let mut tree = Tree::new(&element);
     let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
@@ -511,6 +519,26 @@ fn cold_reader_draw_waits_for_more_than_four_actual_virtual_viewport_passes() {
         clicks.get() > 0,
         "coherent content becomes interactive again"
     );
+    let held = |tree: &Tree| {
+        tree.state
+            .downcast_ref::<ReaderState>()
+            .memory
+            .0
+            .borrow()
+            .held
+    };
+    assert!(held(&tree), "a press over the transcript holds it");
+    element.as_widget_mut().update(
+        &mut tree,
+        &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        Layout::new(&node),
+        mouse::Cursor::Unavailable,
+        &renderer,
+        &mut iced::advanced::clipboard::Null,
+        &mut Shell::new(&mut vec![]),
+        &viewport,
+    );
+    assert!(!held(&tree), "a release anywhere lets it go");
     assert!(
         !element
             .as_widget()
@@ -545,6 +573,7 @@ fn cold_pending_reader_is_unpainted_without_spinning_but_find_and_empty_settle()
             pending,
             HashSet::new(),
             Some(guard.clone()),
+            History::default(),
         )
     };
     let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
@@ -704,6 +733,7 @@ fn cold_pending_reader_is_unpainted_without_spinning_but_find_and_empty_settle()
         false,
         HashSet::new(),
         None,
+        History::default(),
     );
     let mut empty_tree = Tree::new(&empty);
     empty
@@ -743,6 +773,7 @@ fn wheel_during_cold_reveal_moves_from_saved_reader_not_provisional_end() {
                 pending,
                 HashSet::new(),
                 None,
+                History::default(),
             )
         };
         {
@@ -843,6 +874,7 @@ fn cold_reader_wheel_reports_saved_geometry_and_dispatches_real_history_edges() 
                 pending,
                 HashSet::new(),
                 None,
+                History::default(),
             )
         };
         {
@@ -966,6 +998,7 @@ fn history_reader(
         false,
         HashSet::new(),
         None,
+        History::default(),
     )
 }
 
@@ -1337,6 +1370,7 @@ fn dropping_and_recreating_native_trees_preserves_only_the_reader_anchor_memory(
             false,
             HashSet::new(),
             None,
+            History::default(),
         )
     };
     let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
@@ -1407,6 +1441,7 @@ fn cold_reader_restore_ignores_empty_and_same_item_placeholder_layouts() {
             pending,
             HashSet::new(),
             None,
+            History::default(),
         )
     };
     let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
@@ -1516,6 +1551,7 @@ fn actual_native_wheel_survives_tree_drop_before_the_next_layout() {
             false,
             HashSet::new(),
             None,
+            History::default(),
         )
     };
     let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
@@ -1585,6 +1621,7 @@ fn pending_child_switch_and_current_find_preserve_their_own_native_reader_contex
             pending,
             HashSet::new(),
             Some(navigation.guard()),
+            History::default(),
         )
     };
     let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
@@ -1734,6 +1771,7 @@ fn superseded_latest_refresh_keeps_native_find_and_overlap_without_waiting_for_u
             false,
             preparing,
             Some(navigation.guard()),
+            History::default(),
         )
     };
     let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
@@ -1936,6 +1974,7 @@ fn cold_fitting_native_home_end_and_wheel_keep_explicit_context_intent() {
                     pending,
                     HashSet::new(),
                     None,
+                    History::default(),
                 )
             };
             {
@@ -2044,6 +2083,7 @@ fn cold_fitting_native_home_end_and_wheel_keep_explicit_context_intent() {
                 false,
                 HashSet::new(),
                 None,
+                History::default(),
             );
             tree.diff(empty.as_widget_mut());
             empty.as_widget_mut().layout(&mut tree, &renderer, &limits);
@@ -2103,6 +2143,7 @@ fn queued_edge_operation_refuses_new_generation_and_source_document() {
             false,
             HashSet::new(),
             None,
+            History::default(),
         );
         let mut tree = Tree::new(&element);
         let node = element
@@ -2260,6 +2301,7 @@ fn find_geometry_and_corrections_stay_in_the_exact_mounted_transcript() {
             false,
             HashSet::new(),
             Some(guard),
+            History::default(),
         ))
         .width(400)
         .height(400)
@@ -2736,6 +2778,7 @@ fn find_corrections_preserve_their_intent_but_native_nested_wheels_cancel_it() {
             false,
             HashSet::new(),
             Some(guard.clone()),
+            History::default(),
         );
         let mut tree = Tree::new(&element);
         let node = element
@@ -3033,6 +3076,7 @@ fn native_geometry_updates_the_reader_without_echoing_a_model_message() {
             false,
             HashSet::new(),
             None,
+            History::default(),
         )
     };
     let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
@@ -3458,15 +3502,176 @@ fn nested_output_consumes_wheel_without_paging_transcript() {
 #[test]
 fn wheel_navigation_respects_direction_and_nested_capture() {
     let top = Scroll::new(10.0, 1000.0, 400.0);
-    assert!(navigation_input(Some(20.0), 10.0, top, Some(1.0), false).is_some());
-    assert!(navigation_input(Some(0.0), 10.0, top, Some(-1.0), false).is_none());
-    assert!(navigation_input(Some(10.0), 10.0, top, Some(1.0), true).is_none());
+    assert!(navigation_input(Some(20.0), 10.0, top, Some(1.0), false, BOTH).is_some());
+    assert!(navigation_input(Some(0.0), 10.0, top, Some(-1.0), false, BOTH).is_none());
+    assert!(navigation_input(Some(10.0), 10.0, top, Some(1.0), true, BOTH).is_none());
     let bottom = Scroll::new(590.0, 1000.0, 400.0);
-    assert!(navigation_input(Some(580.0), 590.0, bottom, Some(-1.0), false).is_some());
-    assert!(navigation_input(Some(600.0), 590.0, bottom, Some(1.0), false).is_none());
-    assert!(navigation_input(Some(590.0), 590.0, bottom, Some(-1.0), true).is_none());
-    assert!(navigation_input(Some(100.0), 200.0, bottom, None, false).is_some());
-    assert!(navigation_input(Some(10.0), 10.0, top, Some(0.0), false).is_none());
+    assert!(navigation_input(Some(580.0), 590.0, bottom, Some(-1.0), false, BOTH).is_some());
+    assert!(navigation_input(Some(600.0), 590.0, bottom, Some(1.0), false, BOTH).is_none());
+    assert!(navigation_input(Some(590.0), 590.0, bottom, Some(-1.0), true, BOTH).is_none());
+    assert!(navigation_input(Some(100.0), 200.0, bottom, None, false, BOTH).is_some());
+    assert!(navigation_input(Some(10.0), 10.0, top, Some(0.0), false, BOTH).is_none());
+}
+
+fn kept(older_end: f32, newer_start: f32) -> Option<view::Kept> {
+    Some(view::Kept {
+        older_end,
+        newer_start,
+    })
+}
+
+/// The half a slide keeps is where its rows were drawn, not half the
+/// height: a reader whose viewport reaches past it would lose rows they
+/// see, so the page waits. Before the rows are drawn, only the edge asks
+/// (#3102).
+#[test]
+fn prefetch_waits_until_the_viewport_is_inside_the_half_a_slide_keeps() {
+    // A short older half: it ends 900 px down a 10000 px window.
+    let short_half = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(900.0, 850.0));
+    assert!(short_half(50.0).prefetch_earlier());
+    assert!(!short_half(600.0).prefetch_earlier());
+    // A tall older half keeps more of the window, so the page goes sooner.
+    let tall_half = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(8_400.0, 8_000.0));
+    assert!(tall_half(1_500.0).prefetch_earlier());
+    assert!(!tall_half(7_700.0).prefetch_later());
+    assert!(tall_half(8_000.0).prefetch_later());
+    let unmeasured = Scroll::new(1_500.0, 10_000.0, 800.0);
+    assert!(!unmeasured.prefetch_earlier());
+    assert!(Scroll::new(0.0, 10_000.0, 800.0).prefetch_earlier());
+}
+
+/// An exchange draws its steps on one strip above its prose, whatever
+/// their order, and a row holds every item it aliases. The kept halves end
+/// at the nearest row holding an item of the other half, not at the middle
+/// item's own row (#3102).
+#[test]
+fn the_kept_halves_end_at_the_rows_of_the_items_a_slide_drops() {
+    let ids = ["prompt", "step-1", "prose", "step-2", "next-prompt"];
+    let items: Vec<_> = ids
+        .iter()
+        .map(|id| (item_id(id), *id))
+        .chain([(item_id("turn"), "turn")])
+        .collect();
+    let row = |id: &str, y: f32, height: f32| Row {
+        id: id.to_owned(),
+        bounds: Rectangle::new(iced::Point::new(0.0, y), Size::new(800.0, height)),
+        placeholder: false,
+    };
+    let mut anchor = Anchor::default();
+    anchor.contexts.push(Context {
+        rows: vec![
+            row("prompt", 0.0, 100.0),
+            // Both steps share the strip, which is drawn above the prose.
+            row("step-1", 100.0, 300.0),
+            row("step-2", 100.0, 300.0),
+            row("prose", 400.0, 500.0),
+            row("next-prompt", 900.0, 100.0),
+            // A turn's own row spans every item, and is not one of them.
+            row("turn", 0.0, 900.0),
+        ],
+        ..Context::default()
+    });
+    // The middle item is the prose: an earlier page drops step-2, drawn
+    // above it, and a later page drops step-1, drawn on the same strip.
+    let kept = anchor
+        .kept(None, &items, Pivot { index: 2, items: 5 })
+        .expect("rows on both sides of the middle item");
+    assert_eq!(kept.older_end, 100.0);
+    assert_eq!(kept.newer_start, 400.0);
+    // Nothing is drawn yet for another transcript.
+    assert!(
+        anchor
+            .kept(Some("child"), &items, Pivot { index: 2, items: 5 })
+            .is_none()
+    );
+    // A held thumb asks only at the edge: a page landing mid-drag would
+    // move the view under it.
+    anchor.held = true;
+    assert!(
+        anchor
+            .kept(None, &items, Pivot { index: 2, items: 5 })
+            .is_none()
+    );
+}
+
+/// A wheel near a loaded edge asks once for the page there, and only when
+/// there is one: reading the newest messages of a live conversation sends
+/// nothing to the model. Turning back, or a window that moved, asks again
+/// (#3102).
+#[test]
+fn wheel_prefetch_asks_once_and_only_for_a_page_that_exists() {
+    let at = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(5_000.0, 5_000.0));
+    let live = Pages {
+        earlier: true,
+        later: false,
+    };
+    assert_eq!(
+        navigation_input(Some(8_540.0), 8_600.0, at(8_600.0), Some(-1.0), false, live),
+        None
+    );
+    let mut anchor = Anchor::default();
+    let ask = |anchor: &mut Anchor, from: f32, to: f32, pivot: &str| {
+        let direction = navigation_input(
+            Some(from),
+            to,
+            at(to),
+            Some(if to < from { 1.0 } else { -1.0 }),
+            false,
+            live,
+        );
+        anchor.ahead_once(direction, true, at(to), Some(pivot))
+    };
+    assert_eq!(
+        ask(&mut anchor, 660.0, 600.0, "a"),
+        Some(view::Page::Earlier)
+    );
+    assert_eq!(ask(&mut anchor, 600.0, 540.0, "a"), None);
+    // The reader turns back, then heads for the edge again.
+    assert_eq!(ask(&mut anchor, 540.0, 600.0, "a"), None);
+    assert_eq!(
+        ask(&mut anchor, 600.0, 540.0, "a"),
+        Some(view::Page::Earlier)
+    );
+    // A page arrived: the window slides around another item.
+    assert_eq!(
+        ask(&mut anchor, 600.0, 540.0, "b"),
+        Some(view::Page::Earlier)
+    );
+    // At the edge itself every notch is passed on, as before.
+    let edge = Scroll::new(0.0, 10_000.0, 800.0);
+    for _ in 0..2 {
+        assert_eq!(
+            anchor.ahead_once(Some(view::Page::Earlier), true, edge, Some("b")),
+            Some(view::Page::Earlier)
+        );
+    }
+}
+
+/// A wheel heading for a loaded edge asks for its page a couple of screens
+/// ahead of it, so the page is there when the reader is; reading elsewhere
+/// asks for nothing (#3102).
+#[test]
+fn wheel_toward_a_loaded_edge_fetches_ahead_of_the_reader() {
+    let at = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(5_000.0, 5_000.0));
+    let near_top = at(600.0);
+    assert!(!near_top.at_top() && near_top.prefetch_earlier());
+    assert_eq!(
+        navigation_input(Some(660.0), 600.0, near_top, Some(1.0), false, BOTH),
+        Some(view::Page::Earlier)
+    );
+    // Wheeling away from that edge is reading.
+    assert_eq!(
+        navigation_input(Some(540.0), 600.0, near_top, Some(-1.0), false, BOTH),
+        None
+    );
+    assert_eq!(
+        navigation_input(Some(4_660.0), 4_600.0, at(4_600.0), Some(1.0), false, BOTH),
+        None
+    );
+    assert_eq!(
+        navigation_input(Some(8_540.0), 8_600.0, at(8_600.0), Some(-1.0), false, BOTH),
+        Some(view::Page::Newer)
+    );
 }
 
 #[test]
@@ -3474,21 +3679,21 @@ fn fitting_geometry_keeps_wheel_direction_without_inventing_input() {
     let fitting = Scroll::new(0.0, 200.0, 400.0);
     assert!(fitting.at_top() && fitting.at_bottom());
     assert_eq!(
-        navigation_input(Some(0.0), 0.0, fitting, Some(1.0), false),
+        navigation_input(Some(0.0), 0.0, fitting, Some(1.0), false, BOTH),
         Some(view::Page::Earlier)
     );
     assert_eq!(
-        navigation_input(Some(0.0), 0.0, fitting, Some(-1.0), false),
+        navigation_input(Some(0.0), 0.0, fitting, Some(-1.0), false, BOTH),
         Some(view::Page::Newer)
     );
     for wheel in [None, Some(0.0)] {
         assert_eq!(
-            navigation_input(Some(0.0), 0.0, fitting, wheel, false),
+            navigation_input(Some(0.0), 0.0, fitting, wheel, false, BOTH),
             None
         );
     }
     assert_eq!(
-        navigation_input(Some(0.0), 0.0, fitting, Some(-1.0), true),
+        navigation_input(Some(0.0), 0.0, fitting, Some(-1.0), true, BOTH),
         None
     );
 }
@@ -3496,11 +3701,11 @@ fn fitting_geometry_keeps_wheel_direction_without_inventing_input() {
 #[test]
 fn thumb_touch_and_keyboard_moves_away_from_edges_do_not_page() {
     let top = Scroll::new(10.0, 1000.0, 400.0);
-    assert!(navigation_input(Some(0.0), 10.0, top, None, false).is_none());
-    assert!(navigation_input(Some(20.0), 10.0, top, None, false).is_some());
+    assert!(navigation_input(Some(0.0), 10.0, top, None, false, BOTH).is_none());
+    assert!(navigation_input(Some(20.0), 10.0, top, None, false, BOTH).is_some());
     let bottom = Scroll::new(590.0, 1000.0, 400.0);
-    assert!(navigation_input(Some(600.0), 590.0, bottom, None, false).is_none());
-    assert!(navigation_input(Some(580.0), 590.0, bottom, None, false).is_some());
+    assert!(navigation_input(Some(600.0), 590.0, bottom, None, false, BOTH).is_none());
+    assert!(navigation_input(Some(580.0), 590.0, bottom, None, false, BOTH).is_some());
 }
 
 #[test]

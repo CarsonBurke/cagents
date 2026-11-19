@@ -6,7 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
-use crate::model::SavedQueue;
+use crate::model::{SavedQueue, SentAfter};
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -548,6 +548,22 @@ pub enum Action {
     ),
     ToggleBlockedDetails(CardId, chat::Session),
     CopyBlockedDetails(CardId, chat::Session),
+    /// Copies the unsent message an unreachable agent's card would discard.
+    CopyBlockedDraft(CardId, chat::Session),
+    /// The processes of an unreachable agent's conversation the daemon
+    /// proved still running.
+    UnnamedAgentRunning(
+        CardId,
+        chat::Session,
+        Vec<crate::terminal::ipc::ProcessStart>,
+    ),
+    /// What ending an unreachable agent's processes, before its card
+    /// closes, left running.
+    UnnamedAgentEnded(
+        CardId,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
     /// Asks the daemon what still runs for a conversation whose Close it
     /// refused.
     AskCloseHolders(Target, chat::Session),
@@ -773,6 +789,9 @@ impl Action {
             Self::FreshCloseFinished(..) => "FreshCloseFinished",
             Self::ToggleBlockedDetails(..) => "ToggleBlockedDetails",
             Self::CopyBlockedDetails(..) => "CopyBlockedDetails",
+            Self::CopyBlockedDraft(..) => "CopyBlockedDraft",
+            Self::UnnamedAgentRunning(..) => "UnnamedAgentRunning",
+            Self::UnnamedAgentEnded(..) => "UnnamedAgentEnded",
             Self::Composer(..) => "Composer",
             Self::ReadComposer(..) => "ReadComposer",
             Self::ComposerUp(..) => "ComposerUp",
@@ -963,6 +982,8 @@ impl Action {
                 | Self::FreshCloseFinished(..)
                 | Self::CloseHolders(..)
                 | Self::CloseHoldersEnded(..)
+                | Self::UnnamedAgentRunning(..)
+                | Self::UnnamedAgentEnded(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
@@ -1127,6 +1148,15 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
+/// Why an agent's card that never saved its provider's conversation ID can't
+/// reopen it; [`blocked_recovery::Reopen::UnnamedAgent`] says what to do.
+fn unnamed_agent_conversation(session: &chat::Session) -> String {
+    format!(
+        "{} hadn't reported this agent's conversation ID when cagents' background service stopped, so this tab has no saved conversation to reconnect to.",
+        session.launch.provider.label()
+    )
+}
+
 /// Why sending cannot move a conversation to another account yet: a
 /// background subagent holds it, which the daemon would refuse to close.
 fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
@@ -1235,9 +1265,9 @@ pub(super) struct State {
     /// than the rest to bring back.
     confirmed_losses: HashMap<CardId, (TerminalId, ConfirmedLoss)>,
     /// Cards reopening a conversation with the message their last card was
-    /// still sending as it closed. Their composer drops it once the
-    /// transcript shows it arrived.
-    sending_on_close: HashSet<CardId>,
+    /// still sending as it closed, with what the reader had said before it.
+    /// Their composer drops it once the transcript shows it arrived.
+    sending_on_close: HashMap<CardId, SentAfter>,
     /// Drafts another window started, whose cards are attaching to that
     /// conversation. Their carried-over unsent text may repeat its first
     /// message, which is checked once the transcript shows it.
@@ -1286,7 +1316,7 @@ impl Default for State {
             peer_started: HashMap::new(),
             waiting: HashMap::new(),
             confirmed_losses: HashMap::new(),
-            sending_on_close: HashSet::new(),
+            sending_on_close: HashMap::new(),
             started_elsewhere: HashSet::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
@@ -2779,6 +2809,9 @@ struct PendingCommand {
     /// the provider has accepted it. A rejected send is not history: the
     /// draft it came from is still in the composer.
     sent: Option<String>,
+    /// What the reader had said last as `sent` went out, which tells it apart
+    /// from an earlier message reading the same.
+    sent_after: SentAfter,
     sent_attachments: Vec<Attachment>,
     /// Which end of the history this command is extending, where it is a
     /// page request at all. The transcript says so at the edge the rows will
@@ -2932,14 +2965,53 @@ fn unaccounted(
     remaining
 }
 
+/// The reader's messages `snapshot` shows, oldest first, with their item ids.
+fn user_messages(snapshot: &Snapshot) -> impl DoubleEndedIterator<Item = (&str, &str)> {
+    snapshot
+        .items
+        .iter()
+        .filter_map(|item| match &item.content {
+            chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => {
+                Some((item.id.as_str(), text.as_str()))
+            }
+            _ => None,
+        })
+}
+
+/// What the reader had said last in `snapshot`'s conversation, as `sent`
+/// goes to it.
+fn sent_after(snapshot: &Snapshot, sent: &str) -> SentAfter {
+    if snapshot.has_later {
+        // The conversation's latest messages are not in view.
+        return SentAfter::Unseen;
+    }
+    if snapshot
+        .queued_messages
+        .iter()
+        .any(|queued| !queued.editable || queued.text.trim() == sent.trim())
+    {
+        // A message the provider still holds may arrive before this one,
+        // and nothing shows where it will: one reading the same would pass
+        // for this one. A preview may not be the whole message, so it may
+        // read the same too.
+        return SentAfter::Unseen;
+    }
+    match user_messages(snapshot).next_back() {
+        Some((id, text)) if text.trim() == sent.trim() => SentAfter::Same(id.to_owned()),
+        Some(_) => SentAfter::Different,
+        None if snapshot.has_earlier => SentAfter::Unseen,
+        None => SentAfter::Different,
+    }
+}
+
 /// Which message of the conversation carried-over unsent text may repeat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DraftEcho {
     /// The first, which another window started the conversation with.
     First,
     /// The latest, which the conversation's last card was still sending as it
-    /// closed.
-    Latest,
+    /// closed, after the message this says the reader had sent before it.
+    Latest(SentAfter),
 }
 
 /// What came back to the composer from a provider queue that did not survive.
@@ -2978,7 +3050,9 @@ const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
-    find_matches: Vec<String>,
+    /// The groups Find matched, in transcript order. Every turn asks whether
+    /// it is among them on every frame, so membership is a lookup.
+    find_matches: indexmap::IndexSet<String>,
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
@@ -3985,40 +4059,54 @@ impl Runtime {
     /// which the conversation already has, so it is not offered again. Any
     /// other text is the reader's own and stays.
     fn settle_draft_echo(&mut self) {
-        let Some((revision, echo)) = self.draft_echo else {
+        let Some((revision, echo)) = self.draft_echo.take() else {
             return;
         };
         if revision != self.revision || !self.attachments.is_empty() {
             // Edited since, or more than the text: no longer a copy.
-            self.draft_echo = None;
             return;
         }
         if self.snapshot.history_loading || !self.visible.load(Ordering::Relaxed) {
+            self.draft_echo = Some((revision, echo));
             return;
         }
-        let mut sent = self
-            .snapshot
-            .items
-            .iter()
-            .filter_map(|item| match &item.content {
-                chat::ItemContent::Text { text, .. } if item.role == chat::Role::User => Some(text),
-                _ => None,
-            });
-        let message = match echo {
-            // The first message counts only where the transcript starts.
-            DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
-            DraftEcho::Latest => sent.last(),
+        let composer = self.composer.text();
+        let repeated = {
+            let mut sent = user_messages(&self.snapshot);
+            let message = match &echo {
+                // The first message counts only where the transcript starts.
+                DraftEcho::First => sent.next().filter(|_| !self.snapshot.has_earlier),
+                DraftEcho::Latest(SentAfter::Different) => sent.last(),
+                DraftEcho::Latest(SentAfter::Same(before)) => {
+                    // The message sent before it read the same, so only a
+                    // message shown after that one can be this one. Where that
+                    // one is not in view, or the provider shows it under another
+                    // id, nothing here tells them apart, and the text stays.
+                    let sent = sent.collect::<Vec<_>>();
+                    match sent.iter().position(|(id, _)| id == before) {
+                        Some(index) => match sent[index + 1..].last() {
+                            Some(message) => Some(*message),
+                            None => return,
+                        },
+                        None if sent.is_empty() => None,
+                        None => return,
+                    }
+                }
+                // Nothing told the message apart as it was sent.
+                DraftEcho::Latest(SentAfter::Unseen) => return,
+            };
+            let Some((_, message)) = message else {
+                if !self.snapshot.has_earlier {
+                    // The transcript may yet show it.
+                    self.draft_echo = Some((revision, echo));
+                }
+                // Otherwise the message is not in view, so nothing can be shown
+                // to repeat it.
+                return;
+            };
+            composer.trim() == message.trim()
         };
-        let Some(message) = message else {
-            if self.snapshot.has_earlier {
-                // The message is not in view, so nothing can be shown to
-                // repeat it.
-                self.draft_echo = None;
-            }
-            return;
-        };
-        self.draft_echo = None;
-        if self.composer.text().trim() == message.trim() {
+        if repeated {
             self.replace_draft(text_editor::Content::new());
         }
     }
@@ -4183,7 +4271,7 @@ impl Runtime {
             fork_seen: None,
             files: None,
             find: None,
-            find_matches: Vec::new(),
+            find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
             find_index: 0,
@@ -6646,6 +6734,20 @@ fn retire_conversation(
     session: Option<chat::Session>,
 ) -> Result<(), String> {
     end_conversation(handle, session, super::channel_ui::close_sessions)
+}
+
+/// Gives up a failed start the card replaced on its own, like
+/// [`retire_conversation`], but never retires an open agent that runs as it:
+/// the card's agent check can predate the agents the daemon reports.
+fn give_up_failed_start(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    end_conversation(
+        handle,
+        session,
+        super::channel_ui::close_sessions_sparing_agents,
+    )
 }
 
 /// Closes a conversation the reader closed, like [`retire_conversation`],
@@ -9273,8 +9375,8 @@ impl Cagents {
         }
         if self.chat_ui.started_elsewhere.remove(&card) {
             runtime.await_draft_echo(DraftEcho::First);
-        } else if self.chat_ui.sending_on_close.remove(&card) {
-            runtime.await_draft_echo(DraftEcho::Latest);
+        } else if let Some(after) = self.chat_ui.sending_on_close.remove(&card) {
+            runtime.await_draft_echo(DraftEcho::Latest(after));
         }
     }
 
@@ -9702,6 +9804,11 @@ impl Cagents {
                     None
                 }
             }
+            // Only while the card still names the conversation that was
+            // refused: a replacement is judged on its own.
+            CardKind::Chat(_) if self.unnamed_agent(card).is_some() => {
+                Some(Cow::Borrowed(blocked_recovery::UNNAMED_AGENT_TERMINAL))
+            }
             CardKind::Chat(_) => match self.cards.get(&card) {
                 Some(CardRuntime::Chat(runtime)) => {
                     let named = runtime.connected()
@@ -9880,6 +9987,11 @@ impl Cagents {
             Some(Phase::Closing { restart: None, .. })
         ) {
             return Task::none();
+        }
+        // Its questions are answered, so "Close and end agent" ends what it
+        // said still runs before the card goes.
+        if let Some(ending) = self.end_unnamed_agent_before_close(card) {
+            return ending;
         }
         if !self.prepare_shared_removal(card) {
             return Task::none();
@@ -11261,7 +11373,7 @@ impl Cagents {
             }
             HistoryNavigation::Latest => Task::none(),
             HistoryNavigation::NewerEdge
-                if runtime.parent_scroll().at_bottom() && runtime.snapshot.has_later =>
+                if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
             }
@@ -11269,7 +11381,7 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.parent_scroll().at_top() && runtime.snapshot.has_earlier =>
+                if runtime.parent_scroll().prefetch_earlier() && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
@@ -11396,6 +11508,9 @@ impl Cagents {
             Command::Slash { command } => Some(command.clone()),
             _ => None,
         };
+        let sent_after = sent.as_deref().map_or_else(SentAfter::default, |sent| {
+            sent_after(&runtime.snapshot, sent)
+        });
         let sent_attachments = match &command {
             Command::Prompt { attachments, .. } => attachments.clone(),
             _ => Vec::new(),
@@ -11414,6 +11529,7 @@ impl Cagents {
             model,
             page,
             sent,
+            sent_after,
             sent_attachments,
             queued: step,
         });
@@ -11970,7 +12086,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::ResumeCommitted(target, ready, result) => {
                 match result {
@@ -11997,11 +12113,11 @@ impl Cagents {
                         });
                         return Task::batch([
                             retire,
-                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                            self.dispatch(Message::ChatUi(Action::Ready(target, ready))),
                         ]);
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::AccountCommitted(target, ready, result) => {
                 match result {
@@ -12022,7 +12138,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::DraftStartCheckpointed(target, attempt, result) => {
                 return self.draft_start_checkpointed(target, attempt, result);
@@ -12577,7 +12693,10 @@ impl Cagents {
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
-                            ) =>
+                            )
+                            // An agent ran there, and giving up its card
+                            // would end the agent and its conversation.
+                            && !self.chat_runs_as_open_agent(target.card, &attempt.session) =>
                     {
                         // A conversation its provider never named, and that
                         // no CLI terminal of the reader's holds, has nothing
@@ -12598,19 +12717,45 @@ impl Cagents {
                         let skills = self.open_chat_draft(target.card, draft);
                         return Task::batch([
                             skills,
-                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            self.end_chat(
+                                target.card,
+                                None,
+                                Some(attempt.session),
+                                give_up_failed_start,
+                            ),
                         ]);
                     }
-                    Err(failure) => {
-                        let blocked = blocked_recovery::Reopen::of(failure.recovery);
+                    Err(mut failure) => {
+                        // Starting over would give up the agent's card, so its
+                        // conversation is refused for good, with Close to end it.
+                        let unnamed_agent = failure.recovery == chat::Recovery::Fresh
+                            && attempt.session.launch.session_id.is_none()
+                            && self.chat_runs_as_open_agent(target.card, &attempt.session);
+                        if unnamed_agent {
+                            failure.recovery = chat::Recovery::Blocked;
+                            failure.message = unnamed_agent_conversation(&attempt.session);
+                        }
+                        let blocked = if unnamed_agent {
+                            Some(blocked_recovery::Reopen::UnnamedAgent)
+                        } else {
+                            blocked_recovery::Reopen::of(failure.recovery)
+                        };
+                        let mut running = Task::none();
                         if let Some(reopen) = blocked {
                             self.chat_ui.blocked_starts.insert(
                                 target.card,
                                 blocked_recovery::BlockedStart {
                                     source: attempt.session.clone(),
                                     reopen,
+                                    liveness: Default::default(),
                                 },
                             );
+                            if unnamed_agent {
+                                running = self.ask_unnamed_agent_running(
+                                    target.card,
+                                    attempt.session.clone(),
+                                );
+                            }
                         } else {
                             self.chat_ui.blocked_starts.remove(&target.card);
                         }
@@ -12667,8 +12812,11 @@ impl Cagents {
                                 .unwrap_or_else(|| "a conversation".to_owned());
                             // A launch that names no conversation had none to
                             // reopen: starting it is what failed.
+                            // An agent's conversation that ran is reopened,
+                            // even though it was never named.
                             let verb = if attempt.intent == chat::Intent::Start
                                 && attempt.session.launch.session_id.is_none()
+                                && !unnamed_agent
                             {
                                 "start"
                             } else {
@@ -12702,6 +12850,7 @@ impl Cagents {
                         return Task::batch([
                             self.drain_terminal(target.card, 0),
                             cleanup,
+                            running,
                             if terminal_switch {
                                 cosmic::task::message(Message::ChromeUi(
                                     chrome_ui::Action::ShowNoticesFor(target.card),
@@ -13125,7 +13274,7 @@ impl Cagents {
                 return self.finish_fresh_conversation(target, *source, *requested, result);
             }
             Action::ToggleBlockedDetails(card, source) => {
-                if self.blocked_failure_source(card) == Some(&source) {
+                if self.blocked_details_source(card) == Some(&source) {
                     if self.chat_ui.blocked_details.get(&card) == Some(&source) {
                         self.chat_ui.blocked_details.remove(&card);
                     } else {
@@ -13134,12 +13283,31 @@ impl Cagents {
                 }
             }
             Action::CopyBlockedDetails(card, source) => {
-                if self.blocked_failure_source(card) == Some(&source)
-                    && let Some(CardRuntime::Failed(failure)) = self.cards.get(&card)
+                if self.blocked_details_source(card) == Some(&source)
+                    && let Some(text) = self.blocked_details_text(card)
                 {
                     text_copy::invalidate();
-                    return iced::clipboard::write(failure.message().to_owned())
-                        .map(cosmic::Action::App);
+                    return iced::clipboard::write(text.to_owned()).map(cosmic::Action::App);
+                }
+            }
+            Action::UnnamedAgentRunning(card, source, running) => {
+                self.record_unnamed_agent_running(card, &source, running);
+            }
+            Action::UnnamedAgentEnded(card, source, result) => {
+                return self.unnamed_agent_ended(card, &source, result);
+            }
+            Action::CopyBlockedDraft(card, source) => {
+                if self
+                    .unnamed_agent(card)
+                    .is_some_and(|blocked| blocked.source == source)
+                    && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+                {
+                    let text = runtime.unsent_text();
+                    if !text.trim().is_empty() {
+                        text_copy::invalidate();
+                        self.status = Some(TransientNotice::success("Copied message"));
+                        return iced::clipboard::write(text).map(cosmic::Action::App);
+                    }
                 }
             }
             Action::ComposerCursor(target, cursor) => {
@@ -14061,7 +14229,7 @@ impl Cagents {
                 // Through the app's own dispatch, so every guard a pressed row
                 // passes, such as a remote device refusing local files, holds
                 // for Enter too.
-                let task = self.update(Message::ChatUi(chosen));
+                let task = self.dispatch(Message::ChatUi(chosen));
                 if !refocus {
                     return task;
                 }
@@ -15428,13 +15596,15 @@ impl Cagents {
                     return Task::none();
                 }
                 runtime.scroll = scroll;
-                let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
-                if at_bottom && !runtime.snapshot.has_later {
+                if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
                 }
-                // Leaving an end is what arms the page at it, so a reader who
-                // scrolls away and comes back asks again, while one who stays
-                // put asks once.
+                // Pages are fetched ahead of the reader, within a couple of
+                // screens of a loaded edge rather than at it.
+                let (at_top, at_bottom) = (scroll.prefetch_earlier(), scroll.prefetch_later());
+                // Leaving that reach is what arms the page at it, so a reader
+                // who scrolls away and comes back asks again, while one who
+                // stays put asks once.
                 if !at_top || direction == Some(view::Page::Newer) {
                     if runtime.deferred_page == Some(HistoryNavigation::EarlierEdge) {
                         runtime.deferred_page = None;

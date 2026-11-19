@@ -8418,7 +8418,7 @@ mod tests {
     /// after a restart too; the window holds a bounded number of them.
     #[test]
     fn kept_chat_drafts_survive_a_restart() {
-        use crate::model::KeptChatDraft;
+        use crate::model::{KeptChatDraft, SentAfter};
         let directory = tempdir().unwrap();
         let boot_id = boot("closed-draft-boot");
         let store =
@@ -8436,7 +8436,8 @@ mod tests {
                 delivery: Default::default(),
                 attachments: Vec::new(),
             }],
-            sending: false,
+            sending: true,
+            sent_after: SentAfter::Same("user-1".into()),
             closed_at_unix_ms: at,
         };
         workspace

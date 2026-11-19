@@ -64,9 +64,7 @@ fn validate_command(command: &ChatCommand) -> Result<(), AppError> {
 
 pub(super) fn execute(command: ChatCommand) -> Result<CommandOutput, AppError> {
     validate_command(&command)?;
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = control_daemon_client()?;
     client
         .authenticate(Authority::from_environment())
         .map_err(protocol_error)?;

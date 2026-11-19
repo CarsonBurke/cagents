@@ -22,8 +22,7 @@ impl Preview {
     }
 
     pub(super) fn new(text: &str) -> Self {
-        // Claude uses this canonical placeholder for redacted_thinking blocks.
-        if text.trim() == "[Redacted thinking]" {
+        if redacted(text) {
             return Self::default();
         }
         let first = text.lines().find_map(plain_line).unwrap_or_default();
@@ -33,6 +32,27 @@ impl Preview {
 
     pub(super) fn retained_bytes(&self) -> usize {
         self.first.capacity() + self.latest.capacity()
+    }
+}
+
+/// Claude's canonical placeholder for a redacted_thinking block.
+fn redacted(text: &str) -> bool {
+    text.trim() == "[Redacted thinking]"
+}
+
+/// Whether `content` is reasoning with nothing a reader can read. Claude
+/// usually sends a thinking block as only its signature, or redacts it, and
+/// Codex can send an empty summary. Such a thought is time spent working,
+/// which the working indicator and its group's duration already tell, and
+/// not a row of its own.
+pub(super) fn contentless(content: &ItemContent) -> bool {
+    match content {
+        ItemContent::Text {
+            text,
+            thinking: true,
+            ..
+        } => redacted(text) || !text.lines().any(|line| plain_line(line).is_some()),
+        _ => false,
     }
 }
 
@@ -96,6 +116,24 @@ mod tests {
     }
 
     #[test]
+    fn readable_reasoning_and_answers_are_not_contentless() {
+        for text in ["**Planning the fix**", "\n\nCheck the `probe`"] {
+            let thought = ItemContent::Text {
+                text: text.into(),
+                thinking: true,
+                phase: crate::chat::Phase::Commentary,
+            };
+            assert!(!contentless(&thought), "{text:?}");
+        }
+        let empty_answer = ItemContent::Text {
+            text: String::new(),
+            thinking: false,
+            phase: crate::chat::Phase::Final,
+        };
+        assert!(!contentless(&empty_answer));
+    }
+
+    #[test]
     fn a_long_single_line_has_bounded_preview_storage_without_ellipsis() {
         let source = format!("**{}**", "思".repeat(100_000));
         let preview = Preview::new(&source);
@@ -114,6 +152,12 @@ mod tests {
             "\n[Redacted thinking]\n",
         ] {
             assert_eq!(Preview::new(source), Preview::default(), "{source:?}");
+            let thought = ItemContent::Text {
+                text: source.into(),
+                thinking: true,
+                phase: crate::chat::Phase::Commentary,
+            };
+            assert!(contentless(&thought), "{source:?}");
         }
     }
 }

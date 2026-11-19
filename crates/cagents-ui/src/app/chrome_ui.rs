@@ -38,12 +38,9 @@ pub(super) struct State {
     pub(super) tabs_focus: Option<CardId>,
     rename: Option<(RenameTarget, String)>,
     pub(super) workspace_preview: Option<SidebarAction>,
-    /// When the hold that opened the workspace switcher began, which also
-    /// names the timer that reveals it.
+    /// When the hold that opened the workspace switcher began, which names
+    /// the hold to the messages and timers that belong to it.
     pub(super) workspace_preview_since: Option<Instant>,
-    /// A tap between the two most recent workspaces ends before the switcher
-    /// would be read, so it is drawn only once the hold outlasts one.
-    pub(super) workspace_switcher_shown: bool,
     /// Where the switcher's list was last scrolled to, so following the
     /// selection moves it no further than the selection requires.
     pub(super) workspace_switcher_scroll: f32,
@@ -2726,7 +2723,7 @@ impl Cagents {
                 self.begin_dirty_close(DirtyCloseIntent::PaneGroup, dirty)
             }
             Action::Clone(id) => {
-                let focus = self.update(Message::FocusCard(id));
+                let focus = self.dispatch(Message::FocusCard(id));
                 if self.workspace.focused() == Some(id) {
                     Task::batch([focus, self.clone_focused_pane()])
                 } else {
@@ -2750,25 +2747,28 @@ impl Cagents {
             Action::Reveal(id) => {
                 let was_collapsed = self.chrome_ui.projects_collapsed;
                 self.chrome_ui.projects_collapsed = false;
+                // A whole update rather than a dispatch: the row to reveal is
+                // found in the sidebar as projecting the new focus leaves it.
                 let focus = self.update(Message::FocusCard(id));
                 if self.workspace.focused() != Some(id) {
                     self.chrome_ui.projects_collapsed = was_collapsed;
                     return focus;
                 }
                 self.synchronize_sidebar_selection();
-                if let Some(row) = self.reveal_card_row(id) {
-                    self.persist();
-                    let reveal = sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
-                        .map(cosmic::Action::App);
-                    Task::batch([focus, reveal])
-                } else {
-                    focus
-                }
+                // Unfolding the sidebar to the row changes only the window's
+                // view, which lives in its settings; the focus move saves
+                // the workspace with the navigation burst.
+                let reveal = self.reveal_card_row(id).map_or_else(Task::none, |row| {
+                    sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                        .map(cosmic::Action::App)
+                });
+                Task::batch([focus, reveal, self.save_settings_task(false)])
             }
+            // Whether the projects sidebar is folded belongs to the window's
+            // view, saved with its settings, not to the workspace.
             Action::ToggleProjects => {
                 self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
-                self.persist();
-                Task::none()
+                self.save_settings_task(false)
             }
             Action::AttentionPage(page) => {
                 if !self.attention_is_open() || !self.attention_backend_current() {

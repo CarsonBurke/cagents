@@ -240,6 +240,36 @@ enum Placement<'a> {
     Unplaced(&'a chat::Item),
 }
 
+/// The bubble a user's message is drawn in: the accent wash, or an outline
+/// for an attachment, held to [`PROMPT_MEASURE`].
+///
+/// A message long enough to fold takes the whole measure, so showing more or
+/// less of it changes only its height; any other sizes to what it holds.
+/// Either way the bubble's width is never fluid. A fluid child, such as the
+/// fold's full-width disclosure row, would otherwise make the bubble, and the
+/// row it sits in, fill the transcript, and the bubble would lose its anchor
+/// on the right.
+fn user_bubble<'a>(
+    body: Element<'a, Message>,
+    attachment: bool,
+    folds: bool,
+) -> Element<'a, Message> {
+    widget::container(body)
+        .class(design::surface(
+            (!attachment).then_some(design::accent_wash),
+            [design::RADIUS_M; 4],
+            attachment,
+        ))
+        .padding([step::GAP_S as u16, step::GAP_M as u16])
+        .width(if folds {
+            Length::Fixed(PROMPT_MEASURE)
+        } else {
+            Length::Shrink
+        })
+        .max_width(PROMPT_MEASURE)
+        .into()
+}
+
 /// Reserve an external action row so hovering never shifts the transcript.
 /// The hover also keeps its controls visible while they are keyboard-focused.
 pub(super) fn message_actions<'a>(
@@ -252,7 +282,9 @@ pub(super) fn message_actions<'a>(
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
         ])
-        .spacing(step::GAP_XS),
+        .spacing(step::GAP_XS)
+        // Should the message ever fill the row, it keeps its side.
+        .align_x(alignment),
         widget::container(actions)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -331,6 +363,8 @@ const REQUEST_CONTEXT_CEILING: f32 = 160.0;
 /// arrived at the oldest message they have should not have to nudge the wheel
 /// again to be believed.
 const PAGE_REACH: f32 = 24.0;
+/// How many viewport heights before a loaded edge the next page is fetched.
+const PREFETCH_SCREENS: f32 = 2.0;
 
 /// The composer editor, drawing no surface of its own.
 ///
@@ -1009,6 +1043,22 @@ pub struct Scroll {
     from_top: f32,
     content: f32,
     window: f32,
+    /// What of the window a page keeps, where it was last laid out. Unknown
+    /// until the transcript has laid out its rows.
+    kept: Option<Kept>,
+}
+
+/// Where the halves a page keeps end, in the transcript's laid-out
+/// coordinates. A page slides the window around its middle item: an earlier
+/// page keeps the items through it, a later page the items from it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Kept {
+    /// The top of the highest row holding an item after the middle one:
+    /// everything above it survives an earlier page.
+    pub older_end: f32,
+    /// The bottom of the lowest row holding an item before the middle one:
+    /// everything below it survives a later page.
+    pub newer_start: f32,
 }
 
 impl Scroll {
@@ -1017,7 +1067,11 @@ impl Scroll {
             from_top,
             content,
             window,
+            kept: None,
         }
+    }
+    pub(super) fn with_kept(self, kept: Option<Kept>) -> Self {
+        Self { kept, ..self }
     }
     /// How far the transcript can be scrolled.
     fn travel(self) -> f32 {
@@ -1061,6 +1115,36 @@ impl Scroll {
 
     pub(super) fn page_height(self) -> f32 {
         (self.window * 0.9).max(1.0)
+    }
+
+    /// Whether the next earlier page should be fetched now, ahead of the
+    /// reader. Short of the very top this waits until the whole viewport is
+    /// in the half the page keeps, so what is on screen never leaves the
+    /// window. Items differ in height and are not drawn in item order within
+    /// an exchange, so that half is where its rows were drawn. Until they
+    /// have been, only the edge asks.
+    pub(super) fn prefetch_earlier(self) -> bool {
+        self.at_top()
+            || self.kept.is_some_and(|kept| {
+                self.from_top <= self.prefetch_reach()
+                    && self.from_top + self.window <= kept.older_end
+            })
+    }
+
+    /// Whether the next newer page should be fetched now, the mirror of
+    /// [`Self::prefetch_earlier`].
+    pub(super) fn prefetch_later(self) -> bool {
+        self.at_bottom()
+            || self.kept.is_some_and(|kept| {
+                self.travel() - self.from_top <= self.prefetch_reach()
+                    && self.from_top >= kept.newer_start
+            })
+    }
+
+    /// How far from a loaded edge a page is fetched: far enough that wheel
+    /// and Page Up reading does not reach the edge before the page arrives.
+    fn prefetch_reach(self) -> f32 {
+        self.window * PREFETCH_SCREENS
     }
 }
 
@@ -1233,6 +1317,9 @@ impl Cagents {
         } else {
             0.0
         };
+        if let Some(done) = self.unnamed_agent_view(card) {
+            return done;
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime))
                 if runtime.awaiting_admission()
@@ -1342,43 +1429,37 @@ fn items_activity(items: &[Arc<chat::Item>]) -> &'static str {
 }
 
 /// Each item belongs to this transcript's stream; advancing it ends the thought.
-fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
-    !busy
-        || items
-            .iter()
-            .position(|item| item.id == id)
-            .is_some_and(|index| index + 1 < items.len())
+/// `index` is the thought's place in `items`, which every caller already
+/// holds, so asking costs nothing however long the transcript is.
+fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, index: usize) -> bool {
+    !busy || index + 1 < items.len()
 }
 
 /// The thought's own timestamps describe its work. Older providers without an
 /// end can use the next observation in this same stream, or its recorded end.
+/// `index` is the thought's place in `items`.
 fn reasoning_elapsed(
-    item: &chat::Item,
     items: &[Arc<chat::Item>],
+    index: usize,
     finished: bool,
     finished_at: Option<u64>,
 ) -> Option<String> {
     if !finished {
         return None;
     }
+    let item = items.get(index)?;
     let start = item.started_at?;
     let end = item
         .at
         .or_else(|| {
             items
-                .iter()
-                .skip_while(|candidate| candidate.id != item.id)
-                .skip(1)
-                .next()
-                .and_then(|candidate| candidate.started_at.or(candidate.at))
+                .get(index + 1)
+                .and_then(|next| next.started_at.or(next.at))
         })
-        .or_else(|| {
-            items
-                .last()
-                .filter(|last| last.id == item.id)
-                .and(finished_at)
-        })?;
-    Some(disclosure::duration(end.saturating_sub(start)))
+        .or_else(|| finished_at.filter(|_| index + 1 == items.len()))?;
+    // Under a second reads as "0s", which says nothing.
+    let millis = end.saturating_sub(start);
+    (millis >= 1_000).then(|| disclosure::duration(millis))
 }
 
 /// The providers a draft offers, in the order its picker lists them after
@@ -1825,7 +1906,9 @@ impl Runtime {
             .is_some_and(Coordinated::is_card);
         !card
             && (item.content.status() == Some(chat::ToolStatus::Running)
-                || working && matches!(item.content, ItemContent::Text { thinking: true, .. }))
+                || working
+                    && matches!(item.content, ItemContent::Text { thinking: true, .. })
+                    && !reasoning::contentless(&item.content))
     }
 
     /// Whether the lead's closing line spins, as it does while subagents
@@ -2332,6 +2415,7 @@ impl Runtime {
     fn child_item_revision(
         &self,
         agent: &chat::Subagent,
+        index: usize,
         item: &chat::Item,
         cached: &CachedItem,
         dark: bool,
@@ -2361,11 +2445,11 @@ impl Runtime {
             let finished = reasoning_finished(
                 &agent.items,
                 agent.status == chat::ToolStatus::Running,
-                &item.id,
+                index,
             );
             (
                 finished,
-                reasoning_elapsed(item, &agent.items, finished, None),
+                reasoning_elapsed(&agent.items, index, finished, None),
             )
                 .hash(&mut revision);
         }
@@ -2563,7 +2647,7 @@ impl Runtime {
                         .push(self.failure_view_with_reset(incident, reset_controls.as_ref()));
                 }
             }
-            for item in &agent.items {
+            for (index, item) in agent.items.iter().enumerate() {
                 if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
                     if first {
                         transcript.push(
@@ -2579,6 +2663,11 @@ impl Runtime {
                 let Some(cached) = self.child_cache.get(&item.id) else {
                     continue;
                 };
+                // As in the lead's transcript, a thought with nothing to
+                // read is working time, not a row.
+                if reasoning::contentless(&item.content) {
+                    continue;
+                }
                 let footer = if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
                 {
@@ -2589,8 +2678,14 @@ impl Runtime {
                 use std::hash::{Hash, Hasher};
                 let mut key = std::hash::DefaultHasher::new();
                 ("selected-child-item", &item.id).hash(&mut key);
-                let revision =
-                    self.child_item_revision(agent, item, cached, dark, self.source_now_ms());
+                let revision = self.child_item_revision(
+                    agent,
+                    index,
+                    item,
+                    cached,
+                    dark,
+                    self.source_now_ms(),
+                );
                 let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
                     (body.len() as f32 / (content_width / 8.0).max(20.0))
                         .ceil()
@@ -2627,6 +2722,7 @@ impl Runtime {
                                 } else {
                                     match &item.content {
                                         ItemContent::Text { .. } => self.prose_view(
+                                            index,
                                             item,
                                             cached,
                                             turn::slot_of(item),
@@ -2997,6 +3093,22 @@ impl Runtime {
                         Default::default()
                     },
                     Some(self.find_navigation.guard()),
+                    if selected.is_none() {
+                        scroll::History {
+                            pages: scroll::Pages {
+                                earlier: snapshot.has_earlier,
+                                later: snapshot.has_later,
+                            },
+                            // The store's `middle` cursor is the window's
+                            // item at `len / 2` too (`Store::window_reusing`).
+                            pivot: (!snapshot.items.is_empty()).then(|| scroll::Pivot {
+                                index: snapshot.items.len() / 2,
+                                items: snapshot.items.len(),
+                            }),
+                        }
+                    } else {
+                        scroll::History::default()
+                    },
                 ),
                 target,
                 self.selected_subagent.as_deref(),
@@ -4943,7 +5055,7 @@ impl Runtime {
     }
 
     pub(super) fn find_turn_matches(&self, key: &str) -> bool {
-        self.find_matches.iter().any(|candidate| candidate == key)
+        self.find_matches.contains(key)
     }
 
     /// Everything an exchange draws, as one value: it changes when any of
@@ -5102,7 +5214,7 @@ impl Runtime {
         let coordinating = match part {
             TurnPart::Prompt(index) => {
                 0u8.hash(&mut hasher);
-                self.hash_turn_item(&items[index], cached, None, now, &mut hasher)
+                self.hash_turn_item(index, cached, None, now, &mut hasher)
             }
             TurnPart::Steps => {
                 1u8.hash(&mut hasher);
@@ -5126,7 +5238,7 @@ impl Runtime {
                     };
                     item.id.hash(&mut hasher);
                     coordinating |= self.hash_turn_item(
-                        item,
+                        placed.index,
                         self.cache.get(&item.id),
                         Some(placed.slot),
                         now,
@@ -5138,13 +5250,7 @@ impl Runtime {
             TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                 2u8.hash(&mut hasher);
                 let placed = &turn.prose[prose];
-                self.hash_turn_item(
-                    &items[placed.index],
-                    cached,
-                    Some(placed.slot),
-                    now,
-                    &mut hasher,
-                )
+                self.hash_turn_item(placed.index, cached, Some(placed.slot), now, &mut hasher)
             }
         };
         if coordinating {
@@ -5172,13 +5278,14 @@ impl Runtime {
     /// them.
     fn hash_turn_item(
         &self,
-        item: &chat::Item,
+        index: usize,
         cached: Option<&CachedItem>,
         slot: Option<turn::Slot>,
         now: Option<u64>,
         hasher: &mut std::hash::DefaultHasher,
     ) -> bool {
         use std::hash::Hash;
+        let item = &self.snapshot.items[index];
         // The latest observation can change at provider heartbeat speed even
         // when the rendered content and elapsed second are unchanged.
         (
@@ -5198,13 +5305,13 @@ impl Runtime {
             let finished = reasoning_finished(
                 &self.snapshot.items,
                 self.snapshot.busy && !self.snapshot.has_later,
-                &item.id,
+                index,
             );
             (
                 finished,
                 reasoning_elapsed(
-                    item,
                     &self.snapshot.items,
+                    index,
                     finished,
                     self.snapshot
                         .finished_at
@@ -5358,7 +5465,9 @@ impl Runtime {
                             .then(|| self.step_detail(item, cached, settings));
                         self.coordination_card(item, coordinated, raw)
                     }
-                    (_, ItemContent::Text { .. }) => self.text_view(item, cached, slot, settings),
+                    (_, ItemContent::Text { .. }) => {
+                        self.text_view(turn.prose[prose].index, item, cached, slot, settings)
+                    }
                     (_, ItemContent::Image { .. }) => self.image_preview(item, cached),
                     // Anything else in the answer slot is a step the grouping
                     // did not recognize, drawn the way a step is.
@@ -5721,17 +5830,7 @@ impl Runtime {
                 .size(design::TEXT_PROSE)
                 .into()
         };
-        let mut rows: Vec<Element<'a, Message>> = vec![
-            widget::container(body)
-                .class(design::surface(
-                    Some(design::accent_wash),
-                    [design::RADIUS_M; 4],
-                    false,
-                ))
-                .padding([step::GAP_S as u16, step::GAP_M as u16])
-                .max_width(PROMPT_MEASURE)
-                .into(),
-        ];
+        let mut rows: Vec<Element<'a, Message>> = vec![user_bubble(body, false, false)];
         for attachment in &queued.attachments {
             rows.push(
                 design::caption(
@@ -5777,12 +5876,8 @@ impl Runtime {
             .into()
     }
 
-    /// The user's own message.
-    ///
-    /// Set on the accent wash and tucked to the right, with the corner nearest
-    /// its author squared off. That asymmetry is what identifies the author
-    /// without printing "You" above every message, and the narrower measure
-    /// keeps a turn's opening findable when scrolling back.
+    /// A user message's shown text, before its prepared form is ready: the
+    /// text, whether it is an attachment, and whether it folds.
     fn prompt_text(&self, item: &chat::Item) -> (String, bool, bool) {
         if let ItemContent::Image {
             reference: Some(reference),
@@ -5807,6 +5902,12 @@ impl Runtime {
         }
     }
 
+    /// The user's own message.
+    ///
+    /// Set on the accent wash and tucked to the right. That placement is what
+    /// identifies the author without printing "You" above every message, and
+    /// the narrower measure keeps a turn's opening findable when scrolling
+    /// back.
     fn prompt_view(&self, item: &chat::Item) -> Element<'static, Message> {
         let prepared = self.prepared_prompt(item);
         let attachment = matches!(item.content, ItemContent::Image { .. });
@@ -5919,15 +6020,7 @@ impl Runtime {
                 text
             }
         };
-        let message = widget::container(body)
-            .class(design::surface(
-                (!attachment).then_some(design::accent_wash),
-                [design::RADIUS_M; 4],
-                attachment,
-            ))
-            .padding([step::GAP_S as u16, step::GAP_M as u16])
-            .max_width(PROMPT_MEASURE)
-            .into();
+        let message = user_bubble(body, attachment, long);
         widget::container(message_actions(
             message,
             self.message_copy(item),
@@ -6126,6 +6219,7 @@ impl Runtime {
     /// including partial streaming paragraphs.
     fn prose_view<'a>(
         &'a self,
+        index: usize,
         item: &'a chat::Item,
         cached: &'a CachedItem,
         slot: turn::Slot,
@@ -6137,12 +6231,14 @@ impl Runtime {
             // inventing a second treatment for it.
             return self.step_view(item, cached, settings);
         };
-        self.text_view(item, cached, slot, settings)
+        self.text_view(index, item, cached, slot, settings)
     }
 
     /// A text item in its slot, as an element that owns what it draws.
+    /// `index` is the item's place in the transcript it is drawn from.
     fn text_view(
         &self,
+        index: usize,
         item: &chat::Item,
         cached: &CachedItem,
         slot: turn::Slot,
@@ -6182,11 +6278,15 @@ impl Runtime {
                         )
                     },
                 );
-            let finished = reasoning_finished(items, busy, &item.id);
+            debug_assert!(
+                items.get(index).is_none_or(|at| at.id == item.id),
+                "a thought is drawn at its own position in its stream"
+            );
+            let finished = reasoning_finished(items, busy, index);
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
             let expanded = has_text && self.item_expanded(&item.id);
-            let mut elapsed = reasoning_elapsed(item, items, finished, finished_at);
+            let mut elapsed = reasoning_elapsed(items, index, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
                 if finished {
@@ -7096,6 +7196,9 @@ mod user_image_preview_tests;
 
 #[cfg(test)]
 mod figure_tests;
+
+#[cfg(test)]
+mod user_bubble_tests;
 
 #[cfg(test)]
 mod provider_context_tests;

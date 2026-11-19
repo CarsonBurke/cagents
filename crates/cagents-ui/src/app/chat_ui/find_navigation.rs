@@ -803,6 +803,8 @@ fn raw_groups(runtime: &Runtime) -> Vec<(String, Vec<(usize, bool)>)> {
             .find(|agent| &agent.id == child)
             .into_iter()
             .flat_map(|agent| agent.items.iter().enumerate())
+            // As in the view, a thought with nothing to read has no row.
+            .filter(|(_, item)| !super::reasoning::contentless(&item.content))
             .map(|(index, item)| {
                 (
                     item.id.clone(),
@@ -959,7 +961,7 @@ impl Runtime {
                 && old.session == stamp.session
                 && old.query == stamp.query
         });
-        let previous = self.find_matches.get(self.find_index).cloned();
+        let previous = self.find_matches.get_index(self.find_index).cloned();
         if same_scope {
             // A source publication coalesces behind the one running query.
             // Stable item proofs remain usable while changed groups are pending.
@@ -979,11 +981,7 @@ impl Runtime {
         self.find_matches = current_groups(self);
         self.find_index = previous
             .as_ref()
-            .and_then(|key| {
-                self.find_matches
-                    .iter()
-                    .position(|candidate| candidate == key)
-            })
+            .and_then(|key| self.find_matches.get_index_of(key))
             .unwrap_or_else(|| self.find_matches.len().saturating_sub(1));
         register_highlights(self);
         if small_raw_work(self) {
@@ -1003,11 +1001,7 @@ impl Runtime {
                 self.find_matches = result.groups.iter().map(|(key, _)| key.clone()).collect();
                 self.find_index = previous
                     .as_ref()
-                    .and_then(|key| {
-                        self.find_matches
-                            .iter()
-                            .position(|candidate| candidate == key)
-                    })
+                    .and_then(|key| self.find_matches.get_index_of(key))
                     .unwrap_or_else(|| {
                         self.find_index
                             .min(self.find_matches.len().saturating_sub(1))
@@ -1059,9 +1053,14 @@ impl Runtime {
         if child.is_none() {
             self.find_disclosure.turn(key, &mut self.opened);
         }
+        let stamped = stamped_group(self, key);
+        let in_group: Vec<bool> = plans
+            .iter()
+            .map(|plan| plan_in_group(stamped, plan))
+            .collect();
         let mut prepare_reports = false;
-        for plan in plans.iter() {
-            if !plan_in_group(self, key, plan) {
+        for (plan, in_group) in plans.iter().zip(in_group) {
+            if !in_group {
                 continue;
             }
             let Some(item) = self
@@ -1529,16 +1528,11 @@ impl Cagents {
         }
         runtime.find_navigation.raw.complete =
             epoch == runtime.find_navigation.raw.clock.load(Ordering::Acquire);
-        let previous = runtime.find_matches.get(runtime.find_index).cloned();
+        let previous = runtime.find_matches.get_index(runtime.find_index).cloned();
         runtime.find_navigation.raw.accepted = Some(result);
         runtime.find_matches = current_groups(runtime);
         runtime.find_index = previous
-            .and_then(|key| {
-                runtime
-                    .find_matches
-                    .iter()
-                    .position(|candidate| candidate == &key)
-            })
+            .and_then(|key| runtime.find_matches.get_index_of(&key))
             .unwrap_or_else(|| runtime.find_matches.len().saturating_sub(1));
         register_highlights(runtime);
         self.resume_current_find(target, true)
@@ -1989,45 +1983,54 @@ pub(super) fn inline_highlights(target: Target, text: &str) -> Marks {
         .map_or_else(Marks::default, |found| found.ranges.into())
 }
 
-fn current_groups(runtime: &Runtime) -> Vec<String> {
+fn current_groups(runtime: &Runtime) -> indexmap::IndexSet<String> {
     let Some(accepted) = &runtime.find_navigation.raw.accepted else {
-        return Vec::new();
+        return indexmap::IndexSet::new();
     };
     let Some(stamp) = &runtime.find_navigation.raw.stamp else {
-        return Vec::new();
+        return indexmap::IndexSet::new();
     };
+    // Keyed once, so matching every stamped group stays linear. The first
+    // group under a key wins, as a search from the front would find it.
+    let mut accepted_groups = HashMap::with_capacity(accepted.groups.len());
+    for (group, plans) in &accepted.groups {
+        accepted_groups.entry(group.as_str()).or_insert(plans);
+    }
     stamp
         .groups
         .iter()
         .filter(|(key, sources)| {
-            accepted
-                .groups
-                .iter()
-                .find(|(group, _)| group == key)
-                .is_some_and(|(_, plans)| {
-                    plans.iter().any(|plan| {
-                        sources
-                            .iter()
-                            .any(|(source, _)| source.0.ptr_eq(&plan.source))
-                    })
+            accepted_groups.get(key.as_str()).is_some_and(|plans| {
+                plans.iter().any(|plan| {
+                    sources
+                        .iter()
+                        .any(|(source, _)| source.0.ptr_eq(&plan.source))
                 })
+            })
         })
         .map(|(key, _)| key.clone())
         .collect()
 }
 
-fn plan_in_group(runtime: &Runtime, key: &str, plan: &ItemPlan) -> bool {
+type StampedSources = [(SourceProof<chat::Item>, Vec<(u64, SourceProof<str>)>)];
+
+/// The sources the current stamp holds for the group under `key`.
+fn stamped_group<'a>(runtime: &'a Runtime, key: &str) -> Option<&'a StampedSources> {
     runtime
         .find_navigation
         .raw
         .stamp
         .as_ref()
         .and_then(|stamp| stamp.groups.iter().find(|(group, _)| group == key))
-        .is_some_and(|(_, sources)| {
-            sources
-                .iter()
-                .any(|(source, _)| source.0.ptr_eq(&plan.source))
-        })
+        .map(|(_, sources)| sources.as_slice())
+}
+
+fn plan_in_group(stamped: Option<&StampedSources>, plan: &ItemPlan) -> bool {
+    stamped.is_some_and(|sources| {
+        sources
+            .iter()
+            .any(|(source, _)| source.0.ptr_eq(&plan.source))
+    })
 }
 
 struct MetadataBudget {

@@ -699,6 +699,7 @@ fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
         let item = runtime.active_item("shared-thought").unwrap();
         let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
         let mut element = runtime.prose_view(
+            0,
             item,
             &runtime.presentation_cache()[&item.id],
             turn::Slot::Thinking,
@@ -1395,6 +1396,103 @@ fn long_activity_remains_one_line_in_a_narrow_pane() {
 }
 
 #[test]
+fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place() {
+    let item = |id: &str, role, content| chat::Item {
+        id: id.into(),
+        role,
+        content,
+        started_at: Some(1_000),
+        at: Some(2_000),
+    };
+    let command = |id: &str, status| {
+        item(
+            id,
+            chat::Role::Assistant,
+            ItemContent::Command {
+                label: String::new(),
+                command: "cargo test".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+        )
+    };
+    // What Claude sends for most thinking: a signature and no text.
+    let thought = item(
+        "thought",
+        chat::Role::Assistant,
+        ItemContent::Text {
+            text: String::new(),
+            thinking: true,
+            phase: chat::Phase::Commentary,
+        },
+    );
+    let prompt = item(
+        "prompt",
+        chat::Role::User,
+        ItemContent::Text {
+            text: "Run the tests".into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        },
+    );
+    let regroup = |runtime: &mut Runtime| {
+        runtime.turns = turn::group(
+            &runtime.snapshot.items,
+            &runtime.asked_after,
+            crate::app::chat_ui::Presentations(&runtime.cache),
+        );
+    };
+    let (mut runtime, _handle) =
+        frame_cost::live_runtime(&[prompt, command("c1", chat::ToolStatus::Succeeded), thought]);
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    regroup(&mut runtime);
+    let placed = |runtime: &Runtime| {
+        runtime
+            .turns
+            .iter()
+            .flat_map(|turn| turn.steps.iter().chain(&turn.prose))
+            .map(|placed| placed.index)
+            .collect::<Vec<_>>()
+    };
+    // While the agent thinks with nothing to show, the thought draws no row
+    // and nothing in the transcript claims the work, so the closing line
+    // keeps its glyph and says the agent is thinking.
+    assert_eq!(placed(&runtime), [1], "the thought has no row");
+    assert!(!runtime.work_shown(None));
+    let (glyph, label) = runtime
+        .timeline_activity(false, None)
+        .expect("the lead is working");
+    assert_eq!(
+        runtime.closing_line(glyph, label, false, None),
+        (Some(Icon::AgentWorking), "Thinking".to_owned())
+    );
+
+    // The next command joins the one before the thought: one group.
+    Arc::make_mut(&mut runtime.snapshot)
+        .items
+        .push(Arc::new(command("c2", chat::ToolStatus::Running)));
+    regroup(&mut runtime);
+    assert_eq!(runtime.turns.len(), 1);
+    assert_eq!(
+        runtime.turns[0]
+            .steps
+            .iter()
+            .map(|step| step.index)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert_eq!(placed(&runtime), [1, 3]);
+    assert_eq!(
+        runtime.strip_status(&runtime.turns[0]),
+        Some(chat::ToolStatus::Running)
+    );
+}
+
+#[test]
 fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
     use iced::advanced::{layout, widget::Tree};
     let item = |id: &str, role, content| chat::Item {
@@ -1420,11 +1518,13 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
             },
         )
     };
+    // A thought with words to show is a row of its own; one with nothing to
+    // read is not (see the test below).
     let thought = item(
         "thought",
         chat::Role::Assistant,
         ItemContent::Text {
-            text: String::new(),
+            text: "**Checking the results**".into(),
             thinking: true,
             phase: chat::Phase::Commentary,
         },
@@ -1778,6 +1878,7 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         first_prompt: None,
         model: sent.is_none().then(|| ("haiku".to_owned(), None)),
         sent: sent.map(str::to_owned),
+        sent_after: Default::default(),
         sent_attachments: Vec::new(),
         page: None,
         queued: None,
@@ -2161,7 +2262,7 @@ fn selected_child_find_navigation_resolves_real_scoped_widget_anchors() {
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
         let task = app.handle_chat_ui(Action::Find(target, "needle".into()));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        assert_eq!(runtime.find_matches, vec![item]);
+        assert_eq!(runtime.find_matches.iter().collect::<Vec<_>>(), vec![item]);
         let expected =
             iced::advanced::widget::Id::new(format!("chat-child-item-{}-{framed}", target.card));
         assert_ne!(
@@ -4787,6 +4888,7 @@ fn live_reasoning_disclosure_toggles_through_actions_and_retains_streaming_choic
         let runtime = runtime(app, target);
         let item = &runtime.snapshot.items[0];
         runtime.text_view(
+            0,
             item,
             &runtime.cache[&item.id],
             turn::Slot::Thinking,
@@ -4976,6 +5078,7 @@ fn reasoning_disclosure_preserves_keyboard_focus_across_retained_toggles() {
         let runtime = runtime(app, target);
         let item = &runtime.snapshot.items[0];
         runtime.text_view(
+            0,
             item,
             &runtime.cache[&item.id],
             turn::Slot::Thinking,
@@ -8267,16 +8370,8 @@ fn reasoning_finishes_on_any_later_item_in_its_own_stream() {
         at: None,
         started_at: None,
     });
-    assert!(!reasoning_finished(
-        std::slice::from_ref(&thought),
-        true,
-        "thought"
-    ));
-    assert!(reasoning_finished(
-        std::slice::from_ref(&thought),
-        false,
-        "thought"
-    ));
+    assert!(!reasoning_finished(std::slice::from_ref(&thought), true, 0));
+    assert!(reasoning_finished(std::slice::from_ref(&thought), false, 0));
     let successors = [
         thought.content.clone(),
         ItemContent::Text {
@@ -8313,19 +8408,15 @@ fn reasoning_finishes_on_any_later_item_in_its_own_stream() {
             ..(*thought).clone()
         });
         let items = vec![thought.clone(), next];
-        assert!(reasoning_finished(&items, true, "thought"));
-        assert!(!reasoning_finished(&items, true, "next"));
+        assert!(reasoning_finished(&items, true, 0));
+        assert!(!reasoning_finished(&items, true, 1));
     }
     let user = Arc::new(chat::Item {
         id: "user".into(),
         role: chat::Role::User,
         ..(*thought).clone()
     });
-    assert!(reasoning_finished(
-        &[thought.clone(), user],
-        true,
-        "thought"
-    ));
+    assert!(reasoning_finished(&[thought.clone(), user], true, 0));
     let child = chat::Subagent {
         items: vec![thought.clone()],
         status: chat::ToolStatus::Running,
@@ -8338,12 +8429,8 @@ fn reasoning_finishes_on_any_later_item_in_its_own_stream() {
             ..(*thought).clone()
         }),
     ];
-    assert!(reasoning_finished(&parent, true, "thought"));
-    assert!(!reasoning_finished(
-        &child.items,
-        child.status.is_live(),
-        "thought"
-    ));
+    assert!(reasoning_finished(&parent, true, 0));
+    assert!(!reasoning_finished(&child.items, child.status.is_live(), 0));
     let mut child = child;
     child.items.push(Arc::new(chat::Item {
         id: "child-command".into(),
@@ -8355,11 +8442,7 @@ fn reasoning_finishes_on_any_later_item_in_its_own_stream() {
         },
         ..(*thought).clone()
     }));
-    assert!(reasoning_finished(
-        &child.items,
-        child.status.is_live(),
-        "thought"
-    ));
+    assert!(reasoning_finished(&child.items, child.status.is_live(), 0));
 }
 
 #[test]
@@ -8390,39 +8473,76 @@ fn finished_reasoning_uses_its_own_end_before_successor_or_turn_timing() {
             vec![Arc::new(thought.clone()), later.clone()],
         ] {
             assert_eq!(
-                reasoning_elapsed(&thought, &items, true, Some(200_000)).as_deref(),
+                reasoning_elapsed(&items, 0, true, Some(200_000)).as_deref(),
                 Some("12s")
             );
-            assert_eq!(
-                reasoning_elapsed(&thought, &items, false, Some(200_000)),
-                None
-            );
+            assert_eq!(reasoning_elapsed(&items, 0, false, Some(200_000)), None);
         }
     }
     thought.at = thought.started_at;
     assert_eq!(
-        reasoning_elapsed(&thought, &[], true, None).as_deref(),
-        Some("0s")
+        reasoning_elapsed(&[Arc::new(thought.clone())], 0, true, None),
+        None,
+        "under a second has no duration to show"
     );
     thought.at = None;
     let items = vec![Arc::new(thought.clone()), later];
     assert_eq!(
-        reasoning_elapsed(&thought, &items, true, None).as_deref(),
+        reasoning_elapsed(&items, 0, true, None).as_deref(),
         Some("1m 29s")
     );
     let items = vec![Arc::new(thought.clone())];
     assert_eq!(
-        reasoning_elapsed(&thought, &items, true, Some(66_000)).as_deref(),
+        reasoning_elapsed(&items, 0, true, Some(66_000)).as_deref(),
         Some("1m 5s")
     );
-    assert_eq!(reasoning_elapsed(&thought, &items, true, None), None);
+    assert_eq!(reasoning_elapsed(&items, 0, true, None), None);
     thought.started_at = None;
     thought.at = Some(13_000);
     assert_eq!(
-        reasoning_elapsed(&thought, &[Arc::new(thought.clone())], true, None),
+        reasoning_elapsed(&[Arc::new(thought.clone())], 0, true, None),
         None,
         "a last-update timestamp alone does not establish a zero-length interval"
     );
+}
+
+/// A thought's end is read from its own position in the stream, so a
+/// thought in the middle of a turn ends where the next item starts, and only
+/// the last item can still be thinking.
+#[test]
+fn reasoning_reads_its_end_from_its_own_position() {
+    let item = |id: &str, started_at, at| {
+        Arc::new(chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: "Weighing the options".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            started_at: Some(started_at),
+            at,
+        })
+    };
+    let items = [
+        item("first", 1_000, Some(2_000)),
+        item("second", 2_000, Some(3_000)),
+        item("middle", 10_000, None),
+        item("last", 25_000, None),
+    ];
+    assert!(reasoning_finished(&items, true, 2));
+    assert!(!reasoning_finished(&items, true, 3));
+    assert_eq!(
+        reasoning_elapsed(&items, 2, true, Some(90_000)).as_deref(),
+        Some("15s"),
+        "the next item's start ends the middle thought, not the turn's end"
+    );
+    assert_eq!(
+        reasoning_elapsed(&items, 3, true, Some(90_000)).as_deref(),
+        Some("1m 5s"),
+        "only the last item ends with the turn"
+    );
+    assert_eq!(reasoning_elapsed(&items, 4, true, Some(90_000)), None);
 }
 
 #[test]
@@ -8564,6 +8684,7 @@ fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
     let renderer = crate::app::tests::headless_renderer();
     let label = |runtime: &Runtime| {
         let mut element = runtime.text_view(
+            0,
             &thought,
             &runtime.cache["shared-thought"],
             turn::Slot::Thinking,
@@ -8637,6 +8758,7 @@ fn historical_reasoning_pages_do_not_show_live_status_or_borrow_the_latest_turns
         for busy in [true, false] {
             Arc::make_mut(&mut runtime.snapshot).busy = busy;
             let mut element = runtime.text_view(
+                0,
                 &thought,
                 &runtime.cache[&thought.id],
                 turn::Slot::Thinking,
@@ -8726,6 +8848,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
         }
         for width in [200.0, 320.0, 960.0] {
             let mut element = runtime.text_view(
+                0,
                 &thought,
                 &runtime.cache["thought"],
                 turn::Slot::Thinking,
@@ -8784,6 +8907,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&thought));
     Arc::make_mut(&mut runtime.snapshot).busy = true;
     let mut element = runtime.text_view(
+        0,
         &thought,
         &runtime.cache["thought"],
         turn::Slot::Thinking,
@@ -9249,18 +9373,16 @@ fn busy_changes_invalidate_only_turns_containing_reasoning() {
             .collect::<Vec<_>>(),
         reasoning,
     );
-    assert!(!reasoning_finished(
-        &runtime.snapshot.items,
-        true,
-        "reasoning"
-    ));
+    let thought = runtime
+        .snapshot
+        .items
+        .iter()
+        .position(|item| item.id == "reasoning")
+        .unwrap();
+    assert!(!reasoning_finished(&runtime.snapshot.items, true, thought));
     Arc::make_mut(&mut runtime.snapshot).busy = false;
     assert_eq!(idle, fingerprints(&runtime, true));
-    assert!(reasoning_finished(
-        &runtime.snapshot.items,
-        false,
-        "reasoning"
-    ));
+    assert!(reasoning_finished(&runtime.snapshot.items, false, thought));
 
     // Completed historical reasoning keeps its retained presentation when
     // another turn changes the conversation's busy state.
@@ -9554,8 +9676,9 @@ fn quiet_coordination_and_child_tool_rows_advance_only_on_elapsed_seconds() {
     let mut agent = native_child_fixture();
     agent.items = vec![Arc::new(item.clone())];
     let cached = &runtime.cache[&item.id];
-    let revision =
-        |item: &chat::Item, now| runtime.child_item_revision(&agent, item, cached, true, Some(now));
+    let revision = |item: &chat::Item, now| {
+        runtime.child_item_revision(&agent, 0, item, cached, true, Some(now))
+    };
     assert_eq!(revision(&item, 2_500), revision(&item, 2_999));
     assert_ne!(revision(&item, 2_500), revision(&item, 3_000));
     let mut waiting = item;
@@ -9999,11 +10122,7 @@ fn an_attachment_is_named_by_something_a_reader_recognises() {
 }
 
 fn scroll(from_top: f32, content: f32, window: f32) -> Scroll {
-    Scroll {
-        from_top,
-        content,
-        window,
-    }
+    Scroll::new(from_top, content, window)
 }
 
 /// History arrives by gesture now, so the two ends of the loaded window

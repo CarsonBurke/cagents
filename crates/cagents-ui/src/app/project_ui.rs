@@ -1234,7 +1234,7 @@ impl Cagents {
                             if let Some(pr) = row.and_then(|row| row.pull_request()) {
                                 return self.open_clicked_link(pr.url.clone());
                             }
-                            return self.update(Message::Sidebar(
+                            return self.dispatch(Message::Sidebar(
                                 SidebarAction::CreatePullRequest {
                                     project_id,
                                     worktree: Some(target.path),
@@ -1289,7 +1289,7 @@ impl Cagents {
                             }
                             order.get(index + 2).copied()
                         };
-                        return self.update(Message::Sidebar(SidebarAction::ReorderProject {
+                        return self.dispatch(Message::Sidebar(SidebarAction::ReorderProject {
                             project: project_id,
                             before,
                         }));
@@ -2644,10 +2644,9 @@ fn remove_project_from_cagents(
         &removal.project_sessions,
         None,
     )?;
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client =
-        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-    client
+    crate::terminal::connect_ready_daemon()
+        .map_err(|error| error.to_string())?
+        .client
         .apply_workspace_edit(crate::workspace_model::ModelEdit::CloseProject {
             repository: removal.repository.clone(),
         })

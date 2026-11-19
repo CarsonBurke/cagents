@@ -74,7 +74,8 @@ impl Summary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scan {
     offset: u64,
-    /// A hash of the bytes just before `offset`.
+    /// A hash of the bytes just before `offset`, or of all of them once the
+    /// scan is a settled negative.
     boundary: u64,
     /// `None` until a record declares the conversation, then whether it is
     /// one that can be resumed on its own.
@@ -113,8 +114,11 @@ pub fn scan(
 ) -> Option<Scan> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
+    // A transcript found not to be a resumable conversation is trusted to
+    // stay one only while it still holds the bytes that decided it: one
+    // rewritten in place may now hold a conversation.
     let mut scan = previous
-        .filter(|previous| previous.settled_negative() || continues(&mut file, len, previous))
+        .filter(|previous| continues(&mut file, len, previous))
         .cloned()
         .unwrap_or_default();
     if scan.settled_negative() {
@@ -123,20 +127,21 @@ pub fn scan(
     file.seek(SeekFrom::Start(scan.offset)).ok()?;
     let mut reader = Records::new(provider, path, &mut scan);
     let position = reader.scan.offset;
-    if read_records(
+    let settled = read_records(
         &mut file,
         &mut reader,
         (position, len),
         READ_CHUNK,
         cancel,
         |reader| reader.scan.settled_negative(),
-    )? {
-        return Some(scan);
+    )?;
+    if !settled {
+        reader.finish();
     }
-    reader.finish();
-    // An unfinished last record is read again, whole, next time.
-    scan.boundary = boundary(&mut file, scan.offset).unwrap_or(0);
-    if len >= UNCACHE_BYTES {
+    // An unfinished last record is read again, whole, next time; a settled
+    // negative keeps where it was decided, so a later read can confirm it.
+    scan.boundary = boundary(&mut file, &scan).unwrap_or(0);
+    if !settled && len >= UNCACHE_BYTES {
         uncache(&file);
     }
     Some(scan)
@@ -258,19 +263,37 @@ pub fn first_prompt<T>(
 
 /// Whether `file` still holds what `previous` read, and possibly more.
 fn continues(file: &mut std::fs::File, len: u64, previous: &Scan) -> bool {
-    previous.offset <= len
-        && boundary(file, previous.offset).is_some_and(|hash| hash == previous.boundary)
+    previous.offset <= len && boundary(file, previous).is_some_and(|hash| hash == previous.boundary)
 }
 
-fn boundary(file: &mut std::fs::File, offset: u64) -> Option<u64> {
-    let start = offset.saturating_sub(BOUNDARY_BYTES);
+/// A hash of the bytes of `file` that `scan` depends on. A growing
+/// conversation is checked at its tail, which is cheap however long it gets;
+/// a settled negative, decided by its first records and never read past them,
+/// is checked whole, so a rewrite anywhere in them is read again.
+fn boundary(file: &mut std::fs::File, scan: &Scan) -> Option<u64> {
+    let start = if scan.settled_negative() {
+        0
+    } else {
+        scan.offset.saturating_sub(BOUNDARY_BYTES)
+    };
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut bytes = vec![0; (offset - start) as usize];
-    file.read_exact(&mut bytes).ok()?;
+    let length = scan.offset - start;
+    let mut bytes = file.by_ref().take(length);
+    let mut buffer = [0; 8192];
     // FNV-1a: stable across builds, unlike the standard library's hasher.
-    Some(bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
-    }))
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut read = 0;
+    loop {
+        let count = bytes.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        read += count as u64;
+        for &byte in &buffer[..count] {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    (read == length).then_some(hash)
 }
 
 fn uncache(file: &std::fs::File) {
@@ -1135,6 +1158,28 @@ mod tests {
         let scan = read(Provider::Codex, &child, None);
         assert!(scan.summary().is_none());
         assert!(scan.settled_negative());
+        // What it goes on to record is not read.
+        std::fs::File::options()
+            .append(true)
+            .open(&child)
+            .unwrap()
+            .write_all(format!("{}\n", user("Profile it")).as_bytes())
+            .unwrap();
+        let grown = read(Provider::Codex, &child, Some(&scan));
+        assert!(grown.settled_negative());
+        assert_eq!(grown.offset, scan.offset);
+        // Rewritten in place as a conversation, it is read from its start.
+        std::fs::write(
+            &child,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":{"id":ID,"cwd":"/work/api","source":"cli"}}),
+                item("UserMessage", "Profile it")
+            ),
+        )
+        .unwrap();
+        let rewritten = read(Provider::Codex, &child, Some(&grown));
+        assert_eq!(rewritten.summary().unwrap().prompts, 1);
     }
 
     #[test]

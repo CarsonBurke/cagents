@@ -1,22 +1,22 @@
 //! The workspace switcher: recently used workspaces, held open with the
 //! modifier of Alt+Tab, and a live look at the highlighted one.
 //!
-//! Stepping through it changes nothing but the switcher. The window behind
-//! it switches workspace once, when the modifier is released or Enter is
-//! pressed, so a step costs a redraw of the list rather than a rebuilt
-//! workspace. The highlighted workspace's focused pane is shown as it is,
-//! from its own conversation or terminal, once the selection rests on it.
+//! It is drawn on the frame after the shortcut. Stepping through it changes
+//! nothing but the switcher. The window behind it switches workspace once,
+//! when the modifier is released or Enter is pressed, so a step costs a
+//! redraw of the list rather than a rebuilt workspace. Only the rows in and
+//! near view are built, so a long history costs no more to draw than a short
+//! one. The highlighted workspace's focused pane is named at once and shown
+//! as it is, from its own conversation or terminal, once the selection rests
+//! on it, in room the preview keeps whatever it shows.
 
 use super::*;
 use crate::sidebar::AttentionSummary;
 use cosmic::Theme;
 
-/// How long the modifier is held before the switcher is drawn. A tap that
-/// toggles between the two most recent workspaces ends sooner, and would
-/// otherwise flash a list nobody reads.
-pub(super) const DELAY: Duration = Duration::from_millis(120);
 /// How long the selection rests on a workspace before its pane is brought up
-/// for the preview, so stepping quickly past rows brings none of them up.
+/// for the preview, so stepping quickly past rows, or tapping the shortcut
+/// to go back to the last workspace, brings none of them up.
 const PREVIEW_DWELL: Duration = Duration::from_millis(90);
 const SCROLL_ID: &str = "workspace-switcher.rows";
 /// Rows have one height so the list can be scrolled to a row by its index.
@@ -117,6 +117,18 @@ impl Geometry {
 
 fn rows_height(rows: usize) -> f32 {
     rows as f32 * (ROW_HEIGHT + ROW_GAP) - ROW_GAP.min(rows as f32 * ROW_GAP)
+}
+
+/// The rows worth building for a list of `count` scrolled to `scroll` in a
+/// view `view` tall: those in view, and a view's worth either side, so the
+/// rows a wheel turn brings in are there before the offset it reports.
+fn built_rows(scroll: f32, view: f32, count: usize) -> std::ops::Range<usize> {
+    let pitch = ROW_HEIGHT + ROW_GAP;
+    let top = scroll - LIST_PADDING - view;
+    let bottom = scroll - LIST_PADDING + 2.0 * view;
+    let first = (top / pitch).floor().max(0.0) as usize;
+    let end = ((bottom / pitch).ceil().max(0.0) as usize).min(count);
+    first.min(end)..end
 }
 
 /// `over` painted on `under`, for a fade that must end in the exact colour
@@ -230,20 +242,15 @@ impl Cagents {
         if self.workspace_cycle_modifiers.is_empty() {
             return self.commit_workspace_preview();
         }
-        if !first {
-            // A second step is someone looking for a workspace, not a tap.
-            self.chrome_ui.workspace_switcher_shown = true;
-            return Task::batch([
-                self.workspace_selection_moved(),
-                self.reveal_workspace_selection(),
-            ]);
+        if first {
+            let since = Instant::now();
+            self.chrome_ui.workspace_preview_since = Some(since);
+            crate::performance::ui_trace::latency_to_next_frame("workspace switcher shown", since);
         }
-        let since = Instant::now();
-        self.chrome_ui.workspace_preview_since = Some(since);
-        cosmic::task::future(async move {
-            tokio::time::sleep(DELAY).await;
-            Message::WorkspaceSwitcherDue(since)
-        })
+        Task::batch([
+            self.workspace_selection_moved(),
+            self.reveal_workspace_selection(),
+        ])
     }
 
     pub(super) fn commit_workspace_preview(&mut self) -> Task<Message> {
@@ -259,7 +266,7 @@ impl Cagents {
                         .iter()
                         .any(|available| available == action)
             })
-            .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+            .map_or_else(Task::none, |action| self.dispatch(Message::Sidebar(action)));
         self.workspace_history
             .finish(self.active_workspace_destination());
         self.workspace_history
@@ -286,7 +293,6 @@ impl Cagents {
         self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
         let state = &mut self.chrome_ui;
         state.workspace_preview_since = None;
-        state.workspace_switcher_shown = false;
         state.workspace_switcher_scroll = 0.0;
         state.workspace_switcher_rows.clear();
         state.workspace_switcher_panes = Panes::default();
@@ -670,17 +676,6 @@ impl Cagents {
         Task::none()
     }
 
-    /// The switcher is drawn for the first time. The selection has rested
-    /// for as long as the hold took to show it.
-    pub(super) fn show_workspace_switcher(&mut self) -> Task<Message> {
-        self.chrome_ui.workspace_switcher_shown = true;
-        if let Some(destination) = self.workspace_switcher_selection() {
-            self.chrome_ui.workspace_switcher_panes = self.workspace_panes(destination);
-            self.chrome_ui.workspace_switcher_rested = Some(destination);
-        }
-        self.reveal_workspace_selection()
-    }
-
     /// The pane `destination` would focus.
     fn workspace_panes(&self, destination: WorkspaceDestination) -> Panes {
         if Some(destination) == self.active_workspace_destination() {
@@ -785,7 +780,9 @@ impl Cagents {
     /// on screen behind the switcher already, and a widget mounted twice
     /// would have both copies claim the same scroll and find anchors.
     fn wanted_workspace_preview_card(&self) -> Option<CardId> {
-        if !self.chrome_ui.workspace_switcher_shown || !self.workspace_switcher_geometry().detail {
+        if self.chrome_ui.workspace_preview_since.is_none()
+            || !self.workspace_switcher_geometry().detail
+        {
             return None;
         }
         let selected = self.workspace_switcher_selection()?;
@@ -855,6 +852,12 @@ impl Cagents {
                 _ => {}
             }
         }
+        if let (Some(_), Some(since)) = (wanted, self.chrome_ui.workspace_preview_since) {
+            crate::performance::ui_trace::latency_to_next_frame(
+                "workspace switcher preview",
+                since,
+            );
+        }
         self.chrome_ui.workspace_switcher_preview = wanted;
         self.trim_warm_chats();
         self.lifecycle_sweep()
@@ -862,24 +865,35 @@ impl Cagents {
 
     pub(super) fn workspace_switcher(&self) -> Option<Element<'_, Message>> {
         let selected = self.workspace_switcher_selection()?;
-        if !self.chrome_ui.workspace_switcher_shown {
-            // Not drawn yet, but already holding the keyboard.
-            return Some(crate::interaction::keyboard_modal(
-                iced::widget::Space::new(),
-            ));
-        }
         let since = self.chrome_ui.workspace_preview_since?;
         let geometry = self.workspace_switcher_geometry();
         let active = self.active_workspace_destination();
-        let rows = self
-            .chrome_ui
-            .workspace_switcher_rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                self.workspace_switcher_row(index, row, row.destination == selected, since)
-            })
-            .collect::<Vec<Element<'_, Message>>>();
+        let all = &self.chrome_ui.workspace_switcher_rows;
+        let built = built_rows(
+            self.chrome_ui.workspace_switcher_scroll,
+            geometry.list_height + 2.0 * LIST_PADDING,
+            all.len(),
+        );
+        // The rows out of reach keep their room, so the list scrolls as far
+        // and the built rows sit where they would.
+        let room = |rows: usize| -> Element<'_, Message> {
+            iced::widget::Space::new().height(rows_height(rows)).into()
+        };
+        let mut rows = Vec::with_capacity(built.len() + 2);
+        if built.start > 0 {
+            rows.push(room(built.start));
+        }
+        rows.extend(all[built.clone()].iter().enumerate().map(|(offset, row)| {
+            self.workspace_switcher_row(
+                built.start + offset,
+                row,
+                row.destination == selected,
+                since,
+            )
+        }));
+        if built.end < all.len() {
+            rows.push(room(all.len() - built.end));
+        }
         // Rows passing an edge fade into the panel. The rail stays clear of
         // the rows, so the fade, which leaves the rail at full strength,
         // covers every row it reaches.
@@ -978,41 +992,27 @@ impl Cagents {
         let project = row
             .project
             .and_then(|project| self.sidebar_model.project(project));
-        // What kind of workspace the row is, drawn as the sidebar draws it:
-        // a worktree's pull request or branch, a channel's chat. A folder of
-        // its own carries its project's chip, and the caption names the
-        // project for the rest. The list draws every row at full strength.
-        let slot = |glyph: widget::Container<'a, Message, Theme>| -> Element<'a, Message> {
-            glyph
-                .center_x(Length::Fixed(sidebar::PROJECT_CHIP_SIZE))
-                .into()
-        };
-        let ink = sidebar::RowInk::Full;
-        let size = design::ROW_ICON_SIZE;
-        let chip = match (row.destination, project) {
-            (WorkspaceDestination::Folder(_), Some(project)) => sidebar::project_chip(project),
-            (WorkspaceDestination::Folder(_), None) => slot(sidebar::ink_glyph(
-                widget::icon::from_name("folder-symbolic").handle(),
-                ink,
-                size,
-            )),
-            (WorkspaceDestination::Worktree(id), project) => slot(
-                match project
-                    .and_then(|project| project.worktrees.iter().find(|worktree| worktree.id == id))
-                {
-                    Some(worktree) => {
-                        sidebar::row_glyph(sidebar::WorkspaceGlyph::Worktree(worktree), ink, size)
-                    }
-                    // Gone from the model while the list is held.
-                    None => sidebar::ink_glyph(sidebar::worktree_icon(), ink, size),
-                },
+        // What kind of workspace the row is, with the mark its sidebar row
+        // leads with: a folder's avatar, a worktree's pull request or branch,
+        // a channel's members. The caption names the project. The list draws
+        // every row at full strength, where the sidebar mutes the rows its
+        // filter keeps only for what was read.
+        let mark = match row.destination {
+            WorkspaceDestination::Folder(_) => project.map_or(
+                sidebar::WorkspaceMark::Folder,
+                sidebar::WorkspaceMark::Project,
             ),
-            (WorkspaceDestination::Channel(_), _) => slot(sidebar::row_glyph(
-                sidebar::WorkspaceGlyph::Channel,
-                ink,
-                size,
-            )),
+            WorkspaceDestination::Worktree(id) => {
+                sidebar::WorkspaceMark::Worktree(project.and_then(|project| {
+                    project.worktrees.iter().find(|worktree| worktree.id == id)
+                }))
+            }
+            WorkspaceDestination::Channel(id) => sidebar::WorkspaceMark::Channel(
+                project
+                    .and_then(|project| project.channels.iter().find(|channel| channel.id == id)),
+            ),
         };
+        let chip = sidebar::workspace_mark(mark, sidebar::RowInk::Full);
         let text = widget::column::with_children(vec![
             crate::ui_controls::fade_text(row.name.as_str())
                 .edge(row.name_edge())
@@ -1083,9 +1083,10 @@ impl Cagents {
         }
     }
 
-    /// The highlighted workspace as it is now: its focused pane, live and
-    /// edge to edge. The row beside it names the workspace already, so the
-    /// only words here are ones the row lacks: what the pane is doing.
+    /// The highlighted workspace as it is now: its focused pane, named in a
+    /// heading and drawn live beneath it. The heading and the room beneath it
+    /// keep one size whatever the pane shows, so the preview fills in where
+    /// it will stay rather than moving as the pane comes up.
     fn workspace_switcher_detail(
         &self,
         selected: WorkspaceDestination,
@@ -1097,6 +1098,7 @@ impl Cagents {
         }
         let notice = |text: &'static str| -> Element<'_, Message> {
             widget::container(design::caption(text))
+                .padding(space::M)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
@@ -1109,91 +1111,87 @@ impl Cagents {
             return notice("Nothing open yet");
         };
         let live = self.chrome_ui.workspace_switcher_preview == Some(card);
-        let body: Option<Element<'_, Message>> = match self.cards.get(&card).filter(|_| live) {
-            Some(CardRuntime::Chat(runtime)) => runtime.transcript_preview().map(|transcript| {
-                widget::container(crate::interaction::inert(transcript))
-                    .padding([space::XS, space::M])
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_y(Alignment::End)
-                    .clip(true)
-                    .into()
-            }),
-            Some(CardRuntime::Terminal(handle)) => Some(
-                widget::container(
-                    crate::terminal::SnapshotPreview::new(handle)
-                        .font_size(TERMINAL_PREVIEW_FONT)
-                        .font_family(&self.settings.terminal_font_family)
-                        .scale_factor(effective_surface_scale(
-                            self.window_scale_factor,
-                            self.settings.ui_scale,
-                        ))
-                        .padding(space::S),
+        // Until the pane is up, the room it will fill stays empty.
+        let body: Element<'_, Message> = match self.cards.get(&card).filter(|_| live) {
+            Some(CardRuntime::Chat(runtime)) => match runtime.transcript_preview() {
+                // The newest exchange sits on the bottom inset; older ones
+                // run under the top one, so the clip is the inset's.
+                Some(transcript) => widget::container(
+                    widget::container(crate::interaction::inert(transcript))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .align_y(Alignment::End)
+                        .clip(true),
                 )
+                .padding(space::M)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .clip(true)
                 .into(),
-            ),
-            _ => None,
-        };
-        let Some(body) = body else {
-            // Until the pane is up, and for one with nothing to draw, it is
-            // named instead.
-            return widget::container(self.workspace_switcher_pane_heading(card))
-                .padding(space::M)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into();
-        };
-        let mut children = Vec::with_capacity(3);
-        // A conversation ends with what its agent is doing. A terminal's
-        // screen does not say what it runs, and neither says that the pane is
-        // a channel's, which the workspace only shows.
-        let channel = panes.channel.and_then(|channel| {
-            self.chrome_ui
-                .workspace_switcher_rows
-                .iter()
-                .find(|row| row.destination == WorkspaceDestination::Channel(channel))
-                .map(|row| row.name.as_str())
-        });
-        let caption = match (self.terminal_running(card), channel) {
-            (Some(running), Some(channel)) => Some(format!("{running} · from {channel}")),
-            (Some(running), None) => Some(running),
-            (None, Some(channel)) => Some(format!("From {channel}")),
-            (None, None) => None,
-        };
-        if let Some(caption) = caption {
-            children.push(
-                widget::container(
-                    crate::ui_controls::FadeText::caption(caption).width(Length::Fill),
-                )
-                .padding([space::XS, space::M])
-                .width(Length::Fill)
-                .into(),
-            );
-            children.push(rule(Length::Fill, Length::Fixed(design::BORDER_WIDTH)));
-        }
-        children.push(body);
-        widget::column::with_children(children)
+                // Up, with nothing to draw: a blank body would read as a
+                // preview still loading.
+                None => notice("No messages to show"),
+            },
+            // The screen's own background reaches the edges; its text keeps
+            // the same inset as a conversation's.
+            Some(CardRuntime::Terminal(handle)) => widget::container(
+                crate::terminal::SnapshotPreview::new(handle)
+                    .font_size(TERMINAL_PREVIEW_FONT)
+                    .font_family(&self.settings.terminal_font_family)
+                    .scale_factor(effective_surface_scale(
+                        self.window_scale_factor,
+                        self.settings.ui_scale,
+                    ))
+                    .padding(space::M),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
-            .into()
+            .clip(true)
+            .into(),
+            _ => iced::widget::Space::new().into(),
+        };
+        widget::column::with_children(vec![
+            self.workspace_switcher_pane_heading(card),
+            rule(Length::Fill, Length::Fixed(design::BORDER_WIDTH)),
+            body,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     /// What pane `card` is doing, when that is known: an agent's activity, or
-    /// what a terminal runs.
+    /// what a terminal runs, and that it is a channel's, which the workspace
+    /// only shows.
     fn workspace_switcher_pane_doing(&self, card: CardId) -> Option<String> {
-        match self.cards.get(&card)? {
+        let doing = match self.cards.get(&card)? {
             CardRuntime::Chat(runtime) => runtime
                 .timeline_activity(false, None)
                 .map(|(_, label)| label),
             CardRuntime::Terminal(_) => self.terminal_running(card),
             _ => None,
+        };
+        let channel = self
+            .chrome_ui
+            .workspace_switcher_panes
+            .channel
+            .and_then(|channel| {
+                self.chrome_ui
+                    .workspace_switcher_rows
+                    .iter()
+                    .find(|row| row.destination == WorkspaceDestination::Channel(channel))
+                    .map(|row| row.name.as_str())
+            });
+        match (doing, channel) {
+            (Some(doing), Some(channel)) => Some(format!("{doing} · from {channel}")),
+            (Some(doing), None) => Some(doing),
+            (None, Some(channel)) => Some(format!("From {channel}")),
+            (None, None) => None,
         }
     }
 
-    /// A pane that is not drawn live: its icon, name and what it is doing.
+    /// The previewed pane's heading: its icon, its name and what it is
+    /// doing, in a row as tall as the list's, whether or not it says what
+    /// the pane is doing.
     fn workspace_switcher_pane_heading(&self, card: CardId) -> Element<'_, Message> {
         let state = self.card_state(card);
         let chrome = self.card_chrome.get(&card);
@@ -1218,20 +1216,38 @@ impl Cagents {
             }
             None => Cow::Borrowed(title),
         };
-        let mut text = vec![design::body(title).into()];
-        if let Some(doing) = self.workspace_switcher_pane_doing(card) {
-            text.push(design::caption(doing).into());
+        // A shell's reported title is often its tab's name already.
+        let doing = self
+            .workspace_switcher_pane_doing(card)
+            .filter(|doing| !title.contains(doing.as_str()));
+        let mut text = vec![
+            crate::ui_controls::fade_text(title)
+                .width(Length::Fill)
+                .into(),
+        ];
+        if let Some(doing) = doing {
+            text.push(
+                crate::ui_controls::FadeText::caption(doing)
+                    .width(Length::Fill)
+                    .into(),
+            );
         }
-        widget::row::with_children(vec![
-            self.card_icon(card)
-                .icon()
-                .size(design::ROW_ICON_SIZE)
-                .into(),
-            widget::column::with_children(text)
-                .spacing(space::XXS)
-                .into(),
-        ])
-        .spacing(space::S)
+        widget::container(
+            widget::row::with_children(vec![
+                widget::container(self.card_icon(card).icon().size(design::ROW_ICON_SIZE))
+                    .center_x(Length::Fixed(ROW_NUMBER_WIDTH))
+                    .into(),
+                widget::column::with_children(text)
+                    .spacing(space::XXS)
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center),
+        )
+        .padding([0.0, space::M])
+        .height(ROW_HEIGHT)
+        .width(Length::Fill)
         .align_y(Alignment::Center)
         .into()
     }
@@ -1315,6 +1331,33 @@ mod tests {
         );
         let tiny = Geometry::new(iced::Size::new(300.0, 200.0), 40);
         assert!(tiny.height <= 200.0);
+    }
+
+    #[test]
+    fn only_the_rows_in_and_near_view_are_built() {
+        let pitch = ROW_HEIGHT + ROW_GAP;
+        let view = 10.0 * pitch;
+        // At the top, the view and the one beneath it.
+        assert_eq!(built_rows(0.0, view, 200), 0..20);
+        // A short list is built whole.
+        assert_eq!(built_rows(0.0, view, 6), 0..6);
+        // Scrolled down, a view's worth either side.
+        let built = built_rows(50.0 * pitch, view, 200);
+        assert!(built.start <= 40 && built.start >= 39, "{built:?}");
+        assert!(built.end >= 70 && built.end <= 71, "{built:?}");
+        // At the end, nothing past the last row.
+        let built = built_rows(190.0 * pitch, view, 200);
+        assert_eq!(built.end, 200);
+        assert!(built.start < 190 - 9);
+        // The rows left out keep their room: the spacers and the built rows
+        // are as tall as every row together.
+        let built = built_rows(50.0 * pitch, view, 200);
+        let spaced = rows_height(built.start)
+            + ROW_GAP
+            + rows_height(built.len())
+            + ROW_GAP
+            + rows_height(200 - built.end);
+        assert_eq!(spaced, rows_height(200));
     }
 
     #[test]

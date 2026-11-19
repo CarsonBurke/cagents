@@ -22,6 +22,7 @@ use super::{
     SurfacePlacement,
     fallback::{FallbackSurface, WaylandSubsurfaceFactory},
     handle::{CoalescedCommands, Command, CommandMailbox, EventBus},
+    history::{HistoryStep, NavigationState},
     input,
     lifecycle::LifecycleMachine,
 };
@@ -477,7 +478,7 @@ impl Engine {
             return;
         };
         // A ready receiver can still come up empty when a producer lost a race.
-        let Ok(command) = card.mailbox.receiver().try_recv() else {
+        let Some(command) = card.mailbox.try_recv() else {
             return;
         };
         if let Command::Import(request) = command {
@@ -634,27 +635,7 @@ impl Card {
             Command::WakeCoalesced => {
                 return self.apply_coalesced(self.mailbox.drain_coalesced());
             }
-            Command::Navigate(url) => {
-                self.restore
-                    .history
-                    .truncate(self.restore.history_index + 1);
-                self.restore.history.push(url.clone());
-                self.restore.history_index = self.restore.history.len() - 1;
-                // Forget the oldest entries rather than letting one long-lived
-                // card turn every navigation into an ever larger serialize and
-                // SQLite blob write.
-                crate::model::trim_browser_history(
-                    &mut self.restore.history,
-                    &mut self.restore.history_index,
-                );
-                self.restore.url = url.clone();
-                self.restore.scroll_x = 0.0;
-                self.restore.scroll_y = 0.0;
-                if let Some(session) = &self.session {
-                    session.set_navigation(&self.restore, false);
-                    session.webview.load(url);
-                }
-            }
+            Command::Navigate(url) => self.navigate(url),
             Command::Back => self.traverse(-1),
             Command::Forward => self.traverse(1),
             Command::Reload => {
@@ -806,23 +787,60 @@ impl Card {
         }
     }
 
-    fn traverse(&mut self, delta: isize) {
-        let new_index = self.restore.history_index.saturating_add_signed(delta);
-        if new_index >= self.restore.history.len() || new_index == self.restore.history_index {
-            return;
-        }
-        self.restore.history_index = new_index;
-        self.restore.url = self.restore.history[new_index].clone();
+    /// Loads `url` as a new entry after the current one.
+    ///
+    /// A live webview's history belongs to its session, which Servo also
+    /// changes on its own when the page navigates; the restore state is only
+    /// what a card without a webview shows, and what it reopens.
+    fn navigate(&mut self, url: Url) {
         self.restore.scroll_x = 0.0;
         self.restore.scroll_y = 0.0;
         if let Some(session) = &self.session {
-            session.set_navigation(&self.restore, true);
-            session.webview.load(self.restore.url.clone());
+            navigate_webview(&session.webview, &session.navigation, url);
+        } else {
+            self.restore
+                .history
+                .truncate(self.restore.history_index + 1);
+            self.restore.history.push(url.clone());
+            self.restore.history_index = self.restore.history.len() - 1;
+            // Forget the oldest entries rather than letting one long-lived
+            // card turn every navigation into an ever larger serialize and
+            // SQLite blob write.
+            crate::model::trim_browser_history(
+                &mut self.restore.history,
+                &mut self.restore.history_index,
+            );
+            self.restore.url = url;
         }
-        self.events.semantic(BrowserEvent::HistoryChanged {
-            entries: self.restore.history.clone(),
-            current: self.restore.history_index,
-        });
+        self.publish_history();
+    }
+
+    fn traverse(&mut self, delta: isize) {
+        if let Some(session) = &self.session {
+            if !traverse_webview(&session.webview, &session.navigation, delta) {
+                return;
+            }
+        } else {
+            let new_index = self.restore.history_index.saturating_add_signed(delta);
+            if new_index >= self.restore.history.len() || new_index == self.restore.history_index {
+                return;
+            }
+            self.restore.history_index = new_index;
+            self.restore.url = self.restore.history[new_index].clone();
+        }
+        self.restore.scroll_x = 0.0;
+        self.restore.scroll_y = 0.0;
+        self.publish_history();
+    }
+
+    /// Reports the history the card now shows, ahead of Servo's confirmation.
+    fn publish_history(&self) {
+        let (entries, current) = match &self.session {
+            Some(session) => session.navigation.borrow().entries(),
+            None => (self.restore.history.clone(), self.restore.history_index),
+        };
+        self.events
+            .semantic(BrowserEvent::HistoryChanged { entries, current });
     }
 
     /// Releases this card's webview and surface while the shared runtime and
@@ -957,6 +975,38 @@ impl Card {
     }
 }
 
+/// Moves a live webview one entry back (`-1`) or forward (`1`) in the card's
+/// history, returning whether there was an entry to move to.
+fn traverse_webview(
+    webview: &servo::WebView,
+    navigation: &RefCell<NavigationState>,
+    delta: isize,
+) -> bool {
+    let Some(step) = navigation.borrow_mut().traverse(delta) else {
+        return false;
+    };
+    match step {
+        HistoryStep::Back => {
+            webview.go_back(1);
+        }
+        HistoryStep::Forward => {
+            webview.go_forward(1);
+        }
+        HistoryStep::Load(url) => webview.load(url),
+        HistoryStep::Wait => {}
+    }
+    true
+}
+
+/// Loads `url` in a live webview as a new entry after the current one, once
+/// any load Servo is still carrying out has committed.
+fn navigate_webview(webview: &servo::WebView, navigation: &RefCell<NavigationState>, url: Url) {
+    let load_now = navigation.borrow_mut().navigate(url.clone());
+    if load_now {
+        webview.load(url);
+    }
+}
+
 /// One card's webview on the shared runtime, together with the Wayland child
 /// surface and rendering context that webview paints into.
 struct CardSession {
@@ -1023,12 +1073,11 @@ impl CardSession {
         let next_input_sequence = Arc::new(AtomicU64::new(1));
         let pending_clipboard = Rc::new(RefCell::new(HashMap::new()));
         let pending_file_pickers = Rc::new(RefCell::new(HashMap::new()));
-        let navigation = Rc::new(RefCell::new(NavigationState {
-            url: restore.url.clone(),
-            history: restore.history.clone(),
-            current: restore.history_index,
-            preserve_restored_history: true,
-        }));
+        let navigation = Rc::new(RefCell::new(NavigationState::restored(
+            &restore.url,
+            &restore.history,
+            restore.history_index,
+        )));
         let request_ids = Rc::new(Cell::new(1_u64));
         // Shared with both delegates so a panic caught at our dispatch boundary
         // can retire this one card instead of the whole engine thread.
@@ -1164,20 +1213,8 @@ impl CardSession {
 
     fn store_navigation(&self, restore: &mut BrowserRestoreState) {
         let navigation = self.navigation.borrow();
-        restore.url = navigation.url.clone();
-        restore.history = navigation.history.clone();
-        restore.history_index = navigation
-            .current
-            .min(restore.history.len().saturating_sub(1));
-    }
-
-    fn set_navigation(&self, restore: &BrowserRestoreState, preserve_restored_history: bool) {
-        *self.navigation.borrow_mut() = NavigationState {
-            url: restore.url.clone(),
-            history: restore.history.clone(),
-            current: restore.history_index,
-            preserve_restored_history,
-        };
+        restore.url = navigation.url().clone();
+        (restore.history, restore.history_index) = navigation.entries();
     }
 }
 
@@ -1210,13 +1247,6 @@ struct BrowserDelegate {
     ime_control: RefCell<Option<(servo::EmbedderControlId, DelegateRequestId)>>,
     navigation: Rc<RefCell<NavigationState>>,
     faulted: Rc<Cell<bool>>,
-}
-
-struct NavigationState {
-    url: Url,
-    history: Vec<Url>,
-    current: usize,
-    preserve_restored_history: bool,
 }
 
 impl BrowserDelegate {
@@ -1276,7 +1306,7 @@ fn panic_detail(payload: &(dyn Any + Send)) -> &str {
 impl servo::WebViewDelegate for BrowserDelegate {
     fn notify_url_changed(&self, _webview: servo::WebView, url: Url) {
         self.guard(|| {
-            self.navigation.borrow_mut().url = url.clone();
+            self.navigation.borrow_mut().set_url(url.clone());
             self.events.semantic(BrowserEvent::UrlChanged(url));
         });
     }
@@ -1301,9 +1331,10 @@ impl servo::WebViewDelegate for BrowserDelegate {
         self.guard(|| {
             self.events
                 .semantic(BrowserEvent::LoadStateChanged(format!("{status:?}")));
-            if status == servo::LoadStatus::Complete {
+            if status == servo::LoadStatus::Complete
+                && self.navigation.borrow_mut().take_restore_scroll()
+            {
                 self.restore_scroll_ready.set(true);
-                self.navigation.borrow_mut().preserve_restored_history = false;
             }
         });
     }
@@ -1312,18 +1343,17 @@ impl servo::WebViewDelegate for BrowserDelegate {
         self.guard(|| self.frame_ready.set(true));
     }
 
-    fn notify_history_changed(&self, _webview: servo::WebView, entries: Vec<Url>, current: usize) {
+    fn notify_history_changed(&self, webview: servo::WebView, entries: Vec<Url>, current: usize) {
         self.guard(|| {
-            let mut navigation = self.navigation.borrow_mut();
-            if navigation.preserve_restored_history && entries.len() <= 1 {
-                return;
+            let (waiting, entries, current) = {
+                let mut navigation = self.navigation.borrow_mut();
+                let waiting = navigation.servo_history_changed(entries, current);
+                let (entries, current) = navigation.entries();
+                (waiting, entries, current)
+            };
+            if let Some(url) = waiting {
+                webview.load(url);
             }
-            navigation.history = entries.clone();
-            navigation.current = current.min(entries.len().saturating_sub(1));
-            if let Some(url) = entries.get(navigation.current) {
-                navigation.url = url.clone();
-            }
-            drop(navigation);
             self.events
                 .semantic(BrowserEvent::HistoryChanged { entries, current });
         });
@@ -2070,5 +2100,140 @@ mod tests {
         assert_eq!(state.history_index, 0);
         state.history_index = state.history_index.saturating_add_signed(2);
         assert_eq!(state.history[state.history_index], urls[2]);
+    }
+
+    /// Follows a link in a real Servo webview, then goes Back and Forward
+    /// through the same delegate and traversal the card uses.
+    ///
+    /// This is the only test that builds a `Servo`, which a process may do
+    /// once; the engine tests above never reach their runtime.
+    #[test]
+    fn a_followed_link_goes_back_and_forward_in_servo() {
+        let directory =
+            std::env::temp_dir().join(format!("cagents-browser-history-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(directory.clone());
+        std::fs::write(
+            directory.join("first.html"),
+            r#"<!DOCTYPE html><a id="next" href="second.html">Next</a>"#,
+        )
+        .unwrap();
+        std::fs::write(directory.join("second.html"), "<!DOCTYPE html>Second").unwrap();
+        std::fs::write(directory.join("third.html"), "<!DOCTYPE html>Third").unwrap();
+        std::fs::write(directory.join("fourth.html"), "<!DOCTYPE html>Fourth").unwrap();
+        let first = Url::from_file_path(directory.join("first.html")).unwrap();
+        let second = Url::from_file_path(directory.join("second.html")).unwrap();
+
+        let rendering_context = Rc::new(
+            servo::SoftwareRenderingContext::new(dpi::PhysicalSize::new(320, 240))
+                .expect("a software rendering context"),
+        );
+        rendering_context.make_current().unwrap();
+        let (wake_tx, _wake_rx) = crossbeam_channel::bounded(1);
+        let servo = servo::ServoBuilder::default()
+            .event_loop_waker(Box::new(BrowserWaker {
+                wake_tx,
+                wake_queued: Arc::new(AtomicBool::new(false)),
+            }))
+            .build();
+        let events = EventBus::new();
+        let navigation = Rc::new(RefCell::new(NavigationState::restored(
+            &first,
+            std::slice::from_ref(&first),
+            0,
+        )));
+        let delegate = Rc::new(BrowserDelegate {
+            events: events.clone(),
+            animating: Rc::default(),
+            frame_ready: Rc::default(),
+            restore_scroll_ready: Rc::default(),
+            input_sequences: Rc::default(),
+            pending_file_pickers: Rc::default(),
+            request_ids: Rc::new(Cell::new(1)),
+            ime_control: RefCell::new(None),
+            navigation: navigation.clone(),
+            faulted: Rc::default(),
+        });
+        let webview = servo::WebViewBuilder::new(&servo, rendering_context)
+            .url(first.clone())
+            .delegate(delegate)
+            .build();
+        webview.show();
+
+        // The card's history as the application last heard it, and whether
+        // the page has finished loading since the last step.
+        let mut history: Option<(Vec<Url>, usize)> = None;
+        let mut loaded = false;
+        let mut spin_until = |what: &str, done: &dyn Fn(&(Vec<Url>, usize), bool) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                while let Ok(event) = events.try_recv() {
+                    match event {
+                        BrowserEvent::HistoryChanged { entries, current } => {
+                            history = Some((entries, current));
+                        }
+                        BrowserEvent::LoadStateChanged(state) => loaded = state == "Complete",
+                        _ => {}
+                    }
+                }
+                if let Some(history) = &history
+                    && done(history, loaded)
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}; last reported history: {history:?}"
+                );
+                servo.spin_event_loop();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let both = vec![first.clone(), second.clone()];
+
+        spin_until("the first page", &|history, loaded| {
+            *history == (vec![first.clone()], 0) && loaded
+        });
+        // Follow the link from the page, as a person would: no command from
+        // the card announces this navigation.
+        webview.evaluate_javascript("document.getElementById('next').click();", |_| {});
+        spin_until("the followed link", &|history, loaded| {
+            *history == (both.clone(), 1) && loaded
+        });
+        assert_eq!(webview.url(), Some(second.clone()));
+
+        assert!(traverse_webview(&webview, &navigation, -1));
+        spin_until("Back", &|history, loaded| {
+            *history == (both.clone(), 0) && loaded && webview.url() == Some(first.clone())
+        });
+        // Servo went back within its own list rather than loading the first
+        // page again as a third entry.
+        assert_eq!(navigation.borrow().servo_entries(), both.as_slice());
+        assert!(!traverse_webview(&webview, &navigation, -1));
+
+        assert!(traverse_webview(&webview, &navigation, 1));
+        spin_until("Forward", &|history, loaded| {
+            *history == (both.clone(), 1) && loaded && webview.url() == Some(second.clone())
+        });
+        assert_eq!(navigation.borrow().servo_entries(), both.as_slice());
+        assert!(!traverse_webview(&webview, &navigation, 1));
+
+        // Two addresses entered in quick succession: Servo ignores a load
+        // requested while another is loading, so the second waits for the
+        // first and is the page the card ends on.
+        let third = Url::from_file_path(directory.join("third.html")).unwrap();
+        let fourth = Url::from_file_path(directory.join("fourth.html")).unwrap();
+        navigate_webview(&webview, &navigation, third);
+        navigate_webview(&webview, &navigation, fourth.clone());
+        let typed = vec![first.clone(), second.clone(), fourth.clone()];
+        spin_until("the second typed address", &|history, loaded| {
+            *history == (typed.clone(), 2) && loaded && webview.url() == Some(fourth.clone())
+        });
     }
 }

@@ -1268,6 +1268,7 @@ impl Cagents {
 
     /// Selects where the open `card` is and focuses it.
     fn reveal_conversation_card(&mut self, card: CardId, session: &chat::Session) -> Task<Message> {
+        // The conversation is already open: going to it is navigation.
         let scope = if let Some(channel) = self
             .durable
             .channels
@@ -1275,14 +1276,14 @@ impl Cagents {
             .find(|channel| channel.cards.contains(&card))
             .map(|channel| channel.id)
         {
-            self.select_channel(channel)
+            self.navigate_to_channel(channel)
         } else {
             let owner = self
                 .card_state(card)
                 .and_then(|card| self.card_worktree(card))
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| session.launch.recipe.working_directory.clone());
-            self.select_worktree(owner, false)
+            self.navigate_to_worktree(owner, false)
         };
         Task::batch([scope, cosmic::task::message(Message::FocusCard(card))])
     }

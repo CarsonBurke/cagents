@@ -3466,7 +3466,10 @@ fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
         "STRASSE".into(),
     ));
     let runtime = chat_runtime(&app, card);
-    assert_eq!(runtime.find_matches, vec!["prompt"]);
+    assert_eq!(
+        runtime.find_matches.iter().collect::<Vec<_>>(),
+        vec!["prompt"]
+    );
     assert!(
         ["automatic", "manual", "changed"]
             .iter()
@@ -4802,7 +4805,7 @@ fn selected_child_find_searches_visible_scope_and_preserves_explicit_disclosures
     ));
     let runtime = chat_runtime(&app, card);
     assert_eq!(
-        runtime.find_matches,
+        runtime.find_matches.iter().collect::<Vec<_>>(),
         vec!["same#opaque-id"],
         "Find must search the visible child, not the parent"
     );
@@ -4826,7 +4829,10 @@ fn selected_child_find_searches_visible_scope_and_preserves_explicit_disclosures
     drop(app.handle_chat_ui(Action::Toggle(target, "same#opaque-id".into())));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("two".into()))));
     assert_eq!(
-        chat_runtime(&app, card).find_matches,
+        chat_runtime(&app, card)
+            .find_matches
+            .iter()
+            .collect::<Vec<_>>(),
         vec!["same#opaque-id"]
     );
     drop(app.handle_chat_ui(Action::FindNext(target, true)));
@@ -4937,7 +4943,10 @@ fn selected_child_find_refreshes_on_live_changes_and_child_retirement() {
         &mut app, target,
     ));
     assert_eq!(
-        chat_runtime(&app, card).find_matches,
+        chat_runtime(&app, card)
+            .find_matches
+            .iter()
+            .collect::<Vec<_>>(),
         vec!["same#opaque-id"]
     );
     drop(app.handle_chat_ui(Action::FindNext(target, true)));
@@ -5940,7 +5949,7 @@ fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
     use crate::app::terminal_output_tests::persists;
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let saved = persists();
-    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into(), true));
     let automatic = app.workspace.focused().unwrap();
     assert!(app.chat_is_unused_default(automatic));
     assert_eq!(persists(), saved, "opening the placeholder waits");
@@ -5951,17 +5960,17 @@ fn placeholders_save_with_the_navigation_that_opens_and_leaves_them() {
     assert!(written.cards.iter().all(|card| card.id != automatic));
     assert_ne!(written.focused, Some(automatic));
 
-    drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+    drop(app.navigate_to_worktree("/workspace/elsewhere".into(), true));
     assert!(app.card_state(automatic).is_none());
     assert_eq!(persists(), saved + 1, "discarding the placeholder waits");
     drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
     assert_eq!(persists(), saved + 2);
 
-    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into()));
+    drop(app.navigate_to_worktree(FIXTURE_DIRECTORY.into(), true));
     let used = app.workspace.focused().unwrap();
     write(&mut app, used, "keep this message");
     let before = persists();
-    drop(app.navigate_to_worktree("/workspace/elsewhere".into()));
+    drop(app.navigate_to_worktree("/workspace/elsewhere".into(), true));
     assert_eq!(
         persists(),
         before + 1,
@@ -16205,6 +16214,253 @@ fn a_never_named_conversation_whose_daemon_is_gone_reopens_as_a_draft() {
         Err(chat::StartFailure::fresh("fixture: daemon gone")),
     );
     assert!(app.chat_offers_fresh_conversation(card));
+}
+
+/// An agent's chat card whose Codex conversation was never named, after its
+/// restore found the daemon gone. `kept_runtime` keeps the card's chat
+/// runtime, as a window open across the daemon's restart does.
+fn unreachable_unnamed_agent(kept_runtime: bool) -> (Cagents, CardId, chat::Session) {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, None);
+    let session = chat_runtime(&app, card).session.clone();
+    assert!(!session.is_unstarted());
+    assert!(session.launch.session_id.is_none());
+    app.workspace_model.agents = vec![crate::app::channel_ui::close_tests::agent(&session)];
+    if !kept_runtime {
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+    }
+    let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+    let target = chat_runtime_attempt(&app, card);
+    answer_start(
+        &mut app,
+        target,
+        Err(chat::StartFailure::fresh("fixture: daemon gone")),
+    );
+    (app, card, session)
+}
+
+/// #3095: an agent's Codex conversation whose thread ID was never saved
+/// came back from an abandoned update as a draft, and giving up the old
+/// conversation retired the agent. The card keeps the conversation and says
+/// why it can't reopen; the agent stays open.
+#[test]
+fn an_agents_never_named_conversation_stays_its_card_when_its_daemon_is_gone() {
+    // Whether the card still had its chat runtime when the restore failed, as
+    // a window that stays open across the daemon's restart does.
+    for kept_runtime in [true, false] {
+        let (mut app, card, session) = unreachable_unnamed_agent(kept_runtime);
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card),
+            "nothing gives up the agent's conversation"
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(session.clone()),
+            "the card still names the conversation the agent ran"
+        );
+        let why = super::unnamed_agent_conversation(&session);
+        // Starting over would retire the agent's pane, and reconnecting finds
+        // nothing, so Close is its only recovery.
+        assert!(!app.chat_offers_fresh_conversation(card));
+        // Nor does it open in a terminal, which would give the card up and
+        // leave the agent without one.
+        assert_eq!(
+            app.chat_switch_blocker(card).as_deref(),
+            Some(blocked_recovery::UNNAMED_AGENT_TERMINAL)
+        );
+        // One centred state replaces the pane, composer included.
+        assert!(app.unnamed_agent(card).is_some());
+        assert!(app.unnamed_agent_view(card).is_some());
+        assert_eq!(app.blocked_details_text(card), Some(why.as_str()));
+        assert!(!why.contains("daemon"));
+        // Its open record doesn't make the agent run: until the daemon proves
+        // its processes still run, the card claims nothing, and Close is only
+        // Close.
+        let stopped_copy = blocked_recovery::UnnamedAgentCopy {
+            body: "cagents lost track of this conversation when its background service stopped. Nothing new was started.",
+            close: "Close",
+            close_name: "Close this tab",
+        };
+        assert_eq!(app.unnamed_agent_copy(card), Some(stopped_copy));
+        // An answer about another conversation changes nothing.
+        let survivor = crate::terminal::ipc::ProcessStart {
+            pid: 4242,
+            start: 7,
+        };
+        let mut other = session.clone();
+        other.id = TerminalId::new();
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            other.clone(),
+            vec![survivor],
+        )));
+        assert_eq!(app.unnamed_agent_copy(card), Some(stopped_copy));
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            vec![survivor],
+        )));
+        assert_eq!(
+            app.unnamed_agent_copy(card),
+            Some(blocked_recovery::UnnamedAgentCopy {
+                body: "cagents lost track of this conversation when its background service stopped. The agent is still running. Nothing new was started.",
+                close: "Close and end agent",
+                close_name: "Close this tab and end its agent",
+            })
+        );
+        assert!(app.unnamed_agent_view(card).is_some());
+        // Close and end agent ends exactly what the card said runs before it
+        // closes anything; an answer arriving meanwhile doesn't change that.
+        let liveness = |app: &Cagents| app.unnamed_agent(card).unwrap().liveness.clone();
+        let _ = app.update(Message::CloseCard(card));
+        assert!(liveness(&app).ending);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            Vec::new(),
+        )));
+        assert_eq!(liveness(&app).running, vec![survivor]);
+        // A failure to end it keeps the card, says why, and lets Close try
+        // again; so does an agent still running afterwards.
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            session.clone(),
+            Err("fixture: cannot end".into()),
+        )));
+        assert!(!liveness(&app).ending);
+        assert_eq!(
+            liveness(&app).end_error.as_deref(),
+            Some("fixture: cannot end")
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(session.clone())
+        );
+        let _ = app.update(Message::CloseCard(card));
+        assert!(liveness(&app).ending);
+        assert_eq!(liveness(&app).end_error, None);
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            session.clone(),
+            Ok(vec![crate::terminal::ipc::LostProcess {
+                process: survivor,
+                name: "codex".into(),
+                command: "codex app-server".into(),
+                proved: true,
+            }]),
+        )));
+        assert_eq!(
+            liveness(&app).end_error.as_deref(),
+            Some(blocked_recovery::UNNAMED_AGENT_STILL_RUNS)
+        );
+        assert_eq!(liveness(&app).running, vec![survivor]);
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            Vec::new(),
+        )));
+        assert_eq!(app.unnamed_agent_copy(card), Some(stopped_copy));
+        if kept_runtime {
+            let runtime = chat_runtime(&app, card);
+            assert!(!runtime.is_draft());
+            assert_eq!(runtime.error.as_ref(), Some(&why));
+            assert_eq!(
+                runtime.start_blocked,
+                Some(blocked_recovery::Reopen::UnnamedAgent)
+            );
+            let stopped = runtime.stopped(false, false);
+            assert_eq!(
+                stopped.primary.map(|(label, press, _)| (label, press)),
+                Some(("Close", stopped::Press::Close))
+            );
+            assert_eq!(stopped.secondary, None);
+        } else {
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert_eq!(attach_failure_details(&app, card), Some(why));
+            assert_eq!(
+                app.blocked_failure(card).map(|blocked| blocked.reopen),
+                Some(blocked_recovery::Reopen::UnnamedAgent)
+            );
+        }
+        // The refusal belongs to the conversation it refused, not the card:
+        // once the card names another one, neither its state nor its
+        // terminal blocker applies, and its Details reveal nothing.
+        let mut replacement = session.clone();
+        replacement.id = TerminalId::new();
+        app.replace_chat_conversation(card, replacement);
+        assert!(app.unnamed_agent(card).is_none());
+        assert!(app.unnamed_agent_view(card).is_none());
+        assert_eq!(app.unnamed_agent_copy(card), None);
+        assert_ne!(
+            app.chat_switch_blocker(card).as_deref(),
+            Some(blocked_recovery::UNNAMED_AGENT_TERMINAL)
+        );
+        assert_eq!(app.blocked_details_text(card), None);
+    }
+}
+
+/// #3095: Close and end agent ends the agent only once the close is settled:
+/// an unsent message is asked about first, and the card closes once nothing
+/// it named still runs.
+#[test]
+fn closing_an_unreachable_unnamed_agent_ends_it_after_asking_then_closes() {
+    for kept_runtime in [true, false] {
+        let (mut app, card, session) = unreachable_unnamed_agent(kept_runtime);
+        let survivor = crate::terminal::ipc::ProcessStart {
+            pid: 4242,
+            start: 7,
+        };
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            vec![survivor],
+        )));
+        let liveness = |app: &Cagents| app.unnamed_agent(card).unwrap().liveness.clone();
+        // A retained conversation closes through the daemon, so its card
+        // goes once that answers; any other card goes at once.
+        let closing = |app: &Cagents| {
+            app.chat_close_owned(card) || !app.card_state(card).unwrap().existence.is_open()
+        };
+        if kept_runtime {
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                unreachable!()
+            };
+            runtime.replace_draft(text_editor::Content::with_text("Keep this unsent note."));
+            let _ = app.update(Message::CloseCard(card));
+            assert!(app.chat_close_dialog_visible());
+            assert!(!liveness(&app).ending, "nothing ends before the answer");
+            let _ = app.update(Message::CancelChatClose);
+            assert!(!liveness(&app).ending);
+            assert!(!closing(&app));
+            let _ = app.update(Message::CloseCard(card));
+            let _ = app.update(Message::ConfirmChatClose);
+        } else {
+            let _ = app.update(Message::CloseCard(card));
+        }
+        assert!(liveness(&app).ending);
+        assert!(!closing(&app));
+        // Another conversation's answer settles nothing.
+        let mut other = session.clone();
+        other.id = TerminalId::new();
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            other,
+            Ok(Vec::new()),
+        )));
+        assert!(liveness(&app).ending);
+        assert!(!closing(&app));
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            session.clone(),
+            Ok(Vec::new()),
+        )));
+        assert!(closing(&app));
+    }
 }
 
 #[test]

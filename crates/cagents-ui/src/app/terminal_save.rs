@@ -148,12 +148,17 @@ fn retry_save(
     terminal: TerminalId,
     expected: HostSessionProof,
 ) -> Result<crate::workspace_model::WorkspaceModel, SaveError> {
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|e| SaveError {
-        reason: "The terminal service is unavailable. Keep this terminal open and retry saving."
-            .into(),
-        diagnostics: e.to_string(),
-    })?;
-    let mut client = ControlClient::connect(&socket).map_err(SaveError::control)?;
+    let mut client = crate::terminal::connect_ready_daemon()
+        .map_err(|error| match error {
+            crate::terminal::HostedTerminalStartError::Connect(error) => SaveError::control(error),
+            error => SaveError {
+                reason:
+                    "The terminal service is unavailable. Keep this terminal open and retry saving."
+                        .into(),
+                diagnostics: error.to_string(),
+            },
+        })?
+        .client;
     if client.proof() != &expected {
         return Err(SaveError {
             reason: "The terminal service changed. This terminal has not been saved.".into(),

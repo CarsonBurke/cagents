@@ -77,6 +77,14 @@ struct FileVersion {
     changed: (i64, i64),
 }
 impl FileVersion {
+    /// Whether both versions are of the same file, however it changed, so a
+    /// transcript replaced at its path is read from its start. Only a
+    /// heuristic: a file deleted and created again can reuse the inode, so a
+    /// scan also confirms the bytes it read before it is reused.
+    fn same_file(&self, other: &Self) -> bool {
+        (self.device, self.inode) == (other.device, other.inode)
+    }
+
     fn new(metadata: &std::fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
@@ -224,7 +232,10 @@ impl Cache {
                 let scan = Arc::new(scan::scan(
                     provider,
                     &candidate.path,
-                    previous.as_ref().map(|entry| &*entry.scan),
+                    previous
+                        .as_ref()
+                        .filter(|entry| entry.version.same_file(&candidate.version))
+                        .map(|entry| &*entry.scan),
                     cancel,
                 )?);
                 let mut entries = self.entries.lock().ok()?;
@@ -624,6 +635,65 @@ mod tests {
         assert_eq!(header(Provider::Codex, &path).unwrap().id(), parent);
     }
 
+    /// A rollout found to be a subagent's stays unlisted as it grows, but a
+    /// conversation written over it, in place or by replacing the file, is
+    /// listed.
+    #[test]
+    fn a_conversation_written_over_a_subagent_rollout_is_listed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        let id = "f0e49307-af96-4edd-b23f-60b185fe4fea";
+        let cwd = directory.path().to_str().unwrap();
+        let asked =
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"Profile it"}});
+        let cache = Cache::default();
+        let find = |path: &Path| cache.find(Provider::Codex, &candidate(0, path));
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+
+        let meta = |source: &str| {
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{id}","cwd":"{cwd}","source":{source}}}}}"#
+            )
+        };
+        std::fs::write(&path, format!("{}\n", meta(r#"{"subagent":{}}"#))).unwrap();
+        assert!(find(&path).is_none());
+        let written = inode(&path);
+        std::fs::write(&path, format!("{}\n{asked}\n", meta(r#"{"subagent":{}}"#))).unwrap();
+        assert!(find(&path).is_none());
+        std::fs::write(&path, format!("{}\n{asked}\n", meta(r#""cli""#))).unwrap();
+        assert_eq!(inode(&path), written);
+        assert_eq!(find(&path).unwrap().id(), id);
+
+        // The replacement's first record is as long as the subagent's and
+        // ends in the same bytes, so only the file's identity tells them
+        // apart.
+        let padded = |source: &str| {
+            format!(
+                r#"{{"type":"session_meta","payload":{{"source":{source},"id":"{id}","cwd":"{cwd}","note":"{}"}}}}"#,
+                "n".repeat(300)
+            )
+        };
+        let (subagent, main) = (padded(r#"{"subagent":{}}"#), padded(r#""cli","xxxx":12"#));
+        assert_eq!(subagent.len(), main.len());
+        std::fs::write(&path, format!("{subagent}\n")).unwrap();
+        assert!(find(&path).is_none());
+        let replaced = inode(&path);
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, format!("{main}\n{asked}\n")).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(inode(&path), replaced);
+        assert_eq!(find(&path).unwrap().id(), id);
+
+        // Rewritten in place, the same file differs only before the bytes
+        // that end its first record.
+        std::fs::write(&path, format!("{subagent}\n")).unwrap();
+        assert!(find(&path).is_none());
+        let rewritten = inode(&path);
+        std::fs::write(&path, format!("{main}\n{asked}\n")).unwrap();
+        assert_eq!(inode(&path), rewritten);
+        assert_eq!(find(&path).unwrap().id(), id);
+    }
+
     /// A transcript with nothing in it has nothing to return to.
     #[test]
     fn an_empty_conversation_is_not_listed_unless_named() {
@@ -955,6 +1025,37 @@ mod tests {
                 .unwrap()
                 .title,
             "Original fallback"
+        );
+    }
+
+    /// A conversation renamed over another is read from its start, even
+    /// where the bytes the earlier scan stopped after are the same.
+    #[test]
+    fn a_conversation_replaced_by_rename_is_read_afresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let reply = json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":[{"type":"text","text":"r".repeat(400)}]}});
+        let write = |path: &Path, prompt: &str| {
+            let user = json!({"type":"user","sessionId":id,"cwd":directory.path(),"message":{"content":prompt}});
+            std::fs::write(path, format!("{user}\n{reply}\n")).unwrap();
+        };
+        write(&path, "Profile the importer");
+        let cache = Cache::default();
+        let before = candidate(0, &path);
+        assert_eq!(
+            cache.find(Provider::Claude, &before).unwrap().title,
+            "Profile the importer"
+        );
+        let replacement = path.with_extension("replacement");
+        write(&replacement, "Profile the exporter");
+        std::fs::rename(&replacement, &path).unwrap();
+        let after = candidate(0, &path);
+        assert_eq!(before.version.len, after.version.len);
+        assert_ne!(before.version.inode, after.version.inode);
+        assert_eq!(
+            cache.find(Provider::Claude, &after).unwrap().title,
+            "Profile the exporter"
         );
     }
 

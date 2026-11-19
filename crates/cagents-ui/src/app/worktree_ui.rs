@@ -1125,8 +1125,13 @@ impl Cagents {
     /// changes, as when the user opens it from the sidebar. The switch is
     /// saved with the next save, or within [`NAVIGATION_SAVE_DELAY`]; a
     /// default pane opened for an empty worktree saves itself.
-    pub(super) fn navigate_to_worktree(&mut self, path: PathBuf) -> Task<Message> {
-        self.show_worktree(path, true, DurableChange::Navigation).1
+    pub(super) fn navigate_to_worktree(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> Task<Message> {
+        self.show_worktree(path, create_if_empty, DurableChange::Navigation)
+            .1
     }
 
     fn show_worktree(

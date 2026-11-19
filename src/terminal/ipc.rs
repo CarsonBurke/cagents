@@ -268,7 +268,10 @@ use crate::{
 /// Version 188 appends `ProtocolErrorCode::NotAdmitted`, which an automatic
 /// account switch is refused with when nothing was changed yet. Older clients
 /// cannot decode it; an admitted older CLI is sent `InvalidRequest` instead.
-pub const PROTOCOL_VERSION: u16 = 188;
+/// Version 189 appends `ModelEdit::CloseConfirmedProject`, which `project
+/// close` sends with the channels it confirmed so the daemon refuses the close
+/// if they changed. A daemon before it could not decode the edit.
+pub const PROTOCOL_VERSION: u16 = 189;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

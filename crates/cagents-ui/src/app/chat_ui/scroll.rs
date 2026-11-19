@@ -37,6 +37,7 @@ pub(super) fn transcript<'a>(
         false,
         HashSet::new(),
         None,
+        History::default(),
     )
 }
 
@@ -326,6 +327,7 @@ pub(super) fn transcript_observed<'a>(
     restoration_pending: bool,
     preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
+    history: History,
 ) -> Element<'a, Message> {
     transcript_impl(
         content.into(),
@@ -339,7 +341,32 @@ pub(super) fn transcript_observed<'a>(
         restoration_pending,
         preparing,
         find_intent,
+        history,
     )
+}
+
+/// The history around the loaded window that the transcript stands in for.
+#[derive(Clone, Copy, Default)]
+pub(super) struct History {
+    /// Whether there is history before and after the loaded window.
+    pub pages: Pages,
+    /// The item a page slides the window around.
+    pub pivot: Option<Pivot>,
+}
+
+/// The item a page slides the window around, by its place among the
+/// transcript's first `items` ids, which are its items in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Pivot {
+    pub index: usize,
+    pub items: usize,
+}
+
+/// Which pages of history beyond the loaded window there are to fetch.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(super) struct Pages {
+    pub earlier: bool,
+    pub later: bool,
 }
 
 fn transcript_impl<'a>(
@@ -354,6 +381,7 @@ fn transcript_impl<'a>(
     restoration_pending: bool,
     preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
+    history: History,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -386,6 +414,7 @@ fn transcript_impl<'a>(
         restoration_pending,
         preparing,
         find_intent,
+        history,
     })
 }
 
@@ -405,6 +434,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         restoration_pending: false,
         preparing: HashSet::new(),
         find_intent: None,
+        history: History::default(),
     })
 }
 
@@ -953,6 +983,7 @@ struct Anchored<'a> {
     restoration_pending: bool,
     preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
+    history: History,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1205,9 +1236,93 @@ struct Anchor {
     pending_input: Option<view::Page>,
     modifiers: iced::keyboard::Modifiers,
     seed: Option<Scroll>,
+    /// The page a wheel last asked for ahead of the reader, and the item
+    /// the window it asked from was to slide around.
+    prefetched: Option<(view::Page, String)>,
+    /// The primary button is held down over the transcript, as while its
+    /// scrollbar thumb is dragged.
+    held: bool,
 }
 
 impl Anchor {
+    /// Where the halves a page around `pivot` keeps end, from the rows
+    /// `subagent`'s transcript last laid out. `items` is the transcript's
+    /// ids, its items in order first. A row can hold several items, such as
+    /// an exchange's steps, and an exchange draws its steps above its prose
+    /// whatever their order, so each half ends at the nearest row holding
+    /// any item of the other.
+    ///
+    /// Unknown while the primary button is held, as while the thumb is
+    /// dragged: a page that grows the content under a dragged thumb would
+    /// move the view the drag maps to, so a drag asks only at the edge.
+    fn kept(
+        &self,
+        subagent: Option<&str>,
+        items: &[(Id, &str)],
+        pivot: Pivot,
+    ) -> Option<view::Kept> {
+        if self.held {
+            return None;
+        }
+        let context = self
+            .contexts
+            .iter()
+            .find(|context| context.subagent.as_deref() == subagent)?;
+        let order: std::collections::HashMap<&str, usize> = items
+            .iter()
+            .take(pivot.items)
+            .enumerate()
+            .map(|(index, (_, id))| (*id, index))
+            .collect();
+        let mut older_end = None::<f32>;
+        let mut newer_start = None::<f32>;
+        for row in &context.rows {
+            let Some(&index) = order.get(row.id.as_str()) else {
+                continue;
+            };
+            if index > pivot.index {
+                older_end = Some(older_end.map_or(row.bounds.y, |end| end.min(row.bounds.y)));
+            } else if index < pivot.index {
+                let bottom = row.bounds.y + row.bounds.height;
+                newer_start = Some(newer_start.map_or(bottom, |start| start.max(bottom)));
+            }
+        }
+        Some(view::Kept {
+            older_end: older_end?,
+            newer_start: newer_start?,
+        })
+    }
+
+    /// A wheel heading for an edge asks for its page once: further notches
+    /// toward the same edge, before the page moves the window, would only
+    /// cost the model an update each. A reader who turns back, or a window
+    /// around another item, asks again.
+    fn ahead_once(
+        &mut self,
+        direction: Option<view::Page>,
+        wheel: bool,
+        scroll: Scroll,
+        pivot: Option<&str>,
+    ) -> Option<view::Page> {
+        if !wheel || scroll.at_top() || scroll.at_bottom() {
+            return direction;
+        }
+        let Some(page) = direction else {
+            self.prefetched = None;
+            return None;
+        };
+        let pivot = pivot.unwrap_or_default();
+        if self
+            .prefetched
+            .as_ref()
+            .is_some_and(|(asked, from)| *asked == page && from == pivot)
+        {
+            return None;
+        }
+        self.prefetched = Some((page, pivot.to_owned()));
+        direction
+    }
+
     fn context_index(&mut self, subagent: Option<&str>) -> usize {
         self.contexts
             .iter()
@@ -1384,6 +1499,7 @@ fn navigation_input(
     scroll: Scroll,
     wheel: Option<f32>,
     child_captured: bool,
+    pages: Pages,
 ) -> Option<view::Page> {
     match wheel {
         Some(y) if !child_captured => {
@@ -1392,7 +1508,19 @@ fn navigation_input(
             } else if y < 0.0 && scroll.at_bottom() && before.is_none_or(|old| top >= old) {
                 Some(view::Page::Newer)
             } else {
-                None
+                // A wheel within reach of a loaded edge is a reader heading
+                // there: the page they are heading for is fetched ahead of
+                // them. Elsewhere a notch is only reading, and asks nothing
+                // of the model.
+                before.and_then(|old| {
+                    if pages.earlier && top < old && scroll.prefetch_earlier() {
+                        Some(view::Page::Earlier)
+                    } else if pages.later && top > old && scroll.prefetch_later() {
+                        Some(view::Page::Newer)
+                    } else {
+                        None
+                    }
+                })
             }
         }
         Some(_) => None,
@@ -1553,6 +1681,22 @@ impl Operation for SetBottom {
             x: None,
             y: Some(self.0),
         });
+    }
+}
+
+impl Anchored<'_> {
+    /// The item a page slides this transcript's window around.
+    fn pivot_id(&self) -> Option<&str> {
+        let pivot = self.history.pivot?;
+        self.items
+            .get(..pivot.items)?
+            .get(pivot.index)
+            .map(|(_, id)| *id)
+    }
+
+    /// What of the window a page keeps, see [`Anchor::kept`].
+    fn kept(&self, anchor: &Anchor) -> Option<view::Kept> {
+        anchor.kept(self.subagent, &self.items, self.history.pivot?)
     }
 }
 
@@ -1913,6 +2057,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     Scroll::new(top, geometry.content.height, geometry.viewport.height),
                     None,
                     false,
+                    self.history.pages,
                 )
                 .or(anchor.pending_input);
             }
@@ -1938,6 +2083,27 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .0
                 .borrow_mut()
                 .modifiers = *modifiers;
+        }
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cursor.is_over(layout.bounds()) =>
+            {
+                tree.state
+                    .downcast_ref::<ReaderState>()
+                    .memory
+                    .0
+                    .borrow_mut()
+                    .held = true;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                tree.state
+                    .downcast_ref::<ReaderState>()
+                    .memory
+                    .0
+                    .borrow_mut()
+                    .held = false;
+            }
+            _ => {}
         }
         if let Some(intent) = &self.find_intent
             && (!revealing
@@ -2078,7 +2244,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         top,
                         saved_geometry.content.height,
                         saved_geometry.viewport.height,
-                    );
+                    )
+                    .with_kept(self.kept(&anchor));
                     let wheel = match event {
                         Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(match *delta {
                             mouse::ScrollDelta::Lines { x, y } => {
@@ -2092,7 +2259,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         }),
                         _ => None,
                     };
-                    let direction = navigation_input(Some(saved_top), top, scroll, wheel, false)
+                    let direction = navigation_input(
+                        Some(saved_top),
+                        top,
+                        scroll,
+                        wheel,
+                        false,
+                        self.history.pages,
+                    );
+                    let direction = anchor
+                        .ahead_once(direction, wheel.is_some(), scroll, self.pivot_id())
                         .or(anchor.pending_input);
                     anchor.pending_input = None;
                     anchor.reported = Some(Report {
@@ -2163,7 +2339,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     || previous.top != top
                     || previous.geometry != geometry
             });
-            let scroll = Scroll::new(top, geometry.content.height, geometry.viewport.height);
+            let scroll = Scroll::new(top, geometry.content.height, geometry.viewport.height)
+                .with_kept(self.kept(&anchor));
             // Only navigation toward an edge can request its page. Content
             // scrollables own their gestures, including retries at their ends.
             let wheel = match event {
@@ -2187,7 +2364,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .captured
                 .as_ref()
                 .is_some_and(|captured| captured.get());
-            let direction = navigation_input(before.0, top, scroll, wheel, child_captured)
+            let direction = navigation_input(
+                before.0,
+                top,
+                scroll,
+                wheel,
+                child_captured,
+                self.history.pages,
+            );
+            let direction = anchor
+                .ahead_once(direction, wheel.is_some(), scroll, self.pivot_id())
                 .or(anchor.pending_input);
             if changed || direction.is_some() {
                 anchor.pending_input = None;
@@ -2211,7 +2397,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     shell.publish(action(Action::Scrolled(
                         target,
                         self.subagent.map(str::to_owned),
-                        Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                        scroll,
                         direction,
                     )));
                 }

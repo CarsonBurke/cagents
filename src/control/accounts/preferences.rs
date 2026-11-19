@@ -19,9 +19,7 @@ pub(super) fn execute(
     provider: Provider,
     selection: DefaultSelection,
 ) -> Result<CommandOutput, AppError> {
-    let socket = control_daemon_socket()?;
-    let mut client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
+    let mut client = control_daemon_client()?;
     // Bind the real caller before preferences reads/writes. Device operations
     // remain user-only under the existing daemon token policy.
     execute_with(&mut client, provider, selection)

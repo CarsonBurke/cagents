@@ -7173,6 +7173,33 @@ fn a_resumed_background_agent_settles_from_a_receipt_naming_send_message() {
 }
 
 #[test]
+fn a_worker_messaging_one_of_the_leads_agents_resumes_that_agent_here() {
+    let mut adapter = Claude::default();
+    notification_agent(&mut adapter, "worker-call", "worker-task", true);
+    notification_agent(&mut adapter, "agent-call", "agent-task", true);
+    adapter
+        .receive(notification_frame(
+            "first-receipt",
+            "agent-call",
+            "agent-task",
+            "completed",
+        ))
+        .unwrap();
+    // The worker, not the lead, sends the message that resumes it.
+    adapter.receive(json!({"type":"assistant","uuid":"resume-call","parent_tool_use_id":"worker-call","message":{"id":"resume-message","content":[{"type":"tool_use","id":"send-call","name":"SendMessage","input":{"to":"agent-task","message":"Check again"}}]}})).unwrap();
+    let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent-task","tool_use_id":"send-call","task_type":"local_agent","spawn_depth":1})).unwrap();
+    assert_eq!(
+        notification_agent_statuses(&started, "agent-call"),
+        [ToolStatus::Running]
+    );
+    let settled = adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"second-receipt","task_id":"agent-task","tool_use_id":"send-call","status":"completed","summary":"Done"})).unwrap();
+    assert_eq!(
+        notification_agent_statuses(&settled, "agent-call"),
+        [ToolStatus::Succeeded]
+    );
+}
+
+#[test]
 fn a_send_message_alias_never_settles_the_agent_it_resumed_for_another_task() {
     let mut adapter = Claude::default();
     notification_agent(&mut adapter, "call-a", "task-a", true);
@@ -12824,4 +12851,364 @@ fn claude_history_correlation_budget_counts_only_retained_rewritten_carriers() {
     let page = history.page().unwrap();
     assert_eq!(page.len(), 2);
     assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
+}
+
+/// A lead conversation fed live frames, as the store projects them.
+#[derive(Default)]
+struct Lead {
+    adapter: Claude,
+    snapshot: chat::Snapshot,
+}
+
+impl Lead {
+    fn receive(&mut self, frame: Value) {
+        let events = self.adapter.receive(frame).unwrap().events;
+        crate::chat::runtime::project_events_for_test(&mut self.snapshot, events);
+    }
+
+    /// Feed a scene's frames, without its fixture directives, up to its end.
+    fn replay(&mut self, frames: &str) {
+        for line in frames.lines() {
+            let mut frame: Value = serde_json::from_str(line).unwrap();
+            if frame["_end"] == true {
+                break;
+            }
+            frame.as_object_mut().unwrap().remove("_live");
+            self.receive(frame);
+        }
+    }
+}
+
+/// The direct agents' standing as the footer counts them: working, paused on
+/// a question, waiting on background work, failed.
+fn agent_counts(snapshot: &chat::Snapshot) -> (usize, usize, usize, usize) {
+    let activity = snapshot.subagent_activity();
+    (
+        activity.working,
+        activity.waiting,
+        activity.on_background_work,
+        activity.failed.len(),
+    )
+}
+
+fn subagent_ids(snapshot: &chat::Snapshot) -> Vec<&str> {
+    snapshot
+        .subagents
+        .iter()
+        .map(|agent| agent.id.as_str())
+        .collect()
+}
+
+/// Recorded from Claude Code 2.1.325 on the cheapest model: the lead starts a
+/// background command and a background agent, "level one". That agent starts
+/// a background agent, "level two", and a background command of its own;
+/// level two starts a foreground agent, "level three". Claude Code forwards
+/// every level's conversation under the call that started it, and reports
+/// each level's tasks and its `background_tasks_changed` level to the lead.
+const NESTED_AGENTS: &str =
+    include_str!("../../../../tests/fixtures/claude-nested-agents-live.jsonl");
+const LEVEL_ONE: &str = "toolu_01B1JrnP33WivhUSSSsVMkBk";
+const LEVEL_THREE: &str = "toolu_01GQB8xT2snQ9EugnzUATXuB";
+const LEAD_COMMAND: &str = "toolu_01HUi7AHnEFak4VugVSfa4E7";
+
+/// Feed recorded frames until `stop` matches one, inclusive.
+fn replay_until(
+    adapter: &mut Claude,
+    snapshot: &mut chat::Snapshot,
+    frames: &mut std::str::Lines<'_>,
+    stop: impl Fn(&Value) -> bool,
+) {
+    for line in frames.by_ref() {
+        let frame: Value = serde_json::from_str(line).unwrap();
+        let done = stop(&frame);
+        crate::chat::runtime::project_events_for_test(
+            snapshot,
+            adapter.receive(frame).unwrap().events,
+        );
+        if done {
+            return;
+        }
+    }
+    panic!("the recorded frames ended early");
+}
+
+#[test]
+fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
+    let mut adapter = Claude::default();
+    let mut snapshot = chat::Snapshot::default();
+    let mut frames = NESTED_AGENTS.lines();
+    // Level three's own conversation is forwarded under a call made inside
+    // level two, whose frames the lead never keeps. It used to become a
+    // phantom direct agent that nothing would ever settle.
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["parent_tool_use_id"] == LEVEL_THREE && frame["type"] == "assistant"
+    });
+    assert_eq!(subagent_ids(&snapshot), [LEVEL_ONE]);
+    assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
+
+    // Level one's own command finishes while level one waits on it, and its
+    // notice resumes level one: it is working again, not a second agent.
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "task_notification" && frame["task_id"] == "bshw00wt6"
+    });
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "task_started" && frame["tool_use_id"] == LEVEL_ONE
+    });
+    assert_eq!(subagent_ids(&snapshot), [LEVEL_ONE]);
+    assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
+
+    for line in frames {
+        crate::chat::runtime::project_events_for_test(
+            &mut snapshot,
+            adapter
+                .receive(serde_json::from_str(line).unwrap())
+                .unwrap()
+                .events,
+        );
+    }
+    assert_eq!(subagent_ids(&snapshot), [LEVEL_ONE]);
+    assert!(
+        !format!("{:?}", snapshot.items).contains(LEVEL_THREE),
+        "level three's call belongs to level two's transcript"
+    );
+    // Nor do the lifecycle frames of the helpers' tasks, which later name
+    // only the task, make rows of their own.
+    for helper in ["a98e0b22772b08ab9", "afe38f7adf887d7e3"] {
+        assert!(
+            !format!("{:?}", snapshot.items).contains(helper),
+            "{helper} is a helper's task"
+        );
+    }
+    // The recording ends with level one's completion and an empty background
+    // level: nothing is still working, and level one finished.
+    assert_eq!(agent_counts(&snapshot), (0, 0, 0, 0));
+    assert_eq!(snapshot.subagents[0].status, ToolStatus::Succeeded);
+    let command = snapshot
+        .items
+        .iter()
+        .find(|item| item.id == LEAD_COMMAND)
+        .unwrap();
+    assert_eq!(command.content.status(), Some(ToolStatus::Succeeded));
+}
+
+#[test]
+fn an_agent_that_completes_with_its_own_work_still_live_is_waiting_on_it() {
+    let mut adapter = Claude::default();
+    let mut snapshot = chat::Snapshot::default();
+    let mut frames = NESTED_AGENTS.lines();
+    // Level one's first notice says only that it completed: its summary is
+    // its own last words, with no note that it is waiting.
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "task_notification" && frame["tool_use_id"] == LEVEL_ONE
+    });
+    assert_eq!(agent_counts(&snapshot), (0, 0, 0, 0));
+    // The level that follows has dropped it while its command, which it
+    // started, still runs: it paused on that command.
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "background_tasks_changed"
+    });
+    assert_eq!(agent_counts(&snapshot), (0, 0, 1, 0));
+    let agent = &snapshot.subagents[0];
+    assert_eq!(agent.status, ToolStatus::Waiting);
+    assert!(agent.detail.contains("background work"), "{}", agent.detail);
+    // Its command's notice resumes it under the same task.
+    replay_until(&mut adapter, &mut snapshot, &mut frames, |frame| {
+        frame["subtype"] == "task_started" && frame["tool_use_id"] == LEVEL_ONE
+    });
+    assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
+}
+
+#[test]
+fn helpers_stay_nested_after_the_tool_cache_turns_over() {
+    let mut lead = Lead::default();
+    lead.receive(
+        json!({"type":"assistant","uuid":"lead","message":{"id":"m-lead","role":"assistant",
+        "content":[{"type":"tool_use","id":"worker","name":"Agent","input":{"description":"Worker","prompt":"Work","run_in_background":true}}]}}),
+    );
+    lead.receive(
+        json!({"type":"assistant","uuid":"spawn","parent_tool_use_id":"worker","message":{"id":"m-spawn","role":"assistant",
+        "content":[{"type":"tool_use","id":"helper","name":"Agent","input":{"description":"Helper","prompt":"Help"}},
+                   {"type":"tool_use","id":"fork","name":"Skill","input":{"skill":"review"}},
+                   {"type":"tool_use","id":"resume","name":"SendMessage","input":{"to":"helper","message":"Go on"}}]}}),
+    );
+    // A busy worker makes far more calls than the tool cache keeps while
+    // its helper and forked skill run.
+    for index in 0..MAX_TOOLS + 64 {
+        lead.receive(
+            json!({"type":"assistant","uuid":format!("busy-{index}"),"parent_tool_use_id":"worker",
+            "message":{"id":format!("m-busy-{index}"),"role":"assistant",
+            "content":[{"type":"tool_use","id":format!("read-{index}"),"name":"Read","input":{"file_path":"/fixture/a"}}]}}),
+        );
+    }
+    // A worker resuming its helper by message: Claude Code forwards the
+    // helper's conversation under that message's call.
+    for (carrier, deeper) in [
+        ("helper", "deep"),
+        ("fork", "fork-deep"),
+        ("resume", "resume-deep"),
+    ] {
+        lead.receive(
+            json!({"type":"assistant","uuid":format!("{carrier}-text"),"parent_tool_use_id":carrier,
+            "message":{"id":format!("m-{carrier}"),"role":"assistant",
+            "content":[{"type":"text","text":"Helping"},
+                       {"type":"tool_use","id":deeper,"name":"Agent","input":{"description":"Deeper","prompt":"Go"}}]}}),
+        );
+        lead.receive(
+            json!({"type":"assistant","uuid":format!("{deeper}-text"),"parent_tool_use_id":deeper,
+            "message":{"id":format!("m-{deeper}"),"role":"assistant","content":[{"type":"text","text":"Deeper"}]}}),
+        );
+    }
+    // A nested task's lifecycle names its call too, before any of its frames.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"s","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-late",
+        "tool_use_id":"late","task_type":"local_agent","description":"Late","is_backgrounded":true,
+        "spawn_depth":2,"parent_task_id":"a-worker"}),
+    );
+    lead.receive(
+        json!({"type":"assistant","uuid":"late-text","parent_tool_use_id":"late",
+        "message":{"id":"m-late","role":"assistant","content":[{"type":"text","text":"Late"}]}}),
+    );
+    // A command it starts is its own work too.
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"s2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"b-late",
+        "tool_use_id":"late-bash","task_type":"local_bash","description":"Wait","is_backgrounded":true,"parent_task_id":"a-late"}),
+    );
+    // Its later lifecycle frames name only the task.
+    lead.receive(
+        json!({"type":"system","subtype":"task_updated","uuid":"u","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-late",
+        "patch":{"status":"completed"}}),
+    );
+    assert_eq!(subagent_ids(&lead.snapshot), ["worker"]);
+    assert_eq!(agent_counts(&lead.snapshot), (1, 0, 0, 0));
+    assert!(
+        !lead
+            .snapshot
+            .items
+            .iter()
+            .any(|item| item.id.starts_with("claude-task:")),
+        "a helper's task has no row in the lead's transcript"
+    );
+}
+
+#[test]
+fn work_that_leaves_the_background_level_without_a_notice_stops_running() {
+    let mut lead = Lead::default();
+    let level = |tasks: Value| json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"00000000-0000-4000-8000-000000000001","tasks":tasks});
+    lead.receive(
+        json!({"type":"assistant","uuid":"a","message":{"id":"m","role":"assistant","content":[
+        {"type":"tool_use","id":"cmd","name":"Bash","input":{"command":"sleep 60","description":"Wait","run_in_background":true}},
+        {"type":"tool_use","id":"agent","name":"Agent","input":{"description":"Worker","prompt":"Work","run_in_background":true}}]}}),
+    );
+    lead.receive(level(
+        json!([{"task_id":"bcmd","task_type":"local_bash","description":"Wait"}]),
+    ));
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t1","session_id":"00000000-0000-4000-8000-000000000001","task_id":"bcmd",
+        "tool_use_id":"cmd","task_type":"local_bash","description":"Wait","is_backgrounded":true}),
+    );
+    lead.receive(
+        json!({"type":"user","uuid":"r1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"cmd",
+        "content":"Command running in background with ID: bcmd."}]},"tool_use_result":{"backgroundTaskId":"bcmd"}}),
+    );
+    lead.receive(level(
+        json!([{"task_id":"bcmd","task_type":"local_bash","description":"Wait"},
+        {"task_id":"a-worker","task_type":"local_agent","description":"Worker"}]),
+    ));
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-worker",
+        "tool_use_id":"agent","task_type":"local_agent","description":"Worker","is_backgrounded":true,"spawn_depth":1}),
+    );
+    lead.receive(
+        json!({"type":"user","uuid":"r2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent",
+        "content":[{"type":"text","text":"Async agent launched successfully.\nagentId: a-worker"}]}]},
+        "tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a-worker"}}),
+    );
+    lead.receive(json!({"type":"result","subtype":"success","is_error":false,"uuid":"turn"}));
+    let command = |snapshot: &chat::Snapshot| {
+        snapshot
+            .items
+            .iter()
+            .find(|item| item.id == "cmd")
+            .and_then(|item| item.content.status())
+    };
+    assert_eq!(command(&lead.snapshot), Some(ToolStatus::Running));
+    assert_eq!(agent_counts(&lead.snapshot), (1, 0, 0, 0));
+
+    // Both end, but neither notice reaches the conversation.
+    lead.receive(level(json!([])));
+    assert_eq!(command(&lead.snapshot), Some(ToolStatus::Ended));
+    assert_eq!(agent_counts(&lead.snapshot), (0, 0, 0, 0));
+    assert_eq!(lead.snapshot.subagents[0].status, ToolStatus::Ended);
+    assert!(!lead.snapshot.holds_work());
+
+    // A notice that arrives late still says how the command went.
+    lead.receive(
+        json!({"type":"system","subtype":"task_notification","uuid":"n","session_id":"00000000-0000-4000-8000-000000000001","task_id":"bcmd",
+        "tool_use_id":"cmd","status":"completed","output_file":"/tmp/o",
+        "summary":"Background command \"Wait\" completed (exit code 0)"}),
+    );
+    assert_eq!(command(&lead.snapshot), Some(ToolStatus::Succeeded));
+    // So does the agent's, and the note that nothing said how it went goes.
+    lead.receive(
+        json!({"type":"system","subtype":"task_notification","uuid":"n2","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-worker",
+        "tool_use_id":"agent","status":"completed","output_file":"/tmp/o2","summary":"Done"}),
+    );
+    let agent = &lead.snapshot.subagents[0];
+    assert_eq!(agent.status, ToolStatus::Succeeded);
+    assert_eq!(agent.detail, "");
+}
+
+#[test]
+fn the_first_background_level_of_a_process_settles_nothing() {
+    let mut lead = Lead::default();
+    lead.receive(
+        json!({"type":"assistant","uuid":"a","message":{"id":"m","role":"assistant","content":[
+        {"type":"tool_use","id":"agent","name":"Agent","input":{"description":"Worker","prompt":"Work","run_in_background":true}}]}}),
+    );
+    lead.receive(
+        json!({"type":"system","subtype":"task_started","uuid":"t","session_id":"00000000-0000-4000-8000-000000000001","task_id":"a-worker",
+        "tool_use_id":"agent","task_type":"local_agent","description":"Worker","is_backgrounded":true}),
+    );
+    lead.receive(
+        json!({"type":"user","uuid":"r","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent",
+        "content":[{"type":"text","text":"Async agent launched successfully.\nagentId: a-worker"}]}]},
+        "tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"a-worker"}}),
+    );
+    // Nothing is emitted at startup, so an empty first level is only the
+    // first one seen, not news that the agent ended.
+    lead.receive(
+        json!({"type":"system","subtype":"background_tasks_changed","uuid":"l","session_id":"00000000-0000-4000-8000-000000000001","tasks":[]}),
+    );
+    assert_eq!(agent_counts(&lead.snapshot), (1, 0, 0, 0));
+}
+
+/// The frames of `tests/fixtures/nested-agents-scene.sh`, as the native
+/// evidence replays them.
+#[test]
+fn the_nested_agents_scene_counts_only_the_leads_running_agents() {
+    let mut lead = Lead::default();
+    lead.replay(include_str!(
+        "../../../../tests/fixtures/nested-agents-scene/launch.jsonl"
+    ));
+    let direct = [
+        "toolu_review",
+        "toolu_audit",
+        "toolu_trace",
+        "toolu_rollback",
+    ];
+    assert_eq!(subagent_ids(&lead.snapshot), direct);
+    assert_eq!(agent_counts(&lead.snapshot), (4, 0, 0, 0));
+    lead.replay(include_str!(
+        "../../../../tests/fixtures/nested-agents-scene/settle.jsonl"
+    ));
+    assert_eq!(subagent_ids(&lead.snapshot), direct);
+    // Audit still works; Review waits on the check it started.
+    assert_eq!(agent_counts(&lead.snapshot), (1, 0, 1, 0));
+    let soak = lead
+        .snapshot
+        .items
+        .iter()
+        .find(|item| item.id == "toolu_soak")
+        .unwrap();
+    assert_eq!(soak.content.status(), Some(ToolStatus::Ended));
 }

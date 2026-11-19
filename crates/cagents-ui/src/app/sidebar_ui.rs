@@ -135,7 +135,7 @@ impl Cagents {
                     if let sidebar::SelectionRow::Project(project) = row {
                         let expanded = self.sidebar_state.project_expanded(project);
                         if expanded == (key == Named::ArrowLeft) {
-                            return ControlFlow::Break(self.update(Message::Sidebar(SidebarAction::ToggleProject(project))));
+                            return ControlFlow::Break(self.dispatch(Message::Sidebar(SidebarAction::ToggleProject(project))));
                         }
                     }
                     return ControlFlow::Break(Task::none());
@@ -187,9 +187,9 @@ impl Cagents {
                 repository,
             } => {
                 let directory = self.project_entry_directory(project_id, &repository);
-                self.navigate_to_worktree(directory)
+                self.navigate_to_worktree(directory, true)
             }
-            SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path),
+            SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path, true),
             SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
             SidebarAction::OpenPullRequest {
                 project_id,

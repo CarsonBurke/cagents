@@ -9,6 +9,8 @@ mod console_relaunch;
 pub(super) use console_relaunch::matched_cli;
 #[cfg(test)]
 mod console_relaunch_tests;
+#[cfg(test)]
+mod failed_upgrade_stop_tests;
 pub(super) mod floor_history;
 #[cfg(test)]
 mod lost_agent_close_tests;
@@ -1233,6 +1235,13 @@ fn refuse_scheduled_agent(host: &SharedHost, session: &Session) -> Result<(), St
 /// will, and its directory would outlive the conversation. An endpoint that
 /// something still serves keeps it.
 fn return_listener_allocation(session: &Session) -> Result<(), String> {
+    return_listener_allocation_checked(session, false)
+}
+
+fn return_listener_allocation_checked(
+    session: &Session,
+    require_stopped: bool,
+) -> Result<(), String> {
     let Some(listener) = session
         .owned_codex_listener
         .as_ref()
@@ -1241,6 +1250,9 @@ fn return_listener_allocation(session: &Session) -> Result<(), String> {
         return Ok(());
     };
     if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? {
+        if require_stopped {
+            return Err("The failed restart still serves its local listener".into());
+        }
         return Ok(());
     }
     if let Some(parent) = listener.socket.parent() {
@@ -2001,6 +2013,39 @@ fn publication_refusal(
 }
 
 fn start_with_execution(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+    source: Option<HostSessionProof>,
+    terminate_source: bool,
+    selection: Option<PendingBinding>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    execution: Option<Arc<chat::protocol::ExecutionContext>>,
+    restart_launch: Option<&chat::Launch>,
+    pane: Option<crate::terminal_ipc::PaneChatStart>,
+) -> Result<ServerResponse, ProtocolError> {
+    let id = session.id;
+    let response = start_publishing(
+        host,
+        client,
+        session,
+        source,
+        terminate_source,
+        selection,
+        execution_environment,
+        execution,
+        restart_launch,
+        pane,
+    )?;
+    // An update that stopped this conversation's failed restart reported it
+    // as needing a reopen. Starting it again is that reopen.
+    if matches!(&response, ServerResponse::ChatAttached { session, .. } if session.id == id) {
+        super::state::retire_stopped_upgrade_chat(host, id);
+    }
+    Ok(response)
+}
+
+fn start_publishing(
     host: &SharedHost,
     client: ClientId,
     mut session: Session,
@@ -3470,18 +3515,22 @@ impl Drop for AccountSwitchReservation {
 }
 
 /// The original conversation an automatic account switch may close, held
-/// against every other start of it until its successor starts.
+/// against every other start of it until its successor starts, and the copy
+/// of its history the alternate account will resume.
 struct AdmittedSwitch {
     handle: Handle,
     reservation: AccountSwitchReservation,
+    history: crate::account::handoff::Staged,
 }
 
 /// Everything [`recover_account`] checks before it changes anything. An
 /// automatic switch is given its original's actor and a reservation of it; an
 /// explicit recovery, whose original is no longer hosted, is given nothing.
 ///
-/// Every refusal here leaves the original exactly as it was: the only thing
-/// held is the reservation, which drops with the refusal.
+/// Every refusal here leaves the original exactly as it was: what is held is
+/// the reservation and the staged copy of its history, which both drop with
+/// the refusal. Staging may leave the alternate account's empty, private
+/// project directory, which no conversation reads.
 fn admit_account_recovery(
     host: &SharedHost,
     source: &Session,
@@ -3519,7 +3568,7 @@ fn admit_account_recovery(
     {
         return Err(error("This conversation has an explicitly pinned account"));
     }
-    let admitted = {
+    let (handle, reservation) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(source.proof.as_ref(), state.proof())?;
         let record = state.chats.get(&source.id).ok_or_else(|| {
@@ -3539,13 +3588,13 @@ fn admit_account_recovery(
         }
         let handle = record.handle.clone();
         state.chat_spawning.insert(source.id, source.clone());
-        AdmittedSwitch {
+        (
             handle,
-            reservation: AccountSwitchReservation {
+            AccountSwitchReservation {
                 host: host.clone(),
                 source: source.clone(),
             },
-        }
+        )
     };
     // A refused replacement must leave the original actor and history
     // intact. The temporary source reservation drops on this error;
@@ -3553,8 +3602,15 @@ fn admit_account_recovery(
     // An account the registry no longer lists is the replacement's, not the
     // original's, so it is refused as any other replacement would be.
     check_launch_account(&replacement.launch)?;
-    crate::account::handoff::preflight(source, replacement).map_err(unavailable)?;
-    Ok(Some(admitted))
+    // Copy the history while the original still runs, so an alternate
+    // account that cannot take it refuses before anything closes. A refused
+    // copy removes itself.
+    let history = crate::account::handoff::stage(source, replacement).map_err(unavailable)?;
+    Ok(Some(AdmittedSwitch {
+        handle,
+        reservation,
+        history,
+    }))
 }
 
 fn recover_account(
@@ -3584,6 +3640,7 @@ fn recover_account(
         Some(AdmittedSwitch {
             handle,
             reservation: held,
+            history,
         }),
     ) = (idle_generation, admitted)
     {
@@ -3593,7 +3650,8 @@ fn recover_account(
         handle
             .close_if_idle_for_resume(generation)
             .map_err(unavailable)?;
-        crate::account::handoff::prepare(&source, &replacement).map_err(unavailable)?;
+        // Publish what the conversation wrote between staging and its close.
+        history.commit().map_err(unavailable)?;
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -4416,6 +4474,7 @@ fn process_inner(
                 record.returning_terminal = true;
                 record.completion_observed = false;
                 state.inventory_generation += 1;
+                state.recovery_independence.extend(chat_id, terminal_id);
             }
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.
@@ -5124,16 +5183,67 @@ pub(super) fn restored_terminal_source(
     Ok(replacement)
 }
 
+/// Lock queue time is shared by the entire checkpoint, rather than granted
+/// anew to every conversation while the daemon's accept loop is unavailable.
+pub(super) struct UpgradeRestoreQueueBudget {
+    remaining: Duration,
+}
+
+impl Default for UpgradeRestoreQueueBudget {
+    fn default() -> Self {
+        Self {
+            remaining: Duration::from_secs(60),
+        }
+    }
+}
+
+impl UpgradeRestoreQueueBudget {
+    fn permits(&self, queued: Duration) -> bool {
+        queued.is_zero() || queued < self.remaining
+    }
+
+    fn charge(&mut self, queued: Duration) {
+        self.remaining = self.remaining.saturating_sub(queued);
+    }
+}
+
 pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
+) -> Result<(), String> {
+    restore_upgrade_with_queue_budget(host, saved, &mut UpgradeRestoreQueueBudget::default())
+}
+
+pub(super) fn restore_upgrade_with_queue_budget(
+    host: &SharedHost,
+    saved: &crate::upgrade::handoff::Chat,
+    queue_budget: &mut UpgradeRestoreQueueBudget,
+) -> Result<(), String> {
+    let result = restore_upgrade_with_queue_limit(host, saved, queue_budget);
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&saved.source.id)
+        .map(|record| record.handle.clone());
+    // Charge unsuccessful restarts too, before their stop removes the actor.
+    if let Some(handle) = handle {
+        queue_budget.charge(handle.startup_lock_wait());
+    }
+    result
+}
+
+fn restore_upgrade_with_queue_limit(
+    host: &SharedHost,
+    saved: &crate::upgrade::handoff::Chat,
+    queue_budget: &UpgradeRestoreQueueBudget,
 ) -> Result<(), String> {
     if saved.source.native_continuity.retains_provider() {
         native_recovery::restore(host, 0, &saved.source)?;
         return Ok(());
     }
     if saved.launch.needs_read_only_history() {
-        return Err("The saved Claude working directory is unavailable. No provider was restarted; open the saved pane to read its conversation history.".into());
+        return Err("The saved Claude working directory is unavailable, so only its conversation history can be opened".into());
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut session = crate::upgrade::handoff::restored_chat(&saved.source, &saved.launch)?;
@@ -5221,19 +5331,22 @@ pub(super) fn restore_upgrade(
                 "Restored native provider exited before confirming its exact conversation".into(),
             );
         }
+        let queued = handle.startup_lock_wait();
+        if !queue_budget.permits(queued) {
+            return Err(
+                "Codex startup lock queue budget for this upgrade restore was exhausted".into(),
+            );
+        }
         if let Some(actual) = handle.confirmed_session_id() {
             if Some(&actual) != saved.launch.session_id.as_ref() {
-                return Err(
-                    "Restored provider confirmed a different conversation; checkpoint retained"
-                        .into(),
-                );
+                return Err("The restarted provider confirmed a different conversation".into());
             }
             break;
         }
-        if Instant::now() >= deadline {
-            return Err(
-                "Native provider did not confirm its exact conversation within 30 seconds".into(),
-            );
+        // Time its server spent queued behind another Codex's startup lock is
+        // not this conversation's own startup; its listener wait bounds that.
+        if Instant::now() >= deadline + queued {
+            return Err("The restarted provider did not confirm its conversation in time".into());
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -5249,6 +5362,121 @@ pub(super) fn restore_upgrade(
         launch: saved.launch.clone(),
     });
     state.upgrade_chats.insert(saved.source.id, sources);
+    Ok(())
+}
+
+/// Positively stops whatever [`restore_upgrade`] started for one relaunched
+/// conversation whose restart failed, so that conversation alone is left to
+/// reopen while the rest of the update's restore continues.
+///
+/// Ok means nothing of this restart runs: its actor joined after releasing its
+/// holder, which reaps the provider and everything it started, and its record
+/// and socket allocation are gone. An error means that teardown is unproven,
+/// so nothing may replace the conversation and the caller keeps the whole
+/// checkpoint for explicit recovery.
+pub(super) fn stop_failed_upgrade_restore(
+    host: &SharedHost,
+    saved: &crate::upgrade::handoff::Chat,
+) -> Result<(), String> {
+    let id = saved.source.id;
+    let (handle, terminal, session) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.chats.get(&id);
+        let session = record
+            .map(|record| record.session.clone())
+            .unwrap_or_else(|| saved.source.clone());
+        let paired = session.terminal.as_deref().filter(|source| source.id == id);
+        let terminal = match (paired, state.terminals.get(&id)) {
+            (Some(source), Some(terminal)) => {
+                let source = if let Some(record) = record {
+                    if !matches_paired_terminal(&terminal.session, source, state.proof())
+                        || !record
+                            .paired_terminal
+                            .as_ref()
+                            .is_some_and(|expected| terminal.handle.same_worker(expected))
+                    {
+                        return Err("The failed restart's paired terminal changed; its replacement was not stopped".into());
+                    }
+                    source.clone()
+                } else {
+                    // A failure before publishing the chat can still leave
+                    // its checkpointed TUI running. Match its issued source
+                    // and current daemon proof before capturing that worker.
+                    let current = state.descriptor(0, id).map_err(|error| error.message)?;
+                    restored_terminal_source(source, &current.session)?
+                };
+                Some((source, terminal.handle.clone()))
+            }
+            (None, Some(_)) => {
+                return Err("The failed restart's paired terminal cannot be identified".into());
+            }
+            (_, None) => None,
+        };
+        (
+            record.map(|record| record.handle.clone()),
+            terminal,
+            session,
+        )
+    };
+    if let Some(handle) = &handle {
+        handle.close()?;
+        if !handle.is_completed() {
+            return Err("The failed restart's provider teardown did not complete".into());
+        }
+    }
+    let require_current = |state: &HostState| -> Result<(), String> {
+        // A start that failed before publishing its record has nothing here,
+        // but a start or handoff still in flight would.
+        if state.chat_spawning.contains_key(&id)
+            || state.native_actor_startups.contains_key(&id)
+            || state.native_closing.contains_key(&id)
+            || state.chat_handoffs.contains_key(&id)
+        {
+            return Err("The failed restart's startup has not settled".into());
+        }
+        match (&handle, state.chats.get(&id)) {
+            (Some(handle), Some(record)) if record.handle.same_attachment(handle) => {}
+            (None, None) => {}
+            _ => return Err("The failed restart's actor changed while it was stopped".into()),
+        }
+        if let Some((source, handle)) = &terminal
+            && state.terminals.get(&id).is_none_or(|record| {
+                !matches_paired_terminal(&record.session, source, state.proof())
+                    || !record.handle.same_worker(handle)
+            })
+        {
+            return Err("The failed restart's paired terminal changed while it was stopped".into());
+        }
+        Ok(())
+    };
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_current(&state)?;
+    }
+    if let Some((_, terminal)) = &terminal {
+        terminal.shutdown().map_err(|error| error.to_string())?;
+    }
+    // Only a holder that outlived its release could still claim this id.
+    if has_native_owner(&saved.source).map_err(|error| error.message)? {
+        return Err("The failed restart left its native holder registered".into());
+    }
+    return_listener_allocation_checked(&session, true)?;
+    let record = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        require_current(&state)?;
+        let record = state.chats.remove(&id);
+        if record.is_some() {
+            state.inventory_generation += 1;
+            if let Some(notifications) = &state.notifications {
+                notifications.retire(id);
+            }
+        }
+        if terminal.is_some() {
+            state.retire_terminal(id);
+        }
+        record
+    };
+    drop(record);
     Ok(())
 }
 

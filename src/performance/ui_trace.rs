@@ -7,7 +7,8 @@
 //! collection. A [`region`] of the view breaks its share of those out beneath
 //! the totals. Each window also gives the work and pacing of the frames the
 //! shell presented, from the vendored runtime's frame hook. It also logs each
-//! call over [`SLOW`] as it returns. Times are
+//! call over [`SLOW`] as it returns, and, through [`latency_to_next_frame`],
+//! how long an input took to reach the screen. Times are
 //! wall-clock time on the UI thread. A nested `update` counts towards the
 //! outermost one. Overlays lay out and draw outside the root, as do the
 //! libcosmic chrome and the renderer, so they are not counted. Without the
@@ -167,6 +168,17 @@ thread_local! {
     /// The outermost update's message, which names its projection.
     static UPDATE_LABEL: RefCell<Box<str>> = RefCell::new(Box::from(""));
     static RECORDER: RefCell<Recorder> = RefCell::new(Recorder::new());
+    /// Moments waiting for the next presented frame, by what they began.
+    static AWAITING_FRAME: RefCell<Vec<(&'static str, Instant)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Logs, when the shell next presents a frame, how long it has been since
+/// `since`, as `ui-trace latency LABEL MS`: for the time from an input to the
+/// first frame that shows its effect, such as the key that opens a popup.
+pub fn latency_to_next_frame(label: &'static str, since: Instant) {
+    if enabled() {
+        AWAITING_FRAME.with_borrow_mut(|awaiting| awaiting.push((label, since)));
+    }
 }
 
 #[derive(Default)]
@@ -209,6 +221,12 @@ struct Recorder {
 /// Records a frame the shell presented.
 #[cfg(feature = "development")]
 fn frame(frame: cosmic::iced::runtime::frame::Frame) {
+    for (label, since) in AWAITING_FRAME.take() {
+        eprintln!(
+            "ui-trace latency {label} {:.1} ms",
+            since.elapsed().as_secs_f64() * 1e3
+        );
+    }
     RECORDER.with_borrow_mut(|recorder| {
         recorder.frames.push(frame.work);
         recorder.intervals.extend(frame.interval);

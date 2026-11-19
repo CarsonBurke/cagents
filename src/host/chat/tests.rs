@@ -8,6 +8,26 @@ use crate::{
 };
 use serde_json::{Value, json};
 
+#[test]
+fn upgrade_restore_queue_budget_is_shared_across_conversations() {
+    let mut budget = UpgradeRestoreQueueBudget::default();
+    budget.charge(Duration::from_secs(40));
+    assert!(budget.permits(Duration::from_secs(19)));
+    assert!(!budget.permits(Duration::from_secs(20)));
+    budget.charge(Duration::from_secs(15));
+    assert!(budget.permits(Duration::from_secs(4)));
+    assert!(!budget.permits(Duration::from_secs(5)));
+}
+
+#[test]
+fn upgrade_restore_queue_budget_exhaustion_still_permits_unqueued_startup() {
+    let mut budget = UpgradeRestoreQueueBudget::default();
+    // A sample can cross the remaining budget; charging it must saturate.
+    budget.charge(Duration::from_secs(61));
+    assert!(budget.permits(Duration::ZERO));
+    assert!(!budget.permits(Duration::from_millis(1)));
+}
+
 // Each case owns the process-global daemon wake pipe in an exact child;
 // unrelated tests cannot supply the wake this regression is waiting for.
 fn isolated_completion_wake_case(marker: &str) -> bool {
@@ -1466,7 +1486,7 @@ fn missing_claude_directory_restores_a_hosted_history_reader_without_authority()
     );
     handle.command(chat::Command::Refresh).unwrap();
     let failure = restore_upgrade(&host, &saved).unwrap_err();
-    assert!(failure.contains("No provider was restarted"));
+    assert!(failure.contains("only its conversation history can be opened"));
     assert!(
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2566,6 +2586,39 @@ done
     assert_ne!(stale.code, ProtocolErrorCode::NotAdmitted, "{stale:?}");
     assert!(!handle.is_completed());
     assert!(host.lock().unwrap().chat_spawning.is_empty());
+    // An alternate account that cannot take the history refuses the switch
+    // before the original conversation closes. The refusals above staged and
+    // discarded copies, which left the project directory; this account cannot
+    // create it again. Root writes through the missing permission, as no
+    // daemon user can, so the step only runs unprivileged.
+    if unsafe { libc::geteuid() } != 0 {
+        let alternate_projects = alternate_home.join("projects");
+        std::fs::remove_dir(alternate_projects.join(&project)).unwrap();
+        std::fs::set_permissions(&alternate_projects, std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let unwritable = recover_account(
+            &host,
+            1,
+            source.clone(),
+            replacement.clone(),
+            Some(generation),
+            Default::default(),
+        );
+        std::fs::set_permissions(&alternate_projects, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let unwritable = unwritable.unwrap_err();
+        assert_eq!(unwritable.code, ProtocolErrorCode::NotAdmitted);
+        assert!(
+            unwritable.message.contains("could not be prepared"),
+            "{unwritable:?}"
+        );
+        assert!(
+            !handle.is_completed(),
+            "the original conversation stays open when its history cannot move"
+        );
+        assert!(host.lock().unwrap().chat_spawning.is_empty());
+        assert_eq!(std::fs::read_dir(&alternate_projects).unwrap().count(), 0);
+    }
     let response = recover_account(
         &host,
         1,

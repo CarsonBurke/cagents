@@ -859,9 +859,7 @@ fn request<T>(
     operation: Operation,
     expected: impl FnOnce(Reply) -> Option<T>,
 ) -> Result<T, AppError> {
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = control_daemon_client()?;
     let reply = client
         .agent(Authority::from_environment(), operation)
         .map_err(protocol_error)?;

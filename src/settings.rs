@@ -2376,7 +2376,8 @@ fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsErro
 }
 
 /// Applies only fields this window changed since its last successful save.
-/// Nested shortcut tables merge by action; list-valued preferences are atomic.
+/// Nested shortcut tables merge by action; list-valued preferences and
+/// [`ATOMIC_SETTINGS`] are replaced whole.
 pub fn save_merged(
     path: impl AsRef<Path>,
     base: &AppSettings,
@@ -2390,11 +2391,25 @@ pub fn save_merged(
         &toml::Value::try_from(base)?,
         &toml::Value::try_from(desired)?,
         &mut current,
+        &ATOMIC_SETTINGS,
     );
     save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
 }
 
-fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
+/// Settings chosen as a whole. Merging a palette color by color could save
+/// one that neither window chose.
+const ATOMIC_SETTINGS: [&str; 2] = ["terminal_theme", "custom_terminal_theme"];
+
+/// Writes into `current` what changed from `base` to `desired`. Keys named in
+/// `atomic` apply at this level only. A changed entry that `current` lacks is
+/// written whole, even when it is a table the window edited one field of:
+/// its other fields may be required, so a partial table could not load.
+fn merge_changed_fields(
+    base: &toml::Value,
+    desired: &toml::Value,
+    current: &mut toml::Value,
+    atomic: &[&str],
+) {
     if base == desired {
         return;
     }
@@ -2402,8 +2417,16 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
         (base.as_table(), desired.as_table(), current.as_table_mut())
     {
         for (key, value) in desired {
-            match (base.get(key), current.get_mut(key)) {
-                (Some(previous), Some(current)) => merge_changed_fields(previous, value, current),
+            let previous = base.get(key);
+            // An entry this window left alone says nothing about the file,
+            // even when another window has since removed it there.
+            if previous == Some(value) {
+                continue;
+            }
+            match (previous, current.get_mut(key)) {
+                (Some(previous), Some(current)) if !atomic.contains(&key.as_str()) => {
+                    merge_changed_fields(previous, value, current, &[]);
+                }
                 _ => {
                     current.insert(key.clone(), value.clone());
                 }
@@ -3855,6 +3878,115 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn unrelated_save_from_a_stale_window_keeps_another_windows_cleared_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let project = crate::model::ProjectId::new();
+        let other_project = crate::model::ProjectId::new();
+        let mut base = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        base.sidebar_worktree_overrides
+            .insert(project, SidebarWorktrees::Expanded);
+        save(&path, &base).unwrap();
+
+        let mut cleared = base.clone();
+        cleared.editor_font_size = None;
+        cleared.sidebar_worktree_overrides.remove(&project);
+        save_merged(&path, &base, &cleared).unwrap();
+
+        let mut stale = base.clone();
+        stale.app_theme = AppTheme::Light;
+        stale
+            .sidebar_worktree_overrides
+            .insert(other_project, SidebarWorktrees::Hidden);
+        save_merged(&path, &base, &stale).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.editor_font_size, None);
+        assert!(!restored.sidebar_worktree_overrides.contains_key(&project));
+        assert_eq!(restored.app_theme, AppTheme::Light);
+        assert_eq!(
+            restored.sidebar_worktree_overrides.get(&other_project),
+            Some(&SidebarWorktrees::Hidden)
+        );
+    }
+
+    #[test]
+    fn a_value_this_window_sets_replaces_another_windows_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        save(&path, &base).unwrap();
+        let cleared = AppSettings {
+            editor_font_size: None,
+            ..base.clone()
+        };
+        save_merged(&path, &base, &cleared).unwrap();
+        let resized = AppSettings {
+            editor_font_size: Some(14.0),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &resized).unwrap();
+        assert_eq!(load(&path).unwrap().editor_font_size, Some(14.0));
+    }
+
+    #[test]
+    fn a_palette_is_saved_whole_rather_than_merged_color_by_color() {
+        use crate::terminal::{TerminalTheme, ThemeColor};
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let palette = TerminalTheme::Dracula.palette();
+        let base = AppSettings {
+            terminal_theme: TerminalTheme::Custom(palette),
+            ..AppSettings::default()
+        }
+        .validate()
+        .unwrap();
+        save(&path, &base).unwrap();
+
+        let mut first = palette;
+        first.background = ThemeColor(0x112233);
+        let first = AppSettings {
+            terminal_theme: TerminalTheme::Custom(first),
+            custom_terminal_theme: Some(first),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &first).unwrap();
+        let mut second = palette;
+        second.foreground = ThemeColor(0x445566);
+        let second = AppSettings {
+            terminal_theme: TerminalTheme::Custom(second),
+            custom_terminal_theme: Some(second),
+            ..base.clone()
+        };
+        save_merged(&path, &base, &second).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.terminal_theme, second.terminal_theme);
+        assert_eq!(restored.custom_terminal_theme, second.custom_terminal_theme);
+    }
+
+    #[test]
+    fn a_changed_entry_another_window_removed_is_written_whole() {
+        let base: toml::Value = toml::toml! {
+            [entries.kept]
+            size = 1
+            shape = "round"
+        }
+        .into();
+        let mut desired = base.clone();
+        desired["entries"]["kept"]["size"] = 2.into();
+        let mut current: toml::Value = toml::toml! { [entries] }.into();
+        merge_changed_fields(&base, &desired, &mut current, &[]);
+        assert_eq!(current, desired);
     }
 
     #[test]

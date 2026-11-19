@@ -953,7 +953,10 @@ mod tests {
             .card_scopes
             .insert(source_a, scope_a.clone());
         app.worktree_owners.insert(source_a, scope_a.clone());
-        drop(app.add_repository_card(project_b, scope_b.clone(), scope_b.clone()));
+        drop(
+            app.add_repository_card(project_b, scope_b.clone(), scope_b.clone())
+                .1,
+        );
         let browser = app.workspace.focused().unwrap();
         app.workspace
             .set_card_width(browser, CardWidth::Fixed(180.0))

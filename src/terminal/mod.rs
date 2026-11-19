@@ -28,7 +28,8 @@ pub const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 pub use ipc::TerminalSpawnOptions;
 
 pub use hosted::{
-    HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
+    HostedTerminalHandle, HostedTerminalStartError, ReadyDaemon, connect_ready_daemon,
+    connect_ready_daemon_for, ensure_daemon_ready, ensure_daemon_ready_for,
 };
 pub use hosted::{ensure_daemon_ready_for_explicit_action, existing_daemon_socket_path};
 pub use snapshot::{

@@ -22,6 +22,9 @@ const REFUSAL: &str = "Private Agent peer refused the original scope";
 enum Business {
     List,
     Send,
+    /// A Send whose daemon is gone once it has lost the Prompt reply, so the
+    /// exact retry's route shows in how it reports the absent daemon.
+    LostSend,
 }
 fn root() -> PathBuf {
     PathBuf::from(std::env::var_os(ROOT).unwrap())
@@ -78,7 +81,7 @@ fn assert_operation(request: &ClientEnvelope, authority: &Authority, expected: &
         "exact Agent operation with original authority; never Authenticate or User fallback"
     );
 }
-struct Peer(Option<JoinHandle<(UnixListener, usize, usize)>>);
+struct Peer(Option<JoinHandle<(Option<UnixListener>, usize, usize)>>);
 impl Peer {
     fn new(business: Business, authority: Authority) -> Self {
         let socket = daemon_socket_path().unwrap();
@@ -97,11 +100,12 @@ impl Peer {
             } else {
                 1
             };
+            let mut listener = Some(listener);
             for attempt in 0..attempts {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let (mut peer, request) = loop {
                     let mut peer = loop {
-                        match listener.accept() {
+                        match listener.as_ref().unwrap().accept() {
                             Ok((peer, _)) => break peer,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 assert!(
@@ -135,8 +139,9 @@ impl Peer {
                         assert_eq!(request.proof.as_ref(), Some(&proof()));
                         break (peer, request);
                     }
-                    // Accept the predecessor's valid initial/retry readiness,
-                    // then reach actual business before asserting routing.
+                    // A connection that only handshakes is a separate
+                    // readiness probe. Reach actual business before
+                    // diagnosing it.
                     readiness += 1;
                     assert!(readiness <= attempts, "no repeated readiness/fallback");
                 };
@@ -171,6 +176,11 @@ impl Peer {
                     );
                     let request = next(&mut peer);
                     assert_operation(&request, &authority, &original_prompt());
+                    if matches!(business, Business::LostSend) {
+                        // Gone before the retry can connect; the stale
+                        // socket refuses it.
+                        listener = None;
+                    }
                     // Lose precisely the first Prompt reply. Do not fabricate
                     // an acceptance, receipt, or backend side effect.
                     peer.shutdown(std::net::Shutdown::Both).unwrap();
@@ -196,10 +206,12 @@ impl Peer {
     }
     fn finished(mut self) -> (usize, usize) {
         let (listener, readiness, raw) = self.0.take().unwrap().join().unwrap();
-        assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
-            "no extra connection after the definitive refusal"
-        );
+        if let Some(listener) = listener {
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                "no extra connection after the definitive refusal"
+            );
+        }
         (readiness, raw)
     }
 }
@@ -210,29 +222,38 @@ impl Drop for Peer {
         }
     }
 }
+fn arguments(business: Business, no_start: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["cagents".into(), "--json".into(), "agent".into()];
+    match business {
+        Business::List => args.push("list".into()),
+        Business::Send | Business::LostSend => args.extend([
+            "send".into(),
+            agent().to_string().into(),
+            PROMPT.into(),
+            "--idempotency-key".into(),
+            KEY.into(),
+        ]),
+    }
+    if no_start {
+        args.insert(1, "--no-start".into());
+    }
+    args
+}
 fn exercise(role: &str) {
     let authority = Authority::from_environment();
     let scoped = authority.token().is_some();
     let no_start = role == "user-no-start";
     let mut routing = Vec::new();
-    for business in [Business::List, Business::Send] {
+    for business in [Business::List, Business::Send, Business::LostSend] {
+        // Readiness hands its connection to the request, so the routes are
+        // told apart by how the absent daemon is reported: the initial
+        // connection's by a List once the daemon is gone, the exact retry's
+        // by a LostSend. Readiness would start the daemon, which the held
+        // launch fence refuses.
+        let _fence = matches!(business, Business::LostSend).then(startup_route::hold_launch_fence);
         let peer = Peer::new(business, authority.clone());
-        let mut args: Vec<OsString> = vec!["cagents".into(), "--json".into(), "agent".into()];
-        match business {
-            Business::List => args.push("list".into()),
-            Business::Send => args.extend([
-                "send".into(),
-                agent().to_string().into(),
-                PROMPT.into(),
-                "--idempotency-key".into(),
-                KEY.into(),
-            ]),
-        }
-        if no_start {
-            args.insert(1, "--no-start".into());
-        }
         let staged = Cell::new(0);
-        let result = run_from_with_staged_lookup(args, |_, recover| {
+        let result = run_from_with_staged_lookup(arguments(business, no_start), |_, recover| {
             staged.set(staged.get() + 1);
             assert_eq!(recover, !no_start);
             Ok(None)
@@ -248,6 +269,7 @@ fn exercise(role: &str) {
         let (ready, raw) = peer.finished();
         routing.push((business, staged.get(), ready, raw));
     }
+    startup_route::run_absent(arguments(Business::List, no_start));
     for (business, staged, ready, raw) in routing {
         let connections = if matches!(business, Business::Send) {
             2
@@ -260,9 +282,8 @@ fn exercise(role: &str) {
             "{business:?}: scoped Agent requests cannot delegate before capture"
         );
         assert_eq!(
-            ready,
-            if !scoped && !no_start { connections } else { 0 },
-            "{business:?}: both initial and exact Prompt retry must retain startup policy"
+            ready, 0,
+            "{business:?}: readiness hands its connection to the request rather than handshaking twice"
         );
         assert_eq!(raw, if !scoped && no_start { connections } else { 0 });
     }
@@ -338,6 +359,16 @@ fn public_agent_list_and_exact_submit_retry_keep_scope_before_staged_owner_and_r
         let errors = stderr
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        // Both initial and exact Prompt retry retain the startup policy.
+        let route = startup_route::Route::of(
+            role != "user" && role != "user-no-start",
+            role == "user-no-start",
+        );
+        startup_route::assert_absent_routes(&stderr, &[route, route]);
+        let errors = errors
+            .into_iter()
+            .filter(|error| !startup_route::reports_absent_daemon(error))
             .collect::<Vec<_>>();
         assert_eq!(errors.len(), 1);
         let error = &errors[0];

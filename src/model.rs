@@ -428,7 +428,28 @@ pub struct KeptChatDraft {
     /// closed, which the conversation may have received.
     #[serde(default)]
     pub sending: bool,
+    /// While `sending`, what the reader had said last when `text` was sent,
+    /// which tells a reopened conversation's message `text` from an earlier
+    /// one.
+    #[serde(default)]
+    pub sent_after: SentAfter,
     pub closed_at_unix_ms: i64,
+}
+
+/// The reader's latest message in a conversation as it was sent another,
+/// which the conversation then shows that one after if it received it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SentAfter {
+    /// None, or one that read differently, so a latest message reading the
+    /// same is the one sent. Drafts kept before this was recorded say so.
+    #[default]
+    Different,
+    /// One that read the same, with this transcript item id: only a later
+    /// message can be the one sent.
+    Same(String),
+    /// None was in view, so no message can be told apart as the one sent.
+    Unseen,
 }
 
 impl KeptChatDraft {
@@ -1100,20 +1121,21 @@ impl BrowserSession {
     }
 }
 
-/// Drops the oldest entries until the history fits [`BROWSER_HISTORY_LIMIT`],
-/// keeping `index` pointed at the same entry it pointed at before.
+/// Drops entries until the history fits [`BROWSER_HISTORY_LIMIT`], keeping
+/// `index` pointed at the same entry it pointed at before.
 ///
-/// Recent history — everything a user can reach with the back button — is
-/// preserved exactly; only entries older than the cap are forgotten.
+/// The oldest entries go first. Only when the current entry is too close to
+/// the start for that, as after going far back, do the newest forward entries
+/// go instead. The current page is never dropped, and neither is the entry
+/// before it, so a page that can go back still shows that it can.
 pub fn trim_browser_history(history: &mut Vec<Url>, index: &mut usize) {
     let Some(excess) = history.len().checked_sub(BROWSER_HISTORY_LIMIT) else {
         return;
     };
-    if excess == 0 {
-        return;
-    }
-    history.drain(..excess);
-    *index = index.saturating_sub(excess);
+    let older = excess.min(index.saturating_sub(1));
+    history.drain(..older);
+    *index -= older;
+    history.truncate(BROWSER_HISTORY_LIMIT);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2113,6 +2135,30 @@ mod tests {
             history[0],
             Url::parse("https://example.test/10").unwrap(),
             "the oldest entries are the ones dropped"
+        );
+
+        // Far back in a long history, the newest forward entries go instead
+        // of the page the cursor is on.
+        let mut history: Vec<Url> = (0..BROWSER_HISTORY_LIMIT + 10)
+            .map(|index| Url::parse(&format!("https://example.test/{index}")).unwrap())
+            .collect();
+        let mut index = 4;
+        trim_browser_history(&mut history, &mut index);
+        assert_eq!(history.len(), BROWSER_HISTORY_LIMIT);
+        assert_eq!(index, 1, "the page can still go back");
+        assert_eq!(
+            history.last(),
+            Some(
+                &Url::parse(&format!(
+                    "https://example.test/{}",
+                    BROWSER_HISTORY_LIMIT + 2
+                ))
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            history[index],
+            Url::parse("https://example.test/4").unwrap()
         );
 
         // Already inside the bound: nothing moves.

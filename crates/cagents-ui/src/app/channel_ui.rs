@@ -22,6 +22,14 @@ pub(super) fn close_sessions_retiring_agents(sessions: Vec<CardKind>) -> Result<
     close_sessions_with(sessions, OpenAgents::Retire)
 }
 
+/// [`close_sessions`] for a failed start a card gives up on its own, which
+/// must leave an open agent that runs as the conversation alone, even where
+/// the conversation's retained owner would otherwise be closed: that close
+/// retires the agent too.
+pub(super) fn close_sessions_sparing_agents(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_with(sessions, OpenAgents::Spare)
+}
+
 /// Fresh replaces this exact conversation, rather than whichever conversation
 /// currently occupies its native ID. A changed owner must be reconciled before
 /// Fresh can be attempted again; inventory alone cannot authorize that change.
@@ -108,6 +116,7 @@ fn captured_chat_changed() -> String {
 enum OpenAgents {
     Keep,
     Retire,
+    Spare,
 }
 
 fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Result<(), String> {
@@ -118,26 +127,31 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
         return Ok(());
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let Some(mut client) = connect(&socket)? else {
+    let Some(client) = connect(&socket)? else {
         return no_daemon_close_result(&sessions);
     };
+    close_sessions_through(client, &socket, &sessions, open_agents)
+}
+
+/// [`close_sessions_with`] on a connected `client`; `socket` reconnects when a
+/// failed request leaves it out of step with the daemon.
+fn close_sessions_through(
+    mut client: crate::control::ControlClient,
+    socket: &std::path::Path,
+    sessions: &[CardKind],
+    open_agents: OpenAgents,
+) -> Result<(), String> {
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
-    let terminal_ids = channel_terminal_ids(&sessions, &chats);
+    let terminal_ids = channel_terminal_ids(sessions, &chats);
     // Read only once a conversation turns out not to be live, the state a
     // daemon stop leaves an open agent's conversation in.
     let mut agents = None;
-    for kind in &sessions {
+    for kind in sessions {
         if let CardKind::Chat(session) = kind {
             let Some(live) = chats.iter().find(|live| live.id == session.id) else {
-                if may_have_retained_owner(session)
-                    || (open_agents == OpenAgents::Retire
-                        && bound_to_open_agent(
-                            session,
-                            read_open_agents(&mut agents, &mut client)?,
-                        ))
-                {
+                if closes_unhosted(session, open_agents, &mut agents, &mut client)? {
                     client
                         .close_retained_chat(session.clone())
                         .map_err(|error| error.reason())?;
@@ -162,11 +176,11 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
-                let Some(fresh) = connect(&socket)? else {
+                let Some(fresh) = connect(socket)? else {
                     return if may_have_retained_owner(live) {
                         Err(error.reason())
                     } else {
-                        no_daemon_close_result(&sessions)
+                        no_daemon_close_result(sessions)
                     };
                 };
                 client = fresh;
@@ -178,10 +192,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 {
                     return Err(error.reason());
                 }
-                if may_have_retained_owner(live)
-                    || (open_agents == OpenAgents::Retire
-                        && bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?))
-                {
+                if closes_unhosted(live, open_agents, &mut agents, &mut client)? {
                     // Disappearance from actor inventory can mean retained
                     // ownership, not process exit. Demand its close receipt.
                     client
@@ -203,8 +214,8 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
-            let Some(fresh) = connect(&socket)? else {
-                return no_daemon_close_result(&sessions);
+            let Some(fresh) = connect(socket)? else {
+                return no_daemon_close_result(sessions);
             };
             client = fresh;
             let still_running = client
@@ -221,6 +232,28 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
         }
     }
     Ok(())
+}
+
+/// Whether a conversation no actor hosts needs the daemon's retained close.
+/// A retained owner may still hold it, and closing for good also retires an
+/// open agent that runs as it. That close always retires such an agent, so a
+/// give-up that spares agents leaves the conversation to the agent.
+fn closes_unhosted(
+    session: &crate::chat::Session,
+    open_agents: OpenAgents,
+    agents: &mut Option<Vec<crate::agent_execution::Agent>>,
+    client: &mut crate::control::ControlClient,
+) -> Result<bool, String> {
+    let retained = may_have_retained_owner(session);
+    Ok(match open_agents {
+        OpenAgents::Keep => retained,
+        OpenAgents::Spare => {
+            retained && !bound_to_open_agent(session, read_open_agents(agents, client)?)
+        }
+        OpenAgents::Retire => {
+            retained || bound_to_open_agent(session, read_open_agents(agents, client)?)
+        }
+    })
 }
 
 fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
@@ -2429,7 +2462,13 @@ impl Cagents {
         }
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
-        for project in &mut self.sidebar_model.projects {
+        // The rows are compared through a shared borrow and written only
+        // where they differ: a mutable borrow takes a new revision, and the
+        // navigation list deep-compares every project on a frame after one.
+        // Most projections change no row, so most take none.
+        let mut changed_rows = Vec::new();
+        let mut row_counts = Vec::new();
+        for (position, project) in self.sidebar_model.projects.iter().enumerate() {
             // One primary-branch lookup and placeholder per project refresh,
             // regardless of how many unnamed channels it contains.
             let unnamed = default_channel_title(Some(project));
@@ -2560,15 +2599,29 @@ impl Cagents {
                     .with_attention(attention);
                     row.deletion = deletion;
                     row = row.with_notification_preview(notification_preview.cloned());
-                    if index < project.channels.len() {
-                        project.channels[index] = row;
-                    } else {
-                        project.channels.push(row);
-                    }
+                    changed_rows.push((position, index, row));
                 }
                 index += 1;
             }
-            project.channels.truncate(index);
+            if index != project.channels.len() {
+                row_counts.push((position, index));
+            }
+        }
+        if changed_rows.is_empty() && row_counts.is_empty() {
+            return;
+        }
+        let projects = &mut *self.sidebar_model.projects;
+        // Ascending per project, so a row past the end is always the next one.
+        for (position, index, row) in changed_rows {
+            let channels = &mut projects[position].channels;
+            if index < channels.len() {
+                channels[index] = row;
+            } else {
+                channels.push(row);
+            }
+        }
+        for (position, count) in row_counts {
+            projects[position].channels.truncate(count);
         }
     }
 }
@@ -2976,6 +3029,65 @@ pub(in crate::app) mod tests {
             !app.modal_is_open(),
             "creating a channel opens its composer directly"
         );
+    }
+
+    #[test]
+    fn a_projection_that_changes_no_channel_row_keeps_the_sidebar_revision() {
+        use crate::sidebar::Revisioned;
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let project = ProjectId::new();
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                title_source: Default::default(),
+                id,
+                project_id: project,
+                title: "Parser".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        drop(app.project_workspace(false));
+        let settled = Revisioned::revision(&app.sidebar_model.projects);
+
+        drop(app.project_workspace(false));
+        app.refresh_sidebar_channels();
+        assert_eq!(
+            Revisioned::revision(&app.sidebar_model.projects),
+            settled,
+            "rows that are already current take no new revision"
+        );
+
+        Arc::make_mut(&mut app.durable).channels[0].title = "Lexer".into();
+        drop(app.project_workspace(false));
+        assert_ne!(
+            Revisioned::revision(&app.sidebar_model.projects),
+            settled,
+            "a changed row takes a new revision"
+        );
+        assert_eq!(app.sidebar_model.projects[0].channels[0].title, "Lexer");
+
+        Arc::make_mut(&mut app.durable).channels.clear();
+        let renamed = Revisioned::revision(&app.sidebar_model.projects);
+        drop(app.project_workspace(false));
+        assert_ne!(
+            Revisioned::revision(&app.sidebar_model.projects),
+            renamed,
+            "a removed row takes a new revision"
+        );
+        assert!(app.sidebar_model.projects[0].channels.is_empty());
     }
 
     #[test]
@@ -4252,6 +4364,22 @@ pub(in crate::app) mod close_tests {
             crate::terminal::ipc::ServerResponse,
         )>,
     ) -> Result<(), String> {
+        let (mut client, server) = scripted_daemon(source, steps);
+        let result = close_captured_chat_with(&mut client, source);
+        drop(client);
+        server.join().unwrap();
+        result
+    }
+
+    /// A daemon that answers exactly `steps`, in order, and fails on any
+    /// request after them.
+    fn scripted_daemon(
+        source: &crate::chat::Session,
+        steps: Vec<(
+            crate::terminal::ipc::ClientRequest,
+            crate::terminal::ipc::ServerResponse,
+        )>,
+    ) -> (crate::control::ControlClient, std::thread::JoinHandle<()>) {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
@@ -4343,11 +4471,69 @@ pub(in crate::app) mod close_tests {
                 );
             }
         });
-        let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
-        let result = close_captured_chat_with(&mut client, source);
-        drop(client);
-        server.join().unwrap();
-        result
+        (
+            crate::control::ControlClient::from_stream(stream).unwrap(),
+            server,
+        )
+    }
+
+    /// #3095: giving up a conversation that failed to start must not retire
+    /// the agent that runs as it, which the daemon's retained close does.
+    #[test]
+    fn giving_up_an_unhosted_conversation_keeps_the_agent_that_runs_as_it() {
+        use crate::terminal::ipc::{ClientRequest, ServerResponse};
+        let mut source = captured_source();
+        source.launch.session_id = None;
+        source.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "fixture".into(),
+        };
+        let close = |open_agents, steps| {
+            let (client, server) = scripted_daemon(&source, steps);
+            let result = close_sessions_through(
+                client,
+                std::path::Path::new("/nonexistent/daemon.sock"),
+                &[CardKind::Chat(source.clone())],
+                open_agents,
+            );
+            server.join().unwrap();
+            result
+        };
+        let close_retained = || {
+            (
+                ClientRequest::ChatCloseRetained {
+                    session: source.clone(),
+                },
+                ServerResponse::Accepted,
+            )
+        };
+        // The agent keeps its conversation and whatever still holds it.
+        close(
+            OpenAgents::Spare,
+            vec![
+                (ClientRequest::ChatList, listed(vec![])),
+                (read_agents(), model(vec![agent(&source)])),
+            ],
+        )
+        .unwrap();
+        // Without an agent, the retained owner is still closed.
+        close(
+            OpenAgents::Spare,
+            vec![
+                (ClientRequest::ChatList, listed(vec![])),
+                (read_agents(), model(vec![])),
+                close_retained(),
+            ],
+        )
+        .unwrap();
+        // Closing the conversation for good still retires its agent, as does
+        // any other give-up, such as a card closed while it was reopening.
+        for open_agents in [OpenAgents::Retire, OpenAgents::Keep] {
+            close(
+                open_agents,
+                vec![(ClientRequest::ChatList, listed(vec![])), close_retained()],
+            )
+            .unwrap();
+        }
     }
 
     fn paired_source() -> crate::chat::Session {
