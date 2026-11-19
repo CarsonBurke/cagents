@@ -23,7 +23,7 @@ config=$fx/home/.claude
 channel_title='Release checks'
 
 shot() {
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     sleep 1
     evidence shot "$1"
 }
