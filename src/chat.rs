@@ -2311,11 +2311,11 @@ pub enum ItemContent {
         reference: Option<ImageReference>,
     },
     /// Something another agent or the provider harness delivered to this
-    /// conversation: a report, a message, a background-work notice, or context
-    /// the provider added without attributing it to the user.
+    /// conversation: a report, a message, a background-work notice, or where
+    /// the provider compacted its context, with the summary that replaced it.
     ///
     /// It can arrive in the user's slot and the agent acts on it as on a
-    /// prompt; provider context uses the System role. The user did not write
+    /// prompt; a compaction uses the System role. The user did not write
     /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
@@ -2332,7 +2332,7 @@ pub enum ItemContent {
         /// message. Empty when there is none.
         summary: String,
         /// A report/message with harness framing removed, a notice's quoted
-        /// output, or provider context retained verbatim without interpretation.
+        /// output, or a compaction's summary retained verbatim.
         body: String,
     },
 }
@@ -2344,7 +2344,7 @@ pub enum DeliveryKind {
     /// A message from a teammate or another session.
     Message,
     /// A provider/harness notice, including background-work events and
-    /// provider context. An empty sender makes no agent-origin claim.
+    /// compaction. An empty sender makes no agent-origin claim.
     Notice,
 }
 

@@ -4487,6 +4487,69 @@ fn a_loaded_skill_is_its_calls_step_live_and_in_history() {
     );
 }
 
+/// Live, instructions name no call, so each goes to the skill that just
+/// launched by its directory: the same skill loaded twice at once, a
+/// plugin's namespaced skill, and the one skill loading when its name is
+/// not its directory's.
+#[test]
+fn live_instructions_reach_the_skill_that_launched_them() {
+    let body = |directory: &str, arguments: &str| {
+        format!(
+            "Base directory for this skill: /skills/{directory}\n\n# Notes\n\nARGUMENTS: {arguments}"
+        )
+    };
+    let call = |id: &str, skill: &str| json!({"type":"tool_use","id":id,"name":"Skill","input":{"skill":skill}});
+    let result = |id: &str| json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"Launching skill"}]}});
+    let instructions = |text: String| json!({"type":"user","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":text}]}});
+    let outputs = |frames: &[Value]| {
+        let frames = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let mut frame = frame.clone();
+                frame["uuid"] = json!(format!("frame-{index}"));
+                frame
+            })
+            .collect::<Vec<_>>();
+        settled_live(&frames)
+            .into_iter()
+            .filter_map(|item| match item.content {
+                ItemContent::Tool { output, .. } => Some((item.id, output)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        outputs(&[
+            json!({"type":"assistant","message":{"id":"msg-calls","role":"assistant","content":[call("first", "release-notes"), call("second", "release-notes")]}}),
+            result("first"),
+            instructions(body("release-notes", "one")),
+            result("second"),
+            instructions(body("release-notes", "two")),
+        ]),
+        [
+            ("first".to_owned(), body("release-notes", "one")),
+            ("second".to_owned(), body("release-notes", "two")),
+        ]
+    );
+    assert_eq!(
+        outputs(&[
+            json!({"type":"assistant","message":{"id":"msg-call","role":"assistant","content":[call("plugin", "docs:release-notes")]}}),
+            result("plugin"),
+            instructions(body("release-notes", "one")),
+        ]),
+        [("plugin".to_owned(), body("release-notes", "one"))]
+    );
+    assert_eq!(
+        outputs(&[
+            json!({"type":"assistant","message":{"id":"msg-call","role":"assistant","content":[call("renamed", "Release Notes")]}}),
+            result("renamed"),
+            instructions(body("release-notes", "one")),
+        ]),
+        [("renamed".to_owned(), body("release-notes", "one"))]
+    );
+}
+
 /// A skill that failed to launch keeps its error, even when instructions of
 /// the same name arrive later without a call of their own.
 #[test]
@@ -4549,16 +4612,23 @@ fn injected_context_is_classified_alike_live_and_in_history() {
         ),
     ];
     let shown = [
-        "Stop hook feedback:\n[goal]: The goal is not met.",
-        "<system-reminder>a</system-reminder> and a request",
-        "[Image: a diagram the reader described]",
-        "Base directory for nothing in particular",
+        (
+            "Stop hook feedback:\n[goal]: The goal is not met.",
+            "Hook context",
+        ),
+        (
+            "<system-reminder>a</system-reminder> and a request",
+            CONTEXT_STEP,
+        ),
+        ("[Image: a diagram the reader described]", CONTEXT_STEP),
+        ("Base directory for nothing in particular", CONTEXT_STEP),
+        ("A reminder about Stop hook feedback: none", CONTEXT_STEP),
     ];
     let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
     for content in hidden
         .iter()
         .cloned()
-        .chain(shown.iter().map(|text| json!(text)))
+        .chain(shown.iter().map(|(text, _)| json!(text)))
     {
         let text = message_text(&content).unwrap();
         let live = settled_live(&[
@@ -4570,10 +4640,10 @@ fn injected_context_is_classified_alike_live_and_in_history() {
             json!({"type":"user","uuid":"context","isMeta":true,"message":{"role":"user","content":content}}),
         ]);
         assert_eq!(live, history, "{text}");
-        if shown.contains(&text.as_str()) {
+        if let Some((_, step)) = shown.iter().find(|(shown, _)| *shown == text) {
             assert!(
                 matches!(&live[1..], [Item { id, role: Role::Assistant, content: ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded }, .. }]
-                if id == "context:0" && name == CONTEXT_STEP && input.is_empty() && *output == text),
+                if id == "context:0" && name == step && input.is_empty() && *output == text),
                 "{live:?}"
             );
         } else {
@@ -4605,6 +4675,50 @@ fn synthetic_context_peer_delivery_and_assistant_text_remain_visible() {
     let answer = adapter.receive(frame).unwrap();
     assert!(
         matches!(&deliveries(&answer)[..], [(Role::Assistant, ItemContent::Text { text, .. })] if text == "Skill findings")
+    );
+}
+
+/// A reopened chat does not add what the live one never showed: a task's
+/// notification Claude Code saved as meta, which is shown as that task's
+/// notice, and what a command the reader typed expanded into.
+#[test]
+fn saved_meta_notifications_and_command_expansions_stay_hidden() {
+    let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
+    let notification = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>";
+    for record in [
+        json!({"type":"user","uuid":"notice","parentUuid":"prompt","isMeta":true,"origin":{"kind":"task-notification"},"message":{"role":"user","content":notification}}),
+        json!({"type":"user","uuid":"notice","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":notification}}),
+        json!({"type":"user","uuid":"notice","parentUuid":"prompt","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"Check in."}}),
+    ] {
+        let shown = settled_history(vec![prompt.clone(), record.clone()]);
+        assert!(
+            !shown
+                .iter()
+                .any(|item| matches!(&item.content, ItemContent::Tool { .. })),
+            "{record}: {shown:?}"
+        );
+    }
+    // A command whose expansion names no skill directory, as a project's
+    // own commands and Claude Code's built-in prompts do.
+    let command = "<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>the diff</command-args>";
+    let answer = json!({"type":"assistant","uuid":"answer","parentUuid":"expansion-2","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Reviewed."}]}});
+    let live = settled_live(&[
+        json!({"type":"user","uuid":"prompt","isReplay":true,"message":{"role":"user","content":command}}),
+        answer.clone(),
+    ]);
+    let history = settled_history(vec![
+        json!({"type":"user","uuid":"prompt","message":{"role":"user","content":command}}),
+        json!({"type":"user","uuid":"expansion-1","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":"Review the diff for bugs."}}),
+        json!({"type":"user","uuid":"expansion-2","parentUuid":"expansion-1","isMeta":true,"message":{"role":"user","content":"Then list them by severity."}}),
+        answer,
+    ]);
+    assert_eq!(live, history);
+    assert_eq!(
+        history
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["prompt:0", "msg-answer:0"]
     );
 }
 

@@ -4578,7 +4578,7 @@ fn parse_item_with_windows(
             if added.is_empty() {
                 Vec::new()
             } else {
-                tool_call("Hook context".into(), String::new(), added)
+                tool_call(super::HOOK_CONTEXT.into(), String::new(), added)
             }
         }
         // The agent pausing, named as a pause. As with compaction, the status

@@ -1092,12 +1092,19 @@ impl Claude {
                             .rsplit_once(':')
                             .is_some_and(|(_, name)| name == directory)
                 };
-                match self
+                // The latest launch of the skill it names, or, when the
+                // skill's name is not its directory's, the one skill this
+                // agent is loading.
+                let mut pending = self
                     .skill_loads
                     .iter()
                     .rev()
-                    .find(|(call, skill)| call.parent == scope && named(skill))
-                {
+                    .filter(|(call, _)| call.parent == scope);
+                let named_call = pending.clone().find(|(_, skill)| named(skill));
+                match named_call.or_else(|| {
+                    let only = pending.next();
+                    pending.next().is_none().then_some(only).flatten()
+                }) {
                     Some((call, _)) => call.clone(),
                     None => return,
                 }
@@ -1860,7 +1867,8 @@ impl Claude {
         let meta = delivered.is_empty() && frame["isMeta"].as_bool() == Some(true);
         if meta
             && (role != Role::User
-                || string(&frame["origin"], "kind") == "peer"
+                || !string(&frame["origin"], "kind").is_empty()
+                || recorded_notification(frame).is_some()
                 || message_text(&frame["message"]["content"]).is_none())
         {
             self.track_carrier(carrier, Vec::new(), child);
@@ -2114,11 +2122,24 @@ impl Claude {
                             }
                             if string(block, "name") == "Skill" {
                                 let call = ScopedId::new(child, &tool_id);
-                                self.skill_loads.retain(|(known, _)| known != &call);
-                                self.skill_loads
-                                    .push_back((call, string(&block["input"], "skill").into()));
-                                while self.skill_loads.len() > MAX_SKILL_LOADS {
-                                    self.skill_loads.pop_front();
+                                if self.loaded_skills.contains(&call) {
+                                    // A repeated call keeps what it loaded.
+                                    if let (
+                                        Some(ItemContent::Tool { output: loaded, .. }),
+                                        ItemContent::Tool { output, .. },
+                                    ) = (
+                                        self.tools.get(&call).map(|known| &known.content),
+                                        &mut item.content,
+                                    ) {
+                                        output.clone_from(loaded);
+                                    }
+                                } else {
+                                    self.skill_loads.retain(|(known, _)| known != &call);
+                                    self.skill_loads
+                                        .push_back((call, string(&block["input"], "skill").into()));
+                                    while self.skill_loads.len() > MAX_SKILL_LOADS {
+                                        self.skill_loads.pop_front();
+                                    }
                                 }
                             }
                             self.tool(child, item.clone());
@@ -2211,12 +2232,22 @@ impl Claude {
                         {
                             *output = instructions;
                         }
-                        // A skill that did not launch loads nothing.
-                        if let ItemContent::Tool { status, .. } = &item.content
-                            && !matches!(status, ToolStatus::Running | ToolStatus::Succeeded)
+                        // Instructions follow the result of the skill that
+                        // just launched, and a skill that did not launch
+                        // loads nothing.
+                        let call = ScopedId::new(child, &tool_id);
+                        if let Some(index) = self
+                            .skill_loads
+                            .iter()
+                            .position(|(known, _)| *known == call)
+                            && let Some(load) = self.skill_loads.remove(index)
                         {
-                            let call = ScopedId::new(child, &tool_id);
-                            self.skill_loads.retain(|(known, _)| known != &call);
+                            match item.content.status() {
+                                Some(ToolStatus::Running | ToolStatus::Succeeded) => {
+                                    self.skill_loads.push_back(load)
+                                }
+                                _ => {}
+                            }
                         }
                         if let Some(task) = structured["backgroundTaskId"].as_str() {
                             self.foreground_tasks.retain(|known| known != task);
@@ -4971,12 +5002,22 @@ fn model_only(frame: &Value) -> bool {
 /// streams.
 fn saved_context_shown(frame: &Value) -> bool {
     string(frame, "type") == "user"
+        && string(&frame["origin"], "kind").is_empty()
+        && recorded_notification(frame).is_none()
         && message_text(&frame["message"]["content"]).is_some()
         && match injected(&frame["message"]["content"]) {
             Injected::Skill { .. } => frame["sourceToolUseID"].is_string(),
             Injected::ModelOnly => false,
             Injected::Other => true,
         }
+}
+
+/// Whether a record is a prompt the reader typed as a slash command.
+fn typed_command(frame: &Value) -> bool {
+    string(frame, "type") == "user"
+        && !model_only(frame)
+        && message_text(&frame["message"]["content"])
+            .is_some_and(|text| slash_command_prompt(&text).is_some())
 }
 
 /// What Claude Code put in front of the model on its own, by what it says.
@@ -5077,11 +5118,23 @@ const CONTEXT_STEP: &str = "Claude context";
 /// particular tool, or another agent: a finished step whose output is the
 /// context itself, read on demand.
 fn context_item(id: String, body: String) -> Item {
+    // What a hook said back, such as a Stop hook keeping the turn going,
+    // names the hook that said it.
+    let hook = body
+        .split_once(" hook feedback:")
+        .is_some_and(|(event, _)| {
+            !event.is_empty() && event.chars().all(|c| c.is_ascii_alphabetic())
+        });
     Item {
         id,
         role: Role::Assistant,
         content: ItemContent::Tool {
-            name: CONTEXT_STEP.into(),
+            name: if hook {
+                super::HOOK_CONTEXT
+            } else {
+                CONTEXT_STEP
+            }
+            .into(),
             input: String::new(),
             output: body,
             status: ToolStatus::Succeeded,
@@ -7865,6 +7918,9 @@ impl History {
         let mut task_notices = Vec::new();
         let mut user_prompts = HashSet::new();
         let mut main_message: Option<String> = None;
+        // The prompt a reader typed as a command, or the last record of what
+        // it expanded into.
+        let mut command_tail: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
@@ -7976,9 +8032,15 @@ impl History {
             if let Some(parent) = &parent {
                 parents.insert(parent.clone());
             }
+            // What a typed command expanded into follows it as meta naming
+            // no call. Claude Code never streams it, so it is not shown.
+            let expands_command = model_only(&value)
+                && value["sourceToolUseID"].is_null()
+                && parent.is_some()
+                && parent == command_tail;
             // A manual compaction's output repeats the summary shown above it.
             let visible = message
-                && (!model_only(&value) || saved_context_shown(&value))
+                && (!model_only(&value) || (!expands_command && saved_context_shown(&value)))
                 && main
                 && value["repeatsCompactSummary"].as_bool() != Some(true);
             // A rewritten record keeps what it first said: where it was, the
@@ -8005,6 +8067,7 @@ impl History {
                 });
             if message && main {
                 main_message = Some(uuid.to_owned());
+                command_tail = (expands_command || typed_command(&value)).then(|| uuid.to_owned());
             }
             let compact_record = if !visible {
                 None
