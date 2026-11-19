@@ -8282,9 +8282,10 @@ impl Cagents {
                         format!(" · {}", choice.detail)
                     }
                 ))
-                .on_press_maybe(
-                    (!busy).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
-                )
+                .on_press_maybe((!busy).then_some(Message::ChatUi(Action::RecoverAccount(
+                    card,
+                    choice.id.clone(),
+                ))))
                 .into(),
             );
         }

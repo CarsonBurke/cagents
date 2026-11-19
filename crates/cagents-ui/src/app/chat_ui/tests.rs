@@ -3991,13 +3991,14 @@ fn the_footer_names_the_conversations_account_through_a_pending_switch() {
         let accounts = app
             .chat_accounts(launch.provider, &launch.recipe)
             .expect("two accounts to choose between");
-        let current = accounts.current;
+        let current = accounts.current.to_owned();
         let candidate = accounts
             .choices
             .into_iter()
             .find(|choice| !choice.selected)
             .expect("an account to switch to")
-            .label;
+            .label
+            .to_owned();
         assert_ne!(current, candidate);
         // Names the conversation's account, and not the one it may move
         // to, which it has not reached.
@@ -15244,6 +15245,45 @@ fn removed_account_without_available_alternatives_still_offers_accounts() {
     let _ = app.update(Message::AccountUi(account_ui::Action::OpenPane));
     assert!(app.utility_card(&CardKind::Accounts).is_some());
     assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
+}
+
+#[test]
+fn a_chat_view_reads_its_account_choices_without_resolving_account_homes() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let work = app.account_ui.add_managed_fixture(Provider::Codex, 106);
+    // An update ends with the choices its frame reads.
+    let _ = app.update(Message::AccountUi(account_ui::Action::Tick));
+    let launch = chat_runtime(&app, card).session.launch.clone();
+    let offered = |app: &Cagents| -> Vec<crate::account::AccountId> {
+        app.chat_accounts(launch.provider, &launch.recipe)
+            .expect("two accounts to choose between")
+            .choices
+            .iter()
+            .map(|choice| choice.id.clone())
+            .collect()
+    };
+    let resolved = account_ui::home_resolutions();
+    for _ in 0..3 {
+        drop(app.chat_view(card));
+    }
+    assert_eq!(
+        offered(&app),
+        [Account::system(Provider::Codex).id(), work.clone()]
+    );
+    assert_eq!(
+        account_ui::home_resolutions(),
+        resolved,
+        "a frame resolves no account's home"
+    );
+
+    // Another account is offered as soon as it is known, with no frame
+    // between the change and the read.
+    let personal = app.account_ui.add_managed_fixture(Provider::Codex, 107);
+    assert_eq!(
+        offered(&app),
+        [Account::system(Provider::Codex).id(), work, personal]
+    );
 }
 
 #[test]

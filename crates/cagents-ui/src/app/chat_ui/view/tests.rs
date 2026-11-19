@@ -6182,10 +6182,10 @@ fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
     (runtime, handle)
 }
 
-fn fixture_accounts() -> ChatAccounts {
+fn fixture_accounts() -> ChatAccounts<'static> {
     ChatAccounts {
-        current: "Synthetic account with a long name".into(),
-        choices: Vec::new(),
+        current: "Synthetic account with a long name",
+        choices: Default::default(),
     }
 }
 
