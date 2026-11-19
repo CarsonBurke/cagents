@@ -509,21 +509,15 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if work.lists_work => {
                     self.work_section(card, work)
                 }
-                // Nothing listed because nothing could be read says so,
-                // rather than promising rows that will never come.
-                pull_request_ui::WorkPhase::Listed => match self.work_transcript(card) {
-                    Some(crate::work::TranscriptCoverage::Unsupported) => list_notice(
-                        "Work isn't tracked for this chat",
-                        "Its provider's conversations aren't read for pull requests and worktrees.",
-                    ),
-                    Some(crate::work::TranscriptCoverage::Unavailable { reason }) => {
-                        list_notice("Couldn't read this chat's conversation", reason)
-                    }
-                    _ => list_notice(
-                        "No pull requests or worktrees yet",
-                        "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
-                    ),
-                },
+                pull_request_ui::WorkPhase::Listed => {
+                    self.unread_notice(card, "Work isn't tracked for this chat")
+                        .unwrap_or_else(|| {
+                            list_notice(
+                                "No pull requests or worktrees yet",
+                                "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
+                            )
+                        })
+                }
                 pull_request_ui::WorkPhase::Reading => list_notice(
                     "Reading this chat's work…",
                     "Its pull requests and worktrees show here.",
@@ -542,6 +536,34 @@ impl Cagents {
         match self.work_pane(card, &self.work_summary(card)).height {
             Height::Content { height } => height,
             Height::Share => f32::NAN,
+        }
+    }
+
+    /// Why `card`'s empty Work or Mentioned list may be empty only because
+    /// its conversation was not read, rather than promising rows that will
+    /// never come; `None` when it was read. `untracked` is the section's
+    /// title for a provider whose conversations are never read.
+    fn unread_notice<'a>(
+        &'a self,
+        card: CardId,
+        untracked: &'a str,
+    ) -> Option<Element<'a, Message>> {
+        match self.work_transcript(card)? {
+            crate::work::TranscriptCoverage::Unsupported => Some(list_notice(
+                untracked,
+                "cagents doesn't look through this provider's chats for pull requests or worktrees.",
+            )),
+            // The reason is the system's, so it waits behind a tooltip.
+            crate::work::TranscriptCoverage::Unavailable { reason } => {
+                Some(crate::interaction::tooltip(
+                    list_notice(
+                        "Couldn't read this chat's conversation",
+                        "Its pull requests and worktrees show here once it can be read.",
+                    ),
+                    reason.as_str(),
+                ))
+            }
+            _ => None,
         }
     }
 
@@ -572,10 +594,14 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if count > 0 => {
                     self.mentioned_section(card, work)
                 }
-                pull_request_ui::WorkPhase::Listed => list_notice(
-                    "No mentions",
-                    "Pull requests this chat only names show here.",
-                ),
+                pull_request_ui::WorkPhase::Listed => self
+                    .unread_notice(card, "Mentions aren't tracked for this chat")
+                    .unwrap_or_else(|| {
+                        list_notice(
+                            "No mentions",
+                            "Pull requests this chat only names show here.",
+                        )
+                    }),
                 pull_request_ui::WorkPhase::Reading => {
                     list_notice("Reading this chat's mentions…", "")
                 }
