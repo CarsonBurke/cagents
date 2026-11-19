@@ -15357,27 +15357,68 @@ impl Cagents {
                 });
             }
             Action::Attached(target, id, result) => {
+                // The draft takes up what another window chose while its
+                // chooser was open only once the choice has ended, so the
+                // files are judged by the provider it is about to adopt.
+                let provider = self
+                    .card_state(target.card)
+                    .and_then(|state| match &state.kind {
+                        CardKind::Chat(session) => Some(session.launch.provider),
+                        _ => None,
+                    });
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if runtime.attachment_chooser_pending != Some(id.id) {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
+                    // Why the choice attached nothing, told once the draft
+                    // has caught up below.
+                    let mut failure = None;
                     let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
                         Task::none()
                     } else {
                         match result {
-                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(Some(paths)) => {
+                                let rules = chat::AttachmentRules::for_provider(
+                                    provider.unwrap_or(runtime.session.launch.provider),
+                                );
+                                if rules.images_only
+                                    && paths.iter().any(|path| !chat::is_image_path(path))
+                                {
+                                    runtime.cancel_attachment_insert(id.id, None);
+                                    failure = Some(
+                                        "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.".to_owned(),
+                                    );
+                                    Task::none()
+                                } else {
+                                    self.stage_chat_attachments(target, id, paths)
+                                }
+                            }
                             Ok(None) => {
                                 runtime.cancel_attachment_insert(id.id, None);
                                 Task::none()
                             }
                             Err(error) => {
-                                runtime.cancel_attachment_insert(id.id, Some(error));
+                                runtime.cancel_attachment_insert(id.id, None);
+                                failure = Some(error);
                                 Task::none()
                             }
                         }
                     };
-                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
+                    // With the choice settled the draft can catch up, which
+                    // may attach it to a conversation another window started.
+                    let adopted = self.adopt_stored_draft_session(target.card);
+                    // Adopting another account clears its failed start's
+                    // reason, but this one is about the files just chosen.
+                    // A draft that gave way to the conversation another
+                    // window started has no composer here to say it in.
+                    if let Some(failure) = failure {
+                        match self.chat_runtime_mut(target) {
+                            Some(runtime) => runtime.error = Some(failure),
+                            None => self.status = Some(TransientNotice::warning(failure)),
+                        }
+                    }
+                    return Task::batch([staged, adopted]);
                 }
             }
             Action::Dropped(target, payload) => {
