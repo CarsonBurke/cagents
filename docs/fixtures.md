@@ -446,6 +446,13 @@ Remove the marker to report the selected model on the next start/resume.
 to 300 for the peer's busy turn, instead of its usual six-second pause.
 The footer scene uses 20 seconds so native capture can show confirmed running
 work without depending on how quickly OCR and screenshot conversion finish.
+`home/.codex/fixture-turn-start-delay` optionally holds a number of seconds
+from 0 to 30 to hold each `turn/start` response and its turn's notifications.
+Codex learns a turn's id only from those, so this shows a message the daemon has
+accepted whose turn has not begun, and what is sent meanwhile. The peer accepts
+a `turn/steer` naming its active turn. With `home/.codex/fixture-user-items`
+present, the peer reports each prompt and steer as a `userMessage` item of its
+turn, as Codex does, so the reader's own messages appear in the transcript.
 Create `home/.codex/fixture-turn-audit.json` containing `[]` to record the last
 16 accepted turn IDs and the actual requested model/effort fields, including
 only fields present in the request. This private audit excludes prompt input and

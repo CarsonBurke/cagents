@@ -1869,24 +1869,23 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
     // Choosing a model is not a message on its way: it neither reads as
     // sending nor takes the stamp away. A message does.
     runtime.error = None;
-    let pending = |sent: Option<&str>| PendingCommand {
-        followup: false,
-        take_back: None,
-        id: 1,
-        draft_revision: None,
-        request: None,
-        first_prompt: None,
-        model: sent.is_none().then(|| ("haiku".to_owned(), None)),
-        sent: sent.map(str::to_owned),
-        sent_after: Default::default(),
-        sent_attachments: Vec::new(),
-        page: None,
-        queued: None,
+    let model = Command::SetModel {
+        model: "haiku".into(),
+        reasoning: None,
     };
-    runtime.pending = Some(pending(None));
+    let pending = commands::PendingCommand::new(1, &model);
+    let snapshot = runtime.snapshot.clone();
+    assert!(runtime.commands.push(pending, model, &snapshot).is_some());
     assert!(!runtime.sending());
     assert_eq!(activity(&runtime), None);
-    runtime.pending = Some(pending(Some("next")));
+    runtime.commands = commands::Commands::default();
+    let message = Command::Prompt {
+        text: "next".into(),
+        attachments: Vec::new(),
+        mode: PromptMode::Queue,
+    };
+    let pending = commands::PendingCommand::new(1, &message);
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
     assert!(runtime.sending());
     assert_eq!(
         activity(&runtime),
@@ -3567,8 +3566,8 @@ fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child
         assert!(runtime(&app, target).preparation.contains("cold-rich"));
         drop(app.handle_chat_ui(Action::Latest(target)));
         let pending = runtime(&app, target)
-            .pending
-            .as_ref()
+            .commands
+            .in_flight()
             .expect("actual Latest dispatch");
         assert_eq!(pending.page, Some(Page::Latest));
         let pending_id = pending.id;
@@ -3760,7 +3759,7 @@ fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child
                 dispatched,
                 "post-ACK repeated Latest coalesces the existing request"
             );
-            assert!(runtime(&app, target).pending.is_none());
+            assert!(runtime(&app, target).commands.is_idle());
             assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
             assert_eq!(
                 runtime(&app, target).scroll_memory.edge(None),
@@ -3972,7 +3971,7 @@ fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacemen
                 },
                 false,
             ));
-            Some(runtime(&app, target).pending.as_ref().unwrap().id)
+            Some(runtime(&app, target).commands.in_flight().unwrap().id)
         };
         drop(app.handle_chat_ui(Action::Latest(target)));
         if unrelated.is_some() {
@@ -4172,8 +4171,8 @@ fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacemen
             );
         }
         let fetch = runtime(&app, target)
-            .pending
-            .as_ref()
+            .commands
+            .in_flight()
             .expect("deferred FETCH resumed despite later reader intent");
         assert_eq!(fetch.page, Some(Page::Latest));
         let fetch_id = fetch.id;
@@ -4202,7 +4201,7 @@ fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacemen
             Ok(()),
         )));
         assert_eq!(
-            runtime(&app, target).pending.as_ref().unwrap().id,
+            runtime(&app, target).commands.in_flight().unwrap().id,
             fetch_id,
             "stale ACK cannot consume the actual fetch"
         );
@@ -6266,6 +6265,49 @@ fn a_stop_waiting_for_confirmation_keeps_its_place_and_says_what_it_stops() {
     }
 }
 
+/// While a message is only on its way, there is no turn in view: the
+/// composer invites a message rather than steering. Stop is offered while
+/// the conversation reports working, whether or not its turn has begun.
+#[test]
+fn a_message_on_its_way_offers_no_turn_to_steer_and_stop_only_while_working() {
+    let roles = ["chat-submit-0", "chat-stop", "chat-composer"];
+    let (mut runtime, _handle) = furnished_runtime();
+    let message = Command::Prompt {
+        text: "Look at the logs".into(),
+        attachments: Vec::new(),
+        mode: PromptMode::Send,
+    };
+    let mut pending = commands::PendingCommand::new(1, &message);
+    pending.outgoing = Some(commands::Outgoing::new(
+        "Look at the logs".into(),
+        Vec::new(),
+        PromptMode::Send,
+        &runtime.snapshot,
+    ));
+    let snapshot = runtime.snapshot.clone();
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
+    assert!(runtime.turn_under_way());
+    runtime.composer = text_editor::Content::with_text("Then fix them");
+    let laid = lay_out(&runtime, 900.0, None, &roles);
+    assert!(laid.controls.contains_key("chat-submit-0"));
+    assert!(!laid.controls.contains_key("chat-stop"));
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Steer), false),
+        "Message"
+    );
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Steer), true),
+        "Steer this turn"
+    );
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Queue), false),
+        "Queue for the next turn"
+    );
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    let laid = lay_out(&runtime, 900.0, None, &roles);
+    assert!(laid.controls.contains_key("chat-stop"));
+}
+
 #[test]
 fn send_appears_with_a_draft_left_of_a_stop_that_stays_put() {
     let roles = [
@@ -7797,24 +7839,22 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     let delivery = runtime.snapshot.items.last().unwrap().clone();
     runtime.expanded.insert(delivery.id.clone());
     let queued = Queued {
-        source: prompt::LocalSource::new("Queued message".into()),
-        presentation: prompt::LocalPresentation::default(),
+        prompt: prompt::LocalPrompt::new("Queued message".into(), vec![]),
         resolved_text: "Queued message".into(),
-        attachments: vec![],
         model: None,
         draft: runtime.session.clone(),
         since: None,
         rechecking: false,
     };
-    let source = queued.source.clone();
+    let source = queued.prompt.source.clone();
     runtime.queued = Some(queued);
     let (run, ready) = preparation::local_reply_for_test(&mut runtime);
     let prepared = runtime
         .preparation
         .accept_local(runtime.target, run, &source, ready)
         .unwrap();
-    let mut queued = runtime.queued.take().unwrap();
-    prepared.install_local(&mut queued.presentation);
+    prepared.install_local(&mut runtime.queued.as_mut().unwrap().prompt.presentation);
+    let queued = runtime.queued.as_ref().unwrap();
     let cached = &runtime.cache[&delivery.id];
     let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
     let first = notice_identity(Some("turn-a"), "Repeated failure");
@@ -7827,7 +7867,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     builder.logical(second, Arc::from("Repeated failure"));
     let content = widget::column::with_children(vec![
         notice_entry("Repeated failure", runtime.target, first),
-        runtime.queued_view(&queued),
+        runtime.queued_view(queued),
         runtime.delivery_view(&delivery, &cached, settings),
         notice_entry("Repeated failure", runtime.target, second),
     ]);
@@ -10440,16 +10480,22 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
         reasoning: None,
         default_reasoning: Some("medium".into()),
     });
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.models.push(model("opus", "Opus 5.5"));
     snapshot.selected_model = Some("opus".into());
     assert_eq!(
-        staged_model_choice(snapshot),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
         None,
         "ordinary aliases also resolve to the running model"
     );
     snapshot.selected_model = None;
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.models[0].label = "Default (Another model)".into();
     snapshot
         .active_model
@@ -10458,7 +10504,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
         .aliases
         .retain(|alias| alias != "default");
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Default (Another model)")
     );
     snapshot.models[0].label = "Default (Opus 5.5)".into();
@@ -10471,23 +10517,33 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
     snapshot.selected_model = Some("default".into());
     snapshot.reasoning = Some("high".into());
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("High effort")
     );
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Opus 5.5"
     );
     snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.reasoning = None;
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Default effort")
     );
     snapshot.selected_model = Some("next".into());
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Next model · Default effort")
     );
     let catalog = crate::account::cache::Catalog {
@@ -10503,7 +10559,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
     assert_eq!(reasoning_default(snapshot, &snapshot.models[1], None), None);
     snapshot.models[1].label = "Opus 5.5".into();
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Opus 5.5 · Default effort"),
         "distinct concrete models can share a display name"
     );
@@ -10512,16 +10568,33 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
         Some("high")
     );
     snapshot.active_model = None;
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.selected_model = Some("default".into());
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Default (Opus 5.5)"
     );
     snapshot.reasoning = Some("high".into());
     for provider in [Provider::Claude, Provider::Codex] {
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Default (Opus 5.5) · High"
         );
     }
@@ -10545,11 +10618,14 @@ fn footer_staged_model_uses_reported_aliases_even_when_their_names_differ() {
     });
     for alias in ["opusplan", "deployment-current"] {
         snapshot.selected_model = Some(alias.into());
-        assert_eq!(staged_model_choice(snapshot), None);
+        assert_eq!(
+            staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+            None
+        );
     }
     snapshot.active_model.as_mut().unwrap().aliases.clear();
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Team model"),
         "an unreported alias resolution cannot be inferred from its display name"
     );
@@ -10571,31 +10647,73 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
     });
     for fit in [FooterFit::Wide, FooterFit::Narrow, FooterFit::Tight] {
         assert_eq!(
-            footer_model_label(snapshot, false, Provider::Claude, fit, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                Provider::Claude,
+                fit,
+                None
+            ),
             "Opus 5.5"
         );
         assert_eq!(
-            footer_model_label(snapshot, true, Provider::Claude, fit, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                true,
+                Provider::Claude,
+                fit,
+                None
+            ),
             "Default (Opus 5.5)"
         );
     }
     snapshot.selected_model = None;
     assert_eq!(
-        footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            true,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Default (Opus 5.5)"
     );
     snapshot.selected_model = Some("next-turn-model".into());
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Opus 5.5"
     );
     snapshot.active_model = None;
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "next-turn-model"
     );
     assert_eq!(
-        footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            true,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "next-turn-model"
     );
 }
@@ -10679,6 +10797,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
     assert_eq!(
         footer_model_label(
             snapshot,
+            ChosenModel::reported(snapshot),
             true,
             Provider::Codex,
             FooterFit::Wide,
@@ -10687,7 +10806,14 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
         "Offline Mini"
     );
     assert_eq!(
-        footer_model_label(snapshot, true, Provider::Codex, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            true,
+            Provider::Codex,
+            FooterFit::Wide,
+            None
+        ),
         "Offline Mini · Medium",
         "an unknown default does not erase the explicit choice"
     );
@@ -10695,6 +10821,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
     assert_eq!(
         footer_model_label(
             snapshot,
+            ChosenModel::reported(snapshot),
             true,
             Provider::Codex,
             FooterFit::Wide,
@@ -10707,6 +10834,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
     assert_eq!(
         footer_model_label(
             snapshot,
+            ChosenModel::reported(snapshot),
             true,
             Provider::Codex,
             FooterFit::Wide,
@@ -10732,17 +10860,38 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
     for provider in [Provider::Claude, Provider::Codex] {
         snapshot.active_model.as_mut().unwrap().reasoning = None;
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Resolved model"
         );
         snapshot.active_model.as_mut().unwrap().reasoning = Some("medium".into());
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Resolved model"
         );
         snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Resolved model · High"
         );
     }

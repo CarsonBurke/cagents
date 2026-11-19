@@ -84,6 +84,8 @@ mod close_refusal;
 #[cfg(test)]
 pub(in crate::app) use close_refusal::{close_refusal_dismiss_id, close_refusal_end_id};
 mod closed_draft;
+mod commands;
+use commands::ChosenModel;
 mod completion;
 mod coordination;
 #[cfg(test)]
@@ -398,6 +400,9 @@ pub enum Action {
     /// Lets a cancel waiting for its second press lapse, if it is that one.
     DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
+    /// Looks again at a message the provider took once its turn has had
+    /// time to begin, as no report may come to show it never will.
+    CommandsDue(Target),
     Toggle(Target, String),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
@@ -854,6 +859,7 @@ impl Action {
             Self::Interrupt(..) => "Interrupt",
             Self::DisarmInterrupt(..) => "DisarmInterrupt",
             Self::CommandFinished(..) => "CommandFinished",
+            Self::CommandsDue(..) => "CommandsDue",
             Self::Toggle(..) => "Toggle",
             Self::ToggleTurn(..) => "ToggleTurn",
             Self::SelectSubagent(..) => "SelectSubagent",
@@ -1000,6 +1006,7 @@ impl Action {
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
+                | Self::CommandsDue(..)
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
@@ -2840,34 +2847,34 @@ struct FinishedStamp {
     outcome: &'static str,
 }
 
-struct PendingCommand {
-    followup: bool,
-    /// The provider's queued message this command asks back, which stops
-    /// being waited for if the request never reaches the provider.
-    take_back: Option<String>,
-    id: u64,
-    draft_revision: Option<u64>,
-    request: Option<String>,
-    /// The first user prompt, used to name a new channel once locally queued.
-    first_prompt: Option<String>,
-    /// The model this command chooses, remembered for new drafts of the
-    /// provider once the provider has accepted it.
-    model: Option<(String, Option<String>)>,
-    /// The message this command sends, kept for the composer's history once
-    /// the provider has accepted it. A rejected send is not history: the
-    /// draft it came from is still in the composer.
-    sent: Option<String>,
-    /// What the reader had said last as `sent` went out, which tells it apart
-    /// from an earlier message reading the same.
-    sent_after: SentAfter,
-    sent_attachments: Vec<Attachment>,
-    /// Which end of the history this command is extending, where it is a
-    /// page request at all. The transcript says so at the edge the rows will
-    /// appear at, so it has to know which edge is waiting.
-    page: Option<view::Page>,
-    /// The step of a queued first message this command takes, if it is one.
-    queued: Option<QueuedStep>,
+/// [`Action::CommandsDue`] for `target`, once a turn has had time to begin.
+fn commands_due(target: Target) -> Task<Message> {
+    cosmic::task::future(async move {
+        tokio::time::sleep(commands::TURN_PATIENCE).await;
+        Message::ChatUi(Action::CommandsDue(target))
+    })
 }
+
+/// Sends `command` to the conversation `handle` reaches, off the UI thread,
+/// and answers with its outcome. Without one, it is answered as not sent.
+fn run_chat_command(
+    target: Target,
+    id: u64,
+    handle: Option<Arc<ClientHandle>>,
+    command: Command,
+) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = match handle {
+            Some(handle) => tokio::task::spawn_blocking(move || handle.send(command))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result),
+            None => Err("The conversation disconnected before this was sent.".to_owned()),
+        };
+        Message::ChatUi(Action::CommandFinished(target, id, result))
+    })
+}
+
 /// What a chat card's conversation runs through.
 enum Connection {
     /// Nothing runs yet. A new conversation starts its CLI when its first
@@ -2897,12 +2904,10 @@ pub enum QueueCopy {
 /// conversation takes it, and returns to the composer if it never does.
 struct Queued {
     /// Immutable local input; never a fabricated provider-history Item.
-    source: Arc<prompt::LocalSource>,
-    presentation: prompt::LocalPresentation,
+    prompt: prompt::LocalPrompt,
     /// Resolve draft skill choices before the provider replaces the draft
     /// catalog; two provider skills may share a name after startup.
     resolved_text: String,
-    attachments: Vec<Attachment>,
     /// The model the draft chose, to be selected before the message is sent.
     /// `None` once it has been, or when the provider's default was chosen.
     model: Option<(String, Option<String>)>,
@@ -2919,8 +2924,8 @@ impl Queued {
     fn submission_text<'a>(&'a self, snapshot: &Snapshot) -> &'a str {
         // A provider command learned during startup takes precedence over a
         // draft skill with the same slash name.
-        if slash_invocation(self.source.text(), snapshot).is_some() {
-            self.source.text()
+        if slash_invocation(self.prompt.text(), snapshot).is_some() {
+            self.prompt.text()
         } else {
             &self.resolved_text
         }
@@ -3026,6 +3031,20 @@ fn user_messages(snapshot: &Snapshot) -> impl DoubleEndedIterator<Item = (&str, 
         })
 }
 
+/// What follows `message` in `text`, where `text` begins with it as a
+/// message of its own: all of it, or its first lines.
+fn leading<'a>(text: &'a str, message: &str) -> Option<&'a str> {
+    let message = message.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let rest = text.trim_start().strip_prefix(message)?;
+    if rest.trim().is_empty() {
+        return Some("");
+    }
+    rest.strip_prefix('\n')
+}
+
 /// What the reader had said last in `snapshot`'s conversation, as `sent`
 /// goes to it.
 fn sent_after(snapshot: &Snapshot, sent: &str) -> SentAfter {
@@ -3127,7 +3146,10 @@ pub(super) struct Runtime {
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
-    next_followup: u64,
+    /// The place of the next thing the reader writes: a held follow-up's ID,
+    /// or a message's, so that what comes back to the composer from both
+    /// comes back in the order written.
+    next_written: u64,
     /// Provider queue entries asked back, until the provider says whether it
     /// let go of each.
     recalling: Vec<Recall>,
@@ -3238,7 +3260,7 @@ pub(super) struct Runtime {
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
     answers: view::Answers,
-    pending: Option<PendingCommand>,
+    commands: commands::Commands,
     next_command: u64,
     disconnected: bool,
     /// A fingerprint of the models this conversation last listed to the
@@ -3894,13 +3916,21 @@ impl Runtime {
 
     /// Returns every held follow-up to the composer, in the order written.
     fn restore_followups(&mut self) {
+        if self.return_followups() {
+            let _ = self.present();
+        }
+    }
+
+    /// [`Self::restore_followups`], leaving the pane to be presented by its
+    /// caller. Whether there were any.
+    fn return_followups(&mut self) -> bool {
         if self.followups.is_empty() {
-            return;
+            return false;
         }
         let (text, attachments) = self.combined_followups();
         self.followups.clear();
         self.take_back(&text, attachments, PromptMode::Queue);
-        let _ = self.present();
+        true
     }
 
     /// The held follow-ups as the one prompt they are sent as: their text in
@@ -3931,11 +3961,17 @@ impl Runtime {
         (text, attachments)
     }
 
-    /// Whether a command is carrying the held follow-ups to the provider.
+    /// Whether a command is carrying held follow-ups to the provider.
     fn followups_sending(&self) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|pending| pending.followup)
+        self.commands.carrying_followups()
+    }
+
+    /// Whether the held follow-up `id` is on its way to the provider, and so
+    /// no longer the reader's to take back or remove.
+    fn followup_sending(&self, id: u64) -> bool {
+        self.commands
+            .iter()
+            .any(|pending| pending.followups.contains(&id))
     }
 
     /// Whether `message`, held by the provider, can return to the composer.
@@ -3991,20 +4027,19 @@ impl Runtime {
     /// The waiting message the keyboard takes back: the newest one that can
     /// be. Held follow-ups are sent after everything the provider holds.
     fn newest_take_back(&self) -> Option<QueueEntry> {
-        if self.followups_sending() {
-            return None;
+        match self.followups.last() {
+            // One on its way is no longer the reader's to take back.
+            Some(followup) => {
+                (!self.followup_sending(followup.id)).then_some(QueueEntry::Local(followup.id))
+            }
+            None => self
+                .snapshot
+                .queued_messages
+                .iter()
+                .rev()
+                .find(|message| self.provider_take_back(message))
+                .map(|message| QueueEntry::Provider(message.id.clone())),
         }
-        self.followups
-            .last()
-            .map(|followup| QueueEntry::Local(followup.id))
-            .or_else(|| {
-                self.snapshot
-                    .queued_messages
-                    .iter()
-                    .rev()
-                    .find(|message| self.provider_take_back(message))
-                    .map(|message| QueueEntry::Provider(message.id.clone()))
-            })
     }
 
     /// Records a message the provider accepted. The same message sent twice
@@ -4106,9 +4141,11 @@ impl Runtime {
         self.settle_draft_echo();
     }
 
-    /// Drops the composer text if it is exactly the message it may repeat,
-    /// which the conversation already has, so it is not offered again. Any
-    /// other text is the reader's own and stays.
+    /// Drops from the composer the message it may repeat, which the
+    /// conversation already has, so it is not offered again: the whole text
+    /// where it is exactly that message, or, for one still being sent as its
+    /// chat closed, the lines it leads. Any other text is the reader's own
+    /// and stays.
     fn settle_draft_echo(&mut self) {
         let Some((revision, echo)) = self.draft_echo.take() else {
             return;
@@ -4155,10 +4192,17 @@ impl Runtime {
                 // to repeat it.
                 return;
             };
-            composer.trim() == message.trim()
+            // A message still being sent leads what was written after it,
+            // which is the reader's own however it went.
+            match &echo {
+                DraftEcho::First => (composer.trim() == message.trim()).then(String::new),
+                DraftEcho::Latest(_) => {
+                    leading(&composer, message).map(|rest| rest.trim_end().to_owned())
+                }
+            }
         };
-        if repeated {
-            self.replace_draft(text_editor::Content::new());
+        if let Some(rest) = repeated {
+            self.replace_draft(text_editor::Content::with_text(&rest));
         }
     }
 
@@ -4171,13 +4215,16 @@ impl Runtime {
         self.unsent_with_held(self.queued.as_ref())
     }
 
-    /// The composer's text and attachments, after `queued` and the held
-    /// follow-ups, each part on its own line, every attachment once.
+    /// The composer's text and attachments, after `queued`, the messages on
+    /// their way the provider has not taken yet, and the held follow-ups,
+    /// each part on its own line, every attachment once.
     fn unsent_with_held(&self, queued: Option<&Queued>) -> (String, Vec<Attachment>) {
         let followups = (!self.followups.is_empty()).then(|| self.combined_followups());
         let held = queued
+            .map(|queued| &queued.prompt)
             .into_iter()
-            .map(|queued| (queued.source.text(), queued.attachments.as_slice()))
+            .chain(self.commands.unsent().map(|outgoing| &outgoing.prompt))
+            .map(|prompt| (prompt.text(), prompt.attachments.as_slice()))
             .chain(
                 followups
                     .iter()
@@ -4206,10 +4253,10 @@ impl Runtime {
     fn prompt_suggestion(&self) -> Option<&chat::PromptSuggestion> {
         let suggestion = self.snapshot.prompt_suggestion.as_ref()?;
         if self.disconnected
-            || self.pending.is_some()
+            || !self.commands.is_idle()
             || self.queued.is_some()
             || self.handle().is_none()
-            || self.snapshot.busy
+            || self.turn_under_way()
             || !self.snapshot.ready
             || self.snapshot.exited
             || !self.composer.text().trim_end_matches('\n').is_empty()
@@ -4306,7 +4353,7 @@ impl Runtime {
             agent_addresses: Default::default(),
             queued: None,
             followups: Vec::new(),
-            next_followup: 0,
+            next_written: 0,
             recalling: Vec::new(),
             taken_back: Vec::new(),
             resend: None,
@@ -4370,7 +4417,7 @@ impl Runtime {
             child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
             answers: HashMap::new(),
-            pending: None,
+            commands: commands::Commands::default(),
             next_command: 0,
             disconnected: false,
             listed_models: 0,
@@ -4540,19 +4587,19 @@ impl Runtime {
     /// Puts a first message that was never sent back in the composer, ahead
     /// of anything written since, with its attachments.
     fn unqueue(&mut self) -> Option<chat::Session> {
-        let queued = self.queued.take()?;
+        let mut queued = self.queued.take()?;
         self.preparation.clear_local();
         // Nothing waits on the snapshot of a hidden card any more; a
         // connection that has gone has nothing to be told.
         let _ = self.present();
         let written = self.composer.text();
         let text = if written.is_empty() {
-            queued.source.text().to_owned()
+            queued.prompt.text().to_owned()
         } else {
-            format!("{}\n{written}", queued.source.text())
+            format!("{}\n{written}", queued.prompt.text())
         };
         self.replace_draft(text_editor::Content::with_text(&text));
-        let written = self.replace_attachments(queued.attachments);
+        let written = self.replace_attachments(std::mem::take(&mut queued.prompt.attachments));
         self.merge_attachments(written);
         Some(queued.draft)
     }
@@ -4671,13 +4718,13 @@ impl Runtime {
     }
 
     /// Whether the composer takes a message now. A first or queued message
-    /// still waiting goes before anything else is sent.
+    /// still waiting goes before anything else is sent. A command on its way
+    /// never closes it: what is given meanwhile waits behind that command.
     pub(super) fn composer_available(&self, transitioning: bool) -> bool {
         !transitioning
             && !self.closed_elsewhere
             && !self.disconnected
             && !self.snapshot.exited
-            && self.pending.is_none()
             && self.queued.is_none()
     }
 
@@ -4693,7 +4740,6 @@ impl Runtime {
             && (!snapshot.exited || self.has_connected_saved_history(snapshot))
             && !self.closed_elsewhere
             && !self.disconnected
-            && self.pending.is_none()
             && self.queued.is_none()
             && self.attachment_chooser_pending.is_none();
         [
@@ -4732,7 +4778,7 @@ impl Runtime {
     pub(super) fn plan_toggle(&self) -> Option<&str> {
         let modes = &self.snapshot.capabilities.permission_modes;
         modes.iter().any(|mode| mode == PLAN_MODE).then_some(())?;
-        if self.snapshot.permission_mode.as_deref() != Some(PLAN_MODE) {
+        if self.chosen_permission_mode() != Some(PLAN_MODE) {
             return Some(PLAN_MODE);
         }
         let other = |mode: &&String| mode.as_str() != PLAN_MODE;
@@ -5114,13 +5160,15 @@ impl Runtime {
             self.preparation.clear_local();
             return;
         }
-        if let Some(queued) = &self.queued {
-            if queued.presentation.prepared.is_none() {
-                self.preparation
-                    .stage_local(self.target, &queued.source, self.syntax_theme);
+        match self.local_prompt() {
+            Some(prompt) => {
+                if prompt.presentation.prepared.is_none() {
+                    let source = prompt.source.clone();
+                    self.preparation
+                        .stage_local(self.target, &source, self.syntax_theme);
+                }
             }
-        } else {
-            self.preparation.clear_local();
+            None => self.preparation.clear_local(),
         }
     }
 
@@ -5682,6 +5730,7 @@ impl Runtime {
         self.child_ordinals.observe(&snapshot.subagents);
         if !self.presents() {
             self.release_transcript_presentation();
+            self.settle_commands(&snapshot, false);
             Arc::make_mut(&mut snapshot).evict_transcript();
             self.snapshot = snapshot;
             self.source_clock = source_clock;
@@ -5709,10 +5758,7 @@ impl Runtime {
         );
         if self.page_request.is_some_and(|(_, generation)| {
             snapshot.generation > generation && !snapshot.history_loading
-        }) && self
-            .pending
-            .as_ref()
-            .is_none_or(|pending| pending.page.is_none())
+        }) && self.commands.iter().all(|pending| pending.page.is_none())
         {
             self.page_request = None;
             self.earlier_asked = None;
@@ -5763,6 +5809,9 @@ impl Runtime {
         });
         self.scroll_memory.retain_children(&snapshot.subagents);
         self.settle_recalls(&snapshot);
+        if self.settle_commands(&snapshot, true) {
+            self.prepare_local_prompt();
+        }
         self.taken_back.retain(|id| {
             snapshot
                 .queued_messages
@@ -6210,9 +6259,7 @@ impl Runtime {
         if !visible {
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
-            if let Some(queued) = &mut self.queued {
-                queued.presentation = prompt::LocalPresentation::default();
-            }
+            self.forget_local_presentations();
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
         let rewarmed = visible && self.warm.take().is_some();
@@ -6363,9 +6410,7 @@ impl Runtime {
         // choices for the authoritative rehydration.
         self.failure_ui.release_presentation();
         self.provider_queue.borrow_mut().clear();
-        if let Some(queued) = &mut self.queued {
-            queued.presentation = prompt::LocalPresentation::default();
-        }
+        self.forget_local_presentations();
         self.preparation.clear();
         self.cache = HashMap::new();
         self.child_cache = HashMap::new();
@@ -6533,10 +6578,8 @@ impl Runtime {
     fn message_on_its_way(&self) -> bool {
         self.queued.is_some()
             || !self.followups.is_empty()
-            || self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.sent.is_some())
+            || self.commands.unsent().next().is_some()
+            || self.followups_sending()
     }
     /// Ownership can become durable after the initial attachment, including
     /// while the pane is hidden. Preserve that confirmed capability before
@@ -6561,7 +6604,7 @@ impl Runtime {
             Some("Finish or cancel the file chooser before leaving the chat.")
         } else if self.pastes_pending != 0 {
             Some("Wait for the image attachment to finish before leaving the chat.")
-        } else if self.pending.is_some() {
+        } else if !self.commands.is_idle() {
             Some("Wait for the pending chat command to finish before leaving the chat.")
         } else if self.queued.is_some() {
             Some(QUEUED_BLOCKER)
@@ -6996,13 +7039,6 @@ fn draft_snapshot(
     }
 }
 
-/// The chosen model, including a listed default alias when no explicit model
-/// has been stored yet. A stale explicit choice does not select another model.
-pub(super) fn selected_chat_model(snapshot: &Snapshot) -> Option<&chat::Model> {
-    let selected = snapshot.selected_model.as_deref().unwrap_or("default");
-    snapshot.models.iter().find(|model| model.id == selected)
-}
-
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -7431,10 +7467,7 @@ impl Cagents {
             _ => return Task::none(),
         };
         let permission_controls = runtime.permission_controls(
-            !runtime.disconnected
-                && !runtime.snapshot.exited
-                && runtime.pending.is_none()
-                && runtime.queued.is_none(),
+            !runtime.disconnected && !runtime.snapshot.exited && runtime.queued.is_none(),
         );
         let focus = match &action {
             Action::AccountPicker(_, true) => Some(card_control_id(card, "chat-account-choice-0")),
@@ -7519,7 +7552,6 @@ impl Cagents {
                 !self.chat_start_pending(card)
                     && !runtime.disconnected
                     && !runtime.snapshot.exited
-                    && runtime.pending.is_none()
                     && runtime.queued.is_none(),
             )
         };
@@ -8031,7 +8063,8 @@ impl Cagents {
                 || runtime.snapshot.waiting
                 || !runtime.snapshot.requests.is_empty()
                 || !runtime.snapshot.queued_messages.is_empty()
-                || runtime.pending.is_some()
+                || !runtime.commands.is_idle()
+                || runtime.turn_under_way()
                 || !runtime.followups.is_empty()
                 || runtime.disconnected
                 || runtime.snapshot.exited)
@@ -8677,7 +8710,7 @@ impl Cagents {
                 && runtime.choosing()
                 && runtime.composer.is_empty()
                 && runtime.attachments.is_empty()
-                && runtime.pending.is_none())
+                && runtime.commands.is_idle())
             && !self.chat_start_pending(card)
     }
 
@@ -9756,10 +9789,10 @@ impl Cagents {
         (!self.chat_start_pending(card)
             && !runtime.disconnected
             && !snapshot.exited
-            && runtime.pending.is_none()
+            && runtime.commands.is_idle()
             && runtime.queued.is_none()
             && snapshot.ready
-            && !snapshot.busy
+            && !runtime.turn_under_way()
             && snapshot.read_only_reason.is_none()
             && snapshot.capabilities.branch)
             .then_some(runtime.target)
@@ -9991,7 +10024,7 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) => runtime
                 .queued
                 .as_ref()
-                .map(|queued| queued.source.text().to_owned()),
+                .map(|queued| queued.prompt.text().to_owned()),
             _ => None,
         }
     }
@@ -11087,11 +11120,10 @@ impl Cagents {
             return Task::none();
         };
         runtime.preparation.clear_local();
+        let attachments = runtime.take_attachments();
         runtime.queued = Some(Queued {
-            source: prompt::LocalSource::new(pending.text),
-            presentation: prompt::LocalPresentation::default(),
+            prompt: prompt::LocalPrompt::new(pending.text, attachments),
             resolved_text: pending.resolved_text,
-            attachments: runtime.take_attachments(),
             model: pending.model,
             draft: pending.candidate.clone(),
             since: None,
@@ -11142,11 +11174,18 @@ impl Cagents {
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };
-        if runtime.pending.is_some() || runtime.disconnected {
+        if !runtime.commands.is_idle() || runtime.disconnected {
             return Task::none();
         }
         let latest = handle.snapshot();
-        if latest.ready && !latest.busy && !latest.exited && !runtime.followups.is_empty() {
+        // Held follow-ups wait until a message just sent has shown, which
+        // is when the turn it starts can be seen.
+        if latest.ready
+            && !latest.busy
+            && !latest.exited
+            && !runtime.followups.is_empty()
+            && runtime.commands.outgoing().next().is_none()
+        {
             let (text, attachments) = runtime.combined_followups();
             // A queued message remains a prompt. Resolving it as an idle
             // slash command could discard everything combined after /compact.
@@ -11164,11 +11203,20 @@ impl Cagents {
                     return Task::none();
                 }
             };
+            let ids = runtime
+                .followups
+                .iter()
+                .map(|followup| followup.id)
+                .collect();
+            let message =
+                commands::Outgoing::new(text, attachments, PromptMode::Send, &runtime.snapshot);
+            let sent = runtime.next_command;
             let task = self.chat_send(target, command, false);
             if let Some(runtime) = self.chat_runtime_mut(target)
-                && let Some(pending) = &mut runtime.pending
+                && runtime.next_command != sent
+                && let Some(pending) = runtime.commands.newest_mut()
             {
-                pending.followup = true;
+                pending.carry_followups(ids, message);
             }
             return task;
         }
@@ -11224,7 +11272,7 @@ impl Cagents {
         match submission(
             queued.submission_text(&snapshot),
             &snapshot,
-            &queued.attachments,
+            &queued.prompt.attachments,
             PromptMode::Send,
         ) {
             Ok(command) => self.chat_send_step(
@@ -11313,7 +11361,7 @@ impl Cagents {
         let text = runtime
             .queued
             .take()
-            .map(|queued| (queued.source.text().to_owned(), queued.attachments));
+            .map(|queued| (queued.prompt.text().to_owned(), queued.prompt.attachments));
         let _ = runtime.present();
         // A delivery report about a message that arrived anyway says
         // nothing more the reader can act on.
@@ -11363,7 +11411,8 @@ impl Cagents {
         runtime.session = draft.clone();
         runtime.snapshot = Arc::new(snapshot);
         runtime.forget_transcript();
-        runtime.pending = None;
+        let unsent = runtime.commands.abandon();
+        runtime.restore_outgoing(unsent);
         runtime.disconnected = false;
         runtime.error = error;
         runtime.refresh();
@@ -11387,9 +11436,9 @@ impl Cagents {
         };
         if runtime.queued.is_none()
             || runtime
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.queued == Some(QueuedStep::Prompt))
+                .commands
+                .iter()
+                .any(|pending| pending.queued == Some(QueuedStep::Prompt))
         {
             return Task::none();
         }
@@ -11409,7 +11458,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        if runtime.pending.is_some()
+        if !runtime.commands.is_idle()
             || runtime.queued.is_some()
             || runtime.disconnected
             || runtime.selected_subagent.is_some()
@@ -11490,30 +11539,30 @@ impl Cagents {
             return Task::none();
         }
         // A queued first message goes out ahead of anything else, and
-        // nothing is sent past it while it waits.
-        if runtime.pending.is_some()
-            || runtime.disconnected
+        // nothing is sent past it while it waits. Anything else given while
+        // a command is on its way waits behind it, in order.
+        if runtime.disconnected
             || (runtime.queued.is_some() != step.is_some())
+            || (step.is_some() && !runtime.commands.is_idle())
         {
             return Task::none();
         }
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };
-        let request = if let Command::Answer {
+        if let Command::Answer {
             request_id, action, ..
         } = &command
-        {
-            if !runtime.snapshot.requests.iter().any(|request| {
+            && !runtime.snapshot.requests.iter().any(|request| {
                 &request.id == request_id
                     && request.actions.iter().any(|choice| &choice.id == action)
-            }) {
-                return Task::none();
-            }
-            Some(request_id.clone())
-        } else {
-            None
-        };
+            })
+        {
+            return Task::none();
+        }
+        if runtime.commands.repeats(&command) {
+            return Task::none();
+        }
         if command == Command::LoadEarlier
             && (runtime.selected_subagent.is_some()
                 || !runtime.snapshot.has_earlier
@@ -11541,13 +11590,22 @@ impl Cagents {
         }
         runtime.next_command = runtime.next_command.wrapping_add(1);
         let id = runtime.next_command;
-        let page = match &command {
-            Command::LoadEarlier => Some(view::Page::Earlier),
-            Command::Refresh => Some(view::Page::Latest),
-            Command::LoadLater => Some(view::Page::Newer),
-            _ => None,
-        };
-        if let Some(page) = page {
+        let mut pending = commands::PendingCommand::new(id, &command);
+        pending.queued = step;
+        if let Some(sent) = &pending.sent {
+            // A message still on its way reading the same may arrive first,
+            // and nothing would tell the two apart.
+            pending.sent_after = if runtime
+                .commands
+                .outgoing()
+                .any(|outgoing| outgoing.prompt.text().trim() == sent.trim())
+            {
+                SentAfter::Unseen
+            } else {
+                sent_after(&runtime.snapshot, sent)
+            };
+        }
+        if let Some(page) = pending.page {
             if page == view::Page::Latest {
                 match latest_reader {
                     LatestReader::Follow => runtime
@@ -11569,48 +11627,43 @@ impl Cagents {
                 }
             }
         }
-        let first_prompt = match &command {
-            Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
-            _ => None,
-        };
-        let sent = match &command {
-            Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
-            Command::Slash { command } => Some(command.clone()),
-            _ => None,
-        };
-        let sent_after = sent.as_deref().map_or_else(SentAfter::default, |sent| {
-            sent_after(&runtime.snapshot, sent)
-        });
-        let sent_attachments = match &command {
-            Command::Prompt { attachments, .. } => attachments.clone(),
-            _ => Vec::new(),
-        };
-        let model = match &command {
-            Command::SetModel { model, reasoning } => Some((model.clone(), reasoning.clone())),
-            _ => None,
-        };
-        runtime.pending = Some(PendingCommand {
-            followup: false,
-            take_back: None,
-            id,
-            draft_revision: clear_draft.then_some(runtime.revision),
-            request,
-            first_prompt,
-            model,
-            page,
-            sent,
-            sent_after,
-            sent_attachments,
-            queued: step,
-        });
+        if clear_draft {
+            // The message leaves the composer now, for where it is going,
+            // rather than when the provider answers: the reader can write
+            // the next one meanwhile, and one the provider refuses comes
+            // back with the reason.
+            let text = runtime.composer.text().trim_end().to_owned();
+            let attachments = runtime.take_attachments();
+            runtime.replace_draft(text_editor::Content::new());
+            let mode = match &command {
+                Command::Prompt { mode, .. } => *mode,
+                _ => PromptMode::Send,
+            };
+            let mut outgoing = commands::Outgoing::new(text, attachments, mode, &runtime.snapshot);
+            outgoing.written = runtime.next_written;
+            runtime.next_written += 1;
+            pending.outgoing = Some(outgoing);
+            runtime.prepare_local_prompt();
+        }
         runtime.error = None;
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || handle.send(command))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            Message::ChatUi(Action::CommandFinished(target, id, result))
-        })
+        let snapshot = runtime.snapshot.clone();
+        match runtime.commands.push(pending, command, &snapshot) {
+            Some((id, command)) => run_chat_command(target, id, Some(handle), command),
+            None => Task::none(),
+        }
+    }
+
+    /// Sends the next command waiting behind one the provider has answered.
+    fn next_chat_command(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        let snapshot = runtime.snapshot.clone();
+        let Some((id, command)) = runtime.commands.next(&snapshot) else {
+            return Task::none();
+        };
+        let handle = runtime.handle().cloned().filter(|_| !runtime.disconnected);
+        run_chat_command(target, id, handle, command)
     }
     /// [`Self::handle_chat_ui`] for the update loop, which also answers how
     /// much of the workspace projection the action changed.
@@ -11898,13 +11951,14 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.refresh();
                     if runtime.visible.load(Ordering::Relaxed)
-                        && let Some(queued) = runtime.queued.as_mut()
-                        && let Some(prepared) =
-                            runtime
-                                .preparation
-                                .accept_local(target, run, &queued.source, ready)
+                        && let Some(source) =
+                            runtime.local_prompt().map(|prompt| prompt.source.clone())
+                        && let Some(prepared) = runtime
+                            .preparation
+                            .accept_local(target, run, &source, ready)
+                        && let Some(prompt) = runtime.local_prompt_mut()
                     {
-                        prepared.install_local(&mut queued.presentation);
+                        prepared.install_local(&mut prompt.presentation);
                         runtime.presentation_revision =
                             runtime.presentation_revision.wrapping_add(1);
                         runtime.find_navigation.changed_document();
@@ -12541,9 +12595,7 @@ impl Cagents {
                                 waiting.clear();
                             }
                             runtime.preparation.clear();
-                            if let Some(queued) = &mut runtime.queued {
-                                queued.presentation = prompt::LocalPresentation::default();
-                            }
+                            runtime.forget_local_presentations();
                             if runtime.retains_source_body() {
                                 // The validated successor owns a new source,
                                 // even if its generation and item IDs repeat.
@@ -12556,7 +12608,16 @@ impl Cagents {
                             runtime.account_picker = false;
                             runtime.session = session.clone();
                             runtime.disconnected = false;
-                            runtime.pending = None;
+                            // Whatever the old handle was still sending may
+                            // or may not have arrived. It comes back to the
+                            // composer, which lets go of it if the
+                            // conversation shows it did.
+                            let after = runtime.commands.first_unsent_after();
+                            let unsent = runtime.commands.abandon();
+                            if !unsent.is_empty() {
+                                runtime.restore_outgoing(unsent);
+                                runtime.await_draft_echo(DraftEcho::Latest(after));
+                            }
                             // Request generations belong to the old handle. A
                             // restarted daemon can begin again at generation 1.
                             runtime.page_request = None;
@@ -13213,6 +13274,9 @@ impl Cagents {
                             refresh_limits,
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
+                            // A command waiting for the turn a message
+                            // starts goes once the conversation shows it.
+                            self.next_chat_command(target),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
                             fork.map_or_else(Task::none, |session| {
@@ -13327,7 +13391,7 @@ impl Cagents {
                     return Task::none();
                 };
                 let session = runtime.session.clone();
-                if runtime.pending.is_some()
+                if !runtime.commands.is_idle()
                     || runtime.attachment_chooser_pending.is_some()
                     || runtime.pastes_pending > 0
                 {
@@ -13363,7 +13427,7 @@ impl Cagents {
                 }
                 if !runtime.is_saved_history_snapshot(&snapshot)
                     || snapshot.history_loading
-                    || runtime.pending.is_some()
+                    || !runtime.commands.is_idle()
                     || runtime.attachment_chooser_pending.is_some()
                 {
                     return Task::none();
@@ -13701,7 +13765,10 @@ impl Cagents {
                 };
                 // Match the disabled Send control before account routing,
                 // paste deferral or queue mutation can consume the draft.
+                // Nothing goes past a first message still on its way; the
+                // draft stays as written.
                 if runtime.start_blocked.is_some()
+                    || runtime.queued.is_some()
                     || (!runtime.is_draft()
                         && (runtime.disconnected
                             || runtime.snapshot.exited
@@ -13803,8 +13870,7 @@ impl Cagents {
                 if (!runtime.followups.is_empty() && mode != PromptMode::Steer
                     || mode == PromptMode::Queue
                         && !runtime.snapshot.capabilities.queue
-                        && runtime.snapshot.busy)
-                    && runtime.pending.is_none()
+                        && runtime.turn_under_way())
                     && !runtime.disconnected
                     && !runtime.snapshot.exited
                 {
@@ -13829,8 +13895,8 @@ impl Cagents {
                         );
                         return Task::none();
                     }
-                    let id = runtime.next_followup;
-                    runtime.next_followup += 1;
+                    let id = runtime.next_written;
+                    runtime.next_written += 1;
                     let text = runtime.composer.text().trim_end().to_owned();
                     let followup = Followup {
                         id,
@@ -13842,7 +13908,7 @@ impl Cagents {
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
-                    return if runtime.snapshot.busy {
+                    return if runtime.turn_under_way() {
                         Task::none()
                     } else {
                         self.dispatch_queued(target)
@@ -13850,7 +13916,7 @@ impl Cagents {
                 }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
-                    || (mode == PromptMode::Send && runtime.snapshot.busy)
+                    || (mode == PromptMode::Send && runtime.turn_under_way())
                 {
                     return Task::none();
                 }
@@ -13877,7 +13943,7 @@ impl Cagents {
                         .map(cosmic::Action::App);
                 match entry {
                     QueueEntry::Local(id) => {
-                        if runtime.followups_sending() {
+                        if runtime.followup_sending(id) {
                             return Task::none();
                         }
                         let Some(index) = runtime
@@ -13917,7 +13983,7 @@ impl Cagents {
                             self.chat_send(target, Command::RemoveQueued { id: id.clone() }, false);
                         if let Some(runtime) = self.chat_runtime_mut(target)
                             && runtime.next_command != sent
-                            && let Some(pending) = &mut runtime.pending
+                            && let Some(pending) = runtime.commands.newest_mut()
                         {
                             pending.take_back = Some(id);
                             runtime.recalling.push(Recall { message, answered });
@@ -13929,7 +13995,7 @@ impl Cagents {
             Action::RemoveQueued(target, entry) => match entry {
                 QueueEntry::Local(id) => {
                     if let Some(runtime) = self.chat_runtime_mut(target)
-                        && !runtime.followups_sending()
+                        && !runtime.followup_sending(id)
                     {
                         runtime.followups.retain(|followup| followup.id != id);
                         let _ = runtime.present();
@@ -14119,9 +14185,9 @@ impl Cagents {
                             return Task::none();
                         }
                         if runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page.is_none())
+                            .commands
+                            .iter()
+                            .any(|pending| pending.page.is_none())
                             && runtime.deferred_page != Some(HistoryNavigation::Latest)
                         {
                             runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
@@ -14131,8 +14197,8 @@ impl Cagents {
                 }
                 if matches!(command, Command::Branch { .. })
                     && let Some(runtime) = self.chat_runtime_mut(target)
-                    && runtime.pending.is_none()
-                    && !runtime.snapshot.busy
+                    && runtime.commands.is_idle()
+                    && !runtime.turn_under_way()
                 {
                     runtime.branch_picker = false;
                     runtime.fork_requested = true;
@@ -14153,6 +14219,10 @@ impl Cagents {
                     });
                 }
                 runtime.interrupt_armed = None;
+                // Before the turn has begun, Stop also takes back what was
+                // lined up behind it. The provider is still told to stop, so
+                // the turn ends as it begins.
+                runtime.withdraw_before_turn();
                 return self.chat_send(target, Command::Interrupt, false);
             }
             Action::DisarmInterrupt(target, at) => {
@@ -14398,50 +14468,55 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.id == id)
-                {
+                let Some(mut pending) = runtime.commands.finish(id) else {
                     return Task::none();
-                }
-                let pending = runtime.pending.take().unwrap();
+                };
                 let provider = runtime.session.launch.provider;
                 if result.is_ok()
-                    && let Some((model, reasoning)) = pending.model.clone()
+                    && let Some(commands::Choice::Model { model, reasoning }) =
+                        pending.choice.clone()
                 {
                     self.remember_chat_model(provider, Some(model), reasoning);
                 }
                 if let Some(step) = pending.queued {
-                    return self.queued_step_finished(target, step, pending.first_prompt, result);
+                    return Task::batch([
+                        self.queued_step_finished(target, step, pending.first_prompt, result),
+                        self.next_chat_command(target),
+                    ]);
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 let mut followups_sent = false;
+                let mut due = Task::none();
                 let first_prompt = match result {
                     Ok(()) => {
-                        if pending.followup {
-                            followups_sent = !runtime.followups.is_empty();
-                            runtime.followups.clear();
+                        if !pending.followups.is_empty() {
+                            let before = runtime.followups.len();
+                            runtime
+                                .followups
+                                .retain(|followup| !pending.followups.contains(&followup.id));
+                            followups_sent = runtime.followups.len() != before;
                             let _ = runtime.present();
                         }
-                        // What the notice described left with this message,
-                        // even when the reader has typed on since.
-                        if pending.draft_revision.is_some() {
-                            runtime.restored_waiting = None;
+                        if let Some(sent) = pending.sent.take() {
+                            runtime.remember_with_attachments(
+                                sent,
+                                std::mem::take(&mut pending.sent_attachments),
+                            );
                         }
-                        if pending.draft_revision == Some(runtime.revision) {
-                            runtime.replace_draft(text_editor::Content::new());
-                            runtime.take_attachments();
-                        }
-                        if let Some(sent) = pending.sent {
-                            runtime.remember_with_attachments(sent, pending.sent_attachments);
-                        }
-                        if let Some(request) = pending.request {
-                            runtime.answers.retain(|(id, _), _| id != &request);
+                        if let Some(request) = &pending.request {
+                            runtime.answers.retain(|(id, _), _| id != request);
                         }
                         runtime.refresh();
+                        let snapshot = runtime.snapshot.clone();
+                        runtime.commands.accept(&mut pending, &snapshot);
+                        let items = runtime.presents();
+                        runtime.settle_commands(&snapshot, items);
+                        runtime.prepare_local_prompt();
+                        if runtime.commands.turn_coming(&snapshot) {
+                            due = commands_due(target);
+                        }
                         if pending.page == Some(view::Page::Latest)
                             && runtime.deferred_page == Some(HistoryNavigation::Latest)
                         {
@@ -14463,6 +14538,8 @@ impl Cagents {
                             }
                             return Task::batch([
                                 snap,
+                                due,
+                                self.next_chat_command(target),
                                 self.dispatch_queued(target),
                                 self.resume_history_navigation(target),
                             ]);
@@ -14479,11 +14556,22 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                         }
-                        if pending.followup {
-                            runtime.restore_followups();
-                        }
+                        // A message the provider did not take goes back to
+                        // the composer, and so does any written after it:
+                        // sent without it, they would arrive out of order.
+                        // Held follow-ups were written after it too, or are
+                        // what it carried.
+                        let unsent = pending.take_unsent();
                         if let Some(id) = &pending.take_back {
                             runtime.recalling.retain(|recall| &recall.message.id != id);
+                        }
+                        if let Some(outgoing) = unsent {
+                            let mut messages = vec![outgoing];
+                            messages.extend(runtime.commands.withdraw_messages());
+                            runtime.take_back_lined_up(messages);
+                            runtime.prepare_local_prompt();
+                        } else if !pending.followups.is_empty() {
+                            runtime.restore_followups();
                         }
                         runtime.note(error.clone());
                         runtime.fork_requested = false;
@@ -14503,9 +14591,24 @@ impl Cagents {
                 // acknowledgement. No later provider event is guaranteed to
                 // wake the follow-up again once the command releases it.
                 return Task::batch([
+                    due,
+                    self.next_chat_command(target),
                     self.dispatch_queued(target),
                     self.resume_history_navigation(target),
                 ]);
+            }
+            Action::CommandsDue(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let snapshot = runtime.snapshot.clone();
+                let items = runtime.presents();
+                if runtime.settle_commands(&snapshot, items) {
+                    runtime.prepare_local_prompt();
+                }
+                // A conversation still working reports again when it stops,
+                // and its report settles the message then.
+                return Task::batch([self.next_chat_command(target), self.dispatch_queued(target)]);
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -14993,10 +15096,8 @@ impl Cagents {
                 };
                 let text: Option<Arc<str>> = match source {
                     QueueCopy::Initial(source) => runtime
-                        .queued
-                        .as_ref()
-                        .filter(|queued| source.as_ptr() == Arc::as_ptr(&queued.source))
-                        .map(|queued| Arc::from(queued.source.text())),
+                        .local_prompt_by_source(&source)
+                        .map(|prompt| Arc::from(prompt.text())),
                     QueueCopy::Provider(source, id) => {
                         let current = runtime
                             .provider_queue
@@ -15060,14 +15161,14 @@ impl Cagents {
                 };
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
-                    if runtime.pending.is_some() {
+                    if !runtime.commands.is_idle() {
                         runtime
                             .scroll_memory
                             .request_edge(None, scroll::Edge::Latest);
                         if !runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page == Some(view::Page::Latest))
+                            .commands
+                            .iter()
+                            .any(|pending| pending.page == Some(view::Page::Latest))
                         {
                             runtime.deferred_page = Some(HistoryNavigation::Latest);
                         }
@@ -15298,9 +15399,9 @@ impl Cagents {
                     return Task::none();
                 };
                 let reasoning = runtime
-                    .snapshot
+                    .chosen_model()
                     .reasoning
-                    .clone()
+                    .map(str::to_owned)
                     .filter(|reasoning| model.reasoning.contains(reasoning));
                 let command = Command::SetModel {
                     model: id,
@@ -15313,8 +15414,10 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.model_picker = None;
-                let Some(model) =
-                    selected_chat_model(&runtime.snapshot).filter(|model| model.id == model_id)
+                let Some(model) = runtime
+                    .chosen_model()
+                    .model(&runtime.snapshot)
+                    .filter(|model| model.id == model_id)
                 else {
                     return Task::none();
                 };
@@ -15357,10 +15460,9 @@ impl Cagents {
                 // replaced, whichever control entered it.
                 if mode == PLAN_MODE
                     && let Some(current) = runtime
-                        .snapshot
-                        .permission_mode
-                        .clone()
-                        .filter(|current| current != PLAN_MODE)
+                        .chosen_permission_mode()
+                        .filter(|current| *current != PLAN_MODE)
+                        .map(str::to_owned)
                 {
                     runtime.mode_before_plan = Some(current);
                 }
@@ -15743,11 +15845,11 @@ impl Cagents {
                     && runtime.snapshot.has_earlier
                     && runtime.earlier_asked != height
                 {
-                    if runtime.pending.is_some() {
+                    if !runtime.commands.is_idle() {
                         if runtime
-                            .pending
-                            .as_ref()
-                            .is_some_and(|pending| pending.page.is_none())
+                            .commands
+                            .iter()
+                            .any(|pending| pending.page.is_none())
                             && runtime
                                 .deferred_page
                                 .is_none_or(|page| page == HistoryNavigation::EarlierEdge)
@@ -15763,7 +15865,7 @@ impl Cagents {
                     && runtime.snapshot.has_later
                     && runtime.later_asked != height
                 {
-                    if runtime.pending.is_some() {
+                    if !runtime.commands.is_idle() {
                         if runtime.deferred_page.is_none() {
                             runtime.deferred_page = Some(HistoryNavigation::NewerEdge);
                         }

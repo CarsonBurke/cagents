@@ -447,6 +447,18 @@ fn composer_trailing(modes: &[PromptMode], busy: bool, has_draft: bool) -> Vec<T
         .collect()
 }
 
+/// What an empty composer says it is for, when Enter would send in `mode`
+/// and the conversation is `busy` or not.
+fn composer_placeholder(mode: Option<PromptMode>, busy: bool) -> &'static str {
+    match mode {
+        // Until the turn a message just sent starts shows, there is no turn
+        // in view to steer: what is written next joins it.
+        Some(PromptMode::Steer) if busy => "Steer this turn",
+        Some(PromptMode::Queue) => "Queue for the next turn",
+        Some(PromptMode::Send | PromptMode::Steer) | None => "Message",
+    }
+}
+
 /// The icon and tooltip for a submit control.
 ///
 /// `slot` is the control's place among the modes the provider currently
@@ -1814,9 +1826,14 @@ impl Runtime {
         selected: Option<&chat::Subagent>,
     ) -> Option<(Icon, String)> {
         let snapshot = &self.snapshot;
+        // A message drawn in the transcript as on its way says so itself.
         if self.closed_elsewhere
             || transitioning
             || self.queued.is_some()
+            || self
+                .commands
+                .outgoing()
+                .any(|outgoing| outgoing.in_transcript())
             || self.attachment_chooser_pending.is_some()
             || self.disconnected
             || snapshot.exited
@@ -2004,9 +2021,11 @@ impl Runtime {
     /// choosing a model or permissions, paging history, answering, stopping -
     /// leave what the conversation is doing as it was until it says otherwise.
     pub(super) fn sending(&self) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|pending| pending.sent.is_some() || !pending.sent_attachments.is_empty())
+        self.commands.outgoing().next().is_some()
+            || self
+                .commands
+                .iter()
+                .any(|pending| pending.sent.is_some() || !pending.sent_attachments.is_empty())
     }
 
     /// How the last turn ended, for the stamp that closes a settled
@@ -2179,9 +2198,8 @@ impl Runtime {
                 (preview, &incident.anchor).hash(&mut fingerprint);
             }
         }
-        self.queued
-            .as_ref()
-            .map(|queued| (queued.source.id, queued.presentation.revision))
+        self.local_prompt()
+            .map(|local| (local.source.id, local.presentation.revision))
             .hash(&mut fingerprint);
         let fingerprint = fingerprint.finish();
         let mut document = self.selection_document.borrow_mut();
@@ -2245,8 +2263,8 @@ impl Runtime {
                         self.selection_failure(&mut builder, incident);
                     }
                 }
-                if let Some(queued) = &self.queued
-                    && let Some(prepared) = &queued.presentation.prepared
+                if let Some(local) = self.local_prompt()
+                    && let Some(prepared) = &local.presentation.prepared
                 {
                     builder.indexed(
                         "queued-prompt",
@@ -2754,7 +2772,7 @@ impl Runtime {
             // A pane that shows why its conversation couldn't open is not
             // waiting for a first message; inviting one would contradict it.
             if self.turns.is_empty()
-                && self.queued.is_none()
+                && self.local_prompt().is_none()
                 && !self.closed_elsewhere
                 && !self
                     .failure_ui
@@ -2848,6 +2866,13 @@ impl Runtime {
             }
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
+            }
+            for outgoing in self
+                .commands
+                .outgoing()
+                .filter(|outgoing| outgoing.in_transcript())
+            {
+                transcript.push(self.local_prompt_view(&outgoing.prompt, "Sending…".into(), None));
             }
         }
         // What the agent is doing now closes the transcript, so it scrolls
@@ -3158,7 +3183,7 @@ impl Runtime {
             content.push(self.closed_draft_controls(transitioning));
         } else if self.capacity_refused {
             let enabled = !transitioning
-                && self.pending.is_none()
+                && self.commands.is_idle()
                 && self.attachment_chooser_pending.is_none()
                 && (!self.is_draft()
                     || !self.composer.text().trim().is_empty()
@@ -3440,7 +3465,10 @@ impl Runtime {
         let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        let modes: &[PromptMode] = if snapshot.busy {
+        // A message just sent is about to start a turn, so what is written
+        // after it steers or waits as it would once the turn shows.
+        let under_way = self.turn_under_way();
+        let modes: &[PromptMode] = if under_way {
             match snapshot.capabilities.steer {
                 // A message taken back from the queue goes back the way it
                 // was queued unless the other chord says otherwise.
@@ -3462,18 +3490,15 @@ impl Runtime {
         let placeholder = if selected.is_some() {
             "Message main agent"
         } else {
-            match modes.first() {
-                Some(PromptMode::Send) => "Message",
-                Some(PromptMode::Steer) => "Steer this turn",
-                Some(PromptMode::Queue) => "Queue for the next turn",
-                None => "Message",
-            }
+            composer_placeholder(modes.first().copied(), self.turn_running())
         };
         // Key bindings must remain available while the editor changes its own
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
         // inserting a newline until another pointer event redraws the pane.
-        let key_submit = if available && !self.start_blocked.is_some() {
+        // A first message still on its way keeps the binding too: Enter then
+        // sends nothing, rather than breaking the line of the next draft.
+        let key_submit = if (available || self.queued.is_some()) && !self.start_blocked.is_some() {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -3646,12 +3671,18 @@ impl Runtime {
         // a user arrives from works and what the composer already answers to.
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
+        // Stop is there whenever the conversation works, turn or not: it is
+        // the way out of a turn that is slow to begin.
         let submissions: Vec<Element<'_, Message>> =
             composer_trailing(modes, snapshot.busy, has_draft)
                 .into_iter()
                 .map(|control| match control {
                     Trailing::Submit { mode, slot } => {
-                        let (name, tooltip) = submit_control(mode, slot, enter_sends);
+                        let shown = match mode {
+                            PromptMode::Steer if !self.turn_running() => PromptMode::Send,
+                            mode => mode,
+                        };
+                        let (name, tooltip) = submit_control(shown, slot, enter_sends);
                         crate::ui_controls::icon_button(name, tooltip)
                             .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
                             .selected(slot == 0)
@@ -3977,9 +4008,9 @@ impl Runtime {
         if self.disconnected {
             return None;
         }
-        self.pending
-            .as_ref()
-            .and_then(|pending| pending.page)
+        self.commands
+            .iter()
+            .find_map(|pending| pending.page)
             .or(self.page_request.map(|(page, _)| page))
             .or(self.snapshot.history_loading.then_some(Page::Earlier))
     }
@@ -4093,8 +4124,12 @@ impl Runtime {
             Cow::Owned(format!(
                 "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
             ))
-        } else {
+        } else if self.turn_running() {
             Cow::Borrowed("Cancel active turn (Esc)")
+        } else {
+            Cow::Borrowed(
+                "Stop before the turn begins (Esc). Unsent messages return to the composer.",
+            )
         };
         let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
             .id(card_control_id(target.card, "chat-stop"))
@@ -4395,9 +4430,10 @@ impl Runtime {
                 .iter()
                 .find(|offer| offer.provider == self.session.launch.provider)
                 .and_then(|offer| offer.catalog)
-                .and_then(|catalog| catalog.default_effort(snapshot.selected_model.as_deref()));
+                .and_then(|catalog| catalog.default_effort(self.chosen_model().id));
             let label = footer_model_label(
                 snapshot,
+                self.chosen_model(),
                 draft,
                 self.session.launch.provider,
                 fit,
@@ -4418,9 +4454,8 @@ impl Runtime {
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
             let modes = &snapshot.capabilities.permission_modes;
-            let selected = modes
-                .iter()
-                .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
+            let chosen = self.chosen_permission_mode();
+            let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
                 controls.push(
                     design::caption(
@@ -4674,7 +4709,7 @@ impl Runtime {
             (shortcut, Cow::Borrowed("Choose a model"))
         };
         if !self.is_draft()
-            && let Some(choice) = staged_model_choice(&self.snapshot)
+            && let Some(choice) = staged_model_choice(&self.snapshot, self.chosen_model())
         {
             tooltip = format!("{choice} applies from the next turn");
         }
@@ -4748,15 +4783,16 @@ impl Runtime {
             draft,
             (
                 provider,
-                selected_chat_model(&self.snapshot)
+                self.chosen_model()
+                    .model(&self.snapshot)
                     .map(|model| model.id.as_str())
-                    .or(self.snapshot.selected_model.as_deref()),
+                    .or(self.chosen_model().id),
             ),
             query,
         );
         let mut sections = vec![models];
         if self.snapshot.capabilities.reasoning_selection
-            && let Some(model) = selected_chat_model(&self.snapshot)
+            && let Some(model) = self.chosen_model().model(&self.snapshot)
             && !model.reasoning.is_empty()
         {
             let default_effort = reasoning_default(&self.snapshot, model, catalog);
@@ -4790,7 +4826,7 @@ impl Runtime {
                                     Some(_) => format!("chat-reasoning-choice-{}", index - 1),
                                 },
                             ),
-                            effort == self.snapshot.reasoning.as_deref(),
+                            effort == self.chosen_model().reasoning,
                             action(Action::Reasoning(
                                 self.target,
                                 model.id.clone(),
@@ -4815,7 +4851,6 @@ impl Runtime {
         };
         let available = !self.disconnected
             && !self.snapshot.exited
-            && self.pending.is_none()
             && self.queued.is_none()
             && self.snapshot.ready
             && self.snapshot.capabilities.fast_mode
@@ -5558,7 +5593,7 @@ impl Runtime {
         let target = self.target;
         let caps = &self.snapshot.capabilities;
         let sending = self.followups_sending();
-        let available = self.pending.is_none() && !self.disconnected && !self.snapshot.exited;
+        let available = !self.disconnected && !self.snapshot.exited;
         let control = |name, label: &'static str, enabled: bool, message: Action| {
             crate::ui_controls::icon_button(name, label)
                 .compact()
@@ -5651,8 +5686,29 @@ impl Runtime {
                 controls,
             ));
         }
+        // A message on its way to the provider's queue, or to steer the
+        // turn, joins the list at once; the provider's own listing replaces
+        // it once it has the message.
+        for outgoing in self
+            .commands
+            .outgoing()
+            .filter(|outgoing| !outgoing.in_transcript())
+        {
+            rows.push(queue_row(
+                QueueTiming::Leaving,
+                outgoing.preview.as_str().into(),
+                &outgoing.prompt.attachments,
+                copy(
+                    outgoing.prompt.text(),
+                    QueueCopy::Initial(Arc::downgrade(&outgoing.prompt.source)),
+                )
+                .into_iter()
+                .collect(),
+            ));
+        }
         for followup in &self.followups {
             let entry = QueueEntry::Local(followup.id);
+            let sending = self.followup_sending(followup.id);
             rows.push(queue_row(
                 if sending {
                     QueueTiming::Leaving
@@ -5693,7 +5749,12 @@ impl Runtime {
                 .into(),
         ];
         // The one thing about the queue a reader cannot discover by looking.
-        if sending {
+        if sending
+            || self
+                .commands
+                .outgoing()
+                .any(|outgoing| !outgoing.in_transcript())
+        {
             header.push(design::caption("Sending…").into());
         } else if self.newest_take_back().is_some() {
             // Bare Up belongs to the caret once there is a draft.
@@ -5810,19 +5871,43 @@ impl Runtime {
         // Until the message itself is on its way it can still be taken back,
         // to be edited or sent somewhere else.
         let sending = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.queued == Some(super::QueuedStep::Prompt));
+            .commands
+            .iter()
+            .any(|pending| pending.queued == Some(super::QueuedStep::Prompt));
+        self.local_prompt_view(&queued.prompt, waiting, Some(!sending))
+    }
+
+    /// A message of the reader's this window holds until its conversation
+    /// has it: a first message while its conversation starts, or one sent
+    /// and not yet shown.
+    ///
+    /// It is drawn where it will be once sent, as the reader's own message,
+    /// with what it is waiting on under it: sending it cleared the composer,
+    /// and a message that vanished until the provider answered would read
+    /// as lost. `take_back` offers to return it to the composer, enabled or
+    /// not, where that can be done.
+    fn local_prompt_view<'a>(
+        &'a self,
+        local: &'a super::prompt::LocalPrompt,
+        waiting: String,
+        take_back: Option<bool>,
+    ) -> Element<'a, Message> {
+        // One message is prepared at a time; another, rarely, reads plain
+        // until its turn.
+        let prepared = self
+            .local_prompt()
+            .filter(|shown| Arc::ptr_eq(&shown.source, &local.source))
+            .and(local.presentation.prepared.as_ref());
         let logical = selectable_prose::Logical {
             identity: selection::logical_identity("queued-prompt", &[2]),
             start: 0,
         };
-        let body: Element<'a, Message> = if let Some(prepared) = &queued.presentation.prepared {
+        let body: Element<'a, Message> = if let Some(prepared) = prepared {
             let mut settings =
                 design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
             settings.style.font = iced::Font::default();
             if prepared.full.len() > 2048 {
-                let flow = queued.presentation.flow.markdown_entry(
+                let flow = local.presentation.flow.markdown_entry(
                     logical.identity,
                     prepared.full.clone(),
                     settings.style,
@@ -5846,12 +5931,15 @@ impl Runtime {
                 )
             }
         } else {
-            widget::text(prompt::preview(queued.source.text()).0)
+            widget::text(prompt::preview(local.text()).0)
                 .size(design::TEXT_PROSE)
                 .into()
         };
-        let mut rows: Vec<Element<'a, Message>> = vec![user_bubble(body, false, false)];
-        for attachment in &queued.attachments {
+        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        if !local.text().trim().is_empty() {
+            rows.push(user_bubble(body, false, false));
+        }
+        for attachment in &local.attachments {
             rows.push(
                 design::caption(
                     attachment
@@ -5863,31 +5951,42 @@ impl Runtime {
                 .into(),
             );
         }
-        rows.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::activity_spinner(
-                    f32::from(design::COMPACT_ICON_SIZE),
-                    design::accent_color,
+        let mut status: Vec<Element<'a, Message>> = vec![
+            crate::ui_controls::activity_spinner(
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::accent_color,
+            ),
+            design::caption(waiting)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+            small_icon(
+                Icon::Copy,
+                // A message still to send is in the queue; one sent is the
+                // reader's message like any other.
+                if take_back.is_some() {
+                    "Copy queued message"
+                } else {
+                    "Copy this message"
+                },
+                Action::CopyQueued(
+                    self.target,
+                    QueueCopy::Initial(Arc::downgrade(&local.source)),
                 ),
-                design::caption(waiting)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
-                small_icon(
-                    Icon::Copy,
-                    "Copy queued message",
-                    Action::CopyQueued(
-                        self.target,
-                        QueueCopy::Initial(Arc::downgrade(&queued.source)),
-                    ),
-                ),
+            ),
+        ];
+        if let Some(enabled) = take_back {
+            status.push(
                 crate::ui_controls::icon_button(Icon::Undo, "Take the message back to edit it")
                     .compact()
-                    .on_press_maybe((!sending).then(|| action(Action::CancelQueued(self.target))))
+                    .on_press_maybe(enabled.then(|| action(Action::CancelQueued(self.target))))
                     .into(),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Center)
-            .into(),
+            );
+        }
+        rows.push(
+            widget::row::with_children(status)
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
         );
         widget::column::with_children(rows)
             .spacing(step::GAP_XS)
@@ -6866,17 +6965,14 @@ fn reasoning_default<'a>(
         .or_else(|| catalog.and_then(|catalog| catalog.default_effort(Some(&model.id))))
 }
 
-fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
+fn staged_model_choice(snapshot: &chat::Snapshot, chosen: ChosenModel<'_>) -> Option<String> {
     let active = snapshot.active_model.as_ref()?;
-    let model = selected_chat_model(snapshot);
-    let selected = model
-        .map(|model| model.id.as_str())
-        .or(snapshot.selected_model.as_deref());
+    let model = chosen.model(snapshot);
+    let selected = model.map(|model| model.id.as_str()).or(chosen.id);
     let model_changed = selected.is_some_and(|id| id != active.id)
         && !model.is_some_and(|model| model_matches_active(model, active));
     let default = active.default_reasoning.as_deref();
-    let effort_changed =
-        snapshot.reasoning.as_deref().or(default) != active.reasoning.as_deref().or(default);
+    let effort_changed = chosen.reasoning.or(default) != active.reasoning.as_deref().or(default);
     let mut choices = Vec::new();
     if model_changed {
         choices.push(model.map_or_else(
@@ -6885,7 +6981,7 @@ fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
         ));
     }
     if effort_changed {
-        let label = snapshot.reasoning.as_deref().map_or_else(
+        let label = chosen.reasoning.map_or_else(
             || "Default".to_owned(),
             |effort| effort_label(effort).into_owned(),
         );
@@ -6896,12 +6992,13 @@ fn staged_model_choice(snapshot: &chat::Snapshot) -> Option<String> {
 
 fn footer_model_label<'a>(
     snapshot: &'a chat::Snapshot,
+    chosen: ChosenModel<'a>,
     draft: bool,
     provider: Provider,
     fit: FooterFit,
     draft_default_effort: Option<&str>,
 ) -> Cow<'a, str> {
-    let selected = selected_chat_model(snapshot);
+    let selected = chosen.model(snapshot);
     let active = (!draft).then_some(snapshot.active_model.as_ref()).flatten();
     let label = if let Some(active) = active {
         active.label.as_str().into()
@@ -6909,15 +7006,15 @@ fn footer_model_label<'a>(
         match selected {
             Some(model) if provider == Provider::Omp && !draft => model.label.as_str().into(),
             Some(model) => model_choice_label(model),
-            None => match &snapshot.selected_model {
-                Some(id) => id.as_str().into(),
+            None => match chosen.id {
+                Some(id) => id.into(),
                 None if fit != FooterFit::Wide => "Default model".into(),
                 None => format!("{} · Default model", family_label(provider)).into(),
             },
         }
     };
     let chosen = (active.is_none() || provider == Provider::Omp)
-        .then_some(snapshot.reasoning.as_deref())
+        .then_some(chosen.reasoning)
         .flatten()
         .filter(|effort| Some(*effort) != draft_default_effort);
     let effort = active.map_or(chosen, |active| {
