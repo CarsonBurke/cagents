@@ -8233,6 +8233,47 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
+    /// Antigravity's probe answers a working sign-in with its plan and no
+    /// limits. That system login is listed, with its plan, and its chip says
+    /// it reports no limits; signed out, it asks for sign-in again.
+    #[test]
+    fn a_signed_in_antigravity_login_is_listed_with_its_plan_and_no_limits() {
+        let mut app = context_inspector_test_app(false);
+        let provider = Provider::Antigravity;
+        let id = Account::system(provider).id();
+        app.account_ui.installed.insert(provider, true);
+        assert!(!table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+        let answer = |app: &mut Cagents, status, plan: Option<&str>| {
+            let now = app.account_ui.now_ms;
+            let (owner, ticket) = admit_actual_ticket(app, &id, now);
+            let mut snapshot = UsageSnapshot::state(status, "probed", now);
+            snapshot.plan_display_name = plan.map(str::to_owned);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: plan.map(|plan| Identity {
+                        plan: Some(plan.into()),
+                        ..Identity::default()
+                    }),
+                    snapshot: Box::new(snapshot),
+                },
+            })));
+            app.account_ui.now_ms = now + schedule::MANUAL_DEBOUNCE + 1;
+        };
+        answer(&mut app, UsageStatus::Ok, Some("Google AI Pro"));
+        assert!(table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+        let state = app.account_ui.account(&id).unwrap();
+        let snapshot = state.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.plan_display_name.as_deref(), Some("Google AI Pro"));
+        let shown = chip(state, "Antigravity", app.account_ui.now_ms, Default::default());
+        assert_eq!(shown.text, "No limits");
+        answer(&mut app, UsageStatus::NeedsLogin, None);
+        assert_eq!(app.account_ui.provider_status(provider), "Sign in again");
+    }
+
     #[test]
     fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
         let mut app = context_inspector_test_app(false);
