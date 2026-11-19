@@ -83,7 +83,7 @@ if answer.get("fail"):
 branch = json.loads((root / "pr.json").read_text())["head"]["ref"]
 head = subprocess.check_output(["git", "-C", str(root / "origin.git"), "rev-parse",
                                 "refs/heads/" + branch], text=True).strip()
-pr = {"state": answer.get("state", "OPEN"), "isDraft": False, "headRefOid": answer.get("head", head),
+pr = {"state": answer.get("state", "OPEN"), "isDraft": answer.get("draft", False), "headRefOid": answer.get("head", head),
       "mergeable": answer.get("mergeable", "MERGEABLE")}
 # As gh-pr-status reports them: passing checks counted, the rest listed.
 checks = answer.get("checks", [])
@@ -395,6 +395,26 @@ class LandTests(unittest.TestCase):
         self.status({"ci": "PENDING"}, {"state": "MERGED"})
         self.assertEqual(self.run_land(), land.REFUSED)
         self.assertIn("is merged", self.output)
+
+    def test_a_draft_from_a_read_older_than_the_ready_pr_waits_and_lands(self):
+        self.status({"draft": True, "age": -1000}, {})
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(self.merged()["sha"], self.remote_head())
+        self.assertIn("waiting for GitHub to report it ready", self.output)
+        self.assertEqual(len(self.sleeps), 1)
+
+    def test_a_closed_state_from_an_older_read_waits_and_lands(self):
+        self.status({"state": "CLOSED", "age": -1000}, {})
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(self.merged()["sha"], self.remote_head())
+        self.assertIn("waiting for GitHub to report it open", self.output)
+        self.assertEqual(len(self.sleeps), 1)
+
+    def test_a_current_draft_read_is_still_refused(self):
+        self.status({"draft": True}, {})
+        self.assertEqual(self.run_land(), land.REFUSED)
+        self.assertIn("converted to draft", self.output)
+        self.assertIsNone(self.merged())
 
     def test_status_failures_and_fallback_wait_on_the_shared_cadence(self):
         self.retry_at = int(time.time()) + 50000
