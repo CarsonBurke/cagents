@@ -54,6 +54,13 @@ const SMALL_ASSET_LIMIT: u64 = 1024 * 1024;
 const JOB_STATE_LIMIT: u64 = crate::terminal_ipc::MAX_FRAME_BYTES as u64;
 const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const WORKER_LOCK_FD: i32 = 198;
+const NO_DAEMON_INSTALLED: &str = "The application files are installed. No daemon was serving before the update, and none is running now; the daemon will start at graphical login.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    Served,
+    NoDaemon,
+}
 
 /// SIGINT or SIGTERM to this process while installed, without SA_RESTART.
 pub(crate) struct WorkerInterrupt {
@@ -1573,11 +1580,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     };
     job.confirmation = None;
     job.refusal = result.as_ref().err().and_then(UpdateError::refusal);
-    job.message = match &result {
-        Ok(()) => "Update installed; saved windows reopened".into(),
-        Err(_) if settled_failure => job.message.clone(),
-        Err(error) => error.record_message(),
-    };
+    job.message = completion_message(&result, &job, settled_failure);
     if !job.message.contains("Ended or stopped:") {
         job.message.push_str(&survivors.recovery_report());
     }
@@ -1604,7 +1607,20 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         // status cannot be recorded. The caller still owns handoff custody.
         eprintln!("Could not record update result: {error}");
     }
-    result
+    result.map(|_| ())
+}
+
+fn completion_message(
+    result: &Result<Handoff, UpdateError>,
+    job: &UpdateJob,
+    settled_failure: bool,
+) -> String {
+    match result {
+        Ok(Handoff::NoDaemon) => NO_DAEMON_INSTALLED.into(),
+        Ok(Handoff::Served) => "Update installed; saved windows reopened".into(),
+        Err(_) if settled_failure => job.message.clone(),
+        Err(error) => error.record_message(),
+    }
 }
 
 /// What the serving daemon recorded of the conversations its restore could
@@ -1630,7 +1646,7 @@ fn perform_update(
     job: &mut UpdateJob,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
-) -> Result<(), UpdateError> {
+) -> Result<Handoff, UpdateError> {
     let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
@@ -1823,7 +1839,7 @@ fn perform_update(
     );
     // Do not let a recovery UI autostart the frozen previous executable while
     // ownership or Prepared recovery is unresolved.
-    recovery_result?;
+    let handoff_kind = recovery_result?;
     let reopen_result = guard
         .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
@@ -1837,7 +1853,7 @@ fn perform_update(
             )),
         );
     }
-    install_result
+    install_result.map(|()| handoff_kind)
 }
 
 fn verify_reopened_service(
@@ -2225,7 +2241,7 @@ fn finish_handoff(
     recovery: &recovery::Context,
     survivors: &mut floor::Survivors,
     guard: &crate::instance::UiUpdateGuard,
-) -> Result<(), UpdateError> {
+) -> Result<Handoff, UpdateError> {
     let needed =
         recovery.shutdown_requested || handoff.is_some() || survivors.needs_daemon_recovery();
     if let Err(error) = result {
@@ -2254,7 +2270,7 @@ fn finish_handoff(
             &survivors.recovery_report(),
             &survivors.prepared_report(),
         )?;
-        return Ok(());
+        return Ok(Handoff::Served);
     };
     let outcome_path = recovery::outcome_path(state, &job.id);
     let target = installation.prefix.join("versions").join(&job.version);
@@ -2280,10 +2296,10 @@ fn finish_handoff(
         );
         recording_errors.extend(recorded.err().map(|e| e.to_string()));
         if result.is_ok() {
-            job.message = "The application files are installed. No daemon was serving before the update, and none is running now; the daemon will start at graphical login.".into();
+            job.message = NO_DAEMON_INSTALLED.into();
             recording_errors.extend(write_job(state, job).err().map(|e| e.to_string()));
         }
-        return finish_recording_recovery(state, job, recording_errors);
+        return finish_recording_recovery(state, job, recording_errors).map(|()| Handoff::NoDaemon);
     }
     if verified.usable() {
         let saved = verified.save(&outcome_path);
@@ -2299,7 +2315,7 @@ fn finish_handoff(
         survivors.release_recovery_reservation();
         recording_errors.extend(saved.err().map(|e| e.to_string()));
         recording_errors.extend(recorded.err().map(|e| e.to_string()));
-        return finish_recording_recovery(state, job, recording_errors);
+        return finish_recording_recovery(state, job, recording_errors).map(|()| Handoff::Served);
     }
     if needed {
         let permission = match census.inspect_restart() {
@@ -2438,7 +2454,7 @@ fn finish_handoff(
             " The terminal service is ready and its original terminal inventory was verified.",
         );
         recording_errors.extend(write_job(state, job).err().map(|e| e.to_string()));
-        finish_recording_recovery(state, job, recording_errors)
+        finish_recording_recovery(state, job, recording_errors).map(|()| Handoff::Served)
     } else {
         if let Err(error) = verified.save(&outcome_path) {
             eprintln!("Could not save recovery proof: {error}");
@@ -2481,11 +2497,11 @@ fn finish_recording_recovery(
     )
 }
 
-fn report_recovery_failure(
+fn report_recovery_failure<T>(
     state: &Path,
     job: &mut UpdateJob,
     error: UpdateError,
-) -> Result<(), UpdateError> {
+) -> Result<T, UpdateError> {
     job.phase = UpdatePhase::Failed;
     job.confirmation = None;
     if !job.message.is_empty() {
@@ -4813,6 +4829,28 @@ finally:
         assert!(acquire_lock(root.path()).is_err());
         assert_eq!(fs::read(destination).unwrap(), b"untouched");
     }
+    #[test]
+    fn completion_message_preserves_the_handoff_outcome() {
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Complete,
+            message: String::new(),
+            log_path: PathBuf::new(),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+        };
+        assert_eq!(
+            completion_message(&Ok(Handoff::NoDaemon), &job, false),
+            NO_DAEMON_INSTALLED
+        );
+        assert_eq!(
+            completion_message(&Ok(Handoff::Served), &job, false),
+            "Update installed; saved windows reopened"
+        );
+    }
+
     #[cfg(feature = "host")]
     #[test]
     fn startup_failure_is_persisted_before_releasing_the_handoff() {
@@ -5243,6 +5281,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
         );
         if failure == "first-start-failed-without-source" {
             assert!(settled.is_ok(), "{settled:?}");
+            assert!(matches!(settled, Ok(Handoff::NoDaemon)), "{settled:?}");
             assert!(job.message.contains("will start at graphical login"));
             assert!(!root.path().join("start-attempts").exists());
             let receipt: recovery::Receipt = serde_json::from_slice(
@@ -5406,6 +5445,9 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 | "start-nonzero-with-service"
         );
         assert_eq!(settled.is_err(), expected_failure, "{failure}: {settled:?}");
+        if !expected_failure {
+            assert!(matches!(settled, Ok(Handoff::Served)), "{settled:?}");
+        }
         assert_eq!(
             fs::read_to_string(root.path().join("start-attempts")).unwrap(),
             "attempt\n"
