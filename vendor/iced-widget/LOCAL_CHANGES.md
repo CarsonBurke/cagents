@@ -61,3 +61,7 @@ crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.
 Why: a scrolled composer draft was sliced at the padding's inner edge (#2824). Remove this when upstream editors can draw into their padding.
 
 Dragging a selection into a band selects the line drawn there, and cursor reveal then scrolls it into view. The drag therefore scrolls one line for each pointer move inside the band, and stops while the pointer is still. iced still reports drags only within the widget's bounds.
+
+## Grid accessibility (cagents #3153)
+
+`Grid` forwards its cells' accessibility nodes, in reading order, the way `Row` and `Column` do. Upstream's `Grid` has no `a11y_nodes`, so every control inside one was missing from the accessibility tree. The transcript's image gallery is a `Grid` of buttons, one per picture (crates/cagents-ui/src/app/chat_ui/images/tiles.rs); its tests read the tiles' names from that tree. Remove this when upstream's `Grid` forwards them.

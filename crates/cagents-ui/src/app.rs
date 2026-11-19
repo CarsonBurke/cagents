@@ -10422,7 +10422,10 @@ impl Cagents {
                         if *repeat {
                             return (Task::none(), Projection::Unchanged);
                         }
-                        let image = gallery.selected_image();
+                        // Nothing to copy until the picture is read.
+                        let Some(image) = gallery.selected_image() else {
+                            return (Task::none(), Projection::Unchanged);
+                        };
                         return (
                             self.handle_chat_ui(chat_ui::Action::Image(
                                 image,
@@ -10433,16 +10436,22 @@ impl Cagents {
                     }
                     // Escape is the viewer's own (`Gallery::view`), so that
                     // one an open context menu claims closes only the menu.
-                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                        self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                    }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                        self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                    keyboard::Key::Named(
+                        named
+                        @ (keyboard::key::Named::ArrowLeft | keyboard::key::Named::ArrowRight),
+                    ) => {
+                        // Stepping through the gallery changes only the
+                        // viewer, and reads the picture it steps to.
+                        return (
+                            self.handle_chat_ui(chat_ui::Action::ImageNext(
+                                *named == keyboard::key::Named::ArrowRight,
+                            )),
+                            Projection::Unchanged,
+                        );
                     }
                     _ => {}
                 }
             }
-            // Stepping through the gallery changes only the viewer.
             return (Task::none(), Projection::Unchanged);
         }
         if !captured
