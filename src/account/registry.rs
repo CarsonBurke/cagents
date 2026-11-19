@@ -1354,7 +1354,7 @@ impl Store {
                         "Another account in the list already uses this account's key",
                     ));
                 }
-                if registry.is_released(key) {
+                if homes.is_released(provider, key) || registry.is_released(key) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "This home is from a sign-in that was not kept, so it is not restored",
@@ -2637,6 +2637,78 @@ mod tests {
             .update(|registry| registry.release(gone, &homes))
             .unwrap();
         assert!(!registry.is_released(copy) && registry.is_released(gone));
+    }
+
+    #[test]
+    fn a_released_home_is_not_offered_for_restore_after_the_list_is_lost() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, home) = homes.create(provider, None).unwrap();
+        homes.mark_released(provider, key).unwrap();
+
+        let registry = Registry::default();
+        assert!(!registry.is_released(key));
+        assert!(
+            homes
+                .unregistered(&registry)
+                .iter()
+                .all(|(_, found, _)| *found != key)
+        );
+        let error = store
+            .restore_home(&homes, restorable(key, "plan2@example.com"), &[])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(home.is_dir() && homes.is_released(provider, key));
+        assert!(store.load().unwrap().find(key).is_none());
+    }
+
+    #[test]
+    fn marking_a_home_released_is_idempotent_and_ignores_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, home) = homes.create(provider, None).unwrap();
+        homes.mark_released(provider, key).unwrap();
+        homes.mark_released(provider, key).unwrap();
+        assert!(homes.is_released(provider, key));
+        let marker = home.with_file_name(format!(".released-{}", key.hyphenated()));
+        let metadata = fs::symlink_metadata(&marker).unwrap();
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let (linked, linked_home) = homes.create(provider, None).unwrap();
+        let link = linked_home.with_file_name(format!(".released-{}", linked.hyphenated()));
+        symlink(&marker, &link).unwrap();
+        assert!(!homes.is_released(provider, linked));
+        assert!(homes.mark_released(provider, linked).is_err());
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn an_unmarked_home_is_still_restorable_from_a_lost_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, _) = homes.create(provider, None).unwrap();
+        let registry = Registry::default();
+        assert_eq!(
+            homes
+                .unregistered(&registry)
+                .into_iter()
+                .map(|(provider, key, _)| (provider, key))
+                .collect::<Vec<_>>(),
+            [(provider, key)]
+        );
+        let (registry, restored) = store
+            .restore_home(&homes, restorable(key, "plan2@example.com"), &[])
+            .unwrap();
+        assert_eq!(restored, Restored::Listed);
+        assert!(registry.find(key).is_some());
     }
 
     #[test]
