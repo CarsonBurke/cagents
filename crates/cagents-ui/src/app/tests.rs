@@ -3254,7 +3254,7 @@ fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget
 /// A repository card whose durable state and runtime both say repository,
 /// with an unsaved buffer and a language server reporting on it - the
 /// state a user is in while editing a file.
-fn editing_repository_app() -> (Cagents, CardId) {
+pub(super) fn editing_repository_app() -> (Cagents, CardId) {
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().expect("a focused card");
     {
@@ -8858,7 +8858,7 @@ fn request_test_completion(
 
 fn navigate_find_key(app: &mut Cagents, backwards: bool) {
     let key = keyboard::Key::Named(keyboard::key::Named::F3);
-    let action = task_app_message(app.update(Message::KeyEvent {
+    drop(app.update(Message::KeyEvent {
         event: keyboard::Event::KeyPressed {
             key: key.clone(),
             modified_key: key,
@@ -8874,13 +8874,6 @@ fn navigate_find_key(app: &mut Cagents, backwards: bool) {
         },
         captured: false,
     }));
-    assert!(matches!(
-        &action,
-        Message::Repository(
-            RepositoryAction::FindNext { .. } | RepositoryAction::FindPrevious { .. }
-        )
-    ));
-    drop(app.update(action));
 }
 
 #[test]
@@ -13623,8 +13616,12 @@ fn control_tab_uses_history_and_respects_blocking_surfaces() {
 #[test]
 fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     let mut app = context_inspector_test_app(true);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+    let worktree = app.sidebar_state.active_worktree().unwrap().clone();
     let card = app.workspace.focused().unwrap();
-    let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    runtime.descriptor.worktree = worktree.canonical_path.clone();
     assert!(runtime.selected_staging_selection(true).is_some());
     app.cards
         .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -13640,11 +13637,14 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
         },
         captured: false,
     };
-    assert!(matches!(
-        task_app_message(app.update(key())),
-        Message::Repository(RepositoryAction::StageSelected { card: id, stage: true })
-            if id == card
-    ));
+    // The shortcut stages the selection within its own update.
+    drop(app.update(key()));
+    assert_eq!(
+        app.source_control_mutations[&worktree.canonical_path].kind,
+        MutationKind::Stage
+    );
+    assert!(!app.palette.is_open());
+    app.source_control_mutations.clear();
     app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
     drop(app.update(key()));
     assert!(app.palette.is_open());

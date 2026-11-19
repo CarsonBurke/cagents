@@ -10372,7 +10372,7 @@ impl Cagents {
             let stage = runtime.selected_staging_selection(true).is_some();
             if stage || runtime.selected_staging_selection(false).is_some() {
                 return (
-                    cosmic::task::message(Message::Repository(RepositoryAction::StageSelected {
+                    self.dispatch(Message::Repository(RepositoryAction::StageSelected {
                         card,
                         stage,
                     })),
@@ -10459,10 +10459,7 @@ impl Cagents {
                 return (self.cancel_terminal_close(), Projection::Full);
             }
             if self.chat_close_dialog_visible() {
-                return (
-                    cosmic::task::message(Message::CancelChatClose),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelChatClose), Projection::Full);
             }
         }
         if self.form_dialog_on_top()
@@ -10499,7 +10496,7 @@ impl Cagents {
         if is_escape_press(&event) && !captured {
             if self.transient_work_close.is_some() {
                 return (
-                    cosmic::task::message(Message::CancelTransientWorkClose),
+                    self.dispatch(Message::CancelTransientWorkClose),
                     Projection::Full,
                 );
             }
@@ -10522,14 +10519,11 @@ impl Cagents {
                 return (self.cancel_terminal_close(), Projection::Full);
             }
             if self.chat_close_dialog_visible() {
-                return (
-                    cosmic::task::message(Message::CancelChatClose),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelChatClose), Projection::Full);
             }
             if self.sidebar_state.pending_discard().is_some() {
                 return (
-                    cosmic::task::message(Message::Sidebar(SidebarAction::CancelDiscard)),
+                    self.dispatch(Message::Sidebar(SidebarAction::CancelDiscard)),
                     Projection::Full,
                 );
             }
@@ -10558,7 +10552,7 @@ impl Cagents {
                     return (Task::none(), Projection::Unchanged);
                 }
                 return (
-                    cosmic::task::message(Message::CancelRepositoryClose),
+                    self.dispatch(Message::CancelRepositoryClose),
                     Projection::Full,
                 );
             }
@@ -10572,7 +10566,7 @@ impl Cagents {
                 );
             }
             if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                return (self.dispatch(Message::CancelDialog), Projection::Full);
+                return (self.cancel_form_dialog(), Projection::Full);
             }
             if self.sidebar_state.controls_expanded() {
                 return (
@@ -10637,7 +10631,7 @@ impl Cagents {
             && let Some(card) = self.focused_repository_card_with_find()
         {
             return (
-                cosmic::task::message(Message::Repository(if modifiers.shift() {
+                self.dispatch(Message::Repository(if modifiers.shift() {
                     RepositoryAction::FindPrevious { card }
                 } else {
                     RepositoryAction::FindNext { card }
@@ -10652,7 +10646,7 @@ impl Cagents {
             && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
             && let Some(message) = browser_shortcut(card, &event)
         {
-            return (cosmic::task::message(message), Projection::Full);
+            return (self.dispatch(message), Projection::Full);
         }
         if !captured && let Some(task) = self.chat_scroll_key(&event) {
             return (task, Projection::Full);
@@ -11060,6 +11054,16 @@ impl Cagents {
             || self.workspace.pending_close().is_some()
     }
 
+    /// What a lifecycle sweep's update projects: what the sweep changed,
+    /// unless the update's tail may still close or commit something.
+    fn sweep_projection(&self, sweep: Projection) -> Projection {
+        if self.update_tail_may_close_or_commit() {
+            Projection::Full
+        } else {
+            sweep
+        }
+    }
+
     /// A navigation save timer with nothing left to save changes nothing a
     /// projection reads, so it skips the sidebar and chrome rebuild.
     fn navigation_save_is_stale(&self, message: &Message) -> bool {
@@ -11113,19 +11117,20 @@ impl Cagents {
     fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> (Task<Message>, Projection) {
         if generation != self.lifecycle_sweep_generation {
             // Superseded by a later arming, whose own delivery is still to come.
-            return (Task::none(), Projection::Full);
+            return (Task::none(), Projection::Unchanged);
         }
         // A matching generation carries the deadline it was armed with, because
         // `arm_lifecycle_sweep` writes both together, so neither branch below
         // is reachable through the normal path. They are guards, not flow: a
         // sweep that ran without a deadline has nothing to do, and a timer that
         // woke marginally early must wait out the grace rather than cut it.
+        // Neither changes anything a projection reads.
         let Some(deadline) = self.lifecycle_sweep_deadline else {
-            return (Task::none(), Projection::Full);
+            return (Task::none(), Projection::Unchanged);
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            return (self.arm_lifecycle_sweep(deadline), Projection::Full);
+            return (self.arm_lifecycle_sweep(deadline), Projection::Unchanged);
         }
         self.lifecycle_sweep_deadline = None;
         let (sweep, projection) = self.lifecycle_sweep_update();
@@ -14421,7 +14426,7 @@ impl Cagents {
             return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
         }
         if self.transient_work_close.is_some() {
-            return cosmic::task::message(Message::CancelTransientWorkClose);
+            return self.dispatch(Message::CancelTransientWorkClose);
         }
         if let Some(action) = self.automation_ui.keep_draft_action() {
             return self.update_automation_ui(action);
@@ -18414,14 +18419,14 @@ impl Cagents {
                 let update = self.workspace.tick(elapsed);
                 Task::batch([inspector_task, self.apply_viewport(update, true, DurableChange::None)])
             }
-            message @ (Message::LifecycleSweep | Message::LifecycleSweepElapsed(_)) => {
-                let (task, sweep_projection) = match message {
-                    Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
-                    _ => self.lifecycle_sweep_update(),
-                };
-                if !self.update_tail_may_close_or_commit() {
-                    projection = sweep_projection;
-                }
+            Message::LifecycleSweep => {
+                let (task, sweep_projection) = self.lifecycle_sweep_update();
+                projection = self.sweep_projection(sweep_projection);
+                task
+            }
+            Message::LifecycleSweepElapsed(generation) => {
+                let (task, sweep_projection) = self.lifecycle_sweep_elapsed(generation);
+                projection = self.sweep_projection(sweep_projection);
                 task
             }
             Message::WorkspaceSwitcherSelected { since, index } => {
