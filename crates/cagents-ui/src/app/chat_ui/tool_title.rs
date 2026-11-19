@@ -448,9 +448,29 @@ impl Title {
                 ),
                 None,
             ),
+            // Loading a skill reads its instructions, which the call's
+            // output holds.
             "Skill" => named(
-                verb("Using skill", "Used skill", "Tried to use skill"),
+                verb("Reading skill", "Read skill", "Tried to read skill"),
                 owned(&fields.skill),
+            ),
+            // What Claude Code, or a Codex hook, put in front of the model
+            // on its own, which the output holds.
+            "Claude context" => named(
+                verb(
+                    "Adding to Claude's context",
+                    "Added to Claude's context",
+                    "Tried to add to Claude's context",
+                ),
+                None,
+            ),
+            "Hook context" => named(
+                verb(
+                    "Adding context from a hook",
+                    "Added context from a hook",
+                    "Tried to add context from a hook",
+                ),
+                None,
             ),
             "WebFetch" => named(
                 verb("Fetching", "Fetched", "Tried to fetch"),
@@ -704,7 +724,7 @@ mod tests {
             (
                 "Skill",
                 json!({"skill":"writing-copy","args":"long instructions"}),
-                "Used skill writing-copy",
+                "Read skill writing-copy",
             ),
             (
                 "WebFetch",
@@ -935,7 +955,7 @@ mod tests {
             (
                 "Skill",
                 json!({"skill":"writing-copy"}),
-                "Using skill writing-copy",
+                "Reading skill writing-copy",
             ),
             (
                 "Agent",
@@ -1077,7 +1097,7 @@ mod tests {
         );
         assert_eq!(
             row("Skill", json!({"skill":"tab\tescaped","args":null}), done),
-            "Used skill tab\tescaped"
+            "Read skill tab\tescaped"
         );
     }
 

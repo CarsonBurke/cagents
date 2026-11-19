@@ -4201,36 +4201,30 @@ fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
                 matches!(&items(&call)[..], [ItemContent::Tool { name, input, status: ToolStatus::Running, .. }]
                 if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example")
             );
-            let call_id = call
-                .events
-                .iter()
-                .find_map(|event| match event {
-                    Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
-                        Some(item.id.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(call_id, "skill-1");
 
             let mut frame = json!({"type":"user","uuid":"internal","message":{"role":"user","content":content}});
             frame[marker] = json!(true);
             // Stream-json omits the other internal fields, including
             // turnCompanion and sourceToolUseID, so do not depend on them.
             let context = adapter.receive(frame).unwrap();
-            if marker == "isMeta" {
-                assert!(context.events.is_empty(), "{marker}: {context:?}");
-                assert!(adapter.carrier_items["internal"].is_empty());
-            } else {
-                // Only the transcript's own summary flag names a
-                // compaction; the broader flags stay generic context.
-                let expected = if marker == "isCompactSummary" {
-                    compaction_item("internal:0".into(), body.into())
-                } else {
-                    context_item("internal:0".into(), body.into())
-                };
+            let compaction = marker == "isCompactSummary";
+            if compaction {
+                // Only the transcript's own summary flag names a compaction.
+                let expected = compaction_item("internal:0".into(), body.into());
                 assert_eq!(deliveries(&context), vec![(Role::System, expected.content)]);
                 assert_eq!(adapter.carrier_items["internal"], vec!["internal:0"]);
+            } else {
+                // The instructions are the call's, read on demand from its
+                // step, even before the result that says it is launching.
+                let [Event::Item(item)] = &context.events[..] else {
+                    panic!("{marker}: {context:?}");
+                };
+                assert_eq!(item.id, "skill-1");
+                assert!(
+                    matches!(&item.content, ItemContent::Tool { name, output, status: ToolStatus::Running, .. }
+                    if name == "Skill" && output == body)
+                );
+                assert!(adapter.carrier_items["internal"].is_empty());
             }
 
             for flag in [
@@ -4250,21 +4244,20 @@ fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
                 );
             }
             let result = adapter.receive(json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
+            let expected = if compaction {
+                "Launching skill: example"
+            } else {
+                body
+            };
+            let [Event::Item(item)] = &result.events[..] else {
+                panic!("{result:?}");
+            };
+            assert_eq!(item.id, "skill-1");
             assert!(
-                matches!(&items(&result)[..], [ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }]
-                if name == "Skill" && output == "Launching skill: example")
+                matches!(&item.content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }
+                if name == "Skill" && output == expected),
+                "{marker}: {item:?}"
             );
-            let result_id = result
-                .events
-                .iter()
-                .find_map(|event| match event {
-                    Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
-                        Some(item.id.as_str())
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(result_id, call_id);
             let replacement = adapter.receive(json!({"type":"user","uuid":"replacement","supersedes":["internal"],"message":{"content":"Continue"}})).unwrap();
             assert!(
                 !replacement
@@ -4296,6 +4289,7 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
     let mut expected = vec![
         "root".to_owned(),
         "call".into(),
+        "legacy".into(),
         "wire".into(),
         "raw-summary".into(),
         "result".into(),
@@ -4355,17 +4349,36 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
             .count(),
         16
     );
-    assert!(items(&replay).iter().any(|content| matches!(content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. } if name == "Skill" && output == "Launching skill: example")));
-    let skill_ids = replay.events.iter().filter_map(|event| match event {
-        Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item.id.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>();
-    assert_eq!(skill_ids, vec!["skill-1", "skill-1"]);
+    // The call's instructions are its output, from the transcript's own
+    // correlation; copies no call is waiting for add nothing.
+    let skill = replay
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["skill-1", "skill-1", "skill-1"]
+    );
+    assert!(
+        matches!(&skill.last().unwrap().content, ItemContent::Tool { output, status: ToolStatus::Succeeded, .. } if output == body)
+    );
     let contexts = replay
         .events
         .iter()
         .filter_map(|event| match event {
-            Event::Item(item) if item.role == Role::System => Some(item),
+            Event::Item(item)
+                if item.role == Role::System
+                    || matches!(&item.content, ItemContent::Tool { name, .. } if name == CONTEXT_STEP) =>
+            {
+                Some(item)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -4374,13 +4387,183 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
             .iter()
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["wire:0", "raw-summary:0", "tail:0"]
+        vec!["raw-summary:0"]
     );
-    assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && *summary == if item.id == "raw-summary:0" { COMPACTED } else { "Claude context" } && original.as_bytes() == body.as_bytes())));
+    assert!(
+        matches!(&contexts[0].content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && summary == COMPACTED && original.as_bytes() == body.as_bytes())
+    );
     source.rewind().unwrap();
     let mut after = String::new();
     source.read_to_string(&mut after).unwrap();
     assert_eq!(after, before, "raw provider evidence must remain intact");
+}
+
+/// Items as a chat holds them once `steps` are applied: each ID in the
+/// place it first appeared, with what it last said.
+fn shown_items(steps: &[Step]) -> Vec<Item> {
+    let mut settled: Vec<Item> = Vec::new();
+    for event in steps.iter().flat_map(|step| &step.events) {
+        if let Event::Item(item) = event {
+            match settled.iter_mut().find(|known| known.id == item.id) {
+                Some(known) => *known = item.clone(),
+                None => settled.push(item.clone()),
+            }
+        }
+    }
+    settled
+}
+
+fn settled_live(frames: &[Value]) -> Vec<Item> {
+    let mut adapter = Claude::default();
+    let steps = frames
+        .iter()
+        .map(|frame| adapter.receive(frame.clone()).unwrap())
+        .collect::<Vec<_>>();
+    shown_items(&steps)
+}
+
+fn settled_history(frames: Vec<Value>) -> Vec<Item> {
+    let mut history = correlation_history(frames);
+    let records = history.page().unwrap();
+    let mut adapter = Claude::default();
+    let mut replay = Step::default();
+    for record in &records {
+        adapter.history_message(record, &mut replay).unwrap();
+    }
+    shown_items(&[replay])
+}
+
+const SKILL_BODY: &str = "Base directory for this skill: /work/.claude/skills/release-notes\n\n# Release notes\n\nWrite one sentence of release notes. Do not use any tools.\n\n\nARGUMENTS: Write release notes for a typo fix.";
+
+/// A skill the agent loads is one "Read skill" step whose output is the
+/// instructions it read, live and reopened alike: never a context notice,
+/// and never a message.
+#[test]
+fn a_loaded_skill_is_its_calls_step_live_and_in_history() {
+    let prompt = "Use the release-notes skill to write release notes for a typo fix.";
+    let call = json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes","args":"Write release notes for a typo fix."}}]}});
+    let answer = json!({"type":"assistant","uuid":"answer","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Fixed a typo in the user-facing text."}]}});
+    let result = |extra: Value| {
+        let mut frame = json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_skill","content":"Launching skill: release-notes"}]}});
+        frame
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        frame
+    };
+    // As Claude Code 2.1.325 streams it: the instructions follow the result,
+    // marked only isSynthetic and naming no call.
+    let live = settled_live(&[
+        json!({"type":"user","uuid":"prompt","isReplay":true,"message":{"role":"user","content":prompt}}),
+        call.clone(),
+        result(json!({"tool_use_result":{"success":true,"commandName":"release-notes"}})),
+        json!({"type":"user","uuid":"instructions","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        answer.clone(),
+    ]);
+    // As it saves them: marked isMeta, naming the call.
+    let history = settled_history(vec![
+        json!({"type":"user","uuid":"prompt","message":{"role":"user","content":prompt}}),
+        call,
+        result(json!({"toolUseResult":{"success":true,"commandName":"release-notes"}})),
+        json!({"type":"user","uuid":"instructions","isMeta":true,"turnCompanion":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        answer,
+    ]);
+    let shown = |items: &[Item]| {
+        items
+            .iter()
+            .map(|item| (item.id.clone(), item.role, item.content.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shown(&live), shown(&history));
+    assert_eq!(
+        live.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+        ["prompt:0", "toolu_skill", "msg-answer:0"]
+    );
+    assert!(
+        matches!(&live[1].content, ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded }
+        if name == "Skill"
+            && serde_json::from_str::<Value>(input).unwrap()["skill"] == "release-notes"
+            && output == SKILL_BODY)
+    );
+}
+
+/// A skill the reader runs as a command is shown by the prompt they typed.
+/// Claude Code saves its instructions but never streams them, so the
+/// reopened chat must not add a step the live one lacked.
+#[test]
+fn a_typed_skill_command_shows_only_its_prompt_live_and_in_history() {
+    let command = "<command-message>release-notes</command-message>\n<command-name>/release-notes</command-name>\n<command-args>a typo fix</command-args>";
+    let answer = json!({"type":"assistant","uuid":"answer","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Fixed a typo."}]}});
+    let live = settled_live(&[
+        json!({"type":"user","uuid":"prompt","isReplay":true,"message":{"role":"user","content":command}}),
+        answer.clone(),
+    ]);
+    let history = settled_history(vec![
+        json!({"type":"user","uuid":"prompt","message":{"role":"user","content":command}}),
+        json!({"type":"user","uuid":"instructions","isMeta":true,"turnCompanion":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        answer,
+    ]);
+    assert_eq!(live, history);
+    assert!(matches!(&live[..], [
+        Item { role: Role::User, content: ItemContent::Text { text, .. }, .. },
+        Item { role: Role::Assistant, .. },
+    ] if text == "/release-notes a typo fix"));
+}
+
+/// Everything else Claude Code puts in front of the model is read by what it
+/// says, so the transcript's isMeta and the wire's isSynthetic agree: notes
+/// for the model alone leave no row, and the rest is one compact context
+/// step, with the same ID, whose output is the text.
+#[test]
+fn injected_context_is_classified_alike_live_and_in_history() {
+    let hidden = [
+        json!(
+            "[Image: original 2600x1800, displayed at 2306x1596. Multiply coordinates by 1.13 to map to original image.]"
+        ),
+        json!([{"type":"text","text":"[Image: source: /var/tmp/claude/images/1.png]"}]),
+        json!(
+            "<system-reminder>\nThe session's working directory has changed.\n</system-reminder>"
+        ),
+        json!("<system-reminder>a</system-reminder>\n<system-reminder>b</system-reminder>"),
+        json!(
+            "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>"
+        ),
+        json!(
+            "(Re-invocation of /release-notes — the skill instructions were previously loaded; the arguments or dynamic output below are new.)"
+        ),
+    ];
+    let shown = [
+        "Stop hook feedback:\n[goal]: The goal is not met.",
+        "<system-reminder>a</system-reminder> and a request",
+        "[Image: a diagram the reader described]",
+        "Base directory for nothing in particular",
+    ];
+    let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
+    for content in hidden
+        .iter()
+        .cloned()
+        .chain(shown.iter().map(|text| json!(text)))
+    {
+        let text = message_text(&content).unwrap();
+        let live = settled_live(&[
+            prompt.clone(),
+            json!({"type":"user","uuid":"context","isSynthetic":true,"message":{"role":"user","content":content}}),
+        ]);
+        let history = settled_history(vec![
+            prompt.clone(),
+            json!({"type":"user","uuid":"context","isMeta":true,"message":{"role":"user","content":content}}),
+        ]);
+        assert_eq!(live, history, "{text}");
+        if shown.contains(&text.as_str()) {
+            assert!(
+                matches!(&live[1..], [Item { id, role: Role::Assistant, content: ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded }, .. }]
+                if id == "context:0" && name == CONTEXT_STEP && input.is_empty() && *output == text),
+                "{live:?}"
+            );
+        } else {
+            assert_eq!(live.len(), 1, "{text}: {live:?}");
+        }
+    }
 }
 
 #[test]
@@ -4504,7 +4687,7 @@ fn synthetic_context_raw_compact_summary_history_matches_wire_presentation() {
         };
         assert_eq!(
             deliveries(&restored),
-            vec![(Role::System, expected.content)]
+            vec![(expected.role, expected.content)]
         );
     }
 }
@@ -11060,9 +11243,9 @@ fn metadata_leaf_falls_back_to_latest_chain_and_filters_invisible_ancestors() {
     for value in [
         json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":id,"message":{"content":"Question"}}),
         json!({"type":"assistant","uuid":"side","parentUuid":"root","isSidechain":true,"sessionId":id,"message":{"content":"Side branch"}}),
-        json!({"type":"user","uuid":"hidden","parentUuid":"root","isMeta":true,"sessionId":id,"message":{"content":"Internal"}}),
+        json!({"type":"user","uuid":"hidden","parentUuid":"root","isMeta":true,"sessionId":id,"message":{"content":"<system-reminder>Internal</system-reminder>"}}),
         json!({"type":"assistant","uuid":"answer","parentUuid":"hidden","sessionId":id,"message":{"content":"Answer"}}),
-        json!({"type":"user","uuid":"meta","parentUuid":"answer","isMeta":true,"sessionId":id,"message":{"content":"Internal tail"}}),
+        json!({"type":"user","uuid":"meta","parentUuid":"answer","isMeta":true,"sessionId":id,"message":{"content":"[Image: source: /tmp/internal-tail.png]"}}),
         json!({"type":"progress","uuid":"progress","parentUuid":"meta","sessionId":id}),
     ] {
         writeln!(file, "{value}").unwrap();
@@ -12300,7 +12483,7 @@ fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
     assert_eq!(
         deliveries(&later),
         vec![(
-            Role::System,
+            Role::Assistant,
             context_item("later:0".into(), body.into()).content
         )]
     );
@@ -12315,7 +12498,7 @@ fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
     assert_eq!(
         deliveries(&later),
         vec![(
-            Role::System,
+            Role::Assistant,
             context_item("after-agent:0".into(), body.into()).content
         )]
     );

@@ -1967,7 +1967,7 @@ mod tests {
             ToolStatus::Succeeded,
         );
         let (verb, label) = step_title(&skill.content, Some(&title));
-        assert_eq!((verb, label.as_ref()), ("Used skill", "writing-copy"));
+        assert_eq!((verb, label.as_ref()), ("Read skill", "writing-copy"));
         // Without its title the row names the tool alone: nothing reads the
         // call's input while drawing it.
         assert_eq!(step_title(&skill.content, None), ("", "Skill".into()));
