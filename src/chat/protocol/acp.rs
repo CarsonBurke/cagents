@@ -1025,16 +1025,6 @@ impl Acp {
     }
 }
 
-/// The profile of each provider whose native chat cagents drives over ACP.
-pub fn profile(provider: crate::agent::Provider) -> Option<&'static Profile> {
-    use crate::agent::Provider;
-    match provider {
-        // Each joins here once cagents drives its conversations.
-        Provider::Antigravity | Provider::Muse => None,
-        Provider::Omp | Provider::Claude | Provider::Codex => None,
-    }
-}
-
 impl Profile {
     /// The cagents mode the agent's own mode `mode` means.
     pub fn mode_meaning<'a>(&self, mode: &'a str) -> &'a str {
