@@ -13300,6 +13300,12 @@ fn only_a_whole_scaling_note_is_withheld_and_other_context_says_what_it_is() {
             json!([{"type":"text","text":note},{"type":"text","text":"Also read the README"}]),
             false,
         ),
+        (json!(format!("{note}\n{note}")), true),
+        (json!(format!("{note}\nAlso read README [required]")), false),
+        (
+            json!([{"type":"text","text":format!("{note} Also read README [required]")}]),
+            false,
+        ),
         (json!("[Image: original attachment]"), false),
         (
             json!("Base directory for this skill: /skills/example"),

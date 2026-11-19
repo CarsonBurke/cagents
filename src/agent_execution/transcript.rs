@@ -861,6 +861,32 @@ mod tests {
     }
 
     #[test]
+    fn an_image_is_summarized_by_its_description_then_its_path_and_pixels_by_kind() {
+        let summary = |description: &str, path: &str| {
+            let content = ItemContent::Image {
+                path: path.into(),
+                reference: None,
+                description: description.into(),
+            };
+            let (tool, _) = tool(&content).unwrap();
+            assert_eq!(tool.name, "Image");
+            tool.summary
+        };
+        assert_eq!(
+            summary("proposed-fast.png", "/repo/proposed-fast.png"),
+            "proposed-fast.png"
+        );
+        assert_eq!(
+            summary("", "/repo/proposed-fast.png"),
+            "/repo/proposed-fast.png"
+        );
+        assert_eq!(
+            summary("", "data:image/png;base64,iVBORw0K"),
+            "Inline image"
+        );
+    }
+
+    #[test]
     fn tool_input_summary_prefers_descriptive_fields() {
         assert_eq!(
             input_summary(

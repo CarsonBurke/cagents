@@ -4870,12 +4870,17 @@ fn model_only(frame: &Value) -> bool {
 /// Whether `content` is nothing but Claude Code's notes on how it scaled an
 /// image a tool returned, such as `[Image: original 2600x1800, displayed at
 /// 2306x1596. Multiply coordinates by 1.13 to map to original image.]`.
+/// Every line must be one whole note, so a note followed by anything else
+/// still shows, even when that ends in a bracket of its own.
 fn image_scaling_note(content: &Value) -> bool {
-    let note = |text: &str| {
-        text.trim()
-            .strip_prefix("[Image: original ")
+    let line = |line: &str| {
+        line.strip_prefix("[Image: original ")
             .and_then(|rest| rest.strip_suffix(']'))
-            .is_some_and(|rest| rest.contains(", displayed at "))
+            .is_some_and(|rest| !rest.contains(['[', ']']) && rest.contains(", displayed at "))
+    };
+    let note = |text: &str| {
+        let mut lines = text.lines().map(str::trim).filter(|text| !text.is_empty());
+        lines.next().is_some_and(line) && lines.all(line)
     };
     match content {
         Value::String(text) => note(text),
