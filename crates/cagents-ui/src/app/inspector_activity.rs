@@ -427,10 +427,11 @@ mod tests {
             let template = project.worktrees[0].clone();
             project.worktrees = worktrees
                 .iter()
-                .map(|(path, branch)| crate::sidebar::SidebarWorktree {
-                    path: (*path).into(),
-                    branch: Some((*branch).into()),
-                    ..template.clone()
+                .map(|(path, branch)| {
+                    let mut worktree = template.clone();
+                    worktree.path = (*path).into();
+                    worktree.branch = Some((*branch).into());
+                    worktree
                 })
                 .collect();
             project
