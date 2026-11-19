@@ -532,6 +532,29 @@ fn composer_placeholder(mode: Option<PromptMode>, busy: bool) -> &'static str {
     }
 }
 
+/// What the composer says when it's empty. Nothing can be typed while the
+/// conversation changes hands, so it says nothing then. A refused
+/// conversation's box, read-only or not, says why it sends nothing, rather
+/// than inviting a message that has nowhere to go. Otherwise it names what
+/// the field is for.
+fn composer_hint(
+    transitioning: bool,
+    unsendable: Option<blocked_recovery::Unsendable>,
+    main_agent: bool,
+    mode: Option<PromptMode>,
+    busy: bool,
+) -> &'static str {
+    if transitioning {
+        ""
+    } else if let Some(unsendable) = unsendable {
+        unsendable.placeholder
+    } else if main_agent {
+        "Message main agent"
+    } else {
+        composer_placeholder(mode, busy)
+    }
+}
+
 /// The icon and tooltip for a submit control.
 ///
 /// `slot` is the control's place among the modes the provider currently
@@ -3677,18 +3700,16 @@ impl Runtime {
         // the moment the preference changed. The steering and queueing modes
         // still say so, because there the mode is not what a reader expects
         // Enter to do.
-        // A refused conversation keeps its draft but sends nothing; the field
-        // says so, rather than inviting a message that has nowhere to go.
         let unsendable = self
             .start_blocked
             .map(|reopen| reopen.unsendable(fresh_available));
-        let placeholder = if let Some(unsendable) = unsendable {
-            unsendable.placeholder
-        } else if selected.is_some() {
-            "Message main agent"
-        } else {
-            composer_placeholder(modes.first().copied(), self.turn_running())
-        };
+        let placeholder = composer_hint(
+            transitioning,
+            unsendable,
+            selected.is_some(),
+            modes.first().copied(),
+            self.turn_running(),
+        );
         // Key bindings must remain available while the editor changes its own
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
@@ -3745,10 +3766,7 @@ impl Runtime {
                 && !self.is_draft());
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
-            // Nothing can be typed while the conversation changes hands. A
-            // refused conversation's box, read-only or not, says why it
-            // sends nothing.
-            .placeholder(if transitioning { "" } else { placeholder })
+            .placeholder(placeholder)
             .size(design::TEXT_PROSE)
             .height(Length::Shrink)
             .max_height(composer_ceiling)
