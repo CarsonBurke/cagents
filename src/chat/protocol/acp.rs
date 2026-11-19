@@ -592,12 +592,25 @@ impl Acp {
                 self.setting_in_flight = false;
                 match outcome {
                     Ok(result) => {
-                        if let Some(options) = result["configOptions"].as_array() {
+                        let options = result["configOptions"].as_array();
+                        if let Some(options) = options {
                             self.config.learn_options(options);
                             self.config.retain_models(self.profile.offers_model);
                         }
                         match &setting {
-                            Setting::Model(model) => self.config.model_changed(model),
+                            Setting::Model(model) => {
+                                self.config.model_changed(model);
+                                // Each model offers its own reasoning levels,
+                                // as Muse's do. A level chosen with the model
+                                // that the new model's options leave out
+                                // stays with the model it was chosen for.
+                                if options.is_some()
+                                    && let Some(Setting::Reasoning(level)) = self.settings.front()
+                                    && !self.config.offers_reasoning(level)
+                                {
+                                    self.settings.pop_front();
+                                }
+                            }
                             Setting::Mode(mode) => self.config.mode_changed(mode),
                             Setting::Reasoning(_) => {}
                         }
