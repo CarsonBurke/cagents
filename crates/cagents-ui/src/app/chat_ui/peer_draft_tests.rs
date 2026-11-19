@@ -615,7 +615,7 @@ fn warned_of_refused_update(peer: &Peer) -> bool {
     peer.app
         .notices
         .recent()
-        .any(|entry| entry.notice.message.contains("session update was refused"))
+        .any(|entry| entry.notice.message.contains("changed elsewhere"))
 }
 
 /// Two windows attached to one conversation learn its provider session at the
@@ -962,7 +962,7 @@ fn a_message_written_while_the_provider_comes_up_waits_in_the_composer() {
     let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
         panic!("expected a chat runtime");
     };
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(runtime.error.is_none());
     assert_eq!(runtime.unsent_text(), "from this window");
 }
@@ -1115,16 +1115,11 @@ fn escape_on_the_question_lets_the_next_close_ask() {
         drop(app.begin_card_close(next));
         assert!(app.chat_close_asked(asked));
 
-        let task = app.update(Message::KeyEvent {
+        // Escape answers the question within its own update.
+        drop(app.update(Message::KeyEvent {
             event: crate::app::dialog_ui::tests::key_press(iced::keyboard::key::Named::Escape),
             captured,
-        });
-        let cancel = crate::app::tests::task_app_message(task);
-        assert!(
-            matches!(cancel, Message::CancelChatClose),
-            "captured={captured}"
-        );
-        drop(app.update(cancel));
+        }));
 
         assert!(app.chat_close_asked(next), "captured={captured}");
         assert!(!app.chat_close_owned(asked), "captured={captured}");
@@ -1316,6 +1311,7 @@ fn a_copy_of_the_first_message_leaves_the_composer_and_other_writing_stays() {
 /// along to the attached conversation.
 #[test]
 fn a_file_chosen_while_another_window_sends_comes_along() {
+    let _admission = super::attachment_draft::test_admission();
     const FILE: &str = "/repo/notes.txt";
     let mut peer = peer();
     write(&mut peer.app, peer.card, "notes");
@@ -1342,7 +1338,6 @@ fn a_file_chosen_while_another_window_sends_comes_along() {
         "the chooser holds the draft"
     );
 
-    let _admission = super::attachment_draft::test_admission();
     drop(peer.app.handle_chat_ui(Action::Attached(
         target,
         ticket.clone(),
@@ -1407,6 +1402,7 @@ fn a_file_queued_behind_this_windows_own_start_comes_along() {
     match peer.app.cards.get(&peer.card) {
         Some(CardRuntime::Chat(runtime)) => assert!(
             runtime.queued.as_ref().is_some_and(|queued| queued
+                .prompt
                 .attachments
                 .iter()
                 .any(|attachment| attachment.path == std::path::Path::new(FILE))),
@@ -1487,12 +1483,10 @@ fn a_working_chat_close_answers_enter_and_escape_and_can_stop_asking() {
 
     // Escape keeps the chat, and a tick only counts once the close goes ahead.
     drop(app.update(Message::DontAskAgain(StopWorkingChat, true)));
-    let escape = crate::app::tests::task_app_message(app.update(Message::KeyEvent {
+    drop(app.update(Message::KeyEvent {
         event: key_press(keyboard::key::Named::Escape),
         captured: false,
     }));
-    assert!(matches!(escape, Message::CancelChatClose));
-    drop(app.update(escape));
     assert!(!app.chat_close_dialog_visible());
     assert!(
         app.card_state(card)

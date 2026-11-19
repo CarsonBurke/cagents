@@ -998,11 +998,10 @@ impl Cagents {
                         .any(|held| held.repository == order.repository)
             });
             model.views.retain(|view| {
-                !self
-                    .shared_views
+                self.shared_views
                     .scope_absences
                     .get(&view.scope)
-                    .is_some_and(|absence| *absence > sequence)
+                    .is_none_or(|absence| *absence <= sequence)
             });
             for view in &self.workspace_model.views {
                 let previous = model.views.iter().find(|held| held.scope == view.scope);
@@ -1588,10 +1587,32 @@ impl Cagents {
                 if self.shared_views.is_requested_transfer(operation) {
                     self.reject_pane_transfer(operation, error);
                 } else {
+                    let closed = self
+                        .shared_views
+                        .pending
+                        .iter()
+                        .find(|(id, owner, _)| *id == operation && *owner == scope)
+                        .and_then(|(_, _, change)| match change {
+                            crate::workspace_model::views::Change::Remove { id } => Some(*id),
+                            crate::workspace_model::views::Change::RemoveSource {
+                                before, ..
+                            } => Some(before.id),
+                            _ => None,
+                        });
+                    let kept = closed.map(|card| self.pane_kept_notice(card));
                     self.refuse_shared_view_edit(&scope, operation);
-                    self.status = Some(TransientNotice::warning(format!(
-                        "The pane change was not applied: {error}"
-                    )));
+                    // The error is the registry's own wording, or a resend's
+                    // deadline; the trace keeps it, and the person is told
+                    // what happened to the pane.
+                    let (Some(card), Some(kept)) = (closed, kept) else {
+                        self.status = Some(TransientNotice::warning(
+                            super::shared_views::PANE_CHANGE_NOT_SAVED,
+                        ));
+                        return self.reconcile_shared_views();
+                    };
+                    let projected = self.reconcile_shared_views();
+                    self.report_refused_close(&scope, operation, card, &error, kept);
+                    return projected;
                 }
                 self.reconcile_shared_views()
             }
@@ -2211,8 +2232,8 @@ impl Cagents {
     /// rather than by a request of its own.
     ///
     /// Nothing happens at all until a registry has answered. The window
-    /// reconciles on its own events too - a repository finishing loading is one
-    /// - and the cached model starts out as a [`WorkspaceModel::default`], whose
+    /// reconciles on its own events too - a repository finishing loading is one -
+    /// and the cached model starts out as a [`WorkspaceModel::default`], whose
     /// emptiness is not a registry's emptiness. Publishing against it would be
     /// premature and retiring against it would be destruction.
     pub(super) fn reconcile_workspace_model(&mut self) -> Task<Message> {

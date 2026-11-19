@@ -3284,8 +3284,10 @@ fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
 
 #[test]
 fn shortcut_tooltips_follow_customized_and_unbound_bindings() {
-    let mut shortcuts = KeyboardShortcuts::default();
-    shortcuts.search_projects = vec!["Alt+S".into(), "Ctrl+Shift+F".into()];
+    let mut shortcuts = KeyboardShortcuts {
+        search_projects: vec!["Alt+S".into(), "Ctrl+Shift+F".into()],
+        ..KeyboardShortcuts::default()
+    };
     assert_eq!(
         shortcut_tooltip(GlobalShortcut::FocusProjectSearch, &shortcuts),
         "Search projects — Alt+S, Ctrl+Shift+F"

@@ -1,6 +1,14 @@
 //! The desktop application: windows, views, widgets and the state behind them.
 //! The shared library `cagents` holds what the CLI and the daemon also use.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "an assertion's expected `[value.clone()]` reads as the value it expects"
+    )
+)]
+
 // Native hot patches keep thread-local storage in unchanged libraries.
 // Both roots include one module list; application types are never mixed.
 include!("modules.rs");

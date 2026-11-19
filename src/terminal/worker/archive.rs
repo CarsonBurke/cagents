@@ -336,7 +336,7 @@ impl History {
         let mut snapshot = self.base.clone();
         snapshot.generation = generation;
         snapshot.detached = false;
-        snapshot.rows = rows.unwrap_or(self.base.rows).max(1).min(500);
+        snapshot.rows = rows.unwrap_or(self.base.rows).clamp(1, 500);
         snapshot.scroll.len = u64::from(snapshot.rows).min(snapshot.scroll.total);
         snapshot.scroll.offset = offset
             // Following output aligns the last meaningful row rather than

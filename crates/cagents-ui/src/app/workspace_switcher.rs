@@ -97,8 +97,7 @@ impl Geometry {
         let width = (window.width - 2.0 * space::XL).clamp(0.0, PANEL_MAX_WIDTH);
         let detail = width >= LIST_WIDTH + DETAIL_MIN_WIDTH;
         let available = (window.height - 2.0 * WINDOW_MARGIN)
-            .max(PANEL_MIN_HEIGHT)
-            .min(PANEL_MAX_HEIGHT)
+            .clamp(PANEL_MIN_HEIGHT, PANEL_MAX_HEIGHT)
             .min((window.height - 2.0 * space::S).max(0.0));
         // Without a preview beside it, the list is only as tall as its rows.
         let height = if detail {

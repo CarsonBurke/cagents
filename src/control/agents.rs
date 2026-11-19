@@ -216,7 +216,7 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
         .into_iter()
         .find(|provider| provider.executable().eq_ignore_ascii_case(value))
-        .ok_or_else(|| "Choose omp, claude, or codex".into())
+        .ok_or_else(|| "Choose omp, claude, codex, agy or muse".into())
 }
 
 impl PromptArgs {
@@ -1354,11 +1354,26 @@ pub(super) fn execute_with_context(
                 });
             let (placement, placement_warning) = spawn_placement(explicit, caller.as_ref(), owner);
             let caller_view = caller.as_ref().and_then(|caller| caller.view_scope.clone());
-            let provider = provider
-                .or(caller.and_then(|caller| caller.provider))
-                .ok_or_else(|| {
-                    AppError::new("agent_request", "Choose --provider claude, codex, or omp")
-                })?;
+            // The agent runs as a native conversation, so a provider cagents
+            // has no native chat for, named or the caller's own, is refused.
+            let provider = match provider.or(caller.and_then(|caller| caller.provider)) {
+                Some(provider) if provider.has_native_chat() => provider,
+                Some(provider) => {
+                    return Err(AppError::new(
+                        "agent_request",
+                        format!(
+                            "{} Choose --provider claude, codex, or omp",
+                            provider.native_chat_refusal()
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(AppError::new(
+                        "agent_request",
+                        "Choose --provider claude, codex, or omp",
+                    ));
+                }
+            };
             let request = Submit {
                 name,
                 destination: Destination::New(Spec {
@@ -2439,6 +2454,8 @@ mod tests {
             ("CLAUDE", Provider::Claude),
             ("CoDeX", Provider::Codex),
             ("Omp", Provider::Omp),
+            ("agy", Provider::Antigravity),
+            ("Muse", Provider::Muse),
         ] {
             let parsed =
                 Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();

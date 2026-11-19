@@ -7,14 +7,14 @@ printf '1\n' >"$config/fixture-first-turn-seconds"
 printf 'Fixture reply.\n' >"$config/fixture-reply.md"
 rm -f "$config/fixture-run-once"
 parent_tab() {
-    evidence drive move 500,22 >/dev/null
+    evidence drive hover 500,22 >/dev/null
     evidence drive scroll horizontal -100 >/dev/null
     sleep 1
     evidence drive click 310,22 >/dev/null
     sleep 2
 }
 shot() {
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     sleep 1
     evidence shot "$1"
 }
@@ -79,16 +79,16 @@ evidence cli --json agent list
 evidence drive observe
 shot same-project
 if [ "${LABEL_FOLLOWUP:-0}" = 1 ]; then
-    evidence drive move 500,22
+    evidence drive hover 500,22
     evidence drive scroll horizontal 100
     sleep 2
     shot same-project-pager-end
     parent_tab
     at=$(open_point)
-    evidence drive move "$at"
+    evidence drive hover "$at"
     sleep 2
     evidence shot same-project-hover
-    evidence drive move 1,1
+    evidence drive hover 1,1
     for _ in $(seq 1 "${SPAWN_ACTION_REVERSE_TABS:-3}"); do
         evidence drive key shift+Tab
     done

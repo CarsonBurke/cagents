@@ -697,7 +697,7 @@ fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
     let renderer = crate::app::tests::headless_renderer();
     let inspect = |runtime: &Runtime| {
         let item = runtime.active_item("shared-thought").unwrap();
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         let mut element = runtime.prose_view(
             0,
             item,
@@ -784,7 +784,7 @@ fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
         },
     };
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
-    runtime.expanded.insert(item.id.clone());
+    runtime.expanded.edit().insert(item.id.clone());
     let stamp = runtime.cache[&item.id]
         .stamp
         .as_ref()
@@ -796,7 +796,7 @@ fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
         let mut element = runtime.step_view(
             &item,
             &runtime.cache[&item.id],
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         );
         let mut tree = Tree::new(element.as_widget());
         let limits =
@@ -1444,7 +1444,8 @@ fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place()
             &runtime.snapshot.items,
             &runtime.asked_after,
             crate::app::chat_ui::Presentations(&runtime.cache),
-        );
+        )
+        .into();
     };
     let (mut runtime, _handle) =
         frame_cost::live_runtime(&[prompt, command("c1", chat::ToolStatus::Succeeded), thought]);
@@ -1543,7 +1544,8 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
             &runtime.snapshot.items,
             &runtime.asked_after,
             crate::app::chat_ui::Presentations(&runtime.cache),
-        );
+        )
+        .into();
     };
     let running = command("c1", chat::ToolStatus::Running);
     let (mut runtime, _handle) =
@@ -1869,24 +1871,23 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
     // Choosing a model is not a message on its way: it neither reads as
     // sending nor takes the stamp away. A message does.
     runtime.error = None;
-    let pending = |sent: Option<&str>| PendingCommand {
-        followup: false,
-        take_back: None,
-        id: 1,
-        draft_revision: None,
-        request: None,
-        first_prompt: None,
-        model: sent.is_none().then(|| ("haiku".to_owned(), None)),
-        sent: sent.map(str::to_owned),
-        sent_after: Default::default(),
-        sent_attachments: Vec::new(),
-        page: None,
-        queued: None,
+    let model = Command::SetModel {
+        model: "haiku".into(),
+        reasoning: None,
     };
-    runtime.pending = Some(pending(None));
+    let pending = commands::PendingCommand::new(1, &model);
+    let snapshot = runtime.snapshot.clone();
+    assert!(runtime.commands.push(pending, model, &snapshot).is_some());
     assert!(!runtime.sending());
     assert_eq!(activity(&runtime), None);
-    runtime.pending = Some(pending(Some("next")));
+    runtime.commands = commands::Commands::default();
+    let message = Command::Prompt {
+        text: "next".into(),
+        attachments: Vec::new(),
+        mode: PromptMode::Queue,
+    };
+    let pending = commands::PendingCommand::new(1, &message);
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
     assert!(runtime.sending());
     assert_eq!(
         activity(&runtime),
@@ -3567,8 +3568,8 @@ fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child
         assert!(runtime(&app, target).preparation.contains("cold-rich"));
         drop(app.handle_chat_ui(Action::Latest(target)));
         let pending = runtime(&app, target)
-            .pending
-            .as_ref()
+            .commands
+            .in_flight()
             .expect("actual Latest dispatch");
         assert_eq!(pending.page, Some(Page::Latest));
         let pending_id = pending.id;
@@ -3760,7 +3761,7 @@ fn native_paginated_latest_waits_for_newest_source_after_ack_and_preserves_child
                 dispatched,
                 "post-ACK repeated Latest coalesces the existing request"
             );
-            assert!(runtime(&app, target).pending.is_none());
+            assert!(runtime(&app, target).commands.is_idle());
             assert_eq!(runtime(&app, target).page_request, Some((Page::Latest, 10)));
             assert_eq!(
                 runtime(&app, target).scroll_memory.edge(None),
@@ -3972,7 +3973,7 @@ fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacemen
                 },
                 false,
             ));
-            Some(runtime(&app, target).pending.as_ref().unwrap().id)
+            Some(runtime(&app, target).commands.in_flight().unwrap().id)
         };
         drop(app.handle_chat_ui(Action::Latest(target)));
         if unrelated.is_some() {
@@ -4172,8 +4173,8 @@ fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacemen
             );
         }
         let fetch = runtime(&app, target)
-            .pending
-            .as_ref()
+            .commands
+            .in_flight()
             .expect("deferred FETCH resumed despite later reader intent");
         assert_eq!(fetch.page, Some(Page::Latest));
         let fetch_id = fetch.id;
@@ -4202,7 +4203,7 @@ fn native_deferred_latest_fetch_preserves_later_home_and_wheel_across_replacemen
             Ok(()),
         )));
         assert_eq!(
-            runtime(&app, target).pending.as_ref().unwrap().id,
+            runtime(&app, target).commands.in_flight().unwrap().id,
             fetch_id,
             "stale ACK cannot consume the actual fetch"
         );
@@ -4395,7 +4396,7 @@ fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
                     keyboard::key::Named::End
                 };
                 app.chat_scroll_key(&keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key.clone()),
+                    key: keyboard::Key::Named(key),
                     modified_key: keyboard::Key::Named(key),
                     physical_key: keyboard::key::Physical::Unidentified(
                         keyboard::key::NativeCode::Unidentified,
@@ -4637,12 +4638,10 @@ fn native_app_dispatches_home_end_and_latest_while_cold_placeholder_fits() {
             runtime(&app, target).scroll_memory.edge(None),
             Some(if command == "Home" {
                 scroll::Edge::Start
+            } else if command == "Latest" {
+                scroll::Edge::Latest
             } else {
-                if command == "Latest" {
-                    scroll::Edge::Latest
-                } else {
-                    scroll::Edge::End
-                }
+                scroll::Edge::End
             })
         );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
@@ -4702,7 +4701,7 @@ fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebu
     target.card = app.workspace.focused().unwrap();
     live.target = target;
     live.session.launch.provider = Provider::Codex;
-    live.expanded.insert("live-thought".into());
+    live.expanded.edit().insert("live-thought".into());
     let mut child = native_child_fixture();
     child.waiting = true;
     child.model = Some("gpt-fixture-mini".into());
@@ -4892,7 +4891,7 @@ fn live_reasoning_disclosure_toggles_through_actions_and_retains_streaming_choic
             item,
             &runtime.cache[&item.id],
             turn::Slot::Thinking,
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         )
     };
     let mut tree = Tree::new(view(&app).as_widget());
@@ -5082,7 +5081,7 @@ fn reasoning_disclosure_preserves_keyboard_focus_across_retained_toggles() {
             item,
             &runtime.cache[&item.id],
             turn::Slot::Thinking,
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         )
     };
     let mut tree = Tree::new(view(&app).as_widget());
@@ -5198,9 +5197,9 @@ fn drawing_and_regrouping_a_tool_row_do_not_read_its_input_again() {
     let name = "Tried to write docs/large-report.md · Denied";
     for open in [false, true, false] {
         if open {
-            runtime.expanded.insert(item.id.clone());
+            runtime.expanded.edit().insert(item.id.clone());
         } else {
-            runtime.expanded.remove(&item.id);
+            runtime.expanded.edit().remove(&item.id);
         }
         let mut element = runtime.step_header(&item, &runtime.cache[&item.id], open);
         let renderer = crate::app::tests::headless_renderer();
@@ -5373,14 +5372,14 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
         assert_eq!(runtime.turns[0].summary, name);
         for open in [false, true] {
             if open {
-                runtime.expanded.insert(item.id.clone());
+                runtime.expanded.edit().insert(item.id.clone());
             } else {
-                runtime.expanded.remove(&item.id);
+                runtime.expanded.edit().remove(&item.id);
             }
             let mut element = runtime.step_view(
                 &item,
                 &runtime.cache[&item.id],
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
             );
             let renderer = crate::app::tests::headless_renderer();
             let mut tree = Tree::new(element.as_widget());
@@ -5488,7 +5487,6 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
                 if *actual == runtime.target && id == &item.id)
             );
             assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
-            drop(dispatch);
             // Keep the actual widget state mounted through diff. AT focus
             // makes the hover control keyboard-visible without a pointer.
             tree.diff(element.as_widget_mut());
@@ -6183,10 +6181,10 @@ fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
     (runtime, handle)
 }
 
-fn fixture_accounts() -> ChatAccounts {
+fn fixture_accounts() -> ChatAccounts<'static> {
     ChatAccounts {
-        current: "Synthetic account with a long name".into(),
-        choices: Vec::new(),
+        current: "Synthetic account with a long name",
+        choices: Default::default(),
     }
 }
 
@@ -6264,6 +6262,49 @@ fn a_stop_waiting_for_confirmation_keeps_its_place_and_says_what_it_stops() {
         assert!(!says(&first));
         assert!(says(&second), "{:?}", second.text);
     }
+}
+
+/// While a message is only on its way, there is no turn in view: the
+/// composer invites a message rather than steering. Stop is offered while
+/// the conversation reports working, whether or not its turn has begun.
+#[test]
+fn a_message_on_its_way_offers_no_turn_to_steer_and_stop_only_while_working() {
+    let roles = ["chat-submit-0", "chat-stop", "chat-composer"];
+    let (mut runtime, _handle) = furnished_runtime();
+    let message = Command::Prompt {
+        text: "Look at the logs".into(),
+        attachments: Vec::new(),
+        mode: PromptMode::Send,
+    };
+    let mut pending = commands::PendingCommand::new(1, &message);
+    pending.outgoing = Some(commands::Outgoing::new(
+        "Look at the logs".into(),
+        Vec::new(),
+        PromptMode::Send,
+        &runtime.snapshot,
+    ));
+    let snapshot = runtime.snapshot.clone();
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
+    assert!(runtime.turn_under_way());
+    runtime.composer = text_editor::Content::with_text("Then fix them");
+    let laid = lay_out(&runtime, 900.0, None, &roles);
+    assert!(laid.controls.contains_key("chat-submit-0"));
+    assert!(!laid.controls.contains_key("chat-stop"));
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Steer), false),
+        "Message"
+    );
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Steer), true),
+        "Steer this turn"
+    );
+    assert_eq!(
+        composer_placeholder(Some(PromptMode::Queue), false),
+        "Queue for the next turn"
+    );
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    let laid = lay_out(&runtime, 900.0, None, &roles);
+    assert!(laid.controls.contains_key("chat-stop"));
 }
 
 #[test]
@@ -6577,6 +6618,8 @@ fn inspector_open_header_reserves_a_standard_gap_before_its_toggle() {
     let (mut app, card) = inspector_chat_fixture(1440.0);
     app.sidebar_model = sidebar::tests::panel_model();
     app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+    // Without the activity block the toggle ends the first section's header.
+    app.settings.inspector_show_activity = false;
     app.open_pane_inspector_now(card);
     let renderer = crate::app::tests::headless_renderer();
     let mut element = app.card_view(card, true, false);
@@ -6935,14 +6978,14 @@ fn reading_column_is_stable_across_transcript_states() {
             } else {
                 frame_cost::transcript(1)
             };
-            if state == 5 || state == 6 {
-                if let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content {
-                    *text = if state == 5 {
-                        "w".repeat(3000)
-                    } else {
-                        format!("```rust\n{}\n```", "long_code_token".repeat(1000))
-                    };
-                }
+            if (state == 5 || state == 6)
+                && let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content
+            {
+                *text = if state == 5 {
+                    "w".repeat(3000)
+                } else {
+                    format!("```rust\n{}\n```", "long_code_token".repeat(1000))
+                };
             }
             let (mut runtime, _handle) = frame_cost::live_runtime(&items);
             if state == 2 {
@@ -6958,7 +7001,10 @@ fn reading_column_is_stable_across_transcript_states() {
                     });
             }
             if state == 3 {
-                runtime.opened.insert(runtime.turns[0].key.clone(), true);
+                runtime
+                    .opened
+                    .edit()
+                    .insert(runtime.turns[0].key.clone(), true);
             }
             if state == 4 {
                 Arc::make_mut(&mut runtime.snapshot).ready = false;
@@ -7205,7 +7251,7 @@ fn notice_projection_keeps_exact_visible_newlines() {
     let long = "line\n".repeat(NOTICE_LINES + 1);
     assert_eq!(
         visible_notice_body(&long, false),
-        vec!["line"; NOTICE_LINES].join("\n")
+        ["line"; NOTICE_LINES].join("\n")
     );
     assert_eq!(visible_notice_body(&long, true), long);
 }
@@ -7252,7 +7298,7 @@ fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
             .any(|(_, text)| text.contains("Repeated failure") || text.contains("Current failure"))
     );
     for key in &keys {
-        runtime.failure_ui.expanded.insert(key.clone());
+        runtime.failure_ui.expanded.edit().insert(key.clone());
         runtime.cache_failure_preview(key);
     }
     let (catalog, _) = runtime.selection_document();
@@ -7357,7 +7403,7 @@ fn copy_web_search_native(select_all: bool) {
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
     let runtime = app.chat_runtime_mut(target).unwrap();
     let key = runtime.turns[0].key.clone();
-    runtime.opened.insert(key, true);
+    runtime.opened.edit().insert(key, true);
     let (catalog, bookmark) = runtime.selection_document();
     let canonical = runtime
         .snapshot
@@ -7368,7 +7414,7 @@ fn copy_web_search_native(select_all: bool) {
     let content = runtime.step_detail(
         canonical,
         &runtime.cache[&item.id],
-        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
     );
     let mut element = selection::transcript_virtualized(content, target, None, catalog, bookmark);
     let renderer = crate::app::tests::headless_renderer();
@@ -7597,7 +7643,7 @@ fn cli_spawn_step_stays_one_row_and_discloses_its_launch_at_narrow_width() {
     };
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     let renderer = crate::app::tests::headless_renderer();
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let mut catalog = selection::Catalog::builder();
     runtime.selection_item(&mut catalog, &item, turn::Slot::Card, false);
     assert_eq!(catalog.finish().retained_plain_bytes(), 0);
@@ -7644,7 +7690,7 @@ fn cli_spawn_step_stays_one_row_and_discloses_its_launch_at_narrow_width() {
             "compact spawn: {size:?}"
         );
     }
-    runtime.expanded.insert(item.id.clone());
+    runtime.expanded.edit().insert(item.id.clone());
     let mut catalog = selection::Catalog::builder();
     runtime.selection_item(&mut catalog, &item, turn::Slot::Card, true);
     assert!(catalog.finish().retained_plain_bytes() > 0);
@@ -7708,7 +7754,7 @@ fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
     let (mut runtime, _handle) = frame_cost::live_runtime(&[item]);
     let item = runtime.snapshot.items[0].clone();
     let renderer = crate::app::tests::headless_renderer();
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(280.0, 1000.0));
     let mut closed = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
     let mut tree = Tree::new(&closed);
@@ -7727,7 +7773,7 @@ fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
         0,
         "closed details cannot be selected"
     );
-    runtime.expanded.insert(item.id.clone());
+    runtime.expanded.edit().insert(item.id.clone());
     let mut open = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
     let mut tree = Tree::new(&open);
     let node = open.as_widget_mut().layout(&mut tree, &renderer, &limits);
@@ -7757,7 +7803,7 @@ fn monitor_event_output_remains_visible_and_selectable_without_expanding() {
     };
     let (runtime, _handle) = frame_cost::live_runtime(&[item]);
     let item = &runtime.snapshot.items[0];
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let mut view = runtime.delivery_view(item, &runtime.cache[&item.id], settings);
     let mut tree = Tree::new(&view);
     let renderer = crate::app::tests::headless_renderer();
@@ -7795,28 +7841,26 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     sources.push(delivery);
     let (mut runtime, _handle) = frame_cost::live_runtime(&sources);
     let delivery = runtime.snapshot.items.last().unwrap().clone();
-    runtime.expanded.insert(delivery.id.clone());
+    runtime.expanded.edit().insert(delivery.id.clone());
     let queued = Queued {
-        source: prompt::LocalSource::new("Queued message".into()),
-        presentation: prompt::LocalPresentation::default(),
+        prompt: prompt::LocalPrompt::new("Queued message".into(), vec![]),
         resolved_text: "Queued message".into(),
-        attachments: vec![],
         model: None,
         draft: runtime.session.clone(),
         since: None,
         rechecking: false,
     };
-    let source = queued.source.clone();
+    let source = queued.prompt.source.clone();
     runtime.queued = Some(queued);
     let (run, ready) = preparation::local_reply_for_test(&mut runtime);
     let prepared = runtime
         .preparation
         .accept_local(runtime.target, run, &source, ready)
         .unwrap();
-    let mut queued = runtime.queued.take().unwrap();
-    prepared.install_local(&mut queued.presentation);
+    prepared.install_local(&mut runtime.queued.as_mut().unwrap().prompt.presentation);
+    let queued = runtime.queued.as_ref().unwrap();
     let cached = &runtime.cache[&delivery.id];
-    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
     let first = notice_identity(Some("turn-a"), "Repeated failure");
     let second = notice_identity(Some("turn-b"), "Repeated failure");
     assert_ne!(first, second);
@@ -7827,8 +7871,8 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     builder.logical(second, Arc::from("Repeated failure"));
     let content = widget::column::with_children(vec![
         notice_entry("Repeated failure", runtime.target, first),
-        runtime.queued_view(&queued),
-        runtime.delivery_view(&delivery, &cached, settings),
+        runtime.queued_view(queued),
+        runtime.delivery_view(&delivery, cached, settings),
         notice_entry("Repeated failure", runtime.target, second),
     ]);
     let mut element = selection::transcript_virtualized(
@@ -8030,7 +8074,7 @@ fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
             } else {
                 prose::view(
                     cached,
-                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
                     target,
                     None,
                 )
@@ -8688,7 +8732,7 @@ fn reasoning_rows_use_the_selected_subagents_completion_and_duration() {
             &thought,
             &runtime.cache["shared-thought"],
             turn::Slot::Thinking,
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
         );
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -8762,7 +8806,7 @@ fn historical_reasoning_pages_do_not_show_live_status_or_borrow_the_latest_turns
                 &thought,
                 &runtime.cache[&thought.id],
                 turn::Slot::Thinking,
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
             );
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -8852,7 +8896,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
                 &thought,
                 &runtime.cache["thought"],
                 turn::Slot::Thinking,
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
             );
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
@@ -8911,7 +8955,7 @@ fn reasoning_preview_rows_keep_duration_disclosure_and_full_width_at_narrow_size
         &thought,
         &runtime.cache["thought"],
         turn::Slot::Thinking,
-        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
     );
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
@@ -9077,7 +9121,7 @@ fn a_kept_thought_finishes_when_the_answer_after_it_arrives() {
         ),
     ]);
     publish_working(&mut runtime, &handle, |_| {});
-    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(
         runtime
@@ -9215,7 +9259,7 @@ fn an_exchange_is_found_through_its_first_row_mounted_or_not() {
     let (runtime, _handle) = frame_cost::live_runtime(&items);
     assert_eq!(runtime.turns.len(), 1);
     let turn = &runtime.turns[0];
-    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut element = runtime.turn_view(turn, settings, true);
     let mut tree = Tree::new(element.as_widget());
@@ -9552,7 +9596,7 @@ fn refresh_replaces_expanded_tool_text_after_a_tail_colliding_rewrite() {
         at: None,
     }];
     let (mut runtime, handle) = frame_cost::live_runtime(&items);
-    runtime.expanded.insert("tool".into());
+    runtime.expanded.edit().insert("tool".into());
     // First update creates the expanded presentation.
     if let ItemContent::Tool { input, .. } = &mut items[0].content {
         *input = "pwd".into();
@@ -9734,7 +9778,7 @@ fn an_exchange_is_drawn_again_when_its_presentation_changes() {
         .get(&key)
         .copied()
         .unwrap_or(runtime.tool_groups_expanded);
-    runtime.opened.insert(key, !open);
+    runtime.opened.edit().insert(key, !open);
     let toggled = fingerprint(&runtime, false);
     assert_ne!(light, toggled, "the strip opening or closing");
     runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::SolarizedDark);
@@ -9756,6 +9800,7 @@ fn an_open_steps_retained_key_changes_once_for_its_disclosure() {
     let step = runtime.turns[strip].steps[0].index;
     runtime
         .expanded
+        .edit()
         .insert(runtime.snapshot.items[step].id.clone());
     let opened = runtime.turn_fingerprint(&runtime.turns[strip], true);
     assert_ne!(closed, opened);
@@ -9786,7 +9831,7 @@ fn every_markdown_block_is_drawn() {
         2,
         "the quoted fence and the top-level one"
     );
-    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut element = prose::view(
         &cached,
@@ -10440,16 +10485,22 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
         reasoning: None,
         default_reasoning: Some("medium".into()),
     });
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.models.push(model("opus", "Opus 5.5"));
     snapshot.selected_model = Some("opus".into());
     assert_eq!(
-        staged_model_choice(snapshot),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
         None,
         "ordinary aliases also resolve to the running model"
     );
     snapshot.selected_model = None;
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.models[0].label = "Default (Another model)".into();
     snapshot
         .active_model
@@ -10458,7 +10509,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
         .aliases
         .retain(|alias| alias != "default");
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Default (Another model)")
     );
     snapshot.models[0].label = "Default (Opus 5.5)".into();
@@ -10471,23 +10522,33 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
     snapshot.selected_model = Some("default".into());
     snapshot.reasoning = Some("high".into());
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("High effort")
     );
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Opus 5.5"
     );
     snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.reasoning = None;
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Default effort")
     );
     snapshot.selected_model = Some("next".into());
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Next model · Default effort")
     );
     let catalog = crate::account::cache::Catalog {
@@ -10503,7 +10564,7 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
     assert_eq!(reasoning_default(snapshot, &snapshot.models[1], None), None);
     snapshot.models[1].label = "Opus 5.5".into();
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Opus 5.5 · Default effort"),
         "distinct concrete models can share a display name"
     );
@@ -10512,16 +10573,33 @@ fn footer_staged_choice_tooltip_keeps_running_values_separate() {
         Some("high")
     );
     snapshot.active_model = None;
-    assert_eq!(staged_model_choice(snapshot), None);
+    assert_eq!(
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+        None
+    );
     snapshot.selected_model = Some("default".into());
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Default (Opus 5.5)"
     );
     snapshot.reasoning = Some("high".into());
     for provider in [Provider::Claude, Provider::Codex] {
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Default (Opus 5.5) · High"
         );
     }
@@ -10545,11 +10623,14 @@ fn footer_staged_model_uses_reported_aliases_even_when_their_names_differ() {
     });
     for alias in ["opusplan", "deployment-current"] {
         snapshot.selected_model = Some(alias.into());
-        assert_eq!(staged_model_choice(snapshot), None);
+        assert_eq!(
+            staged_model_choice(snapshot, ChosenModel::reported(snapshot)),
+            None
+        );
     }
     snapshot.active_model.as_mut().unwrap().aliases.clear();
     assert_eq!(
-        staged_model_choice(snapshot).as_deref(),
+        staged_model_choice(snapshot, ChosenModel::reported(snapshot)).as_deref(),
         Some("Team model"),
         "an unreported alias resolution cannot be inferred from its display name"
     );
@@ -10571,31 +10652,73 @@ fn footer_model_label_names_active_model_and_keeps_draft_alias() {
     });
     for fit in [FooterFit::Wide, FooterFit::Narrow, FooterFit::Tight] {
         assert_eq!(
-            footer_model_label(snapshot, false, Provider::Claude, fit, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                Provider::Claude,
+                fit,
+                None
+            ),
             "Opus 5.5"
         );
         assert_eq!(
-            footer_model_label(snapshot, true, Provider::Claude, fit, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                true,
+                Provider::Claude,
+                fit,
+                None
+            ),
             "Default (Opus 5.5)"
         );
     }
     snapshot.selected_model = None;
     assert_eq!(
-        footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            true,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Default (Opus 5.5)"
     );
     snapshot.selected_model = Some("next-turn-model".into());
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "Opus 5.5"
     );
     snapshot.active_model = None;
     assert_eq!(
-        footer_model_label(snapshot, false, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            false,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "next-turn-model"
     );
     assert_eq!(
-        footer_model_label(snapshot, true, Provider::Claude, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            true,
+            Provider::Claude,
+            FooterFit::Wide,
+            None
+        ),
         "next-turn-model"
     );
 }
@@ -10679,6 +10802,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
     assert_eq!(
         footer_model_label(
             snapshot,
+            ChosenModel::reported(snapshot),
             true,
             Provider::Codex,
             FooterFit::Wide,
@@ -10687,7 +10811,14 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
         "Offline Mini"
     );
     assert_eq!(
-        footer_model_label(snapshot, true, Provider::Codex, FooterFit::Wide, None),
+        footer_model_label(
+            snapshot,
+            ChosenModel::reported(snapshot),
+            true,
+            Provider::Codex,
+            FooterFit::Wide,
+            None
+        ),
         "Offline Mini · Medium",
         "an unknown default does not erase the explicit choice"
     );
@@ -10695,6 +10826,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
     assert_eq!(
         footer_model_label(
             snapshot,
+            ChosenModel::reported(snapshot),
             true,
             Provider::Codex,
             FooterFit::Wide,
@@ -10707,6 +10839,7 @@ fn draft_footer_suppresses_catalog_default_but_keeps_high_override() {
     assert_eq!(
         footer_model_label(
             snapshot,
+            ChosenModel::reported(snapshot),
             true,
             Provider::Codex,
             FooterFit::Wide,
@@ -10732,17 +10865,38 @@ fn footer_model_label_appends_only_nondefault_effort_for_both_providers() {
     for provider in [Provider::Claude, Provider::Codex] {
         snapshot.active_model.as_mut().unwrap().reasoning = None;
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Resolved model"
         );
         snapshot.active_model.as_mut().unwrap().reasoning = Some("medium".into());
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Resolved model"
         );
         snapshot.active_model.as_mut().unwrap().reasoning = Some("high".into());
         assert_eq!(
-            footer_model_label(snapshot, false, provider, FooterFit::Wide, None),
+            footer_model_label(
+                snapshot,
+                ChosenModel::reported(snapshot),
+                false,
+                provider,
+                FooterFit::Wide,
+                None
+            ),
             "Resolved model · High"
         );
     }
@@ -11555,6 +11709,423 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
                 }
             }
         }
+    }
+}
+
+/// An agent started, a step, a thought and a report are each a line of the
+/// timeline by the one rule, so the space between any two of them is the
+/// one gap between lines, the same gap a group of steps puts between its
+/// rows; only prose and an exchange's opening set themselves apart.
+#[test]
+fn every_timeline_row_is_a_line_by_the_one_rhythm_rule() {
+    let item = |content| chat::Item {
+        id: "item".into(),
+        role: chat::Role::Assistant,
+        content,
+        started_at: None,
+        at: None,
+    };
+    let started = item(ItemContent::Tool {
+        name: "Agent".into(),
+        input: serde_json::json!({
+            "subagent_type": "general-purpose",
+            "description": "Design",
+            "prompt": "Draft a design",
+        })
+        .to_string(),
+        output: String::new(),
+        status: chat::ToolStatus::Succeeded,
+    });
+    let thought = item(ItemContent::Text {
+        text: "**Weighing the drafts**".into(),
+        thinking: true,
+        phase: chat::Phase::Commentary,
+    });
+    let answer = item(ItemContent::Text {
+        text: "Done.".into(),
+        thinking: false,
+        phase: chat::Phase::Final,
+    });
+    // A started agent is drawn as a card among the prose.
+    assert_eq!(
+        Rhythm::of(&started, turn::slot_of(&started), true),
+        Rhythm::Line
+    );
+    assert_eq!(Rhythm::of(&started, turn::Slot::Step, false), Rhythm::Line);
+    assert_eq!(
+        Rhythm::of(&thought, turn::Slot::Thinking, false),
+        Rhythm::Line
+    );
+    assert_eq!(Rhythm::of(&answer, turn::Slot::Prose, false), Rhythm::Block);
+    assert_eq!(Rhythm::Line.gap(Rhythm::Line), step::GAP_XS);
+    for above in [Rhythm::Line, Rhythm::Block, Rhythm::Opening] {
+        assert_eq!(above.gap(Rhythm::Opening), step::GAP_L);
+    }
+    assert_eq!(Rhythm::Line.gap(Rhythm::Block), step::GAP_M);
+    assert_eq!(Rhythm::Block.gap(Rhythm::Line), step::GAP_M);
+    // Before it is measured, a line is taken to be one timeline row, and
+    // the gap after it completes the pitch the layout test measures.
+    assert_eq!(
+        super::row_estimate(&started, Rhythm::Line, 0.0, 780.0) + step::GAP_XS,
+        design::LINE_TRANSCRIPT + 3.0 * step::GAP_XS
+    );
+}
+
+/// The sequence from #3119: four agents started, a thought with nothing to
+/// read, a fifth agent, then the reply. Every row of the timeline sits the
+/// same distance below the one before it, whether a hidden thought, a shown
+/// one, a group boundary or nothing at all falls between them, and so do the
+/// reports of agents that finished, though each opens an exchange; the reply
+/// sits the same distance below the last row however it was reached; and the
+/// rows' words, the agents' names, their states and the reply are set at one
+/// size.
+#[test]
+fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Probe {
+        texts: Vec<(String, iced::Rectangle)>,
+        reply: Option<(iced::Rectangle, f32)>,
+    }
+    impl Operation for Probe {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            text: &str,
+        ) {
+            self.texts.push((text.to_owned(), bounds));
+        }
+        fn custom(
+            &mut self,
+            _: Option<&iced::advanced::widget::Id>,
+            bounds: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(state) = state.downcast_ref::<selectable_prose::State>()
+                && state.plain.as_ref() == REPLY
+            {
+                let (_, size) = state.mounted_typography().expect("the reply is laid out");
+                self.reply = Some((bounds, size.0));
+            }
+        }
+    }
+    const REPLY: &str = "All five designs are ready.";
+    let item = |id: &str, role, content| chat::Item {
+        id: id.into(),
+        role,
+        content,
+        started_at: None,
+        at: None,
+    };
+    let text = |id: &str, role, text: &str, thinking| {
+        item(
+            id,
+            role,
+            ItemContent::Text {
+                text: text.into(),
+                thinking,
+                phase: if thinking {
+                    chat::Phase::Commentary
+                } else {
+                    chat::Phase::Final
+                },
+            },
+        )
+    };
+    let started = |id: &str, name: &str| {
+        item(
+            id,
+            chat::Role::Assistant,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                input: serde_json::json!({
+                    "subagent_type": name,
+                    "description": format!("Design {id}"),
+                    "prompt": "Draft a design",
+                })
+                .to_string(),
+                output: String::new(),
+                status: chat::ToolStatus::Succeeded,
+            },
+        )
+    };
+    let command = item(
+        "command",
+        chat::Role::Assistant,
+        ItemContent::Command {
+            label: "Read the fixture".into(),
+            command: "cat fixture".into(),
+            working_directory: "/project".into(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: None,
+            output: String::new(),
+        },
+    );
+    // A second command, so that the open group is one: a lone step is
+    // drawn as itself.
+    let notes = item(
+        "notes",
+        chat::Role::Assistant,
+        ItemContent::Command {
+            label: "Read the notes".into(),
+            command: "cat notes".into(),
+            working_directory: "/project".into(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: None,
+            output: String::new(),
+        },
+    );
+    // What a finished background agent reports, which opens an exchange of
+    // its own and is drawn as a row of the timeline.
+    let finished = |n: usize| {
+        item(
+            &format!("report-{n}"),
+            chat::Role::User,
+            ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: String::new(),
+                sender: String::new(),
+                summary: format!("Agent \"Sidebar direction {n}\" finished"),
+                body: "The design is drafted.".into(),
+            },
+        )
+    };
+    let sequence = |between: Vec<chat::Item>, reports: usize| {
+        let mut items = vec![text(
+            "prompt",
+            chat::Role::User,
+            "Draft five designs.",
+            false,
+        )];
+        items.extend((1..=4).map(|n| started(&format!("agent-{n}"), "general-purpose")));
+        items.extend(between);
+        items.push(started("agent-5", "sol-design2"));
+        items.extend((1..=reports).map(finished));
+        items.push(text("reply", chat::Role::Assistant, REPLY, false));
+        items
+    };
+    // A thought with nothing to read draws no row; one with a headline does.
+    let thought = text("thought", chat::Role::Assistant, "", true);
+    let headline = text(
+        "headline",
+        chat::Role::Assistant,
+        "**Weighing the drafts**",
+        true,
+    );
+    let scenarios = [
+        (
+            "a hidden thought between",
+            sequence(vec![thought.clone()], 0),
+            false,
+            780.0,
+        ),
+        (
+            "a thought between",
+            sequence(vec![headline], 0),
+            false,
+            780.0,
+        ),
+        ("nothing between", sequence(Vec::new(), 0), false, 780.0),
+        (
+            "a group boundary",
+            sequence(vec![command.clone()], 0),
+            false,
+            780.0,
+        ),
+        (
+            "an open group",
+            sequence(vec![command, notes], 0),
+            true,
+            780.0,
+        ),
+        (
+            "agents reporting",
+            sequence(vec![thought.clone()], 2),
+            false,
+            780.0,
+        ),
+        (
+            "a narrow pane",
+            sequence(vec![thought.clone()], 0),
+            false,
+            220.0,
+        ),
+        (
+            "agents reporting in a narrow pane",
+            sequence(vec![thought], 2),
+            false,
+            220.0,
+        ),
+    ];
+    let renderer = crate::app::tests::headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    let width_at = |mut element: Element<'static, Message>| {
+        let mut tree = Tree::new(element.as_widget());
+        element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 100.0)),
+            )
+            .size()
+            .width
+    };
+    let verb = width_at(design::transcript("Started").into());
+    assert_ne!(
+        verb,
+        width_at(design::body("Started").into()),
+        "the sizes differ"
+    );
+    let mut pitches = Vec::new();
+    let mut reply_gaps = Vec::new();
+    for (scenario, items, open, width) in scenarios {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+        runtime.tool_groups_expanded = open;
+        let summary = runtime
+            .turns
+            .iter()
+            .find(|turn| !turn.steps.is_empty())
+            .map(|turn| turn.summary.clone());
+        let mut element = runtime.view(
+            None,
+            false,
+            true,
+            &shortcuts,
+            width,
+            0.0,
+            Place { branch: None },
+            true,
+            None,
+            Vec::new(),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1400.0)),
+        );
+        let mut probe = Probe::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        // Each row of the timeline, by the words that start it.
+        let rows: Vec<&(String, iced::Rectangle)> = probe
+            .texts
+            .iter()
+            .filter(|(text, _)| {
+                text == "Started"
+                    || text.starts_with("Sidebar direction ")
+                    || text.starts_with("Thought")
+                    || text.starts_with("Thinking")
+                    || text.starts_with("Ran cat ")
+                    || text.starts_with("Weighing the drafts")
+                    || summary.as_deref() == Some(text.as_str())
+            })
+            .collect();
+        let expected =
+            5 + usize::from(matches!(
+                scenario,
+                "a thought between" | "a group boundary" | "an open group"
+            )) + 2 * usize::from(open)
+                + 2 * usize::from(scenario.starts_with("agents reporting"));
+        assert_eq!(rows.len(), expected, "{scenario}: {rows:?}");
+        // A report names its agent as a row names any agent, without the
+        // provider's "Agent" and quotes, and the name keeps its room: where
+        // the pane is too narrow for it and the outcome both, the outcome
+        // gives way, and so does a started agent's state.
+        let narrow = width < 300.0;
+        for (text, bounds) in &probe.texts {
+            // Wide, every agent's name is whole; narrow, a report's still
+            // is, its outcome having given way.
+            if text.starts_with("Sidebar direction ")
+                || !narrow && text.starts_with("Design agent-")
+            {
+                let natural = width_at(design::transcript_name(text.clone()).into());
+                assert!(
+                    bounds.width + 0.5 >= natural,
+                    "{scenario}: {text:?} is cut to {} of {natural}",
+                    bounds.width
+                );
+            }
+        }
+        let outcomes = |word: &str| probe.texts.iter().filter(|(text, _)| text == word).count();
+        if scenario.starts_with("agents reporting") {
+            assert_eq!(
+                outcomes("finished"),
+                if narrow { 0 } else { 2 },
+                "{scenario}: the reports' outcome"
+            );
+        }
+        if narrow {
+            assert_eq!(
+                outcomes("Finished"),
+                0,
+                "{scenario}: the started agents' state"
+            );
+        }
+        let tops: Vec<f32> = rows.iter().map(|(_, bounds)| bounds.y).collect();
+        for pair in tops.windows(2) {
+            pitches.push((scenario, pair[1] - pair[0]));
+        }
+        // Every word in the timeline's rows - verbs, names, previews and
+        // states - is set in the transcript's line box.
+        let (first, last) = (tops[0], *tops.last().unwrap());
+        for (text, bounds) in &probe.texts {
+            if bounds.y >= first && bounds.y <= last && bounds.height > 0.0 {
+                assert_eq!(
+                    bounds.height,
+                    design::LINE_TRANSCRIPT,
+                    "{scenario}: {text:?} sits in the transcript's line box"
+                );
+            }
+        }
+        for (text, bounds) in &rows {
+            if text == "Started" {
+                assert_eq!(
+                    bounds.width, verb,
+                    "{scenario}: the verb is at transcript size"
+                );
+            }
+        }
+        let (reply, size) = probe.reply.expect("the reply is drawn");
+        assert_eq!(
+            size,
+            design::TEXT_TRANSCRIPT,
+            "{scenario}: the reply's size"
+        );
+        reply_gaps.push((scenario, reply.y - (last + design::LINE_TRANSCRIPT)));
+    }
+    let pitch = pitches[0].1;
+    for (scenario, found) in &pitches {
+        assert!(
+            (found - pitch).abs() < 0.5,
+            "{scenario}: rows {found} apart rather than {pitch}: {pitches:?}"
+        );
+    }
+    assert_eq!(
+        pitch,
+        design::LINE_TRANSCRIPT + 2.0 * step::GAP_XS + step::GAP_XS,
+        "a row's line box, its padding and the gap between rows"
+    );
+    for (scenario, gap) in &reply_gaps {
+        assert_eq!(
+            *gap,
+            step::GAP_XS + step::GAP_M,
+            "{scenario}: the reply sits a block's gap below the last row's padding"
+        );
     }
 }
 

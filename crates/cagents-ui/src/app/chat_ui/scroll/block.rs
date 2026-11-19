@@ -125,15 +125,15 @@ impl Block<'_> {
             memory.clock = memory.clock.wrapping_add(1);
             saved.used = memory.clock;
             saved.source = self.source.as_ref().map(|source| source.proof());
-            if !memory.entries.contains_key(&self.key) && memory.entries.len() >= 1024 {
-                if let Some(key) = memory
+            if !memory.entries.contains_key(&self.key)
+                && memory.entries.len() >= 1024
+                && let Some(key) = memory
                     .entries
                     .iter()
                     .min_by_key(|(_, saved)| saved.used)
                     .map(|(key, _)| key.clone())
-                {
-                    memory.entries.remove(&key);
-                }
+            {
+                memory.entries.remove(&key);
             }
             memory.entries.insert(self.key.clone(), saved);
         }

@@ -2332,7 +2332,7 @@ mod tests {
         assert!(state.existence.is_open());
         assert_eq!(state.kind, CardKind::Chat(source.clone()));
         assert_eq!(state.title, "Review peripheral Rust modules");
-        assert!(app.cards.get(&card).is_none(), "drawn as starting");
+        assert!(!app.cards.contains_key(&card), "drawn as starting");
         assert!(!app.chat_start_began(card));
         assert!(app.chat_start_pending(card));
         assert!(!app.resume_ui.loading, "other conversations stay resumable");
@@ -2547,7 +2547,7 @@ mod tests {
 
         // Retry waits for a new answer, and only that one applies.
         drop(app.update(Message::RetryCard(card)));
-        assert!(app.cards.get(&card).is_none());
+        assert!(!app.cards.contains_key(&card));
         assert!(app.chat_start_pending(card));
         let retried = app.resume_ui.reopening[&card].attempt;
         assert_ne!(retried, attempt);

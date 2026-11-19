@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     provider: Provider::Omp,
     executable: "omp",
+    aliases: &[],
     label: "Oh My Pi",
     recognizes_script: |path| {
         matches!(
@@ -12,6 +13,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
             Some("omp" | "omp.js")
         )
     },
+    background_command: |arg| super::shared_background_command(arg) || arg.starts_with("__omp_"),
     session_file_id: |stem| Some(stem.rsplit_once('_')?.1),
     session_root,
     #[cfg(feature = "host")]
@@ -71,6 +73,10 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     ],
     resume_flag: "--resume",
     resume_precedes_options: false,
+    resume_picker: true,
+    latest_selectors: &["--continue", "-c"],
+    native_chat: true,
+    acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]

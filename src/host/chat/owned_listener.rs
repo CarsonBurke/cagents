@@ -204,14 +204,15 @@ fn refresh_served(root: &Path) -> io::Result<()> {
         // endpoint anyone else could place must not choose what is dialed.
         let directory = entry.path();
         let endpoint = directory.join("control.sock");
-        if private_allocation(&directory) && listening(&endpoint) {
-            if let Err(error) = refresh(&endpoint) {
-                tracing::warn!(
-                    %error,
-                    endpoint = %endpoint.display(),
-                    "a Codex listener in the temporary directory could not be kept fresh"
-                );
-            }
+        if private_allocation(&directory)
+            && listening(&endpoint)
+            && let Err(error) = refresh(&endpoint)
+        {
+            tracing::warn!(
+                %error,
+                endpoint = %endpoint.display(),
+                "a Codex listener in the temporary directory could not be kept fresh"
+            );
         }
     }
     Ok(())

@@ -77,7 +77,8 @@ enum Escape {
     CsiIntermediates,
     Intermediates,
     String,
-    StringEscape,
+    /// An ESC inside a string, which a following `\` makes its terminator.
+    StringEsc,
 }
 
 #[cfg(any(feature = "host", test))]
@@ -139,7 +140,7 @@ impl Stream {
     fn visible(&mut self, character: char) -> bool {
         // A malformed sequence ends before the character that broke it. Retry
         // only that character in its new state, never the preceding payload.
-        // At most StringEscape -> Introducer -> Ground examines it again.
+        // At most StringEsc -> Introducer -> Ground examines it again.
         loop {
             #[cfg(test)]
             {
@@ -203,12 +204,12 @@ impl Stream {
                     }
                     '\n' => self.escape = Escape::Ground,
                     '\x1b' => {
-                        self.escape = Escape::StringEscape;
+                        self.escape = Escape::StringEsc;
                         return false;
                     }
                     _ => return false,
                 },
-                Escape::StringEscape => {
+                Escape::StringEsc => {
                     if character == '\\' {
                         self.escape = Escape::Ground;
                         return false;

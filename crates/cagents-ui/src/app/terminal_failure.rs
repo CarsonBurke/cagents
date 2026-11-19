@@ -933,7 +933,7 @@ impl Cagents {
         Some(
             widget::container(
                 widget::column::with_children(vec![
-                    crate::ui_controls::activity_spinner(24.0, design::accent_color).into(),
+                    crate::ui_controls::activity_spinner(24.0, design::accent_color),
                     design::title(attempt.details.attempt_title()).into(),
                     design::caption(attempt.details.attempt_caption()).into(),
                     widget::row::with_children(vec![

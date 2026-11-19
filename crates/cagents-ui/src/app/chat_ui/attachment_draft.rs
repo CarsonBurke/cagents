@@ -289,11 +289,9 @@ impl Ticket {
     }
 }
 pub(super) fn admit() -> Option<(Ticket, Lease)> {
-    static POOL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
-        std::sync::OnceLock::new();
-    let pool = POOL
-        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
-        .clone();
+    use std::sync::Arc;
+
+    let pool = application_capacity!(2);
     #[cfg(test)]
     let pool = TEST_POOL.with(|slot| slot.borrow().clone()).unwrap_or(pool);
     Ticket::acquire(pool)
@@ -304,8 +302,9 @@ thread_local! {
     static TEST_POOL: std::cell::RefCell<Option<std::sync::Arc<tokio::sync::Semaphore>>> = const { std::cell::RefCell::new(None) };
 }
 /// An explicit isolated application fixture uses the same two-slot contract.
-/// All Runtime/cards inside that fixture share it; ordinary test code still
-/// uses production's process-global pool unless this guard is installed.
+/// All Runtime/cards inside that fixture share it. Ordinary test code gets a
+/// per-test-thread pool from `application_capacity!`; this guard also asserts
+/// that every permit is settled before fixture retirement.
 #[cfg(test)]
 pub(super) struct TestAdmission {
     previous: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -339,6 +338,8 @@ pub(super) fn message_key(provider: crate::agent::Provider, item_id: &str) -> Op
     let (message, index) = match provider {
         crate::agent::Provider::Codex => item_id.rsplit_once("/input/")?,
         crate::agent::Provider::Claude | crate::agent::Provider::Omp => item_id.rsplit_once(':')?,
+        // No native chat decodes their messages yet.
+        crate::agent::Provider::Antigravity | crate::agent::Provider::Muse => return None,
     };
     if message.is_empty()
         || index.is_empty()
@@ -477,6 +478,26 @@ mod tests {
             excerpt(&content, 0, content.line_count() - 1, false).text(),
             content.text()
         );
+    }
+
+    #[test]
+    fn admission_is_private_to_each_test_thread() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let first = admit();
+            let second = admit();
+            assert!(first.is_some());
+            assert!(second.is_some());
+            assert!(sender.send([first.unwrap(), second.unwrap()]).is_ok());
+        });
+        let other_thread_admissions = receiver.recv().unwrap();
+        thread.join().unwrap();
+
+        let admission = admit();
+        assert!(admission.is_some());
+
+        drop(admission);
+        drop(other_thread_admissions);
     }
 
     #[test]

@@ -280,7 +280,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let counts = parse_counts(output.stdout.trim_ascii()).ok_or_else(|| {
             RepositoryError::InvalidGitOutput {
                 error: malformed("git rev-list --count", 0, "expected two counts"),
-                process: output.clone(),
+                process: Box::new(output.clone()),
             }
         })?;
         Ok(Divergence {

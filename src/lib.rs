@@ -1,3 +1,10 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cloned_ref_to_slice_refs,
+        reason = "an assertion's expected `[value.clone()]` reads as the value it expects"
+    )
+)]
 // Native hot patches of the UI keep thread-local storage in this unchanged
 // library.
 #[doc(hidden)]

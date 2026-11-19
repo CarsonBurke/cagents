@@ -66,6 +66,8 @@ fn discover_at(launch: &Launch, home: &Path, root: &Path) -> Vec<Skill> {
                 roots.push((directory.join(".agents/skills"), false));
                 roots.push((directory.join(".agent/skills"), false));
             }
+            // No native chat offers their skills yet.
+            Provider::Antigravity | Provider::Muse => {}
         }
         // A worktree has a .git file; an ordinary repository has a directory.
         if directory.join(".git").exists() || directory == home {
@@ -378,6 +380,7 @@ fn parse_skill(path: &Path, provider: Provider, require_description: bool) -> Op
         }
         Provider::Claude => format!("/{name}"),
         Provider::Omp => format!("/skill:{name}"),
+        Provider::Antigravity | Provider::Muse => return None,
     };
     Some(Skill {
         name: name.into(),
@@ -413,6 +416,7 @@ mod tests {
             Provider::Codex => "CODEX_HOME",
             Provider::Claude => "CLAUDE_CONFIG_DIR",
             Provider::Omp => "PI_CODING_AGENT_DIR",
+            Provider::Antigravity | Provider::Muse => unreachable!("no native chat"),
         };
         Launch {
             provider,

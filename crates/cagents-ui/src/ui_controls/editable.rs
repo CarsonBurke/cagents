@@ -439,10 +439,10 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextInput<'_
                     match (&request.action, &request.data) {
                         (Action::Focus, _) => {
                             state.focus();
-                            if !own.last_focused.replace(true) {
-                                if let Some(message) = &self.on_focus {
-                                    shell.publish(message.clone());
-                                }
+                            if !own.last_focused.replace(true)
+                                && let Some(message) = &self.on_focus
+                            {
+                                shell.publish(message.clone());
                             }
                         }
                         (

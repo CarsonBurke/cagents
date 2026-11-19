@@ -600,7 +600,7 @@ impl Receipt {
     }
     pub(crate) fn failure(&self) -> UpdateError {
         if let Some(required) = self.target_required() {
-            return UpdateError::TargetRecoveryRequired(required);
+            return UpdateError::TargetRecoveryRequired(Box::new(required));
         }
         let description = match &self.outcome {
             Outcome::Unverified {
@@ -1597,7 +1597,7 @@ fn pending_required(
         checkpoint_before: Some(pending.checkpoint_hash.clone()),
     };
     census.validate()?;
-    Ok(UpdateError::TargetRecoveryRequired(
+    Ok(UpdateError::TargetRecoveryRequired(Box::new(
         TargetRecoveryRequired {
             transaction: census.transaction.clone(),
             census_digest: census.digest()?,
@@ -1606,7 +1606,7 @@ fn pending_required(
             checkpoint_before: census.checkpoint_before.clone(),
             recovery_command: Some(pending.command(candidate_cli, original_census)),
         },
-    ))
+    )))
 }
 
 /// Preserve the original installer census before reporting a target-only
@@ -1641,7 +1641,7 @@ pub(crate) fn verify_file_with_candidate(
             locate(candidate_cli)?;
             required.recovery_command = Some(pending.command(candidate_cli, original_path));
         }
-        return Err(UpdateError::TargetRecoveryRequired(required));
+        return Err(UpdateError::TargetRecoveryRequired(Box::new(required)));
     }
     verify_file(census, outcome, true, false, false, false)
 }
@@ -1882,7 +1882,7 @@ mod tests {
         let original = terminal();
         let expected = census(&original);
         assert!(matches!(
-            compare(&expected, &proof(), &[original.clone()], &[]),
+            compare(&expected, &proof(), std::slice::from_ref(&original), &[]),
             Outcome::Usable { .. }
         ));
         for actual in [
@@ -1983,7 +1983,7 @@ mod tests {
         expected.terminals.clear();
         expected.chats.push(original.clone());
         assert!(matches!(
-            compare(&expected, &proof(), &[], &[original.clone()]),
+            compare(&expected, &proof(), &[], std::slice::from_ref(&original)),
             Outcome::Usable { .. }
         ));
         let mut changed_owner = proof();

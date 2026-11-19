@@ -160,7 +160,7 @@ fn qualify_binding(
         || ownership.actor().is_nil()
         || !crate::agent_execution::same_chat_process(ownership.source(), source)
         || ownership.owner() != native
-        || !matches!(native.version, 2 | 3 | 4)
+        || !matches!(native.version, 2..=4)
         || native.kind != Kind::Native
         || native.terminal != source.id
         || native.boot != proof.boot_id
@@ -171,7 +171,7 @@ fn qualify_binding(
                 .iter()
                 .any(|capability| capability == holder_registry::RETAINED_CLAUDE_CAPABILITY)
         })
-        || !matches!(console.version, 3 | 4 | 5)
+        || !matches!(console.version, 3..=5)
         || console.kind != Kind::Terminal
         || console.terminal != source.id
         || console.boot != proof.boot_id

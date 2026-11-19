@@ -561,8 +561,10 @@ pub struct Editor {
     /// Newest generation written per preference file. Storage work runs on the
     /// blocking pool, so two captures of the same file can finish out of
     /// order; the loser is dropped instead of resurrecting stale values.
-    preference_lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+    preference_lane: Arc<std::sync::Mutex<PreferenceLanes>>,
     preference_generation: u64,
+    /// How many times this editor has confirmed Reset all.
+    settings_resets: u64,
 }
 
 /// One write-ordering lane per preference file ceditor owns.
@@ -578,15 +580,74 @@ impl PreferenceFile {
     const COUNT: usize = 4;
 }
 
+struct PreferenceLanes {
+    applied: [u64; PreferenceFile::COUNT],
+    /// The settings this editor last wrote successfully, which a merged save
+    /// compares against to find this editor's own changes.
+    settings_base: AppSettings,
+    /// How many Reset all actions a successful settings write has carried to
+    /// disk.
+    resets_written: u64,
+}
+
+impl PreferenceLanes {
+    /// Claims `file`'s lane for `generation`, or reports that a newer capture
+    /// of it already ran.
+    fn claim(&mut self, file: PreferenceFile, generation: u64) -> bool {
+        let applied = &mut self.applied[file as usize];
+        if *applied >= generation {
+            return false;
+        }
+        *applied = generation;
+        true
+    }
+
+    /// Writes settings.toml unless a newer capture of it, from either kind of
+    /// write that carries it, already ran.
+    fn write_settings(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        SettingsWrite { settings, resets }: SettingsWrite,
+    ) -> Result<(), String> {
+        if !self.claim(PreferenceFile::Settings, generation) {
+            return Ok(());
+        }
+        if self.resets_written < resets {
+            settings::save(path, &settings)
+        } else {
+            settings::save_merged(path, &self.settings_base, &settings)
+        }
+        .map_err(|error| error.to_string())?;
+        self.resets_written = resets;
+        self.settings_base = settings;
+        Ok(())
+    }
+}
+
+/// One capture of settings.toml.
+struct SettingsWrite {
+    settings: AppSettings,
+    /// The Reset all actions confirmed before this capture. Until a write
+    /// carrying the newest one succeeds, settings writes replace the file
+    /// whole: a newer capture supersedes the reset and carries its defaults,
+    /// so merging it against the old base would undo the reset.
+    resets: u64,
+}
+
 /// Captured on the event loop; all storage work runs on the blocking pool.
 ///
-/// `settings::save` takes a blocking `flock` shared with every other cagents
-/// window and fsyncs twice. None of that belongs on the thread driving the
-/// compositor frame.
+/// Settings writes merge only changes from this editor's last successful save
+/// so another editor's preferences survive. Resets replace settings whole.
+/// The settings writer takes a blocking `flock` shared with other editors and
+/// fsyncs twice. None of that belongs on the thread driving the compositor frame.
 enum PreferenceWrite {
-    Settings(AppSettings),
+    Settings(SettingsWrite),
+    /// The assistance flag, with settings.toml, which the shared settings
+    /// writer creates and validates the directory for. That part shares the
+    /// settings lane, so an older capture cannot overwrite newer settings.
     Assistance {
-        settings: AppSettings,
+        settings: SettingsWrite,
         enabled: bool,
     },
     Shortcuts(crate::preferences::EditorShortcuts),
@@ -607,34 +668,31 @@ impl PreferenceWrite {
 struct PreferenceSave {
     path: PathBuf,
     generation: u64,
-    lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+    lane: Arc<std::sync::Mutex<PreferenceLanes>>,
     write: PreferenceWrite,
 }
 
 impl PreferenceSave {
     fn run(self) -> Result<(), String> {
-        let file = self.write.file();
-        let mut lane = self
+        let mut lanes = self
             .lane
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let applied = &mut lane[file as usize];
-        if *applied >= self.generation {
+        // The lanes stay locked across the write so two captures of one file
+        // land in capture order rather than blocking-pool completion order.
+        // A settings write claims its lane itself, as an assistance write's
+        // settings part does.
+        let file = self.write.file();
+        if !matches!(file, PreferenceFile::Settings) && !lanes.claim(file, self.generation) {
             return Ok(());
         }
-        *applied = self.generation;
-        // The lane stays locked across the write so two captures of one file
-        // land in capture order rather than blocking-pool completion order.
         match self.write {
-            PreferenceWrite::Settings(settings) => {
-                settings::save(&self.path, &settings).map_err(|error| error.to_string())
+            PreferenceWrite::Settings(write) => {
+                lanes.write_settings(&self.path, self.generation, write)
             }
             PreferenceWrite::Assistance { settings, enabled } => {
-                settings::save(&self.path, &settings)
-                    .map_err(|error| error.to_string())
-                    .and_then(|()| {
-                        crate::preferences::save_language_server_assistance(&self.path, enabled)
-                    })
+                lanes.write_settings(&self.path, self.generation, settings)?;
+                crate::preferences::save_language_server_assistance(&self.path, enabled)
             }
             PreferenceWrite::Shortcuts(shortcuts) => {
                 crate::preferences::save_shortcuts(&self.path, &shortcuts)
@@ -953,7 +1011,6 @@ fn dialog_surface<'a>(
             .max_width(max_width)
             .max_height(720),
     )
-    .into()
 }
 
 fn connected_dialog_surface<'a>(
@@ -966,7 +1023,6 @@ fn connected_dialog_surface<'a>(
             .width(Length::Fill)
             .max_width(max_width),
     )
-    .into()
 }
 
 fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_, Message> {
@@ -1409,13 +1465,13 @@ impl Editor {
     }
 
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
-        if let Some(file) = &opened.file {
-            if let Some(owner) = self.file_owner(&opened.root.join(file)) {
-                if focus && !self.modal_open() {
-                    self.active = Some(owner);
-                }
-                return self.resume_pending_files();
+        if let Some(file) = &opened.file
+            && let Some(owner) = self.file_owner(&opened.root.join(file))
+        {
+            if focus && !self.modal_open() {
+                self.active = Some(owner);
             }
+            return self.resume_pending_files();
         }
         let id = CardId::new();
         let project = ProjectId::new();
@@ -1505,14 +1561,13 @@ impl Editor {
                 worktree: opened.root,
             },
         );
-        if let Some(key) = navigation.active_worktree().cloned() {
-            if let Some(paths) = self
+        if let Some(key) = navigation.active_worktree().cloned()
+            && let Some(paths) = self
                 .saved_session
                 .expanded_directories
                 .get(&key.canonical_path.display().to_string())
-            {
-                navigation.restore_expanded_display_paths(paths);
-            }
+        {
+            navigation.restore_expanded_display_paths(paths);
         }
         let task = repository_task(runtime.initial_load(id));
         let mut review = pull_request_review::State::new(
@@ -2183,7 +2238,7 @@ impl Editor {
         })
     }
 
-    fn save_settings(&mut self) -> Task<Message> {
+    fn save_settings(&mut self, reset: bool) -> Task<Message> {
         if !self.settings_writable {
             self.notice = Some(
                 "Settings could not be loaded; repair the settings file before saving preferences."
@@ -2191,10 +2246,26 @@ impl Editor {
             );
             return Task::none();
         }
-        let settings = self.settings.clone();
         // Preference changes are low frequency. One ordered atomic write avoids
         // competing snapshots overwriting newer values.
-        preference_task(self.capture_preference(PreferenceWrite::Settings(settings)))
+        preference_task(self.capture_settings(reset))
+    }
+
+    /// Captures the settings to write; `reset` marks a Reset all, which
+    /// replaces the file whole.
+    fn capture_settings(&mut self, reset: bool) -> PreferenceSave {
+        if reset {
+            self.settings_resets += 1;
+        }
+        let write = self.settings_write();
+        self.capture_preference(PreferenceWrite::Settings(write))
+    }
+
+    fn settings_write(&self) -> SettingsWrite {
+        SettingsWrite {
+            settings: self.settings.clone(),
+            resets: self.settings_resets,
+        }
     }
 
     fn set_language_server_assistance(&mut self, enabled: bool) -> Task<Message> {
@@ -2225,7 +2296,7 @@ impl Editor {
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
-            let settings = self.settings.clone();
+            let settings = self.settings_write();
             tasks.push(preference_task(self.capture_preference(
                 PreferenceWrite::Assistance { settings, enabled },
             )));
@@ -2326,15 +2397,12 @@ impl Editor {
             .width(420)
             .into()
         });
-        Some(
-            popover(
-                anchor,
-                content,
-                widget::popover::Position::Bottom,
-                Message::CloseNotices,
-            )
-            .into(),
-        )
+        Some(popover(
+            anchor,
+            content,
+            widget::popover::Position::Bottom,
+            Message::CloseNotices,
+        ))
     }
 
     fn appearance(&mut self) -> Task<Message> {
@@ -2991,7 +3059,6 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
             dropped: Box::new(|card, before| Message::ReorderTab { card, before }),
         },
     )
-    .into()
 }
 
 impl Application for Editor {
@@ -3065,7 +3132,7 @@ impl Application for Editor {
             notifications: Default::default(),
             active: None,
             selection_epoch: 0,
-            settings,
+            settings: settings.clone(),
             shortcuts,
             shortcut_draft,
             settings_category: SettingsCategory::Editing,
@@ -3106,8 +3173,13 @@ impl Application for Editor {
             sidebar_transition: None,
             document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
-            preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
+            preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
+                applied: [0; PreferenceFile::COUNT],
+                settings_base: settings,
+                resets_written: 0,
+            })),
             preference_generation: 0,
+            settings_resets: 0,
         };
         match cagents::notifications::ui::Observer::bind_editor(flags.notification_window.clone()) {
             Ok(mut observer) => {
@@ -3499,10 +3571,10 @@ impl Application for Editor {
                     if let Some(id) = self.closing {
                         let untitled = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab));
                         if untitled {
-                            if let Some(tab) = self.tab_mut(id) {
-                                if tab.mutation.is_none() {
-                                    let _ = tab.runtime.abandon_unsaved_changes();
-                                }
+                            if let Some(tab) = self.tab_mut(id)
+                                && tab.mutation.is_none()
+                            {
+                                let _ = tab.runtime.abandon_unsaved_changes();
                             }
                             self.close_confirmed = true;
                             return self.request_close(id);
@@ -3586,9 +3658,9 @@ impl Application for Editor {
                         review_revision,
                         ..
                     } = &action
-                        && !self
+                        && self
                             .tab(identity.card)
-                            .is_some_and(|tab| tab.review.annotation_revision() == *review_revision)
+                            .is_none_or(|tab| tab.review.annotation_revision() != *review_revision)
                     {
                         return Task::none();
                     }
@@ -3601,10 +3673,10 @@ impl Application for Editor {
                     {
                         return Task::none();
                     }
-                    if let RepositoryAction::Save { card, .. } = &action {
-                        if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
-                            return self.save_as(*card);
-                        }
+                    if let RepositoryAction::Save { card, .. } = &action
+                        && self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab))
+                    {
+                        return self.save_as(*card);
                     }
                     if let RepositoryAction::DirectorySearchLoaded {
                         generation,
@@ -3738,21 +3810,20 @@ impl Application for Editor {
                     {
                         tasks.push(repository_task(tab.runtime.preview_fragment(id, &fragment)));
                     }
-                    if listing_changed && !tab.git {
-                        if let Some(key) = tab.navigation.active_worktree().cloned() {
-                            let search = tab
-                                .sidebar
-                                .source_control
-                                .as_ref()
-                                .map(|source| source.file_search.clone())
-                                .unwrap_or_default();
-                            let mut model = SourceControlModel::directory_listing(
-                                key,
-                                tab.runtime.listed_files(),
-                            );
-                            model.set_file_search(search);
-                            tab.sidebar.source_control = Some(model);
-                        }
+                    if listing_changed
+                        && !tab.git
+                        && let Some(key) = tab.navigation.active_worktree().cloned()
+                    {
+                        let search = tab
+                            .sidebar
+                            .source_control
+                            .as_ref()
+                            .map(|source| source.file_search.clone())
+                            .unwrap_or_default();
+                        let mut model =
+                            SourceControlModel::directory_listing(key, tab.runtime.listed_files());
+                        model.set_file_search(search);
+                        tab.sidebar.source_control = Some(model);
                     }
                     if back_to_files && tab.runtime.selected_path().is_none() {
                         tab.owned_file = None;
@@ -3793,7 +3864,7 @@ impl Application for Editor {
                                     .update_find_preferences(tab.id, options, preserve),
                             ));
                         }
-                        tasks.push(self.save_settings());
+                        tasks.push(self.save_settings(false));
                     }
                     tasks.push(self.drain(id));
                     if loaded || saved {
@@ -3865,7 +3936,7 @@ impl Application for Editor {
                         return Task::none();
                     }
                     if matches!(&action, SidebarAction::ResizeFinished) {
-                        return self.save_settings();
+                        return self.save_settings(false);
                     }
                     if let SidebarAction::SetWorktreePanel { panel } = action {
                         self.sidebar_panel = panel;
@@ -4064,12 +4135,12 @@ impl Application for Editor {
                                 };
                             }
                             if open {
-                                if !query.trim().is_empty() {
-                                    if let Some(source) = tab.sidebar.source_control.as_mut() {
-                                        source.set_file_search(FileSearch::Pending {
-                                            query: query.clone(),
-                                        });
-                                    }
+                                if !query.trim().is_empty()
+                                    && let Some(source) = tab.sidebar.source_control.as_mut()
+                                {
+                                    source.set_file_search(FileSearch::Pending {
+                                        query: query.clone(),
+                                    });
                                 }
                                 let search = if query.trim().is_empty() {
                                     Task::none()
@@ -4230,7 +4301,7 @@ impl Application for Editor {
                         self.notices_open = false;
                         self.settings_open = !self.settings_open;
                         if self.settings_open {
-                            return self.save_settings();
+                            return self.save_settings(false);
                         }
                     }
                     self.resume_pending_files()
@@ -4286,7 +4357,7 @@ impl Application for Editor {
                     Task::batch([
                         self.set_language_server_assistance(false),
                         self.appearance(),
-                        self.save_settings(),
+                        self.save_settings(true),
                         preference_task(shortcuts),
                         Task::batch(runtime_tasks),
                     ])
@@ -4421,7 +4492,7 @@ impl Application for Editor {
                             repository_task(tab.runtime.auto_save_task(tab.id))
                         })
                         .collect();
-                    tasks.push(self.save_settings());
+                    tasks.push(self.save_settings(false));
                     Task::batch(tasks)
                 }
                 Message::WrapLines(enabled) => {
@@ -4429,7 +4500,7 @@ impl Application for Editor {
                     for tab in &mut self.tabs {
                         tab.runtime.set_wrap_lines(enabled);
                     }
-                    self.save_settings()
+                    self.save_settings(false)
                 }
                 Message::LineHeightChanged(value) => {
                     self.line_height_draft = value.clone();
@@ -4451,7 +4522,7 @@ impl Application for Editor {
                             repository_task(tab.runtime.refresh_diff_presentation(tab.id))
                         })
                         .collect::<Vec<_>>();
-                    Task::batch([self.save_settings(), Task::batch(relaid)])
+                    Task::batch([self.save_settings(false), Task::batch(relaid)])
                 }
                 Message::SyntaxTheme(theme) => {
                     self.settings.editor_syntax_theme = theme;
@@ -4463,18 +4534,18 @@ impl Application for Editor {
                             repository_task(tab.runtime.refresh_diff_presentation(tab.id))
                         })
                         .collect::<Vec<_>>();
-                    Task::batch([self.save_settings(), Task::batch(recoloured)])
+                    Task::batch([self.save_settings(false), Task::batch(recoloured)])
                 }
                 Message::LanguageServerAssistance(enabled) => {
                     self.set_language_server_assistance(enabled)
                 }
                 Message::Theme(theme) => {
                     self.settings.app_theme = theme;
-                    Task::batch([self.save_settings(), self.appearance()])
+                    Task::batch([self.save_settings(false), self.appearance()])
                 }
                 Message::Scale(scale) => {
                     self.set_ui_scale(scale);
-                    Task::batch([self.save_settings(), self.appearance()])
+                    Task::batch([self.save_settings(false), self.appearance()])
                 }
                 Message::FileRevealed(result) => {
                     self.notice = match result {
@@ -4631,14 +4702,13 @@ impl Application for Editor {
                     if self.active != Some(id) || self.modal_open() {
                         return Task::none();
                     }
-                    if let Some(tab) = self.tab_mut(id) {
-                        if tab.completions.get(index) == Some(&target)
-                            && tab.runtime.apply_completion_target(id, &target)
-                        {
-                            tab.completions.clear();
-                            let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
-                            return Task::batch([self.drain(id), focus]);
-                        }
+                    if let Some(tab) = self.tab_mut(id)
+                        && tab.completions.get(index) == Some(&target)
+                        && tab.runtime.apply_completion_target(id, &target)
+                    {
+                        tab.completions.clear();
+                        let focus = tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                        return Task::batch([self.drain(id), focus]);
                     }
                     self.drain(id)
                 }
@@ -4831,7 +4901,7 @@ impl Application for Editor {
         let mut body = Vec::new();
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
-        body.push(design::horizontal_rule().into());
+        body.push(design::horizontal_rule());
         body.push(
             self.operation_recovery
                 .lock()
@@ -4853,17 +4923,14 @@ impl Application for Editor {
                 );
             }
             if tab.runtime.lsp_document().is_some() {
-                toolbar_controls.push(
-                    toolbar_actions(vec![
-                        icon_button(Icon::InsertText, "Complete (Ctrl+Space)")
-                            .on_press_maybe((!self.modal_open()).then_some(Message::Complete))
-                            .into(),
-                        icon_button(Icon::Info, "Show symbol information")
-                            .on_press_maybe((!self.modal_open()).then_some(Message::Hover))
-                            .into(),
-                    ])
-                    .into(),
-                );
+                toolbar_controls.push(toolbar_actions(vec![
+                    icon_button(Icon::InsertText, "Complete (Ctrl+Space)")
+                        .on_press_maybe((!self.modal_open()).then_some(Message::Complete))
+                        .into(),
+                    icon_button(Icon::Info, "Show symbol information")
+                        .on_press_maybe((!self.modal_open()).then_some(Message::Hover))
+                        .into(),
+                ]));
             }
             toolbar_controls.push(
                 icon_button(Icon::Search, "Find in file (Ctrl+F)")
@@ -4884,7 +4951,7 @@ impl Application for Editor {
                 Message::Repository,
             ) {
                 editor.push(toolbar);
-                editor.push(design::horizontal_rule().into());
+                editor.push(design::horizontal_rule());
             }
             editor.push(
                 repository_widget::view_with_review(
@@ -4954,7 +5021,7 @@ impl Application for Editor {
                         .into(),
                     );
                 }
-                editor.push(design::horizontal_rule().into());
+                editor.push(design::horizontal_rule());
                 editor.push(
                     widget::scrollable(
                         widget::column::with_children(results)
@@ -5050,7 +5117,7 @@ impl Application for Editor {
                     .padding(32)
                     .height(Length::Fill)
                     .into(),
-                    design::horizontal_rule().into(),
+                    design::horizontal_rule(),
                     self.settings_footer(),
                 ])
                 .height(Length::Fill)
@@ -5511,7 +5578,7 @@ impl Editor {
         .height(Length::Fill);
         let body = widget::row::with_children(vec![
             navigation.into(),
-            design::vertical_rule().into(),
+            design::vertical_rule(),
             widget::scrollable(
                 widget::container(widget::column::with_children(results).spacing(20))
                     .padding([4.0 * design::GRID_UNIT, 5.0 * design::GRID_UNIT])
@@ -5543,7 +5610,7 @@ impl Editor {
             connected_dialog_surface(
                 widget::column::with_children(vec![
                     header.into(),
-                    design::horizontal_rule().into(),
+                    design::horizontal_rule(),
                     body.into(),
                 ])
                 .spacing(0)
@@ -6013,7 +6080,7 @@ mod tests {
             &root,
             &["remote", "add", "origin", "https://github.com/o/r.git"],
         );
-        let head = Oid::parse(&git(&root, &["rev-parse", "HEAD"])).unwrap();
+        let head = Oid::parse(git(&root, &["rev-parse", "HEAD"])).unwrap();
         let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
         let pr: cagents::github::PullRequest = serde_json::from_value(serde_json::json!({
             "id":"PR_7", "number":7, "title":"Change", "state":"OPEN",
@@ -6211,14 +6278,16 @@ mod tests {
                     3 => {
                         let task = app.update(Message::Checkout(checkout::Action::Prepared(
                             id,
-                            Ok(prepared.clone()),
+                            Ok(Box::new(prepared.clone())),
                         )));
                         run_tasks(&mut app, task);
                     }
                     _ => {
-                        let task = app.update(Message::Checkout(
-                            checkout::Action::ExistingFinished(id, Ok(completed_receipt.unwrap())),
-                        ));
+                        let task =
+                            app.update(Message::Checkout(checkout::Action::ExistingFinished(
+                                id,
+                                Ok(Box::new(completed_receipt.unwrap())),
+                            )));
                         run_tasks(&mut app, task);
                     }
                 }
@@ -6252,7 +6321,7 @@ mod tests {
         app.begin_checkout(cagents_ui::pull_request_review::CheckoutTarget::read_only(
             PathBuf::from("/review"),
             1,
-            cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
+            cagents::repository::Oid::parse("a".repeat(40)).unwrap(),
         ));
         assert_eq!(
             app.checkout_error.as_deref(),
@@ -6776,8 +6845,13 @@ mod tests {
             sidebar_transition: None,
             document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
-            preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
+            preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
+                applied: [0; PreferenceFile::COUNT],
+                settings_base: AppSettings::default(),
+                resets_written: 0,
+            })),
             preference_generation: 0,
+            settings_resets: 0,
         }
     }
 
@@ -7964,14 +8038,11 @@ mod tests {
     /// tests have no executor to drain a `Task`, and the persisted bytes are
     /// the contract under test.
     fn flush_settings(app: &mut Editor) {
-        let settings = app.settings.clone();
-        app.capture_preference(PreferenceWrite::Settings(settings))
-            .run()
-            .unwrap();
+        app.capture_settings(false).run().unwrap();
     }
 
     fn flush_assistance(app: &mut Editor) {
-        let settings = app.settings.clone();
+        let settings = app.settings_write();
         let enabled = app.language_server_assistance;
         app.capture_preference(PreferenceWrite::Assistance { settings, enabled })
             .run()
@@ -7983,6 +8054,251 @@ mod tests {
         app.capture_preference(PreferenceWrite::Session(session))
             .run()
             .unwrap();
+    }
+
+    #[test]
+    fn a_second_editors_preference_save_keeps_the_first_editors_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut first);
+        second.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        flush_settings(&mut second);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, !defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+    }
+
+    #[test]
+    fn a_preference_save_keeps_another_editors_cleared_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial = AppSettings {
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        settings::save(directory.path().join("settings.toml"), &initial).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_font_size = None;
+        flush_settings(&mut first);
+        second.settings.editor_auto_save = !initial.editor_auto_save;
+        flush_settings(&mut second);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_font_size, None);
+        assert_eq!(persisted.editor_auto_save, !initial.editor_auto_save);
+    }
+
+    #[test]
+    fn the_base_advances_only_after_a_successful_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut app = loaded(&directory);
+
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut app);
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+        app.settings.editor_wrap_lines = defaults.editor_wrap_lines;
+        flush_settings(&mut app);
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            defaults.editor_wrap_lines
+        );
+
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        let path = app.settings_path.clone();
+        app.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&app.settings_path).unwrap();
+        assert!(app.capture_settings(false).run().is_err());
+        app.settings_path = path;
+        flush_settings(&mut app);
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+    }
+
+    #[test]
+    fn reset_all_settings_replaces_the_file_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut first);
+        second.settings.editor_auto_save = !defaults.editor_auto_save;
+        flush_settings(&mut second);
+        first.settings_open = true;
+        drop(first.update(Message::ResetSettings));
+        let task = first.update(Message::ResetSettings);
+        run_tasks(&mut first, task);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(
+            toml::Value::try_from(persisted).unwrap(),
+            toml::Value::try_from(defaults).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_save_that_overtakes_a_reset_still_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        first.settings = AppSettings::default();
+        let reset = first.capture_settings(true);
+        first.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        let newer = first.capture_settings(false);
+        // The blocking pool finishes the newer capture first; the reset it
+        // supersedes is then dropped, so the newer write must carry it.
+        newer.run().unwrap();
+        reset.run().unwrap();
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+
+        // Once the reset is written, later saves merge again.
+        second.settings.editor_auto_save = !defaults.editor_auto_save;
+        flush_settings(&mut second);
+        first.settings.editor_font_size = Some(17.0);
+        first.capture_settings(false).run().unwrap();
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_auto_save, !defaults.editor_auto_save);
+        assert_eq!(persisted.editor_font_size, Some(17.0));
+    }
+
+    #[test]
+    fn a_save_after_a_failed_reset_still_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        let path = first.settings_path.clone();
+        first.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&first.settings_path).unwrap();
+        first.settings = AppSettings::default();
+        assert!(first.capture_settings(true).run().is_err());
+        first.settings_path = path;
+        // The reset never reached the disk, so the next save must still
+        // replace the file rather than merge over another editor's change.
+        first.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        first.capture_settings(false).run().unwrap();
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+    }
+
+    #[test]
+    fn an_assistance_save_after_a_failed_reset_completes_the_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        let path = first.settings_path.clone();
+        first.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&first.settings_path).unwrap();
+        first.settings = AppSettings::default();
+        assert!(first.capture_settings(true).run().is_err());
+        first.settings_path = path;
+        // Storage recovers and the next write this editor makes is the
+        // assistance preference, which also carries settings.toml.
+        first.language_server_assistance = true;
+        flush_assistance(&mut first);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(
+            toml::Value::try_from(persisted).unwrap(),
+            toml::Value::try_from(defaults).unwrap()
+        );
+        assert!(
+            crate::preferences::load_language_server_assistance(&first.settings_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_older_assistance_capture_keeps_newer_settings_and_writes_its_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut app = loaded(&directory);
+
+        app.language_server_assistance = true;
+        let settings = app.settings_write();
+        let older = app.capture_preference(PreferenceWrite::Assistance {
+            settings,
+            enabled: true,
+        });
+        app.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        let newer = app.capture_settings(false);
+        // The blocking pool finishes the newer settings capture first.
+        newer.run().unwrap();
+        older.run().unwrap();
+
+        assert_eq!(
+            settings::load(&app.settings_path).unwrap().editor_wrap_lines,
+            !defaults.editor_wrap_lines
+        );
+        assert!(crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
+    }
+
+    #[test]
+    fn an_assistance_save_keeps_another_editors_preference_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+
+        first.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut first);
+        second.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        second.language_server_assistance = true;
+        flush_assistance(&mut second);
+        second.settings.editor_syntax_theme = defaults.editor_syntax_theme;
+        flush_settings(&mut second);
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, !defaults.editor_wrap_lines);
+        assert_eq!(persisted.editor_syntax_theme, defaults.editor_syntax_theme);
+        assert!(
+            crate::preferences::load_language_server_assistance(&second.settings_path).unwrap()
+        );
     }
 
     #[test]
@@ -9174,6 +9490,14 @@ mod tests {
         app
     }
 
+    fn loaded(directory: &tempfile::TempDir) -> Editor {
+        let mut app = configured(directory);
+        app.settings = settings::load(&app.settings_path).unwrap();
+        app.preference_lane.lock().unwrap().settings_base = app.settings.clone();
+        app.settings_writable = true;
+        app
+    }
+
     fn load_selected(app: &mut Editor, id: CardId) {
         files_loaded(app, id);
         let tab = app.tab(id).unwrap();
@@ -9424,10 +9748,7 @@ mod tests {
             "first note\n"
         );
         assert!(app.tab(id).is_some(), "the tab now shows a different note");
-        assert_eq!(
-            std::fs::read_to_string(&second).unwrap(),
-            "second note\n"
-        );
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second note\n");
     }
 
     #[test]
@@ -9482,7 +9803,11 @@ mod tests {
 
         drop(app.update(Message::CloseWindow));
         assert_eq!(app.closing, Some(dirty));
-        assert_eq!(app.tabs.len(), 2, "no tab closes before every tab is settled");
+        assert_eq!(
+            app.tabs.len(),
+            2,
+            "no tab closes before every tab is settled"
+        );
 
         drop(app.update(Message::CancelClose));
         assert!(!app.exiting);

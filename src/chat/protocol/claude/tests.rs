@@ -634,8 +634,10 @@ fn valid_stream_delta_overflow_keeps_unknown_indices_and_next_text_usable() {
 /// frame below keeps a live haiku turn's fields with fixture identifiers.
 #[test]
 fn a_post_turn_summary_does_not_fail_the_turn() {
-    let mut adapter = Claude::default();
-    adapter.busy = true;
+    let mut adapter = Claude {
+        busy: true,
+        ..Claude::default()
+    };
     adapter.receive(json!({"type":"assistant","uuid":"00000000-0000-4000-8000-000000000002","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"ready"}]}})).unwrap();
     let summary = adapter
         .receive(json!({
@@ -670,8 +672,10 @@ fn a_post_turn_summary_does_not_fail_the_turn() {
 
 #[test]
 fn unknown_frames_do_not_interrupt_a_streamed_turn() {
-    let mut adapter = Claude::default();
-    adapter.busy = true;
+    let mut adapter = Claude {
+        busy: true,
+        ..Claude::default()
+    };
     for frame in [
         json!({"type":"future_frame", "payload":"private protocol payload"}),
         json!({"type":"system", "subtype":"future_system", "payload":"private protocol payload"}),
@@ -2230,11 +2234,15 @@ fn permission_settings_changes_wait_for_provider_confirmation_and_preserve_reaso
 
 #[test]
 fn rejected_permission_settings_update_keeps_last_provider_confirmed_metadata() {
-    let mut adapter = Claude::default();
-    adapter.permissions = Some(
-        super::super::claude_permissions::Snapshot::parse(&json!({"effective":{},"sources":[]}))
+    let mut adapter = Claude {
+        permissions: Some(
+            super::super::claude_permissions::Snapshot::parse(
+                &json!({"effective":{},"sources":[]}),
+            )
             .unwrap(),
-    );
+        ),
+        ..Claude::default()
+    };
     let apply = adapter
         .command(Command::UpdatePermissionSettings {
             update: chat::PermissionSettingsUpdate::AddRule {
@@ -2286,9 +2294,12 @@ fn silently_ignored_permission_edits_report_actual_metadata_and_actionable_error
             json!([{"source":"userSettings","settings":{"permissions":{"allow":[rule]},"autoMode":{"environment":[context]}}}])
         };
         let returned = json!({"effective":{},"sources":sources});
-        let mut adapter = Claude::default();
-        adapter.permissions =
-            Some(super::super::claude_permissions::Snapshot::parse(&returned).unwrap());
+        let mut adapter = Claude {
+            permissions: Some(
+                super::super::claude_permissions::Snapshot::parse(&returned).unwrap(),
+            ),
+            ..Claude::default()
+        };
         let apply = adapter
             .command(Command::UpdatePermissionSettings { update })
             .unwrap();
@@ -2419,7 +2430,7 @@ fn align_resume_identity_rewrites_space_and_inline_forms() {
     let mut untouched = vec!["--print".to_string(), "--model".to_string()];
     align_resume_identity(&mut untouched, "new").unwrap();
     assert_eq!(untouched, vec!["--print", "--model"]);
-    assert!(align_resume_identity(&mut vec!["--resume".to_string()], "new").is_err());
+    assert!(align_resume_identity(&mut ["--resume".to_string()], "new").is_err());
 }
 
 fn approval(id: &str, tool: &str, input: Value) -> Value {
@@ -7766,7 +7777,7 @@ fn real_notice_orders_show_the_latest_state_at_every_step() {
     for order in ["fiiiiif", "iiic", "fiiif", "iifiic", "i", "if"] {
         let mut adapter = Claude::default();
         notification_agent(&mut adapter, "tool-one", "task-one", true);
-        for (index, kind) in order.chars().enumerate() {
+        for (index, kind) in order.char_indices() {
             let (status, summary, note, expected) = match kind {
                 'i' => (
                     "completed",
@@ -7792,7 +7803,7 @@ fn real_notice_orders_show_the_latest_state_at_every_step() {
             frame["uuid"] = json!(format!("{order}-{index}"));
             let step = adapter.receive(frame).unwrap();
             let label = format!("{order} at {index}");
-            let repeated = order[..index].chars().last() == Some(kind);
+            let repeated = order[..index].ends_with(kind);
             if repeated && kind != 'i' {
                 assert!(
                     notification_agent_statuses(&step, "tool-one").is_empty(),
@@ -11239,18 +11250,40 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
             .unwrap_err()
             .contains("read-only")
     );
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 20")
-    ));
-    assert!(snapshot.has_earlier);
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")
-    ));
-    assert!(!snapshot.has_earlier);
+    // A window shows a run of the conversation: its prompts in order, with
+    // none missing or repeated.
+    let prompts = |snapshot: &crate::chat::Snapshot| -> std::ops::Range<usize> {
+        let indices: Vec<usize> = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match &item.content {
+                ItemContent::Text { text, .. } => text
+                    .strip_prefix("Saved prompt ")
+                    .and_then(|index| index.parse().ok()),
+                _ => None,
+            })
+            .collect();
+        assert!(!indices.is_empty(), "a window shows prompts");
+        let run = indices[0]..indices[0] + indices.len();
+        assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
+        run
+    };
+    assert_eq!(prompts(&snapshot), 120..220, "the newest history first");
+    // Each earlier page slides the window back by half of it, so the
+    // history is read a window at a time until its start, and every prompt
+    // is shown on the way.
+    let mut seen = std::collections::BTreeSet::from_iter(120..220);
+    let mut snapshot = snapshot;
+    let mut pages = 0;
+    while snapshot.has_earlier {
+        pages += 1;
+        assert!(pages <= 20, "paging back never reached the start");
+        handle.command(Command::LoadEarlier).unwrap();
+        snapshot = handle.snapshot(None).unwrap();
+        seen.extend(prompts(&snapshot));
+    }
+    assert_eq!(prompts(&snapshot).start, 0, "the window reaches the start");
+    assert!(seen.into_iter().eq(0..220), "every prompt was shown");
     handle.close().unwrap();
 
     let mut traversal = launch.clone();

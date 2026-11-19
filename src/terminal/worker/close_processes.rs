@@ -114,12 +114,11 @@ struct FrozenProcess {
 /// Already stopped/traced processes are never resumed by this operation.
 impl Drop for FrozenProcess {
     fn drop(&mut self) {
-        if self.resume {
-            if let Err(error) = signal(&self.pidfd, libc::SIGCONT) {
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    tracing::error!(pid = self.identity.pid, %error, "failed to resume terminal process after close inspection");
-                }
-            }
+        if self.resume
+            && let Err(error) = signal(&self.pidfd, libc::SIGCONT)
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            tracing::error!(pid = self.identity.pid, %error, "failed to resume terminal process after close inspection");
         }
     }
 }
@@ -615,7 +614,7 @@ mod tests {
                 .collect(),
             root_kill_receipt: Arc::new(Mutex::new(false)),
         };
-        assert!(!frozen(&[helper.clone()]).has_jobs());
+        assert!(!frozen(std::slice::from_ref(&helper)).has_jobs());
         assert!(frozen(&[helper.clone(), job.clone()]).has_jobs());
         let background = CloseProcess {
             parent: root.pid,

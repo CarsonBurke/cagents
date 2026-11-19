@@ -345,6 +345,12 @@ reap_reason() {
     fi
 }
 
+# The niri-harness commands the runner uses (start, list, stop, gc, env, exec)
+# arrived together; an older harness has none of them.
+harness_current() {
+    niri-harness start --help >/dev/null 2>&1 </dev/null
+}
+
 # A harness session's state in `niri-harness list`: live, asleep or dead, or
 # nothing for no such session. `env` also answers for a dead session, and
 # `exec` would wake a sleeping one.
@@ -744,6 +750,7 @@ if [ -n "$instance" ] && [ "$in_session" = false ]; then
         printf '%s\n' 'required command not found: niri-harness' >&2
         exit 1
     }
+    harness_current || { printf '%s\n' "the installed niri-harness ($(command -v niri-harness)) is too old for --instance: it has no start command. Update niri-harness on this host." >&2; exit 1; }
     harness_session=cagents-$instance
     if [ "$stop_instance" = false ]; then
         # What earlier sessions left: this name's dead session, which would

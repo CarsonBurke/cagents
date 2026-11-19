@@ -1488,7 +1488,9 @@ fn locate(
             ),
             None => Location::Missed,
         },
-        Provider::Omp => Location::Found(id, Source::Unsupported),
+        Provider::Omp | Provider::Antigravity | Provider::Muse => {
+            Location::Found(id, Source::Unsupported)
+        }
     }
 }
 
@@ -1547,10 +1549,14 @@ struct Scanned {
 /// cursors, so no lock is held while it reads.
 fn scan(source: &Source, cursors: &mut BTreeMap<PathBuf, Cursor>) -> Scanned {
     let located = match source {
+        // Looked for and not there yet: the conversation has reported no
+        // ID, or its provider has written no transcript. All of nothing has
+        // been read, so a reader shows that it has no work rather than
+        // that its work is on its way.
         Source::Pending => {
             return Scanned {
                 found: Vec::new(),
-                coverage: TranscriptCoverage::Pending,
+                coverage: TranscriptCoverage::Complete,
             };
         }
         Source::Unsupported => {

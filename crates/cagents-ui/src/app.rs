@@ -19,6 +19,7 @@ mod device_ui;
 pub(crate) mod dialog_ui;
 #[cfg(test)]
 mod dispatch_tests;
+mod inspector_activity;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -743,10 +744,7 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 }
 
 fn last_success_label(value: Option<i64>) -> String {
-    value.map_or_else(
-        || "none in this run".to_owned(),
-        |value| unix_time_label(value),
-    )
+    value.map_or_else(|| "none in this run".to_owned(), unix_time_label)
 }
 
 fn notice_surface<'a>(
@@ -2720,9 +2718,15 @@ struct WindowView {
     #[serde(default)]
     context_inspector_open: bool,
     /// The panes whose inspectors are open. Absent from a window saved
-    /// before each pane had its own.
+    /// before each pane had its own. Still written, for an older version
+    /// reading this back; this one reads `inspector_choices` when present.
     #[serde(default)]
     open_inspectors: Option<Vec<CardId>>,
+    /// The panes whose inspectors the user opened or closed. Absent from a
+    /// window saved while inspectors were closed until opened, where a
+    /// closed one was not a choice.
+    #[serde(default)]
+    inspector_choices: Option<pane_inspector::Choices>,
     #[serde(default)]
     context_sections: context_sections::Sections,
     sidebar: sidebar::SidebarView,
@@ -2831,6 +2835,7 @@ pub enum SettingsCategory {
     Terminal,
     Editor,
     NativeChat,
+    Inspector,
     Links,
     Keyboard,
     Accounts,
@@ -2838,12 +2843,13 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
         Self::Editor,
         Self::NativeChat,
+        Self::Inspector,
         Self::Terminal,
         Self::Links,
         Self::Keyboard,
@@ -2859,6 +2865,7 @@ impl SettingsCategory {
             Self::Terminal => "Terminal",
             Self::Editor => "Editor",
             Self::NativeChat => "Native chat",
+            Self::Inspector => "Inspector",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
@@ -3448,6 +3455,10 @@ pub enum SettingsField {
     AccountUsageDisplay,
     ShowWorktreeChangesIcons,
     ShowMentionedPullRequests,
+    InspectorOpenByDefault,
+    InspectorShowActivity,
+    InspectorShowWork,
+    InspectorWidth,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
@@ -3607,6 +3618,10 @@ impl SettingsField {
             Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::ShowMentionedPullRequests => "Mentioned pull requests",
+            Self::InspectorOpenByDefault => "Open with each pane",
+            Self::InspectorShowActivity => "Activity",
+            Self::InspectorShowWork => "Work",
+            Self::InspectorWidth => "Inspector width",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
@@ -3645,7 +3660,6 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
-            | Self::ShowMentionedPullRequests
             | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
@@ -3673,6 +3687,11 @@ impl SettingsField {
                 SettingsCategory::NativeChat
             }
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
+            Self::InspectorOpenByDefault
+            | Self::InspectorShowActivity
+            | Self::InspectorShowWork
+            | Self::InspectorWidth
+            | Self::ShowMentionedPullRequests => SettingsCategory::Inspector,
             Self::EditorAutoSave
             | Self::EditorWrapLines
             | Self::EditorSyntaxTheme
@@ -3871,6 +3890,10 @@ struct SettingsDraft {
     account_usage_display: settings::AccountUsageDisplay,
     show_worktree_changes_icons: bool,
     show_mentioned_pull_requests: bool,
+    inspector_open_by_default: bool,
+    inspector_show_activity: bool,
+    inspector_show_work: bool,
+    inspector_width: String,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
@@ -3939,6 +3962,10 @@ impl SettingsDraft {
             account_usage_display: settings.account_usage_display,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
             show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
+            inspector_open_by_default: settings.inspector_open_by_default,
+            inspector_show_activity: settings.inspector_show_activity,
+            inspector_show_work: settings.inspector_show_work,
+            inspector_width: settings.inspector_width.to_string(),
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
@@ -4014,6 +4041,12 @@ impl SettingsDraft {
             SettingsField::ShowMentionedPullRequests => {
                 self.show_mentioned_pull_requests = value == "true"
             }
+            SettingsField::InspectorOpenByDefault => {
+                self.inspector_open_by_default = value == "true"
+            }
+            SettingsField::InspectorShowActivity => self.inspector_show_activity = value == "true",
+            SettingsField::InspectorShowWork => self.inspector_show_work = value == "true",
+            SettingsField::InspectorWidth => self.inspector_width = value,
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
             }
@@ -4274,6 +4307,25 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_mentioned_pull_requests = enabled)
             .map_err(|_| "Choose whether mentioned pull requests are listed.".to_owned()),
+        SettingsField::InspectorOpenByDefault => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_open_by_default = enabled)
+            .map_err(|_| "Choose whether inspectors open with each pane.".to_owned()),
+        SettingsField::InspectorShowActivity => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_show_activity = enabled)
+            .map_err(|_| "Choose whether the inspector shows activity.".to_owned()),
+        SettingsField::InspectorShowWork => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_show_work = enabled)
+            .map_err(|_| "Choose whether the inspector lists work.".to_owned()),
+        SettingsField::InspectorWidth => value
+            .parse::<f32>()
+            .map(|width| {
+                next.inspector_width =
+                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+            })
+            .map_err(|_| "Inspector width must be a number.".to_owned()),
         SettingsField::AutoDeleteMergedWorktrees => value
             .parse::<bool>()
             .map(|enabled| next.auto_delete_merged_worktrees = enabled)
@@ -4682,7 +4734,7 @@ fn grouped_digits(value: usize) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -5359,7 +5411,7 @@ enum CardRuntime {
     Terminal(TerminalSurface),
     Chat(Box<chat_ui::Runtime>),
     #[cfg(feature = "integrated-browser")]
-    Browser(BrowserRuntime),
+    Browser(Box<BrowserRuntime>),
     Repository(Box<RepositoryRuntime>),
     PullRequests(Box<PullRequestPane>),
     /// The settings pane. Its drafts are the window's, not the card's, so
@@ -5685,6 +5737,9 @@ pub struct Cagents {
     /// numbers against, pinned as `card_indices_source` is.
     terminal_ordinals_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
+    /// Where each folder Projects lists sits, for the inspectors' activity
+    /// blocks to name a pane's place without scanning every project.
+    place_index: inspector_activity::PlaceIndex,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     /// Where each open pane is on screen and what its runtime holds. Both
@@ -5852,7 +5907,7 @@ pub struct Cagents {
     refresh_ui: refresh_ui::State,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     operation_recovery: crate::operation_recovery::Shared,
-    account_ui: account_ui::State,
+    account_ui: account_ui::Accounts,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
     automation_approval: automation_approval::State,
@@ -7230,11 +7285,11 @@ impl Cagents {
         durable.focused = Some(id);
         // The descriptor's directory can be a nested editor directory rather
         // than its containing workspace. Keep the filing across projection.
-        if worktree_ui::card_directory(&card).is_some() {
-            if let Some(owner) = owner {
-                durable.card_scopes.insert(id, owner.clone());
-                self.worktree_owners.insert(id, owner);
-            }
+        if worktree_ui::card_directory(&card).is_some()
+            && let Some(owner) = owner
+        {
+            durable.card_scopes.insert(id, owner.clone());
+            self.worktree_owners.insert(id, owner);
         }
         if let Some(title) = user_title {
             self.chrome_ui.user_titles.insert(id, title);
@@ -8217,7 +8272,8 @@ impl Cagents {
                 Some(factory),
             ) {
                 Ok(runtime) => {
-                    self.cards.insert(card_id, CardRuntime::Browser(runtime));
+                    self.cards
+                        .insert(card_id, CardRuntime::Browser(Box::new(runtime)));
                 }
                 Err(error) => {
                     startup_error = Some(error.clone());
@@ -10040,7 +10096,8 @@ impl Cagents {
                     Some(factory),
                 ) {
                     Ok(runtime) => {
-                        self.cards.insert(card, CardRuntime::Browser(runtime));
+                        self.cards
+                            .insert(card, CardRuntime::Browser(Box::new(runtime)));
                     }
                     Err(error) => {
                         self.fail_runtime(card, error.clone());
@@ -10400,7 +10457,7 @@ impl Cagents {
             let stage = runtime.selected_staging_selection(true).is_some();
             if stage || runtime.selected_staging_selection(false).is_some() {
                 return (
-                    cosmic::task::message(Message::Repository(RepositoryAction::StageSelected {
+                    self.dispatch(Message::Repository(RepositoryAction::StageSelected {
                         card,
                         stage,
                     })),
@@ -10487,10 +10544,7 @@ impl Cagents {
                 return (self.cancel_terminal_close(), Projection::Full);
             }
             if self.chat_close_dialog_visible() {
-                return (
-                    cosmic::task::message(Message::CancelChatClose),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelChatClose), Projection::Full);
             }
         }
         if self.form_dialog_on_top()
@@ -10527,7 +10581,7 @@ impl Cagents {
         if is_escape_press(&event) && !captured {
             if self.transient_work_close.is_some() {
                 return (
-                    cosmic::task::message(Message::CancelTransientWorkClose),
+                    self.dispatch(Message::CancelTransientWorkClose),
                     Projection::Full,
                 );
             }
@@ -10550,14 +10604,11 @@ impl Cagents {
                 return (self.cancel_terminal_close(), Projection::Full);
             }
             if self.chat_close_dialog_visible() {
-                return (
-                    cosmic::task::message(Message::CancelChatClose),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelChatClose), Projection::Full);
             }
             if self.sidebar_state.pending_discard().is_some() {
                 return (
-                    cosmic::task::message(Message::Sidebar(SidebarAction::CancelDiscard)),
+                    self.dispatch(Message::Sidebar(SidebarAction::CancelDiscard)),
                     Projection::Full,
                 );
             }
@@ -10586,7 +10637,7 @@ impl Cagents {
                     return (Task::none(), Projection::Unchanged);
                 }
                 return (
-                    cosmic::task::message(Message::CancelRepositoryClose),
+                    self.dispatch(Message::CancelRepositoryClose),
                     Projection::Full,
                 );
             }
@@ -10595,17 +10646,12 @@ impl Cagents {
             // behind the confirmations above because those are modal.
             if let Some(card) = self.focused_repository_card_with_find() {
                 return (
-                    cosmic::task::message(Message::Repository(RepositoryAction::CloseFind {
-                        card,
-                    })),
+                    self.dispatch(Message::Repository(RepositoryAction::CloseFind { card })),
                     Projection::Full,
                 );
             }
             if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                return (
-                    cosmic::task::message(Message::CancelDialog),
-                    Projection::Full,
-                );
+                return (self.cancel_form_dialog(), Projection::Full);
             }
             if self.sidebar_state.controls_expanded() {
                 return (
@@ -10651,13 +10697,13 @@ impl Cagents {
                 key: keyboard::Key::Named(key),
                 ..
             } = &event
+            && *key == keyboard::key::Named::Escape
+            && !captured
         {
-            if *key == keyboard::key::Named::Escape && !captured {
-                return (
-                    self.handle_terminal_find(terminal_ui::Action::Close(card)),
-                    Projection::Full,
-                );
-            }
+            return (
+                self.handle_terminal_find(terminal_ui::Action::Close(card)),
+                Projection::Full,
+            );
         }
         if let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::F3),
@@ -10670,7 +10716,7 @@ impl Cagents {
             && let Some(card) = self.focused_repository_card_with_find()
         {
             return (
-                cosmic::task::message(Message::Repository(if modifiers.shift() {
+                self.dispatch(Message::Repository(if modifiers.shift() {
                     RepositoryAction::FindPrevious { card }
                 } else {
                     RepositoryAction::FindNext { card }
@@ -10685,7 +10731,7 @@ impl Cagents {
             && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
             && let Some(message) = browser_shortcut(card, &event)
         {
-            return (cosmic::task::message(message), Projection::Full);
+            return (self.dispatch(message), Projection::Full);
         }
         if !captured && let Some(task) = self.chat_scroll_key(&event) {
             return (task, Projection::Full);
@@ -10696,7 +10742,7 @@ impl Cagents {
             && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
         {
             return (
-                cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                self.dispatch(Message::Repository(RepositoryAction::Save {
                     card,
                     overwrite: false,
                 })),
@@ -10756,9 +10802,7 @@ impl Cagents {
         {
             return None;
         }
-        let Some(card) = self.workspace.focused() else {
-            return None;
-        };
+        let card = self.workspace.focused()?;
         if !self.chat_input_drawn(card) || !self.card_holds_keyboard(card) {
             return None;
         }
@@ -11093,6 +11137,16 @@ impl Cagents {
             || self.workspace.pending_close().is_some()
     }
 
+    /// What a lifecycle sweep's update projects: what the sweep changed,
+    /// unless the update's tail may still close or commit something.
+    fn sweep_projection(&self, sweep: Projection) -> Projection {
+        if self.update_tail_may_close_or_commit() {
+            Projection::Full
+        } else {
+            sweep
+        }
+    }
+
     /// A navigation save timer with nothing left to save changes nothing a
     /// projection reads, so it skips the sidebar and chrome rebuild.
     fn navigation_save_is_stale(&self, message: &Message) -> bool {
@@ -11143,29 +11197,33 @@ impl Cagents {
         }
     }
 
-    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> Task<Message> {
+    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> (Task<Message>, Projection) {
         if generation != self.lifecycle_sweep_generation {
             // Superseded by a later arming, whose own delivery is still to come.
-            return Task::none();
+            return (Task::none(), Projection::Unchanged);
         }
         // A matching generation carries the deadline it was armed with, because
         // `arm_lifecycle_sweep` writes both together, so neither branch below
         // is reachable through the normal path. They are guards, not flow: a
         // sweep that ran without a deadline has nothing to do, and a timer that
         // woke marginally early must wait out the grace rather than cut it.
+        // Neither changes anything a projection reads.
         let Some(deadline) = self.lifecycle_sweep_deadline else {
-            return Task::none();
+            return (Task::none(), Projection::Unchanged);
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            return self.arm_lifecycle_sweep(deadline);
+            return (self.arm_lifecycle_sweep(deadline), Projection::Unchanged);
         }
         self.lifecycle_sweep_deadline = None;
-        let sweep = self.lifecycle_sweep();
+        let (sweep, projection) = self.lifecycle_sweep_update();
         // That reconcile made the manager's exposure current, so the next
         // wakeup can be placed exactly when the earliest card still holding
         // its grace exhausts it.
-        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
+        (
+            Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()]),
+            projection,
+        )
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
@@ -11328,7 +11386,8 @@ impl Cagents {
                             Some(factory),
                         ) {
                             Ok(runtime) => {
-                                self.cards.insert(card, CardRuntime::Browser(runtime));
+                                self.cards
+                                    .insert(card, CardRuntime::Browser(Box::new(runtime)));
                                 deferred_browser_started = true;
                             }
                             Err(message) => {
@@ -13904,10 +13963,10 @@ impl Cagents {
                 self.request_lsp(card, LspRequestKind::Completion)
             }
             Action::Hover(at) => {
-                if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                    if let Some((request, _)) = state.editor_hover_request.take() {
-                        self.lsp.cancel(request);
-                    }
+                if let Some(state) = self.lsp_contexts.get_mut(&card)
+                    && let Some((request, _)) = state.editor_hover_request.take()
+                {
+                    self.lsp.cancel(request);
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_hover(None, at);
@@ -13947,10 +14006,10 @@ impl Cagents {
             }
             Action::Choose { index, target } => self.apply_lsp_completion(card, index, &target),
             Action::Next(_) | Action::Diagnostic(_) | Action::Dismiss => {
-                if matches!(action, Action::Dismiss) {
-                    if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                        state.invalidate_answers();
-                    }
+                if matches!(action, Action::Dismiss)
+                    && let Some(state) = self.lsp_contexts.get_mut(&card)
+                {
+                    state.invalidate_answers();
                 }
                 match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
@@ -14468,7 +14527,7 @@ impl Cagents {
             return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
         }
         if self.transient_work_close.is_some() {
-            return cosmic::task::message(Message::CancelTransientWorkClose);
+            return self.dispatch(Message::CancelTransientWorkClose);
         }
         if let Some(action) = self.automation_ui.keep_draft_action() {
             return self.update_automation_ui(action);
@@ -14582,11 +14641,17 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Resize { width } => {
-                self.settings.inspector_width =
-                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                // Whole pixels, as Settings shows and steps them.
+                self.settings.inspector_width = width
+                    .round()
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
                 Task::none()
             }
-            InspectorAction::ResizeFinished => self.save_settings_task(false),
+            InspectorAction::ResizeFinished => {
+                // Settings, if open, steps from the dragged width.
+                self.settings_draft.inspector_width = self.settings.inspector_width.to_string();
+                self.save_settings_task(false)
+            }
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
                 chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
@@ -15231,6 +15296,7 @@ impl Cagents {
                 .focused()
                 .is_some_and(|card| self.pane_inspectors.is_open(card)),
             open_inspectors: Some(self.saved_open_inspectors()),
+            inspector_choices: Some(self.saved_inspector_choices()),
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
@@ -15342,12 +15408,12 @@ impl Cagents {
     fn synchronize_terminal_theme(&mut self) {
         let theme = self.effective_terminal_theme();
         for runtime in self.cards.values() {
-            if let CardRuntime::Terminal(surface) = runtime {
-                if let Err(error) = surface.set_theme(theme) {
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not apply terminal theme: {error}"
-                    )));
-                }
+            if let CardRuntime::Terminal(surface) = runtime
+                && let Err(error) = surface.set_theme(theme)
+            {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not apply terminal theme: {error}"
+                )));
             }
         }
     }
@@ -15622,6 +15688,13 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.inspector_open_by_default != self.settings.inspector_open_by_default {
+            // Panes whose inspector the user never opened or closed follow
+            // the default; the rest keep what was chosen for them.
+            self.set_inspectors_open_by_default(self.settings.inspector_open_by_default);
+            self.sync_pane_inspectors();
+            tasks.push(self.rebind_source_control());
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
@@ -15923,10 +15996,13 @@ impl Application for Cagents {
             session.save_worktrees(retired);
         }
         let window_view = startup.window_view;
+        let inspector_open_by_default = settings.inspector_open_by_default;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
+            // Whole pixels, as a drag leaves it, so Settings steps from it.
             settings.inspector_width = if view.inspector_width.is_finite() {
                 view.inspector_width
+                    .round()
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
             } else {
                 AppSettings::default().inspector_width
@@ -16010,6 +16086,7 @@ impl Application for Cagents {
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
+            place_index: inspector_activity::PlaceIndex::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
             presence: HashMap::new(),
@@ -16096,7 +16173,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: account_ui::State::installation().into(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -16170,17 +16247,23 @@ impl Application for Cagents {
             latency_fixture,
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
-            // A window saved before each pane had its own inspector, or none
-            // saved at all, opens the focused pane's as the window's was.
-            pane_inspectors: window_view.as_ref().map_or_else(
-                || pane_inspector::PaneInspectors::restore(None, true),
-                |view| {
-                    pane_inspector::PaneInspectors::restore(
+            // A window saved before each pane had its own inspector opens the
+            // focused pane's as the window's was. Every pane nobody opened or
+            // closed one in, as in a window never saved, follows the default.
+            pane_inspectors: window_view
+                .as_ref()
+                .map_or_else(pane_inspector::PaneInspectors::default, |view| match &view
+                    .inspector_choices
+                {
+                    Some(choices) => {
+                        pane_inspector::PaneInspectors::restore_choices(choices.clone())
+                    }
+                    None => pane_inspector::PaneInspectors::restore(
                         view.open_inspectors.clone(),
                         view.context_inspector_open,
-                    )
-                },
-            ),
+                    ),
+                })
+                .with_default(inspector_open_by_default),
             context_sections: window_view
                 .as_ref()
                 .map_or_else(context_sections::Sections::default, |view| {
@@ -16967,9 +17050,11 @@ impl Application for Cagents {
             ];
             if !scoped {
                 content.push(
+                    // The providers whose accounts the Accounts pane shows.
                     widget::row::with_children(
                         crate::agent::Provider::ALL
                             .into_iter()
+                            .filter(|provider| crate::account::Account::REPORTED.contains(provider))
                             .map(|provider| {
                                 let status = self.account_ui.provider_status(provider);
                                 let control = crate::ui_controls::icon_button(
@@ -18467,12 +18552,14 @@ impl Cagents {
             }
             Message::LifecycleSweep => {
                 let (task, sweep_projection) = self.lifecycle_sweep_update();
-                if !self.update_tail_may_close_or_commit() {
-                    projection = sweep_projection;
-                }
+                projection = self.sweep_projection(sweep_projection);
                 task
             }
-            Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            Message::LifecycleSweepElapsed(generation) => {
+                let (task, sweep_projection) = self.lifecycle_sweep_elapsed(generation);
+                projection = self.sweep_projection(sweep_projection);
+                task
+            }
             Message::WorkspaceSwitcherSelected { since, index } => {
                 if self.chrome_ui.workspace_preview_since == Some(since) {
                     self.select_workspace_preview(index)
@@ -18991,7 +19078,7 @@ impl Cagents {
                         .map(cosmic::Action::App);
                 }
                 let generation = self.pull_request_dialog_generation;
-                let submit = cosmic::task::future(async move {
+                cosmic::task::future(async move {
                     let mut dialog = dialog;
                     let result = tokio::task::spawn_blocking(move || {
                         GitHubService::system("gh")
@@ -19010,8 +19097,7 @@ impl Cagents {
                         generation,
                         result,
                     }
-                });
-                submit
+                })
             }
             Message::PullRequestCreated {
                 mut dialog,
@@ -19584,6 +19670,13 @@ impl Cagents {
         // mounted visible chats are inspected by this bounded handoff.
         let limit_usage =
             projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
+        // Last, after everything above that may change the accounts, so the
+        // frame this update ends in reads its conversations' account choices.
+        projection_stage!(
+            "chat_account_choices",
+            self.account_ui
+                .settle_choices(self.settings.account_usage_display)
+        );
         Task::batch([
             settled_projection,
             task,
@@ -19823,12 +19916,12 @@ fn load_repository_github(
     let github = GitHubService::system("gh");
     (|| {
         let remotes = service
-            .remotes(&repository.selected_path, &cancellation)
+            .remotes(&repository.selected_path, cancellation)
             .map_err(|error| GitHubAvailability::Failed {
                 detail: error.to_string(),
             })?;
         if !github
-            .has_associated_remote(&remotes, &cancellation)
+            .has_associated_remote(&remotes, cancellation)
             .map_err(GitHubAvailability::from_error)?
         {
             return Err(GitHubAvailability::NotAssociated);
@@ -19838,10 +19931,10 @@ fn load_repository_github(
                 &repository.selected_path,
                 &remotes,
                 revalidate,
-                &cancellation,
+                cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
-        let validator = match github.sidebar_probe(&key, revalidate, &cancellation) {
+        let validator = match github.sidebar_probe(&key, revalidate, cancellation) {
             // The probe was answered as this account, so it is signed in.
             crate::github::SidebarProbe::Unchanged(pull_requests) => {
                 return Ok(github_ready(key, pull_requests));
@@ -19849,7 +19942,7 @@ fn load_repository_github(
             crate::github::SidebarProbe::Read(validator) => validator,
         };
         let auth = github
-            .auth_status(&key, &cancellation)
+            .auth_status(&key, cancellation)
             .map_err(GitHubAvailability::from_error)?;
         if auth.state != crate::github::GhAuthState::Authenticated {
             return Err(GitHubAvailability::Unauthenticated);
@@ -19859,7 +19952,7 @@ fn load_repository_github(
                 &key,
                 validator,
                 sidebar::PULL_REQUEST_LIST_LIMIT,
-                &cancellation,
+                cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
         Ok(github_ready(key, pull_requests))

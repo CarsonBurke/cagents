@@ -70,32 +70,32 @@ run = "scripts/run-development"
 # and leaves out the vendored crates' warnings.
 
 [tasks."check:cli"]
-description = "Type-check the control CLI lane"
+description = "Type-check and lint the control CLI lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane check {{vars.cli}} "$@"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.cli}} "$@"'
 
 [tasks."check:host"]
-description = "Type-check the terminal daemon lane"
+description = "Type-check and lint the terminal daemon lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane check {{vars.host}} "$@"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.host}} "$@"'
 
 [tasks."check:ui"]
-description = "Type-check the browserless UI lane"
+description = "Type-check and lint the browserless UI lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane check {{vars.ui}} "$@"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.ui}} "$@"'
 
 [tasks."check:browser"]
-description = "Type-check the integrated-browser UI lane"
+description = "Type-check and lint the integrated-browser UI lane"
 usage = "{{vars.all_targets}}"
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane check {{vars.browser}} "$@"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.browser}} "$@"'
 
 [tasks."check:editor"]
-description = "Type-check the standalone ceditor package"
+description = "Type-check and lint the standalone ceditor package"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--bin=ceditor" help="Cargo arguments, after --; they replace the default --bin=ceditor"'
-run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane check {{vars.editor}} "$@"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.editor}} "$@"'
 
 [tasks.check]
-description = "Type-check every target of the CLI, host and UI lanes, each admitted on its own"
+description = "Type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
 usage = "{{vars.no_arguments}}"
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["check:cli", "check:host", "check:ui"] }]
 
@@ -126,7 +126,7 @@ description = "Test the control CLI lane"
 usage = "{{vars.all_targets}}"
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.cli}} "$@"',
-  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane check {{vars.cli}} --lib --bins --examples ;; esac',
+  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.cli}} --lib --bins --examples ;; esac',
 ]
 
 [tasks."test:host"]
@@ -134,7 +134,7 @@ description = "Test the terminal daemon lane"
 usage = "{{vars.all_targets}}"
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.host}} "$@"',
-  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane check {{vars.host}} --lib --bins --examples ;; esac',
+  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.host}} --lib --bins --examples ;; esac',
 ]
 
 [tasks."test:ui"]
@@ -142,8 +142,13 @@ description = "Test the browserless UI lane"
 usage = "{{vars.all_targets}}"
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.ui}} "$@"',
-  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane check {{vars.ui}} --lib --bins --examples ;; esac',
+  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.ui}} --lib --bins --examples ;; esac',
 ]
+
+[tasks."test:contracts"]
+description = "Test the focused vendored-crate contract packages"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" help="Additional Cargo arguments, after --"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test --locked -p cagents-iced-contracts -p cagents-cosmic-text-contracts "$@"'
 
 [tasks.test]
 description = "Test every target of the CLI, host and UI lanes, one lane after another"

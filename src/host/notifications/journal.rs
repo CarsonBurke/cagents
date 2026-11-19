@@ -131,15 +131,14 @@ impl Journal {
                         diesel::update(notices::table.find(&session))
                             .set(notices::event.eq(&serialized))
                             .execute(connection)?;
-                        if let Some(source) = event.source_session() {
-                            if let Some(window) = owners::table
+                        if let Some(source) = event.source_session()
+                            && let Some(window) = owners::table
                                 .find(source.to_string())
                                 .select(owners::window)
                                 .first::<String>(connection)
                                 .optional()?
-                            {
-                                remember_owner(connection, &session, &window)?;
-                            }
+                        {
+                            remember_owner(connection, &session, &window)?;
                         }
                         return Ok(None);
                     }

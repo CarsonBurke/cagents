@@ -19,6 +19,8 @@ mod codex;
 pub(crate) use codex::archived_rollout as codex_archived_rollout;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use codex::rollout as codex_rollout;
+mod antigravity;
+mod muse;
 mod omp;
 
 #[cfg(feature = "host")]
@@ -32,11 +34,76 @@ pub fn omp_data_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
 }
 
 // Declaration order is persisted by the binary IPC codec and indexes ADAPTERS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+// Append new providers, and give each the protocol that added it in
+// `Provider::since`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
 pub enum Provider {
     Omp,
     Claude,
     Codex,
+    Antigravity,
+    Muse,
+}
+
+/// Encoded as the derived implementation would, except to a client from
+/// before the provider existed, which has no encoding for it: there the value
+/// refuses to encode, and the daemon refuses or withholds the message holding
+/// it rather than send that client something it cannot decode. An optional
+/// value marked with [`absent_where_unknown`] reaches that client as absent
+/// instead.
+impl Serialize for Provider {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !self.is_encodable() {
+            return Err(serde::ser::Error::custom(format!(
+                "a client before protocol {} cannot name {}",
+                self.since().unwrap_or_default(),
+                self.label()
+            )));
+        }
+        let name = match self {
+            Self::Omp => "Omp",
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::Antigravity => "Antigravity",
+            Self::Muse => "Muse",
+        };
+        serializer.serialize_unit_variant("Provider", *self as u32, name)
+    }
+}
+
+/// A value that names a provider.
+pub(crate) trait NamesProvider {
+    fn provider(&self) -> Provider;
+}
+
+impl NamesProvider for Provider {
+    fn provider(&self) -> Provider {
+        *self
+    }
+}
+
+impl NamesProvider for Activity {
+    fn provider(&self) -> Provider {
+        self.provider
+    }
+}
+
+/// Serializes an optional value naming a provider as absent for a client from
+/// before that provider, which could not decode it, so the rest of the message
+/// still reaches that client. Use with `#[serde(serialize_with)]` where absence
+/// is something the client already understands.
+pub(crate) fn absent_where_unknown<T, S>(
+    value: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    T: NamesProvider + Serialize,
+    S: serde::Serializer,
+{
+    value
+        .as_ref()
+        .filter(|value| value.provider().is_encodable())
+        .serialize(serializer)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +124,15 @@ pub struct Activity {
 struct ProviderAdapter {
     provider: Provider,
     executable: &'static str,
+    /// Other executable names that run this provider, such as the launcher a
+    /// wrapper script named `executable` execs.
+    aliases: &'static [&'static str],
     label: &'static str,
     recognizes_script: fn(&Path) -> bool,
+    /// Whether a launch whose first argument is this runs something other
+    /// than an interactive conversation: a server, a tool command or account
+    /// management. A terminal signing in is not an agent.
+    background_command: fn(&str) -> bool,
     session_file_id: fn(&str) -> Option<&str>,
     session_root: fn(&LaunchRecipe, &Path) -> Option<PathBuf>,
     #[cfg(feature = "host")]
@@ -75,6 +149,17 @@ struct ProviderAdapter {
     switches: &'static [&'static str],
     resume_flag: &'static str,
     resume_precedes_options: bool,
+    /// Whether `resume_flag` alone opens the provider's conversation picker.
+    resume_picker: bool,
+    /// Selectors that continue the most recent conversation rather than
+    /// naming one, which neither a bound identity nor a picker keeps.
+    latest_selectors: &'static [&'static str],
+    /// Whether cagents can run this provider's conversations as native chat.
+    /// Without it the provider runs only in a terminal.
+    native_chat: bool,
+    /// What cagents knows of a provider whose native chat is the Agent
+    /// Client Protocol, for one that serves it.
+    acp: Option<Acp>,
     #[cfg(feature = "host")]
     forwards_to_native_child: bool,
     #[cfg(feature = "host")]
@@ -89,7 +174,75 @@ struct ProviderAdapter {
     >,
 }
 
-const ADAPTERS: [ProviderAdapter; 3] = [omp::ADAPTER, claude::ADAPTER, codex::ADAPTER];
+/// How a provider that serves the Agent Client Protocol spells its session
+/// settings on its terminal command line, and what its permission modes mean.
+///
+/// A terminal recipe and a native ACP conversation share one launch: the
+/// recipe is what a terminal would run, and the provider's ACP profile reads
+/// these options from it to configure the session it opens.
+#[derive(Debug, Clone, Copy)]
+pub struct Acp {
+    /// The option naming the permission mode, such as agy's `--mode`.
+    pub mode_option: &'static str,
+    /// The option naming the reasoning effort, such as agy's `--effort`.
+    pub effort_option: &'static str,
+    /// Each of the agent's own mode identifiers, beside the cagents mode
+    /// that means the same, which the interface and the CLI name it by. A
+    /// mode not listed keeps its own identifier.
+    pub modes: &'static [(&'static str, &'static str)],
+    /// The agent's mode its terminal starts in without the mode option, which
+    /// its command line may not accept by name.
+    pub default_mode: &'static str,
+}
+
+impl Acp {
+    /// The cagents name for the agent's mode `mode`.
+    pub fn mode_meaning(self, mode: &str) -> &str {
+        self.modes
+            .iter()
+            .find(|(own, _)| *own == mode)
+            .map_or(mode, |(_, meaning)| *meaning)
+    }
+
+    /// The agent's own mode for the cagents mode `meaning`.
+    pub fn own_mode(self, meaning: &str) -> &str {
+        self.modes
+            .iter()
+            .find(|(_, candidate)| *candidate == meaning)
+            .map_or(meaning, |(own, _)| *own)
+    }
+
+    /// The cagents names of the agent's known modes, in its order.
+    pub fn mode_meanings(self) -> impl Iterator<Item = &'static str> {
+        self.modes.iter().map(|(_, meaning)| *meaning)
+    }
+}
+
+const ADAPTERS: [ProviderAdapter; 5] = [
+    omp::ADAPTER,
+    claude::ADAPTER,
+    codex::ADAPTER,
+    antigravity::ADAPTER,
+    muse::ADAPTER,
+];
+
+/// The commands that do not own a foreground conversation for the providers
+/// that were recognised before each provider listed its own. They stay shared
+/// so recognition of those providers does not change.
+fn shared_background_command(argument: &str) -> bool {
+    matches!(
+        argument,
+        "app-server"
+            | "exec"
+            | "review"
+            | "mcp-server"
+            | "proxy"
+            | "agents"
+            | "auth"
+            | "login"
+            | "logout"
+    )
+}
 
 /// Whether `name` is a variable some provider set for a process one of its
 /// sessions started (see `ProviderAdapter::session_environment`).
@@ -129,9 +282,31 @@ impl Provider {
         &ADAPTERS[self as usize]
     }
 
+    /// The protocol that added this provider, for one appended after the
+    /// first clients this daemon serves.
+    fn since(self) -> Option<u16> {
+        match self {
+            Self::Omp | Self::Claude | Self::Codex => None,
+            Self::Antigravity | Self::Muse => Some(crate::terminal_ipc::ANTIGRAVITY_AND_MUSE),
+        }
+    }
+
+    /// Whether the client being encoded for, if any, knows this provider.
+    fn is_encodable(self) -> bool {
+        !self
+            .since()
+            .is_some_and(crate::terminal_ipc::encoding_before)
+    }
+
     /// Every provider in declaration order, for menus and for recognizing the
     /// placeholder titles a card carries before its conversation names itself.
-    pub const ALL: [Self; 3] = [Self::Omp, Self::Claude, Self::Codex];
+    pub const ALL: [Self; 5] = [
+        Self::Omp,
+        Self::Claude,
+        Self::Codex,
+        Self::Antigravity,
+        Self::Muse,
+    ];
 
     pub fn executable(self) -> &'static str {
         self.adapter().executable
@@ -141,35 +316,57 @@ impl Provider {
         self.adapter().label
     }
 
+    /// Every executable name this provider is recognised by, its own first.
+    pub fn programs(self) -> impl Iterator<Item = &'static str> {
+        let adapter = self.adapter();
+        std::iter::once(adapter.executable).chain(adapter.aliases.iter().copied())
+    }
+
     /// Recognize an exact executable basename, not a shell command or JS wrapper.
     pub fn from_program(program: &str) -> Option<Self> {
         let name = Path::new(program).file_name()?.to_str()?;
         ADAPTERS
             .iter()
-            .find(|adapter| adapter.executable == name)
             .map(|adapter| adapter.provider)
+            .find(|provider| provider.programs().any(|program| program == name))
+    }
+
+    /// Whether cagents can run this provider's conversations as native chat.
+    /// A provider without it is recognised in a terminal but never offered,
+    /// converted or started as a native conversation.
+    pub fn has_native_chat(self) -> bool {
+        self.adapter().native_chat
+    }
+
+    /// How this provider serves the Agent Client Protocol, for one whose
+    /// native chat speaks it.
+    pub fn acp(self) -> Option<Acp> {
+        self.adapter().acp
+    }
+
+    /// Whether this provider's native chat is the Agent Client Protocol.
+    pub fn speaks_acp(self) -> bool {
+        self.adapter().acp.is_some()
+    }
+
+    /// Why a native conversation with this provider cannot start, for a
+    /// provider without native chat.
+    pub fn native_chat_refusal(self) -> String {
+        format!(
+            "Native chat with {} isn't available yet. Run `{}` in a terminal instead.",
+            self.label(),
+            self.executable()
+        )
     }
 
     /// Recognize only known foreground executable/JavaScript entrypoints.
     /// Options and identity still require recovery's separate exact validation.
     pub fn recognize_launch(launch: &LaunchRecipe) -> Option<Self> {
         let (provider, arguments) = Self::launched(launch)?;
-        // Shared servers, tool commands and account management do not own the
-        // foreground conversation: a terminal signing in is not an agent.
-        if arguments.first().is_some_and(|arg| {
-            matches!(
-                arg.as_str(),
-                "app-server"
-                    | "exec"
-                    | "review"
-                    | "mcp-server"
-                    | "proxy"
-                    | "agents"
-                    | "auth"
-                    | "login"
-                    | "logout"
-            ) || arg.starts_with("__omp_")
-        }) {
+        if arguments
+            .first()
+            .is_some_and(|arg| (provider.adapter().background_command)(arg))
+        {
             return None;
         }
         Some(provider)
@@ -236,7 +433,7 @@ impl Provider {
 
     /// Read only the canonical selector position in an already normalized recipe.
     /// Shared checkpoint validation uses this parser before any daemon starts.
-    pub(crate) fn resume_id(self, arguments: &[String]) -> Option<&str> {
+    pub fn resume_id(self, arguments: &[String]) -> Option<&str> {
         let (selector, id) = if self.adapter().resume_precedes_options {
             match arguments {
                 [selector, id, ..] => (selector, id),
@@ -253,6 +450,17 @@ impl Provider {
 
     pub(crate) fn is_switch(self, flag: &str) -> bool {
         self.adapter().switches.contains(&flag)
+    }
+
+    /// Whether `flag` continues the most recent conversation rather than
+    /// naming one.
+    pub(crate) fn is_latest_selector(self, flag: &str) -> bool {
+        self.adapter().latest_selectors.contains(&flag)
+    }
+
+    /// Whether the provider has a conversation picker cagents can open.
+    pub(crate) fn has_resume_picker(self) -> bool {
+        self.adapter().resume_picker
     }
 
     pub(crate) fn append_resume(self, arguments: &mut Vec<String>, id: String) {
@@ -344,6 +552,9 @@ impl Provider {
             // Claude exposes names through its PID-scoped inventory. Arbitrary
             // OSC titles are not an alternative to that authoritative source.
             Self::Claude => return None,
+            // Neither has a title grammar that separates a conversation's
+            // name from the rest of its terminal title.
+            Self::Antigravity | Self::Muse => return None,
         };
         let directory = cwd.file_name().and_then(|name| name.to_str());
         // Codex's default title ends in the project name, separated from the
@@ -451,6 +662,10 @@ mod tests {
         ("CODEX_SANDBOX", "seccomp"),
         ("PI_TOOL_BRIDGE_TOKEN", "parent-bridge"),
         ("OMP_SESSION_ID", "parent-session"),
+        ("ANTIGRAVITY_CONVERSATION_ID", "parent-conversation"),
+        ("ANTIGRAVITY_CSRF_TOKEN", "parent-token"),
+        ("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:41234"),
+        ("ANTIGRAVITY_TRAJECTORY_ID", "parent-trajectory"),
     ];
 
     /// The user's own provider configuration, which may sit beside them.
@@ -463,6 +678,11 @@ mod tests {
         ("CODEX_HOME", "/home/a/.codex"),
         ("OMP_PROFILE", "work"),
         ("PI_CODING_AGENT_DIR", "/home/a/.pi"),
+        (
+            "ANTIGRAVITY_APP_DATA_DIR",
+            "/home/a/.gemini/antigravity-cli",
+        ),
+        ("XDG_DATA_HOME", "/home/a/.local/share"),
     ];
 
     #[test]
@@ -587,6 +807,33 @@ mod tests {
                 Some(recipe.working_directory.join(default))
             );
         }
+        assert_eq!(
+            Provider::Antigravity.session_root(&recipe),
+            Some(
+                recipe
+                    .working_directory
+                    .join("home/.gemini/antigravity-cli")
+            )
+        );
+        assert_eq!(
+            Provider::Muse.session_root(&recipe),
+            Some(recipe.working_directory.join("home/.local/share/muse"))
+        );
+        recipe
+            .environment
+            .insert("XDG_DATA_HOME".into(), "relative/data".into());
+        assert_eq!(
+            Provider::Muse.session_root(&recipe),
+            Some(recipe.working_directory.join("home/.local/share/muse")),
+            "the base directory spec ignores a relative XDG_DATA_HOME"
+        );
+        recipe
+            .environment
+            .insert("XDG_DATA_HOME".into(), "/data".into());
+        assert_eq!(
+            Provider::Muse.session_root(&recipe),
+            Some("/data/muse".into())
+        );
         for (provider, variable) in [
             (Provider::Claude, "CLAUDE_CONFIG_DIR"),
             (Provider::Codex, "CODEX_HOME"),
@@ -658,8 +905,81 @@ mod tests {
         ] {
             assert_eq!(Provider::recognize_launch(&recipe), None);
         }
+        for (recipe, provider) in [
+            (launch("agy", &[]), Provider::Antigravity),
+            (
+                launch("/usr/local/bin/agy", &["--model", "x"]),
+                Provider::Antigravity,
+            ),
+            (
+                launch("agy", &["--conversation", "id"]),
+                Provider::Antigravity,
+            ),
+            (launch("muse", &[]), Provider::Muse),
+            (
+                launch("/home/a/.local/bin/muse-upstream", &[]),
+                Provider::Muse,
+            ),
+            (launch("muse", &["resume"]), Provider::Muse),
+        ] {
+            assert_eq!(
+                Provider::recognize_launch(&recipe),
+                Some(provider),
+                "{recipe:?}"
+            );
+        }
+        // Each provider's own servers and one-shot commands, and only its own.
+        for recipe in [
+            launch("agy", &["acp", "--disable-telemetry"]),
+            launch("agy", &["update"]),
+            launch("agy", &["models"]),
+            launch("muse", &["acp"]),
+            launch("muse-upstream", &["acp", "--contributor-mode", "off"]),
+            launch("muse", &["serve"]),
+            launch("muse", &["sessions"]),
+            launch("muse", &["login"]),
+        ] {
+            assert_eq!(Provider::recognize_launch(&recipe), None, "{recipe:?}");
+        }
+        assert_eq!(
+            Provider::recognize_launch(&launch("claude", &["acp"])),
+            Some(Provider::Claude)
+        );
+        assert_eq!(
+            Provider::recognize_launch(&launch("agy", &["exec"])),
+            Some(Provider::Antigravity)
+        );
         // Foreground recognition must not turn a fresh launch into resume authority.
         let fresh = Provider::normalize_launch(launch("bun", &["/opt/omp/omp.js"])).unwrap();
         assert!(crate::model::agent_recovery::resume_recipe(&fresh).is_none());
+    }
+
+    #[test]
+    fn providers_keep_their_persisted_names_and_refuse_clients_before_them() {
+        for provider in Provider::ALL {
+            let name = serde_json::to_string(&provider).unwrap();
+            assert_eq!(name, format!("\"{provider:?}\""));
+            assert_eq!(serde_json::from_str::<Provider>(&name).unwrap(), provider);
+            assert_eq!(
+                postcard::from_bytes::<Provider>(&postcard::to_allocvec(&provider).unwrap())
+                    .unwrap(),
+                provider
+            );
+        }
+        let older = crate::terminal_ipc::ANTIGRAVITY_AND_MUSE - 1;
+        for provider in [Provider::Antigravity, Provider::Muse] {
+            assert!(
+                crate::terminal_ipc::encoding_for(older, || postcard::to_allocvec(&provider))
+                    .is_err(),
+                "{provider:?} reached a client from before it"
+            );
+        }
+        for provider in [Provider::Omp, Provider::Claude, Provider::Codex] {
+            assert_eq!(
+                crate::terminal_ipc::encoding_for(older, || postcard::to_allocvec(&provider))
+                    .unwrap(),
+                postcard::to_allocvec(&provider).unwrap()
+            );
+        }
     }
 }

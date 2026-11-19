@@ -43,11 +43,12 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `doctor` | Report each missing prerequisite with its fix, and whether the build host answers |
 | `dev` | Run the browserless [development UI](#development-runner) |
 | `dev:browser` | Run the development UI with the embedded browser |
-| `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check one [lane](#feature-boundaries), all targets by default |
-| `check:editor` | Type-check ceditor |
+| `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check and lint one [lane](#feature-boundaries), all targets by default |
+| `check:editor` | Type-check and lint ceditor |
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
+| `test:contracts` | Test the focused vendored-crate contract packages |
 | `test` | The three lane test suites, one after another |
 | `test:lib` | Build one lane's library tests once and run the named ones ([`scripts/test-lib`](#testing)) |
 | `test:scripts` | Verify and run every script contract suite CI runs, or one `JOB [SHARD]` |
@@ -195,13 +196,18 @@ check all targets, tests included, and `check` runs the first three: what a
 change needs before review. The integrated-browser lane compiles the
 application's tests too, so a test that uses a browserless-only fixture must be
 gated like that fixture.
-Each task runs one `scripts/cargo-gate check --locked` command with its lane's
+Each task runs one `scripts/cargo-gate clippy --locked` command with its lane's
 features, `--no-default-features --features host` for the daemon for example;
 `mise.toml` defines the lanes once. The `ui` lane selects both packages,
 `--package cagents --package cagents-ui --features cagents/ui`, and `browser`
 selects `--package cagents-ui --features browser-protocol-fixture`: the
 integrated browser with the Wayland registry test server its tests use, as main's
-build check selects it.
+build check selects it. Clippy type-checks exactly as `cargo check` does and
+adds its lints; `[workspace.lints]` in the root `Cargo.toml` configures them for
+every workspace crate, and a lint warning fails the task like a compiler
+warning. Allow a lint there, with the reason, only when its rewrite is wrong or
+worse for this code base; allow one site with `#[allow(clippy::LINT, reason =
+"...")]` when only that site is the exception.
 
 Every lane compiles the workspace's crates without warnings, tests included,
 and a new warning is a regression to fix in the change that adds it. An item
@@ -229,7 +235,7 @@ its check.
 A test lane narrowed with arguments, such as `mise run test:ui -- --lib`, and
 `mise run test:lib` may build the lane's library only under `cfg(test)`,
 where an item only tests use looks used. So once their tests pass, these tasks
-also check the lane's library, binaries and examples, as main's build check
+also lint the lane's library, binaries and examples, as main's build check
 does, and their status is that check's. A method only tests called reached
 main that way (#3006, fixed by #3035): its author ran a narrowed test lane and
 no check. On fw16 this check took about 20 s to compile where the slot had
@@ -405,6 +411,7 @@ the matched set as usual, then starts the UI in a headless
 `niri-harness` session named
 `cagents-NAME` and returns once its window maps. Drive and capture it with
 `niri-harness --session cagents-NAME ...`.
+It needs a niri-harness with the `start` command; `mise run doctor` warns about an older one.
 
 | Shared by default | Per instance |
 | --- | --- |
@@ -781,14 +788,14 @@ GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
 at most once every two minutes and checks every new first-parent commit in
 order. Its first run checks the current tip. Each commit gets five separate
-`scripts/cargo-gate check --locked --no-default-features --all-targets` commands:
+`scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 `-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
 graph with its Wayland registry test server. These use the ordinary shared queue
 and the persistent sentinel worktree cache, without a held slot between lanes.
 The sentinel neither merges nor modifies another checkout or native session.
 A lane fails when it does not compile or when a workspace crate prints a
-warning; it reads Cargo's JSON messages to tell the workspace's crates, the
+compiler or Clippy warning; it reads Cargo's JSON messages to tell the workspace's crates, the
 checked commit's `[workspace] members`, from vendored path dependencies, whose
 warnings do not count. The lane tasks apply the same rule with the same code,
 `scripts/cargo_warnings.py`, so the rule an author checks a branch against is
@@ -1697,6 +1704,10 @@ changing the tree contract or UI integration:
 scripts/cargo-gate test --locked --no-default-features --features ui --test iced_tree_reconciliation
 ```
 
+The vendored cosmic-text `wrapped_ellipsis` regressions run through the workspace
+member package `cagents-cosmic-text-contracts` (`mise run test:contracts`). Cargo
+refuses to test a crate under the workspace that is not a member.
+
 Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
 tests. Use `--all-targets` to select all targets available in a feature lane.
@@ -2159,7 +2170,14 @@ harness, it provides:
   `--projection-oracle` to check every narrowed update projection against the
   full one; such a session repairs what it finds and so behaves like one that
   projects everything, and its log is the evidence. See "Busy terminals and
-  the update tail" in `docs/performance.md`.
+  the update tail" in `docs/performance.md`. Add `--launch-handshake` to
+  start the app as `cagents ui` does, so its startup gate checks the restored
+  panes and shows the startup recovery notice for any that did not reconnect.
+  A saved terminal its fresh daemon confirms is gone settles as a saved pane
+  and is not reported. To show the notice, save a seed with an open chat pane,
+  then write a delay longer than the gate's budget, such as `120`, to
+  `fixture-seed/home/.claude/fixture-slow-start` in the task: the restored
+  chat's provider does not start in time, so the pane is reported by name.
   These flags apply to the requested session and its relaunches; ordinary
   sessions keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.
@@ -2592,6 +2610,7 @@ display. `ceditor start BIN_DIR`, `record NAME`, `shot NAME` and `update DIR
 VERSION INSTALLER --answer yes` are available separately. `stop` retains evidence;
 `cleanup` stops everything and removes the marked root. Copy reports and images
 elsewhere before cleanup.
+Without a running desktop, `record NAME` records no windows and expects no window stores; comparing a record taken with a desktop to one taken without reports the difference.
 
 The harness's pure checks need no compositor, archive or Rust build, and CI
 runs them as the `update rehearsal` job of the script contracts (see [Testing](#testing)):

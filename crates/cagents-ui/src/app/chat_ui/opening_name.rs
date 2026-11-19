@@ -34,7 +34,7 @@ pub(super) fn read(launch: &chat::Launch) -> Option<String> {
             crate::agent::claude_transcript(&home, &cwd, id).ok()?
         }
         Provider::Codex => crate::agent::codex_rollout(&home, id).ok()?,
-        Provider::Omp => return None,
+        Provider::Omp | Provider::Antigravity | Provider::Muse => return None,
     };
     super::super::resume_ui::first_prompt(
         launch.provider,
@@ -64,13 +64,9 @@ impl Cagents {
         {
             return None;
         }
-        let Some(runtime) = self.chat_runtime_mut(target) else {
-            return None;
-        };
+        let runtime = self.chat_runtime_mut(target)?;
         let launch = &runtime.session.launch;
-        let Some(conversation) = launch.session_id.clone() else {
-            return None;
-        };
+        let conversation = launch.session_id.clone()?;
         if launch.provider == Provider::Omp {
             return None;
         }

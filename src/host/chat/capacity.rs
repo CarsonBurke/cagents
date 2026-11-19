@@ -248,6 +248,575 @@ impl Drop for Reservation {
     }
 }
 
+pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    status_from_state(&state)
+}
+
+pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
+    crate::terminal_ipc::ChatCapacity {
+        resident: state.chats.len() as u32,
+        spawning: pending(state) as u32,
+        limit: state.native_chat_capacity as u32,
+        used: usage(state) as u32,
+        residents: state
+            .chats
+            .iter()
+            .take(4096)
+            .map(|(&id, record)| crate::terminal_ipc::ChatCapacityResident {
+                chat_id: id,
+                provider: record.session.launch.provider,
+                status: if state.chat_spawning.contains_key(&id) {
+                    "starting".into()
+                } else if record.handle.is_read_only_history() {
+                    "read-only history".into()
+                } else if record.handle.is_completed() {
+                    "closed".into()
+                } else {
+                    format!("{:?}", record.handle.activity())
+                },
+                release_blocked: if record.handle.owns_work() {
+                    Some("Actor owns live or unconfirmed provider work".into())
+                } else if !record.subscribers.is_empty() {
+                    Some("A client is attached".into())
+                } else if !record.handle.is_read_only_history() && !record.handle.is_completed() {
+                    Some("Writer teardown is unconfirmed".into())
+                } else if state.chat_spawning.contains_key(&id)
+                    || state.native_closing.contains_key(&id)
+                    || state.chat_handoffs.contains_key(&id)
+                    || record.returning_terminal
+                {
+                    Some("Ownership transition is pending".into())
+                } else if record.paired_terminal.is_some() || record.session.terminal.is_some() {
+                    Some("Paired terminal ownership remains".into())
+                } else {
+                    None
+                },
+            })
+            .collect(),
+        omitted_residents: state.chats.len().saturating_sub(4096) as u32,
+    }
+}
+
+fn inspected_record(
+    state: &HostState,
+    id: TerminalId,
+) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle, Session), ProtocolError> {
+    let record = state
+        .chats
+        .get(&id)
+        .ok_or_else(|| unavailable("Native chat is no longer resident"))?;
+    // Retained actors are never eligible for resident eviction. Inspect only
+    // cached identity metadata while holding HostState, without a helper RPC.
+    if record.handle.actor_identity().is_some() {
+        let mut session = record.session.clone();
+        session.launch.session_id = record.handle.session_id();
+        session.native_continuity = record.handle.native_continuity();
+        return Ok((crate::terminal_ipc::ChatReleaseInspection {
+            proof: crate::terminal_ipc::ChatReleaseProof {
+                session,
+                generation: record.handle.resident_generation(),
+                execution_instance: record.execution_instance,
+            },
+            release_blocked: Some("The actor retains native provider ownership; use its authenticated close operation".into()),
+        }, record.handle.clone(), record.session.clone()));
+    }
+    let ServerResponse::ChatAttached { session, snapshot } =
+        session_snapshot(&record.session, &record.handle).map_err(unavailable)?
+    else {
+        unreachable!()
+    };
+    let blocked = if state.shutting_down {
+        Some("Daemon is shutting down")
+    } else if state.chat_spawning.contains_key(&id)
+        || state.native_closing.contains_key(&id)
+        || state.chat_handoffs.contains_key(&id)
+        || record.returning_terminal
+    {
+        Some("A native ownership transition is pending")
+    } else if record.handle.owns_work() {
+        Some(
+            "The actor is live or still owns unconfirmed backend work; idle does not authorize release",
+        )
+    } else if !record.subscribers.is_empty() {
+        Some("A client is attached; detach its view before releasing the resident actor")
+    } else if record.paired_terminal.is_some() || session.terminal.is_some() {
+        Some("The actor retains a paired terminal")
+    } else if !matches!(
+        session.native_continuity,
+        chat::NativeContinuity::ReconnectOnly
+    ) || session.owned_codex_listener.is_some()
+    {
+        Some("The actor retains native provider ownership; use its authenticated close operation")
+    } else if snapshot.busy
+        || snapshot.waiting
+        || !snapshot.requests.is_empty()
+        || !record.handle.background_subagents().is_empty()
+    {
+        Some("The actor still reports pending or delegated work")
+    } else if !snapshot.subagents.is_empty() {
+        Some("Child transcript preservation is not yet verified; its resident history is preserved")
+    } else if !record.handle.is_read_only_history() && !record.handle.is_completed() {
+        Some("The writer has not finished provider teardown")
+    } else if !snapshot.exited
+        || (record.handle.is_read_only_history() && snapshot.read_only_reason.is_none())
+    {
+        Some("The history reader or completed writer has not settled")
+    } else if session.launch.session_id.is_none() {
+        Some("The provider conversation identity is unconfirmed")
+    } else {
+        None
+    };
+    Ok((
+        crate::terminal_ipc::ChatReleaseInspection {
+            proof: crate::terminal_ipc::ChatReleaseProof {
+                session,
+                generation: snapshot.generation,
+                execution_instance: record.execution_instance,
+            },
+            release_blocked: blocked.map(str::to_owned),
+        },
+        record.handle.clone(),
+        record.session.clone(),
+    ))
+}
+
+fn release_kind(handle: &Handle) -> super::super::model::ResidentRelease {
+    if handle.is_read_only_history() {
+        super::super::model::ResidentRelease::ReadOnlyHistory
+    } else {
+        super::super::model::ResidentRelease::CompletedWriter
+    }
+}
+
+pub(in crate::host) fn inspect(
+    host: &SharedHost,
+    id: TerminalId,
+) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
+    let (mut inspection, handle, source) =
+        inspected_record(&host.lock().unwrap_or_else(|p| p.into_inner()), id)?;
+    if inspection.release_blocked.is_some() {
+        return Ok(inspection);
+    }
+    super::super::account_lifecycle::ensure_idle(host)?;
+    // A writer's own delegation capability is separate from managed work.
+    let ownership = super::super::agent_execution::registry(host).and_then(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .inspect_resident_release(
+                &crate::agent_execution::HostedSession::Chat(source),
+                release_kind(&handle),
+            )
+    });
+    if let Err(error) = ownership {
+        inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
+        return Ok(inspection);
+    }
+    if inspection.release_blocked.is_none() {
+        let reload = reload_history(&inspection.proof.session)
+            .and_then(|reloaded| if handle.history_is_covered_by(&reloaded)? {
+                Ok(())
+            } else {
+                Err("The reloaded provider history does not cover all resident transcript data; older cached pages or changed history remain protected".into())
+            });
+        if let Err(error) = reload {
+            inspection.release_blocked =
+                Some(format!("Saved provider history is not verified: {error}"));
+        }
+    }
+    Ok(inspection)
+}
+
+fn reload_history(session: &Session) -> Result<chat::runtime::Store, String> {
+    let (spec, _, mut initial) = load_history(session)?;
+    chat::runtime::preflight(&spec, &mut initial)
+}
+
+type LoadedHistory = (
+    chat::protocol::ProcessSpec,
+    Box<dyn chat::protocol::Adapter>,
+    chat::protocol::Step,
+);
+
+fn load_history(session: &Session) -> Result<LoadedHistory, String> {
+    load_history_for_start(session).map_err(|error| error.to_string())
+}
+
+fn load_history_for_start(session: &Session) -> Result<LoadedHistory, chat::protocol::SetupError> {
+    if has_native_owner(session).map_err(|error| {
+        if error.retryable {
+            chat::protocol::SetupError::Unavailable(error.message)
+        } else {
+            chat::protocol::SetupError::Invalid(error.message)
+        }
+    })? {
+        return Err(chat::protocol::SetupError::Unavailable(
+            "An authenticated native provider owner remains".into(),
+        ));
+    }
+    let (spec, mut adapter) = chat::protocol::create_history_for_start(&session.launch)?;
+    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
+        return Err(
+            "The saved conversation cannot currently be reopened as read-only history".into(),
+        );
+    }
+    let initial = adapter.initialize_for_start()?;
+    if !initial.writes.is_empty() {
+        return Err("History reload attempted a provider write".into());
+    }
+    if initial
+        .events
+        .iter()
+        .any(|event| matches!(event, chat::Event::HistoryError(_)))
+    {
+        return Err(chat::protocol::SetupError::Unavailable(
+            "Provider history could not be reloaded".into(),
+        ));
+    }
+    Ok((spec, adapter, initial))
+}
+
+fn require_unmanaged_for_start(
+    host: &SharedHost,
+    id: TerminalId,
+) -> Result<(), chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
+    // The legacy registry lookup exposes operational failures as strings.
+    // Preserve Retry until ownership can be read; an actual managed source is
+    // a distinct, permanent refusal of this read-only reattachment route.
+    let managed = !registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(id)
+        .map_err(SetupError::Unavailable)?
+        .is_empty();
+    if managed {
+        return Err(
+            "The actor belongs to a managed agent; use its supported owned-agent close operation"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// A saved read-only descriptor can outlive its resident paging worker. This
+/// path never resumes a provider: the constructor must prove History transport
+/// again, even if the working directory changes while the request is admitted.
+pub(super) fn restore_saved_history(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+) -> Result<ServerResponse, ProtocolError> {
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(session.proof.as_ref(), state.proof())?;
+    }
+    if session.terminal.is_some()
+        || session.owned_codex_listener.is_some()
+        || !matches!(
+            session.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        )
+        || session.launch.provider != Provider::Claude
+    {
+        return Err(unavailable(
+            "Exact native chat not found; only saved read-only history can be reattached without a resident actor",
+        ));
+    }
+    let admission = Reservation::new_with_source(host, &session, None)?;
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chats.contains_key(&session.id) {
+            return Err(retryable_unavailable(
+                "The saved history became resident; retry its normal attach",
+            ));
+        }
+    }
+    super::super::account_lifecycle::ensure_idle(host)?;
+    require_unmanaged_for_start(host, session.id).map_err(setup_error)?;
+    let (mut spec, adapter, mut initial) = load_history_for_start(&session).map_err(setup_error)?;
+    spec.messages = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mailbox_seal
+        .as_ref()
+        .map(|seal| Arc::new(seal.recognizer()));
+    let store = chat::runtime::preflight_for_start(&spec, &mut initial).map_err(setup_error)?;
+    let environment = spec.environment.clone();
+    let weak = Arc::downgrade(host);
+    let id = session.id;
+    let handle = Handle::start_owned(
+        spec,
+        adapter,
+        initial,
+        store,
+        session.clone(),
+        environment,
+        move |update| changed(&weak, id, update),
+    )
+    .map_err(retryable_unavailable)?;
+    let result = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down
+            || state.chats.contains_key(&id)
+            || state.chat_spawning.get(&id) != Some(&session)
+        {
+            Err(retryable_unavailable(
+                "Native history ownership changed before installation",
+            ))
+        } else {
+            let observation = Observation {
+                after_generation: handle.observe_next_update(),
+                ..Observation::default()
+            };
+            let record = Record {
+                execution_instance: uuid::Uuid::new_v4(),
+                console_recipe: None,
+                paired_terminal: None,
+                session,
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: if client == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(client, false)])
+                },
+                observations: if client == 0 {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(client, observation)])
+                },
+                completion_observed: false,
+                returning_terminal: false,
+            };
+            let response =
+                session_snapshot(&record.session, &record.handle).map_err(retryable_unavailable)?;
+            record
+                .handle
+                .commit_native_installation()
+                .map_err(retryable_unavailable)?;
+            state.chats.insert(id, record);
+            state.inventory_generation += 1;
+            Ok(response)
+        }
+    };
+    if result.is_err() {
+        let _ = handle.close();
+    }
+    drop(admission);
+    result
+}
+
+/// Reopen saved data across daemon epochs, without upgrading it to execution
+/// ownership. The host issues the new proof only after the normal history
+/// constructor verifies the exact thread/account and fences native owners and
+/// managed agents. The old descriptor remains an exact Resolve alias.
+pub(super) fn recover_saved_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), ProtocolError> {
+    if !source.is_saved_claude_history() {
+        return Err(unavailable(
+            "This saved pane has no supported read-only history route",
+        ));
+    }
+    let mut session = source.clone();
+    session.proof = Some(
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone(),
+    );
+    restore_saved_history(host, 0, session.clone())?;
+    register_saved_history_alias(host, source)
+}
+
+/// Classify an already authenticated paging reader for an explicit Retry.
+/// This returns its unchanged descriptor, never retirement or launch authority;
+/// normal Start repeats the execution/account/admission checks if requested.
+pub(super) fn prepare_saved_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(record) = state.chats.get(&source.id) else {
+        return Ok(None);
+    };
+    if !source.is_saved_claude_history() || !record.handle.is_read_only_history() {
+        return Ok(None);
+    }
+    validate_proof(source.proof.as_ref(), state.proof())?;
+    if record.session != *source
+        || record.handle.session_id() != source.launch.session_id
+        || record.handle.owns_work()
+    {
+        return Err(unavailable(
+            "The exact saved-history reader changed; no provider was started",
+        ));
+    }
+    if record.returning_terminal
+        || state.shutting_down
+        || state.chat_spawning.contains_key(&source.id)
+        || state.native_closing.contains_key(&source.id)
+        || state.native_actor_startups.contains_key(&source.id)
+    {
+        return Err(retryable_unavailable(
+            "The exact saved-history reader changed; no provider was started",
+        ));
+    }
+    Ok(Some(source.clone()))
+}
+
+/// An inactive window may retain a different former proof for this same
+/// paging allocation. Admit that alias independently against the complete
+/// current reader; an earlier alias cannot authenticate different content.
+pub(super) fn register_saved_history_alias(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let record = state
+        .chats
+        .get(&source.id)
+        .ok_or_else(|| unavailable("Saved history changed during recovery"))?;
+    if !source.is_saved_claude_history()
+        || !record.handle.is_read_only_history()
+        || record.handle.owns_work()
+    {
+        return Ok(()); // native execution keeps its separate lineage contract
+    }
+    let mut expected = source.clone();
+    expected.proof = Some(state.proof().clone());
+    if record.session != expected {
+        return Err(unavailable(
+            "Saved history did not confirm a read-only attachment",
+        ));
+    }
+    let sources = state.upgrade_chats.entry(source.id).or_default();
+    if !sources.iter().any(|previous| previous.source == *source) {
+        if sources.len() >= crate::upgrade::handoff::MAX_CHATS {
+            return Err(unavailable(
+                "Saved history aliases exceed the bounded recovery limit",
+            ));
+        }
+        sources.push(crate::upgrade::handoff::ChatSource {
+            source: source.clone(),
+            launch: source.launch.clone(),
+        });
+    }
+    Ok(())
+}
+
+pub(in crate::host) fn release(
+    host: &SharedHost,
+    proof: &crate::terminal_ipc::ChatReleaseProof,
+    dry_run: bool,
+) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
+    let inspection = inspect(host, proof.session.id)?;
+    if inspection.proof != *proof {
+        return Err(error(
+            "The exact native actor or its generation changed; inspect it again",
+        ));
+    }
+    if let Some(reason) = &inspection.release_blocked {
+        return Err(unavailable(reason.clone()));
+    }
+    let mut reservation = None;
+    let (handle, source) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(proof.session.proof.as_ref(), state.proof())?;
+        let (current, handle, source) = inspected_record(&state, proof.session.id)?;
+        if current.proof != *proof || current.release_blocked.is_some() {
+            return Err(error(
+                "The exact native actor or its release eligibility changed; inspect it again",
+            ));
+        }
+        if dry_run {
+            return Ok(inspection);
+        }
+        Reservation::install(&mut reservation, host, &mut state, &proof.session)?;
+        (handle, source)
+    };
+    // Repeat complete coverage with the ownership reservation held. Paging
+    // admitted before the last detach may still have settled since inspection.
+    super::super::account_lifecycle::ensure_idle(host)?;
+    let reloaded = reload_history(&proof.session).map_err(unavailable)?;
+    if !handle
+        .history_is_covered_by(&reloaded)
+        .map_err(unavailable)?
+    {
+        return Err(unavailable(
+            "Reloaded provider history does not cover all resident data",
+        ));
+    }
+    if handle
+        .snapshot(None)
+        .expect("unconditional history snapshot")
+        .generation
+        != proof.generation
+    {
+        return Err(error(
+            "The native history generation changed; inspect it again",
+        ));
+    }
+    // A history reader only stops paging. A completed writer has already
+    // confirmed teardown and owns no provider work; close joins its worker.
+    // Neither path may stop a running provider to make it eligible.
+    handle.close().map_err(unavailable)?;
+    // The worker is now immutable. A previously queued page must also be
+    // recoverable before its cache can be dropped.
+    if !handle
+        .history_is_covered_by(&reloaded)
+        .map_err(unavailable)?
+    {
+        return Err(unavailable(
+            "History changed while its reader closed; resident data was preserved",
+        ));
+    }
+    // The exclusive request gate remains held through exact capability
+    // retirement and resident removal. No cached-origin submission may cross
+    // this boundary; the reservation also fences actor recovery and attach.
+    super::super::agent_execution::registry(host)
+        .map_err(unavailable)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retire_resident_release(
+            &crate::agent_execution::HostedSession::Chat(source),
+            release_kind(&handle),
+        )
+        .map_err(unavailable)?;
+    let retired = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&proof.session.id)
+            .ok_or_else(|| error("Native history reader changed while closing"))?;
+        if !record.handle.same_actor(&handle)
+            || record.execution_instance != proof.execution_instance
+            || !record.subscribers.is_empty()
+            || record.handle.owns_work()
+            || state.chat_spawning.get(&proof.session.id) != Some(&proof.session)
+        {
+            return Err(error(
+                "The exact native history reader changed; its successor was preserved",
+            ));
+        }
+        state.inventory_generation += 1;
+        let retired = state.chats.remove(&proof.session.id);
+        if let Some(notifications) = &state.notifications {
+            notifications.retire(proof.session.id);
+        }
+        retired
+    };
+    // Store cleanup and final worker joining must never hold the host mutex.
+    drop(retired);
+    drop(reservation);
+    Ok(inspection)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1999,574 +2568,4 @@ exit 0
         assert!(settled.exited && settled.read_only_reason.is_some());
         assert!(reader.is_read_only_history() && !reader.owns_work());
     }
-}
-
-pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCapacity {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    status_from_state(&state)
-}
-
-pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
-    crate::terminal_ipc::ChatCapacity {
-        resident: state.chats.len() as u32,
-        spawning: pending(state) as u32,
-        limit: state.native_chat_capacity as u32,
-        used: usage(&state) as u32,
-        residents: state
-            .chats
-            .iter()
-            .take(4096)
-            .map(|(&id, record)| crate::terminal_ipc::ChatCapacityResident {
-                chat_id: id,
-                provider: record.session.launch.provider,
-                status: if state.chat_spawning.contains_key(&id) {
-                    "starting".into()
-                } else if record.handle.is_read_only_history() {
-                    "read-only history".into()
-                } else if record.handle.is_completed() {
-                    "closed".into()
-                } else {
-                    format!("{:?}", record.handle.activity())
-                },
-                release_blocked: if record.handle.owns_work() {
-                    Some("Actor owns live or unconfirmed provider work".into())
-                } else if !record.subscribers.is_empty() {
-                    Some("A client is attached".into())
-                } else if !record.handle.is_read_only_history() && !record.handle.is_completed() {
-                    Some("Writer teardown is unconfirmed".into())
-                } else if state.chat_spawning.contains_key(&id)
-                    || state.native_closing.contains_key(&id)
-                    || state.chat_handoffs.contains_key(&id)
-                    || record.returning_terminal
-                {
-                    Some("Ownership transition is pending".into())
-                } else if record.paired_terminal.is_some() || record.session.terminal.is_some() {
-                    Some("Paired terminal ownership remains".into())
-                } else {
-                    None
-                },
-            })
-            .collect(),
-        omitted_residents: state.chats.len().saturating_sub(4096) as u32,
-    }
-}
-
-fn inspected_record(
-    state: &HostState,
-    id: TerminalId,
-) -> Result<(crate::terminal_ipc::ChatReleaseInspection, Handle, Session), ProtocolError> {
-    let record = state
-        .chats
-        .get(&id)
-        .ok_or_else(|| unavailable("Native chat is no longer resident"))?;
-    // Retained actors are never eligible for resident eviction. Inspect only
-    // cached identity metadata while holding HostState, without a helper RPC.
-    if record.handle.actor_identity().is_some() {
-        let mut session = record.session.clone();
-        session.launch.session_id = record.handle.session_id();
-        session.native_continuity = record.handle.native_continuity();
-        return Ok((crate::terminal_ipc::ChatReleaseInspection {
-            proof: crate::terminal_ipc::ChatReleaseProof {
-                session,
-                generation: record.handle.resident_generation(),
-                execution_instance: record.execution_instance,
-            },
-            release_blocked: Some("The actor retains native provider ownership; use its authenticated close operation".into()),
-        }, record.handle.clone(), record.session.clone()));
-    }
-    let ServerResponse::ChatAttached { session, snapshot } =
-        session_snapshot(&record.session, &record.handle).map_err(unavailable)?
-    else {
-        unreachable!()
-    };
-    let blocked = if state.shutting_down {
-        Some("Daemon is shutting down")
-    } else if state.chat_spawning.contains_key(&id)
-        || state.native_closing.contains_key(&id)
-        || state.chat_handoffs.contains_key(&id)
-        || record.returning_terminal
-    {
-        Some("A native ownership transition is pending")
-    } else if record.handle.owns_work() {
-        Some(
-            "The actor is live or still owns unconfirmed backend work; idle does not authorize release",
-        )
-    } else if !record.subscribers.is_empty() {
-        Some("A client is attached; detach its view before releasing the resident actor")
-    } else if record.paired_terminal.is_some() || session.terminal.is_some() {
-        Some("The actor retains a paired terminal")
-    } else if !matches!(
-        session.native_continuity,
-        chat::NativeContinuity::ReconnectOnly
-    ) || session.owned_codex_listener.is_some()
-    {
-        Some("The actor retains native provider ownership; use its authenticated close operation")
-    } else if snapshot.busy
-        || snapshot.waiting
-        || !snapshot.requests.is_empty()
-        || !record.handle.background_subagents().is_empty()
-    {
-        Some("The actor still reports pending or delegated work")
-    } else if !snapshot.subagents.is_empty() {
-        Some("Child transcript preservation is not yet verified; its resident history is preserved")
-    } else if !record.handle.is_read_only_history() && !record.handle.is_completed() {
-        Some("The writer has not finished provider teardown")
-    } else if !snapshot.exited
-        || (record.handle.is_read_only_history() && snapshot.read_only_reason.is_none())
-    {
-        Some("The history reader or completed writer has not settled")
-    } else if session.launch.session_id.is_none() {
-        Some("The provider conversation identity is unconfirmed")
-    } else {
-        None
-    };
-    Ok((
-        crate::terminal_ipc::ChatReleaseInspection {
-            proof: crate::terminal_ipc::ChatReleaseProof {
-                session,
-                generation: snapshot.generation,
-                execution_instance: record.execution_instance,
-            },
-            release_blocked: blocked.map(str::to_owned),
-        },
-        record.handle.clone(),
-        record.session.clone(),
-    ))
-}
-
-fn release_kind(handle: &Handle) -> super::super::model::ResidentRelease {
-    if handle.is_read_only_history() {
-        super::super::model::ResidentRelease::ReadOnlyHistory
-    } else {
-        super::super::model::ResidentRelease::CompletedWriter
-    }
-}
-
-pub(in crate::host) fn inspect(
-    host: &SharedHost,
-    id: TerminalId,
-) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
-    let (mut inspection, handle, source) =
-        inspected_record(&host.lock().unwrap_or_else(|p| p.into_inner()), id)?;
-    if inspection.release_blocked.is_some() {
-        return Ok(inspection);
-    }
-    super::super::account_lifecycle::ensure_idle(host)?;
-    // A writer's own delegation capability is separate from managed work.
-    let ownership = super::super::agent_execution::registry(host).and_then(|registry| {
-        let result = registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .inspect_resident_release(
-                &crate::agent_execution::HostedSession::Chat(source),
-                release_kind(&handle),
-            );
-        result
-    });
-    if let Err(error) = ownership {
-        inspection.release_blocked = Some(format!("Cannot verify managed ownership: {error}"));
-        return Ok(inspection);
-    }
-    if inspection.release_blocked.is_none() {
-        let reload = reload_history(&inspection.proof.session)
-            .and_then(|reloaded| if handle.history_is_covered_by(&reloaded)? {
-                Ok(())
-            } else {
-                Err("The reloaded provider history does not cover all resident transcript data; older cached pages or changed history remain protected".into())
-            });
-        if let Err(error) = reload {
-            inspection.release_blocked =
-                Some(format!("Saved provider history is not verified: {error}"));
-        }
-    }
-    Ok(inspection)
-}
-
-fn reload_history(session: &Session) -> Result<chat::runtime::Store, String> {
-    let (spec, _, mut initial) = load_history(session)?;
-    chat::runtime::preflight(&spec, &mut initial)
-}
-
-type LoadedHistory = (
-    chat::protocol::ProcessSpec,
-    Box<dyn chat::protocol::Adapter>,
-    chat::protocol::Step,
-);
-
-fn load_history(session: &Session) -> Result<LoadedHistory, String> {
-    load_history_for_start(session).map_err(|error| error.to_string())
-}
-
-fn load_history_for_start(session: &Session) -> Result<LoadedHistory, chat::protocol::SetupError> {
-    if has_native_owner(session).map_err(|error| {
-        if error.retryable {
-            chat::protocol::SetupError::Unavailable(error.message)
-        } else {
-            chat::protocol::SetupError::Invalid(error.message)
-        }
-    })? {
-        return Err(chat::protocol::SetupError::Unavailable(
-            "An authenticated native provider owner remains".into(),
-        ));
-    }
-    let (spec, mut adapter) = chat::protocol::create_history_for_start(&session.launch)?;
-    if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        return Err(
-            "The saved conversation cannot currently be reopened as read-only history".into(),
-        );
-    }
-    let initial = adapter.initialize_for_start()?;
-    if !initial.writes.is_empty() {
-        return Err("History reload attempted a provider write".into());
-    }
-    if initial
-        .events
-        .iter()
-        .any(|event| matches!(event, chat::Event::HistoryError(_)))
-    {
-        return Err(chat::protocol::SetupError::Unavailable(
-            "Provider history could not be reloaded".into(),
-        ));
-    }
-    Ok((spec, adapter, initial))
-}
-
-fn require_unmanaged_for_start(
-    host: &SharedHost,
-    id: TerminalId,
-) -> Result<(), chat::protocol::SetupError> {
-    use chat::protocol::SetupError;
-    let registry =
-        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
-    // The legacy registry lookup exposes operational failures as strings.
-    // Preserve Retry until ownership can be read; an actual managed source is
-    // a distinct, permanent refusal of this read-only reattachment route.
-    let managed = !registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_sources(id)
-        .map_err(SetupError::Unavailable)?
-        .is_empty();
-    if managed {
-        return Err(
-            "The actor belongs to a managed agent; use its supported owned-agent close operation"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-/// A saved read-only descriptor can outlive its resident paging worker. This
-/// path never resumes a provider: the constructor must prove History transport
-/// again, even if the working directory changes while the request is admitted.
-pub(super) fn restore_saved_history(
-    host: &SharedHost,
-    client: ClientId,
-    session: Session,
-) -> Result<ServerResponse, ProtocolError> {
-    {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        validate_proof(session.proof.as_ref(), state.proof())?;
-    }
-    if session.terminal.is_some()
-        || session.owned_codex_listener.is_some()
-        || !matches!(
-            session.native_continuity,
-            chat::NativeContinuity::ReconnectOnly
-        )
-        || session.launch.provider != Provider::Claude
-    {
-        return Err(unavailable(
-            "Exact native chat not found; only saved read-only history can be reattached without a resident actor",
-        ));
-    }
-    let admission = Reservation::new_with_source(host, &session, None)?;
-    {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chats.contains_key(&session.id) {
-            return Err(retryable_unavailable(
-                "The saved history became resident; retry its normal attach",
-            ));
-        }
-    }
-    super::super::account_lifecycle::ensure_idle(host)?;
-    require_unmanaged_for_start(host, session.id).map_err(setup_error)?;
-    let (mut spec, adapter, mut initial) = load_history_for_start(&session).map_err(setup_error)?;
-    spec.messages = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .mailbox_seal
-        .as_ref()
-        .map(|seal| Arc::new(seal.recognizer()));
-    let store = chat::runtime::preflight_for_start(&spec, &mut initial).map_err(setup_error)?;
-    let environment = spec.environment.clone();
-    let weak = Arc::downgrade(host);
-    let id = session.id;
-    let handle = Handle::start_owned(
-        spec,
-        adapter,
-        initial,
-        store,
-        session.clone(),
-        environment,
-        move |update| changed(&weak, id, update),
-    )
-    .map_err(retryable_unavailable)?;
-    let result = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.shutting_down
-            || state.chats.contains_key(&id)
-            || state.chat_spawning.get(&id) != Some(&session)
-        {
-            Err(retryable_unavailable(
-                "Native history ownership changed before installation",
-            ))
-        } else {
-            let observation = Observation {
-                after_generation: handle.observe_next_update(),
-                ..Observation::default()
-            };
-            let record = Record {
-                execution_instance: uuid::Uuid::new_v4(),
-                console_recipe: None,
-                paired_terminal: None,
-                session,
-                handle: handle.clone(),
-                source_process: None,
-                subscribers: if client == 0 {
-                    BTreeMap::new()
-                } else {
-                    BTreeMap::from([(client, false)])
-                },
-                observations: if client == 0 {
-                    BTreeMap::new()
-                } else {
-                    BTreeMap::from([(client, observation)])
-                },
-                completion_observed: false,
-                returning_terminal: false,
-            };
-            let response =
-                session_snapshot(&record.session, &record.handle).map_err(retryable_unavailable)?;
-            record
-                .handle
-                .commit_native_installation()
-                .map_err(retryable_unavailable)?;
-            state.chats.insert(id, record);
-            state.inventory_generation += 1;
-            Ok(response)
-        }
-    };
-    if result.is_err() {
-        let _ = handle.close();
-    }
-    drop(admission);
-    result
-}
-
-/// Reopen saved data across daemon epochs, without upgrading it to execution
-/// ownership. The host issues the new proof only after the normal history
-/// constructor verifies the exact thread/account and fences native owners and
-/// managed agents. The old descriptor remains an exact Resolve alias.
-pub(super) fn recover_saved_history(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<(), ProtocolError> {
-    if !source.is_saved_claude_history() {
-        return Err(unavailable(
-            "This saved pane has no supported read-only history route",
-        ));
-    }
-    let mut session = source.clone();
-    session.proof = Some(
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .proof()
-            .clone(),
-    );
-    restore_saved_history(host, 0, session.clone())?;
-    register_saved_history_alias(host, source)
-}
-
-/// Classify an already authenticated paging reader for an explicit Retry.
-/// This returns its unchanged descriptor, never retirement or launch authority;
-/// normal Start repeats the execution/account/admission checks if requested.
-pub(super) fn prepare_saved_history(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<Option<Session>, ProtocolError> {
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(record) = state.chats.get(&source.id) else {
-        return Ok(None);
-    };
-    if !source.is_saved_claude_history() || !record.handle.is_read_only_history() {
-        return Ok(None);
-    }
-    validate_proof(source.proof.as_ref(), state.proof())?;
-    if record.session != *source
-        || record.handle.session_id() != source.launch.session_id
-        || record.handle.owns_work()
-    {
-        return Err(unavailable(
-            "The exact saved-history reader changed; no provider was started",
-        ));
-    }
-    if record.returning_terminal
-        || state.shutting_down
-        || state.chat_spawning.contains_key(&source.id)
-        || state.native_closing.contains_key(&source.id)
-        || state.native_actor_startups.contains_key(&source.id)
-    {
-        return Err(retryable_unavailable(
-            "The exact saved-history reader changed; no provider was started",
-        ));
-    }
-    Ok(Some(source.clone()))
-}
-
-/// An inactive window may retain a different former proof for this same
-/// paging allocation. Admit that alias independently against the complete
-/// current reader; an earlier alias cannot authenticate different content.
-pub(super) fn register_saved_history_alias(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<(), ProtocolError> {
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let record = state
-        .chats
-        .get(&source.id)
-        .ok_or_else(|| unavailable("Saved history changed during recovery"))?;
-    if !source.is_saved_claude_history()
-        || !record.handle.is_read_only_history()
-        || record.handle.owns_work()
-    {
-        return Ok(()); // native execution keeps its separate lineage contract
-    }
-    let mut expected = source.clone();
-    expected.proof = Some(state.proof().clone());
-    if record.session != expected {
-        return Err(unavailable(
-            "Saved history did not confirm a read-only attachment",
-        ));
-    }
-    let sources = state.upgrade_chats.entry(source.id).or_default();
-    if !sources.iter().any(|previous| previous.source == *source) {
-        if sources.len() >= crate::upgrade::handoff::MAX_CHATS {
-            return Err(unavailable(
-                "Saved history aliases exceed the bounded recovery limit",
-            ));
-        }
-        sources.push(crate::upgrade::handoff::ChatSource {
-            source: source.clone(),
-            launch: source.launch.clone(),
-        });
-    }
-    Ok(())
-}
-
-pub(in crate::host) fn release(
-    host: &SharedHost,
-    proof: &crate::terminal_ipc::ChatReleaseProof,
-    dry_run: bool,
-) -> Result<crate::terminal_ipc::ChatReleaseInspection, ProtocolError> {
-    let inspection = inspect(host, proof.session.id)?;
-    if inspection.proof != *proof {
-        return Err(error(
-            "The exact native actor or its generation changed; inspect it again",
-        ));
-    }
-    if let Some(reason) = &inspection.release_blocked {
-        return Err(unavailable(reason.clone()));
-    }
-    let mut reservation = None;
-    let (handle, source) = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        validate_proof(proof.session.proof.as_ref(), state.proof())?;
-        let (current, handle, source) = inspected_record(&state, proof.session.id)?;
-        if current.proof != *proof || current.release_blocked.is_some() {
-            return Err(error(
-                "The exact native actor or its release eligibility changed; inspect it again",
-            ));
-        }
-        if dry_run {
-            return Ok(inspection);
-        }
-        Reservation::install(&mut reservation, host, &mut state, &proof.session)?;
-        (handle, source)
-    };
-    // Repeat complete coverage with the ownership reservation held. Paging
-    // admitted before the last detach may still have settled since inspection.
-    super::super::account_lifecycle::ensure_idle(host)?;
-    let reloaded = reload_history(&proof.session).map_err(unavailable)?;
-    if !handle
-        .history_is_covered_by(&reloaded)
-        .map_err(unavailable)?
-    {
-        return Err(unavailable(
-            "Reloaded provider history does not cover all resident data",
-        ));
-    }
-    if handle
-        .snapshot(None)
-        .expect("unconditional history snapshot")
-        .generation
-        != proof.generation
-    {
-        return Err(error(
-            "The native history generation changed; inspect it again",
-        ));
-    }
-    // A history reader only stops paging. A completed writer has already
-    // confirmed teardown and owns no provider work; close joins its worker.
-    // Neither path may stop a running provider to make it eligible.
-    handle.close().map_err(unavailable)?;
-    // The worker is now immutable. A previously queued page must also be
-    // recoverable before its cache can be dropped.
-    if !handle
-        .history_is_covered_by(&reloaded)
-        .map_err(unavailable)?
-    {
-        return Err(unavailable(
-            "History changed while its reader closed; resident data was preserved",
-        ));
-    }
-    // The exclusive request gate remains held through exact capability
-    // retirement and resident removal. No cached-origin submission may cross
-    // this boundary; the reservation also fences actor recovery and attach.
-    super::super::agent_execution::registry(host)
-        .map_err(unavailable)?
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retire_resident_release(
-            &crate::agent_execution::HostedSession::Chat(source),
-            release_kind(&handle),
-        )
-        .map_err(unavailable)?;
-    let retired = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state
-            .chats
-            .get(&proof.session.id)
-            .ok_or_else(|| error("Native history reader changed while closing"))?;
-        if !record.handle.same_actor(&handle)
-            || record.execution_instance != proof.execution_instance
-            || !record.subscribers.is_empty()
-            || record.handle.owns_work()
-            || state.chat_spawning.get(&proof.session.id) != Some(&proof.session)
-        {
-            return Err(error(
-                "The exact native history reader changed; its successor was preserved",
-            ));
-        }
-        state.inventory_generation += 1;
-        let retired = state.chats.remove(&proof.session.id);
-        if let Some(notifications) = &state.notifications {
-            notifications.retire(proof.session.id);
-        }
-        retired
-    };
-    // Store cleanup and final worker joining must never hold the host mutex.
-    drop(retired);
-    drop(reservation);
-    Ok(inspection)
 }

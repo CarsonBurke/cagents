@@ -3,6 +3,7 @@ use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub mod acp;
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
@@ -402,6 +403,21 @@ pub struct ServerIdentity {
     pub canonical_home: PathBuf,
     pub reported_home: String,
 }
+/// What became of a stop an adapter held, unsent, until the provider named
+/// the turn it was for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeldStop {
+    /// No stop is held: none was asked for, or it went out at once.
+    #[default]
+    None,
+    /// Held until the provider names the turn.
+    Waiting,
+    /// Sent once the provider named the turn.
+    Sent,
+    /// Never sent: the provider refused the turn or had already finished it.
+    Dropped,
+}
+
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
@@ -420,6 +436,11 @@ pub trait Adapter: Send {
     /// Advisory frames do not complete it; later readiness changes are separate.
     fn initialization_pending(&self) -> bool {
         false
+    }
+    /// What became of a stop this adapter held until the provider named
+    /// the turn it is for.
+    fn held_stop(&self) -> HeldStop {
+        HeldStop::None
     }
     /// Whether a settled turn's outcome still waits on a provider reply, such
     /// as the acknowledgement of an interrupt sent before its result arrived.
@@ -492,6 +513,8 @@ pub(crate) fn create_history_for_start(
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
         crate::agent::Provider::Claude => claude::create_history_for_start(launch),
+        // An ACP agent replays a conversation only to the process serving it,
+        // and keeps no history cagents could read without starting one.
         _ => {
             Err("This provider does not support restoring a local read-only history reader".into())
         }
@@ -520,6 +543,10 @@ pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
             codex::align_resume_identity(&mut launch.recipe.arguments, &id)
         }
         crate::agent::Provider::Omp => Ok(()),
+        provider @ (crate::agent::Provider::Antigravity | crate::agent::Provider::Muse) => {
+            acp::align_resume_identity(provider, &mut launch.recipe.arguments, id);
+            Ok(())
+        }
     }
 }
 

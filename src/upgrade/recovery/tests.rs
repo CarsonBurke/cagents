@@ -151,7 +151,7 @@ fn handoff(root: &Path) -> LeaseHandoff {
 
 #[test]
 fn empty_or_partial_recovery_claim_is_present_without_authorizing_a_retry() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let bytes = checkpoint(&preparation, "Prepared");
     save(&preparation.authority.checkpoint_path, &bytes);
@@ -177,7 +177,7 @@ fn empty_or_partial_recovery_claim_is_present_without_authorizing_a_retry() {
 
 #[test]
 fn a_prepared_checkpoint_of_more_than_128_chats_stays_inspectable() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let path = &preparation.authority.checkpoint_path;
     let mut index: serde_json::Value =
@@ -195,7 +195,7 @@ fn a_prepared_checkpoint_of_more_than_128_chats_stays_inspectable() {
 
 #[test]
 fn pending_recovery_rejects_reduced_index_with_missing_host_options_without_mutation() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let path = &preparation.authority.checkpoint_path;
     let mut reduced: serde_json::Value =
@@ -221,7 +221,7 @@ fn pending_recovery_rejects_reduced_index_with_missing_host_options_without_muta
 
 #[test]
 fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut authority = preparation(root.path()).authority;
     authority.origin = Origin::ExplicitRecovery {
         checkpoint: "a".repeat(64),
@@ -262,7 +262,7 @@ fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
 
 #[test]
 fn pending_prepared_keeps_original_census_and_exact_window_slots_for_retry() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     let path = &preparation.authority.checkpoint_path;
     let bytes = checkpoint(&preparation, "Prepared");
@@ -327,7 +327,7 @@ fn pending_prepared_keeps_original_census_and_exact_window_slots_for_retry() {
 
 #[test]
 fn pending_original_census_rejects_foreign_source_and_preserves_prepared_bytes() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let path = &preparation.authority.checkpoint_path;
     let bytes = checkpoint(&preparation, "Prepared");
@@ -357,7 +357,7 @@ fn pending_original_census_rejects_foreign_source_and_preserves_prepared_bytes()
 
 #[test]
 fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let source = preparation.authority.source;
     let mut issued = crate::terminal_ipc::TerminalDescriptor::relaunchable(
@@ -384,7 +384,7 @@ fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
 
 #[test]
 fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let bytes = checkpoint(&preparation, "Prepared");
     assert_eq!(
@@ -423,7 +423,7 @@ fn acknowledged_prepare_binds_source_and_every_reviewed_owner() {
 #[test]
 fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
     use crate::update::in_flight::InFlight;
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let proof = &preparation.authority.source;
     let mut census = preparation.authority.census.clone();
@@ -480,7 +480,7 @@ fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
 
 #[test]
 fn paired_census_accepts_only_same_live_owner_attachment_and_hint_projections() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let proof = &preparation.authority.source;
     let mut census = preparation.authority.census.clone();
@@ -608,7 +608,7 @@ fn paired_census_accepts_only_same_live_owner_attachment_and_hint_projections() 
 
 #[test]
 fn snapshot_capture_rejects_known_identity_change_without_mutating_prior_scope() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let source = Session {
         id: preparation.authority.census.terminals[0].id,
@@ -681,7 +681,7 @@ fn snapshot_capture_rejects_known_identity_change_without_mutating_prior_scope()
 
 #[test]
 fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let known = Session {
         id: TerminalId::new(),
@@ -752,7 +752,7 @@ fn captured_pane_aliases_and_presentations_bind_the_exact_confirmed_allocation()
 #[test]
 fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issued_alias() {
     for original_id in [None, Some(uuid::Uuid::new_v4().to_string())] {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let mut preparation = preparation(root.path());
         let confirmed = uuid::Uuid::new_v4().to_string();
         // Frozen 991daa43e ChatList overlays the handle's confirmed ID,
@@ -836,7 +836,7 @@ fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issue
 
 #[test]
 fn preexisting_prepared_or_unknown_evidence_is_preserved_before_any_prepare() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let path = &preparation.authority.checkpoint_path;
     require_absent_checkpoint(path).unwrap();
@@ -867,13 +867,13 @@ fn scale_chat(
     super::super::floor::Presentation,
 ) {
     let terminal = &preparation.authority.census.terminals[0];
-    let provider = if index % 3 == 0 {
+    let provider = if index.is_multiple_of(3) {
         crate::agent::Provider::Codex
     } else {
         crate::agent::Provider::Claude
     };
     let mut recipe = terminal.launch.clone();
-    recipe.program = format!("/home/person/.local/bin/{}", provider.executable()).into();
+    recipe.program = format!("/home/person/.local/bin/{}", provider.executable());
     // Eight arguments each provider accepts on an exact resume.
     recipe.arguments = match provider {
         crate::agent::Provider::Codex => [
@@ -1014,7 +1014,7 @@ fn scale_census(
 /// Long chats hold 400 entries of 1.5 KiB (600 KiB of transcript each);
 /// every tenth chat is short and must keep its whole page.
 fn long_or_short(index: usize) -> (usize, usize) {
-    if index % 10 == 0 {
+    if index.is_multiple_of(10) {
         (6, 200)
     } else {
         (400, 1536)
@@ -1026,7 +1026,7 @@ fn long_or_short(index: usize) -> (usize, usize) {
 /// contiguous entries, and long pages to share the room evenly. Returns
 /// the fewest entries a long page kept.
 fn fit_long_transcripts(chats: usize, page: fn(usize) -> (usize, usize)) -> usize {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     let mut census = scale_census(&mut preparation, chats, page);
     let source = preparation.authority.source.clone();
@@ -1130,7 +1130,7 @@ fn rerun_with_private_data() -> bool {
     if std::env::var_os(ROOT).is_some() {
         return false;
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     for directory in ["home", "run", "data", "config", "cache"] {
         fs::create_dir_all(root.path().join(directory)).unwrap();
     }
@@ -1162,7 +1162,7 @@ fn pages_retained_by_ending_chats_leave_the_census_fit() {
     if rerun_with_private_data() {
         return;
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     let mut census = scale_census(&mut preparation, 81, long_or_short);
     let source = preparation.authority.source.clone();
@@ -1211,7 +1211,7 @@ fn pages_retained_by_ending_chats_leave_the_census_fit() {
 
 #[test]
 fn capture_shortens_pages_while_it_runs_without_losing_their_fair_share() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     // 60 chats of 600 KiB: 35 MiB unless capture compacts as it goes.
     let mut census = scale_census(&mut preparation, 60, |_| (400, 1536));
@@ -1236,7 +1236,7 @@ fn capture_shortens_pages_while_it_runs_without_losing_their_fair_share() {
 
 #[test]
 fn one_huge_entry_does_not_starve_other_pages() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     let mut census = scale_census(&mut preparation, 40, |index| {
         if index == 0 {
@@ -1263,7 +1263,7 @@ fn identity_evidence_that_cannot_fit_says_how_many_chats_to_close() {
     // At 16 KiB only the receipt overflows; at 48 KiB the census and the
     // floor records do too, each with a different share per chat.
     for (environment, failing) in [(16 * 1024, 1), (48 * 1024, 4)] {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let mut preparation = preparation(root.path());
         let mut census = scale_census(&mut preparation, 120, |_| (2, 64));
         for chat in &mut census.chats {
@@ -1332,7 +1332,7 @@ fn identity_evidence_that_cannot_fit_says_how_many_chats_to_close() {
 
 #[test]
 fn losing_the_continuous_worker_lease_prevents_receipt_even_with_matching_bytes() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let bytes = checkpoint(&preparation, "Prepared");
     save(&preparation.authority.checkpoint_path, &bytes);
@@ -1349,7 +1349,7 @@ fn losing_the_continuous_worker_lease_prevents_receipt_even_with_matching_bytes(
 
 #[test]
 fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let original = checkpoint(&preparation, "Prepared");
     save(&preparation.authority.checkpoint_path, &original);
@@ -1370,7 +1370,7 @@ fn a_changed_prepared_checkpoint_is_neither_reinterpreted_nor_modified() {
 
 #[test]
 fn source_finishing_ready_keeps_normal_restore_and_preserves_checkpoint_bytes() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     save(
         &preparation.authority.checkpoint_path,
@@ -1413,7 +1413,7 @@ fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
         return;
     }
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     save(
         &preparation.authority.checkpoint_path,
@@ -1448,7 +1448,7 @@ fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
 
 #[test]
 fn recovery_receipt_is_immutable_after_its_causal_identity_is_sealed() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let mut receipt = sealed_receipt(&preparation.authority).unwrap();
     assert_eq!(
@@ -1473,7 +1473,7 @@ fn mutable_files_and_invalid_descriptors_cannot_pass_the_receipt_seal_check() {
 
 #[test]
 fn recovered_owner_verification_rejects_same_id_with_a_different_recipe_or_conversation() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let known = preparation.authority.census.terminals[0].clone();
     let mut serving = preparation.authority.source.clone();
@@ -1526,7 +1526,7 @@ fn recovered_owner_verification_rejects_same_id_with_a_different_recipe_or_conve
 
 #[test]
 fn prepared_recovery_verifies_the_exact_retained_console_replacement_lineage() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let mut known = preparation.authority.census.terminals[0].clone();
     let agent = crate::model::AgentId::new();
@@ -1801,7 +1801,7 @@ fn prepared_recovery_verifies_the_exact_retained_console_replacement_lineage() {
 
 #[test]
 fn recovery_outcome_requires_disjoint_complete_inventory_including_paired_terminals() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let terminal = preparation.authority.census.terminals[0].clone();
     let mut record = RecoveryRecord {
@@ -1869,7 +1869,7 @@ fn recovery_outcome_requires_disjoint_complete_inventory_including_paired_termin
 }
 #[test]
 fn issued_chat_aliases_bind_the_original_allocation_and_each_serving_proof() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let terminal = &preparation.authority.census.terminals[0];
     let known = Session {
@@ -2132,7 +2132,7 @@ fn issued_chat_aliases_bind_the_original_allocation_and_each_serving_proof() {
 
 #[test]
 fn reviewed_payload_budget_is_rejected_before_source_preparation() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     preflight_preparation_size(&preparation.authority).unwrap();
     preparation.authority.reviewed.as_mut().unwrap().sessions[0].reason =
@@ -2145,7 +2145,7 @@ fn reviewed_payload_budget_is_rejected_before_source_preparation() {
 
 #[test]
 fn preparation_budget_includes_future_adopted_descriptor_copies_and_checkpoint_lineage() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let mut preparation = preparation(root.path());
     preparation.authority.census.terminals[0]
         .launch
@@ -2164,10 +2164,7 @@ fn preparation_budget_includes_future_adopted_descriptor_copies_and_checkpoint_l
 
 #[test]
 fn settled_prepared_is_read_only_history_without_active_update_authority() {
-    let root = tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir_in("/var/tmp")
-        .unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let checkpoint_bytes = checkpoint(&preparation, "Prepared");
     let authority = preparation.authority.clone();
@@ -2579,7 +2576,7 @@ struct SettledFiles {
 }
 
 fn settled_files() -> SettledFiles {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let preparation = preparation(root.path());
     let checkpoint_bytes = checkpoint(&preparation, "Prepared");
@@ -3194,7 +3191,7 @@ fn retirement_sweeps_only_closed_private_metadata_temporaries() {
 
 #[test]
 fn archived_discovery_ignores_a_fresh_install_without_recovery_storage() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     assert!(
         archived_discovery(
             &root.path().join("not-created/daemon-upgrade.json"),
@@ -3207,7 +3204,7 @@ fn archived_discovery_ignores_a_fresh_install_without_recovery_storage() {
 
 #[test]
 fn retained_checkpoint_without_prepared_phase_has_no_settled_classification() {
-    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let path = &preparation.authority.checkpoint_path;
     assert!(
@@ -3342,7 +3339,7 @@ mod forwarding_tests {
             return;
         }
 
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         for mode in ["valid", "bad-hash"] {
             let case = root.path().join(mode);
             fs::create_dir(&case).unwrap();

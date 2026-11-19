@@ -36,7 +36,7 @@ impl Runtime {
     }
     fn recovery_available(&self) -> bool {
         self.auth_error().is_some()
-            && self.pending.is_none()
+            && self.commands.is_idle()
             && self.queued.is_none()
             && !self.snapshot.busy
             && self.attachment_chooser_pending.is_none()

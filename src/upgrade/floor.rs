@@ -201,15 +201,15 @@ impl Record {
         let bytes = self.clone().encode_capture()?;
         let name = self.file_name()?;
         let (mut file, temporary) =
-            crate::fs_safety::create_temporary_in(&root, 0o600).map_err(|e| e.to_string())?;
+            crate::fs_safety::create_temporary_in(root, 0o600).map_err(|e| e.to_string())?;
         let result = (|| {
             file.write_all(&bytes).map_err(|e| e.to_string())?;
             file.sync_all().map_err(|e| e.to_string())?;
-            crate::fs_safety::rename_within(&root, &temporary, OsStr::new(&name))
+            crate::fs_safety::rename_within(root, &temporary, OsStr::new(&name))
                 .map_err(|e| e.to_string())?;
-            crate::fs_safety::sync_directory(&root).map_err(|e| e.to_string())
+            crate::fs_safety::sync_directory(root).map_err(|e| e.to_string())
         })();
-        let _ = crate::fs_safety::unlink_within(&root, &temporary);
+        let _ = crate::fs_safety::unlink_within(root, &temporary);
         result
     }
 }

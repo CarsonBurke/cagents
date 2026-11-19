@@ -3,42 +3,43 @@ use super::*;
 use std::{sync::Arc, time::Instant};
 
 fn workspace(count: usize) -> WorkspaceState {
-    let mut workspace = WorkspaceState::default();
-    workspace.cards = (0..count)
-        .map(|index| CardState {
-            id: CardId::new(),
-            generation: 0,
-            title: format!("Investigate retained conversation {index}"),
-            width_fraction: 0.5,
-            existence: Existence::Open,
-            kind: CardKind::Chat(crate::chat::Session {
-                id: TerminalId::new(),
-                launch: crate::chat::Launch {
-                    provider: crate::agent::Provider::Claude,
-                    recipe: LaunchRecipe {
-                        program: "claude".into(),
-                        arguments: vec!["--model".into(), "haiku".into()],
-                        working_directory: format!("/work/project/worktree-{index}").into(),
-                        environment: (0..16)
-                            .map(|key| {
-                                (
-                                    format!("RUNTIME_{key}"),
-                                    format!("/home/user/.local/runtime/{index}/{key}"),
-                                )
-                            })
-                            .collect(),
-                        unset_environment: Default::default(),
+    WorkspaceState {
+        cards: (0..count)
+            .map(|index| CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: format!("Investigate retained conversation {index}"),
+                width_fraction: 0.5,
+                existence: Existence::Open,
+                kind: CardKind::Chat(crate::chat::Session {
+                    id: TerminalId::new(),
+                    launch: crate::chat::Launch {
+                        provider: crate::agent::Provider::Claude,
+                        recipe: LaunchRecipe {
+                            program: "claude".into(),
+                            arguments: vec!["--model".into(), "haiku".into()],
+                            working_directory: format!("/work/project/worktree-{index}").into(),
+                            environment: (0..16)
+                                .map(|key| {
+                                    (
+                                        format!("RUNTIME_{key}"),
+                                        format!("/home/user/.local/runtime/{index}/{key}"),
+                                    )
+                                })
+                                .collect(),
+                            unset_environment: Default::default(),
+                        },
+                        session_id: Some(uuid::Uuid::new_v4().to_string()),
                     },
-                    session_id: Some(uuid::Uuid::new_v4().to_string()),
-                },
-                native_continuity: Default::default(),
-                owned_codex_listener: None,
-                proof: None,
-                terminal: None,
-            }),
-        })
-        .collect();
-    workspace
+                    native_continuity: Default::default(),
+                    owned_codex_listener: None,
+                    proof: None,
+                    terminal: None,
+                }),
+            })
+            .collect(),
+        ..WorkspaceState::default()
+    }
 }
 
 #[test]

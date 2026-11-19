@@ -255,6 +255,34 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
         }
 }
 
+/// A Close that could not take effect, said once the pane is shown again.
+pub(in crate::app) const PANE_KEPT: &str =
+    "This pane couldn't be removed right now, so it was kept. Close it again.";
+
+/// [`PANE_KEPT`] for a terminal whose shell the refused Close already ended.
+/// Closing that pane again doesn't work yet (#3266), so it isn't suggested.
+pub(in crate::app) const ENDED_TERMINAL_KEPT: &str =
+    "This pane couldn't be removed right now, so it was kept.";
+
+/// A Close the registry kept the pane through, where this window has nothing
+/// to show it in now, such as a worktree with no other open pane.
+pub(super) const PANE_KEPT_ELSEWHERE: &str =
+    "This pane couldn't be removed everywhere, so it may come back. Close it again if it does.";
+
+/// Any other pane edit the registry would not save: a rename, a resize, a
+/// move or an added pane. This window then shows the panes as saved.
+pub(super) const PANE_CHANGE_NOT_SAVED: &str = "A pane change couldn't be saved. Try it again.";
+
+/// A pane's conversation or terminal changed elsewhere, as when another
+/// window or its agent updated it, while this window was saving its own
+/// change to it. The pane now shows that version.
+pub(super) const PANE_CHANGED_ELSEWHERE: &str =
+    "This pane changed elsewhere at the same time, so it now shows that version.";
+
+/// [`PANE_CHANGED_ELSEWHERE`] once this window's rename or resize of the
+/// pane has been saved again on top of that version.
+pub(super) const PANE_CHANGED_ELSEWHERE_KEPT_LAYOUT: &str = "This pane changed elsewhere at the same time, so it now shows that version, with this window's name and width.";
+
 /// What a fenced pane tells its reader, whatever its kind.
 pub(super) const FENCED_PANE_EXPLANATION: &str = "cagents can't confirm that this pane's saved session is the one its agent is running now, so the pane stays as saved and won't reconnect. Other panes here work normally. Closing the pane doesn't stop its agent.";
 
@@ -380,6 +408,10 @@ pub(super) struct State {
     observed_chats: HashMap<CardId, crate::chat::Session>,
     observed_terminals: HashMap<CardId, TerminalSession>,
     applying: bool,
+    /// Panes `detach_shared_pane` detached that are still in the strip. The
+    /// active strip's projection takes them out in its one edit, and
+    /// `finish_shared_viewport_projection` takes out any left.
+    strip_detached: HashSet<CardId>,
     pub creating_default: bool,
     /// An automatic empty pane waiting for this scope's shared panes, bound
     /// to the scope and directory that asked so navigating elsewhere cannot
@@ -482,10 +514,10 @@ impl State {
             .cards
             .iter()
             .filter_map(|card| {
-                if card.existence.is_open() {
-                    if let CardKind::Terminal(session) = &card.kind {
-                        return Some((card.id, session.id));
-                    }
+                if card.existence.is_open()
+                    && let CardKind::Terminal(session) = &card.kind
+                {
+                    return Some((card.id, session.id));
                 }
                 None
             })
@@ -539,6 +571,7 @@ impl State {
             observed_chats,
             observed_terminals,
             applying,
+            strip_detached,
             creating_default,
             deferred_default,
             defaults,
@@ -577,6 +610,7 @@ impl State {
             observed_chats: observed_chats.clone(),
             observed_terminals: observed_terminals.clone(),
             applying: *applying,
+            strip_detached: strip_detached.clone(),
             creating_default: *creating_default,
             deferred_default: deferred_default.clone(),
             defaults: defaults.clone(),
@@ -593,26 +627,27 @@ impl State {
     }
 
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
-        let mut state = Self::default();
-        state.retained = workspace.local_only_cards.clone();
-        state.attached = workspace
-            .channels
-            .iter()
-            .filter(|scope| scope.shared)
-            .flat_map(|scope| scope.cards.iter().copied())
-            .chain(
-                workspace
-                    .cards
-                    .iter()
-                    .filter(|card| {
-                        workspace.workspace_model_identity.is_some()
-                            && card.existence.is_open()
-                            && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
-                    })
-                    .map(|card| card.id),
-            )
-            .collect();
-        state
+        Self {
+            retained: workspace.local_only_cards.clone(),
+            attached: workspace
+                .channels
+                .iter()
+                .filter(|scope| scope.shared)
+                .flat_map(|scope| scope.cards.iter().copied())
+                .chain(
+                    workspace
+                        .cards
+                        .iter()
+                        .filter(|card| {
+                            workspace.workspace_model_identity.is_some()
+                                && card.existence.is_open()
+                                && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                        })
+                        .map(|card| card.id),
+                )
+                .collect(),
+            ..Self::default()
+        }
     }
 }
 
@@ -690,6 +725,15 @@ impl Cagents {
             // An old-scope receipt cannot retire an already retargeted retry.
             return self.reconcile_workspace_model();
         };
+        if let Change::RemoveSource { before, .. } = &change {
+            self.shared_views.pending.remove(index);
+            self.shared_views.source_bases.remove(&operation);
+            let card = before.id;
+            let kept = self.pane_kept_notice(card);
+            let projected = self.reconcile_workspace_model();
+            self.report_refused_close(&scope, operation, card, &error, kept);
+            return projected;
+        }
         // Another window can publish the same session update first, as when two
         // windows attached to one conversation both learn its provider session.
         // Only a session update qualifies: a refused name or width edit can be lost.
@@ -792,6 +836,7 @@ impl Cagents {
         } else {
             tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
         }
+        let retried_layout = retry.is_some();
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -810,12 +855,68 @@ impl Cagents {
                 change,
             });
         }
-        if !already_applied {
-            self.notices.record(TransientNotice::warning(
-                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-            ));
+        // A pane this window has closed, or is closing, shows nothing more,
+        // so the version the registry kept is nothing to tell anyone about.
+        let shown = matches!(&change, Change::Update { pane, .. } | Change::UpdateTerminalSource { pane, .. }
+            if self.card_state(pane.id).is_some_and(|card| card.existence.is_open())
+                && self
+                    .workspace
+                    .pending_close()
+                    .is_none_or(|close| close.unmounting != pane.id));
+        if !already_applied && shown {
+            self.notices
+                .record(TransientNotice::warning(if retried_layout {
+                    PANE_CHANGED_ELSEWHERE_KEPT_LAYOUT
+                } else {
+                    PANE_CHANGED_ELSEWHERE
+                }));
         }
         self.reconcile_workspace_model()
+    }
+
+    /// Settle what the person is told about a Close the registry refused,
+    /// once this window has projected what the registry holds. A pane the
+    /// registry still holds is kept, and said to be. A pane it no longer
+    /// holds is closed, as the person asked: its agent or another window may
+    /// have closed it first, or its project or channel may be gone.
+    ///
+    /// `kept_notice` is [`Self::pane_kept_notice`] as it stood before the refusal
+    /// was settled, which can end the close that decides it.
+    pub(super) fn report_refused_close(
+        &mut self,
+        scope: &Scope,
+        operation: uuid::Uuid,
+        card: CardId,
+        error: &str,
+        kept_notice: &'static str,
+    ) {
+        let kept = self
+            .workspace_model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == card));
+        if kept {
+            tracing::warn!(?scope, %operation, %error, %card, "the registry refused a close and kept its pane");
+            let shown = self.workspace.order().any(|id| id == card);
+            self.notices.record(TransientNotice::warning(if shown {
+                kept_notice
+            } else {
+                PANE_KEPT_ELSEWHERE
+            }));
+        } else {
+            tracing::debug!(?scope, %operation, %error, %card, "a refused close's pane is already gone");
+        }
+    }
+
+    /// What the person is told when `card` is kept after they closed it. A
+    /// terminal whose shell this close has already ended can't be closed
+    /// again yet (#3266), so its notice doesn't ask them to.
+    pub(in crate::app) fn pane_kept_notice(&self, card: CardId) -> &'static str {
+        if self.closed_terminal_cards.contains(&card) {
+            ENDED_TERMINAL_KEPT
+        } else {
+            PANE_KEPT
+        }
     }
 
     /// Refusing publication does not retire an already accepted conversation.
@@ -2288,7 +2389,7 @@ impl Cagents {
         // scope. Such a scope is published from its panes as any other.
         if !settled.is_empty() {
             let mut moving = HashSet::new();
-            let desired = panes.iter().map(|(scope, panes)| (scope, panes)).chain(
+            let desired = panes.iter().chain(
                 settled
                     .iter()
                     .map(|scope| (scope, &self.shared_views.baseline[scope])),
@@ -2631,23 +2732,23 @@ impl Cagents {
                 .filter(|id| self.shared_views.defaults.contains_key(id))
                 .collect::<Vec<_>>();
             for id in defaults {
-                if self.shared_views.default_requests.insert(id) {
-                    if let Some(mut pane) = self.card_state(id).and_then(|card| {
+                if self.shared_views.default_requests.insert(id)
+                    && let Some(mut pane) = self.card_state(id).and_then(|card| {
                         Pane::from_card(card, self.durable.card_scopes.get(&id).cloned())
-                    }) {
-                        let operation = uuid::Uuid::new_v4();
-                        pane.pending_terminal_start = true;
-                        let change = Change::InsertIfEmpty { pane };
-                        self.shared_views
-                            .pending
-                            .push((operation, scope.clone(), change.clone()));
-                        self.publish_model_edit(ModelEdit::ChangeView {
-                            scope: scope.clone(),
-                            expected_revision: revision,
-                            operation,
-                            change,
-                        });
-                    }
+                    })
+                {
+                    let operation = uuid::Uuid::new_v4();
+                    pane.pending_terminal_start = true;
+                    let change = Change::InsertIfEmpty { pane };
+                    self.shared_views
+                        .pending
+                        .push((operation, scope.clone(), change.clone()));
+                    self.publish_model_edit(ModelEdit::ChangeView {
+                        scope: scope.clone(),
+                        expected_revision: revision,
+                        operation,
+                        change,
+                    });
                 }
             }
         }
@@ -3337,9 +3438,15 @@ impl Cagents {
                     .push(change.clone());
             }
         }
+        // Each pending edit is overlaid exactly once. One that no longer fits
+        // the observed view, such as a Close of a pane its agent has already
+        // retired, is left out: the registry answers every pending edit, and
+        // that answer is what the person is told about if anything was lost.
         for view in &mut views {
             for change in pending_by_scope.get(&view.scope).into_iter().flatten() {
-                let _ = view.apply(change);
+                if let Err(error) = view.apply(change) {
+                    tracing::debug!(scope = ?view.scope, %error, "a pending pane edit no longer fits the observed view");
+                }
             }
         }
         // A scoped read or a deferred receipt may prove a close beyond the
@@ -3402,7 +3509,7 @@ impl Cagents {
         }
         phase.mark("selected_prepare");
         let mut projected_scopes = Vec::new();
-        for mut view in views {
+        for view in views {
             if selected.is_some_and(|selected| !selected.contains(&view.scope)) {
                 continue;
             }
@@ -3414,11 +3521,6 @@ impl Cagents {
                 || self.shared_views.seed_failures.contains_key(&view.scope)
             {
                 continue;
-            }
-            for change in pending_by_scope.get(&view.scope).into_iter().flatten() {
-                if let Err(error) = view.apply(change) {
-                    self.status = Some(TransientNotice::error(error));
-                }
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
@@ -3506,6 +3608,9 @@ impl Cagents {
             root_paths.iter().map(PathBuf::as_path),
         ));
         self.prepare_shared_aliases_in(views, owned, None, &topology);
+        // Outside a reconciliation, no projection follows to take the
+        // detached aliases out of the strip.
+        self.remove_detached_from_strip();
     }
 
     fn prepare_shared_aliases_in(
@@ -3854,15 +3959,13 @@ impl Cagents {
                     repository.project = project;
                 }
             }
-            if let CardKind::Browser(browser) = &mut projected.kind {
-                if let Some(CardKind::Browser(local)) =
+            if let CardKind::Browser(browser) = &mut projected.kind
+                && let Some(CardKind::Browser(local)) =
                     self.card_state(projected.id).map(|card| &card.kind)
-                {
-                    if local.current_url == browser.current_url {
-                        browser.scroll_x = local.scroll_x;
-                        browser.scroll_y = local.scroll_y;
-                    }
-                }
+                && local.current_url == browser.current_url
+            {
+                browser.scroll_x = local.scroll_x;
+                browser.scroll_y = local.scroll_y;
             }
             let pane = &projected;
             let accepted_default = self
@@ -3877,11 +3980,11 @@ impl Cagents {
                     && Arc::make_mut(&mut self.durable)
                         .pending_terminal_creations
                         .remove(&pane.id);
-                if automatic.is_some() || explicit {
-                    if let CardKind::Terminal(session) = &pane.kind {
-                        self.shared_views.attached.insert(pane.id);
-                        tasks.push(self.start_terminal(pane.id, session.clone(), true, false));
-                    }
+                if (automatic.is_some() || explicit)
+                    && let CardKind::Terminal(session) = &pane.kind
+                {
+                    self.shared_views.attached.insert(pane.id);
+                    tasks.push(self.start_terminal(pane.id, session.clone(), true, false));
                 }
             }
             // A terminal this window restored as its own saved terminal can be
@@ -4201,7 +4304,12 @@ impl Cagents {
         }
         self.normalize_projected_card_order(&visible);
         if active {
-            self.project_shared_strip(&strip, &visible);
+            // The strip's one edit also takes out every pane detached so far.
+            let detached = std::mem::take(&mut self.shared_views.strip_detached);
+            self.project_shared_strip(&strip, &visible, &detached);
+            if !detached.is_empty() {
+                self.settle_focus();
+            }
         }
         if !self.shared_views.applying {
             self.persist();
@@ -4402,6 +4510,8 @@ impl Cagents {
     }
 
     /// Passive removal detaches surfaces; it never calls a host close request.
+    /// The pane leaves the strip later, in one edit with everything else the
+    /// projection changes there: see `SharedViews::strip_detached`.
     fn detach_shared_pane(&mut self, id: CardId) {
         self.shared_views.defaults.remove(&id);
         Arc::make_mut(&mut self.durable)
@@ -4410,27 +4520,31 @@ impl Cagents {
         self.shared_views.default_requests.remove(&id);
         self.shared_chat_detach(id);
         self.retire_lsp_card(id);
-        if let Some(runtime) = self.cards.remove(&id) {
-            #[cfg(feature = "integrated-browser")]
-            if let CardRuntime::Browser(browser) = runtime {
-                self.begin_browser_teardown(browser.handle);
-            }
-            #[cfg(not(feature = "integrated-browser"))]
-            drop(runtime);
+        #[cfg(feature = "integrated-browser")]
+        if let Some(CardRuntime::Browser(browser)) = self.cards.remove(&id) {
+            self.begin_browser_teardown(browser.handle);
         }
+        #[cfg(not(feature = "integrated-browser"))]
+        self.cards.remove(&id);
         self.lifecycle.remove(id);
-        if self.workspace.card(id).is_some() {
-            if self.workspace.request_close(id).is_ok() {
-                let _ = self.workspace.commit_close(id);
-            }
-        }
         if let Some(card) = self.card_state_mut(id) {
             card.existence = super::project_ui::removed_existence("pane closed in another client");
         }
-        // The strip handed this pane's focus to a neighbour above, with no
+        self.sidebar_state.forget_card_attention(id);
+        self.shared_views.strip_detached.insert(id);
+    }
+
+    /// Takes the panes [`Self::detach_shared_pane`] detached, and no
+    /// projection has yet, out of the strip in one edit.
+    fn remove_detached_from_strip(&mut self) {
+        let detached = std::mem::take(&mut self.shared_views.strip_detached);
+        if detached.is_empty() {
+            return;
+        }
+        let _ = self.workspace.remove_cards(&detached);
+        // The strip handed a removed pane's focus to a neighbour, with no
         // viewport update to tell the saved state.
         self.settle_focus();
-        self.sidebar_state.forget_card_attention(id);
     }
 
     /// Refresh presentation after an exact managed owner changes on first model
@@ -4448,7 +4562,7 @@ impl Cagents {
         let panes = self.local_view_panes(&scope);
         let visible = self.local_view_cards(&scope);
         let viewport = self.workspace.capture_viewport_anchor();
-        self.project_shared_strip(&panes, &visible);
+        self.project_shared_strip(&panes, &visible, &HashSet::new());
         self.finish_shared_viewport_projection(viewport)
     }
 
@@ -4458,6 +4572,7 @@ impl Cagents {
         &mut self,
         anchor: crate::workspace::ViewportAnchor,
     ) -> Task<Message> {
+        self.remove_detached_from_strip();
         let update = self.workspace.restore_viewport_anchor(anchor);
         // Most snapshots leave the strip and its focus alone and need no
         // viewport pass; the sweep still settles descriptors they replaced.
@@ -4474,13 +4589,29 @@ impl Cagents {
     /// Mirrors `panes` into the strip without moving the view: the caller
     /// captured a [`crate::workspace::ViewportAnchor`] first and restores it
     /// with [`Self::finish_shared_viewport_projection`] once the batch ends.
-    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) {
-        let focus = self.workspace.focused();
-        let visible = visible.iter().copied().collect::<HashSet<_>>();
+    ///
+    /// The strip keeps the cards in `visible` and closes the rest, along with
+    /// any in `detached`, whose surfaces are already gone. The panes come
+    /// first, in their order, followed by the other cards it keeps, in theirs.
+    /// The whole edit is one [`crate::workspace::Workspace::arrange`].
+    fn project_shared_strip(
+        &mut self,
+        panes: &[Pane],
+        visible: &[CardId],
+        detached: &HashSet<CardId>,
+    ) {
+        let mut visible = visible.iter().copied().collect::<HashSet<_>>();
+        // A pane the user is closing here stays until that close finishes,
+        // which a transfer elsewhere must not turn into a failed one.
+        visible.extend(
+            self.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+        );
         let removed = self
             .workspace
             .order()
-            .filter(|id| !visible.contains(id))
+            .filter(|id| !visible.contains(id) && !detached.contains(id))
             .collect::<Vec<_>>();
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
@@ -4500,62 +4631,62 @@ impl Cagents {
                 _ => {}
             }
             self.set_exposure(id, Exposure::Offscreen);
-            if self.workspace.request_close(id).is_ok() {
-                let _ = self.workspace.commit_close(id);
-            }
         }
-        for (index, pane) in panes.iter().enumerate() {
-            if self.workspace.card(pane.id).is_none() {
-                // A held reported title is newer than the shared one.
-                let held = self
-                    .reported_title_save
-                    .cards
-                    .contains(&pane.id)
-                    .then(|| self.card_state(pane.id).map(|card| card.title.as_str()))
-                    .flatten();
-                if let Ok(card) = WorkspaceCard::new(
-                    pane.id,
-                    pane.user_title.as_deref().or(held).unwrap_or_else(|| {
-                        browser_host::presentation_title(&pane.kind, &pane.title)
-                    }),
-                    CardWidth::Fraction(pane.width_fraction),
-                ) {
-                    let _ = self.workspace.add_card(
-                        card,
-                        index.min(self.workspace.cards().len()),
-                        false,
-                    );
+        let mut placed = HashSet::with_capacity(panes.len());
+        let mut cards = Vec::with_capacity(panes.len());
+        for pane in panes {
+            if detached.contains(&pane.id) || !placed.insert(pane.id) {
+                continue;
+            }
+            // A held reported title is newer than the shared one.
+            let held = self.reported_title_save.cards.contains(&pane.id);
+            let card = match self.workspace.card(pane.id) {
+                Some(current) => {
+                    // A name or width the strip refuses leaves the one it has.
+                    let accessible_name = (pane.user_title.is_some() || !held)
+                        .then(|| {
+                            crate::workspace::normalize_card_name(
+                                pane.user_title.as_deref().unwrap_or_else(|| {
+                                    browser_host::presentation_title(&pane.kind, &pane.title)
+                                }),
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| current.accessible_name.clone());
+                    Some(WorkspaceCard {
+                        id: pane.id,
+                        accessible_name,
+                        width: CardWidth::fraction(pane.width_fraction).unwrap_or(current.width),
+                    })
                 }
-            } else {
-                // A held reported title is newer than the shared one.
-                if pane.user_title.is_some() || !self.reported_title_save.cards.contains(&pane.id) {
-                    let _ = self.workspace.rename_card(
+                None => {
+                    let held = held
+                        .then(|| self.card_state(pane.id).map(|card| card.title.as_str()))
+                        .flatten();
+                    WorkspaceCard::new(
                         pane.id,
-                        pane.user_title
-                            .as_deref()
-                            .unwrap_or_else(|| {
-                                browser_host::presentation_title(&pane.kind, &pane.title)
-                            })
-                            .to_owned(),
-                    );
+                        pane.user_title.as_deref().or(held).unwrap_or_else(|| {
+                            browser_host::presentation_title(&pane.kind, &pane.title)
+                        }),
+                        CardWidth::Fraction(pane.width_fraction),
+                    )
+                    .ok()
                 }
-                if self
-                    .workspace
-                    .card(pane.id)
-                    .is_some_and(|card| card.width != CardWidth::Fraction(pane.width_fraction))
-                {
-                    let _ = self
-                        .workspace
-                        .set_card_width(pane.id, CardWidth::Fraction(pane.width_fraction));
-                }
-                if self.workspace.order().nth(index) != Some(pane.id) {
-                    let _ = self.workspace.reorder(pane.id, index);
-                }
-            }
+            };
+            cards.extend(card);
         }
-        if let Some(focus) = focus.filter(|id| self.workspace.card(*id).is_some()) {
-            let _ = self.workspace.focus_without_scrolling(focus);
-        }
+        cards.extend(
+            self.workspace
+                .cards()
+                .iter()
+                .filter(|card| {
+                    visible.contains(&card.id)
+                        && !detached.contains(&card.id)
+                        && !placed.contains(&card.id)
+                })
+                .cloned(),
+        );
+        let _ = self.workspace.arrange(cards);
     }
 }
 

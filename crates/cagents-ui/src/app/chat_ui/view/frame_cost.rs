@@ -659,7 +659,7 @@ impl Pane {
     /// Opens `id` the way pressing its header does.
     fn open(&mut self, id: &str) {
         let runtime = &mut self.runtime;
-        runtime.expanded.insert(id.to_owned());
+        runtime.expanded.edit().insert(id.to_owned());
         let (index, item) = runtime
             .snapshot
             .items
@@ -673,7 +673,7 @@ impl Pane {
             .iter()
             .find(|turn| turn.steps.iter().any(|placed| placed.index == index))
         {
-            runtime.opened.insert(turn.key.clone(), true);
+            runtime.opened.edit().insert(turn.key.clone(), true);
         }
         let previous = runtime.cache.remove(id);
         runtime.cache.insert(
@@ -1201,7 +1201,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     assert_eq!(runtime.turns.len(), 2);
     let dark = cosmic::theme::is_dark();
     let settings =
-        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
+        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(
         runtime
@@ -1289,10 +1289,9 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
 #[test]
 #[ignore = "optimized viewport scaling measurement; records fixed budget and size ratio"]
 fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
-    assert!(
-        !cfg!(debug_assertions),
-        "use optimized dev-runtime with opt-level2"
-    );
+    if cfg!(debug_assertions) {
+        panic!("use optimized dev-runtime with opt-level2");
+    }
     let medians = viewport_workloads(&[
         ("small", 16_usize * 1024, 10, 0),
         ("giant paragraph", 1024 * 1024, 300, 0),
@@ -1322,10 +1321,9 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
 #[test]
 #[ignore = "optimized attribution measurement; not a substitute for the combined viewport budget"]
 fn viewport_cost_factorial_attribution() {
-    assert!(
-        !cfg!(debug_assertions),
-        "use optimized dev-runtime with opt-level2"
-    );
+    if cfg!(debug_assertions) {
+        panic!("use optimized dev-runtime with opt-level2");
+    }
     viewport_workloads(&[
         ("small", 16 * 1024, 10, 0),
         ("many tools only", 16 * 1024, 300, 0),

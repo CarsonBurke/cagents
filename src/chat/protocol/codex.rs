@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, HeldStop, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -123,10 +123,9 @@ fn append_display_output(
     // single-line output preserve a UTF-8-safe suffix instead.
     if start > 0
         && let Some(line) = tail[start..].find('\n')
+        && start + line + 1 < tail.len()
     {
-        if start + line + 1 < tail.len() {
-            start += line + 1;
-        }
+        start += line + 1;
     }
     window.omitted = window.omitted.saturating_add(start);
     window.head = head.len();
@@ -159,7 +158,7 @@ fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
 /// Record a provider-confirmed rotation in the recipe: rewrites the `resume`
 /// thread ID `create()` validates so a checkpointed launch stays
 /// self-consistent. Only call with the live provider's own identity.
-pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == "resume" {
@@ -520,6 +519,7 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            held_stop: HeldStop::None,
             notification_turn: None,
             notification_revision: 0,
             busy: false,
@@ -571,6 +571,7 @@ enum Pending {
     History {
         earlier: bool,
         initial_notification_binding: Option<(u64, u64)>,
+        adoption_binding: Option<(u64, u64)>,
     },
     Turn {
         revision: u64,
@@ -686,6 +687,9 @@ struct Codex {
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
+    /// A stop asked for while this thread's `turn/start` was unanswered,
+    /// sent as `turn/interrupt` once the turn's ID is known.
+    held_stop: HeldStop,
     /// Exact live notice authority. Scalar status and paged history must not
     /// replace it; they can arrive after a newer turn's start.
     notification_turn: Option<String>,
@@ -1467,7 +1471,9 @@ impl Codex {
         let initial_notification_binding = (!self.history_initialized
             && self.notification_turn.is_none())
         .then_some((self.lifecycle_revision, self.notification_revision));
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding })?;
+        let adoption_binding =
+            (!earlier).then_some((self.lifecycle_revision, self.notification_revision));
+        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding, adoption_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
             Event::HistoryLoading(true)
@@ -1571,20 +1577,23 @@ impl Codex {
         });
     }
 
-    fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
+    fn page(
+        &mut self,
+        page: &Value,
+        step: &mut Step,
+        earlier: bool,
+    ) -> Result<Option<String>, String> {
         let mut items = Vec::new();
+        let turns = array(page, "data")?;
         // Children whose nickname this page set. The page is read oldest
         // first, so a later call on it may advance that name. A name known
         // before the page stands: it came from a listing, a live
         // notification or a newer page, or, when the latest page is read
         // again, from that page's earlier reading.
         let mut named = std::collections::BTreeSet::new();
-        for turn in array(page, "data")?.iter().rev() {
+        for turn in turns.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
-            if active && self.busy && self.turn.is_none() {
-                self.turn = Some(turn_id.into());
-            }
             if turn["itemsView"]
                 .as_str()
                 .is_some_and(|view| view != "full")
@@ -1592,23 +1601,21 @@ impl Codex {
                 return Err("Codex did not return full turn items as requested; history cannot be hydrated safely".into());
             }
             for value in array(turn, "items")? {
-                if !active && value["type"] == "userMessage" {
-                    if let Some(label) = value["content"]
+                if !active
+                    && value["type"] == "userMessage"
+                    && let Some(label) = value["content"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .find_map(|input| input["text"].as_str())
                         .and_then(crate::account::clean_label)
-                    {
-                        if !self.branch_points.iter().any(|point| point.id == turn_id)
-                            && self.branch_points.len() < 128
-                        {
-                            self.branch_points.push(chat::BranchPoint {
-                                id: turn_id.into(),
-                                label,
-                            });
-                        }
-                    }
+                    && !self.branch_points.iter().any(|point| point.id == turn_id)
+                    && self.branch_points.len() < 128
+                {
+                    self.branch_points.push(chat::BranchPoint {
+                        id: turn_id.into(),
+                        label,
+                    });
                 }
                 if value["type"] == "collabAgentToolCall" {
                     for id in value["receiverThreadIds"]
@@ -1659,7 +1666,7 @@ impl Codex {
             }
         }
         if !earlier {
-            self.child_history_outcome(array(page, "data")?.first(), step);
+            self.child_history_outcome(turns.first(), step);
         }
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
@@ -1681,7 +1688,11 @@ impl Codex {
         });
         step.events
             .push(Event::BranchPoints(self.branch_points.clone()));
-        Ok(())
+        turns
+            .first()
+            .filter(|turn| turn["status"] == "inProgress")
+            .map(|turn| string(turn, "id").map(str::to_owned))
+            .transpose()
     }
     fn input(&self, text: String, attachments: Vec<Attachment>) -> Result<Vec<Value>, String> {
         let mut input = Vec::with_capacity(1 + attachments.len());
@@ -2099,6 +2110,7 @@ impl Adapter for Codex {
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
+                        self.held_stop = HeldStop::None;
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
@@ -2119,10 +2131,13 @@ impl Adapter for Codex {
                     }
                 }
             }
-            Command::Interrupt => {
-                let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to interrupt")?;
-                self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?;
-            }
+            // Codex names a turn only once it has started, so a stop given
+            // while its start is unanswered waits for that name.
+            Command::Interrupt => match self.turn.clone() {
+                Some(turn) => self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?,
+                None if self.starting_turn() => self.held_stop = HeldStop::Waiting,
+                None => return Err("There is no known active Codex turn to interrupt".into()),
+            },
             // The client's form of the model's own `interrupt_agent`: a child
             // is a thread of its own, so interrupting its turn reaches neither
             // the parent nor its siblings. Unlike input, this is not refused
@@ -2230,7 +2245,38 @@ impl Adapter for Codex {
         }
         Ok(step)
     }
+    fn held_stop(&self) -> HeldStop {
+        self.held_stop
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
+        let mut step = self.receive_frame(frame)?;
+        if self.held_stop == HeldStop::Waiting {
+            if let Some(turn) = self.turn.clone() {
+                self.held_stop = HeldStop::Sent;
+                self.call(
+                    &mut step,
+                    "turn/interrupt",
+                    json!({"threadId":self.thread,"turnId":turn}),
+                    Pending::Other,
+                )?;
+            } else if !self.starting_turn() {
+                // The start failed: there is nothing left to stop.
+                self.held_stop = HeldStop::Dropped;
+            }
+        }
+        Ok(step)
+    }
+}
+
+impl Codex {
+    /// Whether a `turn/start` this thread sent is still unanswered.
+    fn starting_turn(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Turn { .. }))
+    }
+
+    fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
         if !frame.is_object() {
             return Err("Codex sent a non-object JSON-RPC frame".into());
@@ -2530,7 +2576,10 @@ impl Adapter for Codex {
                         Pending::ChildList,
                     )?;
                     if result["initialTurnsPage"].is_object() {
-                        self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        let turn = self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        if self.busy && self.turn.is_none() {
+                            self.turn = turn;
+                        }
                         // Only the initial coherent attach response may bind
                         // an active history turn. Later pages are display data.
                         if self.lifecycle_revision == 0
@@ -2752,8 +2801,18 @@ impl Adapter for Codex {
                 Pending::History {
                     earlier,
                     initial_notification_binding,
+                    adoption_binding,
                 } => {
-                    self.page(result, &mut step, earlier)?;
+                    let turn = self.page(result, &mut step, earlier)?;
+                    if !earlier
+                        && !self.starting_turn()
+                        && adoption_binding
+                            == Some((self.lifecycle_revision, self.notification_revision))
+                        && self.busy
+                        && self.turn.is_none()
+                    {
+                        self.turn = turn;
+                    }
                     if initial_notification_binding
                         == Some((self.lifecycle_revision, self.notification_revision))
                         && self.notification_turn.is_none()
@@ -2805,6 +2864,25 @@ impl Adapter for Codex {
                     let owns_current = notification_revision == self.notification_revision
                         || self.notification_turn.as_deref() == Some(id);
                     let early_completion = early.remove(id);
+                    // The answer names the very turn a stop given while it
+                    // was unanswered was for, whichever lifecycle it now
+                    // belongs to. One that already finished needs none.
+                    if self.held_stop == HeldStop::Waiting {
+                        if early_completion
+                            .as_ref()
+                            .is_some_and(|early| early.completed.is_some())
+                        {
+                            self.held_stop = HeldStop::Dropped;
+                        } else {
+                            self.held_stop = HeldStop::Sent;
+                            self.call(
+                                &mut step,
+                                "turn/interrupt",
+                                json!({"threadId":self.thread,"turnId":id}),
+                                Pending::Other,
+                            )?;
+                        }
+                    }
                     // An active-status update may announce newer work before
                     // its turn ID arrives. The old request's correlation alone
                     // cannot assign that lifecycle to its acknowledged turn.
@@ -2983,7 +3061,11 @@ impl Adapter for Codex {
                         child.ready = true;
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
-                            child.page(&result["initialTurnsPage"], &mut content, false)?;
+                            let turn =
+                                child.page(&result["initialTurnsPage"], &mut content, false)?;
+                            if child.busy && child.turn.is_none() {
+                                child.turn = turn;
+                            }
                             // This is the child's coherent initial attachment;
                             // buffered live frames have not been replayed yet.
                             // Later history pages remain presentation only.
@@ -3287,12 +3369,10 @@ impl Adapter for Codex {
                     // it. Retain any known terminal proof for that exact ACK.
                     if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                         matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
-                    {
-                        if let Some(context) = early.get_mut(turn_id) {
+                        && let Some(context) = early.get_mut(turn_id) {
                             step.notification_preview = Some(std::mem::take(&mut context.preview).at_observed_start());
                             context.preview_transferred = true;
                         }
-                    }
                     self.notification_revision = self.notification_revision.wrapping_add(1);
                     self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
@@ -3514,7 +3594,7 @@ impl Adapter for Codex {
                     };
                     format!("{base}/{kind}/{index}")
                 } else {
-                    base.into()
+                    base
                 };
                 step.events.push(Event::TextDelta {
                     id,
@@ -3580,11 +3660,11 @@ impl Adapter for Codex {
                 // The patch is parsed only once there is an item to hold it, so
                 // a notification for an item this adapter never tracked cannot
                 // fail the session over a patch nothing would render.
-                if let Some(item) = self.active_items.get_mut(&id) {
-                    if let ItemContent::Changes { changes, .. } = &mut item.content {
-                        *changes = file_changes(params)?;
-                        step.events.push(Event::Item(item.clone()));
-                    }
+                if let Some(item) = self.active_items.get_mut(&id)
+                    && let ItemContent::Changes { changes, .. } = &mut item.content
+                {
+                    *changes = file_changes(params)?;
+                    step.events.push(Event::Item(item.clone()));
                 }
             }
             "serverRequest/resolved" => {
@@ -3732,9 +3812,9 @@ impl Adapter for Codex {
             // requests are visibly rejected above.
             _ => {}
         }
-        if step.suppress_current_notification {
-            if let Some(turn) = notification_frame_turn {
-                if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+        if step.suppress_current_notification
+            && let Some(turn) = notification_frame_turn
+                && let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                     matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
                 {
                     if !early.contains_key(&turn) && early.len() >= 8 {
@@ -3743,8 +3823,6 @@ impl Adapter for Codex {
                     let context = early.entry(turn).or_default();
                     for event in &step.events { context.preview.observe(event); }
                 }
-            }
-        }
         Ok(step)
     }
 }
@@ -4627,15 +4705,14 @@ fn parse_item_with_windows(
         } else {
             MAX_ITEM_BYTES
         };
-        if bytes > MAX_ITEM_BYTES {
-            if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
+        if bytes > MAX_ITEM_BYTES
+            && let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
                 &mut item.content
-            {
-                let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
-                // Completed items replace streamed items, so apply the same bound.
-                let full = std::mem::take(output);
-                append_display_output(output, &full, limit, &mut window);
-            }
+        {
+            let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+            // Completed items replace streamed items, so apply the same bound.
+            let full = std::mem::take(output);
+            append_display_output(output, &full, limit, &mut window);
         }
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());

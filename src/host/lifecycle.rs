@@ -1,7 +1,7 @@
 //! Deadline-driven retirement. Cleanup and receipt reads run outside HostState.
 use super::model::Registry;
 use super::state::{Retirement, SharedHost};
-use crate::{model::TerminalId, terminal::TerminalRetirement};
+use crate::{daemon::child_reaper, model::TerminalId, terminal::TerminalRetirement};
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -11,8 +11,8 @@ use std::{
 
 const EXITED_RETENTION: Duration = Duration::from_secs(10 * 60);
 // Match the existing five-second durable-notification retry cadence. Only an
-// uncertain or deferred expired pin census arms this deadline; it grants no
-// cleanup.
+// uncertain or deferred expired pin census, or suspended child custody, arms
+// this deadline; it grants no cleanup.
 const RETENTION_RETRY: Duration = Duration::from_secs(5);
 
 pub(super) struct Lifecycle {
@@ -21,6 +21,7 @@ pub(super) struct Lifecycle {
     idle: IdleTimer,
     waiting: Vec<Arc<File>>,
     settlement_retry: Option<Instant>,
+    custody_retry: Option<Instant>,
 }
 
 impl Lifecycle {
@@ -37,6 +38,7 @@ impl Lifecycle {
             ),
             waiting: Vec::new(),
             settlement_retry: None,
+            custody_retry: None,
         }
     }
 
@@ -48,6 +50,7 @@ impl Lifecycle {
             idle: IdleTimer::new(false, Duration::ZERO),
             waiting: Vec::new(),
             settlement_retry: None,
+            custody_retry: None,
         }
     }
 
@@ -59,6 +62,7 @@ impl Lifecycle {
         self.settlement_retry = None;
         self.settle_retirements(host);
         let retention = earliest(self.maintain_retention(host), self.settlement_retry);
+        let retention = earliest(retention, self.retry_suspended_custody(Instant::now()));
         if !self.idle.enabled {
             return retention;
         }
@@ -111,6 +115,34 @@ impl Lifecycle {
         };
         let idle = self.idle.update(now, idle);
         earliest(retention, idle)
+    }
+
+    fn retry_suspended_custody(&mut self, now: Instant) -> Option<Instant> {
+        if !child_reaper::has_suspended_custody() {
+            self.custody_retry = None;
+            return None;
+        }
+        if self.custody_retry.is_none_or(|deadline| now >= deadline) {
+            match child_reaper::retry_preserved() {
+                Ok(report) if report.rearmed > 0 => {
+                    tracing::info!(
+                        rearmed = report.rearmed,
+                        retained = report.retained,
+                        "Rearmed suspended original child custody"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "Suspended original child custody could not be rearmed");
+                }
+            }
+            if !child_reaper::has_suspended_custody() {
+                self.custody_retry = None;
+                return None;
+            }
+            self.custody_retry = Some(now + RETENTION_RETRY);
+        }
+        self.custody_retry
     }
 
     fn settle_retirements(&mut self, host: &SharedHost) {
@@ -623,6 +655,63 @@ mod tests {
                 let _ = self.child.wait();
             }
         }
+    }
+
+    #[test]
+    fn lifecycle_rearms_suspended_custody_and_restores_spawn_admission() {
+        if isolated_lifecycle_case() {
+            return;
+        }
+        let (host, _lease, _paths, _) = fixture_host();
+        let reservation = child_reaper::reserve().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r release"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pin suspended custody child: {error}");
+        }
+        let pidfd = unsafe { File::from_raw_fd(fd as i32) };
+        let mut stdin = child.stdin.take().unwrap();
+        reservation.quarantine();
+        reservation.preserve_suspended(child, Some(pidfd), "fixture");
+        assert!(child_reaper::reserve().is_err());
+
+        Lifecycle::testing(Duration::from_secs(600)).maintain(&host, false);
+        assert!(!child_reaper::has_suspended_custody());
+        assert!(child_reaper::reserve().is_ok());
+        stdin.write_all(b"release\n").unwrap();
+        wait_until(|| !child_reaper::has_retained_ownership());
+    }
+
+    #[test]
+    fn lifecycle_paces_retries_of_custody_it_cannot_rearm() {
+        if isolated_lifecycle_case() {
+            return;
+        }
+        let (host, _lease, _paths, _) = fixture_host();
+        let reservation = child_reaper::reserve().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "IFS= read -r release"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        reservation.quarantine();
+        reservation.preserve_suspended(child, None, "fixture");
+        let mut lifecycle = Lifecycle::testing(Duration::from_secs(600));
+        let before = Instant::now();
+        let first = lifecycle.maintain(&host, false).unwrap();
+        let after = Instant::now();
+        assert!(first >= before + RETENTION_RETRY && first <= after + RETENTION_RETRY);
+        assert_eq!(lifecycle.maintain(&host, false), Some(first));
+        assert!(child_reaper::has_suspended_custody());
+        stdin.write_all(b"release\n").unwrap();
     }
 
     #[test]

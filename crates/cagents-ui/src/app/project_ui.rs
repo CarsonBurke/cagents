@@ -74,7 +74,9 @@ pub struct State {
     /// Projects closed by the shared model but still settling their channels.
     pub(super) closing: HashMap<ProjectId, PathBuf>,
     close_started: HashMap<ProjectId, Instant>,
-    close_in_flight: HashSet<ProjectId>,
+    /// Closing projects whose sessions the daemon is asked to close, or
+    /// that wait for a session still starting before asking.
+    pub(super) close_in_flight: HashSet<ProjectId>,
     close_failed: HashSet<ProjectId>,
     close_cancellations: HashMap<ProjectId, CancellationToken>,
     pub(super) close_generation: HashMap<ProjectId, u64>,
@@ -4663,7 +4665,8 @@ pub(in crate::app) mod tests {
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
         assert!(
-            shared_project_session_scope(&[folder.clone()], &folder, &missing.projects).is_err()
+            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &missing.projects)
+                .is_err()
         );
     }
 

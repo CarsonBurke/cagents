@@ -366,7 +366,7 @@ fn load_file_at_original(
     // the kernel would follow it wherever it points, and only a lexical
     // reading of the target can say whether that is still inside the tree.
     let metadata = loop {
-        let metadata = match fs_safety::metadata_beneath(&root, &source) {
+        let metadata = match fs_safety::metadata_beneath(root, &source) {
             Ok(metadata) => metadata,
             Err(error) => {
                 // The requested path itself failing to resolve is a failure;
@@ -387,7 +387,7 @@ fn load_file_at_original(
         if !metadata.file_type().is_symlink() {
             break metadata;
         }
-        let target = match fs_safety::read_link_beneath(&root, &source) {
+        let target = match fs_safety::read_link_beneath(root, &source) {
             Ok(target) => target,
             // The link a previous hop led to was removed between being
             // classified and being read: a fact about that hop, reported
@@ -401,7 +401,7 @@ fn load_file_at_original(
         if followed == MAX_FOLLOWED_LINKS {
             return Ok(refused_link(source, target, LinkRefusal::TooManyLinks));
         }
-        let Some(resolved) = link_target_beneath(&root, &source, &target) else {
+        let Some(resolved) = link_target_beneath(root, &source, &target) else {
             return Ok(refused_link(source, target, LinkRefusal::LeavesWorktree));
         };
         let Some(resolved) = resolved else {

@@ -274,7 +274,12 @@ use crate::{
 /// Version 190 appends `ListPage` and its `ListedPage` reply, which return the
 /// terminal inventory in pages that each fit a frame. `List` answers an older
 /// CLI as before, or refuses when the whole inventory no longer fits one.
-pub const PROTOCOL_VERSION: u16 = 190;
+///
+/// Version 191 appends `Provider::Antigravity` and `Provider::Muse`, which run
+/// as terminals. An older client has no encoding for either: an optional value
+/// naming one reaches it as absent, and any other message naming one is
+/// refused or withheld.
+pub const PROTOCOL_VERSION: u16 = 191;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -302,8 +307,11 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
+#[cfg(test)]
+pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS, encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
+    encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -1107,6 +1115,7 @@ pub enum ServerResponse {
     },
     AgentActivity {
         terminal_id: TerminalId,
+        #[serde(serialize_with = "crate::agent::absent_where_unknown")]
         activity: Option<crate::agent::Activity>,
     },
     UpgradePrepared {
@@ -1454,6 +1463,7 @@ pub struct TerminalDescriptor {
     pub attached: bool,
     pub transcript: Option<TranscriptMetadata>,
     pub activity: Option<TerminalOutputActivity>,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub agent_activity: Option<crate::agent::Activity>,
     /// Authenticated former daemon identities retained by durable upgrade restore.
     #[serde(default)]
@@ -1985,6 +1995,7 @@ pub enum WireTerminalEvent {
         message: String,
     },
     AgentActivityChanged {
+        #[serde(serialize_with = "crate::agent::absent_where_unknown")]
         activity: Option<crate::agent::Activity>,
     },
     Completed {
@@ -2755,7 +2766,7 @@ mod tests {
             }),
             WireTerminalEvent::Error { .. }
         ));
-        assert!(PROTOCOL_VERSION > 105);
+        const { assert!(PROTOCOL_VERSION > 105) };
     }
 
     #[test]
@@ -3199,10 +3210,12 @@ mod tests {
             postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
             "JSON defaults cannot repair positional postcard layout"
         );
-        assert!(
-            PROTOCOL_VERSION > 104,
-            "image reference fields require matched positional peers"
-        );
+        const {
+            assert!(
+                PROTOCOL_VERSION > 104,
+                "image reference fields require matched positional peers"
+            )
+        };
     }
 
     #[test]

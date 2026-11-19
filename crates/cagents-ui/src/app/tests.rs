@@ -178,7 +178,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
     }))
     .unwrap();
     assert_eq!(
-        matching_attached_pr(&record, &head, &[pr.clone()]).map(|pr| pr.number),
+        matching_attached_pr(&record, &head, std::slice::from_ref(&pr)).map(|pr| pr.number),
         Some(7)
     );
     let mut duplicate = pr.clone();
@@ -191,7 +191,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
                 ..record.clone()
             },
             &head,
-            &[pr.clone()]
+            std::slice::from_ref(&pr)
         )
         .is_none()
     );
@@ -202,7 +202,7 @@ fn archived_worktree_pr_requires_exact_branch_and_head() {
                 ..record.clone()
             },
             &head,
-            &[pr.clone()]
+            std::slice::from_ref(&pr)
         )
         .is_none()
     );
@@ -259,7 +259,7 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
     apply_attached_worktree_prs(
         &mut project,
         &[(record.clone(), None)],
-        &[open.clone()],
+        std::slice::from_ref(&open),
         &[merged],
     );
     assert_eq!(
@@ -369,12 +369,12 @@ fn pull_request_head_prefers_the_context_worktree() {
     );
 
     assert_eq!(
-        pull_request_head(&[project.clone()], project_id, None),
+        pull_request_head(std::slice::from_ref(&project), project_id, None),
         "",
         "a project-level create must not adopt the first worktree's branch"
     );
     assert_eq!(
-        pull_request_head(&[project.clone()], project_id, Some(&selected)),
+        pull_request_head(std::slice::from_ref(&project), project_id, Some(&selected)),
         "selected"
     );
     assert_eq!(
@@ -2063,9 +2063,24 @@ fn a_window_view_saves_each_open_inspector_and_reads_one_from_before_them() {
         "an older version reads the focused pane's as the window's"
     );
 
+    assert_eq!(
+        view.inspector_choices,
+        Some(pane_inspector::Choices {
+            opened: vec![card],
+            closed: Vec::new(),
+        })
+    );
+
     let mut json = serde_json::to_value(&view).unwrap();
     let read: WindowView = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(read.open_inspectors, Some(vec![card]));
+    assert_eq!(read.inspector_choices, view.inspector_choices);
+    // A view saved while inspectors were closed until opened keeps no
+    // choices; its open ones read back as opened.
+    json.as_object_mut().unwrap().remove("inspector_choices");
+    let unchosen: WindowView = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(unchosen.inspector_choices, None);
+    assert_eq!(unchosen.open_inspectors, Some(vec![card]));
     // A view saved before each pane had its own inspector.
     json.as_object_mut().unwrap().remove("open_inspectors");
     let legacy: WindowView = serde_json::from_value(json).unwrap();
@@ -3019,7 +3034,7 @@ fn empty_workspace_exposes_provider_status_on_real_account_controls() {
         element
             .as_widget()
             .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    for provider in crate::agent::Provider::ALL {
+    for provider in crate::account::Account::REPORTED {
         let expected = format!(
             "{} · {} · Manage accounts",
             provider.label(),
@@ -3254,7 +3269,7 @@ fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget
 /// A repository card whose durable state and runtime both say repository,
 /// with an unsaved buffer and a language server reporting on it - the
 /// state a user is in while editing a file.
-fn editing_repository_app() -> (Cagents, CardId) {
+pub(super) fn editing_repository_app() -> (Cagents, CardId) {
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().expect("a focused card");
     {
@@ -3861,9 +3876,11 @@ fn application_close_advances_only_after_current_durability_fence_resolves() {
 
     let _ = app.update(Message::WindowCloseRequested(window));
     let _ = app.update(Message::DiscardAndCloseRepository(first));
-    assert!(app.dirty_repository_close.as_ref().is_some_and(
-        |close| close.card == first && close.remaining == VecDeque::from([second])
-    ));
+    assert!(
+        app.dirty_repository_close
+            .as_ref()
+            .is_some_and(|close| close.card == first && close.remaining == [second])
+    );
 
     let completion = fixture.durable_retry(&mut app, first);
     let _ = app.update(completion);
@@ -4400,8 +4417,12 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
         app.window_width = width;
         assert_eq!(app.trailing_edge_inset(), border);
         if inspector {
-            // A pane measured wide enough to dock its inspector.
-            drop(app.workspace.resize_viewport(width - border));
+            // A pane measured wide enough to dock its inspector, as the
+            // strip beside the sidebar measures itself, so the inspector
+            // ends where the window does rather than past it.
+            let sidebar =
+                sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+            drop(app.workspace.resize_viewport(width - sidebar));
             let card = app.workspace.focused().unwrap();
             app.open_pane_inspector_now(card);
             assert_eq!(
@@ -6098,8 +6119,8 @@ fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
 #[test]
 fn startup_qualification_attaches_offscreen_shell_omp_and_custom_terminal_owners_serially() {
     let mut app = context_inspector_test_app(false);
-    let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
-        .map(|program| restored_live_terminal(program));
+    let terminals =
+        ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"].map(restored_live_terminal);
     app.durable = Arc::new(WorkspaceState {
         cards: terminals.to_vec().into(),
         ..WorkspaceState::default()
@@ -6721,7 +6742,7 @@ fn workspace_switcher_home_end_hover_and_stale_actions_use_the_frozen_hold() {
     assert_eq!(app.chrome_ui.workspace_switcher_rows.len(), 20);
     let key = |key: keyboard::key::Named| Message::KeyEvent {
         event: keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key.clone()),
+            key: keyboard::Key::Named(key),
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::End),
             location: keyboard::Location::Standard,
@@ -8872,7 +8893,7 @@ fn request_test_completion(
 
 fn navigate_find_key(app: &mut Cagents, backwards: bool) {
     let key = keyboard::Key::Named(keyboard::key::Named::F3);
-    let action = task_app_message(app.update(Message::KeyEvent {
+    drop(app.update(Message::KeyEvent {
         event: keyboard::Event::KeyPressed {
             key: key.clone(),
             modified_key: key,
@@ -8888,13 +8909,6 @@ fn navigate_find_key(app: &mut Cagents, backwards: bool) {
         },
         captured: false,
     }));
-    assert!(matches!(
-        &action,
-        Message::Repository(
-            RepositoryAction::FindNext { .. } | RepositoryAction::FindPrevious { .. }
-        )
-    ));
-    drop(app.update(action));
 }
 
 #[test]
@@ -10545,8 +10559,8 @@ pub(super) fn focused_element(
         .as_widget_mut()
         .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
     let _ = probe.finish();
-    let answer = found.lock().expect("the probe survived").clone();
-    answer
+
+    found.lock().expect("the probe survived").clone()
 }
 
 /// A jump that moves the caret must also hand the editor the keyboard.
@@ -11254,6 +11268,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         card_indices_source: std::sync::Weak::new(),
         terminal_ordinals_source: std::sync::Weak::new(),
         navigation_cache: sidebar::NavigationCache::default(),
+        place_index: inspector_activity::PlaceIndex::default(),
         palette: palette_ui::State::default(),
         recently_closed: Vec::new(),
         presence: HashMap::new(),
@@ -11366,7 +11381,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         source_control_mutations: HashMap::new(),
         operation_recovery: Default::default(),
         device_ui: device_ui::State::default(),
-        account_ui: account_ui::State::default(),
+        account_ui: account_ui::Accounts::default(),
         automation_ui: crate::automation_ui::State::default(),
         work_ui: crate::work_ui::State::default(),
         automation_approval: automation_approval::State::default(),
@@ -13637,8 +13652,12 @@ fn control_tab_uses_history_and_respects_blocking_surfaces() {
 #[test]
 fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     let mut app = context_inspector_test_app(true);
+    app.sidebar_model = sidebar::tests::panel_model();
+    app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+    let worktree = app.sidebar_state.active_worktree().unwrap().clone();
     let card = app.workspace.focused().unwrap();
-    let (runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    let (mut runtime, _) = RepositoryRuntime::selection_fixture(card, "notes.txt");
+    runtime.descriptor.worktree = worktree.canonical_path.clone();
     assert!(runtime.selected_staging_selection(true).is_some());
     app.cards
         .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -13654,14 +13673,18 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
         },
         captured: false,
     };
-    assert!(matches!(
-        task_app_message(app.update(key())),
-        Message::Repository(RepositoryAction::StageSelected { card: id, stage: true })
-            if id == card
-    ));
+    // The shortcut stages the selection within its own update.
+    drop(app.update(key()));
+    assert_eq!(
+        app.source_control_mutations[&worktree.canonical_path].kind,
+        MutationKind::Stage
+    );
+    assert!(!app.palette.is_open());
+    app.source_control_mutations.clear();
     app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
     drop(app.update(key()));
     assert!(app.palette.is_open());
+    assert!(app.source_control_mutations.is_empty(), "nothing is staged");
 }
 
 #[test]

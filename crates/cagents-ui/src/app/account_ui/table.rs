@@ -284,7 +284,7 @@ pub(super) fn listed(state: &State, account: &AccountState) -> bool {
 /// The accounts the pane lists for `provider`, in `sort` order: every
 /// account cagents added, and the system account where its CLI is set up or
 /// its last check failed and the reader needs its retry control.
-fn rows<'a>(state: &'a State, provider: Provider, sort: Sort) -> Vec<&'a AccountState> {
+fn rows(state: &State, provider: Provider, sort: Sort) -> Vec<&AccountState> {
     let mut rows: Vec<&AccountState> = state
         .of(provider)
         .filter(|account| listed(state, account))
@@ -625,7 +625,7 @@ fn group<'a>(
             .padding([space::M, space::M])
             .into(),
         );
-        if missing {
+        if missing && super::install_url(provider).is_some() {
             lines.push(
                 crate::ui_controls::button::primary(format!("Install {}", provider.label()))
                     .on_press(Message::AccountUi(Action::Install(provider)))
@@ -961,10 +961,10 @@ fn account_cell<'a>(
             "{}'s own login",
             probe::cli_name(account.account.provider)
         ));
-    } else if account.account.is_linked() {
-        if let Some(home) = account.account.resolved_home() {
-            subtitle.push(format!("Existing home · {}", home.display()));
-        }
+    } else if account.account.is_linked()
+        && let Some(home) = account.account.resolved_home()
+    {
+        subtitle.push(format!("Existing home · {}", home.display()));
     }
     if renaming.is_some() {
         subtitle =
@@ -1135,7 +1135,6 @@ fn actions<'a>(
             widget::popover::Position::Bottom,
             Message::AccountUi(Action::Menu(None)),
         )
-        .into()
     };
     let first: Element<'a, Message> = if removing {
         design::caption("Removing…").into()
@@ -1500,13 +1499,15 @@ pub(in crate::app) mod tests {
 
     #[test]
     fn rows_sort_by_headroom_reset_or_name_with_unknowns_last() {
-        let mut state = State::default();
-        state.accounts = vec![
-            account_with(Provider::Claude, 0, None),
-            account_with(Provider::Claude, 1, Some((0.9, 500))),
-            account_with(Provider::Claude, 2, Some((0.2, 900))),
-            account_with(Provider::Claude, 3, Some((0.5, 100))),
-        ];
+        let state = State {
+            accounts: vec![
+                account_with(Provider::Claude, 0, None),
+                account_with(Provider::Claude, 1, Some((0.9, 500))),
+                account_with(Provider::Claude, 2, Some((0.2, 900))),
+                account_with(Provider::Claude, 3, Some((0.5, 100))),
+            ],
+            ..State::default()
+        };
         let keys = |sort| {
             rows(&state, Provider::Claude, sort)
                 .iter()

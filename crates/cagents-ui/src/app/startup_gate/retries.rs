@@ -253,7 +253,7 @@ impl Cagents {
             && !matches!(self.residency(card), Residency::Hydrating { .. });
         (self.startup_gate.reported
             && unopened
-            && matches!(self.saved_terminal_of(card), Some(_))
+            && self.saved_terminal_of(card).is_some()
             && !self.terminal_start_in_flight(card)
             && !self.startup_pane_needs_registry(card))
         .then_some(None)

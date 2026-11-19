@@ -36,6 +36,10 @@ memory: `realistic` is about 170 MB and `huge` about 1.1 GB.
 | `huge` | Stress: 24 projects, 150 channels, 3538 cards, 10,000 Claude and 2,000 Codex conversations, every edge case `all` adds, and `large-record`. | 21 s, 1.1 GB |
 | `sidebar` | The sidebar's resting states: 10 projects with avatars and initials, dirty worktrees, and unread counts of 3, 12 and 120. | 0.3 s, 6 MB |
 
+Every seeded channel that holds no card is named, so the app keeps all of them
+on its first start, as a long-lived installation already has; a first start
+therefore measures an ordinary start, not the one-time retirement of empty channels.
+
 Times are from one run on this repository's development host.
 
 - `--seed N` chooses another workspace of the same shape. The same profile,

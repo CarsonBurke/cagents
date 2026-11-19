@@ -764,9 +764,7 @@ impl State {
     }
     #[cfg(test)]
     pub(super) fn growing_canonical_for_test(&self, item: &Arc<chat::Item>) -> Option<usize> {
-        let Some(entry) = self.entries.get(&item.id) else {
-            return None;
-        };
+        let entry = self.entries.get(&item.id)?;
         let latest = entry.shared.latest.lock().unwrap();
         if entry.running
             || !latest.growing
@@ -818,15 +816,27 @@ impl State {
         self.local_error = None;
     }
 
-    /// `append` is proof from the immutable source publication, not a tail
-    /// digest or a guessed matching item ID. An unproven replacement starts a
-    /// new lineage and cancels both queued and currently parsing old input.
+    #[cfg(test)]
     pub(super) fn stage(
         &mut self,
         item: &Arc<chat::Item>,
         growing: bool,
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
+    ) -> bool {
+        self.stage_reusing(item, growing, theme, append, HashMap::new)
+    }
+
+    /// `append` is proof from the immutable source publication, not a tail
+    /// digest or a guessed matching item ID. An unproven replacement starts a
+    /// new lineage and cancels both queued and currently parsing old input.
+    pub(super) fn stage_reusing(
+        &mut self,
+        item: &Arc<chat::Item>,
+        growing: bool,
+        theme: crate::settings::EditorSyntaxTheme,
+        append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
+        reusable: impl FnOnce() -> HashMap<u64, prose::CodeBlock>,
     ) -> bool {
         self.last_deferred = false;
         let Some(bytes) = source_bytes(&item.content) else {
@@ -874,24 +884,23 @@ impl State {
                     || (latest.input.transcript().is_some_and(|previous| {
                         same_kind(previous, item) && append(previous, item)
                     })))
+                && entry.shared.lease.resize(bytes)
             {
-                if entry.shared.lease.resize(bytes) {
-                    *latest = Request {
-                        input: Input::Transcript(item.clone()),
-                        provider: self.provider.unwrap_or(Provider::Claude),
-                        growing,
-                        version: latest.version.wrapping_add(1),
-                        theme,
-                        reader_proofs: self.reader_proofs.clone(),
-                        labels: self.labels.clone(),
-                    };
-                    if !entry.running {
-                        entry.run = next_attempt();
-                        entry.running = true;
-                        entry.claim.set(Claim::Unclaimed);
-                    }
-                    return false;
+                *latest = Request {
+                    input: Input::Transcript(item.clone()),
+                    provider: self.provider.unwrap_or(Provider::Claude),
+                    growing,
+                    version: latest.version.wrapping_add(1),
+                    theme,
+                    reader_proofs: self.reader_proofs.clone(),
+                    labels: self.labels.clone(),
+                };
+                if !entry.running {
+                    entry.run = next_attempt();
+                    entry.running = true;
+                    entry.claim.set(Claim::Unclaimed);
                 }
+                return false;
             }
             entry.shared.cancel();
         }
@@ -927,7 +936,10 @@ impl State {
                     }),
                     priority: AtomicU64::new(UNRANKED),
                     place: Place::default(),
-                    canonical: Mutex::new(None),
+                    canonical: Mutex::new(Some(Canonical {
+                        parsed: Parsed::default(),
+                        blocks: reusable(),
+                    })),
                     cancelled: AtomicBool::new(false),
                     lease,
                 })),
@@ -1275,7 +1287,7 @@ impl Prepared {
                 markdown: std::mem::replace(&mut cached.markdown, self.parsed.markdown),
             },
             _blocks: std::mem::replace(&mut cached.blocks, self.blocks),
-            _palettes: std::mem::replace(&mut cached.palette_views, Some(self.palettes)),
+            _palettes: cached.palette_views.replace(self.palettes),
             _item: cached.item.replace(
                 self.request
                     .input
@@ -1773,10 +1785,12 @@ impl Queue {
     /// waits.
     fn eligible(&self, capacity: usize) -> Option<(u64, u64)> {
         let first = *self.waiting.keys().next()?;
-        if first.0 == TAIL && capacity > 1 && self.tail_held + 1 >= capacity {
-            if let Some(other) = self.waiting.keys().find(|key| key.0 != TAIL) {
-                return Some(*other);
-            }
+        if first.0 == TAIL
+            && capacity > 1
+            && self.tail_held + 1 >= capacity
+            && let Some(other) = self.waiting.keys().find(|key| key.0 != TAIL)
+        {
+            return Some(*other);
         }
         Some(first)
     }
@@ -2093,9 +2107,9 @@ fn execute(shared: Arc<Shared>, permit: impl Into<Permit>) -> Result<Prepared, S
             );
         }
     } else {
-        verify_tool_readers(&item, &request.reader_proofs, &mut reader_verifications);
+        verify_tool_readers(item, &request.reader_proofs, &mut reader_verifications);
     }
-    let coordinated = chat::coordination::recognize(&item, request.provider)
+    let coordinated = chat::coordination::recognize(item, request.provider)
         .map(|reading| coordination::Prepared::prepare(reading, &request.labels, &shared.cancelled))
         .transpose()?;
     if let Some(coordinated) = &coordinated {

@@ -115,7 +115,7 @@ impl Registry {
                 "Hosted conversations can inspect automations only in their own project".into(),
             ));
         }
-        let page = read_page(&tx, id, before, limit, Some(&repository))?;
+        let page = read_page(&tx, id, before, limit, Some(repository))?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(page)
     }

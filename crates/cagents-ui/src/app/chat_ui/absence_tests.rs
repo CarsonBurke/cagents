@@ -260,7 +260,7 @@ fn unrelated_model_changes_never_close_a_first_send_that_is_not_published_yet() 
         drop(world.app.update(ready));
         let target = runtime(&world.app, card).target;
         let handle = runtime(&world.app, card).handle().unwrap().clone();
-        let command = runtime(&world.app, card).pending.as_ref().unwrap().id;
+        let command = runtime(&world.app, card).commands.in_flight().unwrap().id;
         super::show_chat_snapshot_for_test(
             &mut world.app,
             card,
@@ -389,7 +389,7 @@ fn accepted_first_send(world: &mut World) -> Arc<ClientHandle> {
     drop(world.app.update(ready));
     let target = runtime(&world.app, card).target;
     let handle = runtime(&world.app, card).handle().unwrap().clone();
-    let command = runtime(&world.app, card).pending.as_ref().unwrap().id;
+    let command = runtime(&world.app, card).commands.in_flight().unwrap().id;
     super::show_chat_snapshot_for_test(
         &mut world.app,
         card,

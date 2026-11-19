@@ -75,6 +75,137 @@ pub fn resolve(source: &Path, target: &str) -> Result<DocumentLink, String> {
     }
 }
 
+use cosmic::iced::{
+    self, Rectangle, Vector,
+    advanced::widget::{Id, Operation, operation},
+};
+use cosmic::widget::markdown;
+
+pub fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
+    let mut used = std::collections::HashSet::new();
+    // Each base slug resumes after its last suffix, instead of retrying every
+    // preceding duplicate when a generated document repeats a heading.
+    let mut suffixes = std::collections::HashMap::<String, usize>::new();
+    let style =
+        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_BODY).style;
+    for (index, item) in items.iter().enumerate() {
+        if let markdown::Item::Heading(_, text) = item {
+            let text: String = text
+                .spans(style)
+                .iter()
+                .map(|span| span.text.as_ref())
+                .collect();
+            let slug: String = text
+                .to_lowercase()
+                .chars()
+                .filter_map(|c| {
+                    if c.is_whitespace() {
+                        Some('-')
+                    } else if c.is_alphanumeric() || c == '-' || c == '_' {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut unique = slug.clone();
+            if !used.insert(unique.clone()) {
+                let suffix = suffixes.entry(slug.clone()).or_default();
+                loop {
+                    *suffix += 1;
+                    unique = format!("{slug}-{suffix}");
+                    if used.insert(unique.clone()) {
+                        break;
+                    }
+                }
+            }
+            if unique == fragment {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+pub fn heading_id(card: crate::model::CardId, index: usize) -> Id {
+    Id::new(format!("document-heading-{card}-{index}"))
+}
+
+pub fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
+    scroll_to_heading_anchored(scroll, target, false)
+}
+
+pub(crate) fn scroll_to_heading_anchored<T: Send + 'static>(
+    scroll: Id,
+    target: Id,
+    bottom: bool,
+) -> iced::Task<T> {
+    struct Find {
+        scroll: Id,
+        target: Id,
+        top: Option<f32>,
+        offset: Option<f32>,
+        bottom: bool,
+        travel: f32,
+    }
+    impl<T: 'static> Operation<T> for Find {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            visit(self);
+        }
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            viewport: Rectangle,
+            content: Rectangle,
+            _: Vector,
+            _: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.scroll) {
+                self.top = Some(content.y);
+                self.travel = (content.height - viewport.height).max(0.0);
+            }
+        }
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.target) {
+                self.offset = self.top.map(|top| {
+                    let from_top = (bounds.y - top).clamp(0.0, self.travel);
+                    if self.bottom {
+                        self.travel - from_top
+                    } else {
+                        from_top
+                    }
+                });
+            }
+        }
+        fn finish(&self) -> operation::Outcome<T> {
+            self.offset.map_or(operation::Outcome::None, |y| {
+                operation::Outcome::Chain(Box::new(operation::scrollable::scroll_to(
+                    self.scroll.clone(),
+                    operation::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(y),
+                    },
+                )))
+            })
+        }
+    }
+    iced::advanced::widget::operate(Find {
+        scroll,
+        target,
+        top: None,
+        offset: None,
+        bottom,
+        travel: 0.0,
+    })
+}
+
+pub struct PreviewViewer;
+impl<'a> markdown::Viewer<'a, markdown::Uri, cosmic::Theme, cosmic::Renderer> for PreviewViewer {
+    fn on_link_click(uri: markdown::Uri) -> markdown::Uri {
+        uri
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,136 +338,5 @@ mod tests {
         ));
         assert!(resolve(source, "javascript:alert(1)").is_err());
         assert!(resolve(source, "file://remote/path").is_err());
-    }
-}
-
-use cosmic::iced::{
-    self, Rectangle, Vector,
-    advanced::widget::{Id, Operation, operation},
-};
-use cosmic::widget::markdown;
-
-pub fn heading_index(items: &[markdown::Item], fragment: &str) -> Option<usize> {
-    let mut used = std::collections::HashSet::new();
-    // Each base slug resumes after its last suffix, instead of retrying every
-    // preceding duplicate when a generated document repeats a heading.
-    let mut suffixes = std::collections::HashMap::<String, usize>::new();
-    let style =
-        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_BODY).style;
-    for (index, item) in items.iter().enumerate() {
-        if let markdown::Item::Heading(_, text) = item {
-            let text: String = text
-                .spans(style)
-                .iter()
-                .map(|span| span.text.as_ref())
-                .collect();
-            let slug: String = text
-                .to_lowercase()
-                .chars()
-                .filter_map(|c| {
-                    if c.is_whitespace() {
-                        Some('-')
-                    } else if c.is_alphanumeric() || c == '-' || c == '_' {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let mut unique = slug.clone();
-            if !used.insert(unique.clone()) {
-                let suffix = suffixes.entry(slug.clone()).or_default();
-                loop {
-                    *suffix += 1;
-                    unique = format!("{slug}-{suffix}");
-                    if used.insert(unique.clone()) {
-                        break;
-                    }
-                }
-            }
-            if unique == fragment {
-                return Some(index);
-            }
-        }
-    }
-    None
-}
-
-pub fn heading_id(card: crate::model::CardId, index: usize) -> Id {
-    Id::new(format!("document-heading-{card}-{index}"))
-}
-
-pub fn scroll_to_heading<T: Send + 'static>(scroll: Id, target: Id) -> iced::Task<T> {
-    scroll_to_heading_anchored(scroll, target, false)
-}
-
-pub(crate) fn scroll_to_heading_anchored<T: Send + 'static>(
-    scroll: Id,
-    target: Id,
-    bottom: bool,
-) -> iced::Task<T> {
-    struct Find {
-        scroll: Id,
-        target: Id,
-        top: Option<f32>,
-        offset: Option<f32>,
-        bottom: bool,
-        travel: f32,
-    }
-    impl<T: 'static> Operation<T> for Find {
-        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) {
-            visit(self);
-        }
-        fn scrollable(
-            &mut self,
-            id: Option<&Id>,
-            viewport: Rectangle,
-            content: Rectangle,
-            _: Vector,
-            _: &mut dyn operation::Scrollable,
-        ) {
-            if id == Some(&self.scroll) {
-                self.top = Some(content.y);
-                self.travel = (content.height - viewport.height).max(0.0);
-            }
-        }
-        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-            if id == Some(&self.target) {
-                self.offset = self.top.map(|top| {
-                    let from_top = (bounds.y - top).clamp(0.0, self.travel);
-                    if self.bottom {
-                        self.travel - from_top
-                    } else {
-                        from_top
-                    }
-                });
-            }
-        }
-        fn finish(&self) -> operation::Outcome<T> {
-            self.offset.map_or(operation::Outcome::None, |y| {
-                operation::Outcome::Chain(Box::new(operation::scrollable::scroll_to(
-                    self.scroll.clone(),
-                    operation::scrollable::AbsoluteOffset {
-                        x: None,
-                        y: Some(y),
-                    },
-                )))
-            })
-        }
-    }
-    iced::advanced::widget::operate(Find {
-        scroll,
-        target,
-        top: None,
-        offset: None,
-        bottom,
-        travel: 0.0,
-    })
-}
-
-pub struct PreviewViewer;
-impl<'a> markdown::Viewer<'a, markdown::Uri, cosmic::Theme, cosmic::Renderer> for PreviewViewer {
-    fn on_link_click(uri: markdown::Uri) -> markdown::Uri {
-        uri
     }
 }

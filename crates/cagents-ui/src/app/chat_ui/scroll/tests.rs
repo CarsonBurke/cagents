@@ -944,13 +944,16 @@ fn cold_reader_wheel_reports_saved_geometry_and_dispatches_real_history_edges() 
         };
         assert_eq!(scroll.content(), 2_000.0);
         assert_eq!(scroll.window_height(), 400.0);
-        assert_eq!(scroll.from_top(), if bottom { 1_600.0 } else { 0.0 });
+        assert_eq!(scroll.offset_from_top(), if bottom { 1_600.0 } else { 0.0 });
         assert_eq!(observations.borrow()[&None], *scroll);
         drop(pending);
         drop(app.update(reports.into_iter().next().unwrap()));
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert_eq!(
-            runtime.pending.as_ref().and_then(|pending| pending.page),
+            runtime
+                .commands
+                .in_flight()
+                .and_then(|pending| pending.page),
             Some(if bottom {
                 view::Page::Newer
             } else {
@@ -1096,15 +1099,16 @@ fn native_paging_shrinks_to_loaded_content_and_wheels_choose_each_edge() {
                     unreachable!()
                 };
                 assert!(
-                    scroll.from_top() > 0.0 && scroll.from_top() < height - viewport.height,
+                    scroll.offset_from_top() > 0.0
+                        && scroll.offset_from_top() < height - viewport.height,
                     "prefetch must start before the physical edge"
                 );
             }
             drop(app.update(messages.pop().unwrap()));
             let runtime = app.chat_runtime_mut(target).unwrap();
             let pending = runtime
-                .pending
-                .as_ref()
+                .commands
+                .in_flight()
                 .expect("native wheel starts a page");
             assert_eq!(pending.page, Some(expected));
             let request = pending.id;
@@ -1117,7 +1121,7 @@ fn native_paging_shrinks_to_loaded_content_and_wheels_choose_each_edge() {
                 Ok(()),
             ))));
             assert!(
-                app.chat_runtime_mut(target).unwrap().pending.is_none(),
+                app.chat_runtime_mut(target).unwrap().commands.is_idle(),
                 "arrival of an equal-height page must wait for the next gesture"
             );
         }
@@ -1236,8 +1240,8 @@ fn fitting_native_wheel_defers_its_direction_and_can_reverse_before_command_ack(
             let request = app
                 .chat_runtime_mut(target)
                 .unwrap()
-                .pending
-                .as_ref()
+                .commands
+                .in_flight()
                 .unwrap()
                 .id;
             let opposite = if first == view::Page::Earlier {
@@ -1290,8 +1294,8 @@ fn fitting_native_wheel_defers_its_direction_and_can_reverse_before_command_ack(
             assert_eq!(
                 app.chat_runtime_mut(target)
                     .unwrap()
-                    .pending
-                    .as_ref()
+                    .commands
+                    .in_flight()
                     .unwrap()
                     .page,
                 Some(if reverse { opposite } else { first })
@@ -1574,7 +1578,7 @@ fn actual_native_wheel_survives_tree_drop_before_the_next_layout() {
             &Rectangle::with_size(Size::new(720.0, 400.0)),
         );
     }
-    let expected = observations.borrow()[&None].from_top();
+    let expected = observations.borrow()[&None].offset_from_top();
     assert!(
         expected < 1600.0 && expected > 0.0,
         "the real native wheel must move the reader"
@@ -2550,7 +2554,7 @@ fn appended_flow_prefix_is_not_exact_find_geometry_before_redraw_requests_curren
         generation: 1,
     };
     let identity = selection::logical_identity("opaque-item", &[0, 0]);
-    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT).style;
     let mut content = markdown::Content::parse(&"prefix needle words ".repeat(300));
     let cache = flow_layout::Cache::default();
     let entry = cache.markdown_entry(identity, paragraph(&content), style);
@@ -2897,7 +2901,7 @@ fn logical_find_realizes_a_distant_chunk_and_centers_its_mounted_glyph() {
         cases.push((
             prose::view(
                 &cached,
-                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
                 target,
                 None,
             ),

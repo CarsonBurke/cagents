@@ -1303,6 +1303,122 @@ fn notification_observed_start_keeps_already_decoded_completion_for_exact_ack() 
 }
 
 #[test]
+fn a_history_page_answered_during_a_turn_start_does_not_take_a_held_stop() {
+    let mut adapter = adapter();
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    let history_id = history.writes[0]["id"].clone();
+    let submitted = adapter
+        .command(Command::Prompt {
+            text: "New turn".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    let start_id = submitted
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "turn/start")
+        .unwrap()["id"]
+        .clone();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    let stopped = adapter.command(Command::Interrupt).unwrap();
+    assert!(stopped.writes.is_empty());
+    let hydrated = adapter.receive(json!({"id":history_id,"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(
+        hydrated
+            .writes
+            .iter()
+            .all(|frame| frame["method"] != "turn/interrupt"),
+        "history must leave the held stop waiting for the new turn"
+    );
+    assert_eq!(adapter.held_stop(), HeldStop::Waiting);
+    assert!(adapter.turn.is_none());
+
+    let answered = adapter
+        .receive(json!({"id":start_id,"result":{"turn":{"id":"new"}}}))
+        .unwrap();
+    let interrupts = answered
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "turn/interrupt")
+        .collect::<Vec<_>>();
+    assert_eq!(interrupts.len(), 1);
+    assert_eq!(interrupts[0]["params"]["turnId"], "new");
+    assert_eq!(adapter.held_stop(), HeldStop::Sent);
+}
+
+#[test]
+fn a_history_page_requested_during_a_turn_start_names_no_turn() {
+    let mut adapter = adapter();
+    adapter
+        .command(Command::Prompt {
+            text: "New turn".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    // Requested after the lifecycle moved, so only the unanswered start
+    // keeps the page's in-progress turn from being taken as the current one.
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+}
+
+#[test]
+fn history_names_the_newest_in_progress_turn_only() {
+    for (status, expected) in [("inProgress", Some("newer")), ("completed", None)] {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut history = Step::default();
+        adapter.history(&mut history, None).unwrap();
+        assert_eq!(history.writes[0]["params"]["sortDirection"], "desc");
+        adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"newer","status":status,"items":[]},{"id":"older","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+        assert_eq!(adapter.turn.as_deref(), expected);
+    }
+}
+
+#[test]
+fn an_earlier_history_page_never_names_the_current_turn() {
+    let mut adapter = adapter();
+    adapter.busy = true;
+    let mut history = Step::default();
+    adapter
+        .history(&mut history, Some("older-page".into()))
+        .unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+}
+
+#[test]
+fn a_history_page_requested_before_a_lifecycle_change_names_no_turn() {
+    let mut adapter = adapter();
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"other","status":"inProgress","items":[]}}})).unwrap();
+    adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"other","status":"completed","items":[]}}})).unwrap();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+    assert_eq!(
+        adapter.command(Command::Interrupt).err().as_deref(),
+        Some("There is no known active Codex turn to interrupt")
+    );
+}
+
+#[test]
+fn attach_still_names_its_active_turn() {
+    let mut adapter = adapter();
+    adapter
+        .pending
+        .insert(json!("attach").to_string(), Pending::Attach);
+    adapter.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"newer","status":"inProgress","items":[]}],"nextCursor":null}}})).unwrap();
+    assert_eq!(adapter.turn.as_deref(), Some("newer"));
+}
+
+#[test]
 fn notification_history_and_scalar_idle_cannot_replace_exact_live_turn_proof() {
     let start = |id| {
         json!({"method":"turn/started","params":{"threadId":"thread-exact",
@@ -1614,7 +1730,7 @@ fn align_resume_identity_rewrites_resume_thread() {
     ];
     align_resume_identity(&mut arguments, "new").unwrap();
     assert_eq!(arguments, vec!["app-server", "resume", "new"]);
-    assert!(align_resume_identity(&mut vec!["resume".to_string()], "new").is_err());
+    assert!(align_resume_identity(&mut ["resume".to_string()], "new").is_err());
 }
 
 #[test]
@@ -1932,6 +2048,7 @@ fn adapter() -> Codex {
         pricing: Default::default(),
         turn_pricing: Default::default(),
         turn: None,
+        held_stop: HeldStop::None,
         notification_turn: None,
         notification_revision: 0,
         busy: false,
@@ -2905,6 +3022,133 @@ fn child_terminal_outcomes_survive_idle_and_closure_and_new_turn_restarts_work()
     )));
 }
 
+/// Codex names a turn only once it has started. A stop given while the
+/// turn's start is unanswered waits for that name, whichever of the start's
+/// answer or its notification brings it first, even once the thread has
+/// reported itself active, and is sent once. A start that
+/// fails leaves nothing to stop.
+#[test]
+fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
+    let prompt = |adapter: &mut Codex| {
+        let step = adapter
+            .command(Command::Prompt {
+                text: "Fix the build".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        step.writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone()
+    };
+    let interrupts = |step: &Step| {
+        step.writes
+            .iter()
+            .filter(|frame| frame["method"] == "turn/interrupt")
+            .map(|frame| frame["params"].clone())
+            .collect::<Vec<_>>()
+    };
+    let finish = |id: &str| {
+        json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+        "turn":{"id":id,"status":"interrupted","items":[]}}})
+    };
+
+    let mut adapter = adapter();
+    let request = prompt(&mut adapter);
+    let stop = adapter.command(Command::Interrupt).unwrap();
+    assert!(stop.writes.is_empty(), "no turn to name yet");
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-a"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-a"})]
+    );
+    assert_eq!(adapter.held_stop(), HeldStop::Sent);
+    adapter.receive(finish("turn-a")).unwrap();
+
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-b","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        interrupts(&started),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-b"})]
+    );
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-b"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "stopped once");
+    adapter.receive(finish("turn-b")).unwrap();
+
+    // The thread can report itself active before the start's answer, which
+    // then no longer owns the lifecycle; the answer still names the turn.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"active","activeFlags":[]}}}),
+        )
+        .unwrap();
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-c"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-c"})]
+    );
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-c","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&started).is_empty(), "stopped once");
+    adapter.receive(finish("turn-c")).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"idle"}}}),
+        )
+        .unwrap();
+
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    let refused = adapter
+        .receive(json!({"id":request,"error":{"code":-32600,"message":"thread is closed"}}))
+        .unwrap();
+    assert!(interrupts(&refused).is_empty());
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
+    assert!(
+        adapter.command(Command::Interrupt).is_err(),
+        "nothing left to stop"
+    );
+
+    // A turn that finished before its start was answered needs no stop.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    assert_eq!(adapter.held_stop(), HeldStop::Waiting);
+    let finished = adapter
+        .receive(
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-d","status":"completed","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&finished).is_empty());
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-d"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "nothing left to stop");
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
+}
+
 /// A child is a thread of its own: stopping it interrupts its turn alone,
 /// and cancelling the parent's turn names only the parent's.
 #[test]
@@ -3368,6 +3612,60 @@ fn child_resume_without_embedded_turns_reads_history_and_settles_idle() {
             .any(|event| matches!(event, Event::SubagentItem { id, .. } if id == "child-exact"))
     );
     assert!(!adapter.child_buffer.contains_key("child-exact"));
+}
+
+#[test]
+fn active_child_history_fallback_names_the_newest_turn_to_stop() {
+    let mut parent = adapter();
+    let mut discovered = Step::default();
+    parent
+        .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+        .unwrap();
+    let resumed = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"},"turns":[]}}})).unwrap();
+    assert_eq!(resumed.writes[0]["method"], "thread/turns/list");
+    assert!(resumed.writes[0]["params"]["cursor"].is_null());
+    assert_eq!(resumed.writes[0]["params"]["sortDirection"], "desc");
+    assert!(parent.children["child-exact"].turn.is_none());
+    parent.receive(json!({"id":resumed.writes[0]["id"],"result":{"data":[{"id":"newer","status":"inProgress","items":[]},{"id":"older","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert_eq!(
+        parent.children["child-exact"].turn.as_deref(),
+        Some("newer")
+    );
+    let stopped = parent
+        .command(Command::StopSubagent {
+            id: "child-exact".into(),
+        })
+        .unwrap();
+    assert_eq!(stopped.writes.len(), 1);
+    assert_eq!(stopped.writes[0]["method"], "turn/interrupt");
+    assert_eq!(
+        stopped.writes[0]["params"],
+        json!({"threadId":"child-exact","turnId":"newer"})
+    );
+}
+
+#[test]
+fn active_child_history_fallback_with_completed_newest_turn_has_no_turn_to_stop() {
+    let mut parent = adapter();
+    let mut discovered = Step::default();
+    parent
+        .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+        .unwrap();
+    let resumed = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"},"turns":[]}}})).unwrap();
+    assert_eq!(resumed.writes[0]["method"], "thread/turns/list");
+    assert!(resumed.writes[0]["params"]["cursor"].is_null());
+    assert_eq!(resumed.writes[0]["params"]["sortDirection"], "desc");
+    parent.receive(json!({"id":resumed.writes[0]["id"],"result":{"data":[{"id":"newer","status":"completed","items":[]},{"id":"older","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(parent.children["child-exact"].turn.is_none());
+    assert_eq!(
+        parent
+            .command(Command::StopSubagent {
+                id: "child-exact".into(),
+            })
+            .err()
+            .as_deref(),
+        Some("This Codex subagent has no active turn to stop")
+    );
 }
 
 #[test]
@@ -4535,7 +4833,7 @@ fn orchestrating_turn_outlives_the_live_tool_bound() {
     // running until its turn ends, whether it arrives in the turn's
     // history or as it starts.
     let auxiliary = |index: usize| {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             json!({"id":format!("aux-{index}"),"type":"sleep","durationMs":1000})
         } else {
             json!({"id":format!("aux-{index}"),"type":"subAgentActivity","kind":"started","agentThreadId":"child","agentPath":"/root/review"})

@@ -251,13 +251,20 @@ pub(super) type LimitEpisode = Vec<(String, Option<String>)>;
 #[derive(Default)]
 pub(super) struct State {
     pub incidents: Vec<Incident>,
-    pub expanded: HashSet<String>,
+    pub expanded: Revised<HashSet<String>>,
     pub revision: u64,
     pub(super) limit_occurrence: u64,
     limit_markers: std::collections::BTreeMap<String, LimitMarker>,
     pub local_error: Option<Arc<str>>,
     pub find_expanded: HashSet<String>,
+    /// Written only through [`State::store_preview`] and
+    /// [`State::prune_previews`], which keep `previews_stamp` current.
     previews: HashMap<String, Preview>,
+    /// Moves whenever the text of a preview that may be exposed appears or
+    /// changes. A preview rebuilt for a new Find query that reads the same
+    /// keeps it, which is why this is not simply a [`Revised`] map: the query
+    /// is bookkeeping.
+    previews_stamp: revised::Stamp,
     item_metadata: HashMap<Source, (Arc<chat::Item>, String, Metadata)>,
 }
 
@@ -274,7 +281,7 @@ fn provider_item_text(provider: Provider, item: &chat::Item) -> Option<&str> {
         } if match provider {
             Provider::Claude => matches!(name.as_str(), "Agent" | "Task"),
             Provider::Codex => matches!(name.as_str(), "spawnAgent" | "spawn_agent"),
-            Provider::Omp => false,
+            Provider::Omp | Provider::Antigravity | Provider::Muse => false,
         } =>
         {
             Some(output)
@@ -731,7 +738,7 @@ impl State {
                 runtime,
                 &child.items,
                 |item| Source::ChildItem(child.id.clone(), item.id.clone()),
-                &item_context,
+                item_context,
             );
             let mut latest = None;
             for item in &child.items {
@@ -1018,13 +1025,14 @@ impl State {
                             && !previous.active)
                 },
             )));
-        state.expanded = runtime
-            .failure_ui
-            .expanded
-            .iter()
-            .filter(|key| state.incidents.iter().any(|incident| &incident.key == *key))
-            .cloned()
-            .collect();
+        // Carry the reader's disclosures, and their stamp unless one names an
+        // incident that is gone.
+        let incident = |key: &String| state.incidents.iter().any(|incident| &incident.key == key);
+        let mut expanded = runtime.failure_ui.expanded.clone();
+        if !expanded.iter().all(incident) {
+            expanded.edit().retain(incident);
+        }
+        state.expanded = expanded;
         state.find_expanded = runtime
             .failure_ui
             .find_expanded
@@ -1086,8 +1094,32 @@ impl State {
         state.revision = hash.finish();
         if state.revision == runtime.failure_ui.revision {
             state.previews = runtime.failure_ui.previews.clone();
+            state.previews_stamp = runtime.failure_ui.previews_stamp;
         }
         state
+    }
+
+    /// What the exposed diagnostic previews read: the incidents they belong
+    /// to, which of them are open, and their bounded text.
+    pub(super) fn exposure(&self) -> (u64, revised::Stamp, revised::Stamp) {
+        (self.revision, self.expanded.stamp(), self.previews_stamp)
+    }
+
+    fn store_preview(&mut self, key: &str, preview: Preview) {
+        if self.previews.get(key).is_none_or(|stored| {
+            (stored.text.as_str(), stored.omitted) != (preview.text.as_str(), preview.omitted)
+        }) {
+            self.previews_stamp = revised::Stamp::fresh();
+        }
+        self.previews.insert(key.to_owned(), preview);
+    }
+
+    /// Releases the previews of incidents that are no longer open.
+    ///
+    /// Only an open incident's preview is ever exposed, so releasing the
+    /// others changes nothing a reader sees and keeps `previews_stamp`.
+    fn prune_previews(&mut self) {
+        self.previews.retain(|key, _| self.expanded.contains(key));
     }
 
     pub fn child_item(&self, child: &str, id: &str) -> Option<(&Incident, bool)> {
@@ -1400,8 +1432,8 @@ impl Runtime {
                 break;
             }
         }
-        self.failure_ui.previews.insert(
-            key.to_owned(),
+        self.failure_ui.store_preview(
+            key,
             Preview {
                 query: self.find.clone(),
                 text: preview,
@@ -1427,7 +1459,8 @@ impl Runtime {
             None => incident.first_item.clone(),
         }
         .unwrap_or_else(|| item.to_owned());
-        if self.failure_ui.expanded.insert(key.clone()) {
+        if !self.failure_ui.expanded.contains(&key) {
+            self.failure_ui.expanded.edit().insert(key.clone());
             self.failure_ui.find_expanded.insert(key.clone());
         }
         self.cache_failure_preview(&key);
@@ -1436,11 +1469,11 @@ impl Runtime {
 
     pub(super) fn restore_failure_find(&mut self) {
         for key in self.failure_ui.find_expanded.drain() {
-            self.failure_ui.expanded.remove(&key);
+            if self.failure_ui.expanded.contains(&key) {
+                self.failure_ui.expanded.edit().remove(&key);
+            }
         }
-        self.failure_ui
-            .previews
-            .retain(|key, _| self.failure_ui.expanded.contains(key));
+        self.failure_ui.prune_previews();
         self.refresh_failure_previews();
     }
 
@@ -1527,7 +1560,7 @@ impl Runtime {
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::LEADING_ICON_SIZE),
-                design::body(if let Some(reopen) = blocked_start {
+                design::transcript(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
                         reopen.draft_headline()
                     } else {
@@ -1785,6 +1818,7 @@ mod tests {
         match provider {
             Provider::Codex => format!("{message}/input/{index}"),
             Provider::Claude | Provider::Omp => format!("{message}:{index}"),
+            Provider::Antigravity | Provider::Muse => unreachable!("no native chat decodes them"),
         }
     }
 
@@ -1853,7 +1887,7 @@ mod tests {
 
     /// Whether the incident's notice is part of the visible transcript.
     fn notice_visible(runtime: &mut Runtime, key: &str) -> bool {
-        runtime.failure_ui.expanded.insert(key.to_owned());
+        runtime.failure_ui.expanded.edit().insert(key.to_owned());
         runtime.cache_failure_preview(key);
         runtime
             .selection_document()
@@ -1996,9 +2030,13 @@ mod tests {
         );
         for (index, open) in [false, true, false].into_iter().enumerate() {
             if open {
-                runtime.failure_ui.expanded.insert(incident.key.clone());
+                runtime
+                    .failure_ui
+                    .expanded
+                    .edit()
+                    .insert(incident.key.clone());
             } else {
-                runtime.failure_ui.expanded.remove(&incident.key);
+                runtime.failure_ui.expanded.edit().remove(&incident.key);
             }
             let mut element = runtime.failure_diagnostics(&incident, design::sunken);
             tree.diff(element.as_widget_mut());
@@ -2212,7 +2250,7 @@ mod tests {
         let (mut runtime, handle) = live_fixture(provider, delivered_work(provider, message));
         publish_error(&mut runtime, &handle, raw);
         let key = runtime.failure_ui.incidents[0].key.clone();
-        runtime.failure_ui.expanded.insert(key.clone());
+        runtime.failure_ui.expanded.edit().insert(key.clone());
 
         // The latest page now starts at the delivery, the error still live.
         publish(&mut runtime, &handle, |page| {

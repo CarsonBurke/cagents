@@ -183,7 +183,7 @@ fn native_permissions_opens_locally_even_while_busy_and_preserves_attachments() 
     assert!(runtime.composer.text().trim().is_empty());
     assert_eq!(runtime.attachments[0].path, PathBuf::from("retained.png"));
     assert!(runtime.followups.is_empty());
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(app.dismiss_chat_picker());
     assert!(!chat_runtime(&app, card).permission_picker);
     assert!(
@@ -232,7 +232,7 @@ fn permission_retry_preserves_the_draft_and_requires_a_current_exact_action() {
     assert!(draft.starts_with("Keep this next task\n\nI authorize"));
     assert!(draft.contains("git push origin topic"));
     assert_eq!(runtime.attachments.len(), 1);
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert_eq!(runtime.snapshot.permission_denials.len(), 1);
 }
 
@@ -284,7 +284,7 @@ fn permission_retry_promotes_recalled_text_for_navigation_and_persistence() {
         assert!(runtime.history_cursor.is_none());
         assert!(runtime.history_stash.is_none());
         assert_eq!(runtime.attachments.len(), 1);
-        assert!(runtime.pending.is_none());
+        assert!(runtime.commands.is_idle());
         assert!(runtime.followups.is_empty());
         assert_eq!(app.persistent_workspace().chat_drafts[&card], prepared);
 
@@ -1126,7 +1126,7 @@ fn preview_hide_and_subagent_switch_release_owners_and_fence_late_attempts() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(target).unwrap();
-    preview_items(runtime, &[parent.clone()]);
+    preview_items(runtime, std::slice::from_ref(&parent));
     let parent_attempt = runtime.cache[&parent.id].image_attempt;
     finish_preview(
         runtime,
@@ -1196,13 +1196,16 @@ fn explicit_preview_pressure_can_retire_automatic_owners_in_other_panes() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(owner_target).unwrap();
-    preview_items(runtime, &[old.clone()]);
+    preview_items(runtime, std::slice::from_ref(&old));
     finish_preview(
         runtime,
         &old,
         images::bounded_handle(bytes.clone(), &budget),
     );
-    preview_items(app.chat_runtime_mut(target).unwrap(), &[requested.clone()]);
+    preview_items(
+        app.chat_runtime_mut(target).unwrap(),
+        std::slice::from_ref(&requested),
+    );
     drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
     let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
     drop(app.handle_chat_ui(Action::ImageLoaded(
@@ -1432,7 +1435,7 @@ fn local_followups_stay_separate_and_are_taken_back_or_removed_one_at_a_time() {
             Path::new("third.png")
         ]
     );
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(runtime.composer.text().trim().is_empty());
     assert!(runtime.transition_blocker().is_some());
     assert!(runtime.handoff_blocker().is_some());
@@ -1512,13 +1515,16 @@ fn a_local_followup_resumes_when_idle_arrives_before_an_unrelated_ack() {
                 },
                 false,
             ));
-            let id = chat_runtime(&app, card).pending.as_ref().unwrap().id;
+            let id = chat_runtime(&app, card).commands.in_flight().unwrap().id;
             drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-            assert_eq!(chat_runtime(&app, card).pending.as_ref().unwrap().id, id);
+            assert_eq!(
+                chat_runtime(&app, card).commands.in_flight().unwrap().id,
+                id
+            );
             settle(&mut app, card, result);
-            let pending = chat_runtime(&app, card).pending.as_ref().unwrap();
+            let pending = chat_runtime(&app, card).commands.in_flight().unwrap();
             assert_ne!(pending.id, id);
-            assert!(pending.followup);
+            assert!(!pending.followups.is_empty());
             assert_eq!(pending.sent.as_deref().unwrap().trim(), "next task");
             settle(&mut app, card, Ok(()));
             assert!(chat_runtime(&app, card).followups.is_empty());
@@ -1544,8 +1550,8 @@ fn a_combined_followup_is_sent_as_one_prompt_and_keeps_the_new_draft() {
     }
     drop(app.dispatch_queued(target));
     let runtime = app.chat_runtime_mut(target).unwrap();
-    let pending = runtime.pending.as_ref().unwrap();
-    assert!(pending.followup);
+    let pending = runtime.commands.in_flight().unwrap();
+    assert!(!pending.followups.is_empty());
     assert_eq!(
         pending.sent.as_deref().unwrap().trim(),
         "/compact\nalso include the second task"
@@ -1571,25 +1577,31 @@ fn a_rejected_combined_followup_restores_order_without_consuming_an_inflight_dra
         followup(0, "first", &["first.png"]),
         followup(1, "second", &[]),
     ];
+    runtime.next_written = 2;
     drop(app.dispatch_queued(target));
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.replace_draft(text_editor::Content::with_text("later"));
     runtime.attach([PathBuf::from("later.png")]);
+    // Written while the others are on their way, it waits behind them.
     drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
-    assert_eq!(chat_runtime(&app, card).followups.len(), 2);
-    assert_eq!(chat_runtime(&app, card).composer.text().trim(), "later");
+    assert_eq!(chat_runtime(&app, card).followups.len(), 3);
+    assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
     for action in [
         Action::TakeBackQueued(target, Some(QueueEntry::Local(0))),
-        Action::TakeBackQueued(target, None),
         Action::RemoveQueued(target, QueueEntry::Local(1)),
     ] {
         drop(app.handle_chat_ui(action));
         assert_eq!(
             chat_runtime(&app, card).followups.len(),
-            2,
+            3,
             "an in-flight send keeps what it is carrying"
         );
     }
+    // The one not yet on its way is still the reader's to take back.
+    drop(app.handle_chat_ui(Action::TakeBackQueued(target, None)));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.followups.len(), 2);
+    assert_eq!(runtime.composer.text().trim(), "later");
     settle(&mut app, card, Err("fixture rejected".into()));
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.composer.text().trim(), "first\nsecond\nlater");
@@ -1598,6 +1610,38 @@ fn a_rejected_combined_followup_restores_order_without_consuming_an_inflight_dra
         [Path::new("first.png"), Path::new("later.png")]
     );
     assert!(runtime.followups.is_empty());
+}
+
+/// A follow-up written while the held ones are on their way is not sent
+/// with them, so it stays held once they are taken, and waits for the
+/// turn they start rather than going out beside them.
+#[test]
+fn a_followup_written_while_others_are_sent_waits_for_the_next_turn() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some("followup"));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.followups = vec![followup(0, "first", &[])];
+    runtime.next_written = 1;
+    drop(app.dispatch_queued(target));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.turn_under_way(), "the held follow-up starts a turn");
+    runtime.replace_draft(text_editor::Content::with_text("second"));
+    drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+    settle(&mut app, card, Ok(()));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime
+            .followups
+            .iter()
+            .map(|followup| followup.text.as_str())
+            .collect::<Vec<_>>(),
+        ["second"]
+    );
+    assert!(runtime.commands.is_idle(), "nothing more is sent yet");
+    assert!(runtime.turn_under_way(), "until the first shows");
+    let local = runtime.local_prompt().expect("the sent follow-up shows");
+    assert_eq!(local.text(), "first");
 }
 
 #[test]
@@ -1647,7 +1691,14 @@ fn sending_a_local_followup_preserves_the_later_composer_draft() {
     runtime.followups.push(followup(0, "queued task", &[]));
     runtime.replace_draft(text_editor::Content::with_text("later draft"));
     let _ = app.dispatch_queued(target);
-    assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
+    assert!(
+        chat_runtime(&app, card)
+            .commands
+            .in_flight()
+            .unwrap()
+            .followups
+            .contains(&0)
+    );
     settle(&mut app, card, Ok(()));
     assert!(chat_runtime(&app, card).followups.is_empty());
     assert_eq!(
@@ -2135,7 +2186,7 @@ fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
         1,
         "only parent source is prepared before child selection"
     );
-    assert!(runtime.cache["body-2"].markdown.items().len() > 0);
+    assert!(!runtime.cache["body-2"].markdown.items().is_empty());
     for selected in [Some("child-2"), Some("child-3"), None] {
         drop(app.handle_chat_ui(Action::SelectSubagent(target, selected.map(str::to_owned))));
         let runtime = app.chat_runtime_mut(target).unwrap();
@@ -2420,7 +2471,7 @@ fn a_short_historical_page_can_explicitly_return_to_latest() {
     Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).has_later = true;
     let _ = app.handle_chat_ui(Action::Latest(target));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Latest)
     );
 }
@@ -2601,7 +2652,7 @@ fn only_a_whole_removable_message_can_be_taken_back() {
         target,
         Some(QueueEntry::Provider("partial".into())),
     )));
-    assert!(chat_runtime(&app, card).pending.is_none());
+    assert!(chat_runtime(&app, card).commands.is_idle());
     // A provider that cannot remove a message cannot give it back either.
     let mut snapshot = (*handle.snapshot()).clone();
     snapshot.capabilities.queue_remove = false;
@@ -2773,7 +2824,7 @@ fn history_reconnect_discards_old_request_generation_and_navigation() {
     assert!(runtime.later_asked.is_none());
     drop(app.handle_chat_ui(Action::Command(reconnect, Command::LoadEarlier)));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Earlier)
     );
 }
@@ -2794,7 +2845,7 @@ fn history_loading_outlives_ack_and_releases_on_provider_response() {
     );
     drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
     assert!(
-        chat_runtime(&app, card).pending.is_none(),
+        chat_runtime(&app, card).commands.is_idle(),
         "duplicate request is suppressed after command ACK"
     );
     snapshot.generation += 1;
@@ -2818,7 +2869,7 @@ fn history_cached_response_before_ack_does_not_latch_loading_forever() {
     assert!(chat_runtime(&app, card).page_request.is_none());
     drop(app.handle_chat_ui(Action::Command(target, Command::LoadEarlier)));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Earlier)
     );
 }
@@ -2853,7 +2904,7 @@ fn history_edge_and_short_page_click_wait_for_unrelated_command() {
         assert!(chat_runtime(&app, card).earlier_asked.is_none());
         settle(&mut app, card, Ok(()));
         assert_eq!(
-            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            chat_runtime(&app, card).commands.in_flight().unwrap().page,
             Some(view::Page::Earlier)
         );
     }
@@ -2889,7 +2940,7 @@ fn history_explicit_navigation_survives_wheeling_away_from_the_edge() {
     );
     settle(&mut app, card, Ok(()));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Earlier)
     );
 }
@@ -2914,7 +2965,7 @@ fn history_failure_can_retry_without_leaving_the_boundary() {
         Some(view::Page::Earlier),
     )));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Earlier)
     );
 }
@@ -3008,7 +3059,7 @@ fn history_provider_failure_can_retry_at_the_same_edge_after_ack() {
         Some(view::Page::Earlier),
     )));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Earlier)
     );
 }
@@ -3024,7 +3075,7 @@ fn history_geometry_changes_never_trigger_paging_even_when_page_heights_match() 
         view::Scroll::new(0.0, 100.0, 400.0),
     ] {
         drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll, None)));
-        assert!(chat_runtime(&app, card).pending.is_none());
+        assert!(chat_runtime(&app, card).commands.is_idle());
     }
 }
 
@@ -3058,7 +3109,7 @@ fn history_latest_gesture_cancels_when_reader_leaves_bottom() {
     )));
     assert!(chat_runtime(&app, card).deferred_page.is_none());
     settle(&mut app, card, Ok(()));
-    assert!(chat_runtime(&app, card).pending.is_none());
+    assert!(chat_runtime(&app, card).commands.is_idle());
 }
 
 #[test]
@@ -3073,7 +3124,7 @@ fn history_bottom_requests_cached_next_page_instead_of_refreshing_to_latest() {
         Some(view::Page::Newer),
     )));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Newer)
     );
 }
@@ -3107,7 +3158,7 @@ fn history_explicit_latest_survives_leaving_bottom() {
     );
     settle(&mut app, card, Ok(()));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Latest)
     );
 }
@@ -3155,7 +3206,7 @@ fn history_repeated_latest_after_ack_waits_for_provider_history() {
         Some(view::Page::Latest)
     );
     drop(app.handle_chat_ui(Action::Latest(target)));
-    assert!(chat_runtime(&app, card).pending.is_none());
+    assert!(chat_runtime(&app, card).commands.is_idle());
     snapshot.generation += 1;
     snapshot.history_loading = false;
     snapshot.has_later = false;
@@ -3209,7 +3260,7 @@ fn history_latest_cancels_earlier_even_before_historical_page_arrives() {
     settle(&mut app, card, Ok(()));
     drop(app.handle_chat_ui(Action::Latest(target)));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Latest)
     );
 }
@@ -3244,7 +3295,7 @@ fn history_subagent_scroll_and_latest_never_page_parent() {
     );
     assert_eq!(chat_runtime(&app, card).active_scroll(), child);
     drop(app.handle_chat_ui(Action::Latest(target)));
-    assert!(chat_runtime(&app, card).pending.is_none());
+    assert!(chat_runtime(&app, card).commands.is_idle());
 }
 
 #[test]
@@ -3459,6 +3510,7 @@ fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
     app.chat_runtime_mut(target)
         .unwrap()
         .opened
+        .edit()
         .insert("prompt".into(), false);
     drop(find_navigation::find_for_test(
         &mut app,
@@ -3477,7 +3529,7 @@ fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
     );
     assert_eq!(runtime.opened.get("prompt"), Some(&true));
     assert!(
-        runtime.pending.is_none(),
+        runtime.commands.is_idle(),
         "Find must not send provider commands"
     );
     assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 3);
@@ -3513,7 +3565,7 @@ fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
     assert_eq!(runtime.opened.get("prompt"), Some(&true));
     assert_eq!(output_count(runtime, &renderer, &mut rendered_tree), 2);
     assert!(runtime.find.is_none() && runtime.find_matches.is_empty());
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
 }
 
 #[test]
@@ -3560,7 +3612,8 @@ fn tool_group_toggles_override_both_default_choices() {
             }],
             &HashSet::new(),
             Presentations(&HashMap::new()),
-        );
+        )
+        .into();
         let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
         assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&!default));
         let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
@@ -3634,6 +3687,131 @@ fn paged_tool_groups_keep_reader_choices_when_their_prompt_is_evicted() {
 }
 
 #[test]
+fn selection_catalog_is_rebuilt_only_when_exposed_text_or_disclosure_changes() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some("selection-catalog"));
+    let target = chat_runtime(&app, card).target;
+    let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![
+        Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("question"),
+            started_at: None,
+            at: None,
+        }),
+        Arc::new(chat::Item {
+            id: "tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Inspect".into(),
+                input: "{}".into(),
+                output: "tool output".into(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        }),
+    ];
+    show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+    // An open diagnostic whose bounded preview a Find query can move.
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let anchor = runtime.turns[0].key.clone();
+    runtime.failures = vec![failure::Note {
+        message: Some(anchor.clone()),
+        after: Some(anchor),
+        text: format!(
+            "Provider failure\n{}\nDIAGNOSTIC_TAIL",
+            "diagnostic bytes ".repeat(4096)
+        ),
+    }];
+    runtime.refresh_failure_ui();
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    drop(app.handle_chat_ui(Action::ToggleFailure(target, key.clone())));
+    let catalog = |app: &Cagents| chat_runtime(app, card).selection_document().0;
+    let preview = |catalog: &selection::Catalog| {
+        catalog
+            .text(failure::diagnostic_preview_identity(&key))
+            .expect("the open diagnostic preview is selectable")
+    };
+
+    let built = catalog(&app);
+    assert!(!preview(&built).contains("DIAGNOSTIC_TAIL"));
+    assert!(
+        Arc::ptr_eq(&built, &catalog(&app)),
+        "an unchanged view reuses it"
+    );
+
+    snapshot.generation += 1;
+    snapshot.detail = "Still working".into();
+    show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+    assert!(
+        Arc::ptr_eq(&built, &catalog(&app)),
+        "a metadata-only publication exposes nothing new"
+    );
+
+    for query in ["absent", "absentee"] {
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            query.into(),
+        ));
+        assert!(
+            Arc::ptr_eq(&built, &catalog(&app)),
+            "a Find keystroke that reveals and restores nothing keeps it"
+        );
+    }
+
+    drop(find_navigation::find_for_test(
+        &mut app,
+        target,
+        "DIAGNOSTIC_TAIL".into(),
+    ));
+    let found = catalog(&app);
+    assert!(
+        !Arc::ptr_eq(&built, &found),
+        "a query that moves the preview's window changes exposed text"
+    );
+    assert!(preview(&found).contains("DIAGNOSTIC_TAIL"));
+    assert!(Arc::ptr_eq(&found, &catalog(&app)));
+
+    drop(app.handle_chat_ui(Action::CloseFind(target)));
+    let closed = catalog(&app);
+    assert!(!preview(&closed).contains("DIAGNOSTIC_TAIL"));
+    assert!(Arc::ptr_eq(&closed, &catalog(&app)));
+
+    drop(app.handle_chat_ui(Action::Toggle(target, "tool".into())));
+    let disclosed = catalog(&app);
+    assert!(
+        !Arc::ptr_eq(&closed, &disclosed),
+        "opening a step changes what is exposed"
+    );
+    assert!(Arc::ptr_eq(&disclosed, &catalog(&app)));
+
+    // A question regroups the transcript around its boundary without
+    // touching any item, so no presented text moves; the grouping does.
+    let presented = chat_runtime(&app, card).presentation_revision;
+    snapshot.generation += 1;
+    snapshot.requests = vec![chat::Request {
+        kind: crate::chat::RequestKind::Approval,
+        id: "approval".into(),
+        title: "Allow Bash?".into(),
+        description: String::new(),
+        fields: vec![],
+        actions: vec![],
+    }];
+    show_chat_snapshot_for_test(&mut app, card, snapshot);
+    assert_eq!(chat_runtime(&app, card).presentation_revision, presented);
+    let regrouped = catalog(&app);
+    assert!(
+        !Arc::ptr_eq(&disclosed, &regrouped),
+        "a regroup with unchanged items is still a new catalog"
+    );
+    assert!(Arc::ptr_eq(&regrouped, &catalog(&app)));
+}
+
+#[test]
 fn paging_inherits_reader_choices_without_retaining_temporary_find_disclosure() {
     for explicit in [false, true] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -3691,13 +3869,17 @@ fn paging_inherits_reader_choices_without_retaining_temporary_find_disclosure() 
 
 #[test]
 fn disclosure_choices_survive_history_eviction_and_are_bounded() {
-    let mut opened = HashMap::from([("u1".to_owned(), true)]);
+    let mut opened = Revised::new(HashMap::from([("u1".to_owned(), true)]));
+    let stamp = opened.stamp();
     reconcile_disclosure(&mut opened, &[]);
     assert_eq!(opened.get("u1"), Some(&true));
-    opened.insert("u1".to_owned(), false);
+    assert_eq!(opened.stamp(), stamp, "within budget, nothing is pruned");
+    opened.edit().insert("u1".to_owned(), false);
     reconcile_disclosure(&mut opened, &[]);
     assert_eq!(opened.get("u1"), Some(&false));
-    opened.extend((0..4097).map(|index| (format!("old-{index}"), true)));
+    opened
+        .edit()
+        .extend((0..4097).map(|index| (format!("old-{index}"), true)));
     reconcile_disclosure(&mut opened, &[]);
     assert!(opened.is_empty());
 }
@@ -3943,13 +4125,14 @@ fn the_footer_names_the_conversations_account_through_a_pending_switch() {
         let accounts = app
             .chat_accounts(launch.provider, &launch.recipe)
             .expect("two accounts to choose between");
-        let current = accounts.current;
+        let current = accounts.current.to_owned();
         let candidate = accounts
             .choices
             .into_iter()
             .find(|choice| !choice.selected)
             .expect("an account to switch to")
-            .label;
+            .label
+            .to_owned();
         assert_ne!(current, candidate);
         // Names the conversation's account, and not the one it may move
         // to, which it has not reached.
@@ -4085,7 +4268,7 @@ fn a_busy_daemon_refusing_an_automatic_switch_keeps_the_conversation_on_its_acco
             // Details carry only what the notice doesn't already say.
             let key = notice.key.clone();
             let runtime = app.chat_runtime_mut(target).unwrap();
-            runtime.failure_ui.expanded.insert(key.clone());
+            runtime.failure_ui.expanded.edit().insert(key.clone());
             runtime.cache_failure_preview(&key);
             assert_eq!(runtime.failure_preview(&key), Some((REASON, false)));
         }
@@ -4459,7 +4642,7 @@ fn a_pane_inspector_overlay_excludes_covered_widgets_and_keeps_other_panes_reach
     let composer = card_control_id(card, "chat-composer");
     let sibling = widget::Id::new("inspector-test.other-pane");
     let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 720.0));
-    let mut tree = Tree::new(&view(&app, card));
+    let mut tree = Tree::new(view(&app, card));
     {
         let mut element = view(&app, card);
         let node = element.as_widget_mut().layout(
@@ -4857,7 +5040,7 @@ fn selected_child_find_searches_visible_scope_and_preserves_explicit_disclosures
     drop(app.handle_chat_ui(Action::CloseFind(target)));
     assert!(chat_runtime(&app, card).child_expanded["one"].contains("same#opaque-id"));
     assert!(
-        chat_runtime(&app, card).pending.is_none(),
+        chat_runtime(&app, card).commands.is_idle(),
         "Find is local UI state"
     );
 }
@@ -5187,6 +5370,7 @@ fn selected_presentation_bounds_child_disclosure_history_without_crossing_transc
         .child_expanded
         .get_mut("long-running-child")
         .unwrap()
+        .edit()
         .extend((0..2048).map(|index| format!("retired-item-{index}")));
     runtime
         .child_unfolded
@@ -5551,7 +5735,10 @@ fn account_picker_keyboard_reaches_manage_accounts_and_activates_it() {
     assert!(!app.chat_start_pending(card));
 }
 
-fn permission_key(key: keyboard::key::Named, modifiers: keyboard::Modifiers) -> keyboard::Event {
+pub(super) fn permission_key(
+    key: keyboard::key::Named,
+    modifiers: keyboard::Modifiers,
+) -> keyboard::Event {
     keyboard::Event::KeyPressed {
         key: keyboard::Key::Named(key),
         modified_key: keyboard::Key::Named(key),
@@ -5773,7 +5960,7 @@ fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_wa
         );
         assert_eq!(describe(messages), name);
         assert!(
-            chat_runtime(&app, card).pending.is_none(),
+            chat_runtime(&app, card).commands.is_idle(),
             "traversal itself submits no provider action"
         );
     }
@@ -6367,6 +6554,54 @@ fn default_pane_keeps_attached_files() {
 }
 
 #[test]
+fn file_completion_reuses_matches_until_files_or_query_change() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    write(&mut app, card, "@sr");
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let paths = vec!["src/main.rs".to_owned(), "src/lib.rs".to_owned()];
+    runtime.files = Some(Arc::new(paths.clone()));
+    let before = completion::FILE_MATCHES.with(std::cell::Cell::get);
+    for _ in 0..3 {
+        assert!(runtime.completion().is_some());
+    }
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 1
+    );
+
+    runtime.files = Some(Arc::new(paths));
+    assert!(runtime.completion().is_some());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 2
+    );
+
+    runtime
+        .composer
+        .perform(text_editor::Action::Edit(text_editor::Edit::Insert('c')));
+    assert!(runtime.completion().is_some());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 3
+    );
+
+    let files = runtime.files.take();
+    assert!(runtime.completion().is_none());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 3
+    );
+    runtime.files = files;
+    assert!(runtime.completion().is_some());
+    assert_eq!(
+        completion::FILE_MATCHES.with(std::cell::Cell::get),
+        before + 3
+    );
+}
+
+#[test]
 fn a_draft_completes_a_skill_and_queues_it_without_starting_early() {
     const INVOCATION: &str = "[$review](/skills/review/SKILL.md)";
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -6410,6 +6645,7 @@ fn a_draft_completes_a_skill_and_queues_it_without_starting_early() {
             .queued
             .as_ref()
             .unwrap()
+            .prompt
             .source
             .text()
             .trim(),
@@ -6587,37 +6823,13 @@ fn composer_history_key(
     key: keyboard::key::Named,
     renderer: &cosmic::Renderer,
 ) {
-    use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
-    let viewport = iced::Rectangle::with_size(iced::Size::new(width, 720.0));
-    let mut messages = Vec::new();
-    {
-        let mut element = app.chat_view(card);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            renderer,
-            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
-        );
-        element.as_widget_mut().operate(
-            &mut tree,
-            Layout::new(&node),
-            renderer,
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
-                card,
-                "chat-composer",
-            )),
-        );
-        element.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Keyboard(permission_key(key, keyboard::Modifiers::empty())),
-            Layout::new(&node),
-            iced::mouse::Cursor::Unavailable,
-            renderer,
-            &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
-        );
-    }
+    let messages = composer_key_messages(
+        app,
+        card,
+        width,
+        permission_key(key, keyboard::Modifiers::empty()),
+        renderer,
+    );
     assert!(
         !messages.is_empty(),
         "the focused native composer must handle the arrow"
@@ -6625,6 +6837,47 @@ fn composer_history_key(
     for message in messages {
         drop(app.update(message));
     }
+}
+
+/// What the focused native composer of the real chat, laid out `width`
+/// wide, publishes for `event`, before any of it is handled.
+pub(super) fn composer_key_messages(
+    app: &Cagents,
+    card: CardId,
+    width: f32,
+    event: keyboard::Event,
+    renderer: &cosmic::Renderer,
+) -> Vec<Message> {
+    use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+    let viewport = iced::Rectangle::with_size(iced::Size::new(width, 720.0));
+    let mut messages = Vec::new();
+    let mut element = app.chat_view(card);
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        renderer,
+        &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+    );
+    element.as_widget_mut().operate(
+        &mut tree,
+        Layout::new(&node),
+        renderer,
+        &mut iced::advanced::widget::operation::focusable::focus::<()>(card_control_id(
+            card,
+            "chat-composer",
+        )),
+    );
+    element.as_widget_mut().update(
+        &mut tree,
+        &iced::Event::Keyboard(event),
+        Layout::new(&node),
+        iced::mouse::Cursor::Unavailable,
+        renderer,
+        &mut clipboard::Null,
+        &mut Shell::new(&mut messages),
+        &viewport,
+    );
+    messages
 }
 
 #[test]
@@ -6650,9 +6903,8 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                 .composer
                 .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
 
-            let mut moved = 0;
             let mut boundary = None;
-            for _ in 0..256 {
+            for moved in 0..256 {
                 let before = chat_runtime(&app, card).composer.cursor();
                 composer_history_key(&mut app, card, width, Named::ArrowUp, &renderer);
                 let runtime = chat_runtime(&app, card);
@@ -6670,7 +6922,6 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                     before,
                     "Up must move within the draft"
                 );
-                moved += 1;
             }
             let boundary = boundary.expect("Up eventually reaches native history");
             assert_eq!(
@@ -7579,7 +7830,7 @@ fn valid_empty_paste_preserves_later_native_selection_and_caret() {
             assert!(runtime.attachment_bookmarks.is_empty());
             assert!(runtime.attachment_order.is_empty());
             assert!(runtime.submit_after_paste.is_none());
-            assert!(runtime.pending.is_none());
+            assert!(runtime.commands.is_idle());
             assert!(runtime.error.is_none());
         }
     }
@@ -7659,7 +7910,7 @@ fn valid_empty_paste_keeps_recalled_history_and_down_restores_the_image_draft() 
             assert!(runtime.history_cursor.is_none());
             assert!(runtime.history_stash.is_none());
             assert!(runtime.history_attachment_stash.is_none());
-            assert!(runtime.pending.is_none());
+            assert!(runtime.commands.is_idle());
         }
     });
 }
@@ -7678,14 +7929,14 @@ fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
         let replay = second.clone();
         submit(&mut app, card);
         let runtime = chat_runtime(&app, card);
-        assert!(runtime.pending.is_none());
+        assert!(runtime.commands.is_idle());
         assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
 
         drop(app.handle_chat_ui(Action::PastedText(target, first, None)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.pastes_pending, 1);
         assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
-        assert!(runtime.pending.is_none());
+        assert!(runtime.commands.is_idle());
         assert_eq!(runtime.composer.text(), text);
 
         drop(app.handle_chat_ui(Action::PastedText(target, second, Some(String::new()))));
@@ -7697,14 +7948,14 @@ fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
         assert!(runtime.submit_after_paste.is_none());
         if text.is_empty() {
             assert!(
-                runtime.pending.is_none(),
+                runtime.commands.is_idle(),
                 "empty clipboard cannot invent a prompt"
             );
         } else {
             assert_eq!(
                 runtime
-                    .pending
-                    .as_ref()
+                    .commands
+                    .in_flight()
                     .unwrap()
                     .sent
                     .as_deref()
@@ -7712,11 +7963,11 @@ fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
                 Some(text)
             );
         }
-        let pending_id = runtime.pending.as_ref().map(|pending| pending.id);
+        let pending_id = runtime.commands.in_flight().map(|pending| pending.id);
         drop(app.handle_chat_ui(Action::PastedText(target, replay, None)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(
-            runtime.pending.as_ref().map(|pending| pending.id),
+            runtime.commands.in_flight().map(|pending| pending.id),
             pending_id
         );
         assert!(
@@ -7938,7 +8189,7 @@ fn a_pending_image_paste_stays_with_the_message_it_precedes() {
         runtime.image_pastes_saving = 1;
     }
     submit(&mut app, card);
-    assert!(chat_runtime(&app, card).pending.is_none());
+    assert!(chat_runtime(&app, card).commands.is_idle());
     assert_eq!(
         chat_runtime(&app, card).submit_after_paste,
         Some(PromptMode::Send)
@@ -7958,16 +8209,20 @@ fn a_pending_image_paste_stays_with_the_message_it_precedes() {
     assert_eq!(runtime.pastes_pending, 0);
     assert_eq!(runtime.image_pastes_saving, 0);
     assert_eq!(runtime.submit_after_paste, None);
+    let sending = runtime
+        .commands
+        .in_flight()
+        .expect("send resumes after the image is ready");
+    // The image leaves the composer with the message it was pasted into.
+    assert!(runtime.attachments.is_empty());
+    let outgoing = &sending.outgoing.as_ref().unwrap().prompt;
+    assert_eq!(outgoing.text(), "describe this image");
     assert_eq!(
-        runtime.attachments,
+        outgoing.attachments,
         [Attachment {
             path,
             reference: None,
         }]
-    );
-    assert!(
-        runtime.pending.is_some(),
-        "send resumes after the image is ready"
     );
 }
 
@@ -8011,7 +8266,7 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
     assert_eq!(runtime.pastes_pending, 0);
     assert!(runtime.attachments.is_empty());
     assert!(
-        runtime.pending.is_some(),
+        runtime.commands.in_flight().is_some(),
         "the send waiting on the paste goes ahead with its text"
     );
 
@@ -9170,7 +9425,7 @@ fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
     let armed = runtime
         .interrupt_armed
         .expect("first cancel arms confirmation");
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     // An old timer cannot disarm a later confirmation.
     drop(app.handle_chat_ui(Action::DisarmInterrupt(
         target,
@@ -9182,7 +9437,7 @@ fn cancelling_background_agents_requires_confirmation_and_disarms_at_idle() {
     drop(app.handle_chat_ui(Action::Interrupt(target)));
     drop(app.handle_chat_ui(Action::Interrupt(target)));
     assert!(chat_runtime(&app, card).interrupt_armed.is_none());
-    assert!(chat_runtime(&app, card).pending.is_some());
+    assert!(chat_runtime(&app, card).commands.in_flight().is_some());
     settle(&mut app, card, Ok(()));
     drop(app.handle_chat_ui(Action::Interrupt(target)));
     let runtime = app.chat_runtime_mut(target).unwrap();
@@ -9212,7 +9467,11 @@ fn cancel_confirmation_does_not_cross_a_coalesced_turn_boundary() {
 /// Answers the command `card` is waiting on with `result`.
 pub(super) fn settle(app: &mut Cagents, card: CardId, result: Result<(), String>) {
     let runtime = chat_runtime(app, card);
-    let id = runtime.pending.as_ref().expect("a command is pending").id;
+    let id = runtime
+        .commands
+        .in_flight()
+        .expect("a command is pending")
+        .id;
     let target = runtime.target;
     let _ = app.update(Message::ChatUi(Action::CommandFinished(target, id, result)));
 }
@@ -9867,7 +10126,7 @@ fn non_floor_read_only_snapshot_renders_without_index_reads_or_writer_permission
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text(), "Keep this unsent");
         assert_eq!(runtime.session, session);
-        assert!(runtime.pending.is_none() && runtime.queued.is_none());
+        assert!(runtime.commands.is_idle() && runtime.queued.is_none());
         assert!(app.chat_ui.attempt(card).is_none());
     }
 }
@@ -9995,7 +10254,7 @@ fn saved_history_admits_attachment_chooser_and_completion_without_starting_or_se
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text(), draft);
         assert_eq!(runtime.attachments, attachments);
-        assert!(runtime.pending.is_none() && runtime.queued.is_none());
+        assert!(runtime.commands.is_idle() && runtime.queued.is_none());
         assert!(app.chat_ui.attempt(card).is_none());
     });
 }
@@ -10095,7 +10354,7 @@ fn saved_history_explicit_resume_keeps_the_pane_draft_and_image_unsent() {
         assert_eq!(runtime.composer.text(), "Keep this draft unsent");
         assert_eq!(runtime.composer.cursor(), cursor);
         assert_eq!(runtime.attachments, [image]);
-        assert!(runtime.queued.is_none() && runtime.pending.is_none());
+        assert!(runtime.queued.is_none() && runtime.commands.is_idle());
         assert!(!runtime.disconnected);
         assert!(runtime.handle().unwrap().snapshot().ready);
     });
@@ -10695,7 +10954,7 @@ fn resuming_a_stopped_chat_keeps_its_transcript_and_draft_and_starts_once() {
     assert!(!runtime.resumes_in_place());
     assert_eq!(runtime.composer.text(), "keep this draft");
     assert_eq!(runtime.attachments, attachments);
-    assert!(runtime.pending.is_none(), "the draft was not sent");
+    assert!(runtime.commands.is_idle(), "the draft was not sent");
 }
 
 /// A resume that fails leaves the card stopped with its conversation and
@@ -10888,7 +11147,7 @@ fn a_queue_the_daemon_lost_comes_back_to_the_draft_unsent() {
             whole: true
         })
     );
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(runtime.queued.is_none());
     assert!(runtime.followups.is_empty());
     assert!(!app.chat_ui.waiting.contains_key(&card));
@@ -10915,19 +11174,20 @@ fn a_queue_the_daemon_lost_comes_back_to_the_draft_unsent() {
 }
 
 /// The notice describes the draft, so it goes when the draft does: sent,
-/// even while the reader types on, or cleared away by hand.
+/// as soon as it leaves the composer, or cleared away by hand.
 #[test]
 fn the_restored_notice_leaves_with_the_draft_it_describes() {
     let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
     let target = chat_runtime(&app, card).target;
     drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
-    assert!(chat_runtime(&app, card).pending.is_some());
+    assert!(chat_runtime(&app, card).commands.in_flight().is_some());
+    assert_eq!(chat_runtime(&app, card).restored_waiting, None);
     app.chat_runtime_mut(target)
         .unwrap()
         .composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
-    assert!(chat_runtime(&app, card).restored_waiting.is_some());
     settle(&mut app, card, Ok(()));
     assert_eq!(chat_runtime(&app, card).restored_waiting, None);
+    assert_eq!(chat_runtime(&app, card).composer.text().trim(), "!");
 
     let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
     let target = chat_runtime(&app, card).target;
@@ -11198,7 +11458,14 @@ fn sent_followups_leave_the_saved_draft_when_the_provider_takes_them() {
     runtime.followups.push(followup(0, "first task", &[]));
     runtime.replace_draft(text_editor::Content::with_text("still typing"));
     drop(app.dispatch_queued(target));
-    assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
+    assert!(
+        chat_runtime(&app, card)
+            .commands
+            .in_flight()
+            .unwrap()
+            .followups
+            .contains(&0)
+    );
     // Until the provider takes it, the follow-up is saved with the draft.
     assert_eq!(
         app.persistent_workspace()
@@ -12369,7 +12636,7 @@ fn stopped_agent_terminal(app: &mut Cagents, arguments: &[&str], exited: bool) -
     terminal.launch = launch.clone();
     terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
         recipe: launch,
-        last_exit: exited.then(|| crate::model::TerminalExit {
+        last_exit: exited.then_some(crate::model::TerminalExit {
             code: Some(0),
             signal: None,
             occurred_at_unix_ms: 1,
@@ -12978,7 +13245,7 @@ fn a_draft_moved_to_another_provider_or_account_is_saved_as_its_new_conversation
     assert_eq!(stored.launch.session_id.as_deref(), Some(fresh_id));
     // A late or repeated press, once nothing offers it, keeps it.
     let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
-    assert!(!app.chat_ui.attempt(card).is_some());
+    assert!(app.chat_ui.attempt(card).is_none());
     assert_eq!(flushed(&app), stored);
 }
 
@@ -14478,7 +14745,7 @@ fn reasoning_action_implicit_default_alias_preserves_high_and_reset_for_first_su
             let runtime = chat_runtime(&app, card);
             assert!(runtime.snapshot.selected_model.is_none());
             assert_eq!(
-                selected_chat_model(&runtime.snapshot).unwrap().id,
+                runtime.chosen_model().model(&runtime.snapshot).unwrap().id,
                 "default"
             );
             let target = runtime.target;
@@ -14563,10 +14830,13 @@ fn reasoning_action_default_targets_the_staged_live_model_and_is_remembered_on_a
         let runtime = chat_runtime(&app, card);
         assert_eq!(
             runtime
-                .pending
-                .as_ref()
-                .and_then(|pending| pending.model.as_ref()),
-            Some(&("staged".into(), None))
+                .commands
+                .in_flight()
+                .and_then(|pending| pending.choice.as_ref()),
+            Some(&commands::Choice::Model {
+                model: "staged".into(),
+                reasoning: None,
+            })
         );
         assert_eq!(
             runtime.snapshot.active_model.as_ref().unwrap().id,
@@ -14601,7 +14871,7 @@ fn reasoning_action_rejects_stale_models_and_unlisted_efforts() {
             Some("fixture-model")
         );
         assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("high"));
-        assert!(runtime.pending.is_none());
+        assert!(runtime.commands.is_idle());
         assert_eq!(
             app.chat_ui.last_models.get(&Provider::Codex),
             Some(&("fixture-model".into(), Some("high".into())))
@@ -14633,8 +14903,15 @@ fn reasoning_action_draft_default_is_sent_when_startup_reports_an_override() {
     answer_start(&mut app, target, Ok(handle));
     assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
     assert_eq!(
-        chat_runtime(&app, card).pending.as_ref().unwrap().model,
-        Some(("fixture-model".into(), None))
+        chat_runtime(&app, card)
+            .commands
+            .in_flight()
+            .unwrap()
+            .choice,
+        Some(commands::Choice::Model {
+            model: "fixture-model".into(),
+            reasoning: None,
+        })
     );
     settle(&mut app, card, Ok(()));
     assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
@@ -14685,8 +14962,8 @@ fn queued_on(app: &mut Cagents, model: &str, listed: Vec<chat::Model>) -> CardId
 
 fn pending_step(app: &Cagents, card: CardId) -> Option<QueuedStep> {
     chat_runtime(app, card)
-        .pending
-        .as_ref()
+        .commands
+        .in_flight()
         .and_then(|pending| pending.queued)
 }
 
@@ -14703,7 +14980,7 @@ fn a_first_message_goes_out_on_the_model_chosen_for_it() {
     settle(&mut app, card, Ok(()));
     let runtime = chat_runtime(&app, card);
     assert!(runtime.queued.is_none());
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(runtime.failures.is_empty(), "{:?}", runtime.failures);
 }
 
@@ -14879,7 +15156,7 @@ fn a_refused_first_message_returns_the_card_to_its_draft() {
     settle(&mut app, card, Err("fixture: refused".into()));
     let runtime = chat_runtime(&app, card);
     assert!(runtime.choosing(), "the card is a draft again");
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert_eq!(runtime.composer.text().trim(), "hello");
     assert_eq!(runtime.error.as_deref(), Some("fixture: refused"));
     assert_eq!(
@@ -15149,6 +15426,45 @@ fn removed_account_without_available_alternatives_still_offers_accounts() {
     let _ = app.update(Message::AccountUi(account_ui::Action::OpenPane));
     assert!(app.utility_card(&CardKind::Accounts).is_some());
     assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
+}
+
+#[test]
+fn a_chat_view_reads_its_account_choices_without_resolving_account_homes() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let work = app.account_ui.add_managed_fixture(Provider::Codex, 106);
+    // An update ends with the choices its frame reads.
+    let _ = app.update(Message::AccountUi(account_ui::Action::Tick));
+    let launch = chat_runtime(&app, card).session.launch.clone();
+    let offered = |app: &Cagents| -> Vec<crate::account::AccountId> {
+        app.chat_accounts(launch.provider, &launch.recipe)
+            .expect("two accounts to choose between")
+            .choices
+            .iter()
+            .map(|choice| choice.id.clone())
+            .collect()
+    };
+    let resolved = account_ui::home_resolutions();
+    for _ in 0..3 {
+        drop(app.chat_view(card));
+    }
+    assert_eq!(
+        offered(&app),
+        [Account::system(Provider::Codex).id(), work.clone()]
+    );
+    assert_eq!(
+        account_ui::home_resolutions(),
+        resolved,
+        "a frame resolves no account's home"
+    );
+
+    // Another account is offered as soon as it is known, with no frame
+    // between the change and the read.
+    let personal = app.account_ui.add_managed_fixture(Provider::Codex, 107);
+    assert_eq!(
+        offered(&app),
+        [Account::system(Provider::Codex).id(), work, personal]
+    );
 }
 
 #[test]
@@ -16831,7 +17147,7 @@ fn nonretryable_failed_resume_preserves_an_explicit_fresh_start_offer() {
         stopped.secondary,
         Some(("Close", stopped::Press::Close, true))
     );
-    assert_eq!(runtime.stopped(true, false).primary.unwrap().2, false);
+    assert!(!runtime.stopped(true, false).primary.unwrap().2);
     assert!(
         matches!(stopped.primary.unwrap().1.message(runtime.target), Message::ChatUi(Action::StartFresh(fresh)) if fresh == card)
     );
@@ -16929,7 +17245,7 @@ fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
             Provider::Codex => chat::NativeContinuity::Durable {
                 provider_version: "0.100.0".into(),
             },
-            Provider::Omp => unreachable!(),
+            Provider::Omp | Provider::Antigravity | Provider::Muse => unreachable!(),
         };
         if paired {
             let proof = source.proof.clone().unwrap();
@@ -17289,7 +17605,10 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
     let attempt = chat_runtime_attempt(&app, card);
     let runtime = chat_runtime(&app, card);
     assert!(!runtime.capacity_refused);
-    assert_eq!(runtime.queued.as_ref().unwrap().source.text(), "hello");
+    assert_eq!(
+        runtime.queued.as_ref().unwrap().prompt.source.text(),
+        "hello"
+    );
     assert!(runtime.composer.text().is_empty());
     // A second press while that attempt owns the card cannot enqueue or
     // create another start, even with the old rendered target.
@@ -17300,6 +17619,7 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
             .queued
             .as_ref()
             .unwrap()
+            .prompt
             .source
             .text(),
         "hello"
@@ -17922,8 +18242,8 @@ fn hidden_prose_releases_graph_and_scratch_and_rehydrates_reader_state() {
     let client_retired = handle.observe_snapshot_retirement_for_test();
     runtime.replace_draft(text_editor::Content::with_text("unsent reader draft"));
     runtime.find = Some("kept query".into());
-    runtime.expanded.insert("scratch-owner".into());
-    runtime.opened.insert("kept turn".into(), true);
+    runtime.expanded.edit().insert("scratch-owner".into());
+    runtime.opened.edit().insert("kept turn".into(), true);
     runtime.set_visible(false).unwrap();
     runtime.set_visible(false).unwrap();
     runtime.cool();
@@ -19168,7 +19488,7 @@ fn auth_recovery_live_resume_dispatches_verification_without_reconnecting_or_rep
     drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
     assert!(app.chat_ui.attempt(card).is_none());
     let runtime = chat_runtime(&app, card);
-    assert!(runtime.pending.is_some());
+    assert!(runtime.commands.in_flight().is_some());
     assert_eq!(runtime.snapshot.error.as_deref(), Some(failure));
     assert_eq!(runtime.session.launch, launch);
     assert_eq!(runtime.composer.text(), "unsent recovery draft");
@@ -19871,7 +20191,7 @@ fn queued_literal_actual_reply_copy_and_takeback_preserve_source_and_reject_late
     answer_start(&mut app, target, Ok(handle));
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.show(true);
-    let source = runtime.queued.as_ref().unwrap().source.clone();
+    let source = runtime.queued.as_ref().unwrap().prompt.source.clone();
     assert_eq!(
         source.text(),
         body,
@@ -19882,6 +20202,7 @@ fn queued_literal_actual_reply_copy_and_takeback_preserve_source_and_reject_late
             .queued
             .as_ref()
             .unwrap()
+            .prompt
             .presentation
             .prepared
             .is_none()
@@ -19920,6 +20241,7 @@ fn queued_literal_actual_reply_copy_and_takeback_preserve_source_and_reject_late
         .queued
         .as_ref()
         .unwrap()
+        .prompt
         .presentation
         .prepared
         .as_ref()
@@ -19944,7 +20266,7 @@ fn queued_literal_actual_reply_copy_and_takeback_preserve_source_and_reject_late
         "newer clipboard intent supersedes queued full-source copy",
     );
     let runtime = app.chat_runtime_mut(target).unwrap();
-    runtime.queued.as_mut().unwrap().presentation = prompt::LocalPresentation::default();
+    runtime.queued.as_mut().unwrap().prompt.presentation = prompt::LocalPresentation::default();
     let (late_run, late_ready) = preparation::local_reply_for_test(runtime);
     drop(app.update(Message::ChatUi(Action::CancelQueued(target))));
     assert!(chat_runtime(&app, card).queued.is_none());
@@ -22038,7 +22360,11 @@ fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
         anchor_prefix: document.fingerprint(anchor),
         end_prefix: document.fingerprint(end),
     }));
-    runtime.selection_document.get_mut().replace((99, document));
+    let key = runtime.selection_key();
+    runtime
+        .selection_document
+        .get_mut()
+        .replace((key, document));
     runtime
         .selection_bookmarks
         .get_mut()
@@ -22047,7 +22373,7 @@ fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
     runtime
         .subagent_scroll
         .insert("child".into(), view::Scroll::new(75.0, 900.0, 400.0));
-    runtime.expanded.insert("parent".into());
+    runtime.expanded.edit().insert("parent".into());
     let scroll = runtime.scroll;
     let child_scroll = runtime.subagent_scroll.clone();
     let turns = runtime

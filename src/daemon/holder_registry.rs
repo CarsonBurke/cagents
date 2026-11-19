@@ -362,8 +362,8 @@ impl Record {
 
     fn supported_version(&self) -> bool {
         match self.kind {
-            Kind::Terminal => matches!(self.version, 3 | 4 | 5),
-            Kind::Native => matches!(self.version, 2 | 3 | 4),
+            Kind::Terminal => matches!(self.version, 3..=5),
+            Kind::Native => matches!(self.version, 2..=4),
         }
     }
 

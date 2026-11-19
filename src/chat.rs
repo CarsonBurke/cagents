@@ -43,6 +43,11 @@ pub(crate) fn declines(action: &str) -> bool {
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
 /// a tool or service unrelated to the conversation's provider account.
 pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
+    // An ACP conversation words every sign-in failure the same way, from the
+    // protocol's own `auth_required` error.
+    if provider.speaks_acp() {
+        return message.starts_with(ACP_SIGN_IN_PREFIX);
+    }
     if provider != Provider::Codex {
         return false;
     }
@@ -65,6 +70,9 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
                 .iter()
                 .any(|phrase| lower.contains(phrase)))
 }
+
+/// How an ACP conversation's sign-in failure begins.
+pub const ACP_SIGN_IN_PREFIX: &str = "Authentication required";
 
 const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
 
@@ -118,6 +126,109 @@ mod authentication_tests {
         }
         assert!(!requires_sign_in(Provider::Claude, "Not logged in"));
         assert!(!requires_sign_in(Provider::Omp, "Not logged in"));
+    }
+
+    #[test]
+    fn an_acp_provider_needs_sign_in_only_for_its_adapter_s_own_words() {
+        let failure =
+            format!("{ACP_SIGN_IN_PREFIX}: sign in to Antigravity, then try again. (log in first)");
+        assert!(requires_sign_in(Provider::Antigravity, &failure));
+        // The words a tool's output may quote are not the protocol's signal.
+        for message in [
+            "Not logged in",
+            "The deployment said: Authentication required",
+            "Please sign in again",
+        ] {
+            assert!(
+                !requires_sign_in(Provider::Antigravity, message),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod acp_permission_tests {
+    use super::*;
+
+    fn recipe(arguments: &[&str]) -> LaunchRecipe {
+        LaunchRecipe {
+            program: "agy".into(),
+            arguments: arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect(),
+            working_directory: "/work".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        }
+    }
+
+    #[test]
+    fn an_acp_terminal_names_its_mode_in_its_own_words() {
+        let provider = Provider::Antigravity;
+        let mut launch = recipe(&["--model", "m", "--mode=plan"]);
+        assert_eq!(
+            acp_permission_mode(&launch, provider).as_deref(),
+            Some("plan")
+        );
+        assert!(apply_acp_permission_mode(
+            &mut launch,
+            provider,
+            "acceptEdits"
+        ));
+        assert_eq!(launch.arguments, ["--model", "m", "--mode", "accept-edits"]);
+        assert_eq!(
+            acp_permission_mode(&launch, provider).as_deref(),
+            Some("acceptEdits")
+        );
+        // Its default is the absence of the option, which `agy` requires.
+        assert!(apply_acp_permission_mode(&mut launch, provider, "default"));
+        assert_eq!(launch.arguments, ["--model", "m"]);
+        assert_eq!(
+            acp_permission_mode(&launch, provider).as_deref(),
+            Some("default")
+        );
+        // A mode never hides the conversation the command resumes.
+        let mut resume = recipe(&["--model", "m", "--conversation", "c"]);
+        assert!(apply_acp_permission_mode(&mut resume, provider, "plan"));
+        assert_eq!(
+            resume.arguments,
+            ["--model", "m", "--mode", "plan", "--conversation", "c"]
+        );
+        assert_eq!(provider.resume_id(&resume.arguments), Some("c"));
+        // A mode the agent does not have changes nothing.
+        assert!(!apply_acp_permission_mode(
+            &mut launch,
+            provider,
+            "bypassPermissions"
+        ));
+        assert_eq!(launch.arguments, ["--model", "m"]);
+        assert!(!apply_acp_permission_mode(
+            &mut launch,
+            Provider::Codex,
+            "plan"
+        ));
+        assert_eq!(acp_permission_mode(&launch, Provider::Codex), None);
+    }
+
+    #[test]
+    fn a_conversation_returned_to_its_terminal_in_any_mode_is_recognized() {
+        let launch = Launch {
+            provider: Provider::Antigravity,
+            recipe: recipe(&["--mode", "plan", "--model", "m"]),
+            session_id: Some("98608bab-5eb6-4cf5-8f9b-46019bf29df7".into()),
+        };
+        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
+            let terminal = launch.terminal_recipe_with_permission_mode(mode).unwrap();
+            assert_eq!(
+                Provider::Antigravity.resume_id(&terminal.arguments),
+                launch.session_id.as_deref(),
+                "{mode:?}"
+            );
+            assert!(launch.resumes_in_terminal(&terminal), "{mode:?}");
+        }
+        assert!(!launch.resumes_in_terminal(&recipe(&["--model", "m"])));
     }
 }
 
@@ -223,10 +334,12 @@ impl Launch {
     /// when the user returns from native chat.
     pub fn terminal_recipe_with_permission_mode(&self, mode: Option<&str>) -> Option<LaunchRecipe> {
         let mut recipe = self.terminal_recipe()?;
-        if self.provider == Provider::Claude
-            && let Some(mode) = mode
-        {
-            apply_claude_permission_mode(&mut recipe, mode);
+        if let Some(mode) = mode {
+            if self.provider == Provider::Claude {
+                apply_claude_permission_mode(&mut recipe, mode);
+            } else {
+                apply_acp_permission_mode(&mut recipe, self.provider, mode);
+            }
         }
         Some(recipe)
     }
@@ -237,11 +350,22 @@ impl Launch {
     /// cannot prove which mode was confirmed; it proves the recipe differs from
     /// the resume by nothing else.
     pub fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
-        let mode = match recipe.arguments.as_slice() {
-            [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
-            _ => None,
+        let mode = if self.provider.speaks_acp() {
+            // Its default mode goes unnamed, and any other comes before the
+            // conversation it resumes.
+            if self.terminal_recipe().as_ref() == Some(recipe) {
+                return true;
+            }
+            acp_permission_mode(recipe, self.provider)
+        } else {
+            match recipe.arguments.as_slice() {
+                [.., flag, mode] if flag == "--permission-mode" => Some(mode.clone()),
+                _ => None,
+            }
         };
-        self.terminal_recipe_with_permission_mode(mode).as_ref() == Some(recipe)
+        self.terminal_recipe_with_permission_mode(mode.as_deref())
+            .as_ref()
+            == Some(recipe)
     }
 
     /// Return to the CLI using the current provider-confirmed identity, not a
@@ -303,6 +427,65 @@ pub fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bo
     arguments.extend(["--permission-mode".into(), mode.into()]);
     recipe.arguments = arguments;
     true
+}
+
+/// Names the cagents permission mode `meaning` on an ACP agent's terminal
+/// command line, in the agent's own words, in place of any mode it named.
+/// Returns whether `provider` serves ACP and has such a mode.
+pub fn apply_acp_permission_mode(
+    recipe: &mut LaunchRecipe,
+    provider: Provider,
+    meaning: &str,
+) -> bool {
+    let Some(acp) = provider.acp() else {
+        return false;
+    };
+    let own = acp.own_mode(meaning);
+    if !acp.modes.iter().any(|(mode, _)| *mode == own) {
+        return false;
+    }
+    let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
+    let mut original = std::mem::take(&mut recipe.arguments).into_iter();
+    let inline = format!("{}=", acp.mode_option);
+    while let Some(argument) = original.next() {
+        if argument == acp.mode_option {
+            original.next();
+        } else if !argument.starts_with(&inline) {
+            arguments.push(argument);
+        }
+    }
+    // The agent's terminal may not accept its default by name. The mode goes
+    // before a conversation the command resumes, which is read only at the
+    // end of the command.
+    if own != acp.default_mode {
+        let at = match arguments.as_slice() {
+            [.., flag, _] if flag == provider.resume_flag() => arguments.len() - 2,
+            _ => arguments.len(),
+        };
+        arguments.splice(at..at, [acp.mode_option.into(), own.into()]);
+    }
+    recipe.arguments = arguments;
+    true
+}
+
+/// The cagents permission mode an ACP agent's terminal command line starts
+/// it in, for a provider that serves ACP.
+pub fn acp_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    let acp = provider.acp()?;
+    let inline = format!("{}=", acp.mode_option);
+    let mut named = None;
+    let mut arguments = recipe.arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == acp.mode_option {
+            named = arguments.next().map(String::as_str);
+        } else if let Some(mode) = argument.strip_prefix(&inline) {
+            named = Some(mode);
+        }
+    }
+    Some(
+        acp.mode_meaning(named.unwrap_or(acp.default_mode))
+            .to_owned(),
+    )
 }
 
 /// What a card is asking the daemon to do with a conversation.
@@ -604,6 +787,14 @@ impl AttachmentRules {
                 max_image_bytes: 16 * MIB,
                 max_file_bytes: None,
             },
+            // An ACP agent is sent an image inline, when it says it reads
+            // them, and is pointed at any other file, which it reads itself.
+            Provider::Antigravity | Provider::Muse => Self {
+                images_only: false,
+                max_count: None,
+                max_image_bytes: ACP_MAX_IMAGE_BYTES,
+                max_file_bytes: None,
+            },
         }
     }
 
@@ -641,6 +832,9 @@ pub fn is_image_path(path: &std::path::Path) -> bool {
                 .any(|image| extension.eq_ignore_ascii_case(image))
         })
 }
+
+/// The largest image an ACP prompt carries inline.
+pub const ACP_MAX_IMAGE_BYTES: u64 = 16 * MIB;
 
 /// Inline tool images are spooled to private files before entering a snapshot.
 pub const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -898,11 +1092,11 @@ pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> 
         || source.launch.recipe != replacement.launch.recipe
         || !source.has_valid_native_continuity()
         || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
-        || !source
+        || source
             .proof
             .as_ref()
             .zip(replacement.proof.as_ref())
-            .is_some_and(|(old, new)| old.boot_id == new.boot_id)
+            .is_none_or(|(old, new)| old.boot_id != new.boot_id)
         || source.terminal.as_ref().is_some_and(|terminal| {
             terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
         })
@@ -4068,6 +4262,12 @@ pub fn fresh_session(
             // settings remain under Claude's own handling.
             if let Some(mode) = claude_configured_default_mode(&recipe) {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
+            }
+        }
+        // An ACP agent opens a new session with no option of its own.
+        Provider::Antigravity | Provider::Muse => {
+            if !provider.has_native_chat() {
+                return Err(provider.native_chat_refusal());
             }
         }
     }

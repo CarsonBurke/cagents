@@ -275,10 +275,7 @@ impl Runtime {
     /// cannot know.
     #[cfg(test)]
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
-        match self.strip_headline(turn) {
-            disclosure::Headline::Text(text) => text,
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        }
+        self.strip_headline(turn).plain()
     }
 
     /// A collapsed strip's line as it is drawn. A lone step on one file
@@ -337,9 +334,9 @@ impl Runtime {
         };
         self.find_disclosure.manual_turn(&key);
         if open {
-            self.opened.insert(key, true);
+            self.opened.edit().insert(key, true);
         } else {
-            self.opened.remove(&key);
+            self.opened.edit().remove(&key);
         }
     }
 
@@ -376,10 +373,7 @@ impl Runtime {
             turn.duration_label(0)
         };
         let text = self.strip_headline(turn);
-        let name = match &text {
-            disclosure::Headline::Text(text) => text.clone(),
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        };
+        let name = text.plain();
         let mut kinds = turn.steps.iter().filter_map(|step| {
             self.step_items().get(step.index).map(|item| {
                 self.presentation_cache()
@@ -435,8 +429,10 @@ impl Runtime {
                 .into(),
             );
         }
+        // Each nested row brings the air above it, so the strip has none of
+        // its own: its rows are as far apart as any two rows of the
+        // timeline, and so are its last row and the row after the strip.
         widget::column::with_children(content)
-            .spacing(GAP_XS)
             .width(Length::Fill)
             .into()
     }
@@ -868,7 +864,7 @@ mod tests {
         };
         let renderer = crate::app::tests::headless_renderer();
         let viewport = iced::Rectangle::with_size(iced::Size::new(275.0, 1_000.0));
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         for group in [false, true] {
             let (mut runtime, _handle) =
                 super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));
@@ -882,11 +878,11 @@ mod tests {
             };
             let mut tree = Tree::new(build(&runtime).as_widget());
             for (index, open) in [false, true, false].into_iter().enumerate() {
-                runtime.opened.insert(key.clone(), open);
+                runtime.opened.edit().insert(key.clone(), open);
                 if open {
-                    runtime.expanded.insert(item.id.clone());
+                    runtime.expanded.edit().insert(item.id.clone());
                 } else {
-                    runtime.expanded.remove(&item.id);
+                    runtime.expanded.edit().remove(&item.id);
                 }
                 let mut element = build(&runtime);
                 tree.diff(element.as_widget_mut());

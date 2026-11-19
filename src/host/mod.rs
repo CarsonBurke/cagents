@@ -13,6 +13,8 @@ pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
 #[cfg(debug_assertions)]
+mod fixture_close_refusal;
+#[cfg(debug_assertions)]
 mod fixture_hold;
 #[cfg(debug_assertions)]
 mod fixture_startup_recovery;
@@ -628,10 +630,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .unwrap_or_else(|p| p.into_inner())
             .startup_recovery()
             .is_some();
-    if !recovery_only {
-        if let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host)) {
-            tracing::warn!(%error, "lost accounts will not be restored automatically");
-        }
+    if !recovery_only
+        && let Err(error) = account_lifecycle::restore_unregistered_homes(Arc::downgrade(&host))
+    {
+        tracing::warn!(%error, "lost accounts will not be restored automatically");
     }
     if !recovery_only {
         let collect_host = Arc::downgrade(&host);

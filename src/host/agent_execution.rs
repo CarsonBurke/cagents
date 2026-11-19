@@ -722,18 +722,33 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     if let Some(model) = &spec.model {
         arguments.extend(["--model".into(), model.clone()]);
     }
+    // An ACP agent's terminal command line names its own modes, which the
+    // spec names by what they mean.
+    let acp = spec.provider.acp();
     if let Some(mode) = &spec.permission_mode {
         let flag = match spec.provider {
             Provider::Claude => "--permission-mode",
             Provider::Omp => "--approval-mode",
             Provider::Codex => "--ask-for-approval",
+            // Muse's own until it names its modes as an ACP agent.
+            Provider::Antigravity | Provider::Muse => {
+                acp.map_or("--approval-mode", |acp| acp.mode_option)
+            }
         };
-        arguments.extend([flag.into(), mode.clone()]);
+        let mode = acp.map_or(mode.as_str(), |acp| acp.own_mode(mode));
+        if acp.is_none_or(|acp| mode != acp.default_mode) {
+            arguments.extend([flag.into(), mode.to_owned()]);
+        }
     }
     if let Some(effort) = &spec.reasoning_effort {
         arguments.extend(match spec.provider {
             Provider::Claude => ["--effort".into(), effort.clone()],
             Provider::Omp => ["--thinking".into(), effort.clone()],
+            Provider::Antigravity | Provider::Muse => [
+                acp.map_or("--reasoning-effort", |acp| acp.effort_option)
+                    .into(),
+                effort.clone(),
+            ],
             Provider::Codex => [
                 "--config".into(),
                 format!(
@@ -1662,11 +1677,11 @@ pub(super) fn preflight_retirement(
     let Ok(registry) = registry(host) else {
         return Ok(());
     };
-    let result = registry
+
+    registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
-    result
+        .preflight_agent_retirement(&HostedSession::Chat(session.clone()))
 }
 
 /// Serializes an agent's operations. The value is the run whose dispatcher
@@ -2609,9 +2624,9 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
     use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
     let running = item.content.status() == Some(ToolStatus::Running);
     if running
-        && !item
+        && item
             .started_at
-            .is_some_and(|started| now.saturating_sub(started) >= CONSOLE_RUNNING_AFTER_MILLIS)
+            .is_none_or(|started| now.saturating_sub(started) < CONSOLE_RUNNING_AFTER_MILLIS)
     {
         return None;
     }

@@ -1260,7 +1260,7 @@ mod tests {
         // bypasses ordinary file permissions, so this assertion is non-root.
         if unsafe { libc::geteuid() } != 0 {
             std::fs::write(&reference, valid_commit).unwrap();
-            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o000)).unwrap();
             let outcome = invoke();
             std::fs::set_permissions(&reference, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(outcome.is_err());
@@ -1985,6 +1985,12 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
         Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
         Provider::Codex => vec!["login".into(), "--device-auth".into()],
         Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
+        Provider::Antigravity | Provider::Muse => {
+            return Err(format!(
+                "open {} in a terminal on this device to sign in",
+                account.provider.label()
+            ));
+        }
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
