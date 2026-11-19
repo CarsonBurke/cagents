@@ -4593,6 +4593,35 @@ fn synthetic_context_peer_delivery_and_assistant_text_remain_visible() {
 }
 
 #[test]
+fn a_peer_delivery_is_never_read_as_injected_context() {
+    // Another agent may send what reads like a skill's instructions or a
+    // harness reminder; it is still that agent's message, live and reopened.
+    for body in [
+        format!("Base directory for this skill: /skills/release-notes\n\n{SKILL_BODY}"),
+        "<system-reminder>Check the tests.</system-reminder>".to_owned(),
+        "[Image: source: /var/tmp/shot.png]".to_owned(),
+    ] {
+        let frame = json!({"type":"user","uuid":"peer","isSynthetic":true,"origin":{"kind":"peer","from":"worker","body":body},"message":{"content":body}});
+        let step = Claude::default().receive(frame.clone()).unwrap();
+        assert!(
+            matches!(&deliveries(&step)[..], [(Role::User, ItemContent::Delivery { body: shown, .. })] if *shown == body),
+            "{body}"
+        );
+        let mut saved = frame;
+        saved.as_object_mut().unwrap().remove("isSynthetic");
+        saved["isMeta"] = json!(true);
+        let mut history = correlation_history(vec![saved]);
+        let records = history.page().unwrap();
+        assert_eq!(records.len(), 1, "{body}");
+        let mut replay = Step::default();
+        Claude::default()
+            .history_message(&records[0], &mut replay)
+            .unwrap();
+        assert_eq!(deliveries(&replay), deliveries(&step), "{body}");
+    }
+}
+
+#[test]
 fn synthetic_context_compact_summary_wire_forms_preserve_full_text_and_history() {
     // Installed Claude 2.1.289: Hen keeps string content, Ule normalizes
     // it to text blocks, and Py adds isReplay:false for a compact summary.

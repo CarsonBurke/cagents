@@ -1875,7 +1875,7 @@ impl Claude {
                 ]
                 .iter()
                 .any(|key| frame[*key].as_bool() == Some(true)));
-        if context && frame["isCompactSummary"].as_bool() != Some(true) {
+        if context && delivered.is_empty() && frame["isCompactSummary"].as_bool() != Some(true) {
             match injected(&frame["message"]["content"]) {
                 Injected::Skill { directory, body } => {
                     self.skill_loaded(frame, child, directory, body, step);
