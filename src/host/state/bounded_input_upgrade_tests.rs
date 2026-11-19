@@ -803,8 +803,10 @@ fn restore_keeps_partial_originals_and_raw_prefix_reachable_after_commit_or_stor
                     visible: true,
                 },
                 ClientRequest::Shutdown,
+                // A fresh, independent terminal is admitted during a retained
+                // recovery (#3111); one reusing an original's identity is not.
                 ClientRequest::Spawn {
-                    session: source(&case, QUERY_CHILD),
+                    session: sources[0].0.clone(),
                     options: TerminalSpawnOptions::default(),
                 },
             ] {
