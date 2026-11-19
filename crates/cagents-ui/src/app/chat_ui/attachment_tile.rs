@@ -291,7 +291,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
         let label = parts.next().expect("a tile's label");
         let close = parts.next().expect("a tile's ×");
         // The face is clipped to the tile's rounded square by its own
-        // container; the label and × draw over it.
+        // container; the label, × and ring draw over it.
         self.children[FACE].as_widget().draw(
             &tree.children[FACE],
             renderer,
@@ -301,19 +301,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
             cursor,
             viewport,
         );
-        if self.revealed(state) {
-            for (index, part) in [(LABEL, label), (CLOSE, close)] {
-                self.children[index].as_widget().draw(
-                    &tree.children[index],
-                    renderer,
-                    theme,
-                    style,
-                    part,
-                    cursor,
-                    viewport,
-                );
-            }
-        }
+        let revealed = self.revealed(state);
         let ring = if state.focused {
             Some(crate::design::accent_color(theme))
         } else if state.hovered || self.marked {
@@ -324,27 +312,51 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
         } else {
             None
         };
-        if let Some(color) = ring {
-            let width = if state.focused { RING } else { 1.0 };
-            let outset = if state.focused { RING } else { 0.0 };
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: Rectangle {
-                        x: bounds.x - outset,
-                        y: bounds.y - outset,
-                        width: bounds.width + 2.0 * outset,
-                        height: bounds.height + 2.0 * outset,
-                    },
-                    border: Border {
-                        color,
-                        width,
-                        radius: (crate::design::RADIUS_S + outset).into(),
-                    },
-                    ..Default::default()
-                },
-                Color::TRANSPARENT,
-            );
+        if !revealed && ring.is_none() {
+            return;
         }
+        let outset = if state.focused { RING } else { 0.0 };
+        let ringed = Rectangle {
+            x: bounds.x - outset,
+            y: bounds.y - outset,
+            width: bounds.width + 2.0 * outset,
+            height: bounds.height + 2.0 * outset,
+        };
+        let Some(clip) = ringed.intersection(viewport) else {
+            return;
+        };
+        // A layer of its own: within one layer the renderer puts images
+        // above quads, so the thumbnail would hide the label's scrim, the ×
+        // and the ring, leaving only the label's text.
+        renderer.with_layer(clip, |renderer| {
+            if revealed {
+                for (index, part) in [(LABEL, label), (CLOSE, close)] {
+                    self.children[index].as_widget().draw(
+                        &tree.children[index],
+                        renderer,
+                        theme,
+                        style,
+                        part,
+                        cursor,
+                        viewport,
+                    );
+                }
+            }
+            if let Some(color) = ring {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: ringed,
+                        border: Border {
+                            color,
+                            width: if state.focused { RING } else { 1.0 },
+                            radius: (crate::design::RADIUS_S + outset).into(),
+                        },
+                        ..Default::default()
+                    },
+                    Color::TRANSPARENT,
+                );
+            }
+        });
     }
 
     fn a11y_nodes(
