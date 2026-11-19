@@ -132,6 +132,13 @@ pub enum Watch {
     },
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread built a conversation's work, for tests
+    /// that a view showing only its count never builds it.
+    pub(in crate::app) static WORK_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     pub(super) conversation: Option<TerminalId>,
@@ -146,6 +153,9 @@ pub struct State {
     /// worktree found to head a pull request becomes that pull request's row
     /// where it is.
     slots: Vec<Slot>,
+    /// How many rows the Work section lists, counted once per list rather
+    /// than on every frame that shows it.
+    work_count: usize,
 }
 
 /// What one Work row is known by: its pull request, its worktree, or both
@@ -235,6 +245,7 @@ impl State {
                 self.revision = revision;
                 self.list = Some(list);
                 self.lost = false;
+                self.work_count = self.count_work();
             }
             // The last list stays: it is what was true, and the daemon's own
             // health is reported elsewhere.
@@ -294,6 +305,8 @@ impl State {
         here: Option<&'a Path>,
         openable: &dyn Fn(&Path) -> bool,
     ) -> Vec<Work<'a>> {
+        #[cfg(test)]
+        WORK_BUILDS.with(|builds| builds.set(builds.get() + 1));
         let mut work = self.listed_work(here, openable);
         work.sort_by_cached_key(|work| {
             self.slots
@@ -481,6 +494,22 @@ impl State {
         self.worktrees()
             .iter()
             .filter(move |worktree| !shown.contains(&worktree.path.as_path()))
+    }
+
+    /// How many rows the Work section lists: every pull request the
+    /// conversation worked on and every edited worktree none of them shows.
+    /// The worktree it runs in, added only to keep its changes a click away,
+    /// is not work it did.
+    pub(crate) fn work_count(&self) -> usize {
+        self.work_count
+    }
+
+    fn count_work(&self) -> usize {
+        self.rows()
+            .iter()
+            .filter(|row| row.relation.worked_on())
+            .count()
+            + self.worktrees_alone().count()
     }
 
     /// Whether the Work section lists anything.

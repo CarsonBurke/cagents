@@ -20,6 +20,7 @@ pub(crate) mod dialog_ui;
 #[cfg(test)]
 mod dispatch_tests;
 mod inspector_activity;
+mod inspector_rail;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -3227,6 +3228,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
         | Message::TogglePaneInspector(_)
+        | Message::ExpandPaneInspector(_)
         | Message::ClosePaneInspector(_)
         | Message::ReviewFilePanelToggle { .. }
         | Message::ReviewFilePanelResize { .. }
@@ -3413,6 +3415,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             }
             | Message::ToggleContextInspector
             | Message::TogglePaneInspector(_)
+            | Message::ExpandPaneInspector(_)
             | Message::ClosePaneInspector(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
@@ -5274,6 +5277,9 @@ pub enum Message {
     ToggleContextInspector,
     /// Opens or closes this pane's inspector.
     TogglePaneInspector(CardId),
+    /// Expands this pane's collapsed inspector rail over its content.
+    ExpandPaneInspector(CardId),
+    /// Collapses this pane's inspector from over its content.
     ClosePaneInspector(CardId),
     ContextSection(context_sections::Action),
     /// The inspector sections were laid out at this height.
@@ -5635,6 +5641,7 @@ struct CardChrome {
     resize_id: widget::Id,
     inspector_toggle_id: widget::Id,
     inspector_resize_id: widget::Id,
+    inspector_rail_id: widget::Id,
     #[cfg(feature = "integrated-browser")]
     browser_back_id: widget::Id,
     #[cfg(feature = "integrated-browser")]
@@ -5674,6 +5681,7 @@ impl CardChrome {
             resize_id: card_control_id(id, "resize"),
             inspector_toggle_id: card_control_id(id, "inspector.toggle"),
             inspector_resize_id: card_control_id(id, "inspector.resize"),
+            inspector_rail_id: card_control_id(id, "inspector.rail"),
             #[cfg(feature = "integrated-browser")]
             browser_back_id: card_control_id(id, "browser.back"),
             #[cfg(feature = "integrated-browser")]
@@ -12048,7 +12056,10 @@ impl Cagents {
         // A pane with no inspector here, such as an application page, has
         // no toggle either.
         let inspector = card.is_some() && self.pane_has_inspector(id);
-        let inspector_closed = inspector && self.pane_inspector_layout(id).is_none();
+        // A rail stands in for the toggle while the pane is too narrow.
+        let inspector_closed = inspector
+            && self.pane_inspector_layout(id).is_none()
+            && !self.pane_inspectors.is_railed(id);
         let toolbar_toggle = || inspector_closed.then(|| self.pane_inspector_toggle(id, false));
         let toolbar_hosts_toggle = browser_session.is_some()
             || matches!(
@@ -19351,8 +19362,15 @@ impl Cagents {
                 Some(card) => self.toggle_pane_inspector(card),
                 None => Task::none(),
             },
-            Message::TogglePaneInspector(_) | Message::ClosePaneInspector(_) if self.modal_is_open() => Task::none(),
+            Message::TogglePaneInspector(_)
+            | Message::ExpandPaneInspector(_)
+            | Message::ClosePaneInspector(_)
+                if self.modal_is_open() =>
+            {
+                Task::none()
+            }
             Message::TogglePaneInspector(card) => self.toggle_pane_inspector(card),
+            Message::ExpandPaneInspector(card) => self.expand_pane_inspector(card),
             Message::ClosePaneInspector(card) => self.close_pane_inspector_overlay(card),
             Message::ContextSection(_) if self.modal_is_open() => Task::none(),
             Message::ContextSection(action) => self.handle_context_section(action),
