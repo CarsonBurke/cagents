@@ -265,6 +265,12 @@ class Planner:
             unread_cards.append({"project": project["id"], "worktree": project["worktrees"][0]["id"],
                                  "cards": [c["id"] for c in chats[:demand]]})
         self.unread = unread_cards
+        # Long-lived installs keep empty channels only when someone named them:
+        # startup retires the rest, and the registry clears suggested titles
+        # once their conversation leaves.
+        for channel in self.channels:
+            if not channel["cards"]:
+                channel["title_source"] = "Manual"
         # Open utilities, which are never panes.
         for kind in UTILITY:
             if profile.cards.get(kind):
