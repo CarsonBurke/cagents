@@ -1121,6 +1121,28 @@ impl ControlClient {
         &self.proof
     }
 
+    /// The stream and proof of a connection that has asked nothing since its
+    /// handshake, for a client that goes on in a protocol of its own, as a
+    /// native chat does, without connecting and handshaking again.
+    ///
+    /// Panics if anything was asked on it: a reply or notification it read
+    /// would be lost to the new owner.
+    pub fn into_handshaken_stream(self) -> (UnixStream, HostSessionProof) {
+        assert!(
+            self.protocol == PROTOCOL_VERSION
+                && self.next_request_id == 2
+                && self.observed.is_empty()
+                && self.observed_model.is_empty()
+                && self.observed_notifications.is_empty()
+                && self.observed_work.is_none()
+                && self.observed_conversation.is_none()
+                && self.attached_chats.is_empty()
+                && self.terminal_streams.is_empty(),
+            "only a connection that has asked nothing since its handshake can be handed over"
+        );
+        (self.stream, self.proof)
+    }
+
     /// Whether nothing has arrived on this connection since its last reply,
     /// and the daemon still holds it open. Asks nothing of the daemon and
     /// never blocks.
