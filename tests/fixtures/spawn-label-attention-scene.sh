@@ -29,7 +29,7 @@ raise SystemExit(0 if ready else 1)
 CHECK
 }
 if ! worktree_ready; then
-    evidence drive move 400,300
+    evidence drive hover 400,300
     evidence drive click main
     sleep 3
     worktree_ready
@@ -43,7 +43,7 @@ for name in lead retry jitter; do
     sleep 3
 done
 # Keep the first two panes visible; the fourth agent must remain unopened.
-evidence drive move 500,22
+evidence drive hover 500,22
 evidence drive scroll horizontal -100
 evidence drive click 310,22
 printf '300\n' >"$config/fixture-first-turn-seconds"
@@ -67,7 +67,7 @@ expected = 'reviewer · Review the one-row cards' if sys.argv[1] == 'after' else
 assert title == expected, (title, expected)
 print('sidebar-unloaded-state ' + json.dumps({'agent': agent, 'placement': json.loads(record)['placement'], 'focus': focus, 'title': title}), flush=True)
 CHECK
-evidence drive move 1,1
+evidence drive hover 1,1
 evidence shot label-sidebar-unloaded
 observation=$(evidence drive observe)
 printf '%s\n' "$observation"
@@ -80,6 +80,6 @@ for line in sys.stdin:
   found.append(tuple(map(int,m.groups())))
 assert found, "missing unopened reviewer Attention row"
 x,y,w,h=max(found,key=lambda row:row[1]); print(f"{min(200,x+w//2)},{y+h//2}")')
-evidence drive move "$point"
+evidence drive hover "$point"
 sleep 2
 evidence shot label-sidebar-hover

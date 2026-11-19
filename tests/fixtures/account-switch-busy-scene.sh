@@ -57,7 +57,7 @@ step() {
     "$ne" drive observe >"$notes/$1.txt" 2>&1 || :
 }
 shot() {
-    "$ne" drive move 1,1 >/dev/null
+    "$ne" drive hover 1,1 >/dev/null
     sleep 1
     "$ne" shot "$scene${VARIANT:+-$VARIANT}-$1"
     step "$1"
