@@ -118,23 +118,36 @@ impl Request {
     }
 
     /// This copy of item `id` again, from what `snapshot` now holds for it,
-    /// or `None` once the item or its whole text is gone. The item is found
-    /// by its ID, because a rewritten child item gets a new source.
+    /// or `None` once the item or its whole text is gone.
     fn reread(&self, snapshot: &Snapshot, id: &str) -> Option<Self> {
-        let (items, sources) = match &self.source.scope {
+        let (items, sources, index) = match &self.source.scope {
+            // The store keeps a conversation item's cache and token when it
+            // rewrites the item. Its ID is no key: a long message's parts and
+            // a provider item can share one.
             chat::TextCopyScope::Conversation => {
-                (&snapshot.items, &snapshot.text_copy_sources.conversation)
+                let sources = &snapshot.text_copy_sources.conversation;
+                let index = sources.iter().position(|source| {
+                    source.as_ref().is_some_and(|source| {
+                        source.cache == self.source.cache && source.token == self.source.token
+                    })
+                })?;
+                (&snapshot.items, sources, index)
             }
-            chat::TextCopyScope::Subagent { id: child } => (
-                &snapshot
+            // A rewritten child item gets a new source, so it is found by ID.
+            chat::TextCopyScope::Subagent { id: child } => {
+                let items = &snapshot
                     .subagents
                     .iter()
                     .find(|agent| agent.id == *child)?
-                    .items,
-                snapshot.text_copy_sources.children.get(child)?,
-            ),
+                    .items;
+                let index = items.iter().position(|item| item.id == id)?;
+                (
+                    items,
+                    snapshot.text_copy_sources.children.get(child)?,
+                    index,
+                )
+            }
         };
-        let index = items.iter().position(|item| item.id == id)?;
         let source = sources
             .get(index)?
             .clone()
@@ -589,11 +602,25 @@ mod tests {
         })
     }
 
+    /// The source of the step at `revision`. The store keeps a conversation
+    /// item's cache and token when it rewrites the item; a child item's
+    /// rewrite gets a new cache.
     fn source(scope: &chat::TextCopyScope, revision: u64) -> chat::TextCopySource {
+        token_source(scope, 7, revision)
+    }
+
+    fn token_source(
+        scope: &chat::TextCopyScope,
+        token: u64,
+        revision: u64,
+    ) -> chat::TextCopySource {
         chat::TextCopySource {
-            cache: uuid::Uuid::new_v4(),
+            cache: match scope {
+                chat::TextCopyScope::Conversation => uuid::Uuid::from_u128(1),
+                chat::TextCopyScope::Subagent { .. } => uuid::Uuid::new_v4(),
+            },
             scope: scope.clone(),
-            token: 7,
+            token,
             revision,
             bytes: 300 * 1024,
         }
@@ -795,9 +822,44 @@ mod tests {
                 Some((step("cargo build"), rewritten.clone())),
             );
             let task = app.finish_message_copy(target, "step".into(), request, changed());
-            assert_eq!(read_by(task, target).source, rewritten, "{scope:?}");
+            let reread = read_by(task, target);
+            assert_eq!(reread.source, rewritten, "{scope:?}");
             assert!(app.chat_runtime_mut(target).unwrap().error.is_none());
+
+            // The store refuses the second read too: it says so, rather than
+            // reading a third time.
+            let task = app.finish_message_copy(target, "step".into(), reread, changed());
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                Some(chat::TEXT_COPY_CHANGED)
+            );
         }
+    }
+
+    /// A conversation item's ID can repeat in the window: a long message's
+    /// parts get generated IDs, and a provider item may have one of them.
+    /// Its reread follows its own source, not the first row with its ID.
+    #[test]
+    fn a_changed_conversation_copy_reads_its_own_item_again_when_an_id_repeats() {
+        let _context = isolated_context();
+        let scope = chat::TextCopyScope::Conversation;
+        let (mut app, target, handle, request) = copy_fixture(scope.clone());
+        let other = token_source(&scope, 3, 1);
+        let rewritten = source(&scope, 2);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = vec![step("cargo test"), step("cargo build --release")];
+        snapshot.text_copy_sources.conversation = vec![Some(other), Some(rewritten.clone())];
+        snapshot.text_copy_sources.conversation_revision += 1;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
+        let reread = read_by(task, target);
+        assert_eq!(reread.source, rewritten);
+        assert_eq!(reread.prefix, "cargo build --release");
     }
 
     #[test]
