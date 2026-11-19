@@ -5422,7 +5422,7 @@ impl Runtime {
                     .hash(&mut hasher);
                 self.opened.get(&turn.key).hash(&mut hasher);
                 self.tool_groups_expanded.hash(&mut hasher);
-                turn.pauses.hash(&mut hasher);
+                (turn.thinking, &turn.pauses).hash(&mut hasher);
                 // A running group's duration counts up, so its strip changes
                 // with the clock; a finished one's is fixed at how long the
                 // work took.
@@ -5616,7 +5616,7 @@ impl Runtime {
                 // A group of one step is that step. `for_each_turn_part`
                 // places the strip only when a step is not drawn as a
                 // failure, so a lone one here is drawn as a row.
-                if let [only] = turn.steps.as_slice()
+                if let Some(only) = turn.lone_step()
                     && let Some((item, cached)) = placed(only.index)
                 {
                     return widget::container(scroll::item(

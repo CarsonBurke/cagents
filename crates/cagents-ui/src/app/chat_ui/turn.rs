@@ -76,6 +76,9 @@ pub(super) struct Turn {
     /// Set while any step in this group is still running, which is what marks
     /// the live group without needing a separate global flag.
     pub(super) running: bool,
+    /// Set while the agent, at work on nothing else, thinks with nothing to
+    /// show after this group's steps: the group is running on that thought.
+    pub(super) thinking: bool,
     /// Whether this group holds the newest step still running anywhere in the
     /// transcript. Older running groups, such as one waiting on a background
     /// command, leave the activity indicator to newer work.
@@ -113,6 +116,7 @@ impl Turn {
             prose: Vec::new(),
             pauses: Vec::new(),
             running: false,
+            thinking: false,
             newest_running: false,
             outcome: None,
             span: item.map(Span::of).unwrap_or_default(),
@@ -155,6 +159,17 @@ impl Turn {
     /// individual steps. The retained cache shares the running timer cadence.
     pub(super) fn duration_label(&self, now: u64) -> Option<String> {
         self.working_for(now).map(super::disclosure::duration)
+    }
+
+    /// The step this group is drawn as, when it is drawn as its only step's
+    /// row rather than as a strip. While the agent thinks after that step,
+    /// the group is its strip, so its time counts on as the agent works, as
+    /// it does once a second step joins.
+    pub(super) fn lone_step(&self) -> Option<&Placed> {
+        match self.steps.as_slice() {
+            [only] if !self.thinking => Some(only),
+            _ => None,
+        }
     }
 
     /// Fills in the summary once the group's membership is final.
@@ -450,9 +465,19 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     .takes_in(Span::of(item));
             }
             // A question asked after it still ends the group, though the
-            // item draws nothing.
+            // item draws nothing, and ends the thinking listed in it: the
+            // reader's answer was not.
             if asked_after.contains(item.id.as_str()) {
                 state = Open::Closed;
+                if let Some(Thinking {
+                    lies: Lies::Among(at),
+                    ..
+                }) = thinking
+                {
+                    turns[at]
+                        .pauses
+                        .extend(thinking.take().and_then(Thinking::pause));
+                }
             }
             continue;
         }
@@ -560,6 +585,7 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         && let Some(turn) = thinking_in.and_then(|at| turns.get_mut(at))
     {
         turn.running = true;
+        turn.thinking = true;
     }
     // Thinking at the end of a group that is still going on is what the
     // working indicator shows; once it is over, it closes the strip.
@@ -1740,6 +1766,26 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_step_followed_by_thinking_is_drawn_as_its_group() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            thought("t", "", 2_000, 3_000),
+        ];
+        let turns = group(&items, &unasked(), Working);
+        assert!(turns[0].thinking);
+        assert_eq!(turns[0].lone_step(), None, "a strip, whose time counts on");
+        assert!(
+            turns[0].summary.ends_with(" · working"),
+            "{}",
+            turns[0].summary
+        );
+        let turns = group(&items, &unasked(), plain);
+        assert!(!turns[0].thinking);
+        assert_eq!(turns[0].lone_step().map(|step| step.index), Some(1));
+    }
+
+    #[test]
     fn thinking_after_the_agent_spoke_does_not_restart_its_group() {
         let items = vec![
             text("prompt", Role::User, Phase::Final, false),
@@ -1828,6 +1874,25 @@ mod tests {
         assert!(pauses(&turns[0]).is_empty());
         assert_eq!(pauses(&turns[1]), [(0, 3, 6_000)]);
         assert_eq!(turns[1].working_for(u64::MAX), Some(8_000));
+    }
+
+    #[test]
+    fn a_question_ends_the_thinking_listed_before_it() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(command("c2", ToolStatus::Succeeded), 2_000, 3_000),
+            thought("before", "", 3_000, 6_000),
+            // Answered a minute later.
+            thought("after", "", 60_000, 65_000),
+            timed(command("c3", ToolStatus::Succeeded), 65_000, 66_000),
+            timed(command("c4", ToolStatus::Succeeded), 66_000, 67_000),
+        ];
+        let asked = HashSet::from(["before".to_owned()]);
+        let turns = group(&items, &asked, plain);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(pauses(&turns[0]), [(2, 3, 3_000)]);
+        assert_eq!(pauses(&turns[1]), [(0, 4, 5_000)]);
     }
 
     #[test]

@@ -150,10 +150,37 @@ fn a_group_counts_on_while_the_agent_thinks_and_stops_when_it_is_done() {
     };
     publish(&mut runtime, true);
     assert!(runtime.turns[0].running, "thinking is work still going on");
+    let shown = texts(&runtime, &mut None);
+    assert!(
+        shown.iter().any(|text| text == "Ran 2 commands · working"),
+        "{shown:?}"
+    );
     assert_eq!(runtime.turns[0].summary, "Ran 2 commands · working");
     // The same items once the agent has stopped: only the busy state moved.
     publish(&mut runtime, false);
     assert!(!runtime.turns[0].running);
     // From the prompt to the end of the thought.
     assert_eq!(runtime.turns[0].working_for(60_000), Some(4_000));
+}
+
+#[test]
+fn a_lone_command_followed_by_thinking_counts_on_as_its_group() {
+    let (mut runtime, handle) = prepared_runtime_for_test(&[
+        prompt(),
+        command("c1", 1_000, 2_000),
+        thought("t", 2_000, 3_000),
+    ]);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.busy = true;
+    handle.publish_delta_snapshot_for_test(snapshot);
+    runtime.refresh();
+    preparation::drain_fixture(&mut runtime);
+    let shown = texts(&runtime, &mut None);
+    assert!(
+        shown
+            .iter()
+            .any(|text| text == "Ran cargo test c1 · working"),
+        "the strip says the group is still working: {shown:?}"
+    );
 }

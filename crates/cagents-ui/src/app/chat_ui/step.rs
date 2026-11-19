@@ -343,7 +343,7 @@ impl Runtime {
     /// Whether a group's steps are on screen: a lone step always is, as its
     /// own row, and the steps of several when their strip is open.
     pub(super) fn steps_shown(&self, turn: &turn::Turn) -> bool {
-        turn.steps.len() == 1 || self.group_open(turn)
+        turn.lone_step().is_some() || self.group_open(turn)
     }
 
     /// One group's activity: a summary line and how long the work took,
