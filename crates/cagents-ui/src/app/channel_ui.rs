@@ -553,6 +553,17 @@ struct ChannelCloseAttempt {
     panes: Vec<(CardId, CardKind, bool)>,
 }
 
+/// Where the workspace goes once a retired channel's cards are gone.
+enum ChannelLanding {
+    /// The channel wasn't on screen and left nothing in the strip that is.
+    Unmoved,
+    /// The channel was on screen; the workspace moved to the selection.
+    Selected(Task<Message>),
+    /// A utility pane it was visiting now belongs in the worktree strip on
+    /// screen, which was built without it.
+    FreedUtility,
+}
+
 // Closing a terminal may publish its ended projection before the worker's
 // completion. Allow that projection, but never a different session, launch,
 // proof, recovery generation, or native conversation descriptor.
@@ -1899,10 +1910,6 @@ impl Cagents {
             .collect()
     }
 
-    pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
-        Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
-    }
-
     /// Removes a channel along with everything that existed only inside it.
     ///
     /// A channel's conversations are reachable nowhere else, so they are
@@ -1910,65 +1917,122 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
-        let Some(cards) = self
+        self.delete_channels(vec![id])
+    }
+
+    /// Deletes each of `ids` as [`Self::delete_channel`] deletes one, in one
+    /// pass over the window: a project's close takes all its channels at once.
+    ///
+    /// Each channel is refused, held for a session still starting, or closed
+    /// on its own, so a refusal leaves only that channel to retry. What every
+    /// channel would otherwise repeat is done once for the lot: the sidebar
+    /// shows them all deleting, the workspace leaves the active one for a
+    /// channel that stays, and the channels with no session to close retire
+    /// together, with one projection and one save.
+    pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
+        let mut started = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(cards) = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .map(|channel| channel.cards.clone())
+            else {
+                continue;
+            };
+            if let Some(blocker) = self.channel_deletion_blocker(&cards) {
+                self.status = Some(TransientNotice::warning(blocker));
+                continue;
+            }
+            if !self.channel_ui.deleting.insert(id) {
+                continue;
+            }
+            // A channel the user deleted stays deleted; reopening one of its
+            // cards does not bring it back.
+            self.fail_channel_reopen(
+                id,
+                "Reopening was cancelled because the channel is being deleted.",
+            );
+            self.forget_channel_revival(id);
+            self.channel_ui.failed.remove(&id);
+            started.push((id, cards));
+        }
+        if started.is_empty() {
+            return Task::none();
+        }
+        self.refresh_sidebar_channels();
+        // Settling spawns and closing sessions take a round trip each, and the
+        // rows report them meanwhile. The workspace leaves the channel now, so
+        // nothing the user does in the meantime lands in a channel whose
+        // sessions are being closed. Every channel going is already marked
+        // deleting, so it lands on one that stays rather than passing through
+        // each of the others on the way.
+        let leaving = self
+            .durable
+            .active_channel
+            .filter(|active| started.iter().any(|(id, _)| id == active))
+            .and_then(|active| {
+                self.durable
+                    .channels
+                    .iter()
+                    .position(|channel| channel.id == active)
+            });
+        let leave = match leaving {
+            Some(index) => {
+                let (project_id, successor) = self.channel_successor(index);
+                self.land_after_channel(project_id, successor)
+            }
+            None => Task::none(),
+        };
+        let mut tasks = Vec::with_capacity(started.len() + 2);
+        tasks.push(leave);
+        let mut retired = Vec::new();
+        let mut closing = Vec::new();
+        for (id, cards) in started {
+            if cards
+                .iter()
+                .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
+            {
+                tasks.push(cosmic::task::future(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Message::ChannelUi(Action::RetryDelete(id))
+                }));
+            } else if self
+                .channel_sessions_to_close(&cards)
+                .iter()
+                .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
+            {
+                closing.push(id);
+            } else {
+                self.channel_ui.deleting.remove(&id);
+                retired.push(id);
+            }
+        }
+        // The channels with nothing to close retire first, so each close
+        // below captures its channel as their save left it.
+        tasks.push(self.retire_channels(&retired, false));
+        for id in closing {
+            tasks.push(self.close_deleted_channel_sessions(id));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Asks the daemon to close the sessions of channel `id`, being deleted,
+    /// and captures what the channel holds so its answer is applied only to
+    /// the channel it closed.
+    fn close_deleted_channel_sessions(&mut self, id: ChannelId) -> Task<Message> {
+        let Some((cards, project)) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
-            .map(|channel| channel.cards.clone())
+            .map(|channel| (channel.cards.clone(), channel.project_id))
         else {
-            return Task::none();
-        };
-        if let Some(blocker) = self.channel_deletion_blocker(&cards) {
-            self.status = Some(TransientNotice::warning(blocker));
-            return Task::none();
-        }
-        if !self.channel_ui.deleting.insert(id) {
-            return Task::none();
-        }
-        // A channel the user deleted stays deleted; reopening one of its
-        // cards does not bring it back.
-        self.fail_channel_reopen(
-            id,
-            "Reopening was cancelled because the channel is being deleted.",
-        );
-        self.forget_channel_revival(id);
-        self.channel_ui.failed.remove(&id);
-        self.refresh_sidebar_channels();
-        // Settling spawns and closing sessions take a round trip each, and the
-        // row reports them meanwhile. The workspace leaves the channel now, so
-        // nothing the user does in the meantime lands in a channel whose
-        // sessions are being closed.
-        let leave = if self.durable.active_channel == Some(id)
-            && let Some(index) = self
-                .durable
-                .channels
-                .iter()
-                .position(|channel| channel.id == id)
-        {
-            let (project_id, successor) = self.channel_successor(index);
-            self.land_after_channel(project_id, successor)
-        } else {
-            Task::none()
-        };
-        if cards
-            .iter()
-            .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
-        {
-            let retry = cosmic::task::future(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Message::ChannelUi(Action::RetryDelete(id))
-            });
-            return Task::batch([leave, retry]);
-        }
-        let sessions = self.channel_sessions_to_close(&cards);
-        if !sessions
-            .iter()
-            .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
-        {
             self.channel_ui.deleting.remove(&id);
-            return Task::batch([leave, self.finish_delete_channel(id)]);
-        }
+            return Task::none();
+        };
+        let sessions = self.channel_sessions_to_close(&cards);
         let operation = uuid::Uuid::new_v4();
         let panes = self
             .durable
@@ -1990,13 +2054,6 @@ impl Cagents {
                 )
             })
             .collect();
-        let project = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.id == id)
-            .unwrap()
-            .project_id;
         let inactive = cards
             .iter()
             .copied()
@@ -2024,7 +2081,7 @@ impl Cagents {
                     .and_then(|result| result);
             Message::ChannelUi(Action::SessionsClosed(id, operation, result))
         });
-        Task::batch([leave, close])
+        close
     }
 
     fn channel_close_targets_current(&self, id: ChannelId, attempt: &ChannelCloseAttempt) -> bool {
@@ -2120,14 +2177,60 @@ impl Cagents {
     }
 
     fn retire_channel(&mut self, id: ChannelId, passive: bool) -> Task<Message> {
-        let Some(index) = self
+        self.retire_channels(&[id], passive)
+    }
+
+    /// Retires each of `ids` that is still here, then settles the window once
+    /// for all of them: however many channels go together, the sidebar is
+    /// projected, the workspace saved and its panes swept once.
+    fn retire_channels(&mut self, ids: &[ChannelId], passive: bool) -> Task<Message> {
+        let mut retired = false;
+        let mut selections = Vec::new();
+        let mut freed_utility = false;
+        for &id in ids {
+            let Some(landing) = self.retire_channel_cards(id, passive) else {
+                continue;
+            };
+            retired = true;
+            match landing {
+                ChannelLanding::Unmoved => {}
+                ChannelLanding::Selected(task) => selections.push(task),
+                ChannelLanding::FreedUtility => freed_utility = true,
+            }
+            // After the reselection: leaving a scope records its camera
+            // against the channel it is leaving, including this one.
+            self.channel_offsets.remove(&id);
+        }
+        if !retired {
+            return Task::none();
+        }
+        // A freed pane now belongs in the worktree strip on screen, which was
+        // built without it. Rebuilt once, with every channel's freed panes.
+        if freed_utility
+            && self.durable.active_channel.is_none()
+            && let Some(path) = self.active_workspace.clone()
+        {
+            selections.push(self.select_worktree(path, false));
+        }
+        self.refresh_sidebar_channels();
+        self.persist();
+        selections.extend([
+            self.lifecycle_sweep(),
+            self.sync_chrome(),
+            self.complete_closed_projects(),
+        ]);
+        Task::batch(selections)
+    }
+
+    /// Removes channel `id` and retires the cards that lived only in it,
+    /// leaving the window's projection and save to [`Self::retire_channels`].
+    /// `None` when the channel is already gone.
+    fn retire_channel_cards(&mut self, id: ChannelId, passive: bool) -> Option<ChannelLanding> {
+        let index = self
             .durable
             .channels
             .iter()
-            .position(|channel| channel.id == id)
-        else {
-            return Task::none();
-        };
+            .position(|channel| channel.id == id)?;
         self.forget_view_seed(&crate::workspace_model::views::Scope::Channel(id));
         let was_active = self.durable.active_channel == Some(id);
         let (project_id, successor) = self.channel_successor(index);
@@ -2217,33 +2320,16 @@ impl Cagents {
                 "A channel was deleted in another client. Your unsaved work and running conversations stay in its worktree.",
             ));
         }
-        let select = if was_active {
-            if let Some(scope) = retained_scope {
-                self.select_worktree(scope, false)
-            } else {
-                self.land_after_channel(project_id, successor)
-            }
-        } else if freed_utility
-            && self.durable.active_channel.is_none()
-            && let Some(path) = self.active_workspace.clone()
-        {
-            // The freed pane now belongs in the worktree strip on screen,
-            // which was built without it.
-            self.select_worktree(path, false)
+        Some(if was_active {
+            ChannelLanding::Selected(match retained_scope {
+                Some(scope) => self.select_worktree(scope, false),
+                None => self.land_after_channel(project_id, successor),
+            })
+        } else if freed_utility && self.durable.active_channel.is_none() {
+            ChannelLanding::FreedUtility
         } else {
-            Task::none()
-        };
-        // After the reselection: leaving a scope records its camera against
-        // the channel it is leaving, including this one.
-        self.channel_offsets.remove(&id);
-        self.refresh_sidebar_channels();
-        self.persist();
-        Task::batch([
-            select,
-            self.lifecycle_sweep(),
-            self.sync_chrome(),
-            self.complete_closed_projects(),
-        ])
+            ChannelLanding::Unmoved
+        })
     }
 
     /// The project of the channel at `index`, and the channel the workspace
@@ -2427,6 +2513,8 @@ impl Cagents {
 
     /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
+        #[cfg(test)]
+        super::terminal_output_tests::record_sidebar_refresh();
         self.sidebar_state
             .set_channel_selected(self.durable.active_channel.is_some());
         self.refresh_attention_projection();
@@ -3970,6 +4058,110 @@ pub(in crate::app) mod tests {
         ));
         app.refresh_sidebar_channels();
         (app, doomed, survivor, conversation)
+    }
+
+    /// `channel_with_a_conversation` with `extra` more empty channels in its
+    /// project, ranked below the active one: (window, every channel, the
+    /// conversation).
+    fn project_of_channels(extra: usize) -> (Cagents, Vec<ChannelId>, CardId) {
+        let (mut app, doomed, survivor, conversation) = channel_with_a_conversation();
+        let project = app.sidebar_model.projects.last().unwrap().id;
+        let mut channels = vec![doomed, survivor];
+        for ordinal in 0..extra {
+            let id = ChannelId::new();
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    title_source: Default::default(),
+                    id,
+                    project_id: project,
+                    title: format!("Channel {ordinal}"),
+                    ordinal: 0,
+                    shared: false,
+                    cards: Vec::new(),
+                    focused: None,
+                });
+            channels.push(id);
+        }
+        app.refresh_sidebar_channels();
+        (app, channels, conversation)
+    }
+
+    /// Closing a project takes all its channels in one pass. However many it
+    /// holds, the sidebar is projected and the workspace saved as often as for
+    /// one, and the workspace lands once, on the project's worktree, rather
+    /// than visiting each doomed channel on the way.
+    #[test]
+    fn closing_a_project_retires_its_channels_in_one_pass() {
+        use super::super::terminal_output_tests::{persists, sidebar_refreshes};
+        let close = |extra| {
+            let (mut app, channels, conversation) = project_of_channels(extra);
+            // With no session to close, every channel retires at once.
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == channels[0])
+                .unwrap()
+                .cards
+                .retain(|card| *card != conversation);
+            let (saved, refreshed) = (persists(), sidebar_refreshes());
+            drop(app.close_shared_project(Path::new("/repo")));
+            let counts = (persists() - saved, sidebar_refreshes() - refreshed);
+            assert!(channels.iter().all(|id| !channel_exists(&app, *id)));
+            assert!(
+                channels
+                    .iter()
+                    .all(|id| app.channel_ui.deleted.contains(id))
+            );
+            assert!(!app.channel_ui.deletion_running());
+            assert_eq!(app.durable.active_channel, None);
+            assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo")));
+            counts
+        };
+        let one = close(0);
+        assert_eq!(one.1, 2, "the rows show the deletion, then the retirement");
+        assert_eq!(close(6), one, "eight channels cost what two do");
+    }
+
+    /// Each channel of a closing project that still has sessions waits for
+    /// its own close while the rest retire together. A refused close keeps
+    /// that channel, and only it, to retry, and the project with it.
+    #[test]
+    fn a_closing_projects_refused_channel_stays_retryable_alone() {
+        let (mut app, channels, conversation) = project_of_channels(2);
+        let doomed = channels[0];
+        let project = app.sidebar_model.projects.last().unwrap().id;
+        drop(app.close_shared_project(Path::new("/repo")));
+        assert!(channel_exists(&app, doomed) && app.channel_ui.is_deleting(doomed));
+        assert!(channels[1..].iter().all(|id| !channel_exists(&app, *id)));
+        assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo")));
+
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Err("the daemon refused".into()),
+        )));
+        assert!(channel_exists(&app, doomed));
+        assert!(app.channel_ui.failed.contains_key(&doomed));
+        assert!(app.card_state(conversation).unwrap().existence.is_open());
+        assert!(app.project_ui.closing.contains_key(&project));
+        assert!(
+            !app.project_ui.close_in_flight.contains(&project),
+            "the project waits for its channel"
+        );
+
+        drop(app.handle_channel_ui(Action::RetryFailed(doomed)));
+        assert!(app.channel_ui.is_deleting(doomed));
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Ok(()),
+        )));
+        assert!(!channel_exists(&app, doomed));
+        assert!(
+            app.project_ui.close_in_flight.contains(&project),
+            "the last channel's retirement resumes the project's close"
+        );
     }
 
     /// Clicking down the channel list changes where this window is and

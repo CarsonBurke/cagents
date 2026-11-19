@@ -74,7 +74,9 @@ pub struct State {
     /// Projects closed by the shared model but still settling their channels.
     pub(super) closing: HashMap<ProjectId, PathBuf>,
     close_started: HashMap<ProjectId, Instant>,
-    close_in_flight: HashSet<ProjectId>,
+    /// Closing projects whose sessions the daemon is asked to close, or
+    /// that wait for a session still starting before asking.
+    pub(super) close_in_flight: HashSet<ProjectId>,
     close_failed: HashSet<ProjectId>,
     close_cancellations: HashMap<ProjectId, CancellationToken>,
     pub(super) close_generation: HashMap<ProjectId, u64>,
