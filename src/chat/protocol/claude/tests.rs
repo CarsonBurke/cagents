@@ -4574,7 +4574,7 @@ fn a_helpers_skill_instructions_stay_with_the_helper() {
             Event::SubagentItem { id, item } if item.id == "toolu_child_skill" => Some((id, item)),
             _ => None,
         })
-        .last()
+        .next_back()
         .unwrap();
     assert_eq!(last.0, "toolu_agent");
     assert!(
@@ -4746,7 +4746,7 @@ fn a_helpers_saved_skill_instructions_are_its_steps_output() {
             _ => None,
         }))
         .filter(|item| item.id == "child-skill")
-        .last()
+        .next_back()
         .unwrap_or_else(|| panic!("{events}"));
     assert!(
         matches!(&shown.content, ItemContent::Tool { name, output, .. } if name == "Skill" && output == SKILL_BODY),
