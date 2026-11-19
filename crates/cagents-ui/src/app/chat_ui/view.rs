@@ -5749,6 +5749,8 @@ impl Runtime {
                     .is_some_and(|card| card.is_card())
             {
                 Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
+            } else if let Some(source) = self.excerpted_output_source(item) {
+                Action::CopyStep(self.target, item.id.clone(), CopyPart::Text, source)
             } else {
                 Action::Copy(self.target, item.id.clone(), CopyPart::Text)
             },

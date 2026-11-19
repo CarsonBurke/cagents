@@ -558,22 +558,6 @@ fn age(now_ms: i64, at_ms: i64) -> String {
     }
 }
 
-/// A transcript's size, rounded for reading at a glance.
-fn size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit + 1 < UNITS.len() {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 || value >= 100.0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
 fn messages(count: u32) -> String {
     match count {
         1 => "1 message".into(),
@@ -1732,7 +1716,7 @@ impl Cagents {
         if let Some(summary) = summary {
             activity.push(messages(summary.messages()));
         }
-        activity.extend(row.bytes.map(size));
+        activity.extend(row.bytes.map(chat::approximate_size));
         column = column.push(design::caption(activity.join(" · ")));
         let warning = |text: String| {
             design::caption(text).class(cosmic::theme::Text::Custom(design::warning_text))
@@ -1798,7 +1782,7 @@ fn resume_details(row: &Row) -> String {
     if let Some(summary) = &row.summary {
         details.push(messages(summary.messages()));
     }
-    details.extend(row.bytes.map(size));
+    details.extend(row.bytes.map(chat::approximate_size));
     details.join(" · ")
 }
 
@@ -2765,9 +2749,9 @@ mod tests {
             "Just now",
             "a clock behind the file"
         );
-        assert_eq!(size(512), "512 B");
-        assert_eq!(size(12_300), "12.3 KB");
-        assert_eq!(size(220_000_000), "220 MB");
+        assert_eq!(chat::approximate_size(512), "512 B");
+        assert_eq!(chat::approximate_size(12_300), "12.3 KB");
+        assert_eq!(chat::approximate_size(220_000_000), "220 MB");
         assert_eq!(messages(1), "1 message");
         assert_eq!(messages(42), "42 messages");
     }
