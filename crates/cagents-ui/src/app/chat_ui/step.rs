@@ -309,6 +309,46 @@ impl Runtime {
         }
     }
 
+    /// Whether a group's strip is open: the reader's choice, or else the
+    /// setting.
+    pub(super) fn group_open(&self, turn: &turn::Turn) -> bool {
+        self.opened
+            .get(&turn.key)
+            .copied()
+            .unwrap_or(self.tool_groups_expanded)
+    }
+
+    /// Carries the reader opening or closing a group's only step, drawn as
+    /// its own row, to the group: when a second step joins it, the strip the
+    /// two share opens over the step the reader was reading, and closing
+    /// that step later folds only the step.
+    pub(super) fn follow_lone_step(&mut self, id: &str, open: bool) {
+        let items = &self.snapshot.items;
+        let Some(key) = self
+            .turns
+            .iter()
+            .find(|turn| match turn.steps.as_slice() {
+                [only] => items.get(only.index).is_some_and(|item| item.id == id),
+                _ => false,
+            })
+            .map(|turn| turn.key.clone())
+        else {
+            return;
+        };
+        self.find_disclosure.manual_turn(&key);
+        if open {
+            self.opened.insert(key, true);
+        } else {
+            self.opened.remove(&key);
+        }
+    }
+
+    /// Whether a group's steps are on screen: a lone step always is, as its
+    /// own row, and the steps of several when their strip is open.
+    pub(super) fn steps_shown(&self, turn: &turn::Turn) -> bool {
+        turn.steps.len() == 1 || self.group_open(turn)
+    }
+
     /// One group's activity: a summary line and how long the work took,
     /// disclosing the individual steps.
     ///
@@ -328,12 +368,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
-        // Explicit reader choices override the configured default.
-        let open = self
-            .opened
-            .get(key)
-            .copied()
-            .unwrap_or(self.tool_groups_expanded);
+        let open = self.group_open(turn);
         let elapsed = if turn.running {
             self.source_now_ms()
                 .and_then(|now| turn.duration_label(now))
@@ -413,8 +448,31 @@ impl Runtime {
         cached: &CachedItem,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
+        self.step_row(item, cached, settings, self.step_status(item))
+    }
+
+    /// A group's only step, drawn in place of the group. A strip over one
+    /// row would repeat that row's title and icon above it, so the row
+    /// stands alone, and carries the activity indicator the strip would have.
+    pub(super) fn lone_step_view(
+        &self,
+        turn: &turn::Turn,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+    ) -> Element<'static, Message> {
+        self.step_row(item, cached, settings, self.strip_status(turn))
+    }
+
+    fn step_row(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        settings: markdown::Settings,
+        status: Option<ToolStatus>,
+    ) -> Element<'static, Message> {
         let open = self.item_expanded(&item.id);
-        let mut rows = vec![self.step_header(item, cached, open)];
+        let mut rows = vec![self.step_button(item, cached, open, status)];
         if open {
             rows.push(
                 widget::container(super::view::message_actions(
@@ -435,13 +493,14 @@ impl Runtime {
 
     /// The header occupies the whole row; copy and time-stamp controls remain
     /// available with the expanded detail instead of shifting its chevron.
+    #[cfg(test)]
     pub(super) fn step_header(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
     ) -> Element<'static, Message> {
-        self.step_button(item, cached, open)
+        self.step_button(item, cached, open, self.step_status(item))
     }
 
     /// The verb and file of a step on one file, the file named the way the
@@ -472,6 +531,7 @@ impl Runtime {
         item: &chat::Item,
         cached: &CachedItem,
         open: bool,
+        status: Option<ToolStatus>,
     ) -> Element<'static, Message> {
         let target = self.target;
         // A step that worked with another agent says what it did in the
@@ -505,6 +565,13 @@ impl Runtime {
             && item.content.status() != Some(ToolStatus::Running)
         {
             said.push_str(&format!(" · {word}"));
+        } else if coordinated.is_some()
+            && item.content.status() == Some(ToolStatus::Running)
+            && status != Some(ToolStatus::Running)
+        {
+            // A coordinating step says what it did in the past tense, so
+            // one still working without the spinner says so in words.
+            said.push_str(" · working");
         }
         let label = if verb.is_empty() {
             said.clone()
@@ -525,7 +592,7 @@ impl Runtime {
             headline,
             name,
             glyph,
-            self.step_status(item),
+            status,
             elapsed,
             Some(open),
             Some(Action::Toggle(target, item.id.clone())),

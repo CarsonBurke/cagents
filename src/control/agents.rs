@@ -220,6 +220,14 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
 }
 
 impl PromptArgs {
+    /// Whether the prompt is read from standard input. The legacy
+    /// `--prompt -` is the literal text `-`, and `--prompt-file -` a file
+    /// called `-`, as [`read_text`] opens it.
+    #[cfg(feature = "ui")]
+    pub(super) fn reads_stdin(&self) -> bool {
+        self.flag.is_none() && self.text.as_deref().is_some_and(standard_input)
+    }
+
     fn read(self) -> Result<String, AppError> {
         if let Some(text) = self.flag {
             check_text_length(
@@ -248,7 +256,9 @@ pub(super) fn read_text(
     limit: usize,
 ) -> Result<String, AppError> {
     match (text, file) {
-        (Some(text), _) if text == "-" => read_bounded_text(io::stdin().lock(), code, limit),
+        (Some(text), _) if standard_input(&text) => {
+            read_bounded_text(io::stdin().lock(), code, limit)
+        }
         (Some(text), _) => {
             check_text_length(text.len(), code, limit)?;
             Ok(text)

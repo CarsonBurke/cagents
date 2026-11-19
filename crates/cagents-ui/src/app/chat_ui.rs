@@ -14519,8 +14519,12 @@ impl Cagents {
                         runtime.find_disclosure.manual_item(&id);
                         &mut runtime.expanded
                     };
-                    if !expanded.remove(&id) {
+                    let open = !expanded.remove(&id);
+                    if open {
                         expanded.insert(id.clone());
+                    }
+                    if runtime.selected_subagent.is_none() {
+                        runtime.follow_lone_step(&id, open);
                     }
                     if runtime.active_item(&id).is_some_and(|item| {
                         matches!(
@@ -14571,13 +14575,10 @@ impl Cagents {
                     runtime.find_navigation.cancel();
                     // Invert the visible default on the first toggle, then
                     // remember explicit choices across paging. Ignore stale keys.
-                    if runtime.turns.iter().any(|turn| turn.key == key) {
+                    if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
+                        let open = !runtime.group_open(turn);
                         runtime.find_disclosure.manual_turn(&key);
-                        let open = runtime
-                            .opened
-                            .entry(key)
-                            .or_insert(runtime.tool_groups_expanded);
-                        *open = !*open;
+                        runtime.opened.insert(key, open);
                     }
                 }
             }
