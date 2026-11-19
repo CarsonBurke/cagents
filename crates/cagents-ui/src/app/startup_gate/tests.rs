@@ -971,6 +971,8 @@ fn panes_settling_at_the_end_of_the_budget_save_without_a_daemon_answer() {
     assert!(!app.startup_gate.saving);
     assert_eq!(reported(&app), None);
 
+    drop(deliver(&mut app, Ok(StartupState::Ready)));
+    app.startup_gate.inspected = None;
     settle(&mut app, &cards);
     elapse(&mut app, Duration::from_secs(3));
     drop(app.verify_startup_gate());
