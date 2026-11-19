@@ -58,6 +58,68 @@ impl Drop for ReleaseOnDrop {
 }
 
 #[test]
+fn a_pulled_capture_from_a_replaced_worker_is_not_accepted() {
+    let shared = host();
+    let id = TerminalId::new();
+    let (old, _) = stream(&shared, id);
+    old.publish(100);
+    let mut state = shared.lock().unwrap();
+    state.register_client(1);
+    state.reserve_spawn(id).unwrap();
+    state
+        .finish_spawn(1, session(id), old.handle.clone(), true)
+        .unwrap();
+    let handle_a = state.history_handle(1, id).unwrap();
+    state.presentation_revision(1, id);
+    let epoch = state.subscriptions.viewports[&(1, id)].epoch;
+    assert_eq!(epoch, 0);
+    let source = handle_a.generation();
+
+    let (successor, _) = stream(&shared, id);
+    successor.publish(1);
+    let retired = state.retire_terminal(id).unwrap();
+    assert!(retired.handle.same_worker(&handle_a));
+    state.reserve_spawn(id).unwrap();
+    state
+        .finish_spawn(1, session(id), successor.handle.clone(), true)
+        .unwrap();
+    state.attach(1, id).unwrap();
+    assert!(state.subscriptions.attached(1, id));
+    assert!(!state.terminals[&id].handle.same_worker(&handle_a));
+    assert!(!state.subscriptions.viewports.contains_key(&(1, id)));
+
+    assert_eq!(
+        presentation::accept_pulled_capture(&mut state, 1, id, &handle_a, epoch, source).unwrap(),
+        None
+    );
+    assert!(!state.subscriptions.viewports.contains_key(&(1, id)));
+}
+
+#[test]
+fn a_pulled_capture_from_the_current_worker_is_accepted() {
+    let shared = host();
+    let id = TerminalId::new();
+    let (current, _) = stream(&shared, id);
+    current.publish(100);
+    let mut state = shared.lock().unwrap();
+    state.register_client(1);
+    state.reserve_spawn(id).unwrap();
+    state
+        .finish_spawn(1, session(id), current.handle.clone(), true)
+        .unwrap();
+    let handle = state.history_handle(1, id).unwrap();
+    let revision = state.presentation_revision(1, id);
+    let epoch = state.subscriptions.viewports[&(1, id)].epoch;
+    assert_eq!(epoch, 0);
+    let source = handle.generation();
+
+    assert_eq!(
+        presentation::accept_pulled_capture(&mut state, 1, id, &handle, epoch, source).unwrap(),
+        Some(revision)
+    );
+}
+
+#[test]
 fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
     for visible in [true, false] {
         let shared = host();
