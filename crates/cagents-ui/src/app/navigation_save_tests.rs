@@ -113,3 +113,31 @@ fn going_to_an_open_pane_from_the_sidebar_saves_with_the_navigation_burst() {
     assert_eq!(app.workspace.focused(), Some(channeled));
     assert_saved_with_the_burst(&mut app, saved, "a pane in a channel");
 }
+
+#[test]
+fn going_to_an_open_worktree_pane_from_the_palette_saves_with_the_navigation_burst() {
+    let (mut app, _) = alt_tab_test_app();
+    drop(app.navigate_to_worktree("/repo".into(), false));
+    finish_burst(&mut app);
+    let feature = app.durable.cards[1].id;
+
+    let saved = persists();
+    drop(app.update(Message::Palette(palette_ui::Action::FocusPane(feature))));
+    assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo/feature")));
+    assert_eq!(app.workspace.focused(), Some(feature));
+    assert_saved_with_the_burst(&mut app, saved, "a palette pane in another worktree");
+}
+
+#[test]
+fn going_to_an_open_channel_pane_from_the_palette_saves_with_the_navigation_burst() {
+    let (mut app, channel) = alt_tab_test_app();
+    drop(app.navigate_to_worktree("/repo".into(), false));
+    finish_burst(&mut app);
+    let channeled = app.durable.cards[2].id;
+
+    let saved = persists();
+    drop(app.update(Message::Palette(palette_ui::Action::FocusPane(channeled))));
+    assert_eq!(app.durable.active_channel, Some(channel));
+    assert_eq!(app.workspace.focused(), Some(channeled));
+    assert_saved_with_the_burst(&mut app, saved, "a palette pane in a channel");
+}
