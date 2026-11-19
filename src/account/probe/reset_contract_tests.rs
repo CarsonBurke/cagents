@@ -399,6 +399,7 @@ for line in sys.stdin:
                 Entry {
                     identity: claude_identity.clone(),
                     snapshot: previous.clone(),
+                    inventory_observed_at: Some(previous.observed_at),
                 },
             )
             .unwrap();
