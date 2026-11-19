@@ -224,6 +224,9 @@ struct Comparison<'a> {
     /// Appended variants of the named enum that the older client is sent as
     /// one it knows, and added fields of the named struct it is sent without.
     restated: Vec<(&'static str, &'static str)>,
+    /// Added fields of the named struct that this build reads as absent from
+    /// the older side, which it therefore never needs to send them.
+    absent: Vec<(&'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
     selected: Vec<(&'static str, Vec<&'static str>)>,
@@ -263,16 +266,24 @@ impl Comparison<'_> {
             }
             (Container::Struct(old), Container::Struct(new)) => {
                 // A field the daemon omits for this client is one it never
-                // receives. A request still has to carry every field.
-                let new: Vec<_> = new
-                    .iter()
-                    .filter(|(name, _)| {
-                        direction == Direction::Request
-                            || !self.restated.contains(&(current, name.as_str()))
-                    })
-                    .cloned()
-                    .collect();
-                self.named(direction, old, &new, path);
+                // receives. One this build reads as absent from an older
+                // source is one that source never sends, whichever side of
+                // the comparison is this build. A request still has to carry
+                // every field.
+                let kept = |fields: &[(String, Shape)], omitted: bool| -> Vec<_> {
+                    fields
+                        .iter()
+                        .filter(|(name, _)| {
+                            let field = (current, name.as_str());
+                            direction == Direction::Request
+                                || !(self.absent.contains(&field)
+                                    || omitted && self.restated.contains(&field))
+                        })
+                        .cloned()
+                        .collect()
+                };
+                let (old, new) = (kept(old, false), kept(new, true));
+                self.named(direction, &old, &new, path);
             }
             (Container::Enum(old), Container::Enum(new)) => {
                 let gate = self
@@ -417,6 +428,7 @@ fn differences(
         gated,
         refused,
         restated,
+        absent: Vec::new(),
         selected: Vec::new(),
         visited: BTreeSet::new(),
         differences: Vec::new(),
@@ -573,6 +585,16 @@ fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// Added fields this build reads as absent from a source of `protocol`, as
+/// (struct, field).
+fn read_as_absent_from(protocol: u16) -> Vec<(&'static str, &'static str)> {
+    READ_AS_ABSENT
+        .iter()
+        .filter(|(.., since)| protocol < *since)
+        .flat_map(|(container, fields, _)| fields.iter().map(move |field| (*container, *field)))
+        .collect()
+}
+
 /// The lifecycle contract with a source of `protocol`: the frozen variants,
 /// those its protocol added, and the unsolicited chat events it already sends.
 fn selected_for(protocol: u16) -> Vec<(&'static str, Vec<&'static str>)> {
@@ -604,6 +626,7 @@ fn lifecycle_differences(
     older: &Shapes,
     current: &Shapes,
     restated: &[(&'static str, &'static str)],
+    absent: &[(&'static str, &'static str)],
     selected: &[(&'static str, Vec<&'static str>)],
 ) -> Vec<String> {
     let mut changed = Vec::new();
@@ -614,6 +637,7 @@ fn lifecycle_differences(
             gated: Vec::new(),
             refused: Vec::new(),
             restated: restated.to_vec(),
+            absent: absent.to_vec(),
             selected: selected.to_vec(),
             visited: BTreeSet::new(),
             differences: Vec::new(),
@@ -642,12 +666,14 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
     for protocol in crate::update::source::protocols() {
         let older = recorded(protocol);
         let restated = restated_for(protocol);
+        let absent = read_as_absent_from(protocol);
         let selected = selected_for(protocol);
-        let mut changed = lifecycle_differences(&older, &current_recording, &restated, &selected);
+        let mut changed =
+            lifecycle_differences(&older, &current_recording, &restated, &absent, &selected);
         // Also compare actual Rust types: regenerating the current fixture
         // cannot bless an incompatible change to an admitted source's subset.
         changed.extend(lifecycle_differences(
-            &older, &current, &restated, &selected,
+            &older, &current, &restated, &absent, &selected,
         ));
         assert!(
             changed.is_empty(),
@@ -655,6 +681,34 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
             changed.join("\n")
         );
     }
+}
+
+/// Only a field marked as read as absent may be missing from what an older
+/// source answers: one this build is merely sent without still fails.
+#[test]
+fn an_older_source_may_omit_only_the_fields_read_as_absent() {
+    let current = traced();
+    let protocol = crate::update::source::protocols()
+        .find(|&protocol| protocol < HISTORY_EXTENTS)
+        .unwrap();
+    let older = recorded(protocol);
+    let restated = restated_for(protocol);
+    let selected = selected_for(protocol);
+    assert!(
+        lifecycle_differences(
+            &older,
+            &current,
+            &restated,
+            &read_as_absent_from(protocol),
+            &selected
+        )
+        .is_empty()
+    );
+    let unmarked = lifecycle_differences(&older, &current, &restated, &[], &selected);
+    assert!(
+        unmarked.iter().any(|difference| difference.contains("snapshot")),
+        "{unmarked:?}"
+    );
 }
 
 #[test]
@@ -700,7 +754,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
                     .unwrap();
                 variants.swap(index, index - 1);
                 assert!(
-                    !lifecycle_differences(&baseline, &changed, &[], &selected_for(protocol))
+                    !lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(protocol))
                         .is_empty(),
                     "protocol {protocol}: inspector variant {name} must be frozen"
                 );
@@ -717,7 +771,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
         };
         fields.push(("future_history_field".into(), Shape::Bool));
         assert!(
-            !lifecycle_differences(&baseline, &changed, &[], &selected_for(protocol)).is_empty()
+            !lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(protocol)).is_empty()
         );
     }
 }
@@ -762,7 +816,7 @@ fn readiness_proof_detects_startup_phase_variants_and_nested_payload_changes() {
                 _ => unreachable!(),
             }
             assert!(
-                !lifecycle_differences(&baseline, &changed, &[], &selected_for(protocol))
+                !lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(protocol))
                     .is_empty(),
                 "protocol {protocol}: readiness mutation {mutation} must be rejected"
             );
@@ -788,7 +842,7 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.swap(0, 1);
-    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[], &selected).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Struct(fields) = changed.containers.get_mut(&key("DaemonImpact")).unwrap()
@@ -796,14 +850,14 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     fields.push(("future_field".into(), Shape::Bool));
-    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[], &selected).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Enum(variants) = changed.containers.get_mut(&key("Disposition")).unwrap() else {
         panic!()
     };
     variants.push(("future_variant".into(), Some(Fields::Unit)));
-    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[], &selected).is_empty());
 
     // The newer daemon can evolve unrelated agent operations independently.
     let mut changed = baseline.clone();
@@ -811,7 +865,7 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
-    assert!(lifecycle_differences(&baseline, &changed, &[], &selected).is_empty());
+    assert!(lifecycle_differences(&baseline, &changed, &[], &[], &selected).is_empty());
 }
 
 #[test]
@@ -828,9 +882,9 @@ fn lifecycle_proof_covers_the_unsolicited_chat_events_a_source_already_sends() {
         panic!()
     };
     assert_eq!(variants.pop().unwrap().0, "chat_agent_addresses");
-    assert!(!lifecycle_differences(&baseline, &changed, &[], &selected_for(173)).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(173)).is_empty());
     // A source from before it never sends it.
-    assert!(lifecycle_differences(&baseline, &changed, &[], &selected_for(172)).is_empty());
+    assert!(lifecycle_differences(&baseline, &changed, &[], &[], &selected_for(172)).is_empty());
 }
 
 /// How a provider addresses a chat's subagents travels beside its snapshot,

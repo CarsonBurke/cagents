@@ -315,8 +315,8 @@ mod older_clients;
 #[cfg(test)]
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
-    encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, HISTORY_EXTENTS, PLAN_AND_RESET_READINGS,
+    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

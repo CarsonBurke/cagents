@@ -2633,9 +2633,11 @@ impl ControlClient {
 
         loop {
             let envelope = match deadline {
-                Some(deadline) => read_frame(&mut DeadlineReader {
-                    stream: &mut self.stream,
-                    deadline,
+                Some(deadline) => crate::terminal_ipc::decoding_from(self.protocol, || {
+                    read_frame(&mut DeadlineReader {
+                        stream: &mut self.stream,
+                        deadline,
+                    })
                 })
                 .map_err(|error| reply_error(error, Some(reply_timeout)))?
                 .ok_or(ControlError::ConnectionClosed)?,
@@ -2759,7 +2761,9 @@ impl ControlClient {
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {
         let timeout = self.stream.read_timeout().ok().flatten();
-        read_frame(&mut self.stream)
+        // An update source answers in its own protocol, which may predate
+        // fields this build added to what it sends.
+        crate::terminal_ipc::decoding_from(self.protocol, || read_frame(&mut self.stream))
             .map_err(|error| reply_error(error, timeout))?
             .ok_or(ControlError::ConnectionClosed)
     }

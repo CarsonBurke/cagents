@@ -154,11 +154,15 @@ impl Client {
         // exact chat's qualified events under the same absolute deadline.
         let mut changed = false;
         for _ in 0..256 {
-            let envelope = if bootstrap_chat.is_some() {
-                read_chat_envelope(&mut stream)?
-            } else {
-                read_response(&mut stream)?
-            };
+            // Read as the source wrote it, which may predate fields this
+            // build added to what it answers.
+            let envelope = ipc::decoding_from(self.protocol, || {
+                if bootstrap_chat.is_some() {
+                    read_chat_envelope(&mut stream)
+                } else {
+                    read_response(&mut stream)
+                }
+            })?;
             if envelope.version != self.protocol || envelope.proof != self.proof {
                 return Err("Source inspection ownership or protocol changed".into());
             }
@@ -191,9 +195,12 @@ impl Client {
                     "Source migration inspection timed out".into()
                 });
             }
-            let envelope = read_chat_envelope(&mut DeadlineStream {
-                stream: &mut self.stream,
-                deadline: self.deadline,
+            let protocol = self.protocol;
+            let envelope = ipc::decoding_from(protocol, || {
+                read_chat_envelope(&mut DeadlineStream {
+                    stream: &mut self.stream,
+                    deadline: self.deadline,
+                })
             })?;
             if envelope.version != self.protocol || envelope.proof != self.proof {
                 return Err("Source inspection ownership or protocol changed".into());

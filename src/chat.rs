@@ -1628,7 +1628,11 @@ pub struct Snapshot {
     pub has_later: bool,
     /// Where the presented window sits in the whole conversation, so a
     /// reader's scrollbar can stand for all of it rather than the window.
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "HistoryExtent::omitted",
+        deserialize_with = "HistoryExtent::read"
+    )]
     pub history: HistoryExtent,
     pub composer: Option<String>,
     #[serde(default)]
@@ -1685,6 +1689,19 @@ pub struct HistoryExtent {
 }
 
 impl HistoryExtent {
+    /// Whether a snapshot goes to a client from before the extent, which is
+    /// sent it without. Postcard is positional, so the field is left out.
+    fn omitted(&self) -> bool {
+        crate::terminal_ipc::encoding_before(crate::terminal_ipc::HISTORY_EXTENTS)
+    }
+    /// Reads the extent, or nothing from a peer from before it: what follows
+    /// in its bytes is the snapshot's next field.
+    fn read<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::HISTORY_EXTENTS) {
+            return Ok(Self::default());
+        }
+        Self::deserialize(deserializer)
+    }
     /// How many items the whole cached conversation holds, given the window's.
     pub fn total(self, window: usize) -> u64 {
         self.before + window as u64 + self.after
