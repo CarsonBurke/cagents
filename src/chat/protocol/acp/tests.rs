@@ -260,9 +260,10 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
         .unwrap();
     assert!(capabilities.model_selection && capabilities.reasoning_selection);
     assert!(!capabilities.steer && !capabilities.queue && !capabilities.compact);
+    // By meaning: the test profile's `acceptEdits` is agy's `accept-edits`.
     assert_eq!(
         capabilities.permission_modes,
-        ["default", "accept-edits", "auto", "plan"]
+        ["default", "acceptEdits", "auto", "plan"]
     );
     assert!(!acp.initialization_pending());
 }
@@ -1309,9 +1310,14 @@ fn modes_reach_the_reader_by_meaning_and_the_agent_in_its_own_words() {
             mode: "acceptEdits".into(),
         })
         .unwrap();
-    let set = only_write(&step);
+    let set = only_write(&step).clone();
     assert_eq!(set["method"], "session/set_config_option");
     assert_eq!(set["params"]["value"], "accept-edits");
+    acp.receive(reply(
+        &set,
+        json!({"configOptions": agy_new()["configOptions"].clone()}),
+    ))
+    .unwrap();
     let step = acp
         .receive(update(
             &session,
