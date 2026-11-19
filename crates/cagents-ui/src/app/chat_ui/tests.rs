@@ -12904,6 +12904,111 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
 }
 
 #[test]
+fn draft_permission_preview_reads_config_once_per_recipe() {
+    let home = tempfile::tempdir().unwrap();
+    let account = home.path().join(".codex");
+    std::fs::create_dir_all(&account).unwrap();
+    let config = account.join("config.toml");
+    std::fs::write(
+        &config,
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+    )
+    .unwrap();
+    let mut recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: home.path().to_owned(),
+        environment: [
+            ("HOME".into(), home.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+        ]
+        .into(),
+    };
+    let mut preview = DraftPermissionPreview::default();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("yolo")
+    );
+    std::fs::write(
+        &config,
+        "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("yolo"),
+        "an unchanged recipe keeps its preview"
+    );
+    recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
+        .map(String::from)
+        .into();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("workspaceWrite")
+    );
+    assert_eq!(
+        preview.get(&recipe, Provider::Omp),
+        None,
+        "the provider is part of the key"
+    );
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("workspaceWrite")
+    );
+}
+
+#[test]
+fn codex_draft_publications_do_not_reread_provider_config() {
+    let home = tempfile::tempdir().unwrap();
+    let account = home.path().join(".codex");
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&account).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let config = account.join("config.toml");
+    std::fs::write(&config, "profile = 'x'\n").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, &project);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    // Only a presented draft falls back to its recipe's preview; a hidden
+    // one stores the publication as it came.
+    runtime.visible.store(true, Ordering::Relaxed);
+    // The draft helper selects its own account. Bind this fixture's recipe
+    // before its first publication and discard the earlier account's preview.
+    runtime.session.launch.recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: project,
+        environment: [
+            ("HOME".into(), home.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+        ]
+        .into(),
+    };
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = None;
+    let mut snapshot = (*runtime.snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.session_id = None;
+    snapshot.permission_mode = None;
+    runtime.install_snapshot(Arc::new(snapshot), None);
+    assert_eq!(runtime.snapshot.permission_mode, None);
+
+    std::fs::write(
+        config,
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+    )
+    .unwrap();
+    let mut snapshot = (*runtime.snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.session_id = None;
+    snapshot.permission_mode = None;
+    runtime.install_snapshot(Arc::new(snapshot), None);
+    assert_eq!(runtime.snapshot.permission_mode, None);
+}
+
+#[test]
 fn codex_draft_permissions_wait_for_project_and_custom_policy_layers() {
     let home = tempfile::tempdir().unwrap();
     let account = home.path().join(".codex");

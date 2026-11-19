@@ -3113,6 +3113,8 @@ struct FileCompletionMemo {
 }
 
 pub(super) struct Runtime {
+    /// The permission mode this draft's launch recipe previews.
+    draft_permission: DraftPermissionPreview,
     preparation: preparation::State,
     find: Option<String>,
     /// The groups Find matched, in transcript order. Every turn asks whether
@@ -4344,10 +4346,11 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let mut draft_permission = DraftPermissionPreview::default();
+        let permission_mode = draft_permission.get(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
             preparation: preparation::State::default(),
+            draft_permission,
             target,
             session,
             snapshot: Arc::new(Snapshot {
@@ -4616,6 +4619,13 @@ impl Runtime {
         self.merge_attachments(written);
         Some(queued.draft)
     }
+    /// The permission mode this draft's launch recipe previews, read from
+    /// provider config only when the recipe changed since the last read.
+    fn draft_permission_mode(&mut self) -> Option<String> {
+        self.draft_permission
+            .get(&self.session.launch.recipe, self.session.launch.provider)
+    }
+
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
         target: Target,
@@ -5844,7 +5854,8 @@ impl Runtime {
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
-                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
+                    self.draft_permission
+                        .get(&self.session.launch.recipe, self.session.launch.provider)
                 });
         }
         if !self.parent_scroll().at_bottom()
@@ -7092,6 +7103,27 @@ fn draft_snapshot(
     }
 }
 
+/// The permission mode a draft's launch recipe previews. Reading it touches
+/// provider config files, so it is computed once per (provider, recipe).
+#[derive(Default)]
+struct DraftPermissionPreview {
+    resolved: Option<(Provider, LaunchRecipe, Option<String>)>,
+}
+
+impl DraftPermissionPreview {
+    fn get(&mut self, recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+        if let Some((cached_provider, cached_recipe, mode)) = &self.resolved
+            && *cached_provider == provider
+            && cached_recipe == recipe
+        {
+            return mode.clone();
+        }
+        let mode = draft_permission_mode(recipe, provider);
+        self.resolved = Some((provider, recipe.clone(), mode.clone()));
+        mode
+    }
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -7768,7 +7800,7 @@ impl Cagents {
             .map_or(&runtime.session.launch.recipe, |session| {
                 &session.launch.recipe
             });
-        snapshot.permission_mode = draft_permission_mode(recipe, provider);
+        snapshot.permission_mode = runtime.draft_permission.get(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
@@ -7887,8 +7919,9 @@ impl Cagents {
         runtime.session = session.clone();
         runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, account.provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -8452,8 +8485,9 @@ impl Cagents {
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
         }
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, provider);
         if rehomed {
             // A failed start's reason belongs to the account it failed on.
             runtime.error = None;
@@ -9326,9 +9360,7 @@ impl Cagents {
         self.chat_ui.capacity_offers.remove(&card);
         self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.blocked_details.remove(&card);
-        let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        snapshot.permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let snapshot = self.chat_draft_snapshot(session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
@@ -9338,6 +9370,8 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
+        // The runtime already read its recipe's preview; this is that answer.
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
@@ -11474,7 +11508,7 @@ impl Cagents {
         let Some(draft) = runtime.unqueue() else {
             return Task::none();
         };
-        snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
+        snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
