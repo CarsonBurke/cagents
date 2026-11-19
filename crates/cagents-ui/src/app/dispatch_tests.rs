@@ -55,6 +55,32 @@ fn ctrl_named(named: Named, code: Code) -> Message {
     press(keyboard::Key::Named(named), code, keyboard::Modifiers::CTRL)
 }
 
+fn escape(captured: bool) -> Message {
+    Message::KeyEvent {
+        event: keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(Named::Escape),
+            modified_key: keyboard::Key::Named(Named::Escape),
+            physical_key: keyboard::key::Physical::Code(Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        },
+        captured,
+    }
+}
+
+fn repository_app() -> (Cagents, CardId) {
+    let (mut app, card, _) = two_pane_app();
+    let runtime = RepositoryRuntime::dirty_fixture(card);
+    app.card_state_mut(card).unwrap().kind = CardKind::Repository(runtime.descriptor.clone());
+    app.cards
+        .insert(card, CardRuntime::Repository(Box::new(runtime)));
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    drop(app.project_workspace(true));
+    (app, card)
+}
+
 /// Updates `app` with `message`, and answers how many times that projected
 /// the whole workspace.
 fn projections_of(app: &mut Cagents, message: Message) -> usize {
@@ -79,6 +105,55 @@ fn a_pane_switching_shortcut_projects_the_workspace_once() {
         assert_eq!(app.workspace.focused(), Some(focused), "{label}");
         projection_oracle::assert_projected(&mut app);
     }
+}
+
+#[test]
+fn closing_find_by_escape_projects_the_workspace_once() {
+    let (mut app, card) = repository_app();
+    drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+    assert_eq!(app.focused_repository_card_with_find(), Some(card));
+    assert_eq!(projections_of(&mut app, escape(false)), 1);
+    assert_eq!(app.focused_repository_card_with_find(), None);
+    projection_oracle::assert_projected(&mut app);
+}
+
+#[test]
+fn cancelling_a_dialog_by_escape_projects_the_workspace_once() {
+    for captured in [false, true] {
+        let (mut app, card) = repository_app();
+        drop(app.update(Message::Repository(RepositoryAction::OpenFind { card })));
+        app.worktree_dialog = Some(WorktreeDialog::new(
+            ProjectId::new(),
+            PathBuf::from("/repo"),
+            WorktreeDraft::default(),
+        ));
+        assert_eq!(projections_of(&mut app, escape(captured)), 1);
+        assert!(app.worktree_dialog.is_none());
+        assert_eq!(app.focused_repository_card_with_find(), Some(card));
+        projection_oracle::assert_projected(&mut app);
+    }
+}
+
+#[test]
+fn saving_by_shortcut_projects_the_workspace_once() {
+    let (mut app, card) = repository_app();
+    assert!(
+        matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+        if runtime.save_error().is_none())
+    );
+    let save = press(
+        keyboard::Key::Character("s".into()),
+        Code::KeyS,
+        keyboard::Modifiers::CTRL,
+    );
+    assert_eq!(projections_of(&mut app, save), 1);
+    // This fixture has no original read root: the save answers in this
+    // update, without running a queued message or writing a file.
+    assert!(
+        matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+        if runtime.save_error() == Some("The original read root is unavailable; reopen this file before saving."))
+    );
+    projection_oracle::assert_projected(&mut app);
 }
 
 /// Every command that stands for another message, chosen from the palette,
@@ -187,6 +262,26 @@ fn a_sweep_that_only_moves_exposures_projects_nothing() {
     }
     drop(app.project_workspace(true));
     assert_eq!(projections_of(&mut app, Message::LifecycleSweep), 0);
+    assert_eq!(app.exposure(first), Exposure::Visible);
+    projection_oracle::assert_projected(&mut app);
+}
+
+#[test]
+fn an_elapsed_sweep_that_only_moves_exposures_projects_nothing() {
+    let (mut app, first, second) = two_pane_app();
+    drop(app.workspace.resize_viewport(400.0));
+    for card in [first, second] {
+        app.register_presence(card, Exposure::Offscreen, Residency::Hot);
+    }
+    drop(app.project_workspace(true));
+    app.lifecycle_sweep_generation = 1;
+    let deadline = Instant::now();
+    app.lifecycle_sweep_deadline = Some(deadline);
+    assert_eq!(
+        projections_of(&mut app, Message::LifecycleSweepElapsed(1)),
+        0
+    );
+    assert_ne!(app.lifecycle_sweep_deadline, Some(deadline));
     assert_eq!(app.exposure(first), Exposure::Visible);
     projection_oracle::assert_projected(&mut app);
 }

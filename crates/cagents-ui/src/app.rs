@@ -10567,17 +10567,12 @@ impl Cagents {
             // behind the confirmations above because those are modal.
             if let Some(card) = self.focused_repository_card_with_find() {
                 return (
-                    cosmic::task::message(Message::Repository(RepositoryAction::CloseFind {
-                        card,
-                    })),
+                    self.dispatch(Message::Repository(RepositoryAction::CloseFind { card })),
                     Projection::Full,
                 );
             }
             if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                return (
-                    cosmic::task::message(Message::CancelDialog),
-                    Projection::Full,
-                );
+                return (self.dispatch(Message::CancelDialog), Projection::Full);
             }
             if self.sidebar_state.controls_expanded() {
                 return (
@@ -10668,7 +10663,7 @@ impl Cagents {
             && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
         {
             return (
-                cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                self.dispatch(Message::Repository(RepositoryAction::Save {
                     card,
                     overwrite: false,
                 })),
@@ -11115,10 +11110,10 @@ impl Cagents {
         }
     }
 
-    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> Task<Message> {
+    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> (Task<Message>, Projection) {
         if generation != self.lifecycle_sweep_generation {
             // Superseded by a later arming, whose own delivery is still to come.
-            return Task::none();
+            return (Task::none(), Projection::Full);
         }
         // A matching generation carries the deadline it was armed with, because
         // `arm_lifecycle_sweep` writes both together, so neither branch below
@@ -11126,18 +11121,21 @@ impl Cagents {
         // sweep that ran without a deadline has nothing to do, and a timer that
         // woke marginally early must wait out the grace rather than cut it.
         let Some(deadline) = self.lifecycle_sweep_deadline else {
-            return Task::none();
+            return (Task::none(), Projection::Full);
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            return self.arm_lifecycle_sweep(deadline);
+            return (self.arm_lifecycle_sweep(deadline), Projection::Full);
         }
         self.lifecycle_sweep_deadline = None;
-        let sweep = self.lifecycle_sweep();
+        let (sweep, projection) = self.lifecycle_sweep_update();
         // That reconcile made the manager's exposure current, so the next
         // wakeup can be placed exactly when the earliest card still holding
         // its grace exhausts it.
-        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
+        (
+            Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()]),
+            projection,
+        )
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
@@ -18416,14 +18414,16 @@ impl Cagents {
                 let update = self.workspace.tick(elapsed);
                 Task::batch([inspector_task, self.apply_viewport(update, true, DurableChange::None)])
             }
-            Message::LifecycleSweep => {
-                let (task, sweep_projection) = self.lifecycle_sweep_update();
+            message @ (Message::LifecycleSweep | Message::LifecycleSweepElapsed(_)) => {
+                let (task, sweep_projection) = match message {
+                    Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+                    _ => self.lifecycle_sweep_update(),
+                };
                 if !self.update_tail_may_close_or_commit() {
                     projection = sweep_projection;
                 }
                 task
             }
-            Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
             Message::WorkspaceSwitcherSelected { since, index } => {
                 if self.chrome_ui.workspace_preview_since == Some(since) {
                     self.select_workspace_preview(index)
