@@ -595,6 +595,7 @@ mod tests {
             log_path: directory.join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let request = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(
@@ -844,6 +845,7 @@ mod tests {
                 expires_at_unix_ms: u64::MAX,
             }),
             refusal: None,
+            in_flight: Vec::new(),
         };
         let mut terminal = Terminal {
             job: job.clone(),

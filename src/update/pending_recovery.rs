@@ -114,6 +114,7 @@ pub(crate) fn run(
         log_path,
         confirmation: None,
         refusal: None,
+        in_flight: Vec::new(),
     };
     write_job(&state, &job)?;
     let result = (|| {

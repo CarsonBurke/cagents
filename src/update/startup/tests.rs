@@ -27,6 +27,7 @@ fn job(phase: UpdatePhase) -> UpdateJob {
         log_path: "/private/LOG_SENTINEL".into(),
         confirmation: None,
         refusal: None,
+        in_flight: Vec::new(),
     }
 }
 fn write(state: &Path, job: &UpdateJob) {

@@ -505,6 +505,7 @@ fn job(directory: &Path) -> UpdateJob {
         log_path: directory.join("worker.log"),
         confirmation: None,
         refusal: None,
+        in_flight: Vec::new(),
     };
     let file = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
     serde_json::to_writer(
@@ -2606,4 +2607,159 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
         report.contains("1 background task stopped; it does not resume automatically."),
         "{report}"
     );
+}
+
+fn running_turn() -> crate::chat::Snapshot {
+    crate::chat::Snapshot {
+        busy: true,
+        ..Default::default()
+    }
+}
+
+fn background_agent() -> crate::chat::Snapshot {
+    crate::chat::Snapshot {
+        subagents: vec![crate::chat::Subagent {
+            id: "child-thread".into(),
+            kind: "Worker".into(),
+            description: "Watch CI".into(),
+            status: crate::chat::ToolStatus::Running,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Capture the census's work as the update does, from each chat's snapshot.
+fn census_in_flight(
+    survivors: &mut Survivors,
+    source: &FakeSource,
+    snapshots: &[(TerminalId, crate::chat::Snapshot)],
+) {
+    let census = crate::upgrade::recovery::Census {
+        chats: source.inventory.chats.clone(),
+        in_flight: snapshots
+            .iter()
+            .map(|(id, snapshot)| survivors.observe_in_flight(*id, snapshot))
+            .filter(|work| !work.is_empty())
+            .collect(),
+        ..Default::default()
+    };
+    survivors.record_census(
+        &source.preview,
+        source.preview.daemon.as_ref().unwrap(),
+        &census,
+    );
+}
+
+#[test]
+fn in_flight_work_survives_only_a_provider_that_was_kept_and_reattached() {
+    use super::super::in_flight::{Fate, TaskKind};
+    use crate::upgrade::handoff::{UnattachedDisposition, UnattachedSummary};
+    let (mut source, interrupted) = interrupt_fixture();
+    source.preview.daemon.as_mut().unwrap().sessions[1].interrupted_subagents =
+        vec!["toolu_agent".into()];
+    let retained = add_chat(&mut source, impact::Disposition::Continues, true);
+    let restarted = add_chat(&mut source, impact::Disposition::Resumes, true);
+    let finished = add_chat(&mut source, impact::Disposition::Resumes, true);
+    let unrestartable = add_chat(&mut source, impact::Disposition::Continues, true);
+    let detached = add_chat(&mut source, impact::Disposition::Continues, true);
+    source
+        .preview
+        .labels
+        .names
+        .insert(restarted, "Watch CI · beta".into());
+    let daemon = source.preview.daemon.clone().unwrap();
+    let mut survivors = Survivors::default();
+    // The interruption settles before the census reads the conversations.
+    survivors.record_interrupt_requests(&source.preview, &daemon);
+    survivors.record_settled_interruptions(&source.preview, &daemon, &[]);
+    census_in_flight(
+        &mut survivors,
+        &source,
+        &[
+            (interrupted, crate::chat::Snapshot::default()),
+            (retained, background_agent()),
+            (restarted, background_agent()),
+            (finished, crate::chat::Snapshot::default()),
+            (unrestartable, running_turn()),
+            (detached, running_turn()),
+        ],
+    );
+    let unattached = |id, disposition| UnattachedSummary {
+        id,
+        provider: crate::agent::Provider::Claude,
+        conversation: None,
+        working_directory: "/repo".into(),
+        reason: "restart failed".into(),
+        disposition,
+    };
+    // Nothing became of the work before the source was prepared.
+    assert!(
+        survivors
+            .in_flight_outcomes(|| unreachable!("nothing was restored"))
+            .is_empty()
+    );
+    survivors.record_prepared(&source.preview, &daemon);
+    let outcomes = survivors.in_flight_outcomes(|| {
+        vec![
+            unattached(unrestartable, UnattachedDisposition::Stopped),
+            unattached(detached, UnattachedDisposition::Retained),
+        ]
+    });
+    let fates: BTreeMap<_, _> = outcomes
+        .iter()
+        .map(|outcome| (outcome.work.id, outcome.fate))
+        .collect();
+    assert_eq!(
+        fates,
+        BTreeMap::from([
+            (interrupted, Fate::Interrupted),
+            (retained, Fate::Continued),
+            (restarted, Fate::Restarted),
+            (unrestartable, Fate::Stopped),
+            (detached, Fate::Detached),
+        ]),
+        "a conversation whose turn simply finished had nothing in flight"
+    );
+    let lost: BTreeSet<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.lost())
+        .map(|outcome| outcome.work.id)
+        .collect();
+    assert_eq!(
+        lost,
+        BTreeSet::from([interrupted, restarted, unrestartable])
+    );
+    let restarted = outcomes
+        .iter()
+        .find(|outcome| outcome.work.id == restarted)
+        .unwrap();
+    assert_eq!(restarted.label, "Watch CI · beta");
+    assert_eq!(restarted.work.tasks[0].id, "child-thread");
+    assert_eq!(restarted.work.tasks[0].kind, TaskKind::Subagent);
+    assert_eq!(restarted.work.tasks[0].name, "Worker");
+    let interrupted = outcomes
+        .iter()
+        .find(|outcome| outcome.work.id == interrupted)
+        .unwrap();
+    assert!(interrupted.work.turn);
+    assert_eq!(interrupted.work.tasks[0].id, "toolu_agent");
+}
+
+#[test]
+fn an_update_that_stopped_the_service_ended_every_conversations_work() {
+    use super::super::in_flight::Fate;
+    let mut source = fixture();
+    let working = add_chat(&mut source, impact::Disposition::Blocked, true);
+    let mut survivors = Survivors::default();
+    census_in_flight(&mut survivors, &source, &[(working, running_turn())]);
+    survivors.service_stopped = true;
+    let outcomes = survivors.in_flight_outcomes(|| unreachable!("no restore ran"));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].fate, Fate::Ended);
+    assert!(outcomes[0].lost());
 }

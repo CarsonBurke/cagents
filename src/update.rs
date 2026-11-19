@@ -7,6 +7,7 @@ mod floor;
 mod floor_display;
 mod floor_prediction;
 mod handoff;
+pub mod in_flight;
 mod installed;
 mod pending_recovery;
 pub(crate) mod recovery;
@@ -203,6 +204,10 @@ pub struct UpdateJob {
     /// this field still shows them rather than a cancellation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<impact::Refusal>,
+    /// The conversations that had work in flight when the update began, and
+    /// what became of it. Empty until the update has changed a provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight: Vec<in_flight::Outcome>,
 }
 
 impl UpdateError {
@@ -1204,6 +1209,7 @@ fn start_job(
         log_path: state.join(format!("{id}.log")),
         confirmation: None,
         refusal: None,
+        in_flight: Vec::new(),
     };
     let log = private_create(&job.log_path)?;
     confirmation::initialize(&state, &id)?;
@@ -1583,6 +1589,7 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
             .push_str("\nStill running; attachment could not be checked:\n");
         job.message.push_str(&unchecked.join("\n"));
     }
+    job.in_flight = survivors.in_flight_outcomes(unattached_after_update);
     if let Err(error) = write_job(&state, &job) {
         if result.is_ok() {
             return Err(error);
@@ -1592,6 +1599,23 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         eprintln!("Could not record update result: {error}");
     }
     result
+}
+
+/// What the serving daemon recorded of the conversations its restore could
+/// not reattach. A record that can't be read reports none: the fates it
+/// would refine are still the reviewed ones.
+fn unattached_after_update() -> Vec<crate::upgrade::handoff::UnattachedSummary> {
+    match crate::upgrade::handoff::Store::existing() {
+        Ok(Some(store)) => store.unattached().unwrap_or_else(|error| {
+            eprintln!("Could not read the conversations the update could not reattach: {error}");
+            Vec::new()
+        }),
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            eprintln!("Could not read the conversations the update could not reattach: {error}");
+            Vec::new()
+        }
+    }
 }
 
 fn perform_update(
@@ -3248,6 +3272,7 @@ mod tests {
             log_path: directory.path().join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let file = private_create(&directory.path().join(format!("{}.request", job.id))).unwrap();
         serde_json::to_writer(file, &UpdateRequest::Release(release)).unwrap();
@@ -4629,6 +4654,7 @@ finally:
             log_path: root.join(".update/historical-failure.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let superseded = |job: &UpdateJob, switched| {
             failed_job_is_superseded(job, &window, &served, Some(&owner), switched)
@@ -4810,6 +4836,7 @@ finally:
             log_path: root.path().join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let result = Err(invalid("the original startup failure"));
         // A failed status write must leave the reservation intact.
@@ -5045,6 +5072,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             log_path: root.path().join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let census: recovery::Census=serde_json::from_value(serde_json::json!({"version":1,"transaction":job.id,"source":proof,"terminals":[],"chats":[]})).unwrap();
         let census = if matches!(
@@ -5484,6 +5512,7 @@ sys.stdin.buffer.read(1)
             log_path: state.join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let (send, recv) = std::sync::mpsc::sync_channel(1);
         let monitor = thread::spawn(move || {
@@ -5510,6 +5539,7 @@ sys.stdin.buffer.read(1)
             log_path: directory.path().join("worker.log"),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let report = concat!(
             "\nThe terminal service accepted the stop.\n",
@@ -5554,6 +5584,7 @@ sys.stdin.buffer.read(1)
             log_path: "/fake/update-worker.log".into(),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         record_primary_failure(
             &mut job,
@@ -5643,6 +5674,7 @@ sys.stdin.buffer.read(1)
                 stop: None,
             }),
             refusal: None,
+            in_flight: Vec::new(),
         };
         let mut terminal = Terminal {
             job: job.clone(),
@@ -5737,6 +5769,7 @@ sys.stdin.buffer.read(1)
             log_path: "/fake/update-worker.log".into(),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         };
         let mut terminal = Terminal {
             job: job.clone(),
