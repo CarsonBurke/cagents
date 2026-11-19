@@ -770,6 +770,19 @@ mod tests {
     }
 
     #[test]
+    fn subagent_activity_other_than_a_start_keeps_the_raw_spawn() {
+        // Only a started activity renders, so only it describes the spawn.
+        let rollout = lines(&[
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{}"}}),
+            completed(
+                json!({"type":"SubAgentActivity","id":"agent-finished","kind":"finished","agent_path":"/root/review"}),
+            ),
+        ]);
+        assert_eq!(tool_summary(&rollout), ["tool spawn_agent"]);
+    }
+
+    #[test]
     fn an_mcp_item_supersedes_its_own_raw_call_only() {
         for prefix in ["", "mcp__"] {
             let rollout = lines(&[
