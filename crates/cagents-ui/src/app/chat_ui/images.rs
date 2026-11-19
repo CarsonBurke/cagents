@@ -635,6 +635,15 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
 }
 pub(super) fn sync(runtime: &mut Runtime) {
     figure::sync(runtime);
+    // The pane viewer covers the transcript its images came from; once the
+    // pane shows another, such as a subagent's, it no longer belongs there.
+    if runtime
+        .image_viewer
+        .as_ref()
+        .is_some_and(|gallery| gallery.transcript != runtime.selected_subagent)
+    {
+        runtime.image_viewer = None;
+    }
     if !runtime.visible.load(Ordering::Relaxed)
         || runtime
             .preview_request
@@ -854,6 +863,10 @@ pub(in crate::app) struct Gallery {
     selected: usize,
     remote: bool,
     pub(super) reset: u64,
+    /// The subagent whose transcript the images came from, `None` for the
+    /// conversation's own. A pane viewer belongs to that transcript and
+    /// closes when the pane shows another ([`sync`]).
+    transcript: Option<String>,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -875,6 +888,7 @@ impl Gallery {
             selected: 0,
             remote: device.is_some(),
             reset: 0,
+            transcript: None,
         }
     }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
@@ -930,6 +944,7 @@ impl Gallery {
             selected,
             remote: crate::device::is_remote(),
             reset: 0,
+            transcript: runtime.selected_subagent.clone(),
         })
     }
     pub(in crate::app) fn next(&mut self, forward: bool) {
@@ -985,20 +1000,22 @@ impl Gallery {
     pub(in crate::app) fn pane_view(&self, target: Target, width: f32) -> Element<'_, Message> {
         let [toolbar, label, canvas, hint] =
             self.parts(ViewerHost::Pane(target), width < COMPACT_TOOLBAR);
-        // A press on the image leaves the keyboard here rather than in the
-        // composer, so the arrows browse and Escape closes the viewer. The
-        // holder is no Tab stop and draws nothing of its own.
-        let canvas = widget::button::custom(canvas)
+        // The pane gives its keyboard to this holder while the viewer is
+        // open (see `card_keyboard_focus`), so the arrows browse and Escape
+        // closes the viewer. It takes no space, is no Tab stop and draws
+        // nothing, so the image keeps its own pointer and cursor.
+        let holder = widget::button::custom(iced::widget::Space::new())
             .id(viewer_focus(target.card))
             .padding(0)
-            .width(Length::Fill)
-            .height(Length::Fill)
             .class(cosmic::theme::Button::Custom {
                 active: Box::new(|_, _| widget::button::Style::new()),
                 disabled: Box::new(|_| widget::button::Style::new()),
                 hovered: Box::new(|_, _| widget::button::Style::new()),
                 pressed: Box::new(|_, _| widget::button::Style::new()),
             });
+        let canvas = iced::widget::stack![canvas, holder]
+            .width(Length::Fill)
+            .height(Length::Fill);
         widget::column::with_children(vec![toolbar, label, canvas.into(), hint])
             .spacing(step::GAP_S)
             .padding(iced::Padding::from([step::GAP_S, step::GAP_M]))
@@ -1120,9 +1137,11 @@ impl Gallery {
             toolbar.into(),
             design::caption(entry.label.as_str()).into(),
             canvas,
-            design::caption(
-                "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy",
-            )
+            design::caption(if self.entries.len() > 1 {
+                "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
+            } else {
+                "Scroll to zoom · Drag to pan · Ctrl+C to copy"
+            })
             .into(),
         ]
     }
@@ -2032,6 +2051,7 @@ mod tests {
             selected: 0,
             remote: false,
             reset: 0,
+            transcript: None,
         };
         gallery.next(false);
         assert_eq!(gallery.selected, 1);

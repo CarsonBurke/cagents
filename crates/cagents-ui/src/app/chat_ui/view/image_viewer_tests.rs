@@ -290,15 +290,27 @@ fn the_viewer_holds_the_transcript_area_and_keeps_the_composer_in_place() {
             composer, closed.controls["chat-composer"],
             "the composer doesn't move as the viewer opens at {width}"
         );
-        let viewer = open.controls["image-viewer"];
         assert!(
-            viewer.x >= 0.0 && viewer.x + viewer.width <= width + 0.5,
-            "the image fits the pane at {width}: {viewer:?}"
+            open.controls.contains_key("image-viewer"),
+            "it holds the keyboard"
         );
-        assert!(
-            viewer.y + viewer.height <= composer.y,
-            "the image stays above the composer at {width}"
-        );
+        // Everything the viewer draws, from its toolbar to its hint, fits the
+        // pane above the composer.
+        for needle in ["1 / 2", "Scroll to zoom"] {
+            let (bounds, _) = open
+                .placed_text
+                .iter()
+                .find(|(_, text)| text.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} drawn at {width}"));
+            assert!(
+                bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.5,
+                "{needle:?} fits the pane at {width}: {bounds:?}"
+            );
+            assert!(
+                bounds.y + bounds.height <= composer.y,
+                "{needle:?} stays above the composer at {width}: {bounds:?}"
+            );
+        }
         assert!(open.text.iter().any(|text| text == "1 / 2"));
         // A narrow pane keeps every command by naming them with icons.
         assert_eq!(
@@ -354,4 +366,109 @@ fn the_image_menu_claims_the_escape_that_closes_it() {
     );
     assert!(send(&mut element, escape.clone()), "the menu takes Escape");
     assert!(!send(&mut element, escape), "and is gone");
+}
+
+/// The composer keeps its own keys while an image is open above it: the
+/// arrows move its caret, and while a turn runs its Escape still interrupts
+/// rather than handing the keyboard to the viewer.
+#[test]
+fn a_focused_composer_keeps_its_arrows_and_its_interrupt() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, images) = viewing(&mut app);
+    let composer = card_control_id(card, "chat-composer");
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .replace_draft(text_editor::Content::with_text("Which chart"));
+    for key in [Named::ArrowLeft, Named::ArrowRight] {
+        let (messages, captured) =
+            key_control(app.chat_view(card), composer.clone(), key_press(key));
+        assert!(captured, "{key:?} stays in the draft");
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::ImageNext(..)))),
+            "{messages:?}"
+        );
+    }
+
+    Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
+    let (messages, captured) = key_control(app.chat_view(card), composer, key_press(Named::Escape));
+    assert!(captured);
+    assert!(
+        matches!(messages.as_slice(), [Message::ChatUi(Action::Interrupt(found))] if *found == target),
+        "{messages:?}"
+    );
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(
+            ViewerHost::Pane(target),
+            images[0].1
+        ))
+    );
+}
+
+/// The images belong to the transcript they came from, so showing a
+/// subagent's transcript instead closes the viewer over it.
+#[test]
+fn switching_to_a_subagent_closes_the_viewer_of_its_parent() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, _) = viewing(&mut app);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    Arc::make_mut(&mut runtime.snapshot).subagents = vec![super::tests::native_child_fixture()];
+    let child = runtime.snapshot.subagents[0].id.clone();
+    drop(app.update(Message::ChatUi(Action::SelectSubagent(target, None))));
+    assert!(
+        shown(&app, target).is_some(),
+        "the same transcript keeps it"
+    );
+    drop(app.update(Message::ChatUi(Action::SelectSubagent(target, Some(child)))));
+    assert!(shown(&app, target).is_none());
+}
+
+/// A device's file, which no conversation shows, still opens as a dialog over
+/// the window, and that dialog answers Escape itself.
+#[test]
+fn a_device_file_opens_as_a_dialog_that_escape_closes() {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::{Shell, clipboard, mouse};
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.chat_ui.image_dialog = Some(Gallery::file(
+        "/fixture/photo.png".into(),
+        None,
+        iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+    ));
+    assert!(app.modal_is_open() && app.dialog().is_some());
+    let renderer = crate::app::tests::headless_renderer();
+    let window = iced::Size::new(900.0, 700.0);
+    let viewport = iced::Rectangle::with_size(window);
+    let mut element = app.chat_ui.image_dialog.as_ref().unwrap().dialog_view();
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &Limits::new(iced::Size::ZERO, window),
+    );
+    let mut messages = Vec::new();
+    let mut shell = Shell::new(&mut messages);
+    element.as_widget_mut().update(
+        &mut tree,
+        &iced::Event::Keyboard(key_press(Named::Escape)),
+        Layout::new(&node),
+        mouse::Cursor::Unavailable,
+        &renderer,
+        &mut clipboard::Null,
+        &mut shell,
+        &viewport,
+    );
+    drop(element);
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [Message::ChatUi(Action::CloseImage(ViewerHost::Dialog))]
+        ),
+        "{messages:?}"
+    );
+    drop(app.update(messages.remove(0)));
+    assert!(app.chat_ui.image_dialog.is_none() && !app.modal_is_open());
 }

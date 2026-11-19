@@ -4490,6 +4490,7 @@ impl Runtime {
         self.last_presented_tail = None;
         self.turns = Revised::default();
         self.selected_subagent = None;
+        self.image_viewer = None;
         self.subagent_scroll.clear();
         self.page_request = None;
         self.deferred_page = None;

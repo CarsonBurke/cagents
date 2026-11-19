@@ -6026,6 +6026,8 @@ pub(super) struct Laid {
     footer_text: Vec<String>,
     /// Every text the view draws.
     pub(super) text: Vec<String>,
+    /// Every text the view draws, with where it lands.
+    pub(super) placed_text: Vec<(iced::Rectangle, String)>,
     /// What assistive technology is told inside the footer.
     footer_names: Vec<String>,
     /// The far edge of whatever the footer draws, text or named glyph.
@@ -6136,6 +6138,7 @@ pub(super) fn lay_out(
         .filter(|(bounds, _)| footer.contains(bounds.center()))
         .collect();
     let all_text = probe.text.iter().map(|(_, text)| text.clone()).collect();
+    let placed_text = probe.text.clone();
     let text: Vec<(iced::Rectangle, String)> = probe
         .text
         .into_iter()
@@ -6144,6 +6147,7 @@ pub(super) fn lay_out(
     Laid {
         footer,
         text: all_text,
+        placed_text,
         controls: probe.controls,
         footer_drawn_right: text
             .iter()
