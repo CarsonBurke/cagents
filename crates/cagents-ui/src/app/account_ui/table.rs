@@ -625,7 +625,7 @@ fn group<'a>(
             .padding([space::M, space::M])
             .into(),
         );
-        if missing {
+        if missing && super::install_url(provider).is_some() {
             lines.push(
                 crate::ui_controls::button::primary(format!("Install {}", provider.label()))
                     .on_press(Message::AccountUi(Action::Install(provider)))

@@ -531,7 +531,8 @@ mod tests {
         let directory = crate::test_fixture::tempdir().unwrap();
         let environment =
             BTreeMap::from([("HOME".into(), directory.path().to_str().unwrap().into())]);
-        for provider in Provider::ALL {
+        // Agents run only as native chat.
+        for provider in Provider::ALL.into_iter().filter(|p| p.has_native_chat()) {
             install(Some(provider), &environment, directory.path());
             let launch = crate::chat::Launch {
                 provider,

@@ -761,6 +761,9 @@ fn resolve_source(
     ProtocolError,
 > {
     use crate::model::agent_recovery::{bind_session, recipe_from_hint};
+    if !provider.has_native_chat() {
+        return Err(unavailable(provider.native_chat_refusal()));
+    }
     let process = handle.observe_agent_process().ok_or_else(|| {
         retryable_unavailable(
             "No supported foreground agent is running in this terminal. Focus its CLI and retry.",
@@ -815,6 +818,8 @@ fn resolve_source(
         Provider::Codex => "This terminal is not associated with a managed thread. Open New thread to use native and CLI views of one conversation.",
         Provider::Claude => "Claude has not published an exact live conversation yet. Retry once its live session is available; the terminal has not been stopped.",
         Provider::Omp => "OMP has not published an exact live conversation or fresh-session boundary for this terminal. The terminal has not been stopped; no recent history will be selected.",
+        // Refused above: they have no native chat to switch to.
+        Provider::Antigravity | Provider::Muse => "This terminal's provider has no native chat yet.",
         };
         if provider == Provider::Codex { unavailable(message) } else { retryable_unavailable(message) }
     })?;

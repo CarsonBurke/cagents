@@ -805,6 +805,10 @@ pub struct Workspace {
     visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
     pending_close: Option<PendingClose>,
+    /// The pane an [`Workspace::arrange`] handed focus to because it removed
+    /// the focused one. The [`Workspace::restore_viewport_anchor`] that ends
+    /// the passive edit brings it into view if the restored camera does not.
+    focus_handoff: Option<CardId>,
     resize_limits: Option<(CardId, WidthLimits)>,
     /// The panes a resize gesture keeps filled until it ends; see
     /// [`StripGeometry::build_holding`].
@@ -830,6 +834,7 @@ impl Workspace {
             visibility_bands: None,
             pending_widget_focus: None,
             pending_close: None,
+            focus_handoff: None,
             resize_limits: None,
             held_fill: None,
             config,
@@ -1219,6 +1224,135 @@ impl Workspace {
         Ok(self.refresh_visibility(false))
     }
 
+    /// Edits the live strip, in one step, to hold `cards` in this order.
+    ///
+    /// Cards it no longer holds are closed, new ones are inserted without
+    /// focus, and the ones it keeps take the given names and widths. The
+    /// indices, geometry and visibility are rebuilt once for the whole edit,
+    /// so mirroring a strip costs time in proportion to its panes rather than
+    /// to their square, as one call per pane would.
+    ///
+    /// The result is the strip's final state, never an intermediate one. A
+    /// focused card that stays keeps focus. A focused card that goes hands it
+    /// to the card that followed it, or failing that the one before it, among
+    /// the cards that stay; with none staying, the first card. That handoff
+    /// asks once for keyboard focus, and [`Self::restore_viewport_anchor`]
+    /// brings the card into view if the restored camera leaves it unmounted.
+    pub fn arrange(
+        &mut self,
+        cards: impl IntoIterator<Item = WorkspaceCard>,
+    ) -> Result<ViewportUpdate, WorkspaceError> {
+        let cards = cards
+            .into_iter()
+            .map(|card| WorkspaceCard::new(card.id, card.accessible_name, card.width))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut kept = HashSet::with_capacity(cards.len());
+        if let Some(card) = cards.iter().find(|card| !kept.insert(card.id)) {
+            return Err(WorkspaceError::DuplicateCard(card.id));
+        }
+        let unchanged_layout = cards.len() == self.cards.len()
+            && cards
+                .iter()
+                .zip(&self.cards)
+                .all(|(card, current)| card.id == current.id && card.width == current.width);
+        if unchanged_layout {
+            // Only names can differ, and they lay nothing out.
+            self.cards = cards;
+            return Ok(ViewportUpdate::unchanged());
+        }
+
+        // A kept card that moves relative to the other kept cards, or changes
+        // width, moves the focused one as a reorder or resize would. Cards
+        // that are only inserted around the focused one do not.
+        let mut survivors = self.cards.iter().filter(|card| kept.contains(&card.id));
+        let mut resized_or_moved = false;
+        for card in cards
+            .iter()
+            .filter(|card| self.card_indices.contains_key(&card.id))
+        {
+            let current = survivors
+                .next()
+                .expect("every kept card is a survivor in some order");
+            resized_or_moved |= current.id != card.id || current.width != card.width;
+        }
+        let removed = self
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| !kept.contains(&card.id))
+            .map(|(index, card)| (index, card.id))
+            .collect::<Vec<_>>();
+        let handoff = self.focused.and_then(|focused| {
+            let index = removed
+                .iter()
+                .find(|(_, id)| *id == focused)
+                .map(|(index, _)| *index)?;
+            // A pane already closing cannot take focus it would then leave
+            // behind, unless nothing else is left to take it.
+            let closing = self.pending_close.map(|pending| pending.id);
+            let survivor =
+                |card: &&WorkspaceCard| kept.contains(&card.id) && Some(card.id) != closing;
+            Some(
+                self.cards[index + 1..]
+                    .iter()
+                    .find(survivor)
+                    .or_else(|| self.cards[..index].iter().rev().find(survivor))
+                    .or_else(|| cards.iter().find(|card| Some(card.id) != closing))
+                    .or_else(|| cards.first())
+                    .map(|card| card.id),
+            )
+        });
+
+        for &(_, id) in &removed {
+            // The ordinary close bookkeeping, without its per-card rebuild.
+            self.visibility.remove(&id);
+            if self.pending_widget_focus == Some(id) {
+                self.pending_widget_focus = None;
+            }
+            if self.pending_close.is_some_and(|pending| pending.id == id) {
+                self.pending_close = None;
+            }
+            if self
+                .resize_limits
+                .is_some_and(|(resizing, _)| resizing == id)
+            {
+                self.resize_limits = None;
+                self.held_fill = None;
+            }
+        }
+        self.cards = cards;
+        self.rebuild_card_indices();
+        if let Some(target) = handoff {
+            self.focused = target;
+            self.pending_widget_focus = target;
+            self.focus_handoff = target;
+        } else if self.focused.is_none() {
+            // Like the first card added to an empty strip.
+            self.focused = self.cards.first().map(|card| card.id);
+            self.pending_widget_focus = self.focused;
+        }
+        self.rebuild_geometry();
+        if !removed.is_empty() || resized_or_moved {
+            self.reveal_focused();
+        }
+        Ok(self.refresh_visibility(false))
+    }
+
+    /// [`Self::arrange`] without the cards in `removed`.
+    pub fn remove_cards(&mut self, removed: &HashSet<CardId>) -> ViewportUpdate {
+        if !self.cards.iter().any(|card| removed.contains(&card.id)) {
+            return ViewportUpdate::unchanged();
+        }
+        let cards = self
+            .cards
+            .iter()
+            .filter(|card| !removed.contains(&card.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.arrange(cards)
+            .expect("the strip's own cards are valid and distinct")
+    }
+
     pub fn move_focused(
         &mut self,
         direction: FocusDirection,
@@ -1355,7 +1489,9 @@ impl Workspace {
         if self.focused == Some(id) {
             self.focused = match pending.handoff.target {
                 FocusTarget::Card(next) if self.index_of(next).is_some() => Some(next),
-                FocusTarget::Unchanged => self.focused,
+                // A close requested while another pane was focused, which
+                // then gave this one focus (a passive arrange can, when
+                // nothing else is left), hands focus on like any other.
                 _ => self
                     .cards
                     .get(index)
@@ -1481,6 +1617,9 @@ impl Workspace {
     /// close animation cannot move the restored reading pane away afterwards.
     /// Reading position and navigation destination survive independently; a
     /// removed anchor keeps the close operation's fallback for that coordinate.
+    /// A pane an [`Self::arrange`] gave focus to, because it removed the
+    /// focused one, is brought into view if the restored camera leaves it
+    /// unmounted.
     pub fn restore_viewport_anchor(&mut self, anchor: ViewportAnchor) -> ViewportUpdate {
         if self.geometry_revision != anchor.geometry_revision {
             self.layout_transition = None;
@@ -1566,6 +1705,24 @@ impl Workspace {
             // (for example the sole pane filling the viewport). Its incidental
             // reveal must not retarget a running local camera or layout.
             self.camera = anchor.camera;
+        }
+        // A pane given focus because the batch removed the focused one is
+        // where the keyboard goes next, so it must be on screen to take it.
+        if let Some(id) = self
+            .focus_handoff
+            .take()
+            .filter(|id| self.focused == Some(*id))
+            && let Some(&index) = self.card_indices.get(&id)
+            && !self
+                .bands(
+                    self.presentation_geometry(),
+                    &self.geometry,
+                    self.camera.offset(),
+                    self.viewport_width,
+                )
+                .is_mounted(index)
+        {
+            self.reveal_focused();
         }
         // Intermediate add/remove/resize operations update the model's mounted
         // map, but their native effects must not escape this passive batch.
@@ -1796,6 +1953,17 @@ impl Workspace {
         Ok(())
     }
 
+    /// How many times this thread has indexed, laid out and classed the
+    /// visibility of a strip, for tests that bound an edit's work.
+    #[cfg(test)]
+    pub(crate) fn rebuild_counts() -> (usize, usize, usize) {
+        (
+            tests::CARD_INDEX_BUILDS.get(),
+            tests::GEOMETRY_BUILDS.get(),
+            tests::VISIBILITY_REFRESHES.get(),
+        )
+    }
+
     fn index_of(&self, id: CardId) -> Option<usize> {
         self.card_indices.get(&id).copied()
     }
@@ -1961,6 +2129,8 @@ impl Workspace {
     }
 
     fn refresh_visibility(&mut self, offset_changed: bool) -> ViewportUpdate {
+        #[cfg(test)]
+        tests::VISIBILITY_REFRESHES.set(tests::VISIBILITY_REFRESHES.get() + 1);
         if self.layout_transition.is_none() {
             self.opening.clear();
         } else {
@@ -2176,6 +2346,8 @@ mod tests {
         pub(super) static CARD_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// How many times this thread has laid out a strip.
         pub(super) static GEOMETRY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many times this thread has classed a strip's cards by visibility.
+        pub(super) static VISIBILITY_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn card(width: CardWidth) -> WorkspaceCard {
@@ -2232,6 +2404,418 @@ mod tests {
             workspace.add_card(card(width), index, index == 0).unwrap();
         }
         workspace
+    }
+
+    fn renamed(card: &WorkspaceCard, name: &str) -> WorkspaceCard {
+        WorkspaceCard::new(card.id, name, card.width).unwrap()
+    }
+
+    /// What a passive projection did before [`Workspace::arrange`]: one
+    /// close, insertion, resize or reorder per card.
+    fn arrange_one_card_at_a_time(workspace: &mut Workspace, cards: &[WorkspaceCard]) {
+        let focus = workspace.focused();
+        let kept = cards.iter().map(|card| card.id).collect::<HashSet<_>>();
+        let removed = workspace
+            .order()
+            .filter(|id| !kept.contains(id))
+            .collect::<Vec<_>>();
+        for id in removed {
+            workspace.request_close(id).unwrap();
+            workspace.commit_close(id).unwrap();
+        }
+        for (index, card) in cards.iter().enumerate() {
+            if workspace.card(card.id).is_none() {
+                let index = index.min(workspace.cards().len());
+                workspace.add_card(card.clone(), index, false).unwrap();
+                continue;
+            }
+            workspace
+                .rename_card(card.id, card.accessible_name.clone())
+                .unwrap();
+            if workspace.card(card.id).unwrap().width != card.width {
+                workspace.set_card_width(card.id, card.width).unwrap();
+            }
+            if workspace.order().nth(index) != Some(card.id) {
+                workspace.reorder(card.id, index).unwrap();
+            }
+        }
+        if let Some(focus) = focus.filter(|id| workspace.card(*id).is_some()) {
+            workspace.focus_without_scrolling(focus).unwrap();
+        }
+    }
+
+    /// A passive projection: anchored, edited, restored.
+    fn project(workspace: &mut Workspace, edit: impl FnOnce(&mut Workspace)) -> ViewportUpdate {
+        let anchor = workspace.capture_viewport_anchor();
+        edit(workspace);
+        workspace.restore_viewport_anchor(anchor)
+    }
+
+    #[test]
+    fn arranging_a_strip_matches_editing_it_card_by_card_when_focus_stays() {
+        // A small deterministic generator: every case is reproducible.
+        let seed = std::cell::Cell::new(0x9e37_79b9_7f4a_7c15_u64);
+        let next = |bound: usize| {
+            let mut state = seed.get();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            seed.set(state);
+            (state % bound as u64) as usize
+        };
+        let widths = [
+            CardWidth::Fraction(0.5),
+            CardWidth::Fraction(1.0),
+            CardWidth::Fraction(1.0 / 3.0),
+            CardWidth::Fixed(300.0),
+            CardWidth::Fixed(900.0),
+        ];
+        let mut exact = 0;
+        for case in 0..400 {
+            let len = 1 + next(7);
+            let strip = (0..len)
+                .map(|_| widths[next(widths.len())])
+                .collect::<Vec<_>>();
+            let mut workspace = workspace_with_widths(&strip, 800.0);
+            let ids = workspace.order().collect::<Vec<_>>();
+            let focused = ids[next(len)];
+            workspace.focus(focused).unwrap();
+            // Settled, moving, or scrolled away from the selection.
+            match next(3) {
+                0 => {
+                    for _ in 0..600 {
+                        workspace.tick(Duration::from_millis(16));
+                    }
+                }
+                1 => {
+                    workspace.tick(Duration::from_millis(16));
+                }
+                _ => {
+                    for _ in 0..600 {
+                        workspace.tick(Duration::from_millis(16));
+                    }
+                    let maximum = workspace.geometry().max_offset(800.0);
+                    workspace.native_scroll(maximum * next(5) as f32 / 4.0, 800.0);
+                }
+            }
+            workspace.take_widget_focus_request();
+
+            // Keep the focused card; drop, resize and move others; insert new.
+            let mut cards = workspace
+                .cards()
+                .iter()
+                .filter(|card| card.id == focused || next(4) != 0)
+                .map(|card| {
+                    let width = if next(3) == 0 {
+                        widths[next(widths.len())]
+                    } else {
+                        card.width
+                    };
+                    WorkspaceCard::new(card.id, format!("Card {case}"), width).unwrap()
+                })
+                .collect::<Vec<_>>();
+            if next(2) == 0 {
+                for index in (1..cards.len()).rev() {
+                    cards.swap(index, next(index + 1));
+                }
+            }
+            for _ in 0..next(4) {
+                let index = next(cards.len() + 1);
+                cards.insert(index, card(widths[next(widths.len())]));
+            }
+
+            // Where the reading position or the navigation destination was
+            // in a pane that goes, the camera falls back to the edit's own
+            // reveal of the selection. One card at a time, that reveal starts
+            // from wherever the previous step left the camera, so only the
+            // final strip can say where it should be.
+            let anchor = workspace.capture_viewport_anchor();
+            let kept = cards.iter().map(|card| card.id).collect::<HashSet<_>>();
+            let path_independent = [anchor.position, anchor.destination]
+                .into_iter()
+                .flatten()
+                .all(|point| kept.contains(&point.card.id));
+            exact += usize::from(path_independent);
+            let mut sequential = workspace.clone();
+            let sequential_update = project(&mut sequential, |workspace| {
+                arrange_one_card_at_a_time(workspace, &cards)
+            });
+            let batched_update = project(&mut workspace, |workspace| {
+                workspace.arrange(cards.clone()).unwrap();
+            });
+
+            let context = format!("case {case}: {strip:?} -> {cards:?}");
+            assert_eq!(workspace.cards(), sequential.cards(), "{context}");
+            assert_eq!(
+                workspace.card_indices(),
+                sequential.card_indices(),
+                "{context}"
+            );
+            assert_eq!(workspace.focused(), Some(focused), "{context}");
+            assert_eq!(workspace.focused(), sequential.focused(), "{context}");
+            assert_eq!(
+                workspace.pending_widget_focus, sequential.pending_widget_focus,
+                "{context}"
+            );
+            assert_eq!(workspace.geometry(), sequential.geometry(), "{context}");
+            assert_eq!(
+                workspace.presentation_geometry(),
+                sequential.presentation_geometry(),
+                "{context}"
+            );
+            if path_independent {
+                assert_eq!(workspace.camera(), sequential.camera(), "{context}");
+                assert_eq!(workspace.visibility, sequential.visibility, "{context}");
+                assert_eq!(batched_update, sequential_update, "{context}");
+            } else if anchor
+                .position
+                .is_some_and(|point| kept.contains(&point.card.id))
+            {
+                // The reading position still holds; only where the camera is
+                // bound can follow the path the edit took.
+                assert_eq!(
+                    workspace.camera().offset(),
+                    sequential.camera().offset(),
+                    "{context}"
+                );
+            }
+            workspace.check_invariants().unwrap();
+        }
+        assert!(exact > 300, "only {exact} cases compared exactly");
+    }
+
+    #[test]
+    fn arranging_a_strip_rebuilds_it_once_whatever_it_changes() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 64], 1_000.0);
+        let mut cards = workspace
+            .cards()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 1)
+            .map(|(index, card)| {
+                let width = if index % 3 == 0 {
+                    CardWidth::Fraction(1.0)
+                } else {
+                    card.width
+                };
+                WorkspaceCard::new(card.id, "Renamed", width).unwrap()
+            })
+            .collect::<Vec<_>>();
+        cards.reverse();
+        for index in (0..cards.len()).step_by(3) {
+            cards.insert(index, card(CardWidth::Fraction(0.5)));
+        }
+        let builds = Workspace::rebuild_counts;
+
+        let before = builds();
+        workspace.arrange(cards.clone()).unwrap();
+        let after = builds();
+        assert_eq!(after.0 - before.0, 1, "indexed once");
+        assert_eq!(after.1 - before.1, 1, "laid out once");
+        assert_eq!(after.2 - before.2, 1, "classed by visibility once");
+        assert_eq!(workspace.cards(), cards.as_slice());
+
+        // Names lay nothing out.
+        let renamed = cards
+            .iter()
+            .map(|card| renamed(card, "Renamed again"))
+            .collect::<Vec<_>>();
+        workspace.arrange(renamed.clone()).unwrap();
+        assert_eq!(builds(), after);
+        assert_eq!(workspace.cards(), renamed.as_slice());
+        workspace.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn arranging_away_the_focused_pane_hands_focus_to_its_surviving_neighbour() {
+        // The pane after it, past any others that go; then the one before.
+        for (focused, removed, expected) in [
+            (1, &[1, 2][..], 3),
+            (0, &[0, 1, 2][..], 3),
+            (3, &[2, 3][..], 1),
+            (2, &[1, 2, 3][..], 0),
+        ] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 4], 1_000.0);
+            let ids = workspace.order().collect::<Vec<_>>();
+            workspace.focus(ids[focused]).unwrap();
+            workspace.take_widget_focus_request();
+            let cards = workspace
+                .cards()
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !removed.contains(index))
+                .map(|(_, card)| card.clone())
+                .collect::<Vec<_>>();
+
+            project(&mut workspace, |workspace| {
+                workspace.arrange(cards).unwrap();
+            });
+            assert_eq!(
+                workspace.focused(),
+                Some(ids[expected]),
+                "{focused} {removed:?}"
+            );
+            assert_eq!(workspace.take_widget_focus_request(), Some(ids[expected]));
+            assert_eq!(workspace.take_widget_focus_request(), None, "asked once");
+            workspace.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_strip_arranged_to_new_panes_only_focuses_the_first_of_them() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 2], 1_000.0);
+        workspace.take_widget_focus_request();
+        let cards = [card(CardWidth::Fixed(400.0)), card(CardWidth::Fixed(400.0))];
+        project(&mut workspace, |workspace| {
+            workspace.arrange(cards.clone()).unwrap();
+        });
+        assert_eq!(workspace.focused(), Some(cards[0].id));
+        assert_eq!(workspace.take_widget_focus_request(), Some(cards[0].id));
+
+        project(&mut workspace, |workspace| {
+            workspace.arrange([]).unwrap();
+        });
+        assert_eq!(workspace.focused(), None);
+        assert_eq!(workspace.take_widget_focus_request(), None);
+        workspace.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_focus_handoff_is_decided_by_the_final_strip_not_an_intermediate_one() {
+        // One card at a time, the second close saw the third pane mounted by
+        // the first close's layout and handed the keyboard to it without a
+        // request (800-wide panes), or saw it offscreen and fell back to the
+        // toolbar (1000-wide). Only the final strip matters: the one pane
+        // left takes focus, the keyboard is asked for once, and it is shown.
+        for width in [800.0, 1_000.0] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(width); 3], 1_000.0);
+            let ids = workspace.order().collect::<Vec<_>>();
+            assert_eq!(workspace.take_widget_focus_request(), Some(ids[0]));
+            assert_eq!(
+                workspace.visibility(ids[2]),
+                Some(VisibilityClass::Offscreen)
+            );
+            let last = workspace.cards()[2].clone();
+
+            project(&mut workspace, |workspace| {
+                workspace.arrange([last]).unwrap();
+            });
+            assert_eq!(workspace.order().collect::<Vec<_>>(), [ids[2]]);
+            assert_eq!(workspace.focused(), Some(ids[2]));
+            assert_eq!(workspace.pending_close(), None);
+            assert_eq!(workspace.visibility(ids[2]), Some(VisibilityClass::Visible));
+            assert_eq!(workspace.take_widget_focus_request(), Some(ids[2]));
+            assert_eq!(workspace.take_widget_focus_request(), None);
+        }
+    }
+
+    #[test]
+    fn a_focus_handoff_out_of_view_brings_its_pane_into_view() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 5], 500.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.take_widget_focus_request();
+        // Reading the last pane, far from the selected first one.
+        workspace.native_scroll(2_000.0, 500.0);
+        assert!(
+            !workspace
+                .visibility(ids[1])
+                .is_some_and(VisibilityClass::is_mounted)
+        );
+        let cards = workspace.cards()[1..].to_vec();
+
+        project(&mut workspace, |workspace| {
+            workspace.arrange(cards).unwrap();
+        });
+        assert_eq!(workspace.focused(), Some(ids[1]));
+        // The reading pane keeps its place until the camera moves to the
+        // handoff, which mounts as the camera's destination.
+        assert_eq!(workspace.camera().offset(), 1_500.0);
+        assert_eq!(workspace.camera().target(), 0.0);
+        assert!(
+            workspace
+                .visibility(ids[1])
+                .is_some_and(VisibilityClass::is_mounted)
+        );
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[1]));
+
+        // A handoff already in view leaves the camera where the reader was.
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 3], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.take_widget_focus_request();
+        let before = workspace.camera();
+        let cards = workspace.cards()[1..].to_vec();
+        project(&mut workspace, |workspace| {
+            workspace.arrange(cards).unwrap();
+        });
+        assert_eq!(workspace.focused(), Some(ids[1]));
+        assert_eq!(workspace.camera(), before);
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[1]));
+    }
+
+    #[test]
+    fn arranging_away_a_pane_ends_its_close_and_resize() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 3], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.request_close(ids[1]).unwrap();
+        workspace.begin_card_resize(ids[1]);
+        let cards = [workspace.cards()[0].clone(), workspace.cards()[2].clone()];
+        workspace.arrange(cards.clone()).unwrap();
+        assert_eq!(workspace.pending_close(), None);
+        assert!(workspace.resize_limits.is_none() && workspace.held_fill.is_none());
+        assert_eq!(workspace.visibility(ids[1]), None);
+
+        // A close of a pane that stays is still the user's to finish.
+        workspace.request_close(ids[2]).unwrap();
+        workspace
+            .arrange([cards[1].clone(), cards[0].clone()])
+            .unwrap();
+        assert_eq!(workspace.pending_close().unwrap().unmounting, ids[2]);
+        workspace.commit_close(ids[2]).unwrap();
+        assert_eq!(workspace.order().collect::<Vec<_>>(), [ids[0]]);
+    }
+
+    #[test]
+    fn a_focus_handoff_passes_over_a_pane_the_user_is_closing() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 3], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.request_close(ids[1]).unwrap();
+        let cards = workspace.cards()[1..].to_vec();
+        workspace.arrange(cards).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+        workspace.commit_close(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+        workspace.check_invariants().unwrap();
+
+        // With only the closing pane left, it holds focus until its close
+        // hands focus on, to a pane that arrived meanwhile or to none.
+        for arrives in [false, true] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 2], 1_000.0);
+            let ids = workspace.order().collect::<Vec<_>>();
+            workspace.request_close(ids[1]).unwrap();
+            workspace.arrange([workspace.cards()[1].clone()]).unwrap();
+            assert_eq!(workspace.focused(), Some(ids[1]));
+            let arrived = card(CardWidth::Fixed(400.0));
+            if arrives {
+                workspace.add_card(arrived.clone(), 1, false).unwrap();
+            }
+            workspace.take_widget_focus_request();
+            workspace.commit_close(ids[1]).unwrap();
+            let expected = arrives.then_some(arrived.id);
+            assert_eq!(workspace.focused(), expected);
+            assert_eq!(workspace.take_widget_focus_request(), expected);
+            workspace.check_invariants().unwrap();
+        }
+    }
+
+    #[test]
+    fn arranging_a_strip_refuses_a_repeated_card() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 2], 1_000.0);
+        let cards = workspace.cards().to_vec();
+        let error = workspace
+            .arrange([cards[0].clone(), cards[1].clone(), cards[0].clone()])
+            .unwrap_err();
+        assert_eq!(error, WorkspaceError::DuplicateCard(cards[0].id));
+        assert_eq!(workspace.cards(), cards.as_slice());
     }
 
     #[test]

@@ -223,8 +223,8 @@ impl Cagents {
 
 impl Runtime {
     /// What closing this conversation's card would keep of what the reader
-    /// has not sent, with what they had said before it where it is exactly
-    /// the message still being sent. A first message the provider already
+    /// has not sent, with what they had said before it where that begins
+    /// with the message still being sent. A first message the provider already
     /// took is in the conversation, so it is not kept again, nor one
     /// `with_first` excludes.
     fn kept_draft(&self, with_first: bool) -> (String, Vec<Attachment>, Option<SentAfter>) {
@@ -233,16 +233,14 @@ impl Runtime {
             .is_some_and(|handle| handle.has_accepted_user_input());
         let (text, attachments) =
             self.unsent_with_held(self.queued.as_ref().filter(|_| with_first && !delivered));
-        let sending =
-            self.pending
-                .as_ref()
-                .filter(|pending| {
-                    attachments.is_empty()
-                        && pending.sent.as_deref().is_some_and(|sent| {
-                            !sent.trim().is_empty() && sent.trim() == text.trim()
-                        })
-                })
-                .map(|pending| pending.sent_after.clone());
+        // The first message still on its way leads what is kept, ahead of
+        // anything written after it, which stays however it went.
+        let sending = self
+            .commands
+            .iter()
+            .find_map(|pending| Some((pending.sent.as_deref()?, &pending.sent_after)))
+            .filter(|(sent, _)| attachments.is_empty() && leading(&text, sent).is_some())
+            .map(|(_, after)| after.clone());
         (text, attachments, sending)
     }
 }
@@ -518,7 +516,10 @@ mod tests {
             let card = live_chat_in(&mut app, Provider::Claude, project.path(), Some("kept"));
             write(&mut app, card, "run the migration");
             submit(&mut app, card);
-            assert!(chat_runtime(&app, card).pending.is_some(), "still sending");
+            assert!(
+                chat_runtime(&app, card).commands.in_flight().is_some(),
+                "still sending"
+            );
             close(&mut app, card);
             let kept = &app.durable.kept_chat_drafts[&card];
             assert_eq!(kept.text, "run the migration");
@@ -536,6 +537,40 @@ mod tests {
             assert_eq!(
                 chat_runtime(&app, reopened).composer.text().trim_end(),
                 if arrived { "" } else { "run the migration" },
+                "arrived {arrived}"
+            );
+        }
+    }
+
+    /// What was written after a message still being sent stays when the
+    /// chat reopens, whether or not that message arrived; only the message
+    /// itself is dropped once the conversation shows it.
+    #[test]
+    fn what_was_written_after_a_message_still_being_sent_stays() {
+        for arrived in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let project = tempfile::tempdir().unwrap();
+            let card = live_chat_in(&mut app, Provider::Claude, project.path(), Some("kept"));
+            write(&mut app, card, "run the migration");
+            submit(&mut app, card);
+            write(&mut app, card, "then the seed");
+            close(&mut app, card);
+            let kept = &app.durable.kept_chat_drafts[&card];
+            assert_eq!(kept.text, "run the migration\nthen the seed");
+            assert!(kept.sending);
+
+            let mut items = vec![user_said("u-1", "an earlier message")];
+            if arrived {
+                items.push(user_said("u-2", "run the migration"));
+            }
+            let reopened = reopen_with(&mut app, card, items);
+            assert_eq!(
+                chat_runtime(&app, reopened).composer.text().trim_end(),
+                if arrived {
+                    "then the seed"
+                } else {
+                    "run the migration\nthen the seed"
+                },
                 "arrived {arrived}"
             );
         }
@@ -564,7 +599,10 @@ mod tests {
         } else {
             submit(&mut app, card);
         }
-        assert!(chat_runtime(&app, card).pending.is_some(), "still sending");
+        assert!(
+            chat_runtime(&app, card).commands.in_flight().is_some(),
+            "still sending"
+        );
         close(&mut app, card);
         assert!(app.durable.kept_chat_drafts[&card].sending);
         (app, card)

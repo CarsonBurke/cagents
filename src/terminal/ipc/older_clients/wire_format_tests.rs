@@ -553,11 +553,13 @@ fn every_older_client_is_proven_against_its_recorded_format() {
     }
 }
 
-/// Appended variants a client of `protocol` is sent as ones it knows, and
-/// added fields it is sent without, as (container, variant or field).
+/// Appended variants a client of `protocol` is sent as ones it knows or never
+/// sent, and added fields it is sent without, as (container, variant or
+/// field).
 fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
     RESTATED_VARIANTS
         .iter()
+        .chain(WITHHELD_VARIANTS)
         .filter(|(.., since)| protocol < *since)
         .map(|(container, variant, _)| (*container, *variant))
         .chain(

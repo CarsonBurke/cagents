@@ -367,7 +367,7 @@ impl Draft {
             value.advanced = !value.permission.is_empty() || definition.precheck.is_some();
             value.timezone = definition.schedule.timezone.clone();
             value.loaded_timezone = Some(definition.schedule.timezone.clone());
-            value.provider = provider_index(definition.agent.provider);
+            value.provider = provider_index(definition.agent.provider).unwrap_or_default();
             value.account = value
                 .accounts
                 .iter()
@@ -3261,7 +3261,8 @@ fn launch_description<'a>(
         .unwrap_or("Saved account is unavailable");
     let description = format!(
         "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
-        PROVIDERS[provider_index(definition.agent.provider)],
+        provider_index(definition.agent.provider)
+            .map_or(definition.agent.provider.label(), |index| PROVIDERS[index]),
         account,
         definition.agent.target.repository.display(),
         definition.agent.target.directory.display(),
@@ -3520,18 +3521,22 @@ fn firing_state_label(firing: &Firing) -> String {
     }
 }
 
+/// The providers an automation can run, in the order `PROVIDERS` names them:
+/// those with native chat, which every scheduled agent runs as.
+const AUTOMATION_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+
 fn provider(index: usize) -> Provider {
-    [Provider::Claude, Provider::Codex, Provider::Omp]
+    AUTOMATION_PROVIDERS
         .get(index)
         .copied()
         .unwrap_or(Provider::Claude)
 }
-fn provider_index(provider: Provider) -> usize {
-    match provider {
-        Provider::Claude => 0,
-        Provider::Codex => 1,
-        Provider::Omp => 2,
-    }
+/// Where `provider` sits among the automation providers. A definition naming
+/// another provider fails validation, so it never reaches the editor.
+fn provider_index(provider: Provider) -> Option<usize> {
+    AUTOMATION_PROVIDERS
+        .iter()
+        .position(|candidate| *candidate == provider)
 }
 /// Every timezone the schedule can name, read once from the system database.
 fn timezone_names() -> &'static [String] {
@@ -5758,7 +5763,7 @@ mod tests {
         state.update(Action::Field(Field::Model, "gpt-future".into()));
         assert_eq!(saved_effort(&state), Ok(Some("high".into())));
         // Model IDs and efforts belong to the provider they were chosen for.
-        state.update(Action::Provider(provider_index(Provider::Claude)));
+        state.update(Action::Provider(provider_index(Provider::Claude).unwrap()));
         let draft = state.draft.as_ref().unwrap();
         assert!(draft.model.is_empty() && draft.effort.is_none());
     }
@@ -5823,13 +5828,13 @@ mod tests {
         state.update(Action::Target(1));
         assert_eq!(selected_account(&state), Some("Work"));
         // With no default of its own, a provider's only account is chosen.
-        state.update(Action::Provider(provider_index(Provider::Codex)));
+        state.update(Action::Provider(provider_index(Provider::Codex).unwrap()));
         assert_eq!(selected_account(&state), Some("Codex"));
         // A provider with no account leaves the choice to the reader.
-        state.update(Action::Provider(provider_index(Provider::Omp)));
+        state.update(Action::Provider(provider_index(Provider::Omp).unwrap()));
         assert_eq!(selected_account(&state), None);
         // Changing provider replaced the picked account with a default.
-        state.update(Action::Provider(provider_index(Provider::Claude)));
+        state.update(Action::Provider(provider_index(Provider::Claude).unwrap()));
         assert_eq!(selected_account(&state), Some("Personal"));
     }
 

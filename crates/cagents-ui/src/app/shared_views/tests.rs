@@ -5830,6 +5830,70 @@ fn a_peer_closing_the_focused_pane_leaves_a_focus_storage_accepts() {
 }
 
 #[test]
+fn a_peer_editing_many_panes_rebuilds_the_strip_once() {
+    let (mut app, a, _, first) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(a);
+    drop(app.workspace.resize_viewport(1_200.0));
+    let pane = |_| {
+        let mut pane = first.clone();
+        pane.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut pane.kind {
+            browser.id = BrowserId::new();
+        }
+        pane
+    };
+    let mut view = View::empty(a);
+    view.panes = (0..48).map(pane).collect();
+    app.workspace_model.views = vec![view.clone()];
+    drop(app.reconcile_shared_views());
+    let ids = view.panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), ids);
+    let update = app.workspace.focus(ids[10]).unwrap();
+    drop(app.apply_viewport(update, false, DurableChange::None));
+
+    // Another window closes every other pane, the focused one among them,
+    // resizes some, and opens as many new ones, in one snapshot.
+    for id in ids.iter().step_by(2) {
+        view.apply(&Change::Remove { id: *id }).unwrap();
+    }
+    let mut panes = view.panes.clone();
+    for (index, pane) in panes.iter_mut().enumerate() {
+        if index % 3 == 0 {
+            pane.width_fraction = 1.0;
+        }
+    }
+    for index in (0..panes.len()).rev().step_by(2) {
+        panes.insert(index, pane(index));
+    }
+    view.panes = panes;
+    app.workspace_model.views = vec![view.clone()];
+    let (indexed, laid_out, _) = crate::workspace::Workspace::rebuild_counts();
+    drop(app.reconcile_shared_views());
+    let (indexed_after, laid_out_after, _) = crate::workspace::Workspace::rebuild_counts();
+    assert_eq!(indexed_after - indexed, 1, "the strip is indexed once");
+    assert_eq!(laid_out_after - laid_out, 1, "the strip is laid out once");
+
+    assert_eq!(
+        app.workspace.order().collect::<Vec<_>>(),
+        view.panes.iter().map(|pane| pane.id).collect::<Vec<_>>()
+    );
+    assert!(
+        app.workspace
+            .cards()
+            .iter()
+            .zip(&view.panes)
+            .all(|(card, pane)| { card.width == CardWidth::Fraction(pane.width_fraction) })
+    );
+    // The focused pane went; the one after it took focus, and the saved
+    // focus followed it.
+    assert_eq!(app.workspace.focused(), Some(ids[11]));
+    assert_eq!(app.durable.focused, Some(ids[11]));
+    assert!(!app.card_state(ids[10]).unwrap().existence.is_open());
+    crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
+}
+
+#[test]
 fn transfer_preserves_runtime_when_destination_is_projected_first() {
     let (mut app, a, b, pane) = fixture();
     Arc::make_mut(&mut app.durable).active_channel = Some(a);
@@ -5866,6 +5930,33 @@ fn transfer_preserves_runtime_when_destination_is_projected_first() {
         );
     }
 }
+
+#[test]
+fn a_transfer_leaves_a_pane_the_user_is_closing_to_that_close() {
+    let (mut app, a, b, pane) = fixture();
+    Arc::make_mut(&mut app.durable).active_channel = Some(a);
+    let owned = HashSet::from([pane.id]);
+    let mut source = View::empty(a);
+    source.panes.push(pane.clone());
+    app.shared_views.applying = true;
+    drop(app.project_shared_view(&source, &owned));
+    app.shared_views.applying = false;
+    app.workspace.request_close(pane.id).unwrap();
+
+    let mut target = View::empty(b);
+    target.panes.push(pane.clone());
+    app.workspace_model.views = vec![target, View::empty(a)];
+    drop(app.reconcile_shared_views());
+    assert!(app.workspace.card(pane.id).is_some());
+    assert_eq!(
+        app.workspace
+            .pending_close()
+            .map(|pending| pending.unmounting),
+        Some(pane.id)
+    );
+    app.workspace.commit_close(pane.id).unwrap();
+}
+
 #[test]
 fn peer_channel_deletion_retains_local_chat_work_in_worktree() {
     let (mut app, a, _, _) = fixture();

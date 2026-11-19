@@ -564,7 +564,7 @@ impl Cagents {
         }
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             if !runtime.start_blocked.is_some_and(Reopen::reopens)
-                || runtime.pending.is_some()
+                || !runtime.commands.is_idle()
                 || runtime.attachment_chooser_pending.is_some()
                 || runtime.pastes_pending > 0
             {
@@ -591,7 +591,7 @@ impl Cagents {
         // The draft Fresh keeps must be complete: its button is disabled
         // until a pending send, paste or attachment settles.
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
-            && (runtime.pending.is_some()
+            && (!runtime.commands.is_idle()
                 || runtime.attachment_chooser_pending.is_some()
                 || runtime.pastes_pending > 0)
         {

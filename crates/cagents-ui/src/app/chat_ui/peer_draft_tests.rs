@@ -962,7 +962,7 @@ fn a_message_written_while_the_provider_comes_up_waits_in_the_composer() {
     let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
         panic!("expected a chat runtime");
     };
-    assert!(runtime.pending.is_none());
+    assert!(runtime.commands.is_idle());
     assert!(runtime.error.is_none());
     assert_eq!(runtime.unsent_text(), "from this window");
 }
@@ -1407,6 +1407,7 @@ fn a_file_queued_behind_this_windows_own_start_comes_along() {
     match peer.app.cards.get(&peer.card) {
         Some(CardRuntime::Chat(runtime)) => assert!(
             runtime.queued.as_ref().is_some_and(|queued| queued
+                .prompt
                 .attachments
                 .iter()
                 .any(|attachment| attachment.path == std::path::Path::new(FILE))),

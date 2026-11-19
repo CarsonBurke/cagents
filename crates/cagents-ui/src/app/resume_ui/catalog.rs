@@ -135,6 +135,8 @@ pub fn candidates(seeds: &[chat::Session], cancel: &AtomicBool) -> Vec<Candidate
             Provider::Claude => (root.join("projects"), 2),
             Provider::Codex => (root.join("sessions"), 4),
             Provider::Omp => (root.join("sessions"), 3),
+            // They keep no transcript files this list reads.
+            Provider::Antigravity | Provider::Muse => continue,
         };
         let root = root.canonicalize().unwrap_or(root);
         if !roots.insert((provider, root.clone())) {
@@ -488,7 +490,8 @@ mod tests {
     fn discovers_all_provider_history_without_changing_account_or_identity() {
         let root = tempfile::tempdir().unwrap();
         let id = "f0e49307-af96-4edd-b23f-60b185fe4fea";
-        for provider in Provider::ALL {
+        // The others' history isn't listed yet.
+        for provider in Provider::ALL.into_iter().filter(|p| p.has_native_chat()) {
             let account_home = root.path().join(provider.executable());
             std::fs::create_dir_all(&account_home).unwrap();
             let account = crate::account::Account {
@@ -526,6 +529,7 @@ mod tests {
                     json!({"type":"session","id":id,"cwd":root.path()}),
                     json!({"type":"message","message":{"role":"user","content":"Restore me"}}),
                 ],
+                Provider::Antigravity | Provider::Muse => unreachable!("not listed"),
             };
             std::fs::write(
                 directory.join(format!("{id}.jsonl")),

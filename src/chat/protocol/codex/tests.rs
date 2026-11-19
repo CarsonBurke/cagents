@@ -1932,6 +1932,7 @@ fn adapter() -> Codex {
         pricing: Default::default(),
         turn_pricing: Default::default(),
         turn: None,
+        held_stop: HeldStop::None,
         notification_turn: None,
         notification_revision: 0,
         busy: false,
@@ -2903,6 +2904,133 @@ fn child_terminal_outcomes_survive_idle_and_closure_and_new_turn_restarts_work()
             ..
         }
     )));
+}
+
+/// Codex names a turn only once it has started. A stop given while the
+/// turn's start is unanswered waits for that name, whichever of the start's
+/// answer or its notification brings it first, even once the thread has
+/// reported itself active, and is sent once. A start that
+/// fails leaves nothing to stop.
+#[test]
+fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
+    let prompt = |adapter: &mut Codex| {
+        let step = adapter
+            .command(Command::Prompt {
+                text: "Fix the build".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        step.writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone()
+    };
+    let interrupts = |step: &Step| {
+        step.writes
+            .iter()
+            .filter(|frame| frame["method"] == "turn/interrupt")
+            .map(|frame| frame["params"].clone())
+            .collect::<Vec<_>>()
+    };
+    let finish = |id: &str| {
+        json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+        "turn":{"id":id,"status":"interrupted","items":[]}}})
+    };
+
+    let mut adapter = adapter();
+    let request = prompt(&mut adapter);
+    let stop = adapter.command(Command::Interrupt).unwrap();
+    assert!(stop.writes.is_empty(), "no turn to name yet");
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-a"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-a"})]
+    );
+    assert_eq!(adapter.held_stop(), HeldStop::Sent);
+    adapter.receive(finish("turn-a")).unwrap();
+
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-b","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        interrupts(&started),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-b"})]
+    );
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-b"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "stopped once");
+    adapter.receive(finish("turn-b")).unwrap();
+
+    // The thread can report itself active before the start's answer, which
+    // then no longer owns the lifecycle; the answer still names the turn.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"active","activeFlags":[]}}}),
+        )
+        .unwrap();
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-c"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-c"})]
+    );
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-c","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&started).is_empty(), "stopped once");
+    adapter.receive(finish("turn-c")).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"idle"}}}),
+        )
+        .unwrap();
+
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    let refused = adapter
+        .receive(json!({"id":request,"error":{"code":-32600,"message":"thread is closed"}}))
+        .unwrap();
+    assert!(interrupts(&refused).is_empty());
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
+    assert!(
+        adapter.command(Command::Interrupt).is_err(),
+        "nothing left to stop"
+    );
+
+    // A turn that finished before its start was answered needs no stop.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    assert_eq!(adapter.held_stop(), HeldStop::Waiting);
+    let finished = adapter
+        .receive(
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-d","status":"completed","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&finished).is_empty());
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-d"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "nothing left to stop");
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
 }
 
 /// A child is a thread of its own: stopping it interrupts its turn alone,

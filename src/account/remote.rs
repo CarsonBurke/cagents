@@ -739,7 +739,12 @@ fn login_recipe_with_path(
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
             Provider::Codex => vec!["login".into(), "--device-auth".into()],
-            Provider::Omp => return Err("Omp manages its own sign-in".into()),
+            Provider::Omp | Provider::Antigravity | Provider::Muse => {
+                return Err(format!(
+                    "{} manages its own sign-in",
+                    account.provider.label()
+                ));
+            }
         },
         working_directory: std::env::var_os("HOME")
             .ok_or("Remote HOME is unavailable")?

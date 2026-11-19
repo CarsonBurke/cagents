@@ -2063,9 +2063,24 @@ fn a_window_view_saves_each_open_inspector_and_reads_one_from_before_them() {
         "an older version reads the focused pane's as the window's"
     );
 
+    assert_eq!(
+        view.inspector_choices,
+        Some(pane_inspector::Choices {
+            opened: vec![card],
+            closed: Vec::new(),
+        })
+    );
+
     let mut json = serde_json::to_value(&view).unwrap();
     let read: WindowView = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(read.open_inspectors, Some(vec![card]));
+    assert_eq!(read.inspector_choices, view.inspector_choices);
+    // A view saved while inspectors were closed until opened keeps no
+    // choices; its open ones read back as opened.
+    json.as_object_mut().unwrap().remove("inspector_choices");
+    let unchosen: WindowView = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(unchosen.inspector_choices, None);
+    assert_eq!(unchosen.open_inspectors, Some(vec![card]));
     // A view saved before each pane had its own inspector.
     json.as_object_mut().unwrap().remove("open_inspectors");
     let legacy: WindowView = serde_json::from_value(json).unwrap();
@@ -3019,7 +3034,7 @@ fn empty_workspace_exposes_provider_status_on_real_account_controls() {
         element
             .as_widget()
             .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    for provider in crate::agent::Provider::ALL {
+    for provider in crate::account::Account::REPORTED {
         let expected = format!(
             "{} · {} · Manage accounts",
             provider.label(),
@@ -4402,8 +4417,12 @@ fn surfaces_and_rules_reach_a_free_right_edge_while_controls_keep_out_of_its_bor
         app.window_width = width;
         assert_eq!(app.trailing_edge_inset(), border);
         if inspector {
-            // A pane measured wide enough to dock its inspector.
-            drop(app.workspace.resize_viewport(width - border));
+            // A pane measured wide enough to dock its inspector, as the
+            // strip beside the sidebar measures itself, so the inspector
+            // ends where the window does rather than past it.
+            let sidebar =
+                sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+            drop(app.workspace.resize_viewport(width - sidebar));
             let card = app.workspace.focused().unwrap();
             app.open_pane_inspector_now(card);
             assert_eq!(

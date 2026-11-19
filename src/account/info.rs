@@ -103,6 +103,7 @@ pub struct Report {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Caller {
     pub session: TerminalId,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub provider: Option<Provider>,
     pub account: Option<AccountId>,
     pub account_detail: Option<String>,

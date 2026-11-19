@@ -27,11 +27,15 @@ static NEXT_ACCOUNT_OWNER: AtomicU64 = AtomicU64::new(1);
 
 use super::*;
 
-fn install_url(provider: Provider) -> &'static str {
+/// Where to install a provider's CLI, for one that publishes it.
+pub(super) fn install_url(provider: Provider) -> Option<&'static str> {
     match provider {
-        Provider::Claude => "https://code.claude.com/docs/en/setup",
-        Provider::Codex => "https://developers.openai.com/codex/cli/",
-        Provider::Omp => "https://github.com/can1357/oh-my-pi",
+        Provider::Claude => Some("https://code.claude.com/docs/en/setup"),
+        Provider::Codex => Some("https://developers.openai.com/codex/cli/"),
+        Provider::Omp => Some("https://github.com/can1357/oh-my-pi"),
+        Provider::Antigravity => Some("https://antigravity.google/"),
+        // Meta distributes Muse only to its employees.
+        Provider::Muse => None,
     }
 }
 use crate::account::{
@@ -1502,7 +1506,9 @@ fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Pro
         .map(|provider| {
             (
                 provider,
-                probe::find_executable(provider.executable(), search_path).is_some(),
+                provider
+                    .programs()
+                    .any(|program| probe::find_executable(program, search_path).is_some()),
             )
         })
         .collect()
@@ -1707,7 +1713,7 @@ fn headline_window(snapshot: &UsageSnapshot) -> Option<&UsageWindow> {
 fn preview_window_key(provider: Provider, window: &UsageWindow) -> String {
     let key = match provider {
         Provider::Claude => account::claude::stable_window_key(&window.key),
-        Provider::Codex | Provider::Omp => &window.key,
+        Provider::Codex | Provider::Omp | Provider::Antigravity | Provider::Muse => &window.key,
     };
     format!("window:{key}")
 }
@@ -1988,7 +1994,7 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Claude, _) => &["auth", "login", "--claudeai"],
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
-        (Provider::Omp, _) => return None,
+        (Provider::Omp | Provider::Antigravity | Provider::Muse, _) => return None,
     })
 }
 
@@ -3985,9 +3991,12 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Action::Install(provider) => self.open_clicked_link(
-                url::Url::parse(install_url(provider)).expect("fixed install URL"),
-            ),
+            Action::Install(provider) => match install_url(provider) {
+                Some(link) => {
+                    self.open_clicked_link(url::Url::parse(link).expect("fixed install URL"))
+                }
+                None => Task::none(),
+            },
             Action::RenameCommit => {
                 let Some((id, draft)) = self.account_ui.table.rename.take() else {
                     return Task::none();
@@ -7256,6 +7265,12 @@ mod tests {
         assert_eq!(installations.get(&Provider::Omp), Some(&true));
         assert_eq!(installations.get(&Provider::Claude), Some(&false));
         assert_eq!(installations.get(&Provider::Codex), Some(&false));
+        assert_eq!(installations.get(&Provider::Muse), Some(&false));
+        let upstream = directory.path().join("muse-upstream");
+        std::fs::write(&upstream, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&upstream, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let installations = provider_installations(Some(directory.path().as_os_str()));
+        assert_eq!(installations.get(&Provider::Muse), Some(&true));
     }
 
     #[test]

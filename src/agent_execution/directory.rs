@@ -82,6 +82,7 @@ pub struct Entry {
     pub id: TerminalId,
     pub surface: Surface,
     /// Absent only for the caller's own plain shell.
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub provider: Option<Provider>,
     pub title: Option<String>,
     /// Daemon-owned channel membership, when this session belongs to one.

@@ -950,7 +950,10 @@ fn cold_reader_wheel_reports_saved_geometry_and_dispatches_real_history_edges() 
         drop(app.update(reports.into_iter().next().unwrap()));
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert_eq!(
-            runtime.pending.as_ref().and_then(|pending| pending.page),
+            runtime
+                .commands
+                .in_flight()
+                .and_then(|pending| pending.page),
             Some(if bottom {
                 view::Page::Newer
             } else {
@@ -1104,8 +1107,8 @@ fn native_paging_shrinks_to_loaded_content_and_wheels_choose_each_edge() {
             drop(app.update(messages.pop().unwrap()));
             let runtime = app.chat_runtime_mut(target).unwrap();
             let pending = runtime
-                .pending
-                .as_ref()
+                .commands
+                .in_flight()
                 .expect("native wheel starts a page");
             assert_eq!(pending.page, Some(expected));
             let request = pending.id;
@@ -1118,7 +1121,7 @@ fn native_paging_shrinks_to_loaded_content_and_wheels_choose_each_edge() {
                 Ok(()),
             ))));
             assert!(
-                app.chat_runtime_mut(target).unwrap().pending.is_none(),
+                app.chat_runtime_mut(target).unwrap().commands.is_idle(),
                 "arrival of an equal-height page must wait for the next gesture"
             );
         }
@@ -1237,8 +1240,8 @@ fn fitting_native_wheel_defers_its_direction_and_can_reverse_before_command_ack(
             let request = app
                 .chat_runtime_mut(target)
                 .unwrap()
-                .pending
-                .as_ref()
+                .commands
+                .in_flight()
                 .unwrap()
                 .id;
             let opposite = if first == view::Page::Earlier {
@@ -1291,8 +1294,8 @@ fn fitting_native_wheel_defers_its_direction_and_can_reverse_before_command_ack(
             assert_eq!(
                 app.chat_runtime_mut(target)
                     .unwrap()
-                    .pending
-                    .as_ref()
+                    .commands
+                    .in_flight()
                     .unwrap()
                     .page,
                 Some(if reverse { opposite } else { first })

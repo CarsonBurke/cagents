@@ -10,6 +10,8 @@ fn provider_marker(provider: Provider) -> (&'static str, &'static str) {
         Provider::Claude => ("provider-error:claude", "Claude"),
         Provider::Codex => ("provider-error:codex", "Codex"),
         Provider::Omp => ("provider-error:omp", "Oh My Pi"),
+        Provider::Antigravity => ("provider-error:antigravity", "Antigravity"),
+        Provider::Muse => ("provider-error:muse", "Muse"),
     }
 }
 
@@ -275,6 +277,8 @@ impl<'a> Failure<'a> {
             Provider::Claude => "Claude",
             Provider::Codex => "Codex",
             Provider::Omp => "Oh My Pi",
+            Provider::Antigravity => "Antigravity",
+            Provider::Muse => "Muse",
         };
         // What stopped is the provider's program, named as the stopped
         // chat's controls name it, rather than its service.

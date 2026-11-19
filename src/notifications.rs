@@ -123,6 +123,7 @@ pub struct Event {
     pub target: Target,
     /// Focus and preferred-window metadata only, never lifecycle authority.
     pub source_session: Option<TerminalId>,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub provider: Option<Provider>,
     pub directory: Option<PathBuf>,
     #[serde(default)]

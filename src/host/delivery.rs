@@ -542,13 +542,21 @@ impl DeliveryQueue {
                 return None;
             }
             if let Some(message) = state.dequeue() {
-                match self.older.get() {
-                    None => return Some(message),
-                    Some(client) => match message.for_older(*client) {
-                        Some(message) => return Some(message),
-                        None => continue,
-                    },
+                let Some(client) = self.older.get() else {
+                    return Some(message);
+                };
+                // Not under the queue lock: converting may encode the whole
+                // message, and a push waits for that lock. Only this writer
+                // pops, so the order is kept.
+                drop(state);
+                if let Some(message) = message.for_older(*client) {
+                    return Some(message);
                 }
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                continue;
             }
             if state.close_after_drain {
                 return None;

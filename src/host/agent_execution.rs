@@ -727,6 +727,9 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
             Provider::Claude => "--permission-mode",
             Provider::Omp => "--approval-mode",
             Provider::Codex => "--ask-for-approval",
+            // Their own launch options; no native chat runs them yet.
+            Provider::Antigravity => "--mode",
+            Provider::Muse => "--approval-mode",
         };
         arguments.extend([flag.into(), mode.clone()]);
     }
@@ -734,6 +737,8 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
         arguments.extend(match spec.provider {
             Provider::Claude => ["--effort".into(), effort.clone()],
             Provider::Omp => ["--thinking".into(), effort.clone()],
+            Provider::Antigravity => ["--effort".into(), effort.clone()],
+            Provider::Muse => ["--reasoning-effort".into(), effort.clone()],
             Provider::Codex => [
                 "--config".into(),
                 format!(

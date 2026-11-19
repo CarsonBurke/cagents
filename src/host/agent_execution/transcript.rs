@@ -299,6 +299,10 @@ impl Source {
                 crate::agent::codex_archived_rollout(&root, id).map_err(|_| error)
             }),
             Provider::Omp => Err("Reading an Omp conversation is not supported yet".into()),
+            Provider::Antigravity | Provider::Muse => Err(format!(
+                "Reading {} conversations is not supported yet",
+                self.launch.provider.label()
+            )),
         }
     }
 
@@ -321,6 +325,10 @@ impl Source {
                 &self.path()?,
             )?)))),
             Provider::Omp => Err("Reading an Omp conversation is not supported yet".into()),
+            Provider::Antigravity | Provider::Muse => Err(format!(
+                "Reading {} conversations is not supported yet",
+                self.launch.provider.label()
+            )),
         }
     }
 }
