@@ -4648,6 +4648,70 @@ fn live_instructions_reach_the_skill_that_launched_them() {
 
 /// A skill that failed to launch keeps its error, even when instructions of
 /// the same name arrive later without a call of their own.
+/// A skill call Claude retracted before it loaded leaves no claim on the
+/// instructions a later skill loads, even one whose name is not its
+/// directory's.
+#[test]
+fn a_retracted_skill_call_never_takes_later_instructions() {
+    let mut adapter = Claude::default();
+    adapter
+        .receive(json!({"type":"assistant","uuid":"call-a","message":{"id":"msg-a","role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Skill","input":{"skill":"draft-notes"}}]}}))
+        .unwrap();
+    adapter
+        .receive(json!({"type":"assistant","uuid":"call-b","supersedes":["call-a"],"message":{"id":"msg-b","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Skill","input":{"skill":"notes"}}]}}))
+        .unwrap();
+    assert!(
+        adapter
+            .skill_loads
+            .iter()
+            .all(|(call, _)| call.id != "toolu_a")
+    );
+    adapter
+        .receive(json!({"type":"user","uuid":"result-b","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"Launching skill: notes"}]},"tool_use_result":{"success":true,"commandName":"notes"}}))
+        .unwrap();
+    let step = adapter
+        .receive(json!({"type":"user","uuid":"instructions","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}))
+        .unwrap();
+    assert!(
+        matches!(&step.events[..], [Event::Item(item)] if item.id == "toolu_b"
+            && matches!(&item.content, ItemContent::Tool { output, .. } if output == SKILL_BODY)),
+        "{step:?}"
+    );
+}
+
+/// Saved instructions whose call is on no branch they share, such as one
+/// Claude retracted, load into no call, even one reusing that call's ID.
+#[test]
+fn saved_instructions_without_their_call_load_nowhere() {
+    let mut adapter = Claude::default();
+    let mut step = Step::default();
+    adapter
+        .history_message(
+            &HistoryRecord {
+                frame: json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+                tool_calls: HashMap::new(),
+                gap: None,
+            },
+            &mut step,
+        )
+        .unwrap();
+    let mut loaded = Step::default();
+    adapter
+        .history_message(
+            &HistoryRecord {
+                frame: json!({"type":"user","uuid":"instructions","isMeta":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+                tool_calls: HashMap::new(),
+                gap: None,
+            },
+            &mut loaded,
+        )
+        .unwrap();
+    assert!(loaded.events.is_empty(), "{loaded:?}");
+    assert!(
+        matches!(&adapter.tools[&ScopedId::new(None, "toolu_skill")].content, ItemContent::Tool { output, .. } if output.is_empty())
+    );
+}
+
 #[test]
 fn a_failed_skill_call_never_takes_later_instructions() {
     let live = settled_live(&[

@@ -1062,6 +1062,7 @@ impl Claude {
         self.labelled_agents.remove(&key.id);
         self.edit_tools.remove(key);
         self.loaded_skills.remove(key);
+        self.skill_loads.retain(|(known, _)| known != key);
         self.tool_inputs.remove(key);
         self.tool_input_order.retain(|known| known != key);
         if key.parent.is_none() {
@@ -1083,6 +1084,9 @@ impl Claude {
         step: &mut Step,
     ) {
         let call = match frame["sourceToolUseID"].as_str() {
+            // Saved instructions load only into the call their page found
+            // on their own branch; another branch's call may share its ID.
+            Some(_) if frame[SKILL_CALL].is_null() => return,
             Some(id) => ScopedId::new(child, id),
             None => {
                 let scope = ScopedId::new(child, "").parent;
