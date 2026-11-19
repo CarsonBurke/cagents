@@ -1093,9 +1093,24 @@ PR merges to remove the task's checkouts from the host.
 speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
 does, with its configuration options for model, thinking level and mode and
 its older `models` and `modes` lists. Run as `muse...` or with
-`FAKE_ACP_SHAPE=muse`, it offers Muse's model and mode options instead, with
-no thinking level. It ignores its arguments, so a launch recipe written for
-the real agent runs it unchanged. It contacts no model, account or network.
+`FAKE_ACP_SHAPE=muse`, it copies Muse 1.4.24 instead: its four modes, a
+`-contributor` model beside each ordinary one, a reasoning option only on
+`muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
+soon as a session opens, and usage with no context size. It ignores its
+arguments, so a launch recipe written for the real agent runs it unchanged.
+It contacts no model, account or network.
+
+In the Muse shape, three account commands answer the way `muse` does, so the
+fixture can stand in for `muse-upstream` on a fixture `PATH`:
+
+| Command | The fixture |
+| --- | --- |
+| `usage --json` | prints Muse's no-allowance report, or exits 1 with `not logged in` when signed out |
+| `logout` | signs out: every later `session/new`, `session/load` and prompt answers Muse's `log in to Muse before opening a session` |
+| `login` | prints a made-up device code, waits `FAKE_ACP_LOGIN_SECONDS` (default 2), and signs back in |
+
+Signing out is a `signed-out` file under `FAKE_ACP_STATE`, so it lasts
+across processes until `login`.
 
 It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
 replays a conversation from an earlier process and `session/list` finds it.
@@ -1127,6 +1142,21 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+
+`native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
+fixture as `bin/agy` and `bin/muse-upstream`, through
+[`tests/fixtures/fixture-acp.sh`](../tests/fixtures/fixture-acp.sh), with a
+`bin/muse` that runs `muse-upstream` behind root options as a reader's own
+wrapper might. Each keeps its sessions in the fixture's `acp/agy` or
+`acp/muse`. While `acp/agy/signed-out` exists, `agy` answers every new or
+loaded session that sign-in is required, and the app's sign-in, `agy acp
+--login`, removes it:
+
+```sh
+evidence env touch '{fixture}/acp/agy/signed-out'
+```
+
+A plain start installs neither, so Antigravity and Muse are not installed.
 
 The ACP adapter's runtime test in `src/chat/runtime/tests.rs` drives it
 through a real pipe.
