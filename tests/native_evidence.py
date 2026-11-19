@@ -969,6 +969,16 @@ class Evidence(unittest.TestCase):
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
 
+    def test_launch_handshake_reaches_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        for options, expected in (([], False), (["--launch-handshake"], True), ([], False)):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                environment = (self.logs / "ui-env").read_text().splitlines()
+                self.assertEqual("CAGENTS_UI_LAUNCH_HANDSHAKE=1" in environment, expected)
+                self.run_tool("stop")
+
     def test_projection_oracle_reaches_only_the_session_that_asked_for_it(self) -> None:
         self.built()
         for options, expected in (([], False), (["--projection-oracle"], True), ([], False)):
@@ -3003,12 +3013,14 @@ class RemoteEvidence(unittest.TestCase):
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
-                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace", "--ui-scoped-fixture")
+                      "--codex", "tool-rows", "--startup-timeout", "900", "--ui-trace", "--workspace-trace", "--ui-scoped-fixture",
+                      "--restore-existing-only", "--launch-handshake")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace --ui-scoped-fixture", calls)
+            self.assertIn(f"start {side} --width 1200 --height 800 --portal gtk --codex tool-rows --startup-timeout 900 --ui-trace --workspace-trace --ui-scoped-fixture"
+                          " --restore-existing-only --launch-handshake", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 
