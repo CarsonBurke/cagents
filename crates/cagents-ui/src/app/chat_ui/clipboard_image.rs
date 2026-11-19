@@ -78,7 +78,6 @@ impl std::fmt::Display for StagingError {
 fn storage_error(message: String) -> StagingError {
     if message.starts_with("Image storage is full (2 GiB or 4096 images).")
         || message == "Image storage metadata is full."
-        || message == "Image storage exceeds its size limit."
         || message == "Image numbering is exhausted; no identity was reused."
         || message == "Image exceeds this provider's image size limit or has an unsupported type."
     {
@@ -347,7 +346,6 @@ mod tests {
         for message in [
             "Image storage is full (2 GiB or 4096 images). No images were removed. Run cagents chat image-assets list, then explicitly remove an image you no longer need before attaching another.",
             "Image storage metadata is full.",
-            "Image storage exceeds its size limit.",
             "Image numbering is exhausted; no identity was reused.",
             "Image exceeds this provider's image size limit or has an unsupported type.",
         ] {
@@ -356,6 +354,7 @@ mod tests {
             assert_eq!(error.message(), message);
         }
         for message in [
+            "Image storage exceeds its size limit.",
             "Image storage metadata is damaged; no image identity was changed.",
             "Image storage must be private to this account.",
             "Cannot write image storage: permission denied",
