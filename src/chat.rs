@@ -189,6 +189,14 @@ mod acp_permission_tests {
             acp_permission_mode(&launch, provider).as_deref(),
             Some("default")
         );
+        // A mode never hides the conversation the command resumes.
+        let mut resume = recipe(&["--model", "m", "--conversation", "c"]);
+        assert!(apply_acp_permission_mode(&mut resume, provider, "plan"));
+        assert_eq!(
+            resume.arguments,
+            ["--model", "m", "--mode", "plan", "--conversation", "c"]
+        );
+        assert_eq!(provider.resume_id(&resume.arguments), Some("c"));
         // A mode the agent does not have changes nothing.
         assert!(!apply_acp_permission_mode(
             &mut launch,
@@ -202,6 +210,25 @@ mod acp_permission_tests {
             "plan"
         ));
         assert_eq!(acp_permission_mode(&launch, Provider::Codex), None);
+    }
+
+    #[test]
+    fn a_conversation_returned_to_its_terminal_in_any_mode_is_recognized() {
+        let launch = Launch {
+            provider: Provider::Antigravity,
+            recipe: recipe(&["--mode", "plan", "--model", "m"]),
+            session_id: Some("98608bab-5eb6-4cf5-8f9b-46019bf29df7".into()),
+        };
+        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
+            let terminal = launch.terminal_recipe_with_permission_mode(mode).unwrap();
+            assert_eq!(
+                Provider::Antigravity.resume_id(&terminal.arguments),
+                launch.session_id.as_deref(),
+                "{mode:?}"
+            );
+            assert!(launch.resumes_in_terminal(&terminal), "{mode:?}");
+        }
+        assert!(!launch.resumes_in_terminal(&recipe(&["--model", "m"])));
     }
 }
 
@@ -323,19 +350,22 @@ impl Launch {
     /// cannot prove which mode was confirmed; it proves the recipe differs from
     /// the resume by nothing else.
     pub fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
-        let mode_option = self
-            .provider
-            .acp()
-            .map_or("--permission-mode", |acp| acp.mode_option);
-        let mode = match recipe.arguments.as_slice() {
-            [.., flag, mode] if flag == mode_option => Some(
-                self.provider
-                    .acp()
-                    .map_or(mode.as_str(), |acp| acp.mode_meaning(mode)),
-            ),
-            _ => None,
+        let mode = if self.provider.speaks_acp() {
+            // Its default mode goes unnamed, and any other comes before the
+            // conversation it resumes.
+            if self.terminal_recipe().as_ref() == Some(recipe) {
+                return true;
+            }
+            acp_permission_mode(recipe, self.provider)
+        } else {
+            match recipe.arguments.as_slice() {
+                [.., flag, mode] if flag == "--permission-mode" => Some(mode.clone()),
+                _ => None,
+            }
         };
-        self.terminal_recipe_with_permission_mode(mode).as_ref() == Some(recipe)
+        self.terminal_recipe_with_permission_mode(mode.as_deref())
+            .as_ref()
+            == Some(recipe)
     }
 
     /// Return to the CLI using the current provider-confirmed identity, not a
@@ -424,9 +454,15 @@ pub fn apply_acp_permission_mode(
             arguments.push(argument);
         }
     }
-    // The agent's terminal may not accept its default by name.
+    // The agent's terminal may not accept its default by name. The mode goes
+    // before a conversation the command resumes, which is read only at the
+    // end of the command.
     if own != acp.default_mode {
-        arguments.extend([acp.mode_option.into(), own.into()]);
+        let at = match arguments.as_slice() {
+            [.., flag, _] if flag == provider.resume_flag() => arguments.len() - 2,
+            _ => arguments.len(),
+        };
+        arguments.splice(at..at, [acp.mode_option.into(), own.into()]);
     }
     recipe.arguments = arguments;
     true
