@@ -913,12 +913,9 @@ impl Cagents {
         }
         self.frame_clock.reset();
         self.sync_pane_inspectors();
-        let binding = self.rebind_source_control();
-        // The rail is docked beneath the sliding panel, so it can take the
-        // keyboard at once.
-        let focus = iced::widget::operation::focus(self.pane_inspector_rail_id(card))
-            .map(cosmic::Action::App);
-        Task::batch([viewport, binding, focus])
+        // The rail beneath takes the keyboard once the panel has slid away,
+        // as the toggle does after a close.
+        Task::batch([viewport, self.rebind_source_control()])
     }
 
     pub(super) fn advance_pane_inspector_transitions(&mut self, now: Instant) -> Task<Message> {
@@ -926,6 +923,7 @@ impl Cagents {
         // replaces the outgoing panel's toggle once the slide ends. Focus
         // that control, unless the user has moved to another pane or opened
         // a modal in the meantime.
+        // One that collapses to its rail is no longer shown either.
         let closing_overlay = self.workspace.focused().filter(|card| {
             !self.modal_is_open()
                 && !self.pane_inspectors.is_open(*card)
@@ -2037,6 +2035,154 @@ mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut find);
         find.1
+    }
+
+    /// Runs `task`'s focus changes against the pane's mounted view, then
+    /// delivers `events` to it, as the native runtime does. Returns what the
+    /// view published and the control left with focus.
+    fn pane_keyboard(
+        app: &Cagents,
+        card: CardId,
+        size: iced::Size,
+        task: Task<Message>,
+        events: &[iced::Event],
+    ) -> (Vec<Message>, Option<widget::Id>) {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::futures::StreamExt;
+        use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+
+        struct Focused(Option<widget::Id>);
+        impl Operation for Focused {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            app.card_view(card, true, false),
+            size,
+            Cache::new(),
+            &mut renderer,
+        );
+        iced::futures::executor::block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    loop {
+                        ui.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        });
+        let mut messages = Vec::new();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        drop(ui.update(
+            events,
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut messages,
+        ));
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        (messages, focused.0)
+    }
+
+    #[test]
+    fn escape_returns_focus_to_the_rail_which_enter_and_space_press() {
+        use cosmic::iced::keyboard::{self, Key, Modifiers, key::Named};
+        let narrow = iced::Size::new(600.0, 800.0);
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let resize = |app: &mut Cagents, width: f32| {
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(width),
+            }));
+        };
+        // Open where it docks, then collapsed to its rail by a narrower pane.
+        resize(&mut app, 1200.0);
+        app.open_pane_inspector_now(card);
+        resize(&mut app, narrow.width);
+        assert!(app.pane_inspectors.is_railed(card));
+        drop(app.update(Message::ExpandPaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_expanded(card));
+
+        // Escape slides the panel away, and the rail it leaves takes the
+        // keyboard, as the toggle does once a panel closes.
+        drop(app.close_pane_inspector_overlay(card));
+        let settled =
+            app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.pane_inspector_layout(card), None);
+        let (_, focused) = pane_keyboard(&app, card, narrow, settled, &[]);
+        assert_eq!(focused, Some(app.pane_inspector_rail_id(card)));
+
+        let press = |key: Key, modifiers: Modifiers, repeat: bool| {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat,
+            })
+        };
+        let space = || Key::Character(" ".into());
+        let focus_rail = || widget::button::focus(app.pane_inspector_rail_id(card));
+        for (event, expands) in [
+            (
+                press(Key::Named(Named::Enter), Modifiers::empty(), false),
+                true,
+            ),
+            (press(space(), Modifiers::empty(), false), true),
+            (press(space(), Modifiers::SHIFT, false), false),
+            (press(space(), Modifiers::CTRL, false), false),
+            (press(space(), Modifiers::empty(), true), false),
+        ] {
+            let (messages, _) = pane_keyboard(&app, card, narrow, focus_rail(), &[event.clone()]);
+            let pressed = messages
+                .iter()
+                .filter(
+                    |message| matches!(message, Message::ExpandPaneInspector(id) if *id == card),
+                )
+                .count();
+            assert_eq!(pressed, usize::from(expands), "{event:?}");
+        }
+        // Unfocused, the rail leaves Space to whatever has the keyboard.
+        let (messages, _) = pane_keyboard(
+            &app,
+            card,
+            narrow,
+            Task::none(),
+            &[press(space(), Modifiers::empty(), false)],
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ExpandPaneInspector(_)))
+        );
     }
 
     #[test]

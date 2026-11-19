@@ -1824,17 +1824,19 @@ impl Runtime {
         {
             return (glyph, label.to_owned());
         }
-        let activity = snapshot.subagent_activity();
-        let (working, waiting, on_background_work, failed) = if include_subagents {
-            (
-                activity.working,
-                activity.waiting,
-                activity.on_background_work,
-                activity.failed.len(),
-            )
+        // Left out, the subagents are not walked at all: the inspector and
+        // its rail ask for the conversation's own status on every frame.
+        let activity = if include_subagents {
+            snapshot.subagent_activity()
         } else {
-            (0, 0, 0, 0)
+            chat::SubagentActivity::default()
         };
+        let (working, waiting, on_background_work, failed) = (
+            activity.working,
+            activity.waiting,
+            activity.on_background_work,
+            activity.failed.len(),
+        );
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });

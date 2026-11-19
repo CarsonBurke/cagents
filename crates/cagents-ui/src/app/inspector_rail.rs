@@ -93,6 +93,7 @@ impl Cagents {
             .spacing(space::XS)
             .width(Length::Fill)
             .height(Length::Fill);
+        let expand = (!self.modal_is_open()).then_some(Message::ExpandPaneInspector(card));
         let button = widget::button::custom(content)
             .name(label.replace('\n', ". "))
             .id(self.pane_inspector_rail_id(card))
@@ -100,7 +101,13 @@ impl Cagents {
             .padding([space::XXS, 0.0])
             .width(Length::Fill)
             .height(Length::Fill)
-            .on_press_maybe((!self.modal_is_open()).then_some(Message::ExpandPaneInspector(card)));
+            .on_press_maybe(expand.clone());
+        // Space presses it as Enter does.
+        let button = crate::interaction::focused_key(button, move |event| {
+            expand
+                .clone()
+                .filter(|_| crate::interaction::is_space_press(event))
+        });
         let button = crate::interaction::tooltip(crate::interaction::hover(button), label);
         widget::container(
             widget::row::with_children(vec![
