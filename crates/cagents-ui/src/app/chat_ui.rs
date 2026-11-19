@@ -3928,8 +3928,8 @@ impl Runtime {
     /// Holds `text` for the turn after the running one, as a message written
     /// in the composer and queued would be.
     fn hold_followup(&mut self, text: String) {
-        let id = self.next_followup;
-        self.next_followup += 1;
+        let id = self.next_written;
+        self.next_written += 1;
         self.followups.push(Followup {
             id,
             preview: prompt::queue_preview(&text),

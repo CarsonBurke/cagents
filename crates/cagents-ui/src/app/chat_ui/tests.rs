@@ -22473,8 +22473,8 @@ fn late_connection_callbacks_cannot_change_a_reconnected_card() {
 pub(in crate::app) fn outgoing(app: &Cagents, card: CardId) -> Option<String> {
     let runtime = chat_runtime(app, card);
     runtime
-        .pending
-        .as_ref()
-        .and_then(|pending| pending.sent.clone())
+        .commands
+        .iter()
+        .find_map(|pending| pending.sent.clone())
         .or_else(|| (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0))
 }
