@@ -4208,7 +4208,12 @@ fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
             // turnCompanion and sourceToolUseID, so do not depend on them.
             let context = adapter.receive(frame).unwrap();
             let compaction = marker == "isCompactSummary";
-            if compaction {
+            if marker == "isMeta" {
+                // Saved instructions naming no call are what a typed command
+                // expanded into, which Claude Code never streams.
+                assert!(context.events.is_empty(), "{context:?}");
+                assert!(adapter.carrier_items["internal"].is_empty());
+            } else if compaction {
                 // Only the transcript's own summary flag names a compaction.
                 let expected = compaction_item("internal:0".into(), body.into());
                 assert_eq!(deliveries(&context), vec![(Role::System, expected.content)]);
@@ -4484,6 +4489,97 @@ fn a_loaded_skill_is_its_calls_step_live_and_in_history() {
         if name == "Skill"
             && serde_json::from_str::<Value>(input).unwrap()["skill"] == "release-notes"
             && output == SKILL_BODY)
+    );
+}
+
+/// A reopened chat pages back 100 records at a time, so a skill's call and
+/// result can be on an earlier page than its instructions. Wherever the
+/// boundary falls, the step reads the instructions, on every page shown.
+#[test]
+fn a_loaded_skill_keeps_its_instructions_across_history_pages() {
+    for after in 97..=99 {
+        let mut frames = vec![
+            json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Write release notes."}}),
+            json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+            json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_skill","content":"Launching skill: release-notes"}]},"toolUseResult":{"success":true,"commandName":"release-notes"}}),
+            json!({"type":"user","uuid":"instructions","isMeta":true,"turnCompanion":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        ];
+        for index in 0..after {
+            frames.push(json!({"type":"assistant","uuid":format!("answer-{index}"),"message":{"id":format!("msg-{index}"),"role":"assistant","content":[{"type":"text","text":format!("Note {index}.")}]}}));
+        }
+        let mut adapter = Claude {
+            history: Some(correlation_history(frames)),
+            ..Claude::default()
+        };
+        let mut steps = Vec::new();
+        while adapter.history.as_ref().unwrap().offset > 0 {
+            let Event::History { items, .. } = adapter
+                .command(Command::LoadEarlier)
+                .unwrap()
+                .events
+                .into_iter()
+                .next()
+                .unwrap()
+            else {
+                panic!("history")
+            };
+            steps.push(items);
+        }
+        assert_eq!(steps.len(), 2, "{after}");
+        for (page, items) in steps.iter().enumerate() {
+            for item in items.iter().filter(|item| item.id == "toolu_skill") {
+                assert!(
+                    matches!(&item.content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }
+                    if name == "Skill" && output == SKILL_BODY),
+                    "{after} records after, page {page}: {item:?}"
+                );
+            }
+        }
+        assert!(
+            steps.iter().flatten().any(|item| item.id == "toolu_skill"),
+            "{after}"
+        );
+        assert!(
+            !steps.iter().flatten().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text.contains("Release notes"))),
+            "{after}"
+        );
+    }
+}
+
+/// A skill an agent's own helper loads is that helper's step: its
+/// instructions update the helper's call, not a row of the main chat.
+#[test]
+fn a_helpers_skill_instructions_stay_with_the_helper() {
+    let mut adapter = Claude::default();
+    adapter
+        .receive(json!({"type":"assistant","uuid":"agent-call","message":{"id":"msg-agent","role":"assistant","content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Notes","prompt":"Write release notes.","subagent_type":"general-purpose"}}]}}))
+        .unwrap();
+    let mut steps = Vec::new();
+    for frame in [
+        json!({"type":"assistant","uuid":"child-call","parent_tool_use_id":"toolu_agent","message":{"id":"msg-child-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_child_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+        json!({"type":"user","uuid":"child-result","parent_tool_use_id":"toolu_agent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_child_skill","content":"Launching skill: release-notes"}]},"tool_use_result":{"success":true,"commandName":"release-notes"}}),
+        json!({"type":"user","uuid":"child-instructions","parent_tool_use_id":"toolu_agent","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+    ] {
+        steps.push(adapter.receive(frame).unwrap());
+    }
+    let events = steps.iter().flat_map(|step| &step.events);
+    assert!(
+        !events
+            .clone()
+            .any(|event| matches!(event, Event::Item(item) if item.id == "toolu_child_skill")),
+        "{steps:?}"
+    );
+    let last = events
+        .filter_map(|event| match event {
+            Event::SubagentItem { id, item } if item.id == "toolu_child_skill" => Some((id, item)),
+            _ => None,
+        })
+        .last()
+        .unwrap();
+    assert_eq!(last.0, "toolu_agent");
+    assert!(
+        matches!(&last.1.content, ItemContent::Tool { name, output, .. } if name == "Skill" && output == SKILL_BODY),
+        "{last:?}"
     );
 }
 

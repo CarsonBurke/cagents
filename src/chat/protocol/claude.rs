@@ -1111,7 +1111,25 @@ impl Claude {
             }
         };
         self.skill_loads.retain(|(known, _)| known != &call);
-        let Some(mut item) = self.tools.get(&call).cloned() else {
+        // A reopened chat's page carries the call when the call and its
+        // result are on an earlier page; the call launched, as its
+        // instructions loaded.
+        let saved = &frame[SKILL_CALL];
+        let Some(mut item) = self.tools.get(&call).cloned().or_else(|| {
+            (string(saved, "name") == "Skill").then(|| {
+                let mut content = tool_content("Skill", &saved["input"], &self.cwd);
+                if let ItemContent::Tool { status, .. } = &mut content {
+                    *status = ToolStatus::Succeeded;
+                }
+                Item {
+                    id: call.id.clone(),
+                    role: Role::Assistant,
+                    content,
+                    started_at: None,
+                    at: None,
+                }
+            })
+        }) else {
             return;
         };
         let ItemContent::Tool { name, output, .. } = &mut item.content else {
@@ -1882,6 +1900,9 @@ impl Claude {
             match injected(&frame["message"]["content"]) {
                 Injected::Skill { directory, body } => {
                     self.skill_loaded(frame, child, directory, body, step);
+                    if let Some(parent) = child {
+                        route_subagent_events(&mut step.events, event_start, parent);
+                    }
                     self.track_carrier(carrier, Vec::new(), child);
                     return Ok(());
                 }
@@ -5025,6 +5046,12 @@ enum Injected<'a> {
 }
 
 const SKILL_DIRECTORY: &str = "Base directory for this skill: ";
+/// Where a reopened chat's page puts the call a saved skill's instructions
+/// name, which may be on an earlier page.
+const SKILL_CALL: &str = "_cagents_skill_call";
+/// The block a saved skill's instructions stand for in the history index:
+/// none of the record's own, as they name their call in `sourceToolUseID`.
+const SKILL_INSTRUCTIONS: usize = usize::MAX;
 
 fn injected(content: &Value) -> Injected<'_> {
     // A skill's body is a single text, which the transcript stores as a
@@ -8119,6 +8146,23 @@ impl History {
                     }
                 }
             }
+            // A skill's instructions need their call, as a result does.
+            if visible
+                && main
+                && model_only(&value)
+                && let Some(call) = value["sourceToolUseID"].as_str()
+                && matches!(
+                    injected(&value["message"]["content"]),
+                    Injected::Skill { .. }
+                )
+            {
+                tool_ref_bytes = tool_ref_bytes.saturating_add(call.len() + 64);
+                tool_ref_count += 1;
+                if tool_ref_bytes > tool_bytes_limit || tool_ref_count > tool_count_limit {
+                    return Err("Claude transcript exceeds the tool correlation index limit".into());
+                }
+                tool_refs.push((call.to_owned(), SKILL_INSTRUCTIONS, true));
+            }
 
             let (mut agents, result) = if message && main {
                 history_branches::details(&value)
@@ -8810,6 +8854,20 @@ impl History {
             if let Some(calls) = self.result_calls.get(&offset) {
                 let record = &mut result[positions[&offset]];
                 for &(result_index, (call, _, _, call_index)) in calls {
+                    if result_index == SKILL_INSTRUCTIONS {
+                        let mut context = (*call_blocks[&(call, call_index)]).clone();
+                        if record.frame["sourceToolUseID"] != context["id"] {
+                            return Err(super::SetupError::Unavailable(
+                                "Claude indexed skill instructions changed while reading".into(),
+                            ));
+                        }
+                        if let Some(identity) = self.tool_identities.get(&(call, call_index)) {
+                            context["id"] = json!(identity);
+                            record.frame["sourceToolUseID"] = json!(identity);
+                        }
+                        record.frame[SKILL_CALL] = context;
+                        continue;
+                    }
                     let block = record.frame["message"]["content"]
                         .as_array()
                         .and_then(|blocks| blocks.get(result_index))
