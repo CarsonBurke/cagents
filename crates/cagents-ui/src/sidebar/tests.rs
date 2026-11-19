@@ -13258,7 +13258,10 @@ fn the_discard_confirmations_own_answers_survive_the_modal_it_is_itself() {
             confirmed: false,
         },
     };
-    let fired = frame_enter_presses(&renderer, discard_confirmation_dialog(&pending));
+    let fired = frame_enter_presses(
+        &renderer,
+        discard_confirmation_dialog(&pending, Id::new("dialog.question.DiscardChanges")),
+    );
     assert!(
         fired.contains(&SidebarAction::CancelDiscard),
         "refusing the dialog's own Cancel while the dialog is up would strand it with no way \
