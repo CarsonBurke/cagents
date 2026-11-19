@@ -15270,6 +15270,10 @@ impl Cagents {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
+                    let adopted = self.adopt_stored_draft_session(target.card);
+                    let Some(runtime) = self.chat_runtime_mut(target) else {
+                        return adopted;
+                    };
                     let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
                         Task::none()
                     } else {
@@ -15300,7 +15304,7 @@ impl Cagents {
                             }
                         }
                     };
-                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
+                    return Task::batch([adopted, staged]);
                 }
             }
             Action::Dropped(target, payload) => {

@@ -7841,6 +7841,60 @@ fn attach_files_refuses_a_non_image_for_an_images_only_provider() {
 }
 
 #[test]
+fn a_chooser_refusal_survives_a_deferred_account_change() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.accepts_draft_attachments());
+    let original = runtime.session.clone();
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+
+    let mut chosen = original.clone();
+    chosen.launch.recipe.environment.insert(
+        "CODEX_HOME".into(),
+        directory.path().join("other-account").display().to_string(),
+    );
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(chosen.clone());
+    drop(app.adopt_stored_draft_session(card));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime.session, original,
+        "the open chooser defers adoption"
+    );
+    assert!(ticket.active());
+    assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session, chosen);
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+        )
+    );
+    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.pastes_pending, 0);
+    assert!(!ticket.active());
+    assert!(!runtime.attachment_bookmarks.contains_key(&ticket.id));
+    assert!(runtime.attachment_jobs.is_empty());
+    assert!(runtime.attachment_order.is_empty());
+    assert!(runtime.attachment_chooser_pending.is_none());
+}
+
+#[test]
 fn attach_files_still_stages_images_for_an_images_only_provider() {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::with_test_image(|image| {
