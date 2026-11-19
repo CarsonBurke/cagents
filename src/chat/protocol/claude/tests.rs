@@ -11252,9 +11252,8 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
                 _ => None,
             })
             .collect();
-        let run = indices
-            .first()
-            .map_or(0..0, |first| *first..first + indices.len());
+        assert!(!indices.is_empty(), "a window shows prompts");
+        let run = indices[0]..indices[0] + indices.len();
         assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
         run
     };
