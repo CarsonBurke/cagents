@@ -24,6 +24,7 @@ thread_local! {
     static CHROME_SYNCS: Cell<usize> = const { Cell::new(0) };
     static CARD_INDEXES: Cell<usize> = const { Cell::new(0) };
     static PERSISTS: Cell<usize> = const { Cell::new(0) };
+    static SIDEBAR_REFRESHES: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
     if super::projection_oracle::verifying() {
@@ -67,6 +68,16 @@ pub(super) fn record_persist() {
     }
     PERSISTS.set(PERSISTS.get() + 1);
 }
+pub(super) fn record_sidebar_refresh() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    SIDEBAR_REFRESHES.set(SIDEBAR_REFRESHES.get() + 1);
+}
+/// How many times this thread has rebuilt the sidebar's channel rows.
+pub(super) fn sidebar_refreshes() -> usize {
+    SIDEBAR_REFRESHES.get()
+}
 /// How many times this thread has handed the workspace to the writer.
 pub(super) fn persists() -> usize {
     PERSISTS.get()
@@ -85,6 +96,7 @@ fn reset() {
     CHROME_SYNCS.set(0);
     CARD_INDEXES.set(0);
     PERSISTS.set(0);
+    SIDEBAR_REFRESHES.set(0);
 }
 
 #[derive(Debug)]
