@@ -1664,6 +1664,9 @@ impl Codex {
                     items.push(item);
                 }
             }
+            if turn["status"] == "interrupted" {
+                items.push(stopped_marker(turn_id));
+            }
         }
         if !earlier {
             self.child_history_outcome(turns.first(), step);
@@ -3080,8 +3083,10 @@ impl Codex {
                             }
                         } else {
                             for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
+                                // A turn still under way leaves its work running.
+                                let done = turn["status"] != "inProgress";
                                 for value in turn["items"].as_array().into_iter().flatten() {
-                                    for item in parse_item(value, true, string(turn, "id")?)? {
+                                    for item in parse_item(value, done, string(turn, "id")?)? {
                                         content.events.push(Event::Item(item));
                                     }
                                 }
@@ -3464,6 +3469,11 @@ impl Codex {
                         step.events.push(Event::Item(item));
                     }
                 }
+                // Where the person stopped the turn, after the work it shows,
+                // as its history shows it.
+                if method == "turn/completed" && current && turn["status"] == "interrupted" {
+                    step.events.push(Event::Item(stopped_marker(turn_id)));
+                }
                 // Its diff can no longer change, and its row says all of it.
                 if method == "turn/completed" {
                     self.turn_diffs.remove(turn_id);
@@ -3472,7 +3482,14 @@ impl Codex {
                 // Only serverRequest/resolved or thread closure invalidates them.
                 if current {
                     if !self.busy {
-                        self.active_items.clear();
+                        // A call the turn ended without finishing, as a stop
+                        // leaves one, ran no further than the turn did.
+                        for mut item in std::mem::take(&mut self.active_items).into_values() {
+                            if let Some(status @ ToolStatus::Running) = item.content.status_mut() {
+                                *status = ToolStatus::Stopped;
+                                step.events.push(Event::Item(item));
+                            }
+                        }
                         self.output_streams.clear();
                         self.output_windows.clear();
                     }
@@ -3961,6 +3978,12 @@ fn status_detail(status: &Value) -> String {
     }
 }
 
+/// Where the person stopped turn `turn`: one marker, whether the turn is
+/// seen ending or read back from history.
+fn stopped_marker(turn: &str) -> Item {
+    crate::chat::stopped_notice(format!("codex-stopped:{turn}"))
+}
+
 /// A turn status as a line a reader can act on.
 ///
 /// The successful states are silent: an in-progress turn is already drawn as
@@ -3968,7 +3991,7 @@ fn status_detail(status: &Value) -> String {
 /// only spends a row of the status line on a word the reader can see.
 fn turn_detail(status: &Value) -> String {
     match status.as_str() {
-        Some("interrupted") => "Turn interrupted".into(),
+        Some("interrupted") => chat::TURN_INTERRUPTED.into(),
         Some("failed") => "Turn failed".into(),
         _ => String::new(),
     }
@@ -4333,6 +4356,9 @@ fn parse_item_with_windows(
         Some("declined") => ToolStatus::Denied,
         // A collaboration call cut short with its turn.
         Some("interrupted") => ToolStatus::Stopped,
+        // Still in progress when its item or turn ended: the turn ended it
+        // unfinished, as a stop does, and nothing will finish it later.
+        Some("inProgress") if done => ToolStatus::Stopped,
         Some("inProgress") => ToolStatus::Running,
         Some("completed") => ToolStatus::Succeeded,
         _ if done => ToolStatus::Succeeded,
