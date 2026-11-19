@@ -563,6 +563,8 @@ pub struct Editor {
     /// order; the loser is dropped instead of resurrecting stale values.
     preference_lane: Arc<std::sync::Mutex<PreferenceLanes>>,
     preference_generation: u64,
+    /// The capture generation of the newest Reset all, or 0 when none.
+    settings_reset: u64,
 }
 
 /// One write-ordering lane per preference file ceditor owns.
@@ -581,6 +583,9 @@ impl PreferenceFile {
 struct PreferenceLanes {
     applied: [u64; PreferenceFile::COUNT],
     settings_base: AppSettings,
+    /// The generation of the newest Reset all a successful settings write has
+    /// carried to disk, or 0.
+    reset_written: u64,
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -592,7 +597,11 @@ struct PreferenceLanes {
 enum PreferenceWrite {
     Settings {
         settings: AppSettings,
-        reset: bool,
+        /// The generation of the newest Reset all captured so far, or 0.
+        /// Until a write carrying that reset succeeds, settings writes
+        /// replace the file whole: a newer capture supersedes the reset and carries its
+        /// defaults, so merging it against the old base would undo the reset.
+        reset: u64,
     },
     Assistance {
         settings: AppSettings,
@@ -636,12 +645,14 @@ impl PreferenceSave {
         // land in capture order rather than blocking-pool completion order.
         match self.write {
             PreferenceWrite::Settings { settings, reset } => {
-                if reset {
+                let replace = lanes.reset_written < reset;
+                if replace {
                     settings::save(&self.path, &settings)
                 } else {
                     settings::save_merged(&self.path, &lanes.settings_base, &settings)
                 }
                 .map_err(|error| error.to_string())?;
+                lanes.reset_written = reset;
                 lanes.settings_base = settings;
                 Ok(())
             }
@@ -2206,10 +2217,23 @@ impl Editor {
             );
             return Task::none();
         }
-        let settings = self.settings.clone();
         // Preference changes are low frequency. One ordered atomic write avoids
         // competing snapshots overwriting newer values.
-        preference_task(self.capture_preference(PreferenceWrite::Settings { settings, reset }))
+        preference_task(self.capture_settings(reset))
+    }
+
+    /// Captures the settings to write; `reset` marks a Reset all, which
+    /// replaces the file whole.
+    fn capture_settings(&mut self, reset: bool) -> PreferenceSave {
+        let settings = self.settings.clone();
+        let mut save = self.capture_preference(PreferenceWrite::Settings { settings, reset: 0 });
+        if reset {
+            self.settings_reset = save.generation;
+        }
+        if let PreferenceWrite::Settings { reset, .. } = &mut save.write {
+            *reset = self.settings_reset;
+        }
+        save
     }
 
     fn set_language_server_assistance(&mut self, enabled: bool) -> Task<Message> {
@@ -3124,8 +3148,10 @@ impl Application for Editor {
             preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
                 applied: [0; PreferenceFile::COUNT],
                 settings_base: settings,
+                reset_written: 0,
             })),
             preference_generation: 0,
+            settings_reset: 0,
         };
         match cagents::notifications::ui::Observer::bind_editor(flags.notification_window.clone()) {
             Ok(mut observer) => {
@@ -6797,8 +6823,10 @@ mod tests {
             preference_lane: Arc::new(std::sync::Mutex::new(PreferenceLanes {
                 applied: [0; PreferenceFile::COUNT],
                 settings_base: AppSettings::default(),
+                reset_written: 0,
             })),
             preference_generation: 0,
+            settings_reset: 0,
         }
     }
 
@@ -7988,7 +8016,7 @@ mod tests {
         let settings = app.settings.clone();
         app.capture_preference(PreferenceWrite::Settings {
             settings,
-            reset: false,
+            reset: 0,
         })
         .run()
         .unwrap();
@@ -8079,7 +8107,7 @@ mod tests {
         assert!(
             app.capture_preference(PreferenceWrite::Settings {
                 settings,
-                reset: false,
+                reset: 0,
             })
             .run()
             .is_err()
@@ -8113,6 +8141,71 @@ mod tests {
         assert_eq!(
             toml::Value::try_from(persisted).unwrap(),
             toml::Value::try_from(defaults).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_save_that_overtakes_a_reset_still_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        first.settings = AppSettings::default();
+        let reset = first.capture_settings(true);
+        first.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        let newer = first.capture_settings(false);
+        // The blocking pool finishes the newer capture first; the reset it
+        // supersedes is then dropped, so the newer write must carry it.
+        newer.run().unwrap();
+        reset.run().unwrap();
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
+        );
+
+        // Once the reset is written, later saves merge again.
+        second.settings.editor_auto_save = !defaults.editor_auto_save;
+        flush_settings(&mut second);
+        first.settings.editor_font_size = Some(17.0);
+        first.capture_settings(false).run().unwrap();
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_auto_save, !defaults.editor_auto_save);
+        assert_eq!(persisted.editor_font_size, Some(17.0));
+    }
+
+    #[test]
+    fn a_save_after_a_failed_reset_still_resets() {
+        let directory = tempfile::tempdir().unwrap();
+        let defaults = AppSettings::default();
+        settings::save(directory.path().join("settings.toml"), &defaults).unwrap();
+        let mut first = loaded(&directory);
+        let mut second = loaded(&directory);
+        second.settings.editor_wrap_lines = !defaults.editor_wrap_lines;
+        flush_settings(&mut second);
+
+        let path = first.settings_path.clone();
+        first.settings_path = directory.path().join("blocked");
+        std::fs::create_dir(&first.settings_path).unwrap();
+        first.settings = AppSettings::default();
+        assert!(first.capture_settings(true).run().is_err());
+        first.settings_path = path;
+        // The reset never reached the disk, so the next save must still
+        // replace the file rather than merge over another editor's change.
+        first.settings.editor_syntax_theme = settings::EditorSyntaxTheme::Mocha;
+        first.capture_settings(false).run().unwrap();
+
+        let persisted = settings::load(&first.settings_path).unwrap();
+        assert_eq!(persisted.editor_wrap_lines, defaults.editor_wrap_lines);
+        assert_eq!(
+            persisted.editor_syntax_theme,
+            settings::EditorSyntaxTheme::Mocha
         );
     }
 
