@@ -390,3 +390,27 @@ fn undo_keeps_the_line_endings_each_step_recorded() {
     let runtime = app.chat_runtime_mut(target).unwrap();
     assert_eq!(runtime.composer.text(), pasted);
 }
+
+#[test]
+fn only_the_image_opened_last_shows_when_loads_finish_out_of_order() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|first| {
+        let second = chat::attachment_assets::test_image("second.png");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "Compare ", &[first.clone(), second.clone()]);
+        drop(app.handle_chat_ui(Action::OpenAttachment(target, 0)));
+        drop(app.handle_chat_ui(Action::OpenAttachment(target, 1)));
+        let failed = || images::Loaded::Failed("could not read it".into());
+        drop(app.handle_chat_ui(Action::AttachmentOpened(target, first.clone(), failed())));
+        assert_eq!(
+            app.chat_runtime_mut(target).unwrap().error,
+            None,
+            "the earlier load is ignored"
+        );
+        drop(app.handle_chat_ui(Action::AttachmentOpened(target, second.clone(), failed())));
+        assert_eq!(
+            app.chat_runtime_mut(target).unwrap().error.as_deref(),
+            Some("could not read it")
+        );
+    });
+}
