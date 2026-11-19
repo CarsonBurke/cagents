@@ -330,18 +330,19 @@ class TestLib(unittest.TestCase):
 
     def test_isolated_lane_arguments_cwd_profile_and_admission_release(self):
         for lane, profile in (("cli", None), ("host", "dev-runtime"), ("shared-ui", "test"),
-                              ("ui", None)):
+                              ("ui", None), ("browser", None)):
             with self.subTest(lane=lane):
                 self.clear()
                 extra = [] if profile is None else ["--profile", profile]
                 result = self.invoke(lane, "module::one", "--test-threads", "2", *extra)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 events = self.events()
-                package = "cagents-ui" if lane == "ui" else "cagents"
+                package = "cagents-ui" if lane in ("ui", "browser") else "cagents"
                 options = ["--locked", "--no-default-features", "--manifest-path",
                            str(self.root / "Cargo.toml"), "--package", package, "--lib"]
                 options += {"host": ["--features", "host"],
-                            "shared-ui": ["--features", "ui"]}.get(lane, [])
+                            "shared-ui": ["--features", "ui"],
+                            "browser": ["--features", "browser-protocol-fixture"]}.get(lane, [])
                 options += ["--config", "target.'cfg(all())'.runner="
                             + json.dumps(self.runner(lane)), *extra]
                 compiler = self.events("compiler")[0]
@@ -355,7 +356,8 @@ class TestLib(unittest.TestCase):
                 metadata = self.events("metadata")[0]
                 self.assertEqual(metadata["arguments"], ["metadata", "--format-version", "1", "--no-deps"])
                 self.assertEqual(events[:2], [metadata, compiler])
-                manifest = self.root / "crates/cagents-ui" if lane == "ui" else self.root
+                manifest = (self.root / "crates/cagents-ui" if lane in ("ui", "browser")
+                            else self.root)
                 for event in events:
                     # Cargo runs from the checkout; the tests from their package.
                     self.assertEqual(event["cwd"], str(manifest if event["program"] == "libtest"
@@ -584,6 +586,8 @@ class TestLib(unittest.TestCase):
                  "shared-ui": ["--locked", "--no-default-features", "--package", "cagents",
                                "--package", "cagents-ui", "--features", "cagents/ui"]}
         lanes["ui"] = lanes["shared-ui"]
+        lanes["browser"] = ["--locked", "--no-default-features", "--package", "cagents-ui",
+                            "--features", "browser-protocol-fixture"]
         for lane, selection in lanes.items():
             with self.subTest(lane=lane):
                 (self.root / "checked.jsonl").unlink(missing_ok=True)
