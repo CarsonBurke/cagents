@@ -546,8 +546,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Validate the pending sign-in under the registry lock before leaving a
-/// permanent release marker: another window may have registered it meanwhile.
+/// Validate and save the release under the registry lock before leaving a
+/// permanent marker: a failed save must not mark a later registered account.
 #[cfg(feature = "host")]
 fn release_pending(
     reservation: &crate::host::AccountReservation,
@@ -563,12 +563,17 @@ fn release_pending(
             hook();
         }
     });
-    store.try_update_reserved(reservation, |registry| {
-        registry.release(key, homes);
-        if let Err(error) = homes.mark_released(provider, key) {
-            tracing::warn!(%error, ?provider, %key, "Could not mark a released sign-in's home");
-        }
-    })
+    store.try_update_reserved_then(
+        reservation,
+        |registry| registry.release(key, homes),
+        |registry| {
+            if registry.is_released(key)
+                && let Err(error) = homes.mark_released(provider, key)
+            {
+                tracing::warn!(%error, ?provider, %key, "Could not mark a released sign-in's home");
+            }
+        },
+    )
 }
 
 /// Why a home was not restored.
@@ -1222,6 +1227,68 @@ mod tests {
                 .any(|(found_provider, found, _)| (*found_provider, *found) == (provider, key))
         );
         assert!(home.is_dir());
+    }
+
+    #[test]
+    fn a_failed_release_save_does_not_mark_a_later_registered_home_as_released() {
+        let list = HeldList::new();
+        let (key, home) = list.pending.clone();
+        let provider = Provider::Codex;
+        let account = Account::managed(provider, key, home.clone());
+        let reservation = list.reserve(&[account], std::time::Duration::from_secs(2));
+        let before = list.store.load().unwrap();
+        let path = list._root.path().join("registry/accounts.toml");
+        let bytes = std::fs::read(&path).unwrap();
+        list.store.fail_next_write_for_test();
+
+        assert_eq!(
+            list.execute(Operation::Abandon { provider, key }, &reservation)
+                .unwrap_err(),
+            LifecycleError::Failed("test account registry write failure".into())
+        );
+        assert_eq!(list.store.load().unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!list.homes.is_released(provider, key));
+        drop(reservation);
+
+        let registered = Registered {
+            key,
+            provider,
+            linked_home: None,
+            label: None,
+            email: Some("registered@example.com".into()),
+            organization: None,
+            added_at: 1,
+        };
+        let (registry, result) = list
+            .store
+            .register_pending(&list.homes, registered.clone(), &[])
+            .unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(registry.find(key), Some(&registered));
+        assert!(registry.pending().is_empty() && !registry.is_released(key));
+
+        std::fs::remove_file(path).unwrap();
+        let lost = list.store.load().unwrap();
+        assert!(lost.find(key).is_none() && !lost.is_released(key));
+        assert!(
+            list.homes
+                .unregistered(&lost)
+                .iter()
+                .any(|(found_provider, found, _)| (*found_provider, *found) == (provider, key))
+        );
+        assert!(home.is_dir() && !list.homes.is_released(provider, key));
+
+        let account = Account::managed(provider, key, home);
+        let reservation = list.reserve(&[account], std::time::Duration::from_secs(2));
+        let (registry, restored) = reservation
+            .commit(|| {
+                list.store
+                    .try_restore_reserved(&reservation, &list.homes, registered.clone(), &[])
+            })
+            .unwrap();
+        assert_eq!(restored, crate::account::registry::Restored::Listed);
+        assert_eq!(registry.find(key), Some(&registered));
     }
 
     #[test]

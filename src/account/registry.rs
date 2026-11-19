@@ -37,6 +37,12 @@ const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
+#[cfg(all(test, feature = "host"))]
+thread_local! {
+    static FAIL_NEXT_WRITE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// How long the daemon keeps asking for a held account-list lock before it
 /// refuses with [`ListHeld`]. The locks are held for the moment it takes to
 /// write the list or start a process, and the person who asked is waiting
@@ -1382,6 +1388,11 @@ impl Store {
         self.directory.join(FILE_NAME)
     }
 
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fail_next_write_for_test(&self) {
+        FAIL_NEXT_WRITE.with(|path| *path.borrow_mut() = Some(self.path()));
+    }
+
     pub(crate) fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX)
@@ -1418,7 +1429,19 @@ impl Store {
         reservation: &crate::host::AccountReservation,
         change: impl FnOnce(&mut Registry) -> T,
     ) -> io::Result<(Registry, T)> {
-        self.update_checked_with_mode(
+        self.try_update_reserved_then(reservation, change, |_| {})
+    }
+
+    /// Runs `after_write` with the saved registry while its lock is still
+    /// held, after a successful write or when `change` left it unchanged.
+    #[cfg(feature = "host")]
+    pub(crate) fn try_update_reserved_then<T>(
+        &self,
+        reservation: &crate::host::AccountReservation,
+        change: impl FnOnce(&mut Registry) -> T,
+        after_write: impl FnOnce(&Registry),
+    ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode_then(
             |registry| {
                 reservation
                     .verify_registry(registry)
@@ -1426,6 +1449,7 @@ impl Store {
                 Ok(change(registry))
             },
             true,
+            after_write,
         )
     }
 
@@ -1456,6 +1480,15 @@ impl Store {
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
         nonblocking: bool,
     ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode_then(change, nonblocking, |_| {})
+    }
+
+    fn update_checked_with_mode_then<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> io::Result<T>,
+        nonblocking: bool,
+        after_write: impl FnOnce(&Registry),
+    ) -> io::Result<(Registry, T)> {
         let _lock = if nonblocking {
             self.try_lock()?
         } else {
@@ -1479,6 +1512,7 @@ impl Store {
                 .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
             registry.written = write(&self.directory, &path, &registry)?;
         }
+        after_write(&registry);
         Ok((registry, result))
     }
 
@@ -1513,6 +1547,21 @@ fn read(path: &Path) -> io::Result<Registry> {
 
 /// Replaces the file at `path` with `registry`, and says when it was written.
 fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<Written> {
+    #[cfg(all(test, feature = "host"))]
+    if FAIL_NEXT_WRITE.with(|next| {
+        let mut next = next.borrow_mut();
+        if next.as_deref() == Some(path) {
+            next.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test account registry write failure",
+        ));
+    }
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
     if !document.ends_with('\n') {
         document.push('\n');
