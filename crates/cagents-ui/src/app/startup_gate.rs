@@ -1311,6 +1311,22 @@ fn reason_sentence(reason: &str) -> String {
     })
 }
 
+/// Splits at the first details label outside quoted pane names.
+fn split_details(text: &str) -> (&str, Option<&str>) {
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        if depth == 0 && text[index..].starts_with(DETAILS_LABEL) {
+            return (&text[..index], Some(&text[index + DETAILS_LABEL.len()..]));
+        }
+        match ch {
+            '\u{201c}' => depth += 1,
+            '\u{201d}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (text, None)
+}
+
 /// What this window shows for `reason`. The handshake prefix tells the
 /// launcher how to treat the report and means nothing to the person reading;
 /// the component's own wording goes beneath the message, as details.
@@ -1318,10 +1334,8 @@ fn incomplete_notice(reason: &str) -> TransientNotice {
     let text = reason
         .strip_prefix(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
         .unwrap_or(reason);
-    let (message, details) = match text.split_once(DETAILS_LABEL) {
-        Some((message, details)) => (message, Some(details.trim_end_matches('.'))),
-        None => (text, None),
-    };
+    let (message, details) = split_details(text);
+    let details = details.map(|details| details.trim_end_matches('.'));
     let mut chars = message.chars();
     let notice = TransientNotice::warning(
         chars
@@ -1395,10 +1409,8 @@ pub(super) fn update_failure(message: &str) -> UpdateFailure {
             retained: true,
         };
     }
-    let (text, details) = match grouped.split_once(DETAILS_LABEL) {
-        Some((text, details)) => (text, Some(details.trim_end_matches('.'))),
-        None => (grouped.as_str(), None),
-    };
+    let (text, details) = split_details(&grouped);
+    let details = details.map(|details| details.trim_end_matches('.'));
     let notice = TransientNotice::error(text);
     let notice = match details {
         Some(details) => notice.with_details(details),
@@ -1525,7 +1537,11 @@ fn saved_panes(count: usize) -> String {
 /// A pane title on one line, bounded so a notice naming several still fits
 /// the launcher's handshake line.
 fn pane_title(title: &str) -> String {
-    let mut title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(['\u{201c}', '\u{201d}'], "\"");
     if let Some((end, _)) = title.char_indices().nth(MAX_PANE_TITLE_CHARS) {
         title.truncate(end);
         title.push('\u{2026}');
