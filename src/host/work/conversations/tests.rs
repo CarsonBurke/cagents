@@ -981,3 +981,16 @@ fn an_edited_worktree_counts_its_changed_paths_and_takes_its_measured_lines() {
     edited.dirty.as_mut().unwrap().newest_modified_at_unix_ms = Some(6);
     assert_ne!(Fingerprint::of(&edited), Fingerprint::of(main));
 }
+
+#[test]
+fn a_conversation_with_no_transcript_yet_reads_as_complete_once_looked_for() {
+    let mut watched = Watched::new();
+    // Before any read, nothing is known.
+    assert_eq!(watched.coverage, TranscriptCoverage::Pending);
+    // A read of a conversation whose transcript is not there yet finds all
+    // of nothing, rather than staying on its way forever.
+    read(&mut watched);
+    assert_eq!(watched.source, Source::Pending);
+    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+    assert!(watched.references.is_empty());
+}

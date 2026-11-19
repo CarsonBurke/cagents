@@ -15929,8 +15929,10 @@ impl Application for Cagents {
         let inspector_open_by_default = settings.inspector_open_by_default;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
+            // Whole pixels, as a drag leaves it, so Settings steps from it.
             settings.inspector_width = if view.inspector_width.is_finite() {
                 view.inspector_width
+                    .round()
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
             } else {
                 AppSettings::default().inspector_width

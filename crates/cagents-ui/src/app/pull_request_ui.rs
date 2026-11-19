@@ -322,6 +322,12 @@ impl Cagents {
             .map_or(conversation::Phase::Reading, conversation::State::phase)
     }
 
+    /// How much of `card`'s conversation's transcript its list was read
+    /// from, once one has arrived.
+    pub(super) fn work_transcript(&self, card: CardId) -> Option<&crate::work::TranscriptCoverage> {
+        self.pull_request_inspector.conversation(card)?.transcript()
+    }
+
     /// What `card`'s Work and Mentioned sections and the section beneath
     /// them need of its conversation's work, worked out once per use.
     pub(super) fn work_summary(&self, card: CardId) -> WorkSummary {

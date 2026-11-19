@@ -368,6 +368,12 @@ impl State {
         self.rows().iter().any(|row| row.relation.worked_on()) || !self.worktrees().is_empty()
     }
 
+    /// How much of the conversation's transcript its latest list was read
+    /// from.
+    pub(crate) fn transcript(&self) -> Option<&TranscriptCoverage> {
+        Some(&self.list.as_ref()?.transcript)
+    }
+
     /// A list whose transcript has not been read yet, and so names
     /// nothing, is still being read, not empty.
     pub(crate) fn phase(&self) -> Phase {

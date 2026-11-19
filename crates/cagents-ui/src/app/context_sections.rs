@@ -509,10 +509,21 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if work.lists_work => {
                     self.work_section(card, work)
                 }
-                pull_request_ui::WorkPhase::Listed => list_notice(
-                    "No pull requests or worktrees yet",
-                    "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
-                ),
+                // Nothing listed because nothing could be read says so,
+                // rather than promising rows that will never come.
+                pull_request_ui::WorkPhase::Listed => match self.work_transcript(card) {
+                    Some(crate::work::TranscriptCoverage::Unsupported) => list_notice(
+                        "Work isn't tracked for this chat",
+                        "Its provider's conversations aren't read for pull requests and worktrees.",
+                    ),
+                    Some(crate::work::TranscriptCoverage::Unavailable { reason }) => {
+                        list_notice("Couldn't read this chat's conversation", reason)
+                    }
+                    _ => list_notice(
+                        "No pull requests or worktrees yet",
+                        "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
+                    ),
+                },
                 pull_request_ui::WorkPhase::Reading => list_notice(
                     "Reading this chat's work…",
                     "Its pull requests and worktrees show here.",

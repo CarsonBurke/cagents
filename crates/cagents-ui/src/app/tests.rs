@@ -2063,9 +2063,24 @@ fn a_window_view_saves_each_open_inspector_and_reads_one_from_before_them() {
         "an older version reads the focused pane's as the window's"
     );
 
+    assert_eq!(
+        view.inspector_choices,
+        Some(pane_inspector::Choices {
+            opened: vec![card],
+            closed: Vec::new(),
+        })
+    );
+
     let mut json = serde_json::to_value(&view).unwrap();
     let read: WindowView = serde_json::from_value(json.clone()).unwrap();
     assert_eq!(read.open_inspectors, Some(vec![card]));
+    assert_eq!(read.inspector_choices, view.inspector_choices);
+    // A view saved while inspectors were closed until opened keeps no
+    // choices; its open ones read back as opened.
+    json.as_object_mut().unwrap().remove("inspector_choices");
+    let unchosen: WindowView = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(unchosen.inspector_choices, None);
+    assert_eq!(unchosen.open_inspectors, Some(vec![card]));
     // A view saved before each pane had its own inspector.
     json.as_object_mut().unwrap().remove("open_inspectors");
     let legacy: WindowView = serde_json::from_value(json).unwrap();

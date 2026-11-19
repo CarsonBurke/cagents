@@ -190,7 +190,8 @@ impl PaneInspectors {
     pub(super) fn restore_choices(choices: Choices) -> Self {
         let closed = choices.closed.into_iter().map(|card| (card, false));
         Self {
-            // A pane in both lists was opened last; see `choices`.
+            // A pane in both lists, which `choices` never writes, counts
+            // as opened.
             restored: closed
                 .chain(choices.opened.into_iter().map(|card| (card, true)))
                 .collect(),
