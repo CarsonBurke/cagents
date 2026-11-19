@@ -5144,13 +5144,10 @@ impl RepositoryRuntime {
         Task::batch([scroll, self.diagram_task(card)])
     }
 
-    /// The languages the reader chose for buffers their names do not type,
-    /// by worktree-relative source, for a shell that keeps them across
-    /// sessions.
-    pub fn language_choices(&self) -> impl Iterator<Item = (&Path, DocumentLanguage)> {
-        self.language_choices
-            .iter()
-            .map(|(source, language)| (source.as_path(), *language))
+    /// The language the reader chose for the buffer at worktree-relative
+    /// `source`, for a shell that keeps the choice across sessions.
+    pub fn language_choice(&self, source: &Path) -> Option<DocumentLanguage> {
+        self.language_choices.get(source).copied()
     }
 
     /// Restores a language chosen in an earlier session, before the buffer
@@ -10215,7 +10212,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     )
 }
 
-/// "Read as" for a buffer its name does not type: whether its preview and
+/// "Language" for a buffer its name does not type: whether its preview and
 /// highlighting follow its content, or the language the reader settled on.
 fn language_choice(
     card: CardId,
@@ -10233,12 +10230,12 @@ fn language_choice(
         (
             Some(DocumentLanguage::Markdown),
             "Markdown",
-            "Always read as Markdown".to_owned(),
+            "Always Markdown".to_owned(),
         ),
         (
             Some(DocumentLanguage::PlainText),
             "Plain text",
-            "Always read as plain text".to_owned(),
+            "Always plain text".to_owned(),
         ),
     ];
     let buttons = choices
@@ -10247,7 +10244,7 @@ fn language_choice(
             let selected = chosen == language;
             crate::interaction::tooltip(
                 widget::button::custom(crate::design::caption(label))
-                    .name(format!("Read as {label}"))
+                    .name(format!("Language: {label}"))
                     .selected(selected)
                     .class(crate::ui_controls::control_style(selected, None))
                     .padding([space::XS, space::S])
@@ -10260,7 +10257,7 @@ fn language_choice(
         .collect();
     Some(
         widget::row::with_children(vec![
-            crate::design::caption("Read as").into(),
+            crate::design::caption("Language").into(),
             crate::ui_controls::segmented_controls(buttons),
         ])
         .spacing(space::S)
