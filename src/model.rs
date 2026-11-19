@@ -1121,20 +1121,21 @@ impl BrowserSession {
     }
 }
 
-/// Drops the oldest entries until the history fits [`BROWSER_HISTORY_LIMIT`],
-/// keeping `index` pointed at the same entry it pointed at before.
+/// Drops entries until the history fits [`BROWSER_HISTORY_LIMIT`], keeping
+/// `index` pointed at the same entry it pointed at before.
 ///
-/// Recent history — everything a user can reach with the back button — is
-/// preserved exactly; only entries older than the cap are forgotten.
+/// The oldest entries go first. Only when the current entry is too close to
+/// the start for that, as after going far back, do the newest forward entries
+/// go instead. The current page is never dropped, and neither is the entry
+/// before it, so a page that can go back still shows that it can.
 pub fn trim_browser_history(history: &mut Vec<Url>, index: &mut usize) {
     let Some(excess) = history.len().checked_sub(BROWSER_HISTORY_LIMIT) else {
         return;
     };
-    if excess == 0 {
-        return;
-    }
-    history.drain(..excess);
-    *index = index.saturating_sub(excess);
+    let older = excess.min(index.saturating_sub(1));
+    history.drain(..older);
+    *index -= older;
+    history.truncate(BROWSER_HISTORY_LIMIT);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2134,6 +2135,30 @@ mod tests {
             history[0],
             Url::parse("https://example.test/10").unwrap(),
             "the oldest entries are the ones dropped"
+        );
+
+        // Far back in a long history, the newest forward entries go instead
+        // of the page the cursor is on.
+        let mut history: Vec<Url> = (0..BROWSER_HISTORY_LIMIT + 10)
+            .map(|index| Url::parse(&format!("https://example.test/{index}")).unwrap())
+            .collect();
+        let mut index = 4;
+        trim_browser_history(&mut history, &mut index);
+        assert_eq!(history.len(), BROWSER_HISTORY_LIMIT);
+        assert_eq!(index, 1, "the page can still go back");
+        assert_eq!(
+            history.last(),
+            Some(
+                &Url::parse(&format!(
+                    "https://example.test/{}",
+                    BROWSER_HISTORY_LIMIT + 2
+                ))
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            history[index],
+            Url::parse("https://example.test/4").unwrap()
         );
 
         // Already inside the bound: nothing moves.
