@@ -964,6 +964,32 @@ fn settled_panes_save_once_the_daemon_is_ready_unreachable_or_past_its_bound() {
 }
 
 #[test]
+fn panes_settling_at_the_end_of_the_budget_save_without_a_daemon_answer() {
+    let (mut app, cards) = waiting(2);
+    elapse(&mut app, launcher_budget(2) - Duration::from_secs(2));
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    assert_eq!(reported(&app), None);
+
+    drop(deliver(&mut app, Ok(StartupState::Ready)));
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    elapse(&mut app, Duration::from_secs(3));
+    drop(app.verify_startup_gate());
+    assert!(app.startup_gate.saving);
+    assert_eq!(reported(&app), None);
+}
+
+#[test]
+fn panes_settling_well_inside_the_budget_still_wait_for_the_answer() {
+    let (mut app, cards) = waiting(2);
+    settle(&mut app, &cards);
+    elapse(&mut app, SETTLED_ANSWER_BOUND - Duration::from_secs(1));
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+}
+
+#[test]
 fn settled_panes_wait_out_a_restore_until_the_inventory_cap() {
     let (mut app, cards) = waiting(2);
     settle(&mut app, &cards);
