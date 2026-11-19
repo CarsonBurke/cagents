@@ -223,7 +223,9 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("CLAUDE_CONFIG_DIR"),
         Provider::Codex => Some("CODEX_HOME"),
-        Provider::Omp => None,
+        // Neither has a home variable of its own: cagents uses only their
+        // system account.
+        Provider::Omp | Provider::Antigravity | Provider::Muse => None,
     }
 }
 
@@ -256,7 +258,9 @@ pub fn credential_overrides(provider: Provider) -> &'static [&'static str] {
             "OPENAI_IDENTITY_TOKEN_FILE",
             "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
         ],
-        Provider::Omp => &[],
+        // Only their system account exists, so no credential outranks one
+        // cagents selected.
+        Provider::Omp | Provider::Antigravity | Provider::Muse => &[],
     }
 }
 
@@ -604,7 +608,7 @@ impl Account {
                 let directory = match self.provider {
                     Provider::Claude => ".claude",
                     Provider::Codex => ".codex",
-                    Provider::Omp => return None,
+                    Provider::Omp | Provider::Antigravity | Provider::Muse => return None,
                 };
                 Some(Path::new(&home).join(directory))
             }

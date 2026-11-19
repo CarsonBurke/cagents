@@ -604,6 +604,13 @@ impl AttachmentRules {
                 max_image_bytes: 16 * MIB,
                 max_file_bytes: None,
             },
+            // No native chat runs them yet, so nothing can be attached.
+            Provider::Antigravity | Provider::Muse => Self {
+                images_only: true,
+                max_count: Some(0),
+                max_image_bytes: 0,
+                max_file_bytes: Some(0),
+            },
         }
     }
 
@@ -4070,6 +4077,7 @@ pub fn fresh_session(
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
         }
+        Provider::Antigravity | Provider::Muse => return Err(provider.native_chat_refusal()),
     }
     Ok(Session {
         native_continuity: Default::default(),

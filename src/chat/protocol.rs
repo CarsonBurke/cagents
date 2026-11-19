@@ -541,6 +541,8 @@ pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
             codex::align_resume_identity(&mut launch.recipe.arguments, &id)
         }
         crate::agent::Provider::Omp => Ok(()),
+        // Never created as native chat (see `Provider::has_native_chat`).
+        crate::agent::Provider::Antigravity | crate::agent::Provider::Muse => Ok(()),
     }
 }
 

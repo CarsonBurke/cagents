@@ -424,6 +424,8 @@ pub fn cli_name(provider: Provider) -> &'static str {
         Provider::Claude => "Claude Code",
         Provider::Codex => "Codex",
         Provider::Omp => "Omp",
+        Provider::Antigravity => "Antigravity",
+        Provider::Muse => "Muse",
     }
 }
 
@@ -441,6 +443,10 @@ async fn probe_cli(
         Provider::Claude => probe_claude_with_path(account, program, search_path, cache).await,
         Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
+        Provider::Antigravity | Provider::Muse => Err(format!(
+            "cagents does not read {} account usage yet",
+            account.provider.label()
+        )),
     }
 }
 
@@ -925,7 +931,7 @@ pub async fn logout(account: Account) -> Result<(), String> {
     let arguments: &[&str] = match account.provider {
         Provider::Claude => &["auth", "logout"],
         Provider::Codex => &["logout"],
-        Provider::Omp => return Ok(()),
+        Provider::Omp | Provider::Antigravity | Provider::Muse => return Ok(()),
     };
     let executable = account.provider.executable();
     let search_path = search_path().await;

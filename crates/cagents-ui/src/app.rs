@@ -17024,9 +17024,11 @@ impl Application for Cagents {
             ];
             if !scoped {
                 content.push(
+                    // The providers whose accounts the Accounts pane shows.
                     widget::row::with_children(
                         crate::agent::Provider::ALL
                             .into_iter()
+                            .filter(|provider| crate::account::Account::REPORTED.contains(provider))
                             .map(|provider| {
                                 let status = self.account_ui.provider_status(provider);
                                 let control = crate::ui_controls::icon_button(

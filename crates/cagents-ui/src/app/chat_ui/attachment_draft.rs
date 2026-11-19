@@ -339,6 +339,8 @@ pub(super) fn message_key(provider: crate::agent::Provider, item_id: &str) -> Op
     let (message, index) = match provider {
         crate::agent::Provider::Codex => item_id.rsplit_once("/input/")?,
         crate::agent::Provider::Claude | crate::agent::Provider::Omp => item_id.rsplit_once(':')?,
+        // No native chat decodes their messages yet.
+        crate::agent::Provider::Antigravity | crate::agent::Provider::Muse => return None,
     };
     if message.is_empty()
         || index.is_empty()

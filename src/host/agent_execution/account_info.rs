@@ -423,7 +423,9 @@ fn select(
             Some(std::path::Path::new(home).join(match provider {
                 crate::agent::Provider::Claude => ".claude",
                 crate::agent::Provider::Codex => ".codex",
-                crate::agent::Provider::Omp => return None,
+                crate::agent::Provider::Omp
+                | crate::agent::Provider::Antigravity
+                | crate::agent::Provider::Muse => return None,
             }))
         })?;
     let home = canonical_home(home)?;

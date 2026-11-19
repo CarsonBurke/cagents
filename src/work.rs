@@ -701,6 +701,7 @@ pub enum TicketSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: TerminalId,
+    #[serde(serialize_with = "crate::agent::absent_where_unknown")]
     pub provider: Option<Provider>,
     pub title: Option<String>,
     pub state: ActivityState,

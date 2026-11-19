@@ -86,6 +86,8 @@ fn arity(provider: Provider, flag: &str) -> Option<ArgumentArity> {
                 None
             }
         }
+        // No native conversation of theirs exists to start afresh.
+        Provider::Antigravity | Provider::Muse => None,
     }
 }
 

@@ -112,7 +112,7 @@ pub fn shared_entries(provider: Provider) -> &'static [&'static str] {
     match provider {
         Provider::Claude => &["CLAUDE.md", "skills", "agents", "commands"],
         Provider::Codex => &["AGENTS.md", "config.toml", "skills", "prompts", "rules"],
-        Provider::Omp => &[],
+        Provider::Omp | Provider::Antigravity | Provider::Muse => &[],
     }
 }
 

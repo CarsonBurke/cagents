@@ -1760,6 +1760,8 @@ fn provider_name(provider: crate::agent::Provider) -> &'static str {
         crate::agent::Provider::Claude => "Claude",
         crate::agent::Provider::Codex => "Codex",
         crate::agent::Provider::Omp => "OMP",
+        crate::agent::Provider::Antigravity => "Antigravity",
+        crate::agent::Provider::Muse => "Muse",
     }
 }
 

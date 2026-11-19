@@ -566,6 +566,22 @@ fn a_terminal_launch_names_the_conversation_its_provider_opens() {
         ),
         ("codex", vec!["resume", "--last"], Selection::Unknown),
         ("codex", vec!["exec", "--last"], Selection::Unknown),
+        (
+            "agy",
+            vec!["--conversation", ID],
+            existing(Provider::Antigravity),
+        ),
+        ("agy", vec!["-c"], Selection::Unknown),
+        ("agy", vec!["--continue"], Selection::Unknown),
+        // For Muse `-c` is configuration, not the latest conversation.
+        ("muse", vec!["-c", "model=m"], Selection::Nothing),
+        (
+            "muse-upstream",
+            vec!["resume", ID],
+            existing(Provider::Muse),
+        ),
+        ("muse", vec!["resume", "--last"], Selection::Unknown),
+        ("muse", vec!["resume"], Selection::Unknown),
     ] {
         assert_eq!(
             selection(&launch(program, &arguments)),

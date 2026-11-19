@@ -105,11 +105,7 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
                 (flag, Some(value))
             });
         if selector == Selector::Picker {
-            let latest = match provider {
-                Provider::Codex => flag == "--last",
-                _ => matches!(flag, "--continue" | "-c"),
-            };
-            if latest && inline.is_none() {
+            if provider.is_latest_selector(flag) && inline.is_none() {
                 continue;
             }
             if provider.is_identity_option(flag) {
@@ -159,7 +155,10 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
     match selector {
         Selector::Fresh => {}
         Selector::Exact => provider.append_resume(&mut arguments, id?),
-        Selector::Picker => provider.append_resume_picker(&mut arguments),
+        Selector::Picker if provider.has_resume_picker() => {
+            provider.append_resume_picker(&mut arguments)
+        }
+        Selector::Picker => return None,
     }
     Some(LaunchRecipe {
         arguments,
@@ -184,7 +183,7 @@ pub fn bind_session(launch: &LaunchRecipe, id: &str) -> Option<LaunchRecipe> {
             .map_or((argument.as_str(), None), |(flag, value)| {
                 (flag, Some(value))
             });
-        if matches!(flag, "--continue" | "-c") && provider != Provider::Codex {
+        if provider.is_latest_selector(flag) && inline.is_none() {
             continue;
         }
         if provider.is_identity_option(flag) {
@@ -648,6 +647,8 @@ fn provider_setting_environment_key(provider: Provider, name: &str) -> bool {
             "AZURE",
         ],
         Provider::Codex => &["CODEX", "OPENAI"],
+        Provider::Antigravity => &["ANTIGRAVITY", "GEMINI", "GOOGLE_", "GCLOUD"],
+        Provider::Muse => &["MUSE"],
     };
     if prefixes.iter().any(|prefix| starts_with(prefix)) {
         return true;
@@ -805,6 +806,8 @@ fn return_environment_key(provider: Provider, name: &str) -> bool {
             "AZURE",
         ],
         Provider::Codex => &["CODEX", "OPENAI"],
+        Provider::Antigravity => &["ANTIGRAVITY", "GEMINI", "GOOGLE_", "GCLOUD"],
+        Provider::Muse => &["MUSE"],
         Provider::Omp => {
             return (provider_setting_environment_key(provider, name)
                 && !native_runtime_environment_key(name))
@@ -2372,6 +2375,11 @@ mod tests {
         .unwrap();
         assert_eq!(omp.arguments, ["--session-dir", "/sessions", "--resume"]);
         assert!(is_picker_recipe(&omp));
+        let muse = picker_recipe(&launch("muse", &["resume", id, "--model", "m"])).unwrap();
+        assert_eq!(muse.arguments, ["resume", "--model", "m"]);
+        assert!(is_picker_recipe(&muse));
+        // `--conversation` needs an ID, so Antigravity has no picker to open.
+        assert!(picker_recipe(&launch("agy", &["--conversation", id])).is_none());
         // Prompts and unknown options stay refused: nothing is ever replayed.
         assert!(picker_recipe(&launch("claude", &["--model", "sonnet", "do it again"])).is_none());
         assert!(picker_recipe(&launch("claude", &["--unknown-permission-mode"])).is_none());
@@ -2847,6 +2855,46 @@ mod tests {
         );
         assert!(bind_session(&launch("claude", &["--fork-session"]), id).is_none());
         assert!(bind_session(&launch("omp", &[]), "a1b2c3d4").is_none());
+        // A latest-session selector becomes the session it selected.
+        assert_eq!(
+            bind_session(&launch("codex", &["resume", "--last", "-m", "o3"]), id)
+                .unwrap()
+                .arguments,
+            ["resume", id, "-m", "o3"]
+        );
+        let agy = bind_session(
+            &launch(
+                "agy",
+                &[
+                    "--continue",
+                    "--mode",
+                    "plan",
+                    "--model",
+                    "m",
+                    "already sent",
+                ],
+            ),
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            agy.arguments,
+            ["--mode", "plan", "--model", "m", "--conversation", id]
+        );
+        // For Muse `-c` is configuration, not a latest-session selector.
+        let muse = bind_session(
+            &launch(
+                "muse-upstream",
+                &["resume", "--last", "-c", "k=v", "--approval-mode", "never"],
+            ),
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            muse.arguments,
+            ["resume", id, "-c", "k=v", "--approval-mode", "never"]
+        );
+        assert!(bind_session(&launch("muse", &["--unknown"]), id).is_none());
     }
 
     #[cfg(feature = "host")]

@@ -1493,6 +1493,8 @@ fn family_label(provider: Provider) -> &'static str {
         Provider::Codex => "ChatGPT",
         Provider::Claude => "Claude",
         Provider::Omp => "Other models",
+        Provider::Antigravity => "Antigravity",
+        Provider::Muse => "Muse",
     }
 }
 
@@ -1596,6 +1598,8 @@ impl Runtime {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
             Provider::Omp => "OMP",
+            Provider::Antigravity => "Antigravity",
+            Provider::Muse => "Muse",
         };
         let model = agent
             .model
@@ -2575,6 +2579,8 @@ impl Runtime {
                 Provider::Codex => "Codex",
                 Provider::Claude => "Claude",
                 Provider::Omp => "OMP",
+                Provider::Antigravity => "Antigravity",
+                Provider::Muse => "Muse",
             };
             // A model the provider never reported is left out rather than
             // announced; the tooltip says so for whoever asks.
@@ -7118,6 +7124,8 @@ fn names_provider(provider: Provider, needle: &str) -> bool {
         Provider::Codex => &["chatgpt", "codex", "openai"],
         Provider::Claude => &["claude", "anthropic"],
         Provider::Omp => &["other models", "omp"],
+        Provider::Antigravity => &["antigravity", "agy", "gemini", "google"],
+        Provider::Muse => &["muse", "meta"],
     };
     names.iter().any(|name| {
         name.starts_with(needle) || name.split(' ').any(|word| word.starts_with(needle))

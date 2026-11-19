@@ -17,7 +17,10 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     let provider = crate::control::agents::parse_provider(value)
         .map_err(|_| "Choose claude or codex".to_owned())?;
     if !crate::account::Account::PROVIDERS.contains(&provider) {
-        return Err("Omp manages its own logins; link supports claude and codex".into());
+        return Err(format!(
+            "{} manages its own logins; link supports claude and codex",
+            provider.label()
+        ));
     }
     Ok(provider)
 }

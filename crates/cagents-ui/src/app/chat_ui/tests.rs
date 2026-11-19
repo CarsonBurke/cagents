@@ -17024,7 +17024,7 @@ fn an_explicit_fresh_start_drops_retained_actor_and_pair_authority() {
             Provider::Codex => chat::NativeContinuity::Durable {
                 provider_version: "0.100.0".into(),
             },
-            Provider::Omp => unreachable!(),
+            Provider::Omp | Provider::Antigravity | Provider::Muse => unreachable!(),
         };
         if paired {
             let proof = source.proof.clone().unwrap();
