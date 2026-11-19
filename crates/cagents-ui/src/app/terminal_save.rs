@@ -966,9 +966,10 @@ mod tests {
                                 sequence: 1,
                             },
                         },
-                        ClientRequest::List => ServerMessage::Response {
-                            response: ServerResponse::Listed {
+                        ClientRequest::ListPage { after: None } => ServerMessage::Response {
+                            response: ServerResponse::ListedPage {
                                 terminals: vec![hosted.clone()],
+                                complete: true,
                             },
                         },
                         _ => {

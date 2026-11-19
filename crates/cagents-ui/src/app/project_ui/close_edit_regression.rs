@@ -438,7 +438,10 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                 },
             );
             let terminals: ClientEnvelope = read_frame(&mut cleanup).unwrap().unwrap();
-            assert!(matches!(&terminals.request, ClientRequest::List));
+            assert!(matches!(
+                &terminals.request,
+                ClientRequest::ListPage { after: None }
+            ));
             if index == 0 {
                 cleanup_entered.take().unwrap().send(()).unwrap();
                 cleanup_release
@@ -449,8 +452,9 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
             respond(
                 &mut cleanup,
                 terminals,
-                ServerResponse::Listed {
+                ServerResponse::ListedPage {
                     terminals: Vec::new(),
+                    complete: true,
                 },
             );
         }

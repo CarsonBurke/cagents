@@ -188,13 +188,16 @@ impl Peer {
             match business {
                 Business::List => {
                     assert!(
-                        matches!(request.request, ClientRequest::List),
+                        matches!(request.request, ClientRequest::ListPage { after: None }),
                         "global list never authenticates even an invalid/empty inherited capability"
                     );
                     response(
                         &mut peer,
                         &request,
-                        ServerResponse::Listed { terminals: vec![] },
+                        ServerResponse::ListedPage {
+                            terminals: vec![],
+                            complete: true,
+                        },
                     );
                 }
                 Business::Spawn => {

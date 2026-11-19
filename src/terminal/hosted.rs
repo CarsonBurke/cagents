@@ -2398,26 +2398,44 @@ fn serve_connection(
                 );
             }
         }
-        let terminals = match exchange(ClientRequest::List) {
-            Ok(ServerResponse::Listed { terminals }) => terminals,
-            Err(end) => return end,
-            _ => {
-                return reject_handshake(
-                    events,
-                    published,
-                    stop,
-                    ProtocolError::new(
-                        ProtocolErrorCode::InvalidRequest,
-                        "Daemon did not return authenticated terminal inventory",
-                        false,
-                    ),
-                );
+        // Pages arrive in identity order, so the listing stops at the page
+        // that reaches this terminal's identity.
+        let mut after = None;
+        let existing = loop {
+            let (terminals, complete) = match exchange(ClientRequest::ListPage { after }) {
+                Ok(ServerResponse::ListedPage {
+                    terminals,
+                    complete,
+                }) if super::ipc::page_follows(after, &terminals, complete) => {
+                    (terminals, complete)
+                }
+                Err(end) => return end,
+                _ => {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "Daemon did not return authenticated terminal inventory",
+                            false,
+                        ),
+                    );
+                }
+            };
+            let last = terminals.last().map(|terminal| terminal.session.id);
+            if let Some(terminal) = terminals
+                .into_iter()
+                .find(|terminal| terminal.session.id == terminal_id)
+            {
+                break Some(terminal);
             }
+            if complete || last.is_some_and(|last| last > terminal_id) {
+                break None;
+            }
+            after = last;
         };
-        if let Some(terminal) = terminals
-            .iter()
-            .find(|terminal| terminal.session.id == terminal_id)
-        {
+        if let Some(terminal) = existing {
             if !spawn.matches_source(&terminal.session) {
                 return reject_handshake(
                     events,

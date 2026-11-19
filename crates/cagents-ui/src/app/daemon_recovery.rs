@@ -1261,8 +1261,14 @@ mod tests {
             while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
                 assert_eq!(request.proof, Some(proof.clone()));
                 let response = match request.request {
-                    ClientRequest::List => ServerResponse::Listed {
-                        terminals: terminals.clone(),
+                    // A daemon lists in identity order.
+                    ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
+                        terminals: {
+                            let mut terminals = terminals.clone();
+                            terminals.sort_by_key(|terminal| terminal.session.id);
+                            terminals
+                        },
+                        complete: true,
                     },
                     ClientRequest::StartupState => ServerResponse::StartupState(state.clone()),
                     other => panic!("recovery sent {other:?}"),
@@ -2501,8 +2507,14 @@ mod tests {
                                     StartupState::Ready
                                 })
                             }
-                            ClientRequest::List => ServerResponse::Listed {
-                                terminals: inventory.terminals.clone(),
+                            // A daemon lists in identity order.
+                            ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
+                                terminals: {
+                                    let mut terminals = inventory.terminals.clone();
+                                    terminals.sort_by_key(|terminal| terminal.session.id);
+                                    terminals
+                                },
+                                complete: true,
                             },
                             ClientRequest::ChatList => ServerResponse::ChatListed {
                                 sessions: inventory.chats.clone(),

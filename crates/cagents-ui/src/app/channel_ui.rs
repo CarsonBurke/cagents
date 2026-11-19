@@ -4421,7 +4421,7 @@ pub(in crate::app) mod close_tests {
                     // Ordinary Close asks for terminal inventory too. Permit
                     // that ordering so the old ID-substitution policy reaches
                     // the ownership assertion, not a fixture protocol mismatch.
-                    if request.request == ClientRequest::List {
+                    if request.request == (ClientRequest::ListPage { after: None }) {
                         assert_eq!(expected, ClientRequest::ChatList);
                         assert!(
                             !terminal_inventory_read,
@@ -4435,8 +4435,9 @@ pub(in crate::app) mod close_tests {
                                 request_id: Some(request.request_id),
                                 proof: proof(),
                                 message: ServerMessage::Response {
-                                    response: ServerResponse::Listed {
+                                    response: ServerResponse::ListedPage {
                                         terminals: Vec::new(),
+                                        complete: true,
                                     },
                                 },
                             },
