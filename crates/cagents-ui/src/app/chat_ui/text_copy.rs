@@ -104,6 +104,30 @@ impl FailureRequest {
     }
 }
 
+/// The item of `snapshot` whose whole text `source` copies.
+fn item_with_source<'a>(
+    snapshot: &'a Snapshot,
+    source: &chat::TextCopySource,
+) -> Option<&'a chat::Item> {
+    let (items, sources) = match &source.scope {
+        chat::TextCopyScope::Conversation => {
+            (&snapshot.items, &snapshot.text_copy_sources.conversation)
+        }
+        chat::TextCopyScope::Subagent { id } => (
+            &snapshot
+                .subagents
+                .iter()
+                .find(|agent| agent.id == *id)?
+                .items,
+            snapshot.text_copy_sources.children.get(id)?,
+        ),
+    };
+    let index = sources
+        .iter()
+        .position(|candidate| candidate.as_ref() == Some(source))?;
+    items.get(index).map(AsRef::as_ref)
+}
+
 impl Request {
     fn read(self, target: Target, id: String) -> Task<Message> {
         let handle = self.handle.clone();
@@ -379,9 +403,12 @@ impl Cagents {
     ) -> Task<Message> {
         let prefix = match &part {
             Some(part) => {
+                // By its source: a step's ID may also be a long message's
+                // generated part ID.
                 let Some(prefix) = self
                     .chat_runtime_mut(target)
-                    .and_then(|runtime| runtime.active_item(&id))
+                    .zip(source.as_ref())
+                    .and_then(|(runtime, source)| item_with_source(&runtime.snapshot, source))
                     .and_then(|item| step_copy_prefix(part, &item.content))
                 else {
                     return Task::none();
@@ -838,6 +865,41 @@ mod tests {
                 Some(chat::TEXT_COPY_CHANGED)
             );
         }
+    }
+
+    /// A step's copy starts with its command, found by its source even when
+    /// an earlier row, such as a long message's part, has the step's ID.
+    #[test]
+    fn a_step_copy_takes_its_command_from_its_own_row_when_an_id_repeats() {
+        let _context = isolated_context();
+        let scope = chat::TextCopyScope::Conversation;
+        let (mut app, target, handle, request) = copy_fixture(scope.clone());
+        let text = Arc::new(chat::Item {
+            content: ItemContent::Text {
+                text: "a part of a long answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            ..(*step("")).clone()
+        });
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = vec![text, step("cargo build")];
+        snapshot.text_copy_sources.conversation = vec![
+            Some(token_source(&scope, 3, 1)),
+            Some(request.source.clone()),
+        ];
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let task = app.start_message_copy(
+            target,
+            "step".into(),
+            Some(CopyPart::Text),
+            Some(request.source.clone()),
+        );
+        let started = read_by(task, target);
+        assert_eq!(started.source, request.source);
+        assert_eq!(started.prefix, "cargo build");
     }
 
     /// A conversation item's ID can repeat in the window: a long message's

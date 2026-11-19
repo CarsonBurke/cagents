@@ -398,7 +398,8 @@ refuse every such read as changed while
 `home/.config/fixture-text-copy-changed` exists in `CAGENTS_EVIDENCE_FIXTURE`.
 The store's sources stay as they are, so the app has nothing newer to read
 and shows the refusal in the chat's error line. Remove the file and the same
-Copy succeeds.
+Copy succeeds. Only the conversation's own items are refused; a subagent's
+copies are unaffected.
 
 ```sh
 scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-changed'

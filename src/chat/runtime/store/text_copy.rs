@@ -21,12 +21,11 @@ pub(super) fn copy_field(item: &Item) -> Option<i64> {
     }
 }
 
-/// Whether a development build under native evidence should answer a copy
-/// as though its item changed after the client's snapshot: while
-/// `home/.config/fixture-text-copy-changed` exists in the fixture, every
-/// conversation copy is refused, and removing the file lets the same copy
-/// succeed again. The store's sources stay as they are, so the client never
-/// sees a newer one.
+/// Whether a development build under native evidence should answer a
+/// conversation copy as though its item changed after the client's snapshot:
+/// while `home/.config/fixture-text-copy-changed` exists in the fixture, every
+/// one is refused, and removing the file lets the same copy succeed again.
+/// The store's sources stay as they are, so the client never sees a newer one.
 fn changed_by_fixture() -> bool {
     #[cfg(feature = "development")]
     if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
@@ -140,10 +139,24 @@ impl Store {
         state.text_copy_sources.conversation_revision = self.copy_revision;
         state.text_copy_sources.conversation = self.copy_projection.clone();
     }
+    /// One page of a conversation item's whole text, from `offset`.
     pub(crate) fn text_copy(
         &self,
         source: &TextCopySource,
         offset: u64,
+    ) -> Result<TextCopyPage, String> {
+        self.copy_page(source, offset, changed_by_fixture())
+    }
+
+    /// One page of the text `source` names, refused as changed when
+    /// `changed`, as when the item was rewritten since `source`. A
+    /// subagent's diagnostic reads its backing through this too, without the
+    /// fixture, because a refusal there clears that backing.
+    pub(crate) fn copy_page(
+        &self,
+        source: &TextCopySource,
+        offset: u64,
+        changed: bool,
     ) -> Result<TextCopyPage, String> {
         if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
             return Err("The full text is unavailable in this owned cache".into());
@@ -165,7 +178,7 @@ impl Store {
         let Some((id, field, revision, total)) = record else {
             return Err("The full text is no longer available in the owned cache".into());
         };
-        if revision != source.revision || source.bytes > total || changed_by_fixture() {
+        if changed || revision != source.revision || source.bytes > total {
             return Err(crate::chat::TEXT_COPY_CHANGED.into());
         }
         if offset > source.bytes {
@@ -505,6 +518,19 @@ mod tests {
         assert_eq!(store.copy_revision, old_revision + 1);
         let new = store.copy_parent_source("answer").unwrap().unwrap();
         assert_eq!(read(&store, &new).unwrap(), "new text");
+    }
+
+    #[test]
+    fn a_copy_refused_as_changed_leaves_its_source_readable() {
+        let mut store = Store::new().unwrap();
+        let text = "a".repeat(PART_BYTES * 2);
+        store.apply(Event::Item(item("answer", &text))).unwrap();
+        let source = source(&mut store, "answer");
+        assert_eq!(
+            store.copy_page(&source, 0, true),
+            Err(crate::chat::TEXT_COPY_CHANGED.to_owned())
+        );
+        assert_eq!(read(&store, &source), Ok(text));
     }
 
     #[test]
