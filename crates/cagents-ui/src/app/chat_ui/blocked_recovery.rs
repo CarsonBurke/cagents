@@ -25,6 +25,12 @@ pub(super) const UNNAMED_AGENT_UNSENT: &str = "Closing also discards your unsent
 pub(super) const UNNAMED_AGENT_UNSENT_ATTACHMENTS: &str =
     "Closing also discards your unsent message and its attachments.";
 pub(super) const CLOSE_GUIDANCE: &str = "Details say why. Closing this tab discards any unsent message; the conversation itself isn't deleted.";
+pub(in crate::app) const UPDATE_HEADLINE: &str =
+    "This conversation hasn't reopened since the update.";
+pub(super) const UPDATE_DRAFT_HEADLINE: &str = "This conversation didn't start during the update.";
+pub(in crate::app) const STOPPED_HEADLINE: &str = "This conversation stopped after the update.";
+pub(super) const STOPPED_GUIDANCE: &str = "It couldn't restart after the update, so cagents stopped it. Nothing was resent. Reopen conversation starts it again in this tab; Details say why it stopped.";
+pub(in crate::app) const REOPEN_LABEL: &str = "Reopen conversation";
 
 /// When a permanently refused saved conversation can come back, as far as
 /// the daemon's typed refusal says. Nothing here promises Resume conversation
@@ -42,6 +48,15 @@ pub(in crate::app) enum Reopen {
     /// can reopen it, and starting over here would give up the agent's card,
     /// so Close, which ends the agent, is the only way on.
     UnnamedAgent,
+    /// The daemon is still restoring what an update carried over, or holds
+    /// that restore for recovery. Nothing is wrong with this conversation:
+    /// the card reopens it, or lets its message be sent, once the daemon says
+    /// its startup recovery has finished (see `update_recovery`).
+    UpdateRecovery,
+    /// The update's restore stopped this conversation after its restart
+    /// failed. Restoring it again only attaches, which meets the same
+    /// refusal; the reader's Reopen conversation starts it again.
+    UpdateStopped,
 }
 
 impl Reopen {
@@ -50,6 +65,8 @@ impl Reopen {
         match recovery {
             chat::Recovery::Blocked => Some(Self::Unproven),
             chat::Recovery::AfterRestart => Some(Self::AfterRestart),
+            chat::Recovery::UpdateRecovery => Some(Self::UpdateRecovery),
+            chat::Recovery::UpdateStopped => Some(Self::UpdateStopped),
             chat::Recovery::Account
             | chat::Recovery::Retry
             | chat::Recovery::Busy
@@ -66,25 +83,54 @@ impl Reopen {
             Self::Unproven => HEADLINE,
             Self::AfterRestart => RESTART_HEADLINE,
             Self::UnnamedAgent => UNNAMED_AGENT_HEADLINE,
+            Self::UpdateRecovery => UPDATE_HEADLINE,
+            Self::UpdateStopped => STOPPED_HEADLINE,
         }
     }
 
-    /// The caption under a saved conversation's refusal, with the
-    /// explanation of Start a new conversation when this card offers it.
-    pub(super) fn guidance(self, fresh: bool) -> String {
+    /// The headline over a first message this refusal kept.
+    pub(super) fn draft_headline(self) -> &'static str {
+        match self {
+            Self::Unproven | Self::AfterRestart | Self::UpdateStopped => DRAFT_HEADLINE,
+            Self::UpdateRecovery => UPDATE_DRAFT_HEADLINE,
+            Self::UnnamedAgent => UNNAMED_AGENT_HEADLINE,
+        }
+    }
+
+    /// The caption under a refusal: for a saved conversation, with the
+    /// explanation of Start a new conversation when this card offers it,
+    /// and for a first message (`draft`), what became of it. `wait` is what
+    /// the daemon last said about its update restore.
+    pub(super) fn guidance(self, fresh: bool, draft: bool, wait: UpdateWait) -> String {
         match (self, fresh) {
+            (Self::UpdateRecovery, _) => wait.guidance(draft).to_owned(),
+            (Self::UnnamedAgent, _) => UNNAMED_AGENT_BODY.to_owned(),
+            _ if draft => DRAFT_GUIDANCE.to_owned(),
+            (Self::UpdateStopped, _) => STOPPED_GUIDANCE.to_owned(),
             (Self::Unproven, true) => FRESH_EXPLANATION.to_owned(),
             (Self::Unproven, false) => CLOSE_GUIDANCE.to_owned(),
             (Self::AfterRestart, true) => [RESTART_GUIDANCE, RESTART_FRESH_TRADEOFF].join(" "),
             (Self::AfterRestart, false) => [RESTART_GUIDANCE, RESTART_CLOSE_TRADEOFF].join(" "),
-            (Self::UnnamedAgent, _) => UNNAMED_AGENT_BODY.to_owned(),
         }
     }
 
     /// Whether doing nothing is the way back. No button is then emphasized
     /// as the next step, since each of them gives that way up.
     pub(in crate::app) fn waits(self) -> bool {
-        self == Self::AfterRestart
+        matches!(self, Self::AfterRestart | Self::UpdateRecovery)
+    }
+
+    /// Whether this card may give up its conversation for a new one. A
+    /// conversation waiting on the update comes back by itself; a new one
+    /// in its place would only lose this tab's way back to it.
+    pub(super) fn offers_fresh(self) -> bool {
+        !matches!(self, Self::UpdateRecovery | Self::UpdateStopped)
+    }
+
+    /// Whether the reader's Reopen conversation is the way back: a start of
+    /// the saved conversation, which the refused restore would not make.
+    pub(in crate::app) fn reopens(self) -> bool {
+        self == Self::UpdateStopped
     }
 }
 
@@ -198,9 +244,11 @@ impl Cagents {
 
     pub(in crate::app) fn blocked_failure_guidance(&self, card: CardId) -> Option<String> {
         self.blocked_failure(card).map(|blocked| {
-            blocked
-                .reopen
-                .guidance(self.chat_offers_fresh_conversation(card))
+            blocked.reopen.guidance(
+                self.chat_offers_fresh_conversation(card),
+                false,
+                self.chat_ui.update_recovery.wait,
+            )
         })
     }
 
@@ -503,6 +551,37 @@ impl Cagents {
             .center(Length::Fill)
             .into(),
         )
+    }
+
+    /// Reopens a conversation the update stopped. Restoring it only meets
+    /// the daemon's refusal again, so this is an explicit start of the saved
+    /// conversation, as Resume conversation and opening it from the sidebar
+    /// make, which also lifts a startup restore's attach-only rule for this
+    /// pane. The provider starts on the conversation with nothing sent.
+    pub(super) fn reopen_stopped(&mut self, card: CardId) -> Task<Message> {
+        if self.chat_start_pending(card) {
+            return Task::none();
+        }
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            if !runtime.start_blocked.is_some_and(Reopen::reopens)
+                || runtime.pending.is_some()
+                || runtime.attachment_chooser_pending.is_some()
+                || runtime.pastes_pending > 0
+            {
+                return Task::none();
+            }
+            runtime.release_start_block();
+            let session = runtime.return_session();
+            return self.start_chat(card, session, chat::Intent::Start, None, false);
+        }
+        if !self
+            .blocked_failure(card)
+            .is_some_and(|blocked| blocked.reopen.reopens())
+        {
+            return Task::none();
+        }
+        self.chat_ui.blocked_starts.remove(&card);
+        self.retry_card_as(card, Some(chat::Intent::Start))
     }
 
     pub(super) fn begin_fresh_conversation(&mut self, card: CardId) -> Task<Message> {

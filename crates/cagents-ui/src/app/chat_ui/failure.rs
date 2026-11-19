@@ -1526,10 +1526,10 @@ impl Runtime {
         let blocked_start = self.start_blocked.filter(|_| current_local_error);
         let mut rows = vec![
             widget::row::with_children(vec![
-                crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+                crate::ui_controls::passive_icon(Icon::Warning, design::LEADING_ICON_SIZE),
                 design::body(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
-                        blocked_recovery::DRAFT_HEADLINE
+                        reopen.draft_headline()
                     } else {
                         reopen.headline()
                     }

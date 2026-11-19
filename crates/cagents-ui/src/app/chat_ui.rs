@@ -120,6 +120,7 @@ mod reader_source;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
 pub(super) mod blocked_recovery;
+pub(in crate::app) use update_recovery::UpdateWait;
 mod scroll;
 mod selectable_prose;
 mod selection;
@@ -130,6 +131,7 @@ mod thumbnails;
 mod tool_text;
 mod tool_title;
 mod turn;
+mod update_recovery;
 mod view;
 mod virtualized;
 mod warm;
@@ -283,6 +285,18 @@ pub enum ReturnRefused {
 #[derive(Clone)]
 pub enum Action {
     PreparationAvailable,
+    /// The daemon's answer about its update restore (see `update_recovery`).
+    UpdateRecoveryAnswered(Result<crate::terminal::ipc::StartupState, String>),
+    /// Time to ask the daemon about its update restore again.
+    UpdateRecoveryDue,
+    /// The daemon finished its update restore: release what it refused.
+    UpdateRecoveryReady,
+    /// Sends a first message the update restore refused, once the daemon no
+    /// longer says that refusal stands.
+    SendAgain(Target),
+    /// Starts again a conversation the update stopped (see
+    /// `blocked_recovery::Reopen::UpdateStopped`).
+    ReopenStopped(CardId),
     FlowAvailable,
     FlowRequest(Target, flow_layout::Request),
     FlowReady(
@@ -762,7 +776,13 @@ impl Action {
             | Self::ChangeListScrolled(target, ..)
             | Self::DropHover(target, ..)
             | Self::ClearCopied(target, ..) => Some(LocalScope::Card(target.card)),
-            Self::PreparationAvailable | Self::FlowAvailable | Self::FindAvailable => {
+            // Asking changes nothing, and an answer changes only what the
+            // panes waiting on it say; releasing them is its own action.
+            Self::PreparationAvailable
+            | Self::FlowAvailable
+            | Self::FindAvailable
+            | Self::UpdateRecoveryAnswered(..)
+            | Self::UpdateRecoveryDue => {
                 Some(LocalScope::Visible)
             }
             _ => None,
@@ -773,6 +793,11 @@ impl Action {
     fn name(&self) -> &'static str {
         match self {
             Self::PreparationAvailable => "PreparationAvailable",
+            Self::UpdateRecoveryAnswered(..) => "UpdateRecoveryAnswered",
+            Self::UpdateRecoveryDue => "UpdateRecoveryDue",
+            Self::UpdateRecoveryReady => "UpdateRecoveryReady",
+            Self::SendAgain(..) => "SendAgain",
+            Self::ReopenStopped(..) => "ReopenStopped",
             Self::FlowAvailable => "FlowAvailable",
             Self::FlowRequest(..) => "FlowRequest",
             Self::FlowReady(..) => "FlowReady",
@@ -1304,6 +1329,9 @@ pub(super) struct State {
     capacity_offers: HashSet<CardId>,
     /// Starts refused as nonretryable before a runtime exists.
     blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
+    /// What the daemon last said about its update restore, for the panes
+    /// that wait on it.
+    update_recovery: update_recovery::Watch,
     /// Expanded diagnostics belong to the exact failed source, never a replacement.
     blocked_details: HashMap<CardId, chat::Session>,
     removed_accounts: HashSet<CardId>,
@@ -1342,6 +1370,7 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
+            update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
@@ -3230,6 +3259,9 @@ pub(super) struct Runtime {
     /// The daemon says repeating this start cannot help, and when the
     /// conversation can come back.
     start_blocked: Option<blocked_recovery::Reopen>,
+    /// What the daemon last said about its update restore, which a pane
+    /// waiting on it explains.
+    update_wait: UpdateWait,
     /// Resume may retire this actor before its replacement answers. Keep the
     /// source body until a successful attachment supplies its successor.
     resume_source_pinned: bool,
@@ -4349,6 +4381,7 @@ impl Runtime {
             close_refusal: None,
             resume_failed: false,
             start_blocked: None,
+            update_wait: UpdateWait::default(),
             resume_source_pinned: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
@@ -6469,8 +6502,10 @@ impl Runtime {
     fn offers_fresh_conversation(&self) -> bool {
         let source = self.return_session();
         source.launch.session_id.is_some()
-            && (self.start_blocked.is_some()
-                || (self.snapshot.exited && self.snapshot.session_id != source.launch.session_id))
+            && self.start_blocked.map_or(
+                self.snapshot.exited && self.snapshot.session_id != source.launch.session_id,
+                blocked_recovery::Reopen::offers_fresh,
+            )
             && source.fresh_start().is_some()
     }
     /// Whether this card's provider stopped while the daemon that ran it still
@@ -9605,17 +9640,25 @@ impl Cagents {
         .then_some(CAPACITY_GUIDANCE)
     }
 
+    /// Whether retrying this card's start would only meet the refusal it has
+    /// already met. One that waits on the update restore stands only while
+    /// the daemon says it does.
     pub(super) fn chat_retry_blocked(&self, card: CardId) -> bool {
+        let stands = |reopen: blocked_recovery::Reopen| {
+            reopen != blocked_recovery::Reopen::UpdateRecovery
+                || self.chat_ui.update_recovery.wait.holds()
+        };
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.start_blocked.is_some(),
+            Some(CardRuntime::Chat(runtime)) => runtime.start_blocked.is_some_and(stands),
             _ => self
                 .chat_ui
                 .blocked_starts
                 .get(&card)
                 .is_some_and(|blocked| {
-                    self.card_state(card).is_some_and(|state| {
-                        matches!(&state.kind, CardKind::Chat(current) if *current == blocked.source)
-                    })
+                    stands(blocked.reopen)
+                        && self.card_state(card).is_some_and(|state| {
+                            matches!(&state.kind, CardKind::Chat(current) if *current == blocked.source)
+                        })
                 }),
         }
     }
@@ -9669,7 +9712,15 @@ impl Cagents {
                 runtime.offers_fresh_conversation()
                     && self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Chat(current) if current == &runtime.session || current == &runtime.return_session()))
             }
-            _ => self.chat_retry_blocked(card) || self.chat_ui.fresh_offers.contains(&card),
+            _ => {
+                (self
+                    .chat_ui
+                    .blocked_starts
+                    .get(&card)
+                    .is_some_and(|blocked| blocked.reopen.offers_fresh())
+                    && self.chat_retry_blocked(card))
+                    || self.chat_ui.fresh_offers.contains(&card)
+            }
         };
         offered
             && self.chat_return_session(card).is_some_and(|source| {
@@ -11754,6 +11805,25 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::UpdateRecoveryAnswered(answer) => {
+                return self.update_recovery_answered(answer);
+            }
+            Action::UpdateRecoveryDue => return self.update_recovery_due(),
+            Action::UpdateRecoveryReady => return self.release_update_recovery(),
+            Action::SendAgain(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.start_blocked != Some(blocked_recovery::Reopen::UpdateRecovery)
+                    || runtime.update_wait.holds()
+                    || !runtime.is_draft()
+                {
+                    return Task::none();
+                }
+                runtime.release_start_block();
+                return self.handle_chat_ui_inner(Action::Submit(target, PromptMode::Send));
+            }
+            Action::ReopenStopped(card) => return self.reopen_stopped(card),
             Action::CopyClosedDraft(target, revision) => {
                 return self.copy_closed_chat_draft(target, revision);
             }
@@ -12639,10 +12709,12 @@ impl Cagents {
                             runtime.start_blocked = blocked_recovery::Reopen::of(failure.recovery);
                             runtime.error = Some(failure.message);
                         }
-                        let restore = if failure.recovery == chat::Recovery::Account {
-                            self.offer_chat_account_restore(target.card, &attempt.session, true)
-                        } else {
-                            Task::none()
+                        let restore = match failure.recovery {
+                            chat::Recovery::Account => {
+                                self.offer_chat_account_restore(target.card, &attempt.session, true)
+                            }
+                            chat::Recovery::UpdateRecovery => self.update_refused(),
+                            _ => Task::none(),
                         };
                         return Task::batch([
                             self.retire_chat(target.card, None, Some(attempt.session)),
@@ -12757,6 +12829,8 @@ impl Cagents {
                             blocked_recovery::Reopen::of(failure.recovery)
                         };
                         let mut running = Task::none();
+                        let update_refused =
+                            blocked == Some(blocked_recovery::Reopen::UpdateRecovery);
                         if let Some(reopen) = blocked {
                             self.chat_ui.blocked_starts.insert(
                                 target.card,
@@ -12820,29 +12894,38 @@ impl Cagents {
                                 self.chat_ui.capacity_offers.remove(&target.card);
                             }
                             self.fail_runtime(target.card, failure.message.clone());
-                            // The notice says what the reader lost in their
-                            // terms; the pane keeps the daemon's reason, and
-                            // the attempt that succeeds withdraws the notice.
-                            let pane = self
-                                .notice_pane_name(target.card)
-                                .unwrap_or_else(|| "a conversation".to_owned());
-                            // A launch that names no conversation had none to
-                            // reopen: starting it is what failed.
-                            // An agent's conversation that ran is reopened,
-                            // even though it was never named.
-                            let verb = if attempt.intent == chat::Intent::Start
-                                && attempt.session.launch.session_id.is_none()
-                                && !unnamed_agent
+                            if update_refused
+                                || blocked.is_some_and(blocked_recovery::Reopen::reopens)
                             {
-                                "start"
+                                // The pane says what the update did to it and
+                                // offers what works now, so an error that it
+                                // could not reopen would only alarm.
+                                self.resolve_notice(NoticeKey::ChatAttach(target.card));
                             } else {
-                                "reopen"
-                            };
-                            self.status = Some(
-                                TransientNotice::error(format!("Could not {verb} {pane}."))
-                                    .with_details(failure.message)
-                                    .with_key(NoticeKey::ChatAttach(target.card)),
-                            );
+                                // The notice says what the reader lost in their
+                                // terms; the pane keeps the daemon's reason, and
+                                // the attempt that succeeds withdraws the notice.
+                                let pane = self
+                                    .notice_pane_name(target.card)
+                                    .unwrap_or_else(|| "a conversation".to_owned());
+                                // A launch that names no conversation had none to
+                                // reopen: starting it is what failed.
+                                // An agent's conversation that ran is reopened,
+                                // even though it was never named.
+                                let verb = if attempt.intent == chat::Intent::Start
+                                    && attempt.session.launch.session_id.is_none()
+                                    && !unnamed_agent
+                                {
+                                    "start"
+                                } else {
+                                    "reopen"
+                                };
+                                self.status = Some(
+                                    TransientNotice::error(format!("Could not {verb} {pane}."))
+                                        .with_details(failure.message)
+                                        .with_key(NoticeKey::ChatAttach(target.card)),
+                                );
+                            }
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
@@ -12867,6 +12950,11 @@ impl Cagents {
                             self.drain_terminal(target.card, 0),
                             cleanup,
                             running,
+                            if update_refused {
+                                self.update_refused()
+                            } else {
+                                Task::none()
+                            },
                             if terminal_switch {
                                 cosmic::task::message(Message::ChromeUi(
                                     chrome_ui::Action::ShowNoticesFor(target.card),
@@ -14428,8 +14516,12 @@ impl Cagents {
                         runtime.find_disclosure.manual_item(&id);
                         &mut runtime.expanded
                     };
-                    if !expanded.remove(&id) {
+                    let open = !expanded.remove(&id);
+                    if open {
                         expanded.insert(id.clone());
+                    }
+                    if runtime.selected_subagent.is_none() {
+                        runtime.follow_lone_step(&id, open);
                     }
                     if runtime.active_item(&id).is_some_and(|item| {
                         matches!(
@@ -14480,13 +14572,10 @@ impl Cagents {
                     runtime.find_navigation.cancel();
                     // Invert the visible default on the first toggle, then
                     // remember explicit choices across paging. Ignore stale keys.
-                    if runtime.turns.iter().any(|turn| turn.key == key) {
+                    if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
+                        let open = !runtime.group_open(turn);
                         runtime.find_disclosure.manual_turn(&key);
-                        let open = runtime
-                            .opened
-                            .entry(key)
-                            .or_insert(runtime.tool_groups_expanded);
-                        *open = !*open;
+                        runtime.opened.insert(key, open);
                     }
                 }
             }

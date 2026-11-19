@@ -1500,17 +1500,22 @@ fn prove_daemon_ready(
     Ok((socket, Some(client)))
 }
 
-/// Provider activation requested by a person, after an attach-only recovery.
-/// Its transport is separate from the window's automatic read-only readers.
-pub fn ensure_daemon_ready_for_explicit_action() -> Result<PathBuf, HostedTerminalStartError> {
+/// [`connect_ready_daemon`] for provider activation requested by a person,
+/// after an attach-only recovery. Its transport is separate from the
+/// window's automatic read-only readers.
+pub fn connect_ready_daemon_for_explicit_action() -> Result<ReadyDaemon, HostedTerminalStartError> {
     if let Some(socket) = crate::device::socket_path_for_explicit_action()
         .map_err(HostedTerminalStartError::SocketPath)?
     {
-        return Ok(socket);
+        // Nothing proves a selected device's daemon ready, so this
+        // connection is the first to reach it.
+        let client = crate::control::ControlClient::connect(&socket)
+            .map_err(HostedTerminalStartError::Connect)?;
+        return Ok(ReadyDaemon { socket, client });
     }
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
-    ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
-    Ok(socket)
+    let client = ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)?;
+    Ok(ReadyDaemon { socket, client })
 }
 
 /// Proves the daemon at `socket` ready, starting it if nothing listens there,
@@ -3864,12 +3869,15 @@ mod tests {
                                         resumed: Vec::new(),
                                     }
                                 }
-                                ClientRequest::List => ServerResponse::Listed {
-                                    terminals: Vec::new(),
-                                },
+                                ClientRequest::ListPage { after: None } => {
+                                    ServerResponse::ListedPage {
+                                        terminals: Vec::new(),
+                                        complete: true,
+                                    }
+                                }
                                 request => panic!("unexpected request {request:?}"),
                             };
-                            let listed = matches!(response, ServerResponse::Listed { .. });
+                            let listed = matches!(response, ServerResponse::ListedPage { .. });
                             write_frame(
                                 &mut stream,
                                 &ServerEnvelope {

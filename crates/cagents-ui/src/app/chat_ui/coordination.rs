@@ -989,9 +989,11 @@ impl widget::menu::Action for RowCommand<'_> {
     }
 }
 
-/// A glyph at the size and tone of the step rows beside it.
-fn muted_glyph(icon: Icon) -> Element<'static, Message> {
-    crate::ui_controls::passive_icon(icon.handle(), design::COMPACT_ICON_SIZE)
+/// A glyph in the step rows' muted tone, at `size`: a row's lead at
+/// [`design::LEADING_ICON_SIZE`], as a step row's, and its trailing arrow or a
+/// caption's mark at [`design::COMPACT_ICON_SIZE`].
+fn muted_glyph(icon: Icon, size: u16) -> Element<'static, Message> {
+    crate::ui_controls::passive_icon(icon.handle(), size)
 }
 
 /// The transcript's own background, which a row's open detail sits on, so
@@ -1409,7 +1411,7 @@ impl Runtime {
         let failed = row.state.tone == Tone::Error;
         let lead: Element<'static, Message> = if failed {
             widget::icon(Icon::Error.handle())
-                .size(design::COMPACT_ICON_SIZE)
+                .size(design::LEADING_ICON_SIZE)
                 .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
                     cosmic::iced::widget::svg::Style {
                         color: Some(design::destructive_color(theme)),
@@ -1417,7 +1419,7 @@ impl Runtime {
                 })))
                 .into()
         } else {
-            muted_glyph(row.glyph)
+            muted_glyph(row.glyph, design::LEADING_ICON_SIZE)
         };
         let (tip, name) = row.described();
         let label = row.shown.clone();
@@ -1519,7 +1521,7 @@ impl Runtime {
             // pointer is. It only marks the row as one that opens: the row
             // is the control, so a click on the arrow is a click on the
             // row, and keyboard traversal and screen readers meet it once.
-            let arrow = widget::container(muted_glyph(Icon::Open))
+            let arrow = widget::container(muted_glyph(Icon::Open, design::COMPACT_ICON_SIZE))
                 .padding(iced::Padding {
                     right: step::GAP_S,
                     ..iced::Padding::ZERO
@@ -1754,7 +1756,7 @@ impl Runtime {
         widget::container(
             widget::column::with_children(vec![
                 widget::row::with_children(vec![
-                    muted_glyph(Icon::Chat),
+                    muted_glyph(Icon::Chat, design::COMPACT_ICON_SIZE),
                     design::caption(caption).into(),
                 ])
                 .spacing(step::GAP_XS)

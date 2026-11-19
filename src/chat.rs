@@ -400,13 +400,29 @@ pub enum Recovery {
     /// stop being the way back to it, rather than implying either a deletion
     /// or a round trip that is not there.
     Fresh,
+    /// The daemon is still restoring the conversations an update carried
+    /// over, or holds that restore for recovery
+    /// ([`STARTUP_RECOVERY_REFUSAL`]), and refused this before starting
+    /// anything. Nothing about this conversation is wrong: the same request
+    /// is admitted once the daemon's startup recovery has finished, which the
+    /// client learns by asking the daemon's startup state.
+    UpdateRecovery,
+    /// The update's restore restarted this conversation, the restart failed,
+    /// and the daemon stopped it again ([`UPDATE_RESTART_STOPPED`]). Nothing of
+    /// it runs and nothing was resent. Attaching to it again, which is all a
+    /// restore does, only meets the same refusal; an explicit start of the
+    /// saved conversation reopens it, and the reader has to ask for that.
+    UpdateStopped,
 }
 
 impl Recovery {
     /// Whether repeating the same start cannot help until something outside
     /// this card changes.
     pub fn is_blocked(self) -> bool {
-        matches!(self, Self::Blocked | Self::AfterRestart)
+        matches!(
+            self,
+            Self::Blocked | Self::AfterRestart | Self::UpdateRecovery | Self::UpdateStopped
+        )
     }
 }
 
@@ -2111,6 +2127,31 @@ impl Serialize for ToolStatus {
             Self::Ended => "Ended",
         };
         serializer.serialize_unit_variant("ToolStatus", status as u32, name)
+    }
+}
+
+/// Characters of a task kept in its short name.
+const SHORT_NAME_CHARS: usize = 60;
+
+/// The first non-empty line of the first text that has one, cut to the
+/// length a list of names can show.
+pub(crate) fn short_name<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let line = texts
+        .into_iter()
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))?;
+    let mut chars = line.chars();
+    let mut name: String = chars.by_ref().take(SHORT_NAME_CHARS).collect();
+    if chars.next().is_some() {
+        name.push('…');
+    }
+    Some(name)
+}
+
+impl Subagent {
+    /// Whether it holds its conversation apart from the turn: it runs in the
+    /// background, or waits on background work of its own.
+    pub fn outlives_turn(&self) -> bool {
+        self.status == ToolStatus::Waiting || self.background && self.status.is_live()
     }
 }
 

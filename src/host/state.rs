@@ -2200,6 +2200,10 @@ impl HostState {
     }
 
     pub(super) fn startup_recovery(&self) -> Option<&str> {
+        #[cfg(debug_assertions)]
+        if let Some(held) = super::fixture_startup_recovery::held() {
+            return Some(held.detail());
+        }
         self.startup_recovery.as_deref().or_else(|| {
             (!self.startup_custody.is_empty())
                 .then_some("Original terminal ownership is awaiting its startup outcome")
@@ -2225,6 +2229,10 @@ impl HostState {
     /// A retained failure outranks custody still awaiting its outcome: it is
     /// never cleared, so waiting on the remaining custody cannot finish startup.
     pub(super) fn startup_state(&self) -> StartupState {
+        #[cfg(debug_assertions)]
+        if let Some(held) = super::fixture_startup_recovery::held() {
+            return held.state();
+        }
         match &self.startup_recovery {
             Some(detail) => StartupState::Retained {
                 detail: detail.clone(),
@@ -3522,8 +3530,17 @@ fn restart_or_stop(
     unattached: &mut Vec<crate::upgrade::handoff::UnattachedChat>,
     queue_budget: &mut super::chat::UpgradeRestoreQueueBudget,
 ) -> Result<(), String> {
-    let Err(reason) = super::chat::restore_upgrade_with_queue_budget(host, chat, queue_budget)
-    else {
+    // A debug fixture's stand-in for a restart that fails: nothing starts,
+    // and the conversation is stopped and recorded as a failed one is.
+    #[cfg(debug_assertions)]
+    let injected = super::fixture_startup_recovery::stopped().map(str::to_owned);
+    #[cfg(not(debug_assertions))]
+    let injected: Option<String> = None;
+    let restarted = match injected {
+        Some(reason) => Err(reason),
+        None => super::chat::restore_upgrade_with_queue_budget(host, chat, queue_budget),
+    };
+    let Err(reason) = restarted else {
         return Ok(());
     };
     if crate::daemon::termination_requested() {

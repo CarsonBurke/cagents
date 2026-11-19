@@ -2220,12 +2220,7 @@ impl Runtime {
                             self.selection_item(&mut builder, item, turn::Slot::Prose, true);
                         }
                     }
-                    if self
-                        .opened
-                        .get(&turn.key)
-                        .copied()
-                        .unwrap_or(self.tool_groups_expanded)
-                    {
+                    if self.steps_shown(turn) {
                         for placed in &turn.steps {
                             if let Some(item) = items.get(placed.index) {
                                 self.selection_item(&mut builder, item, placed.slot, true);
@@ -3508,10 +3503,20 @@ impl Runtime {
         } else {
             design::raised
         };
+        // A saved conversation the update refused takes no message in this
+        // pane until it reopens (#2905): the box would take typing with
+        // nowhere to send it. What it holds stays readable and copyable. A
+        // pane that can start a new conversation in its place, which takes
+        // the message along, and a refused first message stay editable.
+        let read_only = transitioning
+            || (self
+                .start_blocked
+                .is_some_and(|reopen| !reopen.offers_fresh())
+                && !self.is_draft());
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             // Nothing can be typed while the conversation changes hands.
-            .placeholder(if transitioning { "" } else { placeholder })
+            .placeholder(if read_only { "" } else { placeholder })
             .size(design::TEXT_PROSE)
             .height(Length::Shrink)
             .max_height(composer_ceiling)
@@ -3520,7 +3525,7 @@ impl Runtime {
             .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                 composer_editor_style,
             )));
-        let editor: Element<'_, Message> = if transitioning {
+        let editor: Element<'_, Message> = if read_only {
             // While the conversation changes hands the draft stays in place
             // and can still be scrolled, selected and copied, but not edited.
             // It is the same editor rather than a text copy of the draft,
@@ -5407,6 +5412,19 @@ impl Runtime {
                 scroll::item(&item.id, body)
             }
             TurnPart::Steps => {
+                // A group of one step is that step. `for_each_turn_part`
+                // places the strip only when a step is not drawn as a
+                // failure, so a lone one here is drawn as a row.
+                if let [only] = turn.steps.as_slice()
+                    && let Some((item, cached)) = placed(only.index)
+                {
+                    return widget::container(scroll::item(
+                        &item.id,
+                        self.lone_step_view(turn, item, cached, settings),
+                    ))
+                    .id(scroll::steps_id(&item.id))
+                    .into();
+                }
                 let strip = self.step_strip(turn, || {
                     turn.steps
                         .iter()
@@ -5933,7 +5951,9 @@ impl Runtime {
                 self.image_preview(item, cached)
             } else {
                 widget::row::with_children(vec![
-                    widget::icon(Icon::Attachment.handle()).size(12).into(),
+                    widget::icon(Icon::Attachment.handle())
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into(),
                     if let Some(text) = image_text {
                         prose::paragraph(
                             design::markdown_settings(

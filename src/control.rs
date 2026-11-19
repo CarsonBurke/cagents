@@ -58,6 +58,12 @@ pub use work::{WorkCommand, WorkListArgs};
 #[cfg(feature = "ui")]
 pub(crate) mod invocation;
 
+/// Whether a command's text, file or definition argument names standard
+/// input: a lone `-`, wherever a command reads one.
+pub(crate) fn standard_input(word: impl AsRef<std::ffi::OsStr>) -> bool {
+    word.as_ref() == "-"
+}
+
 use crate::{
     agent_execution::Authority,
     instance::{
@@ -1119,6 +1125,28 @@ impl ControlClient {
 
     pub fn proof(&self) -> &HostSessionProof {
         &self.proof
+    }
+
+    /// The stream and proof of a connection that has asked nothing since its
+    /// handshake, for a client that goes on in a protocol of its own, as a
+    /// native chat does, without connecting and handshaking again.
+    ///
+    /// Panics if anything was asked on it: a reply or notification it read
+    /// would be lost to the new owner.
+    pub fn into_handshaken_stream(self) -> (UnixStream, HostSessionProof) {
+        assert!(
+            self.protocol == PROTOCOL_VERSION
+                && self.next_request_id == 2
+                && self.observed.is_empty()
+                && self.observed_model.is_empty()
+                && self.observed_notifications.is_empty()
+                && self.observed_work.is_none()
+                && self.observed_conversation.is_none()
+                && self.attached_chats.is_empty()
+                && self.terminal_streams.is_empty(),
+            "only a connection that has asked nothing since its handshake can be handed over"
+        );
+        (self.stream, self.proof)
     }
 
     /// Whether nothing has arrived on this connection since its last reply,

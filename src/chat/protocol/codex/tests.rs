@@ -5033,7 +5033,7 @@ fn an_unrecognized_item_part_or_untracked_patch_cannot_end_the_session() {
 
 #[test]
 fn command_actions_classify_the_command_and_name_its_target() {
-    let read = json!({"id":"0","type":"commandExecution","command":"sed -n '1,20p' src/app.rs","cwd":"/repo","status":"completed","exitCode":0,"durationMs":12,"aggregatedOutput":"fn main() {}","commandActions":[{"type":"unknown","command":"cd /repo"},{"type":"read","command":"sed -n '1,20p' src/app.rs","name":"app.rs","path":"src/app.rs"},{"type":"search","command":"rg main","query":"main","path":"src"}]});
+    let read = json!({"id":"0","type":"commandExecution","command":"sed -n '1,20p' src/app.rs","cwd":"/repo","status":"completed","exitCode":0,"durationMs":12,"aggregatedOutput":"fn main() {}","commandActions":[{"type":"read","command":"sed -n '1,20p' src/app.rs","name":"app.rs","path":"src/app.rs"}]});
     let items = parse_item(&read, true, "turn").unwrap();
     let ItemContent::Command {
         label,
@@ -5073,6 +5073,73 @@ fn command_actions_classify_the_command_and_name_its_target() {
     assert_eq!(*status, ToolStatus::Running);
     assert_eq!(*exit_code, None);
     assert_eq!(*duration_ms, None);
+}
+
+/// A compound command is classified by what all of it does, never by the
+/// one part Codex could name. These are the shapes Codex reports for the
+/// compound commands agents run.
+#[test]
+fn a_compound_command_is_classified_only_when_every_part_does_the_same() {
+    let intent = |command: &str, actions: Value| {
+        let item = json!({"id":"0","type":"commandExecution","command":command,"cwd":"/repo","status":"completed","exitCode":0,"commandActions":actions});
+        let items = parse_item(&item, true, "turn").unwrap();
+        let ItemContent::Command { action, label, .. } = &items[0].content else {
+            panic!("A Codex commandExecution must map to a command");
+        };
+        (*action, label.clone())
+    };
+    let ran = (CommandAction::Run, String::new());
+    // Listing, then reading: neither is what the command is.
+    assert_eq!(
+        intent(
+            "ls docs && sed -n '1,120p' docs/development.md",
+            json!([
+                {"type":"listFiles","command":"ls docs","path":"docs"},
+                {"type":"read","command":"sed -n '1,120p' docs/development.md","name":"development.md","path":"docs/development.md"}
+            ])
+        ),
+        ran
+    );
+    // Two files read is not a read of the first.
+    assert_eq!(
+        intent(
+            "cat CLAUDE.md; cat docs/development.md",
+            json!([
+                {"type":"read","command":"cat CLAUDE.md","name":"CLAUDE.md","path":"CLAUDE.md"},
+                {"type":"read","command":"cat docs/development.md","name":"development.md","path":"docs/development.md"}
+            ])
+        ),
+        ran
+    );
+    // A part Codex could not name, here the issue's `cagents … sessions`.
+    assert_eq!(
+        intent(
+            "ls ~/.config/cagents/; timeout 20 cagents --device fw16 --no-start sessions --json",
+            json!([
+                {"type":"listFiles","command":"ls ~/.config/cagents/","path":"cagents"},
+                {"type":"unknown","command":"timeout 20 cagents --device fw16 --no-start sessions --json"}
+            ])
+        ),
+        ran
+    );
+    // Two views of one file are still a read of it.
+    assert_eq!(
+        intent(
+            "sed -n '1,40p' src/app.rs && sed -n '200,240p' src/app.rs",
+            json!([
+                {"type":"read","command":"sed -n '1,40p' src/app.rs","name":"app.rs","path":"src/app.rs"},
+                {"type":"read","command":"sed -n '200,240p' src/app.rs","name":"app.rs","path":"src/app.rs"}
+            ])
+        ),
+        (CommandAction::Read, "src/app.rs".to_owned())
+    );
+    assert_eq!(
+        intent(
+            "rg -n 'fn main' src",
+            json!([{"type":"search","command":"rg -n 'fn main' src","query":"fn main","path":"src"}])
+        ),
+        (CommandAction::Search, "fn main in src".to_owned())
+    );
 }
 
 #[test]

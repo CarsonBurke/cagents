@@ -1,6 +1,6 @@
 //! Who is at work in a channel: its live agents and its open plain
-//! terminals, drawn in place of the channel glyph as the mark of the one most
-//! worth seeing, with how many there are.
+//! terminals, drawn as the mark of the one most worth seeing in place of the
+//! channel glyph, with the rest of them beside the title.
 //!
 //! The row model keeps a [`Members`] tally rather than a list of sessions.
 //! It is a few counters, so the navigation cache compares it as cheaply as the
@@ -9,10 +9,24 @@
 //! idle, then terminals. Within one state, providers keep their declaration
 //! order, so a row does not reshuffle when an unrelated card moves.
 //!
-//! The row draws one mark, not one per member: at 1x a mark small enough to
-//! share the glyph column with three others is a smudge. A second provider
-//! peeks out behind it when the channel mixes providers, and a count badge
-//! says how many there are; the tooltip and the accessible name list them.
+//! An expanded row leads with one mark, whole and centred in the glyph
+//! column like every other row's glyph. The others follow the title as a
+//! facepile: a face for each of them, up to a few, overlapping only by a few
+//! pixels, then how many more there are. Faces show the kinds the lead does
+//! not, first, then more of the kinds already shown. The glyph column is one
+//! glyph wide; a second mark and a count squeezed into it covered each other
+//! and pushed the lead out of line.
+//!
+//! The title keeps priority. A title that fits the row is never cut for the
+//! pile: the pile shows as many faces as fit beside it, or nothing. A title
+//! too long for the row is cut anyway, so it shares the row with one face
+//! and the count, unless that would leave too little of it to read. A count
+//! is never shown without a face, which would say how many but not who.
+//!
+//! The collapsed rail has no room beside its glyph, so there a second
+//! provider peeks out behind the lead's mark and a count badge says how
+//! many there are. The tooltip and the accessible name list every member
+//! either way.
 
 use std::sync::LazyLock;
 
@@ -166,8 +180,58 @@ impl Members {
         self.iter().next()
     }
 
+    /// The members after the lead, as the facepile shows them: a face for
+    /// each of them, at most [`MAX_FACES`], and how many members there are
+    /// after the lead.
+    ///
+    /// The faces say who else is there, so each kind among them gets a face
+    /// before any kind gets a second: first the kinds the lead's mark does
+    /// not show, in display order, then the lead's own kind, then the
+    /// remaining members in display order. A channel of three Claude Code
+    /// agents shows two Claude Code faces after its lead; a channel of
+    /// terminals shows one terminal face and counts the rest. One terminal
+    /// face is the most a pile draws: it is a themed glyph that cannot be
+    /// cut for a neighbour, so two of them could not overlap.
+    pub fn company(&self) -> Company {
+        let Some(lead) = self.lead().map(Face::of) else {
+            return Company {
+                faces: Vec::new(),
+                others: 0,
+            };
+        };
+        let mut kinds: Vec<Face> = Vec::with_capacity(Provider::ALL.len() + 1);
+        let mut others = 0;
+        for member in self.iter().skip(1) {
+            others += 1;
+            let face = Face::of(member);
+            if !kinds.contains(&face) {
+                kinds.push(face);
+            }
+        }
+        // A stable sort: the lead's kind moves to the end, the others keep
+        // their display order.
+        kinds.sort_by_key(|face| *face == lead);
+        let mut faces = kinds.clone();
+        faces.truncate(MAX_FACES);
+        // Each kind's first member already has its face; the members after
+        // those fill what room is left.
+        let mut first = kinds;
+        for face in self.iter().skip(1).map(Face::of) {
+            if faces.len() == MAX_FACES {
+                break;
+            }
+            if let Some(index) = first.iter().position(|kind| *kind == face) {
+                first.swap_remove(index);
+            } else if face != Face::Terminal {
+                faces.push(face);
+            }
+        }
+        Company { faces, others }
+    }
+
     /// A provider other than the lead's, the first in display order, which
-    /// peeks out behind the lead's mark. Terminals have no provider to show.
+    /// peeks out behind the lead's mark in the rail. Terminals have no
+    /// provider to show.
     pub fn peek(&self) -> Option<Provider> {
         let lead = match self.lead()? {
             Member::Agent(provider, _) => provider,
@@ -180,8 +244,48 @@ impl Members {
     }
 }
 
-/// The square the mark is laid out in: the row's glyph column. The badge
-/// overhangs it to the right and below, into the gutter before the title.
+/// One kind of member, as a face in the facepile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Face {
+    Provider(Provider),
+    Terminal,
+}
+
+impl Face {
+    fn of(member: Member) -> Self {
+        match member {
+            Member::Agent(provider, _) => Self::Provider(provider),
+            Member::Terminal => Self::Terminal,
+        }
+    }
+}
+
+/// The members after a row's lead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Company {
+    /// The faces the pile may show, in the order a narrowing row keeps
+    /// them; see [`Members::company`].
+    pub faces: Vec<Face>,
+    /// How many members there are after the lead.
+    pub others: usize,
+}
+
+/// The most faces a pile shows; any more members are counted.
+pub const MAX_FACES: usize = 3;
+/// A face. Provider artwork fills its square, where the terminal's symbolic
+/// glyph leaves a margin, so the two read at about the same weight here.
+const FACE: f32 = design::LEADING_ICON_SIZE as f32;
+/// How much of a face the next one covers: enough to read as one group,
+/// little enough that each face's artwork stays whole enough to recognise.
+const FACE_OVERLAP: f32 = 4.0;
+const FACE_STEP: f32 = FACE - FACE_OVERLAP;
+/// The clear ring cut around a face where its neighbour covers it.
+const FACE_GAP: f32 = 1.5;
+/// Between the last face and the count.
+const COUNT_GAP: f32 = 2.0;
+
+/// The square the mark is laid out in: the row's glyph column. In the rail
+/// the badge overhangs it to the right and below.
 const BOX: f32 = super::ROW_ICON_WIDTH;
 /// The lead's mark. Provider artwork fills its square, where a symbolic
 /// glyph leaves a margin, so it is drawn a pixel larger than the glyphs
@@ -189,9 +293,10 @@ const BOX: f32 = super::ROW_ICON_WIDTH;
 const LEAD: f32 = 15.0;
 /// The terminal glyph is a symbolic glyph like the channel glyph it replaces.
 const TERMINAL: u16 = super::CHILD_ROW_ICON_SIZE;
-/// The lead's centre when a badge or a peeking mark goes with it: left of
-/// the column's centre, which leaves the badge room before the title. A lone
-/// mark keeps the column's centre, in line with the glyphs above and below.
+/// The lead's centre in the rail's box when a badge or a peeking mark goes
+/// with it: left of the box's centre, which leaves the badge room. A lone
+/// mark, and every expanded row's mark, keeps the column's centre, in line
+/// with the glyphs above and below.
 const LEAD_CENTRE: Point = Point::new(8.0, BOX / 2.0);
 const LONE_CENTRE: Point = Point::new(BOX / 2.0, BOX / 2.0);
 /// The peeking provider's mark, and where its centre sits from the lead's.
@@ -223,10 +328,6 @@ const RAIL_LEAD_X: f32 = 11.0;
 /// The badge's right edge, from the lead's centre.
 const BADGE_RIGHT: f32 = BADGE_OFFSET.0 + BADGE_WIDTHS[0] / 2.0;
 
-const _: () = assert!(
-    LEAD_CENTRE.x + BADGE_RIGHT <= BOX + super::ROW_GUTTER - 2.0,
-    "the badge stops short of the title"
-);
 const _: () = assert!(
     RAIL_LEAD_X + BADGE_RIGHT <= super::rail::CELL_WIDTH - super::rail::DISC + super::rail::RING,
     "the badge stops at the rail corner badges' ring"
@@ -266,12 +367,13 @@ pub fn view<Message: 'static>(
 ) -> Option<Element<'static, Message>> {
     let lead = members.lead()?;
     let count = members.len();
-    let badge = (count > 1).then(|| badge_label(count));
+    // An expanded row's others follow its title; see [`company`].
+    let badge = (count > 1 && ground == Ground::Rail).then(|| badge_label(count));
     let width = badge
         .as_deref()
         .map(|label| BADGE_WIDTHS[usize::from(label.len() > 1)]);
     let opacity = if ink == RowInk::Muted { 0.55 } else { 1.0 };
-    let peek = members.peek();
+    let peek = members.peek().filter(|_| ground == Ground::Rail);
     let lone = badge.is_none() && peek.is_none();
     let centre = if lone { LONE_CENTRE } else { LEAD_CENTRE };
     let mut layers: Vec<Element<'static, Message>> = Vec::with_capacity(3);
@@ -284,8 +386,8 @@ pub fn view<Message: 'static>(
     }
     let (handle, size) = match lead {
         Member::Agent(provider, _) => (lead_handle(provider, width), LEAD),
-        // A themed glyph's drawing is not ours to cut, so the badge sits on
-        // it; it is drawn only for a channel of terminals alone.
+        // A themed glyph's drawing is not ours to cut, so the rail's badge
+        // sits on it; it is drawn only for a channel of terminals alone.
         Member::Terminal => (Icon::Terminal.handle(), f32::from(TERMINAL)),
     };
     layers.push(at(
@@ -311,6 +413,232 @@ pub fn view<Message: 'static>(
             .width(Length::Fixed(super::rail::CELL_WIDTH))
             .into(),
     })
+}
+
+/// What a row's facepile needs: the faces it may show and the widths of
+/// its count labels, so a row can choose how much of it fits beside its
+/// title without measuring text again on every layout.
+pub struct Pile {
+    company: Company,
+    /// `count_widths[shown - 1]` is the width of the count drawn after
+    /// `shown` faces, or zero when those faces stand for every member.
+    count_widths: Vec<f32>,
+}
+
+/// How a row's title and its facepile share the room beside the glyph.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fit {
+    /// How many faces the pile shows, with their count; none hides it.
+    pub faces: usize,
+    /// The title's width: all of it, or what is left after the pile.
+    pub title: f32,
+}
+
+/// The least of a title a row keeps beside a face; any less and the pile
+/// goes, since a few letters say less than the tooltip's list.
+pub const MIN_TITLE: f32 = 48.0;
+
+impl Pile {
+    /// `None` when the lead is alone. `measure` gives a caption's width.
+    pub fn new(members: &Members, measure: impl Fn(&str) -> f32) -> Option<Self> {
+        let company = members.company();
+        if company.faces.is_empty() {
+            return None;
+        }
+        let count_widths = (1..=company.faces.len())
+            .map(|shown| count_label(&company, shown).map_or(0.0, |label| measure(&label).ceil()))
+            .collect();
+        Some(Self {
+            company,
+            count_widths,
+        })
+    }
+
+    /// The width of the pile with `shown` faces, and their count; zero for
+    /// none.
+    pub fn width(&self, shown: usize) -> f32 {
+        if shown == 0 {
+            return 0.0;
+        }
+        let count = self.count_widths[shown - 1];
+        let faces = FACE + (shown - 1) as f32 * FACE_STEP;
+        faces + if count > 0.0 { COUNT_GAP + count } else { 0.0 }
+    }
+
+    /// How a title `natural` pixels wide shares `room` with this pile, a
+    /// gutter between them. A title that fits keeps all of itself beside
+    /// as many faces as also fit, which may be none. A title that does not
+    /// fit is cut anyway, so it keeps all but the room one face and the
+    /// count take, unless that leaves it less than [`MIN_TITLE`].
+    pub fn fit(&self, room: f32, natural: f32) -> Fit {
+        let gutter = super::ROW_GUTTER;
+        if natural <= room {
+            let faces = (1..=self.company.faces.len())
+                .rev()
+                .find(|&shown| natural + gutter + self.width(shown) <= room)
+                .unwrap_or(0);
+            return Fit {
+                faces,
+                title: natural,
+            };
+        }
+        let title = room - gutter - self.width(1);
+        if title >= MIN_TITLE {
+            Fit { faces: 1, title }
+        } else {
+            Fit {
+                faces: 0,
+                title: room.max(0.0),
+            }
+        }
+    }
+
+    /// The pile with `shown` faces, in the row's `ink`. `face_id` names
+    /// each face's place in the pile.
+    pub fn view<Message: 'static>(
+        &self,
+        shown: usize,
+        ink: RowInk,
+        face_id: impl Fn(usize) -> widget::Id,
+    ) -> Element<'static, Message> {
+        let opacity = if ink == RowInk::Muted { 0.55 } else { 1.0 };
+        let faces = &self.company.faces[..shown.min(self.company.faces.len())];
+        if faces.is_empty() {
+            return cosmic::iced::widget::Space::new().into();
+        }
+        // Neighbouring faces overlap, and one of each pair passes behind
+        // the other with a clear ring cut where it does. A terminal is a
+        // themed glyph whose drawing is not ours to cut, so it is on top of
+        // both its neighbours; without one, the last face is. Faces before
+        // the top one pass behind the face after them, faces after it
+        // behind the face before them.
+        let top = faces
+            .iter()
+            .position(|face| *face == Face::Terminal)
+            .unwrap_or(faces.len() - 1);
+        let layer = |index: usize| {
+            let handle = match faces[index] {
+                Face::Provider(provider) if index < top => face_handle(provider, Side::Right),
+                Face::Provider(provider) if index > top => face_handle(provider, Side::Left),
+                Face::Provider(provider) => crate::ui_controls::provider_icon(provider),
+                Face::Terminal => Icon::Terminal.handle(),
+            };
+            at(
+                widget::container(mark(handle, FACE, ink, opacity))
+                    .id(face_id(index))
+                    .into(),
+                index as f32 * FACE_STEP,
+                0.0,
+            )
+        };
+        // Drawn from both ends toward the top face, so each face is drawn
+        // after the one it covers.
+        let layers: Vec<Element<'static, Message>> = (0..top)
+            .chain((top + 1..faces.len()).rev())
+            .chain(std::iter::once(top))
+            .map(layer)
+            .collect();
+        let mut cells: Vec<Element<'static, Message>> = Vec::with_capacity(2);
+        cells.push(
+            cosmic::iced::widget::Stack::with_children(layers)
+                .width(Length::Fixed(FACE + (faces.len() - 1) as f32 * FACE_STEP))
+                .height(Length::Fixed(FACE))
+                .into(),
+        );
+        if let Some(label) = count_label(&self.company, faces.len()) {
+            cells.push(
+                widget::container(
+                    widget::text(label)
+                        .size(design::TEXT_CAPTION)
+                        .wrapping(cosmic::iced::widget::text::Wrapping::None),
+                )
+                .class(theme::Container::custom(move |theme| {
+                    let mut color = design::muted_text(theme)
+                        .color
+                        .unwrap_or_else(|| theme.current_container().on.into());
+                    color.a *= opacity;
+                    widget::container::Style {
+                        text_color: Some(color),
+                        ..Default::default()
+                    }
+                }))
+                .into(),
+            );
+        }
+        widget::row::with_children(cells)
+            .spacing(COUNT_GAP)
+            .align_y(Alignment::Center)
+            .into()
+    }
+}
+
+impl Pile {
+    /// A title followed by as much of this pile as [`Pile::fit`] lets
+    /// share its slot. `natural` gives the title's whole width; it is
+    /// measured at the first layout and kept, not on every one. `title`
+    /// draws the title at the width it is given.
+    ///
+    /// The pile follows the title rather than the slot's end, and the two
+    /// are as tall as the title's text, as a title on its own is, so they
+    /// share its pixel row; a height of their own would centre them
+    /// between two and blur them.
+    pub fn beside<'a, Message: 'static>(
+        self,
+        ink: RowInk,
+        natural: impl Fn() -> f32 + 'a,
+        title: impl Fn(f32) -> Element<'a, Message> + 'a,
+        face_id: impl Fn(usize) -> widget::Id + 'a,
+    ) -> Element<'a, Message> {
+        let measured = std::cell::OnceCell::new();
+        crate::ui_controls::responsive(move |slot| {
+            let natural = *measured.get_or_init(|| natural().ceil());
+            let fit = self.fit(slot.width, natural);
+            let title = title(fit.title);
+            if fit.faces == 0 {
+                return title;
+            }
+            widget::row::with_children(vec![title, self.view(fit.faces, ink, &face_id)])
+                .spacing(super::ROW_GUTTER)
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
+                .into()
+        })
+        .height(Length::Shrink)
+        .into()
+    }
+}
+
+/// Which neighbour covers a face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// How many members `shown` faces leave uncounted, as the pile says it:
+/// "+3". `None` when the faces stand for every member after the lead.
+fn count_label(company: &Company, shown: usize) -> Option<String> {
+    let rest = company.others - shown.min(company.others);
+    (rest > 0).then(|| format!("+{rest}"))
+}
+
+/// A provider's face with a clear ring cut where its neighbour on `side`
+/// covers it.
+fn face_handle(provider: Provider, side: Side) -> Handle {
+    static CUT: LazyLock<[[Handle; 2]; Provider::ALL.len()]> = LazyLock::new(|| {
+        Provider::ALL.map(|provider| {
+            [-FACE_STEP, FACE_STEP].map(|step| {
+                // The neighbour's centre, in this face's own square.
+                let hole = Hole::Circle {
+                    x: FACE / 2.0 + step,
+                    y: FACE / 2.0,
+                    radius: FACE / 2.0 + FACE_GAP,
+                };
+                cut_handle(provider, FACE, hole)
+            })
+        })
+    });
+    CUT[provider as usize][usize::from(side == Side::Right)].clone()
 }
 
 /// `content` with its top left at `(x, y)` in the mark's box. It keeps its
@@ -577,6 +905,250 @@ mod tests {
         assert_eq!(terminals.lead(), Some(Member::Terminal));
         assert_eq!(terminals.peek(), None);
         assert_eq!(Members::default().lead(), None);
+    }
+
+    #[test]
+    fn the_company_shows_every_other_member_the_kinds_the_lead_does_not_first() {
+        let mixed = members(
+            &[
+                (Claude, MemberState::Working),
+                (Claude, MemberState::Idle),
+                (Codex, MemberState::Idle),
+                (Codex, MemberState::Idle),
+                (Omp, MemberState::Idle),
+            ],
+            2,
+        );
+        let company = mixed.company();
+        assert_eq!(company.others, 6, "everyone after the lead");
+        assert_eq!(
+            company.faces,
+            vec![Face::Provider(Omp), Face::Provider(Codex), Face::Terminal],
+            "one face per kind; the lead's own Claude Code is last, so a fourth"
+        );
+        let paired = members(
+            &[(Claude, MemberState::Working), (Claude, MemberState::Idle)],
+            1,
+        )
+        .company();
+        assert_eq!(
+            paired.faces,
+            vec![Face::Terminal, Face::Provider(Claude)],
+            "the lead's kind follows the others"
+        );
+        let shells = members(&[], 10).company();
+        assert_eq!(
+            (shells.faces, shells.others),
+            (vec![Face::Terminal], 9),
+            "a channel of terminals shows one of the others and counts the rest"
+        );
+        let claudes = members(
+            &[
+                (Claude, MemberState::Working),
+                (Claude, MemberState::Idle),
+                (Claude, MemberState::Idle),
+            ],
+            0,
+        )
+        .company();
+        assert_eq!(
+            (claudes.faces, claudes.others),
+            (vec![Face::Provider(Claude); 2], 2),
+            "the others are shown whatever their kind"
+        );
+        let twin = members(
+            &[(Codex, MemberState::Working), (Codex, MemberState::Idle)],
+            0,
+        )
+        .company();
+        assert_eq!((twin.faces, twin.others), (vec![Face::Provider(Codex)], 1));
+        let repeats = members(
+            &[
+                (Claude, MemberState::Working),
+                (Codex, MemberState::Idle),
+                (Codex, MemberState::Idle),
+                (Codex, MemberState::Idle),
+                (Claude, MemberState::Idle),
+            ],
+            2,
+        )
+        .company();
+        assert_eq!(
+            (repeats.faces, repeats.others),
+            (
+                vec![
+                    Face::Provider(Codex),
+                    Face::Terminal,
+                    Face::Provider(Claude)
+                ],
+                6
+            ),
+            "every kind gets a face before any kind gets a second"
+        );
+        let shells_and_agent = members(&[(Codex, MemberState::Working)], 3).company();
+        assert_eq!(
+            shells_and_agent.faces,
+            vec![Face::Terminal],
+            "one terminal face at most: neither of two could be cut for the other"
+        );
+        let alone = members(&[(Claude, MemberState::Working)], 0).company();
+        assert_eq!((alone.faces.len(), alone.others), (0, 0));
+        assert!(Pile::new(&members(&[], 1), |_| 10.0).is_none());
+        assert!(Pile::new(&members(&[(Claude, MemberState::Working)], 0), |_| 10.0).is_none());
+        assert!(Pile::new(&members(&[], 10), |_| 10.0).is_some());
+    }
+
+    /// Claude Code leading Codex, Oh My Pi and three terminals: three faces
+    /// and "+2" at most, with every caption ten pixels wide.
+    fn crowd() -> Pile {
+        Pile::new(
+            &members(
+                &[
+                    (Claude, MemberState::Working),
+                    (Codex, MemberState::Idle),
+                    (Omp, MemberState::Idle),
+                ],
+                3,
+            ),
+            |_| 10.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pile_shows_faces_with_their_count_and_never_a_count_alone() {
+        let pile = crowd();
+        assert_eq!(pile.width(0), 0.0, "no faces, no pile");
+        assert_eq!(pile.width(1), FACE + COUNT_GAP + 10.0);
+        assert_eq!(pile.width(3), FACE + 2.0 * FACE_STEP + COUNT_GAP + 10.0);
+        assert_eq!(count_label(&pile.company, 1).as_deref(), Some("+4"));
+        assert_eq!(count_label(&pile.company, 3).as_deref(), Some("+2"));
+    }
+
+    #[test]
+    fn one_other_member_is_its_face_alone() {
+        let pair = Pile::new(
+            &members(
+                &[(Claude, MemberState::Working), (Codex, MemberState::Idle)],
+                0,
+            ),
+            |_| 10.0,
+        )
+        .unwrap();
+        assert_eq!(pair.width(1), FACE, "no \"+1\"");
+        assert_eq!(count_label(&pair.company, 1), None);
+        assert_eq!(pair.fit(200.0, 100.0).faces, 1);
+        assert_eq!(pair.fit(200.0, 400.0).faces, 1);
+    }
+
+    #[test]
+    fn a_title_that_fits_stays_whole_beside_as_many_faces_as_fit() {
+        let pile = crowd();
+        let gutter = super::super::ROW_GUTTER;
+        let title = 100.0;
+        let beside = |shown| title + gutter + pile.width(shown);
+        let whole = |faces| Fit { faces, title };
+        assert_eq!(pile.fit(f32::INFINITY, title), whole(3));
+        assert_eq!(pile.fit(beside(3), title), whole(3));
+        assert_eq!(pile.fit(beside(3) - 0.5, title), whole(2));
+        assert_eq!(pile.fit(beside(2), title), whole(2));
+        assert_eq!(pile.fit(beside(2) - 0.5, title), whole(1));
+        assert_eq!(pile.fit(beside(1), title), whole(1));
+        assert_eq!(
+            pile.fit(beside(1) - 0.5, title),
+            whole(0),
+            "the pile goes before the title is cut"
+        );
+        assert_eq!(pile.fit(title, title), whole(0));
+    }
+
+    #[test]
+    fn a_title_cut_anyway_keeps_one_face_while_enough_of_it_shows() {
+        let pile = crowd();
+        let one = super::super::ROW_GUTTER + pile.width(1);
+        assert_eq!(
+            pile.fit(150.0, 400.0),
+            Fit {
+                faces: 1,
+                title: 150.0 - one
+            }
+        );
+        assert_eq!(
+            pile.fit(MIN_TITLE + one, 400.0),
+            Fit {
+                faces: 1,
+                title: MIN_TITLE
+            }
+        );
+        assert_eq!(
+            pile.fit(MIN_TITLE + one - 0.5, 400.0),
+            Fit {
+                faces: 0,
+                title: MIN_TITLE + one - 0.5
+            },
+            "too little title to read: the pile goes"
+        );
+        assert_eq!(
+            pile.fit(0.0, 400.0),
+            Fit {
+                faces: 0,
+                title: 0.0
+            }
+        );
+    }
+
+    /// Every bound in a laid-out element, depth first.
+    fn bounds(
+        element: &mut Element<'static, super::super::SidebarAction>,
+    ) -> Vec<cosmic::iced::Rectangle> {
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+        fn walk(layout: Layout<'_>, out: &mut Vec<cosmic::iced::Rectangle>) {
+            out.push(layout.bounds());
+            for child in layout.children() {
+                walk(child, out);
+            }
+        }
+        let renderer = crate::sidebar::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(cosmic::iced::Size::ZERO, cosmic::iced::Size::new(BOX, BOX)),
+        );
+        let mut out = Vec::new();
+        walk(Layout::new(&node), &mut out);
+        out
+    }
+
+    /// An expanded row's lead sits whole where a lone member's does, in
+    /// the glyph column's centre, however many others follow it; only the
+    /// rail moves it aside for a badge.
+    #[test]
+    fn a_rows_lead_keeps_the_glyph_columns_centre() {
+        let lone = |lead| {
+            let mut element = view(&lead, Ground::Row, RowInk::Full).unwrap();
+            bounds(&mut element)
+        };
+        let claude = members(&[(Claude, MemberState::Working)], 0);
+        let crowd = members(
+            &[
+                (Claude, MemberState::Working),
+                (Codex, MemberState::Idle),
+                (Omp, MemberState::Idle),
+            ],
+            4,
+        );
+        assert_eq!(lone(claude), lone(crowd));
+        let shells = lone(members(&[], 10));
+        assert_eq!(shells, lone(members(&[], 1)));
+        let glyph = shells.last().unwrap();
+        assert_eq!(glyph.center_x(), BOX / 2.0, "{shells:?}");
+        assert!(
+            glyph.x >= 0.0 && glyph.x + glyph.width <= BOX,
+            "whole: {glyph:?}"
+        );
+        let mut rail = view(&crowd, Ground::Rail, RowInk::Full).unwrap();
+        assert_ne!(bounds(&mut rail), lone(crowd), "the rail keeps its badge");
     }
 
     #[test]

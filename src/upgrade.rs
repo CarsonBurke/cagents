@@ -2250,8 +2250,9 @@ pub(crate) mod handoff {
         }
 
         /// Why this restore stopped the conversation an exact descriptor it
-        /// issued names, if it did. Only a complete issued source retrieves
-        /// the reason, as with a retained conversation's refusal.
+        /// issued names, if it did. Only a complete issued source, or the
+        /// confirmed alias a pane learned once its thread was named,
+        /// retrieves the reason, as with a retained conversation's refusal.
         #[cfg(feature = "host")]
         pub fn stopped_reason(&self, source: &crate::chat::Session) -> Option<String> {
             let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
@@ -2262,12 +2263,15 @@ pub(crate) mod handoff {
                 .find(|entry| {
                     entry.summary.id == source.id
                         && entry.summary.disposition == UnattachedDisposition::Stopped
-                        && (entry.evidence.source == *source
-                            || entry
-                                .evidence
-                                .previous_sources
-                                .iter()
-                                .any(|previous| previous.source == *source))
+                        && entry
+                            .evidence
+                            .previous_sources
+                            .iter()
+                            .chain(std::iter::once(&ChatSource {
+                                source: entry.evidence.source.clone(),
+                                launch: entry.evidence.launch.clone(),
+                            }))
+                            .any(|issued| issued_chat_source_matches(issued, source))
                 })
                 .map(|entry| entry.summary.reason)
         }

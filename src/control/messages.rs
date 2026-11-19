@@ -27,6 +27,13 @@ pub struct MessageArgs {
 }
 
 impl MessageArgs {
+    /// Whether the message is read from standard input. `--file -` names a
+    /// file called `-`, as [`agents::read_text`] opens it.
+    #[cfg(feature = "ui")]
+    pub(super) fn reads_stdin(&self) -> bool {
+        self.text.as_deref().is_some_and(standard_input)
+    }
+
     fn read(self) -> Result<String, AppError> {
         agents::read_text(
             self.text,
