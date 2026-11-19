@@ -417,3 +417,57 @@ fn loading_one_picture_of_an_older_gallery_loads_the_gallery() {
         assert!(reading(&runtime, id), "{id} is read with its gallery");
     }
 }
+
+#[test]
+fn a_subagents_gallery_holds_one_senders_pictures() {
+    use chat::Role::{Assistant, User};
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[said("ask", User, "Delegate it.")]);
+    let child = [
+        picture("mine-1", User, "Image 1"),
+        picture("mine-2", User, "Image 2"),
+        picture("theirs-1", Assistant, "shot-1.png"),
+        picture("theirs-2", Assistant, "shot-2.png"),
+    ];
+    for item in &child {
+        runtime.child_cache.insert(
+            item.id.clone(),
+            CachedItem::new(&item.content, runtime.syntax_theme),
+        );
+    }
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(chat::Subagent {
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child".into(),
+            status: chat::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: false,
+            items: child.into_iter().map(Arc::new).collect(),
+        });
+    runtime.selected_subagent = Some("child".into());
+    let run = |id: &str| -> Vec<String> {
+        runtime
+            .image_run(id)
+            .iter()
+            .map(|item| item.id.clone())
+            .collect()
+    };
+    // The viewer, like the transcript, browses only the clicked sender's
+    // pictures, though the agent's follow the reader's directly.
+    assert_eq!(run("mine-2"), ["mine-1", "mine-2"]);
+    assert_eq!(run("theirs-1"), ["theirs-1", "theirs-2"]);
+    let agent = &runtime.snapshot.subagents[0];
+    assert_eq!(
+        images::tiles::run_length(
+            agent
+                .items
+                .iter()
+                .map(|next| runtime.tiled_from(next, User))
+        ),
+        2,
+        "the transcript's gallery ends where the sender changes"
+    );
+}

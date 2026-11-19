@@ -144,6 +144,13 @@ impl Runtime {
             }
     }
 
+    /// Whether `item` is a picture that joins a gallery of `role`'s pictures.
+    /// A gallery holds one sender's pictures, so the reader's never share one
+    /// with an agent's.
+    pub(in crate::app::chat_ui) fn tiled_from(&self, item: &chat::Item, role: chat::Role) -> bool {
+        item.role == role && self.tiled(item)
+    }
+
     /// `pictures`, one after another in the conversation, as one gallery.
     pub(in crate::app::chat_ui) fn image_tiles(
         &self,
@@ -290,8 +297,8 @@ impl Runtime {
         self.run_around(side, id)
     }
 
-    /// The pictures of `members`, drawn one after another, that include the
-    /// one `id` names.
+    /// The pictures of `members`, drawn one after another from one sender,
+    /// that include the one `id` names.
     fn run_around<'a>(
         &self,
         members: Vec<&'a Arc<chat::Item>>,
@@ -303,8 +310,10 @@ impl Runtime {
         if !self.tiled(members[at]) {
             return vec![members[at]];
         }
-        let start = at - run_length(members[..at].iter().rev().map(|item| self.tiled(item)));
-        let end = at + run_length(members[at..].iter().map(|item| self.tiled(item)));
+        let role = members[at].role;
+        let joins = |item: &&Arc<chat::Item>| self.tiled_from(item, role);
+        let start = at - run_length(members[..at].iter().rev().map(joins));
+        let end = at + run_length(members[at..].iter().map(joins));
         members[start..end].to_vec()
     }
 }
