@@ -98,7 +98,8 @@ impl Editor {
             .with_file_name("worktree-operations.sqlite3");
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let boot = cagents_ui::session::current_boot_id().map_err(|e| e.to_string())?;
+                let boot = cagents::model::current_boot_id()
+                    .map_err(|error| format!("failed to read Linux boot identifier: {error}"))?;
                 let store = Arc::new(StateStore::open(path, boot).map_err(|e| e.to_string())?);
                 let reports = RepositoryService::system("git")
                     .rehydrate_worktree_operations(&store)

@@ -121,6 +121,13 @@ macro_rules! evidence_type {
 }
 
 evidence_type!(BootId);
+
+/// Read the current Linux boot identifier, without imposing a caller's validation policy.
+pub fn current_boot_id() -> std::io::Result<BootId> {
+    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    Ok(BootId::new(value.trim()))
+}
+
 evidence_type!(HostSessionId);
 evidence_type!(HostIncarnation);
 

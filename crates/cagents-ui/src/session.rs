@@ -3353,9 +3353,7 @@ fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWri
 }
 
 pub fn current_boot_id() -> Result<BootId, SessionError> {
-    let value =
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(SessionError::BootId)?;
-    Ok(BootId::new(value.trim()))
+    crate::model::current_boot_id().map_err(SessionError::BootId)
 }
 
 #[cfg(test)]
