@@ -255,6 +255,34 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
         }
 }
 
+/// A Close that could not take effect, said once the pane is shown again.
+pub(in crate::app) const PANE_KEPT: &str =
+    "This pane couldn't be removed right now, so it was kept. Close it again.";
+
+/// [`PANE_KEPT`] for a terminal whose shell the refused Close already ended.
+/// Closing that pane again doesn't work yet (#3266), so it isn't suggested.
+pub(in crate::app) const ENDED_TERMINAL_KEPT: &str =
+    "This pane couldn't be removed right now, so it was kept.";
+
+/// A Close the registry kept the pane through, where this window has nothing
+/// to show it in now, such as a worktree with no other open pane.
+pub(super) const PANE_KEPT_ELSEWHERE: &str =
+    "This pane couldn't be removed everywhere, so it may come back. Close it again if it does.";
+
+/// Any other pane edit the registry would not save: a rename, a resize, a
+/// move or an added pane. This window then shows the panes as saved.
+pub(super) const PANE_CHANGE_NOT_SAVED: &str = "A pane change couldn't be saved. Try it again.";
+
+/// A pane's conversation or terminal changed elsewhere, as when another
+/// window or its agent updated it, while this window was saving its own
+/// change to it. The pane now shows that version.
+pub(super) const PANE_CHANGED_ELSEWHERE: &str =
+    "This pane changed elsewhere at the same time, so it now shows that version.";
+
+/// [`PANE_CHANGED_ELSEWHERE`] once this window's rename or resize of the
+/// pane has been saved again on top of that version.
+pub(super) const PANE_CHANGED_ELSEWHERE_KEPT_LAYOUT: &str = "This pane changed elsewhere at the same time, so it now shows that version, with this window's name and width.";
+
 /// What a fenced pane tells its reader, whatever its kind.
 pub(super) const FENCED_PANE_EXPLANATION: &str = "cagents can't confirm that this pane's saved session is the one its agent is running now, so the pane stays as saved and won't reconnect. Other panes here work normally. Closing the pane doesn't stop its agent.";
 
@@ -697,6 +725,15 @@ impl Cagents {
             // An old-scope receipt cannot retire an already retargeted retry.
             return self.reconcile_workspace_model();
         };
+        if let Change::RemoveSource { before, .. } = &change {
+            self.shared_views.pending.remove(index);
+            self.shared_views.source_bases.remove(&operation);
+            let card = before.id;
+            let kept = self.pane_kept_notice(card);
+            let projected = self.reconcile_workspace_model();
+            self.report_refused_close(&scope, operation, card, &error, kept);
+            return projected;
+        }
         // Another window can publish the same session update first, as when two
         // windows attached to one conversation both learn its provider session.
         // Only a session update qualifies: a refused name or width edit can be lost.
@@ -799,6 +836,7 @@ impl Cagents {
         } else {
             tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
         }
+        let retried_layout = retry.is_some();
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -817,12 +855,68 @@ impl Cagents {
                 change,
             });
         }
-        if !already_applied {
-            self.notices.record(TransientNotice::warning(
-                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-            ));
+        // A pane this window has closed, or is closing, shows nothing more,
+        // so the version the registry kept is nothing to tell anyone about.
+        let shown = matches!(&change, Change::Update { pane, .. } | Change::UpdateTerminalSource { pane, .. }
+            if self.card_state(pane.id).is_some_and(|card| card.existence.is_open())
+                && self
+                    .workspace
+                    .pending_close()
+                    .is_none_or(|close| close.unmounting != pane.id));
+        if !already_applied && shown {
+            self.notices
+                .record(TransientNotice::warning(if retried_layout {
+                    PANE_CHANGED_ELSEWHERE_KEPT_LAYOUT
+                } else {
+                    PANE_CHANGED_ELSEWHERE
+                }));
         }
         self.reconcile_workspace_model()
+    }
+
+    /// Settle what the person is told about a Close the registry refused,
+    /// once this window has projected what the registry holds. A pane the
+    /// registry still holds is kept, and said to be. A pane it no longer
+    /// holds is closed, as the person asked: its agent or another window may
+    /// have closed it first, or its project or channel may be gone.
+    ///
+    /// `kept_notice` is [`Self::pane_kept_notice`] as it stood before the refusal
+    /// was settled, which can end the close that decides it.
+    pub(super) fn report_refused_close(
+        &mut self,
+        scope: &Scope,
+        operation: uuid::Uuid,
+        card: CardId,
+        error: &str,
+        kept_notice: &'static str,
+    ) {
+        let kept = self
+            .workspace_model
+            .views
+            .iter()
+            .any(|view| view.panes.iter().any(|pane| pane.id == card));
+        if kept {
+            tracing::warn!(?scope, %operation, %error, %card, "the registry refused a close and kept its pane");
+            let shown = self.workspace.order().any(|id| id == card);
+            self.notices.record(TransientNotice::warning(if shown {
+                kept_notice
+            } else {
+                PANE_KEPT_ELSEWHERE
+            }));
+        } else {
+            tracing::debug!(?scope, %operation, %error, %card, "a refused close's pane is already gone");
+        }
+    }
+
+    /// What the person is told when `card` is kept after they closed it. A
+    /// terminal whose shell this close has already ended can't be closed
+    /// again yet (#3266), so its notice doesn't ask them to.
+    pub(in crate::app) fn pane_kept_notice(&self, card: CardId) -> &'static str {
+        if self.closed_terminal_cards.contains(&card) {
+            ENDED_TERMINAL_KEPT
+        } else {
+            PANE_KEPT
+        }
     }
 
     /// Refusing publication does not retire an already accepted conversation.
@@ -3344,9 +3438,15 @@ impl Cagents {
                     .push(change.clone());
             }
         }
+        // Each pending edit is overlaid exactly once. One that no longer fits
+        // the observed view, such as a Close of a pane its agent has already
+        // retired, is left out: the registry answers every pending edit, and
+        // that answer is what the person is told about if anything was lost.
         for view in &mut views {
             for change in pending_by_scope.get(&view.scope).into_iter().flatten() {
-                let _ = view.apply(change);
+                if let Err(error) = view.apply(change) {
+                    tracing::debug!(scope = ?view.scope, %error, "a pending pane edit no longer fits the observed view");
+                }
             }
         }
         // A scoped read or a deferred receipt may prove a close beyond the
@@ -3409,7 +3509,7 @@ impl Cagents {
         }
         phase.mark("selected_prepare");
         let mut projected_scopes = Vec::new();
-        for mut view in views {
+        for view in views {
             if selected.is_some_and(|selected| !selected.contains(&view.scope)) {
                 continue;
             }
@@ -3421,11 +3521,6 @@ impl Cagents {
                 || self.shared_views.seed_failures.contains_key(&view.scope)
             {
                 continue;
-            }
-            for change in pending_by_scope.get(&view.scope).into_iter().flatten() {
-                if let Err(error) = view.apply(change) {
-                    self.status = Some(TransientNotice::error(error));
-                }
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),

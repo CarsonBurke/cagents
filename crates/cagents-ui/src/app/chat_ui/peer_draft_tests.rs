@@ -615,7 +615,7 @@ fn warned_of_refused_update(peer: &Peer) -> bool {
     peer.app
         .notices
         .recent()
-        .any(|entry| entry.notice.message.contains("session update was refused"))
+        .any(|entry| entry.notice.message.contains("changed elsewhere"))
 }
 
 /// Two windows attached to one conversation learn its provider session at the
