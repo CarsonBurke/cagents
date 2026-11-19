@@ -706,7 +706,7 @@ fn close_project(
         .map_err(|error| error.to_string())?
         > 0;
     if removed || recorded {
-        automations::close_project(transaction, &key, crate::chat::now_ms().unwrap_or(0))?;
+        automations::close_project(transaction, key, crate::chat::now_ms().unwrap_or(0))?;
     }
     Ok(removed || recorded)
 }
