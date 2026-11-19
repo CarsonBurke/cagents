@@ -15245,6 +15245,8 @@ impl Cagents {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
+        #[cfg(test)]
+        terminal_output_tests::record_captured_view(&view.sidebar);
         self.settings_save_generation += 1;
         Ok(SettingsSave {
             generation: self.settings_save_generation,

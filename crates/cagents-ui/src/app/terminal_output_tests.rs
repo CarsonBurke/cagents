@@ -26,6 +26,8 @@ thread_local! {
     static PERSISTS: Cell<usize> = const { Cell::new(0) };
     static SOURCE_CONTROL_REBINDS: Cell<usize> = const { Cell::new(0) };
     static SETTINGS_CAPTURES: Cell<usize> = const { Cell::new(0) };
+    static CAPTURED_SIDEBAR: std::cell::RefCell<Option<crate::sidebar::SidebarView>> =
+        const { std::cell::RefCell::new(None) };
 }
 pub(super) fn record_projection() {
     if super::projection_oracle::verifying() {
@@ -80,6 +82,16 @@ pub(super) fn record_settings_capture() {
         return;
     }
     SETTINGS_CAPTURES.set(SETTINGS_CAPTURES.get() + 1);
+}
+pub(super) fn record_captured_view(sidebar: &crate::sidebar::SidebarView) {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    CAPTURED_SIDEBAR.set(Some(sidebar.clone()));
+}
+/// The sidebar view the last settings save this thread could write held.
+pub(super) fn captured_sidebar_view() -> Option<crate::sidebar::SidebarView> {
+    CAPTURED_SIDEBAR.take()
 }
 /// How many times this thread has rebound source control to the focus.
 pub(super) fn source_control_rebinds() -> usize {

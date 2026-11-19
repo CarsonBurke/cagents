@@ -1773,6 +1773,54 @@ mod tests {
         assert_eq!(active_worktree(&app).as_deref(), Some(Path::new(FIX)));
     }
 
+    /// The view an inspector toggle saves is the one its rebind leaves. A
+    /// browser's inspector in the main worktree's workspace takes source
+    /// control from the fix worktree, whose file filter does not carry over,
+    /// so the one save holds no trace of it.
+    #[test]
+    fn an_inspector_toggle_saves_the_view_it_rebinds() {
+        use super::super::terminal_output_tests::{captured_sidebar_view, settings_captures};
+        let (mut app, browser) = worktree_app();
+        let settings = tempfile::tempdir().unwrap();
+        app.settings_write_blocked = false;
+        app.settings_path = Some(settings.path().join("settings.toml"));
+        let url = Url::parse("http://localhost:8080/").unwrap();
+        app.card_state_mut(browser).unwrap().kind =
+            CardKind::Browser(crate::model::BrowserSession {
+                id: crate::model::BrowserId::new(),
+                current_url: url.clone(),
+                history: vec![url],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            });
+        drop(app.workspace.resize_viewport(1200.0));
+        app.active_workspace = Some(MAIN.into());
+        app.sync_pane_inspectors();
+        let key = app.sidebar_state.active_worktree().cloned().unwrap();
+        assert_eq!(key.canonical_path, Path::new(FIX));
+        app.sidebar_state.apply(&SidebarAction::FilesQueryChanged {
+            key,
+            query: "draft".into(),
+        });
+        drop(captured_sidebar_view());
+
+        let captures = settings_captures();
+        drop(app.update(Message::ToggleContextInspector));
+        assert!(app.pane_inspectors.is_open(browser));
+        assert_eq!(active_worktree(&app).as_deref(), Some(Path::new(MAIN)));
+        assert_eq!(settings_captures() - captures, 1);
+        let mut restored = crate::sidebar::SidebarState::default();
+        restored.restore_view(captured_sidebar_view().expect("the toggle saved the view"));
+        assert_eq!(
+            restored.files_query(),
+            "",
+            "the fix worktree's filter was saved"
+        );
+        assert!(!restored.files_filter_open());
+    }
+
     /// A terminal app with `page` opened beside its terminal and focused.
     fn page_app(page: &CardKind) -> (Cagents, CardId, CardId) {
         let (mut app, terminal) = worktree_app();
