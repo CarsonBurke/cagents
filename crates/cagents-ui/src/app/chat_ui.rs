@@ -3146,6 +3146,8 @@ struct FileCompletionMemo {
 pub(super) struct Runtime {
     /// The permission mode this draft's launch recipe previews.
     draft_permission: DraftPermissionPreview,
+    /// A chosen or restored model/effort makes even an empty draft worth keeping.
+    draft_model_chosen: bool,
     preparation: preparation::State,
     find: Option<String>,
     /// The groups Find matched, in transcript order. Every turn asks whether
@@ -4396,6 +4398,7 @@ impl Runtime {
         let mut runtime = Self {
             preparation: preparation::State::default(),
             draft_permission,
+            draft_model_chosen: false,
             target,
             session,
             snapshot: Arc::new(Snapshot {
@@ -7862,6 +7865,7 @@ impl Cagents {
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
+        runtime.draft_model_chosen = true;
         runtime.snapshot = Arc::new(snapshot);
         runtime.completion.restart(true);
         if let Some(session) = &moved {
@@ -8857,6 +8861,7 @@ impl Cagents {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
             if runtime.session.is_unstarted()
                 && runtime.choosing()
+                && !runtime.draft_model_chosen
                 && runtime.composer.is_empty()
                 && runtime.attachments.is_empty()
                 && runtime.commands.is_idle())
@@ -9462,6 +9467,9 @@ impl Cagents {
         self.chat_ui.blocked_details.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
         let saved_model = self.chat_ui.draft_models.remove(&card);
+        let model_chosen = saved_model
+            .as_ref()
+            .is_some_and(|saved| saved.provider == session.launch.provider);
         tracing::debug!(target: "cagents::draft_model", ?card,
             provider = ?session.launch.provider, ?saved_model, "opening draft");
         if let Some(saved) = saved_model
@@ -9479,6 +9487,7 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
+        runtime.draft_model_chosen = model_chosen;
         // The runtime already read its recipe's preview; this is that answer.
         Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
@@ -15842,6 +15851,7 @@ impl Cagents {
                     if !runtime.choosing() {
                         return Task::none();
                     }
+                    runtime.draft_model_chosen = true;
                     let snapshot = Arc::make_mut(&mut runtime.snapshot);
                     snapshot.selected_model = Some(model.clone());
                     snapshot.reasoning = reasoning.clone();

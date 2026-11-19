@@ -338,6 +338,9 @@ impl Cagents {
             state.kind = CardKind::Chat(runtime.session.clone());
             let local_card = state.clone();
             runtime.retarget(self.chat_ui.next_target(retained));
+            if let Some(model) = self.chat_ui.draft_models.remove(&pane.id) {
+                self.chat_ui.draft_models.insert(retained, model);
+            }
             let durable = Arc::make_mut(&mut self.durable);
             if let Some(scope) = durable.card_scopes.get(&pane.id).cloned() {
                 durable.card_scopes.insert(retained, scope);
