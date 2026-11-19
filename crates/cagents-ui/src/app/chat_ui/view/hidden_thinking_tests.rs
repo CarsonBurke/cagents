@@ -225,7 +225,7 @@ fn placed_texts(runtime: &Runtime, tree: &mut Option<Tree>) -> Vec<(String, f32,
 fn a_lone_step_becomes_its_strip_and_back_without_moving_the_transcript() {
     let (mut runtime, handle) = prepared_runtime_for_test(&[prompt(), command("c1", 1_000, 2_000)]);
     let mut tree = None;
-    let mut publish =
+    let publish =
         |runtime: &mut Runtime, tree: &mut Option<Tree>, item: Option<chat::Item>, busy: bool| {
             let mut snapshot = (*handle.snapshot()).clone();
             snapshot.generation += 1;
