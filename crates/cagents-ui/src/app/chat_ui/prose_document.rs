@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(data.metadata.stats.leaves, small);
         assert!(!data.metadata.stats.inline());
         assert_eq!(data.outline.len(), small);
-        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
         assert!(
             data.metadata.stats.estimate(settings) > 800.0 * 10.0,
             "large composite estimates prevent each nested initial window mounting its complete tree"

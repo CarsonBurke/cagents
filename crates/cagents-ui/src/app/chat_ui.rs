@@ -149,19 +149,6 @@ pub(super) fn prune_pasted_images() {
     clipboard_image::prune_cache();
 }
 
-/// Names lead the chat hierarchy; prose and operational metadata keep their
-/// existing scale. Keep this local so workbench labels remain unchanged.
-fn chat_title<'a>(
-    text: impl Into<Cow<'a, str>> + 'a,
-) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    design::body(text)
-        .size(design::TEXT_PROSE)
-        .font(iced::Font {
-            weight: iced::font::Weight::Semibold,
-            ..cosmic::font::default()
-        })
-}
-
 fn action(action: Action) -> Message {
     Message::ChatUi(action)
 }
@@ -3119,6 +3106,12 @@ impl RestoredWaiting {
 
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
+struct FileCompletionMemo {
+    files: Arc<Vec<String>>,
+    query: String,
+    indices: Vec<usize>,
+}
+
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
@@ -3135,6 +3128,7 @@ pub(super) struct Runtime {
     pub(super) interrupt_armed: Option<Instant>,
     drop_hover: bool,
     files: Option<Arc<Vec<String>>>,
+    file_completion: std::cell::RefCell<Option<FileCompletionMemo>>,
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
@@ -3509,10 +3503,21 @@ impl Runtime {
             return None;
         }
         let rows = if token.sigil == '@' {
-            completion::files(
-                self.files.as_deref().map_or(&[][..], Vec::as_slice),
-                &token.query,
-            )
+            if let Some(files) = &self.files {
+                let mut memo = self.file_completion.borrow_mut();
+                if !memo.as_ref().is_some_and(|memo| {
+                    Arc::ptr_eq(&memo.files, files) && memo.query == token.query
+                }) {
+                    *memo = Some(FileCompletionMemo {
+                        files: Arc::clone(files),
+                        query: token.query.clone(),
+                        indices: completion::file_matches(files, &token.query),
+                    });
+                }
+                completion::file_candidates(files, &memo.as_ref().unwrap().indices)
+            } else {
+                Vec::new()
+            }
         } else {
             completion::candidates(&self.snapshot, &token)
         };
@@ -4375,6 +4380,7 @@ impl Runtime {
             fork_requested: false,
             fork_seen: None,
             files: None,
+            file_completion: Default::default(),
             find: None,
             find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
