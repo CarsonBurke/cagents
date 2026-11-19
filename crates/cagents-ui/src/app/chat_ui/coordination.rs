@@ -430,16 +430,16 @@ impl Recipient {
     }
 
     /// As a row draws it: the name cut to fit beside the session ID that
-    /// tells it apart, which is kept whole.
-    fn shown(&self) -> String {
+    /// tells it apart, and that ID, which the row keeps whole after it.
+    fn shown(&self) -> (String, String) {
         let cut = |name: &str, room: usize| Runtime::short_description(name, room);
         match (&self.session, self.name.is_empty()) {
             (Some(session), false) => {
                 let id = short_id(session);
                 let room = LABEL_CHARS.saturating_sub(id.chars().count() + 3).max(8);
-                format!("{} ({id})", cut(&self.name, room))
+                (cut(&self.name, room), format!(" ({id})"))
             }
-            _ => cut(&self.plain(), LABEL_CHARS),
+            _ => (cut(&self.plain(), LABEL_CHARS), String::new()),
         }
     }
 }
@@ -639,8 +639,9 @@ const LABEL_CHARS: usize = 32;
 const ROW_NAME_CHARS: usize = 80;
 
 /// How much of its status a row shows, a caption naming what an agent waits
-/// on included, so that the status leaves room for the agent's name.
-const STATUS_CHARS: usize = 32;
+/// on included, so that the status leaves room for the agent's name. An
+/// agent's caption is already held to it, so the row and tab say the same.
+const STATUS_CHARS: usize = super::view::AGENT_CAPTION_CHARS;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
 /// and the gap before it, as a step row keeps for its chevron, so statuses
 /// end in line with step durations.
@@ -823,9 +824,12 @@ struct Row {
     verb: &'static str,
     /// Whom the step reached, whole.
     label: String,
-    /// The same as the row draws it: an agent in its tab's words, any
-    /// other name cut to fit the narrowest pane.
+    /// The same as the row draws it: an agent's name, any other name cut to
+    /// fit the narrowest pane. It fades where the row runs short.
     shown: String,
+    /// What follows the name and tells it apart, the number two agents of
+    /// one name go by or a session's ID, which the row keeps whole.
+    tag: String,
     /// The start of what was said, or the started agent's type.
     preview: String,
     /// The preview is one term, the agent's type, which the row shows whole
@@ -871,7 +875,10 @@ impl Row {
         if matches!(&self.open, Some(Action::OpenAgent(_))) {
             tip.push(format!("Open {}", self.label));
         }
-        if self.shown != self.label {
+        if self.shown.len() + self.tag.len() != self.label.len()
+            || !self.label.starts_with(&self.shown)
+            || !self.label.ends_with(&self.tag)
+        {
             tip.push(format!("{} {}", self.verb, self.label));
         }
         tip.extend(reason);
@@ -1024,19 +1031,32 @@ enum Tone {
 /// A row's name and, after it, its preview: the name takes its room before
 /// the preview has any, and a preview that is one term, an agent's type, is
 /// left out whole rather than cut, so the name fades only once nothing
-/// follows it.
-fn row_name(name: String, preview: String, term: bool) -> Element<'static, Message> {
+/// follows it. A `tag` that tells the name apart is kept whole after it.
+fn row_name(name: String, tag: String, preview: String, term: bool) -> Element<'static, Message> {
+    let font = iced::Font {
+        weight: iced::font::Weight::Semibold,
+        ..cosmic::font::default()
+    };
     let title = crate::ui_controls::fade_text(name)
         .size(design::TEXT_BODY)
-        .font(iced::Font {
-            weight: iced::font::Weight::Semibold,
-            ..cosmic::font::default()
-        });
+        .font(font);
+    let title: Element<'static, Message> = if tag.is_empty() {
+        title.into()
+    } else {
+        crate::ui_controls::trailing(
+            title,
+            chat_title(tag)
+                .size(design::TEXT_BODY)
+                .font(font)
+                .wrapping(iced::widget::text::Wrapping::None),
+            0.0,
+        )
+    };
     let preview = crate::ui_controls::fade_text(preview)
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .width(Length::Fill);
     widget::row::with_children(vec![
-        title.into(),
+        title,
         if term { preview.whole() } else { preview }.into(),
     ])
     .spacing(step::GAP_S)
@@ -1106,11 +1126,16 @@ impl Runtime {
             .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
-    /// How a row names a listed agent: as its tab does, number and all, but
-    /// with as much of its name as the row has room for, which comes before
-    /// the agent's type or the start of what was said.
-    fn row_agent_name(&self, agent: &chat::Subagent) -> String {
-        self.child_label(agent, ROW_NAME_CHARS).into_owned()
+    /// How a row names a listed agent: as its tab does, but with as much of
+    /// its name as the row has room for, which comes before the agent's type
+    /// or the start of what was said, and apart from the number that tells
+    /// it from another of its name, which the row keeps whole.
+    fn row_agent_name(&self, agent: &chat::Subagent) -> (String, String) {
+        let name = Self::short_description(Self::native_child_name(agent), ROW_NAME_CHARS);
+        match self.child_ordinal(agent) {
+            1 => (name, String::new()),
+            ordinal => (name, format!(" {ordinal}")),
+        }
     }
 
     /// The agents a step names that this conversation lists, each once.
@@ -1184,11 +1209,20 @@ impl Runtime {
                 .map(|agent| self.child_label(agent, usize::MAX).into_owned())
         };
         let recipient_whole = recipient(message, reading, &whole);
-        let shown = recipient(message, reading, &|id| {
-            self.subagent(id).map(|agent| self.row_agent_name(agent))
-        })
-        .shown();
         let listed: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
+        let joined = |agent: &chat::Subagent| {
+            let (name, tag) = self.row_agent_name(agent);
+            name + &tag
+        };
+        let drawn = recipient(message, reading, &|id| self.subagent(id).map(joined));
+        // One listed agent is named apart from its number, as a started one
+        // is; a phrase for several fades as one.
+        let (shown, tag) = match listed.as_slice() {
+            [agent] if drawn.session.is_none() && drawn.name == joined(agent) => {
+                self.row_agent_name(agent)
+            }
+            _ => drawn.shown(),
+        };
         let open = match (listed.as_slice(), &recipient_whole.session) {
             ([agent], _) => Some(Action::SelectSubagent(self.target, Some(agent.id.clone()))),
             (_, Some(session)) if recipient_whole.live => {
@@ -1261,6 +1295,7 @@ impl Runtime {
             verb: message_verb(message.kind),
             label: recipient_whole.plain(),
             shown,
+            tag,
             preview,
             term: false,
             full: full.join("\n\n").trim().to_owned(),
@@ -1296,8 +1331,8 @@ impl Runtime {
                 agent.and_then(|agent| agent.prompt.inline()),
             )
         });
-        let (label, shown) = if let Some((label, _)) = &cli_label {
-            (label.clone(), label.clone())
+        let (label, (shown, tag)) = if let Some((label, _)) = &cli_label {
+            (label.clone(), (label.clone(), String::new()))
         } else {
             match listed {
                 Some(agent) => (
@@ -1307,7 +1342,7 @@ impl Runtime {
                 None => {
                     let label = started(spawn);
                     let shown = Self::short_description(&label, LABEL_CHARS);
-                    (label, shown)
+                    (label, (shown, String::new()))
                 }
             }
         };
@@ -1431,6 +1466,7 @@ impl Runtime {
             verb: "Started",
             label,
             shown,
+            tag,
             preview,
             term,
             full: full.join("\n\n"),
@@ -1469,7 +1505,12 @@ impl Runtime {
         // is left before the preview does: the preview fades out where the
         // pane runs short, as a step row's summary does, and an agent's type
         // is left out whole, so the name fades only once nothing follows it.
-        let named = row_name(row.shown.clone(), row.preview.clone(), row.term);
+        let named = row_name(
+            row.shown.clone(),
+            row.tag.clone(),
+            row.preview.clone(),
+            row.term,
+        );
         let mut line: Vec<Element<'static, Message>> = vec![
             lead,
             design::body(row.verb)
@@ -2195,23 +2236,27 @@ mod identity_tests {
         use iced::advanced::{layout, widget::Tree};
 
         let renderer = crate::app::tests::headless_renderer();
-        let laid = |width: f32| {
+        let node = |tag: &str, width: f32| {
             let mut element = row_name(
                 "Confirm every supported platform".into(),
+                tag.into(),
                 "general-purpose".into(),
                 true,
             );
             let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(
+            element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
                 &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 100.0)),
-            );
+            )
+        };
+        let parts = |node: &layout::Node| {
             node.children()
                 .iter()
                 .map(|child| child.size().width)
                 .collect::<Vec<_>>()
         };
+        let laid = |width: f32| parts(&node("", width));
         // With room to spare, the name is laid out at its own width.
         let name = laid(2000.0)[0];
         assert!(name > 0.0 && name < 1000.0, "{name}");
@@ -2232,6 +2277,14 @@ mod identity_tests {
             "the name fades at the edge: {widths:?}"
         );
         assert!(widths[1] <= 0.0, "the type is gone: {widths:?}");
+        // The number that tells two agents of one name apart stays whole
+        // where the name fades before it.
+        let number = |width: f32| parts(&node(" 2", width).children()[0]);
+        let whole = number(2000.0);
+        let cut = number(name / 2.0);
+        assert!(whole[1] > 0.0, "{whole:?}");
+        assert_eq!(cut[1], whole[1], "the number keeps its room: {cut:?}");
+        assert_eq!(cut[0] + cut[1], name / 2.0 - step::GAP_S, "{cut:?}");
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the
@@ -2430,6 +2483,7 @@ mod identity_tests {
             verb: "Message to",
             label: label.to_owned(),
             shown: shown.to_owned(),
+            tag: String::new(),
             preview: "The repo is now at /srv".to_owned(),
             term: false,
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
@@ -2522,23 +2576,29 @@ mod identity_tests {
         let tab = runtime.child_label(second, super::super::child_navigation::TAB_CHARS);
         assert!(tab.ends_with(" 2"), "{tab}");
         // The row has room for more of the name than the tab, and keeps the
-        // number.
-        assert_eq!(runtime.row_agent_name(second), format!("{task} 2"));
+        // number apart from it, whole where the name fades.
+        assert_eq!(
+            runtime.row_agent_name(second),
+            (task.to_owned(), " 2".to_owned())
+        );
 
         let titled = Recipient {
             name: "A session whose title runs on well past a row".into(),
             session: Some("95fcd1b9e3a4".into()),
             live: true,
         };
-        let shown = titled.shown();
-        assert!(shown.ends_with(" (95fcd1b9)"), "{shown}");
-        assert!(shown.chars().count() <= LABEL_CHARS + 1, "{shown}");
+        let (shown, id) = titled.shown();
+        assert_eq!(id, " (95fcd1b9)");
+        assert!(
+            shown.chars().count() + id.chars().count() <= LABEL_CHARS + 1,
+            "{shown}{id}"
+        );
         // A phrase the row draws whole.
         let report = Recipient {
             name: "the conversation that started it".into(),
             session: None,
             live: false,
         };
-        assert_eq!(report.shown(), report.name);
+        assert_eq!(report.shown(), (report.name.clone(), String::new()));
     }
 }

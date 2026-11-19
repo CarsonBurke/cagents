@@ -7799,6 +7799,27 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     );
     assert_eq!(stopped.outcome.as_deref(), Some("stopped"));
     assert_eq!(stopped.heading, "Agent \"Review restart safety\" stopped");
+    // Resumed after it was stopped, the notice keeps its own words.
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
+    runtime.agent_work.observe(&runtime.snapshot.subagents);
+    let resumed = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        "",
+        "a-review",
+        stop,
+        stop,
+    );
+    assert_eq!(resumed.outcome.as_deref(), Some("working"));
+    assert_eq!(
+        resumed.heading,
+        "Agent \"Review restart safety\" was stopped · now working"
+    );
+    // A monitor's event is not the agent's report, whatever it says.
+    let event =
+        runtime.delivery_outcome(chat::DeliveryKind::Notice, true, "", "a-review", stop, stop);
+    assert_eq!(event.outcome, None);
+    assert_eq!(event.heading, stop);
     // An agent this conversation doesn't list keeps the heading's own word.
     let unknown = read(&runtime, chat::DeliveryKind::Report, "a-other");
     assert_eq!(unknown.outcome.as_deref(), Some("finished"));

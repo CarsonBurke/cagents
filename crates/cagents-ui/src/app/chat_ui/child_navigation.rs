@@ -193,6 +193,24 @@ impl Ordinals {
     }
 }
 
+/// The number `child` goes by among children of its name, 1 for the first.
+/// A publication the pane has not installed yet, such as one a test built
+/// in place, numbers by earlier namesakes: one pass with no allocation.
+fn child_ordinal(
+    children: &[chat::Subagent],
+    ordinals: &Ordinals,
+    child: &chat::Subagent,
+) -> usize {
+    ordinals.get(child).unwrap_or_else(|| {
+        let namesake = tab_namesake(Runtime::native_child_name(child));
+        1 + children
+            .iter()
+            .take_while(|other| other.id != child.id)
+            .filter(|other| tab_namesake(Runtime::native_child_name(other)) == namesake)
+            .count()
+    })
+}
+
 /// `child`'s name as it is listed among `children`, cut to `limit`
 /// characters before its number so the number always shows.
 pub(super) fn child_label<'a>(
@@ -202,16 +220,7 @@ pub(super) fn child_label<'a>(
     limit: usize,
 ) -> Cow<'a, str> {
     let name = Runtime::native_child_name(child);
-    // A publication the pane has not installed yet, such as one a test built
-    // in place, numbers by earlier namesakes: one pass with no allocation.
-    let ordinal = ordinals.get(child).unwrap_or_else(|| {
-        let namesake = tab_namesake(name);
-        1 + children
-            .iter()
-            .take_while(|other| other.id != child.id)
-            .filter(|other| tab_namesake(Runtime::native_child_name(other)) == namesake)
-            .count()
-    });
+    let ordinal = child_ordinal(children, ordinals, child);
     let cut = name.chars().nth(limit).is_some();
     match (ordinal, cut) {
         (1, false) => Cow::Borrowed(name),
@@ -305,6 +314,12 @@ impl Runtime {
     /// shares that name with another child. See [`Ordinals`].
     pub(super) fn child_label<'a>(&self, child: &'a chat::Subagent, limit: usize) -> Cow<'a, str> {
         child_label(&self.snapshot.subagents, &self.child_ordinals, child, limit)
+    }
+
+    /// The number `child` goes by among children of its name; see
+    /// [`Self::child_label`].
+    pub(super) fn child_ordinal(&self, child: &chat::Subagent) -> usize {
+        child_ordinal(&self.snapshot.subagents, &self.child_ordinals, child)
     }
 
     /// A chooser row's accessible name. It ends with the exact child ID,

@@ -1444,7 +1444,14 @@ struct Place {
 
 /// How much of a command an agent waits on its caption names. The caption
 /// shares its row with the agent's name, which comes first.
-const BACKGROUND_WORK_CHARS: usize = 32;
+const BACKGROUND_WORK_CHARS: usize = 24;
+
+/// How a caption naming one command an agent waits on starts.
+const WAITING_ON: &str = "Waiting on ";
+
+/// The longest an agent's caption runs: one naming the command it waits on.
+/// A row holds its status to this, so it says what the agent's tab says.
+pub(super) const AGENT_CAPTION_CHARS: usize = WAITING_ON.len() + BACKGROUND_WORK_CHARS;
 
 fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
     let (title, outcome) = heading
@@ -1618,7 +1625,7 @@ impl Runtime {
         // and the count is what the reader needs from it.
         Some(match running.count() {
             0 => format!(
-                "Waiting on {}",
+                "{WAITING_ON}{}",
                 Self::short_description(first.trim(), BACKGROUND_WORK_CHARS)
             ),
             more => format!("Waiting on {} commands", more + 1),
@@ -6098,8 +6105,8 @@ impl Runtime {
     ) -> DeliveryOutcome<'a> {
         let notice = kind == chat::DeliveryKind::Notice && !monitor;
         let command = notice.then(|| delivery_command_outcome(first)).flatten();
-        let report = command
-            .is_none()
+        // A monitor's event is not an agent's report, whatever it says.
+        let report = (command.is_none() && !monitor)
             .then(|| delivery_report_outcome(from, first))
             .flatten();
         let agent = report
@@ -6137,9 +6144,12 @@ impl Runtime {
         let heading = match (agent, report, &outcome) {
             (Some(_), Some((_, reported)), Some(now)) => {
                 let rest = &heading[first.len()..];
-                let reported = reported.strip_prefix("was ").unwrap_or(reported);
-                if reported == now {
+                // "was stopped" reads as it was said; "finished" was reported.
+                let word = reported.strip_prefix("was ");
+                if word.unwrap_or(reported) == now {
                     format!("{title} {now}{rest}")
+                } else if word.is_some() {
+                    format!("{title} {reported} · now {now}{rest}")
                 } else {
                     format!("{title} reported {reported} · now {now}{rest}")
                 }
