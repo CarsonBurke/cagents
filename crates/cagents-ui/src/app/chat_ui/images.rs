@@ -635,14 +635,14 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
 }
 pub(super) fn sync(runtime: &mut Runtime) {
     figure::sync(runtime);
-    // The pane viewer covers the transcript its images came from; once the
-    // pane shows another, such as a subagent's, it no longer belongs there.
-    if runtime
-        .image_viewer
-        .as_ref()
-        .is_some_and(|gallery| gallery.transcript != runtime.selected_subagent)
+    // The pane viewer covers the transcript its images came from, and keeps
+    // up with the images that arrive in it. Once the pane shows another
+    // transcript, such as a subagent's, the viewer no longer belongs there.
+    if let Some(mut gallery) = runtime.image_viewer.take()
+        && gallery.transcript == runtime.selected_subagent
     {
-        runtime.image_viewer = None;
+        gallery.refresh(runtime);
+        runtime.image_viewer = Some(gallery);
     }
     if !runtime.visible.load(Ordering::Relaxed)
         || runtime
@@ -841,6 +841,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
+#[derive(Clone)]
 struct Entry {
     id: String,
     managed: bool,
@@ -867,6 +868,9 @@ pub(in crate::app) struct Gallery {
     /// conversation's own. A pane viewer belongs to that transcript and
     /// closes when the pane shows another ([`sync`]).
     transcript: Option<String>,
+    /// Whether the images are the transcript's own, which [`Self::refresh`]
+    /// keeps up with, rather than one file a figure or device opened.
+    from_transcript: bool,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -889,9 +893,26 @@ impl Gallery {
             remote: device.is_some(),
             reset: 0,
             transcript: None,
+            from_transcript: false,
         }
     }
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
+        let entries = Self::entries(runtime, &[])?;
+        let selected = entries.iter().position(|entry| entry.id == id)?;
+        Some(Self {
+            entries,
+            selected,
+            remote: crate::device::is_remote(),
+            reset: 0,
+            transcript: runtime.selected_subagent.clone(),
+            from_transcript: true,
+        })
+    }
+    /// The images of the transcript `runtime` shows, in its order. One that
+    /// `kept` already holds keeps those pixels, even if the transcript has
+    /// since let them go; any other is included once it is decoded. `None`
+    /// when the selected subagent's transcript is gone.
+    fn entries(runtime: &Runtime, kept: &[Entry]) -> Option<Vec<Entry>> {
         let items = match runtime.selected_subagent.as_deref() {
             Some(agent) => {
                 &runtime
@@ -903,49 +924,63 @@ impl Gallery {
             }
             None => &runtime.snapshot.items,
         };
-        let entries: Vec<_> = items
-            .iter()
-            .filter_map(|item| {
-                let ItemContent::Image {
-                    path,
-                    description,
-                    reference,
-                } = &item.content
-                else {
-                    return None;
-                };
-                Some(Entry {
-                    id: item.id.clone(),
-                    managed: reference.is_some(),
-                    path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
-                        path.clone()
-                    } else {
-                        runtime
-                            .session
-                            .launch
-                            .recipe
-                            .working_directory
-                            .join(path)
-                            .to_string_lossy()
-                            .into_owned()
-                    },
-                    label: if description.is_empty() {
-                        "Image".into()
-                    } else {
-                        description.clone()
-                    },
-                    handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+        Some(
+            items
+                .iter()
+                .filter_map(|item| {
+                    let ItemContent::Image {
+                        path,
+                        description,
+                        reference,
+                    } = &item.content
+                    else {
+                        return None;
+                    };
+                    if let Some(entry) = kept.iter().find(|entry| entry.id == item.id) {
+                        return Some(entry.clone());
+                    }
+                    Some(Entry {
+                        id: item.id.clone(),
+                        managed: reference.is_some(),
+                        path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
+                            path.clone()
+                        } else {
+                            runtime
+                                .session
+                                .launch
+                                .recipe
+                                .working_directory
+                                .join(path)
+                                .to_string_lossy()
+                                .into_owned()
+                        },
+                        label: if description.is_empty() {
+                            "Image".into()
+                        } else {
+                            description.clone()
+                        },
+                        handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+                    })
                 })
-            })
-            .collect();
-        let selected = entries.iter().position(|entry| entry.id == id)?;
-        Some(Self {
-            entries,
-            selected,
-            remote: crate::device::is_remote(),
-            reset: 0,
-            transcript: runtime.selected_subagent.clone(),
-        })
+                .collect(),
+        )
+    }
+    /// Brings a viewer of the transcript's images up to date with it, so an
+    /// image that arrives while it is open, as a reply to a question sent
+    /// from it, can be browsed to. The shown image and its zoom stay put.
+    fn refresh(&mut self, runtime: &Runtime) {
+        if !self.from_transcript {
+            return;
+        }
+        let shown = &self.entries[self.selected].id;
+        // An image the transcript no longer holds, such as one paged out,
+        // leaves the viewer as it is rather than lose what it shows.
+        if let Some(entries) = Self::entries(runtime, &self.entries)
+            && let Some(selected) = entries.iter().position(|entry| &entry.id == shown)
+        {
+            self.entries = entries;
+            self.selected = selected;
+        }
     }
     pub(in crate::app) fn next(&mut self, forward: bool) {
         self.selected = if forward {
@@ -2062,6 +2097,7 @@ mod tests {
             remote: false,
             reset: 0,
             transcript: None,
+            from_transcript: false,
         };
         gallery.next(false);
         assert_eq!(gallery.selected, 1);

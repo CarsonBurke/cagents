@@ -3616,7 +3616,10 @@ impl Runtime {
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
-                    if press.modifiers.command()
+                    // The transcript is under the viewer, so Ctrl+End stays
+                    // in the draft rather than scroll what can't be seen.
+                    if !viewing
+                        && press.modifiers.command()
                         && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
@@ -3674,9 +3677,20 @@ impl Runtime {
                     if let Some(mode) =
                         submit_chord(&press, key_submit.0, key_submit.1, enter_sends)
                     {
-                        return Some(text_editor::Binding::Custom(action(Action::Submit(
-                            target, mode,
-                        ))));
+                        let submit =
+                            text_editor::Binding::Custom(action(Action::Submit(target, mode)));
+                        // Once the question about the image is sent, the
+                        // keyboard goes back to the image, so the next Escape
+                        // closes it rather than interrupt the reply. Typing
+                        // still reaches the composer.
+                        return Some(if viewing {
+                            text_editor::Binding::Sequence(vec![
+                                submit,
+                                text_editor::Binding::Custom(action(Action::FocusImage(target))),
+                            ])
+                        } else {
+                            submit
+                        });
                     }
                     if take_back && queue_key(&press, self.composer.is_empty()) {
                         return Some(text_editor::Binding::Custom(action(

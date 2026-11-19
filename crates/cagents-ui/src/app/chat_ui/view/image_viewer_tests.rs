@@ -8,10 +8,16 @@ use crate::app::dialog_ui::tests::{focus_after_key, key_control, key_press};
 use images::{Gallery, ViewerHost, viewer_focus};
 use keyboard::key::Named;
 
-/// Shows `count` decoded images in `runtime`'s transcript, returning their
-/// item ids and the pixels each is drawn with.
+/// Shows `count` more decoded images in `runtime`'s transcript, returning
+/// their item ids and the pixels each is drawn with.
 fn show_images(runtime: &mut Runtime, count: u8) -> Vec<(String, iced::advanced::image::Id)> {
-    (0..count)
+    let shown = runtime
+        .snapshot
+        .items
+        .iter()
+        .filter(|item| matches!(item.content, ItemContent::Image { .. }))
+        .count() as u8;
+    (shown..shown + count)
         .map(|index| {
             let id = format!("image-{index}");
             let content = ItemContent::Image {
@@ -260,6 +266,62 @@ fn sending_and_new_activity_leave_the_viewer_open() {
     assert_eq!(
         shown(&app, target),
         Some(images::ImageRef::Viewer(host, images[1].1))
+    );
+
+    // An image in the reply joins the viewer once it is decoded, so it can be
+    // browsed to without closing it; the shown image stays.
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let arrived = show_images(runtime, 1).pop().unwrap();
+    images::sync(runtime);
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, images[1].1))
+    );
+    named(&mut app, Named::ArrowRight, false);
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, arrived.1))
+    );
+}
+
+/// Sending from the composer hands the keyboard back to the image, so the
+/// Escape that follows closes the viewer rather than interrupt the reply.
+#[test]
+fn sending_hands_the_keyboard_back_to_the_image() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, _) = viewing(&mut app);
+    let composer = card_control_id(card, "chat-composer");
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .replace_draft(text_editor::Content::with_text("Why does it drop?"));
+    let (messages, captured) = key_control(
+        app.chat_view(card),
+        composer.clone(),
+        key_press(Named::Enter),
+    );
+    assert!(captured);
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [
+                Message::ChatUi(Action::Submit(sent, _)),
+                Message::ChatUi(Action::FocusImage(focused)),
+            ] if *sent == target && *focused == target
+        ),
+        "{messages:?}"
+    );
+
+    // Ctrl+End stays in the draft instead of scrolling the covered transcript.
+    let mut end = key_press(Named::End);
+    if let keyboard::Event::KeyPressed { modifiers, .. } = &mut end {
+        *modifiers = keyboard::Modifiers::CTRL;
+    }
+    let (messages, _) = key_control(app.chat_view(card), composer, end);
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, Message::ChatUi(Action::Latest(_)))),
+        "{messages:?}"
     );
 }
 
