@@ -274,6 +274,16 @@ mod tests {
             Ok(SourceControlRead::Changed(Box::new(snapshot()))),
         ));
         let first = Arc::clone(source(&app).source_snapshot().unwrap());
+        // A rebuild allocates its rows while the model it replaces still
+        // holds the old ones, so the same allocation shows none was built.
+        let rows = |app: &Cagents| {
+            source(app)
+                .group(ChangeArea::Unstaged)
+                .unwrap()
+                .rows()
+                .as_ptr()
+        };
+        let built = rows(&app);
 
         drop(app.reload_source_control(&key));
         assert_eq!(source(&app).progress_label(), Some("Refreshing…"));
@@ -281,6 +291,7 @@ mod tests {
         drop(app.source_control_loaded(key.clone(), request, Ok(SourceControlRead::Unchanged)));
         assert_eq!(source(&app).progress_label(), None);
         assert!(Arc::ptr_eq(source(&app).source_snapshot().unwrap(), &first));
+        assert_eq!(rows(&app), built);
 
         let mut changed = snapshot();
         changed.status.entries.push(unstaged("src/lib.rs"));
