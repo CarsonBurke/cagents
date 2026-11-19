@@ -231,20 +231,18 @@ impl Cagents {
                 .file_name()
                 .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned())
         };
-        // One pass over Projects, as each frame draws this.
-        let listed = self.sidebar_model.projects.iter().find_map(|project| {
-            match project
-                .worktrees
-                .iter()
-                .find(|worktree| worktree.path == directory)
-            {
-                Some(worktree) => Some((project.name.as_str(), worktree.branch.as_deref())),
-                None => (project.repository == directory).then_some((project.name.as_str(), None)),
-            }
-        });
+        let listed = self
+            .place_index
+            .listed(&self.sidebar_model.projects, directory);
         let label = match listed {
-            Some((project, Some(branch))) => format!("{branch} · {project}"),
-            Some((project, None)) => format!("{} · {project}", folder()),
+            Some(Listed {
+                project,
+                branch: Some(branch),
+            }) => format!("{branch} · {project}"),
+            Some(Listed {
+                project,
+                branch: None,
+            }) => format!("{} · {project}", folder()),
             None => folder(),
         };
         Place { label, path }
@@ -254,6 +252,80 @@ impl Cagents {
 struct Place {
     label: String,
     path: String,
+}
+
+/// The project, and the branch when it is one of its worktrees, of each
+/// folder Projects lists, built again only when Projects changes: every
+/// inspector draws its pane's place on every frame, so scanning each
+/// project's worktrees there would cost the whole list per pane per frame.
+#[derive(Debug, Default)]
+pub(super) struct PlaceIndex {
+    places: std::cell::RefCell<Option<Places>>,
+    #[cfg(test)]
+    builds: std::cell::Cell<usize>,
+}
+
+#[derive(Debug)]
+struct Places {
+    /// The [`sidebar::Revisioned`] revision of the projects it was built from.
+    revision: u64,
+    folders: HashMap<PathBuf, Listed>,
+}
+
+#[derive(Debug, Clone)]
+struct Listed {
+    project: String,
+    branch: Option<String>,
+}
+
+impl PlaceIndex {
+    /// Where `directory` is listed in `projects`: the first project, in
+    /// Projects' order, that has it as a worktree or as its repository, a
+    /// worktree ahead of a repository within each project.
+    fn listed(
+        &self,
+        projects: &sidebar::Revisioned<Vec<sidebar::SidebarProject>>,
+        directory: &Path,
+    ) -> Option<Listed> {
+        let revision = sidebar::Revisioned::revision(projects);
+        let mut places = self.places.borrow_mut();
+        if places
+            .as_ref()
+            .is_none_or(|places| places.revision != revision)
+        {
+            *places = Some(Places {
+                revision,
+                folders: folders(projects),
+            });
+            #[cfg(test)]
+            self.builds.set(self.builds.get() + 1);
+        }
+        places.as_ref()?.folders.get(directory).cloned()
+    }
+
+    /// How many times it has been built.
+    #[cfg(test)]
+    pub(super) fn builds(&self) -> usize {
+        self.builds.get()
+    }
+}
+
+fn folders(projects: &[sidebar::SidebarProject]) -> HashMap<PathBuf, Listed> {
+    let mut folders = HashMap::new();
+    for project in projects {
+        let rows = project
+            .worktrees
+            .iter()
+            .map(|worktree| (&worktree.path, worktree.branch.clone()))
+            .chain([(&project.repository, None)]);
+        for (path, branch) in rows {
+            folders.entry(path.clone()).or_insert_with(|| Listed {
+                project: project.name.clone(),
+                branch,
+            });
+        }
+    }
+    folders
 }
 
 /// A row on the list grid: `mark` in the icon column, `text` on the label
@@ -298,4 +370,88 @@ fn grid_row<'a>(
     .height(Length::Fixed(height))
     .width(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The place `app`'s focused pane, a terminal, shows after it moves to
+    /// `directory`.
+    fn place_in(app: &mut Cagents, directory: &str) -> String {
+        let terminal = app.workspace.focused().unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(terminal).unwrap().kind else {
+            unreachable!("the test app's pane is a terminal")
+        };
+        session.launch.working_directory = directory.into();
+        app.pane_place(app.card_state(terminal).unwrap()).label
+    }
+
+    #[test]
+    fn a_panes_place_is_looked_up_in_an_index_built_again_only_when_projects_change() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.sidebar_model = crate::sidebar::tests::panel_model();
+
+        assert_eq!(
+            place_in(&mut app, "/repo/fix-sidebar"),
+            "fix-sidebar · cagents"
+        );
+        // Every frame draws it again; none of them scans Projects.
+        for _ in 0..3 {
+            assert_eq!(
+                place_in(&mut app, "/repo/fix-sidebar"),
+                "fix-sidebar · cagents"
+            );
+        }
+        // The repository itself, and a folder Projects doesn't list.
+        assert_eq!(place_in(&mut app, "/repo/cagents"), "cagents · cagents");
+        assert_eq!(place_in(&mut app, "/elsewhere/scratch"), "scratch");
+        assert_eq!(app.place_index.builds(), 1);
+
+        // A change to Projects is seen at the next draw.
+        app.sidebar_model.projects[0].name = "renamed".into();
+        assert_eq!(
+            place_in(&mut app, "/repo/fix-sidebar"),
+            "fix-sidebar · renamed"
+        );
+        assert_eq!(place_in(&mut app, "/repo/main"), "main · renamed");
+        assert_eq!(app.place_index.builds(), 2);
+    }
+
+    #[test]
+    fn a_folder_listed_twice_is_placed_as_the_scan_placed_it() {
+        let project = |name: &str, repository: &str, worktrees: &[(&str, &str)]| {
+            let mut project = crate::sidebar::tests::panel_model().projects[0].clone();
+            project.name = name.into();
+            project.repository = repository.into();
+            let template = project.worktrees[0].clone();
+            project.worktrees = worktrees
+                .iter()
+                .map(|(path, branch)| crate::sidebar::SidebarWorktree {
+                    path: (*path).into(),
+                    branch: Some((*branch).into()),
+                    ..template.clone()
+                })
+                .collect();
+            project
+        };
+        let folders = folders(&[
+            project("first", "/shared", &[("/first/wt", "one")]),
+            project(
+                "second",
+                "/second",
+                &[("/shared", "two"), ("/first/wt", "three")],
+            ),
+            project("third", "/third", &[("/third", "main")]),
+        ]);
+        let at = |path: &str| {
+            let listed = &folders[Path::new(path)];
+            (listed.project.as_str(), listed.branch.as_deref())
+        };
+        // The first project to list a folder keeps it.
+        assert_eq!(at("/shared"), ("first", None));
+        assert_eq!(at("/first/wt"), ("first", Some("one")));
+        // Within a project, its worktree comes ahead of its repository.
+        assert_eq!(at("/third"), ("third", Some("main")));
+    }
 }
