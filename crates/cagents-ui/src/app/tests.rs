@@ -13648,6 +13648,7 @@ fn configured_command_takes_priority_over_the_editor_staging_shortcut() {
     app.settings.keyboard_shortcuts.command_palette = settings::parse_chords("Ctrl+Shift+S");
     drop(app.update(key()));
     assert!(app.palette.is_open());
+    assert!(app.source_control_mutations.is_empty(), "nothing is staged");
 }
 
 #[test]
