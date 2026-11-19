@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +35,18 @@ class OlderClientProof(unittest.TestCase):
             (root / f"tests/fixtures/wire-formats/{recording}.json").write_text("{}\n")
         return root
 
+    def commit(self, root):
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(root),
+                "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                "commit", "-qm", "fixture",
+            ],
+            check=True,
+        )
+
     def test_clients_proven_at_the_recorded_protocol_pass(self):
         self.assertEqual(checker.problems(self.tree(151, [151], [128, 129, 151])), [])
 
@@ -54,6 +67,22 @@ class OlderClientProof(unittest.TestCase):
         (root / "src/terminal/ipc/older_clients.rs").unlink()
         (problem,) = checker.problems(root)
         self.assertIn("older_clients.rs not found", problem)
+
+    def test_a_git_tree_is_checked_like_a_directory(self):
+        for proven in [151, 129]:
+            with self.subTest(proven=proven):
+                root = self.tree(151, [proven], [128, 129, 151])
+                self.commit(root)
+                self.assertEqual(
+                    checker.problems_in_tree(root, "HEAD^{tree}"),
+                    checker.problems(root),
+                )
+
+    def test_a_tree_without_the_protocol_has_nothing_to_check(self):
+        root = self.tree(151, [151], [151])
+        (root / "src/terminal/ipc.rs").unlink()
+        self.commit(root)
+        self.assertIsNone(checker.problems_in_tree(root, "HEAD^{tree}"))
 
 
 if __name__ == "__main__":
