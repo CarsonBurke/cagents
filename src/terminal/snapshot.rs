@@ -269,6 +269,27 @@ impl RenderSnapshot {
             ..Self::empty()
         }
     }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn share_unchanged_rows(&mut self, base: &RenderSnapshot) {
+        if self.columns != base.columns
+            || self.rows != base.rows
+            || self.lines.len() != base.lines.len()
+        {
+            return;
+        }
+
+        let mut lines = None;
+        for (index, (next, previous)) in self.lines.iter().zip(base.lines.iter()).enumerate() {
+            if !Arc::ptr_eq(next, previous) && **next == **previous {
+                let lines = lines.get_or_insert_with(|| self.lines.to_vec());
+                lines[index] = Arc::clone(previous);
+            }
+        }
+        if let Some(lines) = lines {
+            self.lines = lines.into();
+        }
+    }
 }
 
 #[cfg(feature = "host")]
@@ -555,6 +576,141 @@ fn map_cursor(value: CursorVisualStyle) -> CursorShape {
 mod tests {
     use super::*;
     use libghostty_vt::TerminalOptions;
+
+    #[test]
+    fn share_unchanged_rows_reuses_equal_rows_and_keeps_changed_ones() {
+        let snapshot = |texts: [&str; 3]| RenderSnapshot {
+            columns: 1,
+            rows: 3,
+            lines: texts
+                .map(|text| {
+                    Arc::new(RowSnapshot {
+                        cells: vec![CellSnapshot {
+                            text: text.into(),
+                            ..CellSnapshot::default()
+                        }],
+                        ..RowSnapshot::default()
+                    })
+                })
+                .into(),
+            ..RenderSnapshot::empty()
+        };
+        let base = snapshot(["a", "b", "c"]);
+        let mut next = snapshot(["a", "d", "c"]);
+        assert!(
+            next.lines
+                .iter()
+                .zip(base.lines.iter())
+                .all(|(next, previous)| !Arc::ptr_eq(next, previous))
+        );
+        let changed = Arc::clone(&next.lines[1]);
+
+        next.share_unchanged_rows(&base);
+
+        assert!(Arc::ptr_eq(&next.lines[0], &base.lines[0]));
+        assert!(!Arc::ptr_eq(&next.lines[1], &base.lines[1]));
+        assert!(Arc::ptr_eq(&next.lines[1], &changed));
+        assert!(Arc::ptr_eq(&next.lines[2], &base.lines[2]));
+    }
+
+    #[test]
+    fn share_unchanged_rows_ignores_a_resized_base() {
+        let base = RenderSnapshot {
+            columns: 1,
+            rows: 3,
+            lines: (0..3).map(|_| Arc::new(RowSnapshot::default())).collect(),
+            ..RenderSnapshot::empty()
+        };
+        let mut next = RenderSnapshot {
+            columns: 2,
+            lines: base
+                .lines
+                .iter()
+                .map(|row| Arc::new((**row).clone()))
+                .collect(),
+            ..base.clone()
+        };
+        let original = Arc::clone(&next.lines);
+
+        next.share_unchanged_rows(&base);
+
+        assert!(Arc::ptr_eq(&next.lines, &original));
+        for (next, previous) in next.lines.iter().zip(base.lines.iter()) {
+            assert!(!Arc::ptr_eq(next, previous));
+        }
+    }
+
+    #[test]
+    fn a_history_viewport_is_unchanged_by_output_below_it() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 12,
+            rows: 3,
+            max_scrollback: 64,
+        })
+        .unwrap();
+        for line in 0..20 {
+            terminal.vt_write(format!("line-{line:02}\r\n").as_bytes());
+        }
+        let mut visual = VisualResources::new().unwrap();
+        let live = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        let first = capture_viewport(&terminal, &live, Some(0), 3).unwrap();
+        for line in 20..25 {
+            terminal.vt_write(format!("line-{line:02}\r\n").as_bytes());
+        }
+        let live = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
+        let mut second = (*capture_viewport(&terminal, &live, Some(0), 3).unwrap()).clone();
+        assert_eq!(first.scroll.offset, 0);
+        assert_eq!(second.scroll.offset, 0);
+        assert!(second.scroll.total > first.scroll.total);
+        assert_eq!(second.lines, first.lines);
+
+        second.share_unchanged_rows(&first);
+
+        assert!(
+            second
+                .lines
+                .iter()
+                .zip(first.lines.iter())
+                .all(|(next, previous)| Arc::ptr_eq(next, previous))
+        );
+    }
+
+    #[test]
+    fn a_history_viewport_keeps_wide_clusters_and_links() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 24,
+            rows: 4,
+            max_scrollback: 64,
+        })
+        .unwrap();
+        let uri = format!("https://example.com/{}", "a".repeat(1200));
+        terminal.vt_write(
+            format!("\x1b]8;;{uri}\x1b\\linked\x1b]8;;\x1b\\\r\na漢b\r\na👩‍💻b").as_bytes(),
+        );
+        let mut visual = VisualResources::new().unwrap();
+        let live = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        assert_eq!(live.lines[0].hyperlinks[0].uri, uri);
+        assert_eq!(live.lines[1].cells[1].text, "漢");
+        assert_eq!(live.lines[2].cells[1].text, "👩‍💻");
+        for _ in 0..8 {
+            terminal.vt_write(b"\r\nline");
+        }
+        let bottom = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
+        assert!(bottom.scroll.offset > 0);
+        let history = capture_viewport(&terminal, &bottom, Some(0), 4).unwrap();
+
+        for (history, live) in history.lines[..3].iter().zip(live.lines[..3].iter()) {
+            assert_eq!(
+                history
+                    .cells
+                    .iter()
+                    .map(|cell| &cell.text)
+                    .collect::<Vec<_>>(),
+                live.cells.iter().map(|cell| &cell.text).collect::<Vec<_>>()
+            );
+            assert_eq!(history.hyperlinks, live.hyperlinks);
+        }
+    }
 
     #[test]
     fn capture_keeps_wrap_flags_and_coalesces_osc8_spans() {
@@ -918,19 +1074,23 @@ pub(crate) fn capture_viewport(
     };
     let mut lines = Vec::new();
     let mut graphemes = vec!['\0'; 32];
+    let mut text = String::new();
     let mut uri = vec![0; 1024];
     let local_host = std::cell::OnceCell::new();
     for row in snapshot.scroll.offset..snapshot.scroll.offset + snapshot.scroll.len {
         let mut cells = Vec::with_capacity(snapshot.columns as usize);
         let mut hyperlinks: Vec<HyperlinkSpan> = Vec::new();
         let mut wrapped = false;
+        let mut has_hyperlink = false;
         for column in 0..snapshot.columns {
             let reference = terminal.grid_ref(Point::Screen(PointCoordinate {
                 x: column,
                 y: row as u32,
             }))?;
             if column == 0 {
-                wrapped = reference.row()?.is_wrapped()?;
+                let row = reference.row()?;
+                wrapped = row.is_wrapped()?;
+                has_hyperlink = row.has_hyperlink()?;
             }
             let style = reference.style()?;
             let mut fg = color(style.fg_color, foreground);
@@ -945,7 +1105,8 @@ pub(crate) fn capture_viewport(
                 }
                 result => result?,
             };
-            let text = graphemes[..length].iter().collect::<String>();
+            text.clear();
+            text.extend(&graphemes[..length]);
             cells.push(CellSnapshot {
                 text: CellText::new(&text),
                 foreground: fg,
@@ -962,27 +1123,29 @@ pub(crate) fn capture_viewport(
                 },
                 selected: false,
             });
-            let length = match reference.hyperlink_uri(&mut uri) {
-                Err(libghostty_vt::Error::OutOfSpace { required }) if required <= 65536 => {
-                    uri.resize(required, 0);
-                    reference.hyperlink_uri(&mut uri)?
-                }
-                result => result.unwrap_or(0),
-            };
-            if let Ok(link) = std::str::from_utf8(&uri[..length])
-                && !link.is_empty()
-            {
-                if let Some(last) = hyperlinks
-                    .last_mut()
-                    .filter(|last| last.end == column && last.uri == link)
+            if has_hyperlink && reference.cell()?.has_hyperlink()? {
+                let length = match reference.hyperlink_uri(&mut uri) {
+                    Err(libghostty_vt::Error::OutOfSpace { required }) if required <= 65536 => {
+                        uri.resize(required, 0);
+                        reference.hyperlink_uri(&mut uri)?
+                    }
+                    result => result.unwrap_or(0),
+                };
+                if let Ok(link) = std::str::from_utf8(&uri[..length])
+                    && !link.is_empty()
                 {
-                    last.end += 1;
-                } else {
-                    hyperlinks.push(HyperlinkSpan {
-                        start: column,
-                        end: column + 1,
-                        uri: link.into(),
-                    });
+                    if let Some(last) = hyperlinks
+                        .last_mut()
+                        .filter(|last| last.end == column && last.uri == link)
+                    {
+                        last.end += 1;
+                    } else {
+                        hyperlinks.push(HyperlinkSpan {
+                            start: column,
+                            end: column + 1,
+                            uri: link.into(),
+                        });
+                    }
                 }
             }
         }
