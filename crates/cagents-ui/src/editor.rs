@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
 
+pub mod language;
 pub mod retained_save;
 
 /// Rasterizing a page happens in a child process, so the reader's document
@@ -622,16 +623,13 @@ fn weak_signature(format: image::ImageFormat) -> bool {
 }
 
 /// The editable buffer for `text`, read from `relative_path`.
+///
+/// A name that does not say whether the file is Markdown leaves it to the
+/// text, read here on the loading worker so the buffer opens already knowing.
 fn editable_text(relative_path: &Path, text: String) -> FileContent {
-    let markdown = relative_path
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("README"))
-        || relative_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
-            });
+    let markdown = language::markdown_by_name(relative_path).unwrap_or_else(|| {
+        language::infer_markdown(language::inference_prefix(text.lines()).as_str(), false)
+    });
     FileContent::Editable {
         content_hash: blake3::hash(text.as_bytes()),
         text,
@@ -1695,6 +1693,8 @@ mod tests {
         for (name, text, markdown) in [
             ("README", "# Heading\n", true),
             ("LICENSE", "# Literal\n", false),
+            // A name that says nothing leaves it to the content.
+            ("NOTES", "## Plan\n\n- **ship** it\n", true),
             ("notes.txt", "Text\n", false),
             ("flow.mmd", "flowchart LR; A-->B", false),
         ] {

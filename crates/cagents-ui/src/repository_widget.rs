@@ -43,6 +43,7 @@ use crate::{
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
         SaveDurability, SaveOutcome,
+        language::{self, DocumentLanguage},
     },
     editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
@@ -537,11 +538,17 @@ pub enum RepositoryAction {
     FileListUnchanged {
         identity: AsyncIdentity,
     },
-    /// The Markdown preview's debounce elapsed; re-parse if an edit
-    /// invalidated the items.
+    /// The edit debounce elapsed; re-read the buffer's language and, in the
+    /// preview, re-parse if an edit invalidated the items.
     MarkdownDue {
         card: CardId,
         ticket: u64,
+    },
+    /// The reader settled the open buffer's language, or handed it back to
+    /// its content with `None`.
+    ChooseLanguage {
+        card: CardId,
+        language: Option<DocumentLanguage>,
     },
     DiagramsRendered {
         identity: AsyncIdentity,
@@ -906,6 +913,7 @@ impl RepositoryAction {
             | Self::RevealDiffTop { card }
             | Self::WorkingDiffDue { card, .. }
             | Self::MarkdownDue { card, .. }
+            | Self::ChooseLanguage { card, .. }
             | Self::CopyDiagnostic { card, .. }
             | Self::MarkdownLink { card, .. }
             | Self::OpenFind { card }
@@ -962,6 +970,19 @@ enum MarkdownMode {
     Preview,
 }
 
+/// Who decides whether a buffer is Markdown, for its preview and its
+/// highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanguageSource {
+    /// Its name: an extension, a `README` or a dotfile. Nothing is inferred.
+    Name,
+    /// Its content, for a name that says nothing. `stale` from an edit until
+    /// the edit debounce, or the preview, reads the content again.
+    Content { stale: bool },
+    /// The reader, until they hand the choice back to the content.
+    Chosen(DocumentLanguage),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SaveTrigger {
     Explicit,
@@ -982,7 +1003,13 @@ struct EditorDocument {
     saved_history_revision: u64,
     saved_snapshot: text_editor::TextSnapshot,
     disk_hash: blake3::Hash,
+    /// Whether the buffer reads as Markdown, as [`EditorDocument::language`]
+    /// last decided.
     markdown: bool,
+    language: LanguageSource,
+    /// How many times the content was read to infer its language.
+    #[cfg(test)]
+    inferences: usize,
     markdown_items: Vec<markdown::Item>,
     /// Whether [`EditorDocument::markdown_items`] still describes the buffer.
     ///
@@ -1066,6 +1093,13 @@ impl EditorDocument {
     ) -> Self {
         let content = text_editor::Content::with_text(&text);
         let saved_snapshot = content.text_snapshot();
+        // The load inferred a nameless buffer's language from this same text,
+        // so it is current until the first edit.
+        let language = if language::markdown_by_name(&source).is_some() {
+            LanguageSource::Name
+        } else {
+            LanguageSource::Content { stale: false }
+        };
         Self {
             path,
             source,
@@ -1075,6 +1109,9 @@ impl EditorDocument {
             saved_history_revision: 0,
             disk_hash,
             markdown,
+            language,
+            #[cfg(test)]
+            inferences: 0,
             // Source editing does not consume the preview AST. Parse only
             // when preview is first mounted, alongside its text snapshot.
             markdown_items: Vec::new(),
@@ -1180,7 +1217,17 @@ impl EditorDocument {
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
         self.refresh_dirty();
+        self.content_invalidated();
+    }
+
+    /// Marks everything derived from the whole text as needing a fresh read:
+    /// the preview's parse and, for a buffer its name does not type, its
+    /// language. Both are read at the edit debounce, never per keystroke.
+    fn content_invalidated(&mut self) {
         self.markdown_stale = true;
+        if let LanguageSource::Content { stale } = &mut self.language {
+            *stale = true;
+        }
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
@@ -1273,10 +1320,7 @@ impl EditorDocument {
         }
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
-        self.markdown_stale = true;
-        if let Some(cancel) = &self.diagram_cancel {
-            cancel.0.cancel();
-        }
+        self.content_invalidated();
         self.history.adopt_revision(self.saved_history_revision);
         self.dirty = false;
         debug_assert!(self.active_save.is_none());
@@ -1311,10 +1355,7 @@ impl EditorDocument {
         // The positions the history recorded address the buffer that was
         // just thrown away.
         self.history.clear();
-        self.markdown_stale = true;
-        if let Some(cancel) = &self.diagram_cancel {
-            cancel.0.cancel();
-        }
+        self.content_invalidated();
         self.dirty = text != self.saved_text;
         if !self.dirty {
             self.history.adopt_revision(self.saved_history_revision);
@@ -1358,6 +1399,7 @@ impl EditorDocument {
     /// that pays for a full document walk, and nothing reads
     /// [`EditorDocument::markdown_items`] until the preview is on screen.
     fn sync_markdown(&mut self) {
+        self.sync_language();
         if !std::mem::take(&mut self.markdown_stale) {
             return;
         }
@@ -1367,6 +1409,107 @@ impl EditorDocument {
         } else {
             Vec::new()
         };
+    }
+}
+
+impl EditorDocument {
+    /// Whether an edit left the buffer's language to be read again.
+    fn language_stale(&self) -> bool {
+        matches!(self.language, LanguageSource::Content { stale: true })
+    }
+
+    /// Reads an edited buffer's language from its content again, if its name
+    /// leaves that to the content.
+    ///
+    /// Only the bounded [`language::InferencePrefix`] is read, line by line,
+    /// so the buffer is never serialized for it; and only after an edit, from
+    /// the edit debounce or the moment the preview needs it.
+    fn sync_language(&mut self) {
+        let LanguageSource::Content {
+            stale: stale @ true,
+        } = &mut self.language
+        else {
+            return;
+        };
+        *stale = false;
+        #[cfg(test)]
+        {
+            self.inferences += 1;
+        }
+        let mut prefix = language::InferencePrefix::default();
+        for index in 0..self.content.line_count() {
+            if self
+                .content
+                .with_line(index, |line, _| prefix.push_line(line))
+                != Some(true)
+            {
+                break;
+            }
+        }
+        self.set_markdown(language::infer_markdown(prefix.as_str(), self.markdown));
+    }
+
+    fn set_markdown(&mut self, markdown: bool) {
+        if self.markdown != markdown {
+            self.markdown = markdown;
+            // The preview's items were parsed, or skipped, for the other
+            // language.
+            self.markdown_stale = true;
+        }
+    }
+
+    /// The reader's choice of language, or `None` while the content decides.
+    fn chosen_language(&self) -> Option<DocumentLanguage> {
+        match self.language {
+            LanguageSource::Chosen(language) => Some(language),
+            _ => None,
+        }
+    }
+
+    /// Settles the buffer's language on `choice`, or hands it back to the
+    /// content with `None`. A buffer its name types offers no choice and
+    /// answers `false`.
+    fn choose_language(&mut self, choice: Option<DocumentLanguage>) -> bool {
+        if self.language == LanguageSource::Name {
+            return false;
+        }
+        match choice {
+            Some(language) => {
+                self.language = LanguageSource::Chosen(language);
+                self.set_markdown(language.is_markdown());
+            }
+            None => {
+                if !matches!(self.language, LanguageSource::Content { .. }) {
+                    self.language = LanguageSource::Content { stale: true };
+                    // Read afresh, not from the chosen language: what the
+                    // reader picked is not evidence about the content.
+                    self.markdown = false;
+                    self.markdown_stale = true;
+                    self.sync_language();
+                }
+            }
+        }
+        true
+    }
+
+    /// The edit surface's syntax highlighting, which follows the language the
+    /// preview uses rather than the name alone.
+    fn highlighter(
+        &self,
+        theme: crate::settings::EditorSyntaxTheme,
+        dark: bool,
+    ) -> cosmic::iced::highlighter::Settings {
+        let token = match self.language {
+            LanguageSource::Chosen(DocumentLanguage::PlainText) => "txt",
+            _ if self.markdown => "md",
+            // A nameless buffer that is not Markdown keeps whatever its name
+            // highlights as: a `Makefile` is still a Makefile.
+            _ => return highlighter_settings(&self.source, theme, dark),
+        };
+        cosmic::iced::highlighter::Settings {
+            theme: crate::diff_view::syntax_highlighter_theme(theme, dark),
+            token: token.to_owned(),
+        }
     }
 }
 
@@ -2496,6 +2639,11 @@ pub struct RepositoryRuntime {
     /// batch unusable until the next drain.
     lsp_edits_exact: bool,
     markdown_debounce: MarkdownDebounce,
+    /// Languages the reader chose for buffers their names do not type, by
+    /// worktree-relative source. Kept here rather than on the buffer so the
+    /// choice outlives a reload or reopening the file, and a shell can keep
+    /// it across sessions.
+    language_choices: BTreeMap<PathBuf, DocumentLanguage>,
 }
 
 /// Owned, renderer-free projection of the active repository source surface.
@@ -2659,6 +2807,7 @@ impl RepositoryRuntime {
             lsp_edits: Vec::new(),
             lsp_edits_exact: true,
             markdown_debounce: MarkdownDebounce::default(),
+            language_choices: BTreeMap::new(),
         }
     }
 
@@ -4989,6 +5138,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return Task::none();
         };
+        document.sync_language();
         if !document.markdown {
             return Task::none();
         }
@@ -5015,6 +5165,33 @@ impl RepositoryRuntime {
                 )
             });
         Task::batch([scroll, self.diagram_task(card)])
+    }
+
+    /// The languages the reader chose for buffers their names do not type,
+    /// by worktree-relative source, for a shell that keeps them across
+    /// sessions.
+    pub fn language_choices(&self) -> impl Iterator<Item = (&Path, DocumentLanguage)> {
+        self.language_choices
+            .iter()
+            .map(|(source, language)| (source.as_path(), *language))
+    }
+
+    /// Restores a language chosen in an earlier session, before the buffer
+    /// at `source` is opened.
+    pub fn restore_language_choice(&mut self, source: PathBuf, language: DocumentLanguage) {
+        self.language_choices.insert(source, language);
+    }
+
+    /// The open buffer's language as the toolbar offers it: whether it reads
+    /// as Markdown and what the reader chose, or `None` when its name decides
+    /// and there is nothing to choose.
+    fn language_offer(&self) -> Option<(bool, Option<DocumentLanguage>)> {
+        match &self.document {
+            DocumentState::Editable(document) if document.language != LanguageSource::Name => {
+                Some((document.markdown, document.chosen_language()))
+            }
+            _ => None,
+        }
     }
 
     /// The live buffer, or nothing while no editable document is open.
@@ -5072,13 +5249,17 @@ impl RepositoryRuntime {
     /// so continuous typing in a large Markdown file parses once rather than
     /// once per character.
     fn markdown_task(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.markdown_mode != MarkdownMode::Preview {
-            return Task::none();
-        }
         let DocumentState::Editable(document) = &self.document else {
             return Task::none();
         };
-        if !document.markdown_stale {
+        // The edit surface reads nothing parsed, but highlights a nameless
+        // buffer in the language its content reads as.
+        let due = if self.markdown_mode == MarkdownMode::Preview {
+            document.markdown_stale
+        } else {
+            document.language_stale()
+        };
+        if !due {
             return Task::none();
         }
         self.markdown_debounce.deadline = Some(Instant::now() + MARKDOWN_DEBOUNCE);
@@ -5111,7 +5292,12 @@ impl RepositoryRuntime {
         }
         self.markdown_debounce.deadline = None;
         if let DocumentState::Editable(document) = &mut self.document {
-            document.sync_markdown();
+            if self.markdown_mode == MarkdownMode::Preview {
+                document.sync_markdown();
+            } else {
+                // The parse waits for the preview to be mounted.
+                document.sync_language();
+            }
         }
         self.diagram_task(card)
     }
@@ -6609,13 +6795,19 @@ impl RepositoryRuntime {
                                 content_hash,
                                 markdown,
                             },
-                    }) => DocumentState::Editable(EditorDocument::new(
-                        identity.path,
-                        source,
-                        text,
-                        content_hash,
-                        markdown,
-                    )),
+                    }) => {
+                        let mut document = EditorDocument::new(
+                            identity.path,
+                            source,
+                            text,
+                            content_hash,
+                            markdown,
+                        );
+                        if let Some(&language) = self.language_choices.get(&document.source) {
+                            document.choose_language(Some(language));
+                        }
+                        DocumentState::Editable(document)
+                    }
                     Ok(LoadedFile {
                         source,
                         content:
@@ -7310,6 +7502,28 @@ impl RepositoryRuntime {
                 }
             }
             RepositoryAction::MarkdownDue { card, ticket } => self.finish_markdown(card, ticket),
+            RepositoryAction::ChooseLanguage { card, language } => {
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if !document.choose_language(language) {
+                    return Task::none();
+                }
+                match language {
+                    Some(language) => {
+                        self.language_choices
+                            .insert(document.source.clone(), language);
+                    }
+                    None => {
+                        self.language_choices.remove(&document.source);
+                    }
+                }
+                if self.markdown_mode != MarkdownMode::Preview {
+                    return Task::none();
+                }
+                document.sync_markdown();
+                self.diagram_task(card)
+            }
             RepositoryAction::ApplyDiffMode { split, .. } => {
                 if !self.can_change_diff_layout() {
                     return Task::none();
@@ -9805,6 +10019,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     let primary_count = if editable { 2 } else { 1 };
     let mut overflow: Vec<_> = controls.drain(primary_count..).collect();
     overflow.extend(secondary);
+    overflow.extend(language_choice(card, runtime));
     let more = icon_button(Icon::More, "More file actions")
         .selected(runtime.toolbar_overflow_open)
         .on_press(RepositoryAction::ToggleToolbarOverflow { card });
@@ -9852,6 +10067,60 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         widget::column::with_children(vec![toolbar.into(), find.map(map)])
             .width(Length::Fill)
             .into(),
+    )
+}
+
+/// "Read as" for a buffer its name does not type: whether its preview and
+/// highlighting follow its content, or the language the reader settled on.
+fn language_choice(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+) -> Option<Element<'_, RepositoryAction>> {
+    let (markdown, chosen) = runtime.language_offer()?;
+    let enabled = !runtime.is_saving();
+    let detected = if markdown { "Markdown" } else { "plain text" };
+    let choices = [
+        (
+            None,
+            "Automatic",
+            format!("Detect from the content (now {detected})"),
+        ),
+        (
+            Some(DocumentLanguage::Markdown),
+            "Markdown",
+            "Always read as Markdown".to_owned(),
+        ),
+        (
+            Some(DocumentLanguage::PlainText),
+            "Plain text",
+            "Always read as plain text".to_owned(),
+        ),
+    ];
+    let buttons = choices
+        .into_iter()
+        .map(|(language, label, tooltip)| {
+            let selected = chosen == language;
+            crate::interaction::tooltip(
+                widget::button::custom(crate::design::caption(label))
+                    .name(format!("Read as {label}"))
+                    .selected(selected)
+                    .class(crate::ui_controls::control_style(selected, None))
+                    .padding([space::XS, space::S])
+                    .on_press_maybe(
+                        enabled.then_some(RepositoryAction::ChooseLanguage { card, language }),
+                    ),
+                tooltip,
+            )
+        })
+        .collect();
+    Some(
+        widget::row::with_children(vec![
+            crate::design::caption("Read as").into(),
+            crate::ui_controls::segmented_controls(buttons),
+        ])
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .into(),
     )
 }
 
@@ -10606,11 +10875,7 @@ fn editable_document_view<'a>(
             .id(editor_focus_id(card))
             .highlight_with::<crate::editor_highlight::Highlighter>(
                 crate::editor_highlight::Settings {
-                    code: highlighter_settings(
-                        &document.source,
-                        runtime.syntax_theme,
-                        cosmic::theme::is_dark(),
-                    ),
+                    code: document.highlighter(runtime.syntax_theme, cosmic::theme::is_dark()),
                     markdown: document.markdown,
                     font: runtime.editor_font,
                 },

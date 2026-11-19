@@ -1399,6 +1399,20 @@ impl Editor {
             active: self.tabs.iter().position(|tab| Some(tab.id) == self.active),
             sidebar_open: self.sidebar_open,
             expanded_directories,
+            // Only open buffers carry a choice forward: a closed untitled
+            // note's name is reused by the next one, which must start fresh.
+            languages: self
+                .tabs
+                .iter()
+                .flat_map(|tab| {
+                    let root = &tab.runtime.descriptor.worktree;
+                    tab.runtime
+                        .language_choices()
+                        .map(move |(source, language)| {
+                            (root.join(source).display().to_string(), language)
+                        })
+                })
+                .collect(),
         }
     }
 
@@ -1522,6 +1536,11 @@ impl Editor {
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
         );
+        for (path, language) in &self.saved_session.languages {
+            if let Ok(source) = Path::new(path).strip_prefix(&opened.root) {
+                runtime.restore_language_choice(source.to_owned(), *language);
+            }
+        }
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -3274,6 +3293,7 @@ impl Application for Editor {
                 | Message::Repository(RepositoryAction::FilesLoaded { .. })
                 | Message::NewTab
                 | Message::SavedAs(..)
+                | Message::Repository(RepositoryAction::ChooseLanguage { .. })
         );
         let task = (|| {
             if self
@@ -8798,6 +8818,7 @@ mod tests {
             active: Some(2),
             sidebar_open: true,
             expanded_directories: Default::default(),
+            languages: Default::default(),
         };
         let opened = session
             .startup_paths(Vec::new())
@@ -8814,6 +8835,7 @@ mod tests {
                 active: Some(1),
                 sidebar_open: true,
                 expanded_directories: Default::default(),
+            languages: Default::default(),
             }
         );
     }
@@ -8892,6 +8914,7 @@ mod tests {
                 active: Some(0),
                 sidebar_open: true,
                 expanded_directories: Default::default(),
+            languages: Default::default(),
             }
         );
     }
