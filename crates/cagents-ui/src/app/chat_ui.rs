@@ -6,7 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
-use crate::model::{SavedQueue, SentAfter};
+use crate::model::{ChatDraftModel, SavedQueue, SentAfter};
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -1307,6 +1307,9 @@ pub(super) struct State {
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
     draft_attachments: HashMap<CardId, Vec<Attachment>>,
+    /// The model and effort of drafts whose runtime has been dropped, and what
+    /// the saved window held, until their draft opens again.
+    draft_models: HashMap<CardId, ChatDraftModel>,
     /// The conversation each card attached to when another window started its
     /// draft. If that window's start fails, the shared pane goes back to the
     /// same conversation as a draft, and so does this card.
@@ -1370,6 +1373,7 @@ impl Default for State {
             retiring: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
+            draft_models: HashMap::new(),
             peer_started: HashMap::new(),
             waiting: HashMap::new(),
             confirmed_losses: HashMap::new(),
@@ -1408,6 +1412,10 @@ impl State {
     }
     pub(super) fn with_waiting_messages(mut self, waiting: HashMap<CardId, SavedQueue>) -> Self {
         self.waiting = waiting;
+        self
+    }
+    pub(super) fn with_draft_models(mut self, models: HashMap<CardId, ChatDraftModel>) -> Self {
+        self.draft_models = models;
         self
     }
 }
@@ -4993,6 +5001,13 @@ impl Runtime {
     /// included.
     fn is_draft(&self) -> bool {
         matches!(self.connection, Connection::Draft)
+    }
+    fn draft_model(&self) -> Option<ChatDraftModel> {
+        self.is_draft().then(|| ChatDraftModel {
+            provider: self.session.launch.provider,
+            model: self.snapshot.selected_model.clone(),
+            reasoning: self.snapshot.reasoning.clone(),
+        })
     }
     /// Lift a permanent first-start refusal once the draft names a different
     /// launch. That refusal and its diagnostic answered the previous one.
@@ -8787,6 +8802,18 @@ impl Cagents {
             .filter(|(card, draft)| open_cards.contains(card) && !draft.is_empty())
             .map(|(card, draft)| (*card, draft.clone()))
             .collect();
+        let mut chat_draft_models = self
+            .chat_ui
+            .draft_models
+            .iter()
+            .filter(|(card, _)| {
+                open_cards.contains(card)
+                    && self.card_state(**card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Chat(session) if session.is_unstarted())
+                    })
+            })
+            .map(|(card, model)| (*card, model.clone()))
+            .collect::<HashMap<_, _>>();
         let mut chat_draft_attachments = self
             .chat_ui
             .draft_attachments
@@ -8796,6 +8823,11 @@ impl Cagents {
             .collect::<HashMap<_, _>>();
         for (card, runtime) in &self.chat_ui.parked {
             if open_cards.contains(card) {
+                if let Some(model) = runtime.draft_model() {
+                    chat_draft_models.insert(*card, model);
+                } else {
+                    chat_draft_models.remove(card);
+                }
                 let (draft, attachments) = runtime.persistent_draft();
                 if attachments.is_empty() {
                     chat_draft_attachments.remove(card);
@@ -8813,6 +8845,11 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card_runtime
                 && open_cards.contains(card)
             {
+                if let Some(model) = runtime.draft_model() {
+                    chat_draft_models.insert(*card, model);
+                } else {
+                    chat_draft_models.remove(card);
+                }
                 let (draft, attachments) = runtime.persistent_draft();
                 if attachments.is_empty() {
                     chat_draft_attachments.remove(card);
@@ -8903,6 +8940,9 @@ impl Cagents {
         // every later save, each of which then copied the whole workspace.
         if chat_drafts != self.durable.chat_drafts {
             Arc::make_mut(&mut self.durable).chat_drafts = chat_drafts;
+        }
+        if chat_draft_models != self.durable.chat_draft_models {
+            Arc::make_mut(&mut self.durable).chat_draft_models = chat_draft_models;
         }
         if chat_draft_attachments != self.durable.chat_draft_attachments {
             Arc::make_mut(&mut self.durable).chat_draft_attachments = chat_draft_attachments;
@@ -9294,13 +9334,19 @@ impl Cagents {
         self.open_chat_draft(card, session)
     }
 
-    /// Puts a draft of `session` in card `card`, on the model last chosen for
-    /// its provider.
+    /// Puts a draft of `session` in card `card`, on the model it was saved with,
+    /// else the one last chosen for its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
         self.chat_ui.capacity_offers.remove(&card);
         self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.blocked_details.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
+        if let Some(saved) = self.chat_ui.draft_models.remove(&card)
+            && saved.provider == session.launch.provider
+        {
+            snapshot.selected_model = saved.model;
+            snapshot.reasoning = saved.reasoning;
+        }
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
@@ -9550,6 +9596,9 @@ impl Cagents {
         if let Some(draft) = self.chat_ui.drafts.remove(&alias) {
             self.chat_ui.drafts.insert(canonical, draft);
         }
+        if let Some(model) = self.chat_ui.draft_models.remove(&alias) {
+            self.chat_ui.draft_models.insert(canonical, model);
+        }
         true
     }
 
@@ -9605,6 +9654,11 @@ impl Cagents {
     /// card builds next opens with them rather than losing them.
     pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+            if let Some(model) = runtime.draft_model() {
+                self.chat_ui.draft_models.insert(card, model);
+            } else {
+                self.chat_ui.draft_models.remove(&card);
+            }
             let (draft, attachments) = runtime.persistent_draft();
             if attachments.is_empty() {
                 self.chat_ui.draft_attachments.remove(&card);
@@ -9684,6 +9738,7 @@ impl Cagents {
         }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.draft_models.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
         self.chat_ui.confirmed_losses.remove(&card);

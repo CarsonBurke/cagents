@@ -1609,6 +1609,16 @@ impl<'a> IntoIterator for &'a mut Cards {
     }
 }
 
+/// The model and effort a draft shows, kept with the window so it reopens on them.
+/// `model: None` is the provider's default, chosen or never changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatDraftModel {
+    pub provider: crate::agent::Provider,
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
@@ -1643,6 +1653,9 @@ pub struct WorkspaceState {
     pub chat_drafts: HashMap<CardId, String>,
     #[serde(default)]
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    /// The model and effort each unstarted chat's draft shows, keyed by its card.
+    #[serde(default)]
+    pub chat_draft_models: HashMap<CardId, ChatDraftModel>,
     /// The messages each chat's provider held in its queue when this was
     /// saved. A provider that does not come back takes its queue with it, so
     /// a reopened conversation returns these to its composer, unsent.
@@ -1699,6 +1712,7 @@ impl Default for WorkspaceState {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_draft_models: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
             kept_chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),

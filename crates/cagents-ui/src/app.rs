@@ -16016,6 +16016,7 @@ impl Application for Cagents {
         let workspace = Self::rebuild_workspace(&durable);
         let chat_drafts = durable.chat_drafts.clone();
         let chat_draft_attachments = durable.chat_draft_attachments.clone();
+        let chat_draft_models = durable.chat_draft_models.clone();
         let chat_waiting_messages = durable.chat_waiting_messages.clone();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         // The daemon owns the terminal inventory; this window observes it for
@@ -16142,7 +16143,8 @@ impl Application for Cagents {
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments)
-                .with_waiting_messages(chat_waiting_messages),
+                .with_waiting_messages(chat_waiting_messages)
+                .with_draft_models(chat_draft_models),
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
             branch_ui: branch_ui::State::default(),

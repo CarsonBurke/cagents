@@ -283,6 +283,7 @@ pub struct WorkspaceManifest {
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    pub chat_draft_models: HashMap<CardId, crate::model::ChatDraftModel>,
     pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub kept_chat_drafts: HashMap<CardId, crate::model::KeptChatDraft>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -2259,6 +2260,7 @@ impl StateStore {
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
             chat_draft_attachments: manifest.chat_draft_attachments,
+            chat_draft_models: manifest.chat_draft_models,
             chat_waiting_messages: manifest.chat_waiting_messages,
             kept_chat_drafts: manifest.kept_chat_drafts,
             agent_updates: manifest.agent_updates,
@@ -2276,6 +2278,11 @@ impl StateStore {
         state
             .chat_waiting_messages
             .retain(|id, _| open_chats.contains_key(id));
+        state.chat_draft_models.retain(|id, _| {
+            open_chats
+                .get(id)
+                .is_some_and(|session| session.is_unstarted())
+        });
         // A closed chat's draft waits for that chat to reopen as another card.
         state
             .kept_chat_drafts
@@ -4447,6 +4454,21 @@ fn save_workspace_transaction(
     )?;
     // Only an open chat can come back to show what its provider held.
     let open_chats = open_chat_sessions(&state.cards);
+    let models = state
+        .chat_draft_models
+        .iter()
+        .filter(|(id, _)| {
+            open_chats
+                .get(id)
+                .is_some_and(|session| session.is_unstarted())
+        })
+        .map(|(id, model)| (*id, model.clone()))
+        .collect::<HashMap<_, _>>();
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:chat_draft_models"),
+        &ordered_map_json(&models)?,
+    )?;
     let waiting = state
         .chat_waiting_messages
         .iter()
@@ -6227,6 +6249,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat draft attachments", &value))
         .transpose()?
         .unwrap_or_default(),
+        chat_draft_models: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:chat_draft_models"),
+        )?
+        .map(|value| from_json("workspace chat draft models", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_waiting_messages: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_waiting_messages"),
@@ -6947,6 +6976,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_draft_models: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
             kept_chat_drafts: HashMap::new(),
             agent_updates: BTreeMap::new(),
@@ -8654,6 +8684,71 @@ mod tests {
                 .chat_waiting_messages
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn chat_draft_models_are_saved_for_unstarted_chats_and_absent_keys_read_empty() {
+        for started in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("draft-models.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+            if !started {
+                source.launch.session_id = None;
+            }
+            source.terminal = None;
+            let chat = workspace.cards[0].id;
+            workspace.cards[0].kind = CardKind::Chat(source);
+            let model = crate::model::ChatDraftModel {
+                provider: crate::agent::Provider::Claude,
+                model: Some("other-model".into()),
+                reasoning: Some("low".into()),
+            };
+            workspace.chat_draft_models.insert(chat, model.clone());
+            workspace
+                .chat_draft_models
+                .insert(CardId::new(), model.clone());
+            SaveLane::default().save(&store, &workspace).unwrap();
+            drop(store);
+            let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let saved = reopened
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap();
+            let expected = if started {
+                HashMap::new()
+            } else {
+                HashMap::from([(chat, model)])
+            };
+            assert_eq!(saved.chat_draft_models, expected);
+            reopened
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute(
+                    "DELETE FROM metadata WHERE key LIKE '%:navigation:chat_draft_models'",
+                    [],
+                )
+                .unwrap();
+            drop(reopened);
+            let older = StateStore::open(&path, boot("chat-boot")).unwrap();
+            assert!(
+                older
+                    .load_workspace(workspace.id, None)
+                    .unwrap()
+                    .unwrap()
+                    .chat_draft_models
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_state_without_draft_models_deserializes() {
+        let mut value = serde_json::to_value(WorkspaceState::default()).unwrap();
+        value.as_object_mut().unwrap().remove("chat_draft_models");
+        let restored = serde_json::from_value::<WorkspaceState>(value).unwrap();
+        assert!(restored.chat_draft_models.is_empty());
     }
 
     #[test]

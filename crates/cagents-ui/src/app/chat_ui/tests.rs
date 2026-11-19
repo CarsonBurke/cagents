@@ -14652,6 +14652,143 @@ fn reasoning_action_draft(app: &mut Cagents, provider: Provider) -> CardId {
 }
 
 #[test]
+fn a_drafts_model_and_effort_survive_reopening_the_window() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    drop(app.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Claude,
+        Some("other-model".into()),
+    ))));
+    drop(app.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "other-model".into(),
+        Some("low".into()),
+    ))));
+    let saved = app.persistent_workspace();
+    assert_eq!(
+        saved.chat_draft_models[&card],
+        ChatDraftModel {
+            provider: Provider::Claude,
+            model: Some("other-model".into()),
+            reasoning: Some("low".into()),
+        }
+    );
+    let CardRuntime::Chat(runtime) = app.cards.remove(&card).unwrap() else {
+        unreachable!()
+    };
+    let session = runtime.session.clone();
+    app.chat_ui = State::with_draft_attachments(
+        saved.chat_drafts.clone(),
+        saved.chat_draft_attachments.clone(),
+    )
+    .with_draft_models(saved.chat_draft_models.clone());
+    assert!(app.chat_ui.last_models.is_empty());
+    drop(app.open_chat_draft(card, session));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime.snapshot.selected_model.as_deref(),
+        Some("other-model")
+    );
+    assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+    assert_eq!(
+        chat_runtime(&app, card).queued.as_ref().unwrap().model,
+        Some(("other-model".into(), Some("low".into())))
+    );
+}
+
+#[test]
+fn a_dropped_draft_runtime_comes_back_on_its_own_model() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let a = reasoning_action_draft(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, a).target;
+    drop(app.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Claude,
+        Some("other-model".into()),
+    ))));
+    drop(app.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "other-model".into(),
+        Some("low".into()),
+    ))));
+    let b = reasoning_action_draft(&mut app, Provider::Claude);
+    assert_ne!(a, b);
+    assert_eq!(
+        app.chat_ui.last_models[&Provider::Claude],
+        ("fixture-model".into(), Some("high".into()))
+    );
+    app.chat_forget(a);
+    let CardRuntime::Chat(runtime) = app.cards.remove(&a).unwrap() else {
+        unreachable!()
+    };
+    drop(app.open_chat_draft(a, runtime.session.clone()));
+    let runtime = chat_runtime(&app, a);
+    assert_eq!(
+        runtime.snapshot.selected_model.as_deref(),
+        Some("other-model")
+    );
+    assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+}
+
+#[test]
+fn a_saved_draft_model_for_another_provider_is_ignored() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Claude);
+    let expected = app.chat_draft_snapshot(Provider::Claude);
+    app.chat_ui.draft_models.insert(
+        card,
+        ChatDraftModel {
+            provider: Provider::Codex,
+            model: Some("other-model".into()),
+            reasoning: Some("low".into()),
+        },
+    );
+    let CardRuntime::Chat(runtime) = app.cards.remove(&card).unwrap() else {
+        unreachable!()
+    };
+    drop(app.open_chat_draft(card, runtime.session.clone()));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.snapshot.selected_model, expected.selected_model);
+    assert_eq!(runtime.snapshot.reasoning, expected.reasoning);
+    assert!(!app.chat_ui.draft_models.contains_key(&card));
+}
+
+#[test]
+fn a_started_chat_saves_no_draft_model() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    assert!(
+        app.persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+    let target = chat_runtime_attempt(&app, card);
+    let handle = fixture_handle(&app, card, None);
+    handle.replace_snapshot_for_test(Snapshot {
+        models: vec![fixture_model("fixture-model", &["low", "high"])],
+        ready: true,
+        ..Snapshot::default()
+    });
+    answer_start(&mut app, target, Ok(handle));
+    assert!(!chat_runtime(&app, card).is_draft());
+    assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+    settle(&mut app, card, Ok(()));
+    assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+    settle(&mut app, card, Ok(()));
+    assert!(
+        !app.persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
+}
+
+#[test]
 fn reasoning_action_default_clears_the_draft_and_its_next_draft_preference() {
     for provider in [Provider::Claude, Provider::Codex] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
