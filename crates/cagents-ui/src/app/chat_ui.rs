@@ -366,11 +366,15 @@ pub enum Action {
     /// A clipboard image the chat cannot take, offered without any text to
     /// paste in its place.
     PasteRefused(Target, attachment_draft::Ticket, &'static str),
-    ImageSaved(Target, attachment_draft::Ticket, Result<Attachment, String>),
+    ImageSaved(
+        Target,
+        attachment_draft::Ticket,
+        Result<Attachment, clipboard_image::StagingError>,
+    ),
     AttachmentsPrepared(
         Target,
         attachment_draft::Ticket,
-        Result<Vec<Attachment>, String>,
+        Result<Vec<Attachment>, clipboard_image::StagingError>,
     ),
     Submit(Target, PromptMode),
     /// A press of one of the composer's send controls. It submits like
@@ -542,6 +546,7 @@ pub enum Action {
     /// Files or text dropped on the conversation.
     Dropped(Target, file_drop::Payload),
     RemoveAttachment(Target, usize),
+    DismissAttachmentNotice(Target),
     Model(Target, String),
     Reasoning(Target, String, Option<String>),
     PermissionMode(Target, String),
@@ -955,6 +960,7 @@ impl Action {
             Self::Attached(..) => "Attached",
             Self::Dropped(..) => "Dropped",
             Self::RemoveAttachment(..) => "RemoveAttachment",
+            Self::DismissAttachmentNotice(..) => "DismissAttachmentNotice",
             Self::Model(..) => "Model",
             Self::Reasoning(..) => "Reasoning",
             Self::PermissionMode(..) => "PermissionMode",
@@ -3286,6 +3292,8 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: Option<uuid::Uuid>,
+    /// A refused attachment, local to this composer and runtime.
+    attachment_notice: Option<String>,
     /// The composer revision at which carried-over unsent text may still
     /// repeat a message the conversation received, and which one. Cleared
     /// once the transcript settles it, or the reader edits the text.
@@ -3638,7 +3646,7 @@ impl Runtime {
 
     fn try_attachment_insert(&mut self) -> Option<attachment_draft::Ticket> {
         let Some((ticket, lease)) = attachment_draft::admit() else {
-            self.error = Some(
+            self.attachment_notice = Some(
                 "Two attachments are already loading. Wait for them before attaching more.".into(),
             );
             return None;
@@ -3731,7 +3739,7 @@ impl Runtime {
         };
         self.pastes_pending = self.pastes_pending.saturating_sub(1);
         if !bookmark.valid {
-            self.error = Some("The image insertion point changed while loading. Attach the image again at the new caret.".into());
+            self.attachment_notice = Some("The image insertion point changed while loading. Attach the image again at the new caret.".into());
             self.submit_after_paste = None;
             return false;
         }
@@ -3742,7 +3750,7 @@ impl Runtime {
         }
         let current = attachment_draft::Bookmark::capture(&self.composer);
         if !current.valid {
-            self.error = Some("The current text selection could not be preserved. Attach the image again at the new caret.".into());
+            self.attachment_notice = Some("The current text selection could not be preserved. Attach the image again at the new caret.".into());
             self.submit_after_paste = None;
             return false;
         }
@@ -3796,6 +3804,9 @@ impl Runtime {
                 attachment_draft::move_to(&mut self.composer, mapped);
             }
         }
+        if !attachments.is_empty() {
+            self.attachment_notice = None;
+        }
         self.merge_attachments(attachments);
         self.revision = self.revision.wrapping_add(1);
         self.completion.restart(true);
@@ -3805,22 +3816,36 @@ impl Runtime {
         true
     }
 
-    fn cancel_attachment_insert(&mut self, id: uuid::Uuid, error: Option<String>) {
+    fn cancel_attachment_insert(&mut self, id: uuid::Uuid, notice: Option<String>) {
         self.attachment_order.retain(|other| *other != id);
         self.attachment_jobs.remove(&id);
         if self.attachment_bookmarks.remove(&id).is_some() {
             self.pastes_pending = self.pastes_pending.saturating_sub(1);
             self.submit_after_paste = None;
-            if let Some(error) = error {
-                self.error = Some(error);
+            if let Some(notice) = notice {
+                self.attachment_notice = Some(notice);
             }
+        }
+    }
+
+    fn report_attachment_error(&mut self, error: clipboard_image::StagingError) {
+        match error {
+            clipboard_image::StagingError::Refused(notice) => self.attachment_notice = Some(notice),
+            clipboard_image::StagingError::Failed(error) => self.error = Some(error),
+        }
+    }
+
+    fn fail_attachment_insert(&mut self, id: uuid::Uuid, error: clipboard_image::StagingError) {
+        if self.attachment_bookmarks.contains_key(&id) {
+            self.cancel_attachment_insert(id, None);
+            self.report_attachment_error(error);
         }
     }
 
     fn remove_image_token(&mut self, token: &str) -> bool {
         let text = self.composer.text();
         if text.contains(token) && !attachment_draft::Bookmark::capture(&self.composer).valid {
-            self.error = Some("The current text selection could not be preserved. Clear it before removing this image.".into());
+            self.attachment_notice = Some("The current text selection could not be preserved. Clear it before removing this image.".into());
             return false;
         }
         let excerpt = attachment_draft::excerpt(
@@ -3865,6 +3890,7 @@ impl Runtime {
     /// The draft's attachments leave with the draft, when it is sent or held,
     /// and so does what the restored-messages notice said about it.
     fn take_attachments(&mut self) -> Vec<Attachment> {
+        self.attachment_notice = None;
         self.restored_waiting = None;
         self.thumbnails.clear();
         std::mem::take(&mut self.attachments)
@@ -4499,6 +4525,7 @@ impl Runtime {
             image_pastes_saving: 0,
             submit_after_paste: None,
             attachment_chooser_pending: None,
+            attachment_notice: None,
             draft_echo: None,
             expanded: Revised::default(),
             child_expanded: HashMap::new(),
@@ -12198,7 +12225,9 @@ impl Cagents {
         cosmic::task::future(async move {
             let worker_ticket = id.clone();
             let result = images::run_worker(move || {
-                worker_ticket.check()?;
+                worker_ticket
+                    .check()
+                    .map_err(clipboard_image::StagingError::Refused)?;
                 paths
                     .into_iter()
                     .map(|path| {
@@ -12211,6 +12240,7 @@ impl Cagents {
                     .collect::<Result<Vec<_>, _>>()
             })
             .await
+            .map_err(clipboard_image::StagingError::Failed)
             .and_then(|r| r);
             Message::ChatUi(Action::AttachmentsPrepared(target, id, result))
         })
@@ -13972,7 +14002,7 @@ impl Cagents {
                     return Task::none();
                 };
                 if runtime.pastes_pending >= 2 {
-                    runtime.error = Some(
+                    runtime.attachment_notice = Some(
                         "Two attachments are already loading. Wait for them before pasting again."
                             .into(),
                     );
@@ -14025,6 +14055,7 @@ impl Cagents {
                         clipboard_image::save_active(image, rules.max_image_bytes, &worker_ticket)
                     })
                     .await
+                    .map_err(clipboard_image::StagingError::Failed)
                     .and_then(|r| r);
                     Message::ChatUi(Action::ImageSaved(target, id, result))
                 });
@@ -14102,7 +14133,7 @@ impl Cagents {
                             false
                         }
                         Err(error) => {
-                            runtime.cancel_attachment_insert(id.id, Some(error));
+                            runtime.fail_attachment_insert(id.id, error);
                             false
                         }
                     };
@@ -14130,7 +14161,7 @@ impl Cagents {
                             }
                         }
                         Ok(_) => runtime.cancel_attachment_insert(id.id, Some("The model or attachment limit changed while files loaded. Attach them again.".into())),
-                        Err(error) => runtime.cancel_attachment_insert(id.id, Some(error)),
+                        Err(error) => runtime.fail_attachment_insert(id.id, error),
                     }
                 }
             }
@@ -15618,7 +15649,7 @@ impl Cagents {
                     return Task::none();
                 }
                 if runtime.pastes_pending >= 2 {
-                    runtime.error = Some(
+                    runtime.attachment_notice = Some(
                         "Two attachments are already loading. Wait for them before attaching more."
                             .into(),
                     );
@@ -15683,9 +15714,9 @@ impl Cagents {
                                     && paths.iter().any(|path| !chat::is_image_path(path))
                                 {
                                     runtime.cancel_attachment_insert(id.id, None);
-                                    failure = Some(
+                                    failure = Some(clipboard_image::StagingError::Refused(
                                         "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.".to_owned(),
-                                    );
+                                    ));
                                     Task::none()
                                 } else {
                                     self.stage_chat_attachments(target, id, paths)
@@ -15697,7 +15728,7 @@ impl Cagents {
                             }
                             Err(error) => {
                                 runtime.cancel_attachment_insert(id.id, None);
-                                failure = Some(error);
+                                failure = Some(clipboard_image::StagingError::Failed(error));
                                 Task::none()
                             }
                         }
@@ -15711,8 +15742,10 @@ impl Cagents {
                     // window started has no composer here to say it in.
                     if let Some(failure) = failure {
                         match self.chat_runtime_mut(target) {
-                            Some(runtime) => runtime.error = Some(failure),
-                            None => self.status = Some(TransientNotice::warning(failure)),
+                            Some(runtime) => runtime.report_attachment_error(failure),
+                            None => {
+                                self.status = Some(TransientNotice::warning(failure.to_string()))
+                            }
                         }
                     }
                     return Task::batch([staged, adopted]);
@@ -15757,12 +15790,12 @@ impl Cagents {
                         }
                         if !files.is_empty() {
                             if runtime.pastes_pending >= 2 {
-                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                runtime.attachment_notice = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
                             } else if let Some((id, lease)) = attachment_draft::admit() {
                                 staged = Some((id, files, lease));
                             } else {
-                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                runtime.attachment_notice = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
                             }
                         }
@@ -15804,6 +15837,11 @@ impl Cagents {
                     }),
                     cosmic::task::message(Message::FocusCard(target.card)),
                 ]);
+            }
+            Action::DismissAttachmentNotice(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.attachment_notice = None;
+                }
             }
             Action::RemoveAttachment(target, index) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)

@@ -35,6 +35,143 @@ fn composer_text_reach_stops_inside_its_border() {
 }
 
 #[test]
+fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
+    use iced::advanced::{
+        Layout, Shell, clipboard, layout, mouse,
+        widget::{Operation, Tree},
+    };
+    #[derive(Default)]
+    struct Texts(Vec<(String, iced::Rectangle)>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            self.0.push((text.to_owned(), bounds));
+        }
+    }
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let notice = "Codex can attach only images";
+    runtime.attachment_notice = Some(notice.into());
+    assert!(runtime.attachments.is_empty());
+    assert!(runtime.error.is_none());
+    let target = runtime.target;
+    let renderer = crate::app::tests::headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    let mut element = runtime.view(
+        None,
+        false,
+        true,
+        &shortcuts,
+        600.0,
+        0.0,
+        Place { branch: None },
+        true,
+        None,
+        vec![],
+        true,
+    );
+    let mut tree = Tree::new(element.as_widget());
+    let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 800.0));
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+    );
+    let mut texts = Texts::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    let notices: Vec<_> = texts.0.iter().filter(|(text, _)| text == notice).collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "notice renders with no staged attachments"
+    );
+    assert!(
+        !texts
+            .0
+            .iter()
+            .any(|(text, _)| text == "Review the details before trying again."),
+        "attachment refusal does not render the general failure card"
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    let buttons: Vec<_> = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+        .collect();
+    assert!(
+        buttons
+            .iter()
+            .all(|node| !matches!(node.node().label(), Some("Details" | "Copy details"))),
+        "attachment refusal has no diagnostic controls"
+    );
+    let _ = buttons
+        .iter()
+        .find(|node| node.node().label() == Some("Dismiss"))
+        .expect("inline notice has a dismiss button")
+        .node()
+        .bounds()
+        .unwrap();
+    drop(element);
+    // The full pane also publishes the editor's focus action on a click.
+    // Mount the notice itself to pin its button's exact dispatch contract.
+    let mut element = runtime.attachment_notice_view().unwrap();
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    let dismiss = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .find(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some("Dismiss")
+        })
+        .expect("the mounted notice has its native dismiss button")
+        .node()
+        .bounds()
+        .unwrap();
+    let cursor = mouse::Cursor::Available(iced::Point::new(
+        ((dismiss.x0 + dismiss.x1) / 2.0) as f32,
+        ((dismiss.y0 + dismiss.y1) / 2.0) as f32,
+    ));
+    let mut messages = vec![];
+    for event in [
+        mouse::Event::ButtonPressed(mouse::Button::Left),
+        mouse::Event::ButtonReleased(mouse::Button::Left),
+    ] {
+        element.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Mouse(event),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+    }
+    assert!(
+        matches!(messages.as_slice(), [Message::ChatUi(Action::DismissAttachmentNotice(found))]
+            if *found == target),
+        "dismiss targets this runtime: {messages:?}"
+    );
+}
+
+#[test]
 fn saved_history_composer_offers_attachment_in_its_actions_without_enabling_send() {
     use iced::advanced::{
         Layout, Shell, clipboard, layout, mouse,
