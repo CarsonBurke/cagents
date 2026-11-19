@@ -694,9 +694,7 @@ impl Cagents {
             Err(error) => {
                 self.abandon_removal(card);
                 tracing::warn!(%error, "pane removal was refused");
-                self.status = Some(TransientNotice::error(
-                    "This pane couldn't be removed right now, so it was kept. Close it again.",
-                ));
+                self.status = Some(TransientNotice::error(super::shared_views::PANE_KEPT));
                 // Nothing will settle this close, so the queue moves on now. It
                 // waits by itself for a removal still on its way.
                 self.next_queued_card_close()
