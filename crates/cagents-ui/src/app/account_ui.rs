@@ -8268,7 +8268,12 @@ mod app_tests {
         let state = app.account_ui.account(&id).unwrap();
         let snapshot = state.snapshot.as_ref().unwrap();
         assert_eq!(snapshot.plan_display_name.as_deref(), Some("Google AI Pro"));
-        let shown = chip(state, "Antigravity", app.account_ui.now_ms, Default::default());
+        let shown = chip(
+            state,
+            "Antigravity",
+            app.account_ui.now_ms,
+            Default::default(),
+        );
         assert_eq!(shown.text, "No limits");
         answer(&mut app, UsageStatus::NeedsLogin, None);
         assert_eq!(app.account_ui.provider_status(provider), "Sign in again");
