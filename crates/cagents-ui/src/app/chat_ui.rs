@@ -13938,8 +13938,8 @@ impl Cagents {
                 }
                 runtime.interrupt_armed = None;
                 // Before the turn has begun, Stop also takes back what was
-                // written for it. The provider is still told to stop, so a
-                // turn that begins anyway ends.
+                // lined up behind it. The provider is still told to stop, so
+                // the turn ends as it begins.
                 runtime.withdraw_before_turn();
                 return self.chat_send(target, Command::Interrupt, false);
             }

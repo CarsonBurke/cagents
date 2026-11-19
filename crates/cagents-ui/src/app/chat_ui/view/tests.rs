@@ -6263,8 +6263,8 @@ fn a_stop_waiting_for_confirmation_keeps_its_place_and_says_what_it_stops() {
 }
 
 /// While a message is only on its way, there is no turn in view: the
-/// composer invites a message rather than steering, and offers no Stop
-/// until the conversation shows the turn has begun.
+/// composer invites a message rather than steering. Stop is offered while
+/// the conversation reports working, whether or not its turn has begun.
 #[test]
 fn a_message_on_its_way_offers_no_turn_to_steer_and_stop_only_while_working() {
     let roles = ["chat-submit-0", "chat-stop", "chat-composer"];

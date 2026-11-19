@@ -4051,7 +4051,9 @@ impl Runtime {
         } else if self.turn_running() {
             Cow::Borrowed("Cancel active turn (Esc)")
         } else {
-            Cow::Borrowed("Stop, and take back the message on its way (Esc)")
+            Cow::Borrowed(
+                "Stop the turn about to begin (Esc). Messages not yet sent come back to the composer",
+            )
         };
         let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
             .id(card_control_id(target.card, "chat-stop"))
