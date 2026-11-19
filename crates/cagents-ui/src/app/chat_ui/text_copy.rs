@@ -483,6 +483,15 @@ impl Cagents {
             .as_ref()
             .is_err_and(|error| error == chat::TEXT_COPY_CHANGED);
         if refused || !request.snapshot_is_current(&current_snapshot) {
+            // It may have been accepted once, before its write found the
+            // source changed.
+            if runtime
+                .copied
+                .as_ref()
+                .is_some_and(|(copied, _)| *copied == id)
+            {
+                runtime.copied = None;
+            }
             return match request.reread(&current_snapshot, &id) {
                 Some(reread)
                     if !request.retried && !(refused && reread.source == request.source) =>
@@ -502,18 +511,9 @@ impl Cagents {
         match result {
             Ok(text) => {
                 let at = Instant::now();
-                runtime.copied = Some((id, at));
-                let text = match request.prefix.as_str() {
-                    "" => text,
-                    prefix if text.is_empty() => prefix.to_owned(),
-                    prefix => format!("{prefix}\n\n{text}"),
-                };
-                let context = request.context.clone();
-                let intent = request.intent;
+                runtime.copied = Some((id.clone(), at));
                 Task::batch([
-                    clipboard_write(context, intent, text, move || {
-                        request.snapshot_is_current(&request.handle.snapshot())
-                    }),
+                    message_clipboard_write(target, id, request, text),
                     cosmic::task::future(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                         Message::ChatUi(Action::ClearCopied(target, at))
@@ -594,6 +594,41 @@ fn clipboard_write(
         } else {
             Task::none()
         }
+    })
+}
+
+/// Writes the text `request` read for item `id`, checked like
+/// [`clipboard_write`] when the effect is polled. A source that changed after
+/// the read was accepted is read again, as if the change had come first,
+/// rather than dropping the copy without a word.
+fn message_clipboard_write(
+    target: Target,
+    id: String,
+    request: Request,
+    text: String,
+) -> Task<Message> {
+    let mut read = Some((id, request, text));
+    iced::Task::done(()).then(move |_| {
+        let Some((id, request, text)) = read.take() else {
+            return Task::none();
+        };
+        if !request.context.is_current(request.intent) {
+            return Task::none();
+        }
+        if !request.snapshot_is_current(&request.handle.snapshot()) {
+            return cosmic::task::message(Message::ChatUi(Action::MessageCopied(
+                target,
+                id,
+                request,
+                Ok(text),
+            )));
+        }
+        let text = match request.prefix.as_str() {
+            "" => text,
+            prefix if text.is_empty() => prefix.to_owned(),
+            prefix => format!("{prefix}\n\n{text}"),
+        };
+        iced::clipboard::write(text).map(cosmic::Action::App)
     })
 }
 
