@@ -572,6 +572,7 @@ enum Pending {
     History {
         earlier: bool,
         initial_notification_binding: Option<(u64, u64)>,
+        adoption_binding: Option<(u64, u64)>,
     },
     Turn {
         revision: u64,
@@ -1471,7 +1472,9 @@ impl Codex {
         let initial_notification_binding = (!self.history_initialized
             && self.notification_turn.is_none())
         .then_some((self.lifecycle_revision, self.notification_revision));
-        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding })?;
+        let adoption_binding =
+            (!earlier).then_some((self.lifecycle_revision, self.notification_revision));
+        self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding, adoption_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
             Event::HistoryLoading(true)
@@ -1575,20 +1578,23 @@ impl Codex {
         });
     }
 
-    fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
+    fn page(
+        &mut self,
+        page: &Value,
+        step: &mut Step,
+        earlier: bool,
+    ) -> Result<Option<String>, String> {
         let mut items = Vec::new();
+        let turns = array(page, "data")?;
         // Children whose nickname this page set. The page is read oldest
         // first, so a later call on it may advance that name. A name known
         // before the page stands: it came from a listing, a live
         // notification or a newer page, or, when the latest page is read
         // again, from that page's earlier reading.
         let mut named = std::collections::BTreeSet::new();
-        for turn in array(page, "data")?.iter().rev() {
+        for turn in turns.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
-            if active && self.busy && self.turn.is_none() {
-                self.turn = Some(turn_id.into());
-            }
             if turn["itemsView"]
                 .as_str()
                 .is_some_and(|view| view != "full")
@@ -1663,7 +1669,7 @@ impl Codex {
             }
         }
         if !earlier {
-            self.child_history_outcome(array(page, "data")?.first(), step);
+            self.child_history_outcome(turns.first(), step);
         }
         // Refreshing the live end must not rewind the older-history traversal
         // through pages already cached. Commit only after validating the page;
@@ -1685,7 +1691,11 @@ impl Codex {
         });
         step.events
             .push(Event::BranchPoints(self.branch_points.clone()));
-        Ok(())
+        turns
+            .first()
+            .filter(|turn| turn["status"] == "inProgress")
+            .map(|turn| string(turn, "id").map(str::to_owned))
+            .transpose()
     }
     fn input(&self, text: String, attachments: Vec<Attachment>) -> Result<Vec<Value>, String> {
         let mut input = Vec::with_capacity(1 + attachments.len());
@@ -2569,7 +2579,10 @@ impl Codex {
                         Pending::ChildList,
                     )?;
                     if result["initialTurnsPage"].is_object() {
-                        self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        let turn = self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        if self.busy && self.turn.is_none() {
+                            self.turn = turn;
+                        }
                         // Only the initial coherent attach response may bind
                         // an active history turn. Later pages are display data.
                         if self.lifecycle_revision == 0
@@ -2791,8 +2804,18 @@ impl Codex {
                 Pending::History {
                     earlier,
                     initial_notification_binding,
+                    adoption_binding,
                 } => {
-                    self.page(result, &mut step, earlier)?;
+                    let turn = self.page(result, &mut step, earlier)?;
+                    if !earlier
+                        && !self.starting_turn()
+                        && adoption_binding
+                            == Some((self.lifecycle_revision, self.notification_revision))
+                        && self.busy
+                        && self.turn.is_none()
+                    {
+                        self.turn = turn;
+                    }
                     if initial_notification_binding
                         == Some((self.lifecycle_revision, self.notification_revision))
                         && self.notification_turn.is_none()
@@ -3041,7 +3064,11 @@ impl Codex {
                         child.ready = true;
                         child.materialized = true;
                         if result["initialTurnsPage"].is_object() {
-                            child.page(&result["initialTurnsPage"], &mut content, false)?;
+                            let turn =
+                                child.page(&result["initialTurnsPage"], &mut content, false)?;
+                            if child.busy && child.turn.is_none() {
+                                child.turn = turn;
+                            }
                             // This is the child's coherent initial attachment;
                             // buffered live frames have not been replayed yet.
                             // Later history pages remain presentation only.
