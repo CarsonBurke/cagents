@@ -147,7 +147,14 @@ fn edit_then<T>(
             return Ok((receipt, then(&registry)?));
         }
     }
-    if super::chat::pane_start::requires_edit_check(&edit) {
+    let replay = match &edit {
+        ModelEdit::ChangeView { operation, .. } => registry
+            .view_operation_seen(*operation)
+            .map_err(unavailable)?,
+        _ => false,
+    };
+    // A replayed operation returns its original result without re-checking later pane ownership.
+    if !replay && super::chat::pane_start::requires_edit_check(&edit) {
         super::chat::pane_start::validate_edit(host, &registry, &edit)?;
     }
     let applied = if matches!(
