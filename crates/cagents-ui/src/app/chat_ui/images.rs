@@ -995,11 +995,21 @@ impl Gallery {
         })
     }
     /// The viewer over the transcript of the conversation `target` shows,
-    /// in a pane `width` wide. It holds the pane's keyboard while it is
-    /// open (see [`viewer_focus`]); the composer below it keeps its own.
-    pub(in crate::app) fn pane_view(&self, target: Target, width: f32) -> Element<'_, Message> {
-        let [toolbar, label, canvas, hint] =
-            self.parts(ViewerHost::Pane(target), width < COMPACT_TOOLBAR);
+    /// in a pane `width` wide whose trailing `clearance` belongs to a
+    /// control floating over its corner, such as the inspector toggle. It
+    /// holds the pane's keyboard while it is open (see [`viewer_focus`]);
+    /// the composer below it keeps its own.
+    pub(in crate::app) fn pane_view(
+        &self,
+        target: Target,
+        width: f32,
+        clearance: f32,
+    ) -> Element<'_, Message> {
+        let trailing = step::GAP_M.max(clearance);
+        let [toolbar, label, canvas, hint] = self.parts(
+            ViewerHost::Pane(target),
+            width - step::GAP_M - trailing < COMPACT_TOOLBAR,
+        );
         // The pane gives its keyboard to this holder while the viewer is
         // open (see `card_keyboard_focus`), so the arrows browse and Escape
         // closes the viewer. It takes no space, is no Tab stop and draws
@@ -1018,7 +1028,7 @@ impl Gallery {
             .height(Length::Fill);
         widget::column::with_children(vec![toolbar, label, canvas.into(), hint])
             .spacing(step::GAP_S)
-            .padding(iced::Padding::from([step::GAP_S, step::GAP_M]))
+            .padding(iced::Padding::from([step::GAP_S, step::GAP_M]).right(trailing))
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1147,9 +1157,9 @@ impl Gallery {
     }
 }
 
-/// Below this pane width the viewer's toolbar names its commands by icon:
-/// their labels and the navigation no longer fit on one row.
-const COMPACT_TOOLBAR: f32 = 520.0;
+/// Below this width of its row the viewer's toolbar names its commands by
+/// icon: their labels and the navigation no longer fit on one line.
+const COMPACT_TOOLBAR: f32 = 488.0;
 
 /// Where an open image viewer is drawn, and so which one an action means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

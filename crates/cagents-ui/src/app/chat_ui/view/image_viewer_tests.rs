@@ -335,7 +335,7 @@ fn the_image_menu_claims_the_escape_that_closes_it() {
     let renderer = crate::app::tests::headless_renderer();
     let window = iced::Size::new(900.0, 700.0);
     let viewport = iced::Rectangle::with_size(window);
-    let mut element = gallery.pane_view(runtime.target, window.width);
+    let mut element = gallery.pane_view(runtime.target, window.width, 0.0);
     let mut tree = Tree::new(&element);
     let node = element.as_widget_mut().layout(
         &mut tree,
@@ -471,4 +471,59 @@ fn a_device_file_opens_as_a_dialog_that_escape_closes() {
     );
     drop(app.update(messages.remove(0)));
     assert!(app.chat_ui.image_dialog.is_none() && !app.modal_is_open());
+}
+
+/// With the pane's inspector closed, its toggle floats over the pane's
+/// top-right corner; the viewer's toolbar ends before it, as the transcript
+/// does, so Close is never under the toggle.
+#[test]
+fn the_toolbar_clears_the_inspector_toggle() {
+    use iced::advanced::widget::{Operation, Tree, operation::Focusable};
+    use iced::advanced::{Layout, layout::Limits};
+    struct Texts(Vec<(iced::Rectangle, String)>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn container(&mut self, _: Option<&widget::Id>, _: iced::Rectangle) {}
+        fn focusable(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, _: &mut dyn Focusable) {
+        }
+        fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+            self.0.push((bounds, text.to_owned()));
+        }
+    }
+    let (mut runtime, _handle) = super::tests::furnished_runtime();
+    let images = show_images(&mut runtime, 2);
+    let gallery = Gallery::new(&runtime, &images[0].0).unwrap();
+    let renderer = crate::app::tests::headless_renderer();
+    let clearance = crate::app::pane_inspector::TOGGLE_CLEARANCE;
+    let width = 640.0;
+    let mut element = gallery.pane_view(runtime.target, width, clearance);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+    );
+    let mut texts = Texts(Vec::new());
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    let (open, _) = texts
+        .0
+        .iter()
+        .find(|(_, text)| text == "Open externally")
+        .expect("the wide toolbar names its commands");
+    // Close follows the last named command on the toolbar's row, and the
+    // row ends where the clearance begins.
+    let row_end = node.bounds().width - clearance;
+    assert!(
+        open.x + open.width <= row_end,
+        "{open:?} reaches past {row_end}"
+    );
+    let toolbar = node.children()[0].bounds();
+    assert!(
+        toolbar.x + toolbar.width <= row_end + 0.5,
+        "the toolbar {toolbar:?} reaches under the toggle at {row_end}"
+    );
 }

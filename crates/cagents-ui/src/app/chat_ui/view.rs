@@ -3185,9 +3185,9 @@ impl Runtime {
                     .into()
                 })
                 .or_else(|| {
-                    self.image_viewer
-                        .as_ref()
-                        .map(|gallery| gallery.pane_view(target, content_width))
+                    self.image_viewer.as_ref().map(|gallery| {
+                        gallery.pane_view(target, content_width, transcript_clearance)
+                    })
                 }),
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
