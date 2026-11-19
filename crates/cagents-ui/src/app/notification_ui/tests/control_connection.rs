@@ -2,8 +2,8 @@
 //! over one kept connection, not a new connection and handshake per change.
 use super::*;
 use crate::terminal_ipc::{
-    ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
-    read_frame, write_frame,
+    ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+    ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
 };
 use std::{
     os::unix::net::UnixStream,
@@ -22,24 +22,35 @@ fn proof() -> HostSessionProof {
     }
 }
 
-/// One fixture daemon connection: handshakes, then accepts every request,
-/// reporting each with the connection's number. With `close_after` it
-/// closes the connection once it has accepted that many, as a daemon that
-/// exits does.
+/// How a fixture daemon connection answers one request.
+#[derive(Clone, Copy)]
+enum Answer {
+    Accept,
+    /// Refuses it before any effect, as the daemon refuses an invalid
+    /// presence.
+    Refuse(&'static str),
+    /// Reads it and closes the connection without answering, as a daemon
+    /// that exits with the request in flight does.
+    Close,
+}
+
+/// One fixture daemon connection: handshakes, then answers its requests in
+/// turn from `answers`, accepting any past their end, and reports each one
+/// it answers with the connection's number.
 fn serve(
     mut peer: UnixStream,
     connection: usize,
-    close_after: Option<usize>,
+    answers: Vec<Answer>,
     requests: mpsc::Sender<(usize, ClientRequest)>,
 ) {
-    let reply = |peer: &mut UnixStream, request: &ClientEnvelope, response| {
+    let reply = |peer: &mut UnixStream, request: &ClientEnvelope, message| {
         write_frame(
             peer,
             &ServerEnvelope {
                 version: PROTOCOL_VERSION,
                 request_id: Some(request.request_id),
                 proof: proof(),
-                message: ServerMessage::Response { response },
+                message,
             },
         )
         .unwrap();
@@ -51,18 +62,36 @@ fn serve(
     reply(
         &mut peer,
         &hello,
-        ServerResponse::Connected {
-            proof: proof(),
-            resumed: Vec::new(),
+        ServerMessage::Response {
+            response: ServerResponse::Connected {
+                proof: proof(),
+                resumed: Vec::new(),
+            },
         },
     );
-    let mut accepted = 0;
-    while close_after != Some(accepted)
-        && let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap()
-    {
-        reply(&mut peer, &request, ServerResponse::Accepted);
-        accepted += 1;
+    let mut answers = answers.into_iter();
+    while let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
+        let message = match answers.next().unwrap_or(Answer::Accept) {
+            Answer::Accept => ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            },
+            Answer::Refuse(reason) => ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                reason,
+                false,
+            )),
+            Answer::Close => return,
+        };
+        reply(&mut peer, &request, message);
         requests.send((connection, request.request)).unwrap();
+    }
+}
+
+fn focusing(focused: TerminalId) -> Presence {
+    Presence {
+        sessions: vec![focused],
+        focused: Some(focused),
+        ..Presence::default()
     }
 }
 
@@ -76,9 +105,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// A control thread whose daemon closes its first connection after
-    /// `close_first_after` requests, if given.
-    fn new(close_first_after: Option<usize>) -> Self {
+    /// A control thread whose daemon answers the requests on its first
+    /// connection as `first`, and accepts everything else.
+    fn new(first: Vec<Answer>) -> Self {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let (wake, receiver) = crossbeam_channel::bounded(1);
         let (report, requests) = mpsc::channel();
@@ -92,8 +121,12 @@ impl Fixture {
                     let connection = connects.fetch_add(1, Ordering::SeqCst);
                     let (stream, peer) = UnixStream::pair().unwrap();
                     let report = report.clone();
-                    let close = close_first_after.filter(|_| connection == 0);
-                    thread::spawn(move || serve(peer, connection, close, report));
+                    let answers = if connection == 0 {
+                        first.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    thread::spawn(move || serve(peer, connection, answers, report));
                     ControlClient::from_stream(stream).map_err(|error| error.to_string())
                 })
             })
@@ -111,11 +144,7 @@ impl Fixture {
     /// Publishes a presence focusing `focused` and returns the connection
     /// it arrived on.
     fn publish(&self, focused: TerminalId) -> usize {
-        self.pending.lock().unwrap().presence = Some(Presence {
-            sessions: vec![focused],
-            focused: Some(focused),
-            ..Presence::default()
-        });
+        self.pending.lock().unwrap().presence = Some(focusing(focused));
         self.wake.as_ref().unwrap().send(()).unwrap();
         let (connection, request) = self
             .requests
@@ -138,7 +167,7 @@ impl Fixture {
 
 #[test]
 fn presence_changes_ride_one_kept_connection() {
-    let fixture = Fixture::new(None);
+    let fixture = Fixture::new(Vec::new());
     for _ in 0..3 {
         assert_eq!(fixture.publish(TerminalId::new()), 0);
     }
@@ -167,10 +196,10 @@ fn presence_changes_ride_one_kept_connection() {
 /// change still arrives and nothing reports a failure.
 #[test]
 fn a_kept_connection_the_daemon_closed_is_replaced_without_a_notice() {
-    let fixture = Fixture::new(Some(1));
+    let fixture = Fixture::new(vec![Answer::Accept, Answer::Close]);
     assert_eq!(fixture.publish(TerminalId::new()), 0);
-    // Whether the close lands before the quiet check or only after the
-    // request is written, the change arrives over a new connection.
+    // The kept connection is still quiet when the second presence is sent
+    // on it, and closes without answering.
     assert_eq!(fixture.publish(TerminalId::new()), 1);
     assert_eq!(fixture.connects.load(Ordering::SeqCst), 2);
     let actions = fixture.finish();
@@ -179,5 +208,39 @@ fn a_kept_connection_the_daemon_closed_is_replaced_without_a_notice() {
             .iter()
             .any(|action| matches!(action, Action::Failed(_))),
         "a replaced connection reported a failure"
+    );
+}
+
+/// A refusal is the daemon's answer, not a lost connection: it is reported
+/// once, the refused presence stays pending, and the connection is kept.
+#[test]
+fn a_refusal_on_the_kept_connection_is_reported_and_keeps_it() {
+    const REFUSAL: &str = "fixture refuses this presence";
+    let fixture = Fixture::new(vec![Answer::Accept, Answer::Refuse(REFUSAL)]);
+    assert_eq!(fixture.publish(TerminalId::new()), 0);
+    let refused = TerminalId::new();
+    fixture.pending.lock().unwrap().presence = Some(focusing(refused));
+    fixture.wake.as_ref().unwrap().send(()).unwrap();
+    // The refused presence, then its retry after the retry delay, both on
+    // the one connection.
+    for _ in 0..2 {
+        let (connection, request) = fixture
+            .requests
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the refused presence is sent again");
+        assert_eq!(connection, 0);
+        assert!(
+            matches!(&request, ClientRequest::NotificationPresence { presence }
+                if presence.focused == Some(refused)),
+            "{request:?}"
+        );
+    }
+    assert_eq!(fixture.connects.load(Ordering::SeqCst), 1);
+    // Reported before the retry was sent, and only once.
+    let actions = fixture.finish();
+    assert_eq!(actions.len(), 1, "{} actions", actions.len());
+    assert!(
+        matches!(&actions[0], Action::Failed(message) if message.contains(REFUSAL)),
+        "the refusal was not reported as itself"
     );
 }

@@ -424,74 +424,122 @@ fn deliver_control(
                 break 'control;
             }
             let requests = std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
-            let reused = kept.take().filter(ControlClient::is_quiet);
-            let result = match reused {
+            let result = match kept.take().filter(ControlClient::is_quiet) {
                 Some(mut client) => match deliver(&mut client, &requests) {
                     Ok(()) => Ok(client),
                     // The daemon can go between the quiet check and the
-                    // request. Every command is idempotent, so a fresh
-                    // connection tells that apart from a refusal.
-                    Err(_) => deliver_connected(&mut connect, &requests),
+                    // request. Every command is idempotent, so they are sent
+                    // again on a new connection before anything is reported.
+                    Err(Undelivered {
+                        connection: Connection::Lost,
+                        ..
+                    }) => {
+                        tracing::debug!("kept notification connection lost; reconnecting");
+                        deliver_connected(&mut connect, &requests)
+                    }
+                    Err(undelivered) => Err((undelivered, Some(client))),
                 },
                 None => deliver_connected(&mut connect, &requests),
             };
-            match result {
+            let undelivered = match result {
                 Ok(client) => {
                     kept = Some(client);
                     break;
                 }
-                Err(error) => {
-                    // Retain the commands across a daemon restart, but let a
-                    // newer focus/settings update win.
-                    let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
-                    newer.presence = newer.presence.take().or(requests.presence);
-                    newer.preferences = newer.preferences.or(requests.preferences);
-                    newer.acknowledged.extend(requests.acknowledged);
-                    drop(newer);
-                    if let Some(error) = error
-                        && last_error.as_ref() != Some(&error)
-                    {
-                        last_error = Some(error.clone());
-                        let _ = sender.send_blocking(Action::Failed(error));
-                    }
-                    if let Err(crossbeam_channel::RecvTimeoutError::Disconnected) =
-                        wake.recv_timeout(crate::daemon_health::retry_delay())
-                    {
-                        break 'control;
-                    }
+                Err((undelivered, client)) => {
+                    kept = client.filter(|_| undelivered.connection == Connection::Answered);
+                    undelivered
                 }
+            };
+            // Retain the commands across a daemon restart, but let a newer
+            // focus/settings update win.
+            let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
+            newer.presence = newer.presence.take().or(requests.presence);
+            newer.preferences = newer.preferences.or(requests.preferences);
+            newer.acknowledged.extend(requests.acknowledged);
+            drop(newer);
+            if let Some(error) = undelivered.notice
+                && last_error.as_ref() != Some(&error)
+            {
+                last_error = Some(error.clone());
+                let _ = sender.send_blocking(Action::Failed(error));
+            }
+            if let Err(crossbeam_channel::RecvTimeoutError::Disconnected) =
+                wake.recv_timeout(crate::daemon_health::retry_delay())
+            {
+                break 'control;
             }
         }
     }
 }
 
-/// [`deliver`] over a new connection, which is returned to be kept.
+/// Commands the daemon did not take, and what that says of the connection
+/// they were sent on.
+struct Undelivered {
+    /// What the window reports, unless sending them again settles it.
+    notice: Option<String>,
+    connection: Connection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    /// The daemon answered on it, so it can be kept.
+    Answered,
+    /// An answer did not arrive in time, and may yet: it can't be read in
+    /// order, so it is not kept.
+    Unanswered,
+    /// It failed as a connection does: the daemon may be gone or replaced.
+    Lost,
+}
+
+impl Undelivered {
+    fn of(error: &crate::control::ControlError, notice: Option<String>) -> Self {
+        use crate::control::ControlError;
+        let connection = match error {
+            ControlError::Remote { .. } => Connection::Answered,
+            ControlError::ReplyTimeout { .. } => Connection::Unanswered,
+            _ => Connection::Lost,
+        };
+        Self { notice, connection }
+    }
+}
+
+/// [`deliver`] over a new connection, which is returned to be kept. A failed
+/// delivery returns the connection where it can still be kept.
 fn deliver_connected(
     connect: &mut impl FnMut() -> Result<ControlClient, String>,
     requests: &Pending,
-) -> Result<ControlClient, Option<String>> {
-    let mut client = connect().map_err(Some)?;
-    deliver(&mut client, requests)?;
-    Ok(client)
+) -> Result<ControlClient, (Undelivered, Option<ControlClient>)> {
+    let mut client = connect().map_err(|error| {
+        let undelivered = Undelivered {
+            notice: Some(error),
+            connection: Connection::Lost,
+        };
+        (undelivered, None)
+    })?;
+    match deliver(&mut client, requests) {
+        Ok(()) => Ok(client),
+        Err(undelivered) => Err((undelivered, Some(client))),
+    }
 }
 
 /// Sends `requests` over `client`. A refusal that settles on its own when
 /// sent again fails without a notice.
-fn deliver(client: &mut ControlClient, requests: &Pending) -> Result<(), Option<String>> {
+fn deliver(client: &mut ControlClient, requests: &Pending) -> Result<(), Undelivered> {
     if let Some(presence) = requests.presence.clone() {
         client
             .notification_presence(presence)
-            .map_err(|error| presence_refusal_notice(&error))?;
+            .map_err(|error| Undelivered::of(&error, presence_refusal_notice(&error)))?;
     }
     if requests.preferences.is_some() {
         client
             .notification_preferences(requests.preferences)
-            .map_err(|error| Some(error.to_string()))?;
+            .map_err(|error| Undelivered::of(&error, Some(error.to_string())))?;
     }
     for id in &requests.acknowledged {
         client
             .acknowledge_notification(*id)
-            .map_err(|error| Some(error.to_string()))?;
+            .map_err(|error| Undelivered::of(&error, Some(error.to_string())))?;
     }
     Ok(())
 }
