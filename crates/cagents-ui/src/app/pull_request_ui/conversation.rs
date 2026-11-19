@@ -148,17 +148,24 @@ pub struct State {
     slots: Vec<Slot>,
 }
 
-/// What one Work row is known by: its pull request, its worktree, or both
-/// once the worktree is found to head the pull request.
-#[derive(Debug, Clone, Default)]
-struct Slot {
-    pull_request: Option<(GitHubRepoKey, u64)>,
-    worktree: Option<PathBuf>,
+/// What one Work row is known by.
+#[derive(Debug, Clone)]
+enum Slot {
+    /// Its pull request, its worktree, or both once the worktree is found
+    /// to head the pull request.
+    Work {
+        pull_request: Option<(GitHubRepoKey, u64)>,
+        worktree: Option<PathBuf>,
+    },
+    /// The worktree the conversation runs in, listed when none of the work
+    /// is in a worktree Projects lists: it follows the work listed before
+    /// it was first shown, and precedes work found since.
+    Here,
 }
 
 impl Slot {
     fn of(work: &Work<'_>) -> Self {
-        Self {
+        Self::Work {
             pull_request: work
                 .pull_request()
                 .map(|row| (row.repository.clone(), row.number)),
@@ -166,33 +173,39 @@ impl Slot {
         }
     }
 
+    fn pull_request(&self) -> Option<(&GitHubRepoKey, u64)> {
+        match self {
+            Self::Work {
+                pull_request: Some((repository, number)),
+                ..
+            } => Some((repository, *number)),
+            _ => None,
+        }
+    }
+
+    fn worktree(&self) -> Option<&Path> {
+        match self {
+            Self::Work { worktree, .. } => worktree.as_deref(),
+            Self::Here => None,
+        }
+    }
+
     /// Whether `work` is this row's pull request or is in its worktree.
     fn names(&self, work: &Work<'_>) -> bool {
-        self.knows(
-            work.pull_request().map(|row| (&row.repository, row.number)),
-            work.worktree(),
-        )
+        self.same_pull_request(work.pull_request().map(|row| (&row.repository, row.number)))
+            || self.same_worktree(work.worktree())
     }
 
-    /// Whether `other` names the same pull request or the same worktree.
-    fn shares(&self, other: &Self) -> bool {
-        self.knows(
-            other
-                .pull_request
-                .as_ref()
-                .map(|(repository, number)| (repository, *number)),
-            other.worktree.as_deref(),
-        )
-    }
-
-    fn knows(&self, pull_request: Option<(&GitHubRepoKey, u64)>, worktree: Option<&Path>) -> bool {
-        let same_pull_request = matches!(
-            (&self.pull_request, pull_request),
+    fn same_pull_request(&self, other: Option<(&GitHubRepoKey, u64)>) -> bool {
+        matches!(
+            (self.pull_request(), other),
             (Some((known, known_number)), Some((repository, number)))
-                if *known_number == number && known.same_repository(repository)
-        );
-        let same_worktree = worktree.is_some() && self.worktree.as_deref() == worktree;
-        same_pull_request || same_worktree
+                if known_number == number && known.same_repository(repository)
+        )
+    }
+
+    fn same_worktree(&self, other: Option<&Path>) -> bool {
+        other.is_some() && self.worktree() == other
     }
 }
 
@@ -297,21 +310,28 @@ impl State {
         here: Option<&'a Path>,
         openable: &dyn Fn(&Path) -> bool,
     ) -> Vec<Work<'a>> {
-        let mut work = self.listed_work();
-        // Every frame draws it, so it is placed without copying keys.
-        work.sort_by_cached_key(|work| {
+        let place = |work: &Work<'_>| {
             self.slots
                 .iter()
                 .position(|slot| slot.names(work))
                 .unwrap_or(usize::MAX)
-        });
+        };
+        let mut work = self.listed_work();
+        work.sort_by_cached_key(place);
         if let Some(here) = here
             && !work.is_empty()
             && !work
                 .iter()
                 .any(|work| work.worktree().is_some_and(openable))
         {
-            work.push(Work::Here(here));
+            let at = self
+                .slots
+                .iter()
+                .position(|slot| matches!(slot, Slot::Here))
+                .map_or(work.len(), |slot| {
+                    work.partition_point(|work| place(work) < slot)
+                });
+            work.insert(at, Work::Here(here));
         }
         work
     }
@@ -369,23 +389,47 @@ impl State {
     /// for the first time goes last. A row whose work is no longer listed
     /// leaves.
     fn place_rows(&mut self) {
-        let mut next = self.slots.len();
-        let mut placed: Vec<(usize, Slot)> = self
-            .listed_work()
+        let listed: Vec<Slot> = self.listed_work().iter().map(Slot::of).collect();
+        // Each row goes to the work with its pull request, else to the work
+        // in its worktree, so a worktree moved to another pull request's
+        // branch takes no row from a pull request still listed.
+        let owners: Vec<Option<usize>> = self
+            .slots
             .iter()
-            .map(Slot::of)
-            .map(|slot| {
-                let place = self
-                    .slots
+            .map(|known| {
+                listed
                     .iter()
-                    .position(|known| known.shares(&slot))
-                    .unwrap_or_else(|| {
-                        next += 1;
-                        next - 1
-                    });
-                (place, slot)
+                    .position(|slot| known.same_pull_request(slot.pull_request()))
+                    .or_else(|| {
+                        listed
+                            .iter()
+                            .position(|slot| known.same_worktree(slot.worktree()))
+                    })
             })
             .collect();
+        let mut next = self.slots.len();
+        let mut placed: Vec<(usize, Slot)> = Vec::with_capacity(listed.len() + 1);
+        let any = !listed.is_empty();
+        for (index, slot) in listed.into_iter().enumerate() {
+            let place = owners
+                .iter()
+                .position(|owner| *owner == Some(index))
+                .unwrap_or_else(|| {
+                    next += 1;
+                    next - 1
+                });
+            placed.push((place, slot));
+        }
+        // Shown only beside work, the conversation's own worktree keeps its
+        // row while there is any, and first follows what is listed now.
+        if any {
+            let here = self
+                .slots
+                .iter()
+                .position(|slot| matches!(slot, Slot::Here))
+                .unwrap_or(next);
+            placed.push((here, Slot::Here));
+        }
         // Stable, so new work keeps the daemon's order among itself.
         placed.sort_by_key(|(place, _)| *place);
         self.slots = placed.into_iter().map(|(_, slot)| slot).collect();
@@ -1527,6 +1571,70 @@ mod tests {
             vec![worktree("/docs", None)],
         ));
         assert_eq!(rows_of(&state), ["#7", "docs"]);
+    }
+
+    /// A worktree that moves to another pull request's branch takes no row
+    /// from a pull request still listed, so nothing between them moves.
+    #[test]
+    fn a_pull_request_keeps_its_row_when_its_worktree_moves_to_another() {
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some(conversation));
+        state.update(with_worktrees(
+            conversation,
+            1,
+            vec![row(1, Relation::Created)],
+            vec![worktree("/a", Some(1)), worktree("/docs", None)],
+        ));
+        state.update(with_worktrees(
+            conversation,
+            2,
+            vec![row(1, Relation::Created), row(2, Relation::Pushed)],
+            vec![worktree("/a", Some(1)), worktree("/docs", None)],
+        ));
+        assert_eq!(rows_of(&state), ["#1", "docs", "#2"]);
+        // `/a` checks out #2's branch.
+        state.update(with_worktrees(
+            conversation,
+            3,
+            vec![row(1, Relation::Created), row(2, Relation::Pushed)],
+            vec![worktree("/a", Some(2)), worktree("/docs", None)],
+        ));
+        assert_eq!(rows_of(&state), ["#1", "docs", "#2"]);
+    }
+
+    /// The conversation's own worktree, listed when none of its work is in
+    /// a worktree Projects lists, keeps its row as work arrives after it.
+    #[test]
+    fn the_conversations_own_worktree_keeps_its_row() {
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some(conversation));
+        let here = Path::new("/main");
+        let rows = |state: &State| -> Vec<String> {
+            state
+                .work(Some(here), &|_| false)
+                .iter()
+                .map(|work| match work.pull_request() {
+                    Some(row) => format!("#{}", row.number),
+                    None => work.scope_label(),
+                })
+                .collect()
+        };
+        state.update(with_worktrees(
+            conversation,
+            1,
+            vec![row(1, Relation::Created)],
+            Vec::new(),
+        ));
+        assert_eq!(rows(&state), ["#1", "main"]);
+        state.update(with_worktrees(
+            conversation,
+            2,
+            vec![row(1, Relation::Created), row(2, Relation::Pushed)],
+            Vec::new(),
+        ));
+        assert_eq!(rows(&state), ["#1", "main", "#2"]);
     }
 
     /// The height the list reports is the height it lays out at, so its
