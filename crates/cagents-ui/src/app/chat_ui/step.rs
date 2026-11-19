@@ -337,9 +337,9 @@ impl Runtime {
         };
         self.find_disclosure.manual_turn(&key);
         if open {
-            self.opened.insert(key, true);
+            self.opened.edit().insert(key, true);
         } else {
-            self.opened.remove(&key);
+            self.opened.edit().remove(&key);
         }
     }
 
@@ -882,11 +882,11 @@ mod tests {
             };
             let mut tree = Tree::new(build(&runtime).as_widget());
             for (index, open) in [false, true, false].into_iter().enumerate() {
-                runtime.opened.insert(key.clone(), open);
+                runtime.opened.edit().insert(key.clone(), open);
                 if open {
-                    runtime.expanded.insert(item.id.clone());
+                    runtime.expanded.edit().insert(item.id.clone());
                 } else {
-                    runtime.expanded.remove(&item.id);
+                    runtime.expanded.edit().remove(&item.id);
                 }
                 let mut element = build(&runtime);
                 tree.diff(element.as_widget_mut());

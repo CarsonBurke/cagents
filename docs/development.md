@@ -410,6 +410,7 @@ the matched set as usual, then starts the UI in a headless
 `niri-harness` session named
 `cagents-NAME` and returns once its window maps. Drive and capture it with
 `niri-harness --session cagents-NAME ...`.
+It needs a niri-harness with the `start` command; `mise run doctor` warns about an older one.
 
 | Shared by default | Per instance |
 | --- | --- |
@@ -2597,6 +2598,7 @@ display. `ceditor start BIN_DIR`, `record NAME`, `shot NAME` and `update DIR
 VERSION INSTALLER --answer yes` are available separately. `stop` retains evidence;
 `cleanup` stops everything and removes the marked root. Copy reports and images
 elsewhere before cleanup.
+Without a running desktop, `record NAME` records no windows and expects no window stores; comparing a record taken with a desktop to one taken without reports the difference.
 
 The harness's pure checks need no compositor, archive or Rust build, and CI
 runs them as the `update rehearsal` job of the script contracts (see [Testing](#testing)):

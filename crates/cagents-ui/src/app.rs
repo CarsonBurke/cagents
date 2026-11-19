@@ -5722,6 +5722,9 @@ pub struct Cagents {
     /// numbers against, pinned as `card_indices_source` is.
     terminal_ordinals_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
+    /// Where each folder Projects lists sits, for the inspectors' activity
+    /// blocks to name a pane's place without scanning every project.
+    place_index: inspector_activity::PlaceIndex,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     /// Where each open pane is on screen and what its runtime holds. Both
@@ -5889,7 +5892,7 @@ pub struct Cagents {
     refresh_ui: refresh_ui::State,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     operation_recovery: crate::operation_recovery::Shared,
-    account_ui: account_ui::State,
+    account_ui: account_ui::Accounts,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
     automation_approval: automation_approval::State,
@@ -16059,6 +16062,7 @@ impl Application for Cagents {
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
+            place_index: inspector_activity::PlaceIndex::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
             presence: HashMap::new(),
@@ -16145,7 +16149,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: account_ui::State::installation().into(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -19634,6 +19638,13 @@ impl Cagents {
         // mounted visible chats are inspected by this bounded handoff.
         let limit_usage =
             projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
+        // Last, after everything above that may change the accounts, so the
+        // frame this update ends in reads its conversations' account choices.
+        projection_stage!(
+            "chat_account_choices",
+            self.account_ui
+                .settle_choices(self.settings.account_usage_display)
+        );
         Task::batch([
             settled_projection,
             task,

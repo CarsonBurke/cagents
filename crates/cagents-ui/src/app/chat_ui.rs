@@ -103,6 +103,7 @@ mod hover;
 pub(super) mod images;
 mod kept_draft;
 use kept_draft::ConfirmedLoss;
+use revised::Revised;
 mod layout;
 mod literal_content;
 mod logical_prose;
@@ -121,6 +122,7 @@ mod reasoning;
 pub(super) use pull_request_links::Board as PullRequestBoard;
 mod reader_source;
 mod retained;
+mod revised;
 pub(super) use closed_draft::closed_draft_source_matches;
 pub(super) mod blocked_recovery;
 pub(in crate::app) use update_recovery::UpdateWait;
@@ -1665,17 +1667,19 @@ pub(super) fn format_duration(millis: u64) -> String {
 }
 
 /// Remember reader choices across bounded history pages without retaining transcript bodies.
-fn reconcile_disclosure(opened: &mut HashMap<String, bool>, turns: &[turn::Turn]) {
+fn reconcile_disclosure(opened: &mut Revised<HashMap<String, bool>>, turns: &[turn::Turn]) {
     if opened.len() > 4096 {
         let keys: HashSet<&str> = turns.iter().map(|turn| turn.key.as_str()).collect();
-        opened.retain(|key, _| keys.contains(key.as_str()));
+        if opened.keys().any(|key| !keys.contains(key.as_str())) {
+            opened.edit().retain(|key, _| keys.contains(key.as_str()));
+        }
     }
 }
 
 /// A page can retain a tool while evicting the prompt that named its group.
 /// Match overlapping stable tool IDs before replacing the bounded snapshot.
 fn carry_step_disclosures(
-    opened: &mut HashMap<String, bool>,
+    opened: &mut Revised<HashMap<String, bool>>,
     search: &mut find::Disclosure,
     previous: &[turn::Turn],
     previous_items: &[Arc<chat::Item>],
@@ -3205,7 +3209,7 @@ pub(super) struct Runtime {
     pull_request_labels_built_from: Option<LabelSources>,
     /// The snapshot's items grouped into stretches of work, rebuilt only when
     /// the snapshot changes rather than once per frame.
-    turns: Vec<turn::Turn>,
+    turns: Revised<Vec<turn::Turn>>,
     selected_subagent: Option<String>,
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
@@ -3237,7 +3241,7 @@ pub(super) struct Runtime {
     ///
     /// Explicit reader choices override the configured default and survive
     /// history-page eviction within a bounded disclosure budget.
-    opened: HashMap<String, bool>,
+    opened: Revised<HashMap<String, bool>>,
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
@@ -3255,8 +3259,10 @@ pub(super) struct Runtime {
     /// repeat a message the conversation received, and which one. Cleared
     /// once the transcript settles it, or the reader edits the text.
     draft_echo: Option<(u64, DraftEcho)>,
-    expanded: HashSet<String>,
-    child_expanded: HashMap<String, HashSet<String>>,
+    expanded: Revised<HashSet<String>>,
+    /// Each child's own disclosures, stamped separately so pruning departed
+    /// children never disturbs the selected child's.
+    child_expanded: HashMap<String, Revised<HashSet<String>>>,
     child_unfolded: HashMap<String, HashSet<String>>,
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
@@ -3316,7 +3322,7 @@ pub(super) struct Runtime {
     selection_bookmarks: std::cell::RefCell<
         HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>,
     >,
-    selection_document: std::cell::RefCell<Option<(u64, Arc<selection::Catalog>)>>,
+    selection_document: std::cell::RefCell<Option<(view::SelectionKey, Arc<selection::Catalog>)>>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -4389,7 +4395,7 @@ impl Runtime {
             pull_request_labels: Arc::default(),
             pull_request_inspected: Default::default(),
             pull_request_labels_built_from: None,
-            turns: Vec::new(),
+            turns: Revised::default(),
             selected_subagent: None,
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
@@ -4399,7 +4405,7 @@ impl Runtime {
             child_ordinals: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
-            opened: HashMap::new(),
+            opened: Revised::default(),
             tool_groups_expanded: false,
             composer: text_editor::Content::new(),
             revision: 0,
@@ -4413,7 +4419,7 @@ impl Runtime {
             submit_after_paste: None,
             attachment_chooser_pending: None,
             draft_echo: None,
-            expanded: HashSet::new(),
+            expanded: Revised::default(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
@@ -4470,7 +4476,7 @@ impl Runtime {
         self.child_cache_context = None;
         self.presentation_evicted = false;
         self.last_presented_tail = None;
-        self.turns.clear();
+        self.turns = Revised::default();
         self.selected_subagent = None;
         self.subagent_scroll.clear();
         self.page_request = None;
@@ -4484,8 +4490,8 @@ impl Runtime {
         self.asked.clear();
         self.find_disclosure = find::Disclosure::default();
         self.child_find_disclosure.clear();
-        self.opened.clear();
-        self.expanded.clear();
+        self.opened = Revised::default();
+        self.expanded = Revised::default();
         self.child_expanded.clear();
         self.child_unfolded.clear();
         self.answers.clear();
@@ -5650,7 +5656,7 @@ impl Runtime {
                 &turns,
                 &self.snapshot.items,
             );
-            self.turns = turns;
+            self.turns = turns.into();
             reconcile_disclosure(&mut self.opened, &self.turns);
         }
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
@@ -6004,14 +6010,16 @@ impl Runtime {
         let child_disclosures: usize = self
             .child_expanded
             .values()
-            .chain(self.child_unfolded.values())
-            .map(HashSet::len)
+            .map(|choices| choices.len())
+            .chain(self.child_unfolded.values().map(HashSet::len))
             .sum();
         if child_disclosures > 4096 {
             for child in &snapshot.subagents {
                 let live: HashSet<_> = child.items.iter().map(|item| item.id.as_str()).collect();
-                if let Some(expanded) = self.child_expanded.get_mut(&child.id) {
-                    expanded.retain(|id| live.contains(id.as_str()));
+                if let Some(expanded) = self.child_expanded.get_mut(&child.id)
+                    && expanded.iter().any(|id| !live.contains(id.as_str()))
+                {
+                    expanded.edit().retain(|id| live.contains(id.as_str()));
                 }
                 if let Some(unfolded) = self.child_unfolded.get_mut(&child.id) {
                     // The final separator belongs to the part name; opaque
@@ -6028,7 +6036,7 @@ impl Runtime {
             let no_turns = HashMap::new();
             for (child, disclosure) in &mut self.child_find_disclosure {
                 disclosure.retain(
-                    self.child_expanded.get(child).unwrap_or(&empty),
+                    self.child_expanded.get(child).map_or(&empty, |set| &**set),
                     self.child_unfolded.get(child).unwrap_or(&empty),
                     &no_turns,
                 );
@@ -6037,8 +6045,15 @@ impl Runtime {
         // Keep disclosure choices across page eviction, with a bounded budget.
         // Question anchors only describe the currently loaded window.
         let parent_items_pruned = self.expanded.len() > 4096;
-        if parent_items_pruned {
-            self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        if parent_items_pruned
+            && self
+                .expanded
+                .iter()
+                .any(|id| !live_ids.contains(id.as_str()))
+        {
+            self.expanded
+                .edit()
+                .retain(|id| live_ids.contains(id.as_str()));
         }
         self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         let retired_metadata = self.prepare_transcript_cache(&snapshot);
@@ -6137,7 +6152,7 @@ impl Runtime {
             .map(str::to_owned);
         let parent_turns_pruned = self.opened.len() > 4096;
         if let Some(turns) = turns {
-            self.turns = turns;
+            self.turns = turns.into();
             reconcile_disclosure(&mut self.opened, &self.turns);
         }
         if parent_items_pruned || parent_turns_pruned {
@@ -6189,11 +6204,14 @@ impl Runtime {
         self.restore_failure_find();
         self.find_disclosure
             .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        // Restoring reads a child's disclosures before it writes them; an
+        // absent child has nothing to restore, so give it no entry.
+        let mut no_items = Revised::default();
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
             disclosure.restore(
-                self.child_expanded.entry(child.clone()).or_default(),
+                self.child_expanded.get_mut(&child).unwrap_or(&mut no_items),
                 self.child_unfolded.entry(child).or_default(),
-                &mut HashMap::new(),
+                &mut Revised::default(),
             );
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
@@ -6224,7 +6242,9 @@ impl Runtime {
         if let Some(child) = &self.selected_subagent {
             collapse_reports(
                 &mut self.child_cache,
-                self.child_expanded.entry(child.clone()).or_default(),
+                self.child_expanded
+                    .get(child)
+                    .map_or(&HashSet::new(), |set| &**set),
                 self.syntax_theme,
             );
         }
@@ -8279,9 +8299,10 @@ impl Cagents {
                         format!(" · {}", choice.detail)
                     }
                 ))
-                .on_press_maybe(
-                    (!busy).then_some(Message::ChatUi(Action::RecoverAccount(card, choice.id))),
-                )
+                .on_press_maybe((!busy).then_some(Message::ChatUi(Action::RecoverAccount(
+                    card,
+                    choice.id.clone(),
+                ))))
                 .into(),
             );
         }
@@ -14631,6 +14652,7 @@ impl Cagents {
                         runtime.find_disclosure.manual_item(&id);
                         &mut runtime.expanded
                     };
+                    let expanded = expanded.edit();
                     let open = !expanded.remove(&id);
                     if open {
                         expanded.insert(id.clone());
@@ -14690,7 +14712,7 @@ impl Cagents {
                     if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
                         let open = !runtime.group_open(turn);
                         runtime.find_disclosure.manual_turn(&key);
-                        runtime.opened.insert(key, open);
+                        runtime.opened.edit().insert(key, open);
                     }
                 }
             }
@@ -14703,8 +14725,9 @@ impl Cagents {
                         .any(|incident| incident.key == key)
                 {
                     runtime.failure_ui.find_expanded.remove(&key);
-                    if !runtime.failure_ui.expanded.remove(&key) {
-                        runtime.failure_ui.expanded.insert(key.clone());
+                    let expanded = runtime.failure_ui.expanded.edit();
+                    if !expanded.remove(&key) {
+                        expanded.insert(key.clone());
                         runtime.cache_failure_preview(&key);
                     }
                 }

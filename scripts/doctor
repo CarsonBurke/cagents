@@ -181,6 +181,8 @@ def check_optional(report):
                              ("bwrap", "release builds and package smoke tests")):
         if shutil.which(command) is None:
             report.warn(command, f"not found; needed only for {purpose}")
+        elif command == "niri-harness" and output(["niri-harness", "start", "--help"]) is None:
+            report.warn("niri-harness", "found, but too old for --instance: it has no start command; update it")
         else:
             report.ok(command, "found")
 

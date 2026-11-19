@@ -714,13 +714,26 @@ exit 83
         self.assertEqual(name, "cagents-ui")
         self.assertTrue(program.endswith("/cagents-ui"))
 
+    def test_an_instance_with_an_outdated_harness_is_refused_before_starting(self):
+        harness = self.root / "bin/niri-harness"
+        harness.write_text('#!/bin/sh\ncase "$1" in start) exit 2 ;; esac\nexit 1\n')
+        harness.chmod(0o755)
+        result = subprocess.run(
+            [str(self.runner), "--browserless", "--instance", "old"], cwd=self.root,
+            env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("is too old for --instance", result.stderr)
+        self.assertFalse(self.cargo_calls.exists(), "Cargo started with an outdated harness")
+        self.assertFalse(self.target.exists(), "products were created before the harness was checked")
+
     def test_an_instance_runs_under_a_memory_limit(self):
         limit = self.runner.with_name("memory-capped")
         limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
         limit.chmod(0o755)
         started = self.root / "started"
         harness = self.root / "bin/niri-harness"
-        harness.write_text(f'#!/bin/sh\ncase " $* " in *" start "*) printf "%s\\n" "$@" >"{started}" ;; *) exit 1 ;; esac\n')
+        harness.write_text(f'#!/bin/sh\ncase " $* " in *" start --help "*) exit 0 ;; *" start "*) printf "%s\\n" "$@" >"{started}" ;; *) exit 1 ;; esac\n')
         harness.chmod(0o755)
         self.launch("--browserless", "--instance", "capped")
         words = started.read_text().splitlines()
@@ -732,7 +745,7 @@ exit 83
         started = self.root / "started"
         harness = self.root / "bin/niri-harness"
         harness.write_text(
-            '#!/bin/sh\ncase " $* " in *" start "*) printf "%s|%s\\n" '
+            '#!/bin/sh\ncase " $* " in *" start --help "*) exit 0 ;; *" start "*) printf "%s|%s\\n" '
             f'"${{CAGENTS_DEVELOPMENT_DAEMON_LOG-unset}}" "${{CAGENTS_LOCAL_DEBUG-unset}}" >"{started}" ;;'
             ' *) exit 1 ;; esac\n'
         )
@@ -1059,6 +1072,7 @@ exit 83
         runtime.mkdir(parents=True)
         harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
         harness.write_text(f"""#!/bin/sh
+case " $* " in *" start --help "*) exit 0 ;; esac
 for argument do
     case $argument in
         env) printf "XDG_RUNTIME_DIR='%s'\\n" '{runtime}'; exit 0 ;;
@@ -1245,6 +1259,7 @@ class InstanceLifetime(unittest.TestCase):
         # per session, holding its state and runtime directory.
         harness = self.root / "bin/niri-harness"
         harness.write_text(f"""#!/bin/sh
+case " $* " in *" start --help "*) exit 0 ;; esac
 sessions='{self.sessions}'
 printf '%s\\n' "$*" >>'{self.harness_calls}'
 session=

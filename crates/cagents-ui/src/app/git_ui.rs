@@ -421,7 +421,6 @@ impl Cagents {
                         let reconfigure = plan.is_some();
                         let full_catalog = !entry.catalog_requested
                             || entry.plan.is_none()
-                            || reconfigure
                             || entry.read_full_scan;
                         let archived = entry.archived.clone();
                         if let Some(plan) = plan {
@@ -834,7 +833,8 @@ fn records_removed_outside(
 
 /// Only catalog fields belong in this comparison. Status, locks, commit IDs,
 /// and PR authority still flow through the ordinary UI application below.
-/// Structural/first reads always reassert open rows, including tombstone reopen.
+/// First reads and full scans reassert every open row, including tombstone reopen.
+/// Adopting a watch plan alone does not.
 fn catalog_changes(
     project: ProjectId,
     previous: &Snapshot,
@@ -2069,7 +2069,7 @@ mod tests {
     }
 
     #[test]
-    fn established_local_reads_skip_equal_catalog_writes_but_keep_ui_and_reassertions() {
+    fn established_local_reads_skip_equal_catalog_writes_but_keep_ui_and_rearm() {
         let directory = tempfile::tempdir().unwrap();
         let mut snapshot = fixture(&directory.path().join("repo"));
         let (mut app, project) = catalog_app(&snapshot);
@@ -2184,7 +2184,8 @@ mod tests {
         assert!(branched.generation > opened.generation);
 
         // Equal watch values can represent a replaced directory incarnation.
-        // Adopting a plan must still reassert catalog rows and replace the Arc.
+        // Adopting a plan must replace the Arc and rearm, but rows that did not
+        // change are not rewritten.
         let old_plan = app.refresh_ui.git.entries[&project.id]
             .plan
             .clone()
@@ -2201,13 +2202,115 @@ mod tests {
             .unwrap()
             .flush(Duration::from_secs(5))
             .unwrap();
-        assert!(store.load_worktree(id).unwrap().unwrap().generation > branched.generation);
+        assert_eq!(store.load_worktree(id).unwrap().unwrap(), branched);
         let next = app.refresh_ui.git.entries[&project.id]
             .plan
             .as_ref()
             .unwrap();
         assert!(!Arc::ptr_eq(&old_plan, next));
         // Native rearming itself remains covered by the existing watcher test.
+    }
+
+    #[test]
+    fn a_plan_read_still_writes_a_row_whose_git_facts_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("catalog-plan-delta"),
+        )
+        .unwrap();
+        let store = writer.operation_store();
+        writer.save_project(project.clone());
+        app.session = Some(writer);
+        let plan = catalog_plan(project.id, &snapshot);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(plan.clone()))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let baseline = store.load_worktree(id).unwrap().unwrap();
+
+        git(
+            &snapshot.worktrees[0].0.path,
+            &["checkout", "-b", "plan-branch"],
+        );
+        let (snapshot, next_plan) = read_local_with_plan(
+            project.id,
+            snapshot,
+            git_watch::Change {
+                membership: true,
+                worktrees: [id].into_iter().collect(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        let next_plan = next_plan.expect("a membership read must return a watch plan");
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot, Some(next_plan))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let changed = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(changed.branch.as_deref(), Some("plan-branch"));
+        assert!(changed.generation > baseline.generation);
+    }
+
+    #[test]
+    fn a_full_scan_read_reasserts_unchanged_catalog_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let (mut app, project) = catalog_app(&snapshot);
+        let id = snapshot.worktrees[0].0.id;
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("window.sqlite3"),
+            crate::model::BootId::new("catalog-full-scan"),
+        )
+        .unwrap();
+        let store = writer.operation_store();
+        writer.save_project(project.clone());
+        app.session = Some(writer);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot.clone(), Some(catalog_plan(project.id, &snapshot)))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        let baseline = store.load_worktree(id).unwrap().unwrap();
+
+        let entry = app.refresh_ui.git.entries.get_mut(&project.id).unwrap();
+        entry.read_full_scan = true;
+        entry.cancellation = Some(CancellationToken::default());
+        let plan = catalog_plan(project.id, &snapshot);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((snapshot, Some(plan))),
+        }));
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(store.load_worktree(id).unwrap().unwrap().generation > baseline.generation);
     }
 
     #[test]

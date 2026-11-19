@@ -397,7 +397,7 @@ fn manually_expanded_details_survive_find_query_changes_and_close_without_new_pu
     let generation = runtime.snapshot.generation;
     let original = runtime.snapshot.items[0].clone();
     let key = runtime.failure_ui.incidents[0].key.clone();
-    runtime.failure_ui.expanded.insert(key.clone());
+    runtime.failure_ui.expanded.edit().insert(key.clone());
     runtime.cache_failure_preview(&key);
     assert!(raw.starts_with(runtime.failure_preview(&key).unwrap().0));
 
@@ -1479,7 +1479,7 @@ fn expanded_diagnostic_preview_and_copy_follow_changed_sources_with_the_same_key
         assert_eq!(runtime.failure_ui.incidents.len(), 1);
         let key = runtime.failure_ui.incidents[0].key.clone();
         runtime.find = Some("VIEW_".into());
-        runtime.failure_ui.expanded.insert(key.clone());
+        runtime.failure_ui.expanded.edit().insert(key.clone());
         runtime.cache_failure_preview(&key);
         assert_eq!(runtime.failure_preview(&key).unwrap().0, raw_before);
         assert_eq!(
@@ -2375,7 +2375,7 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     let original = runtime.snapshot.items[0].clone();
     let weak = Arc::downgrade(&original);
     let key = runtime.failure_ui.incidents[0].key.clone();
-    runtime.failure_ui.expanded.insert(key.clone());
+    runtime.failure_ui.expanded.edit().insert(key.clone());
     runtime.cache_failure_preview(&key);
     assert!(runtime.failure_preview(&key).is_some());
     drop(original);
