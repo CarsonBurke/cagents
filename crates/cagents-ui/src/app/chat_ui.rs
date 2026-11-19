@@ -14745,8 +14745,28 @@ impl Cagents {
                     // remember explicit choices across paging. Ignore stale keys.
                     if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
                         let open = !runtime.group_open(turn);
+                        // A strip of one step, as while the agent thinks
+                        // after it, carries the choice to the step's own
+                        // row, which it turns back into.
+                        let only = match turn.steps.as_slice() {
+                            [only] => runtime
+                                .snapshot
+                                .items
+                                .get(only.index)
+                                .map(|item| item.id.clone()),
+                            _ => None,
+                        };
                         runtime.find_disclosure.manual_turn(&key);
                         runtime.opened.edit().insert(key, open);
+                        if let Some(id) = only {
+                            runtime.find_disclosure.manual_item(&id);
+                            let expanded = runtime.expanded.edit();
+                            if open {
+                                expanded.insert(id);
+                            } else {
+                                expanded.remove(&id);
+                            }
+                        }
                     }
                 }
             }

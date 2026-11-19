@@ -29,7 +29,7 @@ fn document() -> chat::Item {
     answer(text)
 }
 
-fn view(runtime: &Runtime) -> Element<'_, Message> {
+pub(super) fn view(runtime: &Runtime) -> Element<'_, Message> {
     runtime.view(
         None,
         false,

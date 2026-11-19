@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -373,6 +373,31 @@ if [ "$scene" = contentless ]; then
     scroll_top
     shot contentless-finished-expanded-second
     printf '%s\n' 'Captured a turn of signature-only thoughts working, finished and expanded.'
+    exit 0
+fi
+
+# One command, then a long thought with nothing to read, then the answer:
+# the command's row, the group counting on as its strip while the agent
+# thinks, and the row again once it answers, at one scroll position.
+if [ "$scene" = lone-thinking ]; then
+    cp "$here/reasoning-row-scene/lone-thinking.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: verify the fixture.' \
+        "$fixture/state/reasoning-lone-thinking-spawn.json" 'Lone step thinking'
+    seen() { rg -q "\"uuid\":\"$1\"" "$config/projects"; }
+    for _ in $(seq 30); do seen lone-check-1-result && break; sleep 1; done
+    seen lone-check-1-result || { printf '%s\n' 'reasoning-row-scene: the command did not run' >&2; exit 1; }
+    sleep 1
+    shot lone-row
+    # The thought starts five seconds after the command and runs twelve.
+    sleep 9
+    shot lone-thinking-strip
+    for _ in $(seq 30); do seen lone-answer-1 && break; sleep 1; done
+    seen lone-answer-1 || { printf '%s\n' 'reasoning-row-scene: the answer did not land' >&2; exit 1; }
+    sleep 2
+    shot lone-answered
+    printf '%s\n' 'Captured a lone step before, during and after the thinking that follows it.'
     exit 0
 fi
 
