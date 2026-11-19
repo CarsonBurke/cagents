@@ -2777,22 +2777,8 @@ impl Runtime {
                     heading
                 },
             );
-            // Thoughts with nothing to read draw no row, so a subagent with
-            // only those has shown nothing yet and says it is working.
-            if agent
-                .items
-                .iter()
-                .all(|item| reasoning::contentless(&item.content))
-                && !(agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty())
-            {
-                transcript.push(transcript_body(
-                    if agent.status == chat::ToolStatus::Running {
-                        "Waiting for subagent activity…"
-                    } else {
-                        "No recent subagent activity is available here."
-                    },
-                    target,
-                ));
+            if let Some(placeholder) = child_placeholder(agent) {
+                transcript.push(transcript_body(placeholder, target));
             }
             for incident in self
                 .failure_ui
@@ -6754,6 +6740,23 @@ impl Runtime {
         .width(Length::Fill)
         .into()
     }
+}
+
+/// What a subagent's transcript says in place of rows it has none of yet.
+/// Thoughts with nothing to read draw no row, so a subagent with only those
+/// has shown nothing yet and says so as one with no items does. A failure
+/// with its own detail says it instead.
+fn child_placeholder(agent: &chat::Subagent) -> Option<&'static str> {
+    let shown = agent
+        .items
+        .iter()
+        .any(|item| !reasoning::contentless(&item.content));
+    let failure = agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty();
+    (!shown && !failure).then_some(if agent.status == chat::ToolStatus::Running {
+        "Waiting for subagent activity…"
+    } else {
+        "No recent subagent activity is available here."
+    })
 }
 
 /// A stretch of thinking with nothing to read, as an open strip lists it

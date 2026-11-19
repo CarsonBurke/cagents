@@ -94,10 +94,10 @@ fn an_open_group_says_how_long_it_spent_thinking_between_its_steps() {
     assert_eq!(
         rows,
         [
-            "cargo test c1",
+            "Ran cargo test c1",
             "Thought for 17s",
-            "cargo test c2",
-            "cargo test c3"
+            "Ran cargo test c2",
+            "Ran cargo test c3"
         ],
         "only the long thought is listed, where it fell: {shown:?}"
     );
@@ -105,25 +105,31 @@ fn an_open_group_says_how_long_it_spent_thinking_between_its_steps() {
 
 #[test]
 fn a_subagent_that_has_only_thought_says_it_is_working() {
-    let (mut runtime, _handle) = prepared_runtime_for_test(&[prompt()]);
-    let agent = chat::Subagent {
-        id: "child".into(),
+    let mut agent = chat::Subagent {
         items: vec![Arc::new(thought("child-thought", 1_000, 2_000))],
         status: chat::ToolStatus::Running,
         ..super::tests::native_child_fixture()
     };
-    Arc::make_mut(&mut runtime.snapshot).subagents.push(agent);
-    runtime.selected_subagent = Some("child".into());
-    let snapshot = runtime.snapshot.clone();
-    runtime.prepare_child_cache(&snapshot);
-    preparation::drain_fixture(&mut runtime);
-    let shown = texts(&runtime, &mut None);
-    assert!(
-        shown
-            .iter()
-            .any(|text| text == "Waiting for subagent activity…"),
-        "{shown:?}"
+    assert_eq!(
+        child_placeholder(&agent),
+        Some("Waiting for subagent activity…")
     );
+    agent.status = chat::ToolStatus::Succeeded;
+    assert_eq!(
+        child_placeholder(&agent),
+        Some("No recent subagent activity is available here.")
+    );
+    // Its first row replaces the placeholder.
+    agent.status = chat::ToolStatus::Running;
+    agent
+        .items
+        .push(Arc::new(command("child-command", 2_000, 3_000)));
+    assert_eq!(child_placeholder(&agent), None);
+    // A failure with its own detail says what happened instead.
+    agent.items.truncate(1);
+    agent.status = chat::ToolStatus::Failed;
+    agent.detail = "The provider stopped.".into();
+    assert_eq!(child_placeholder(&agent), None);
 }
 
 #[test]
@@ -148,5 +154,6 @@ fn a_group_counts_on_while_the_agent_thinks_and_stops_when_it_is_done() {
     // The same items once the agent has stopped: only the busy state moved.
     publish(&mut runtime, false);
     assert!(!runtime.turns[0].running);
-    assert_eq!(runtime.turns[0].working_for(60_000), Some(3_000));
+    // From the prompt to the end of the thought.
+    assert_eq!(runtime.turns[0].working_for(60_000), Some(4_000));
 }
