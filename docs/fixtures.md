@@ -23,7 +23,7 @@ person.
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
 | An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
-| The offer, after an update, to resume conversations whose work it stopped | [`tests/fixtures/update-resume-scene.sh`](#an-update-that-stopped-work-in-progress), which records an ended update over four offline agents |
+| The offer, after an update, to resume conversations whose work it stopped | [`tests/fixtures/update-resume-scene.sh`](#an-update-that-stopped-work-in-progress), which records an ended update over four offline agents and reopens the window |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -1273,14 +1273,18 @@ the census's `in_flight` outcomes, which the window reads at startup to offer
 resuming the conversations whose work didn't survive.
 [`update-resume-scene.sh`](../tests/fixtures/update-resume-scene.sh) builds
 one over real offline conversations. Run it as a steps file: `prepare` in a
-running session opens the fixture project, starts four Claude agents in a
-"Release checks" channel, and records a completed update in which one was
-restarted without its subagent and background command, one had its turn
-interrupted, one was ended with a queued message, and one kept running.
-`stop` and `save-seed`, then `shots` in each side's session captures the
-offer and, where it exists, resumes one conversation and dismisses the rest.
-The offer is made once per update: what was resumed or dismissed is kept with
-the window state, so restore the seed (any `start` does) to see it again.
+running session opens the fixture project and starts four Claude agents in a
+"Release checks" channel; then `stop` and `save-seed`. `shots`, in each side's
+session, records a completed update in which one conversation was restarted
+without its subagent and background command, one had its turn interrupted,
+one was ended with a queued message, and one kept running. It then restarts
+only the app window, which reads the update as a window opened after one
+does, and captures the offer. Where the offer exists, it resumes one
+conversation, shows the message that conversation received, and dismisses
+the rest. A session's start reopens the seeded conversations under new ids,
+which is why the update is recorded inside the session that shows it. The
+offer is made once per update: what was resumed or dismissed is kept with the
+window state until the next `start` restores the seed.
 
 ## A refused shared-view seed
 
