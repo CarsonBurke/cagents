@@ -1329,6 +1329,9 @@ pub(super) struct State {
     capacity_offers: HashSet<CardId>,
     /// Starts refused as nonretryable before a runtime exists.
     blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
+    /// A message to resume a conversation's stopped work, held for a card
+    /// reopening without a chat runtime until its conversation attaches.
+    held_for_start: HashMap<CardId, String>,
     /// What the daemon last said about its update restore, for the panes
     /// that wait on it.
     update_recovery: update_recovery::Watch,
@@ -1370,6 +1373,7 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
+            held_for_start: HashMap::new(),
             update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
@@ -3890,6 +3894,20 @@ impl Runtime {
             count: messages.len(),
             whole,
         });
+    }
+
+    /// Holds `text` for the turn after the running one, as a message written
+    /// in the composer and queued would be.
+    fn hold_followup(&mut self, text: String) {
+        let id = self.next_followup;
+        self.next_followup += 1;
+        self.followups.push(Followup {
+            id,
+            preview: prompt::queue_preview(&text),
+            text,
+            attachments: Vec::new(),
+        });
+        let _ = self.present();
     }
 
     /// Returns every held follow-up to the composer, in the order written.
@@ -11135,10 +11153,71 @@ impl Cagents {
     /// to its draft with the reason. A model the conversation does not list is not
     /// waited for past [`MODEL_PATIENCE`]; the message is sent on the default
     /// instead, and the transcript says so.
+    /// Asks the conversation in `card` to pick up the work an update stopped,
+    /// with `text`. The message is held like a queued follow-up, which the
+    /// reader can see, change or take back, and goes out once the provider
+    /// is ready and idle; a conversation the update stopped or ended is
+    /// started again to take it. `None` when the card cannot take a message.
+    pub(super) fn resume_lost_work(&mut self, card: CardId, text: String) -> Option<Task<Message>> {
+        if self.chat_closed_elsewhere(card) {
+            return None;
+        }
+        let starting = self.chat_start_pending(card);
+        let blocked = self
+            .blocked_failure(card)
+            .is_some_and(|blocked| blocked.reopen.reopens());
+        match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                // Saved history read without a provider takes no messages, and
+                // a draft has no conversation to resume.
+                if runtime.is_draft()
+                    || runtime.snapshot.read_only_reason.is_some() && !runtime.snapshot.exited
+                {
+                    return None;
+                }
+                runtime.hold_followup(text);
+                let target = runtime.target;
+                if starting {
+                    // It goes out once the conversation attaches.
+                    self.persist();
+                    return Some(Task::none());
+                }
+                let reopen = runtime
+                    .start_blocked
+                    .is_some_and(blocked_recovery::Reopen::reopens);
+                let restart = runtime.snapshot.exited || runtime.disconnected;
+                self.persist();
+                Some(if reopen {
+                    self.reopen_stopped(card)
+                } else if restart {
+                    self.handle_chat_ui(Action::Reconnect(target))
+                } else {
+                    self.dispatch_queued(target)
+                })
+            }
+            _ if starting => {
+                self.chat_ui.held_for_start.insert(card, text);
+                Some(Task::none())
+            }
+            _ if blocked => {
+                self.chat_ui.held_for_start.insert(card, text);
+                Some(self.reopen_stopped(card))
+            }
+            _ => None,
+        }
+    }
+
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
+        let held = self.chat_ui.held_for_start.remove(&target.card);
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            if let Some(text) = held {
+                self.chat_ui.held_for_start.insert(target.card, text);
+            }
             return Task::none();
         };
+        if let Some(text) = held {
+            runtime.hold_followup(text);
+        }
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };

@@ -22191,3 +22191,13 @@ fn late_connection_callbacks_cannot_change_a_reconnected_card() {
         "an old account wake must not drain the replacement connection's report queue"
     );
 }
+
+/// What the conversation in `card` is sending, or else holds to send next.
+pub(in crate::app) fn outgoing(app: &Cagents, card: CardId) -> Option<String> {
+    let runtime = chat_runtime(app, card);
+    runtime
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.sent.clone())
+        .or_else(|| (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0))
+}

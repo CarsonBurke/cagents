@@ -873,6 +873,28 @@ impl StateStore {
         Ok(())
     }
 
+    /// What the windows have done with the latest update's offer to resume
+    /// the conversations whose work it stopped, as the UI records it.
+    pub fn load_update_resume(&self) -> Result<Option<String>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        metadata(&inner.connection, "update_resume_v1")
+    }
+
+    pub fn save_update_resume(&self, value: &str) -> Result<()> {
+        if value.is_empty() || value.len() > 64 * 1024 {
+            return Err(invalid_state!("invalid update resume record"));
+        }
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        set_metadata(&transaction, "update_resume_v1", value)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn save_window_view(&self, value: &str) -> Result<()> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;

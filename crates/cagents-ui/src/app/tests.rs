@@ -11344,6 +11344,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         chat_ui: chat_ui::State::default(),
         resume_ui: resume_ui::State::default(),
         update_ui: update_ui::State::default(),
+        update_resume: update_resume::State::default(),
         chrome_ui: chrome_ui::State::default(),
         pull_request_inspector: pull_request_ui::State::default(),
         branch_ui: branch_ui::State::default(),
