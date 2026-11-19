@@ -833,9 +833,10 @@ impl LocalHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .usage
                     .clone();
-                for (run, update) in actor
-                    .execution
-                    .ended(actor.stop.load(Ordering::Acquire), usage)
+                for (run, update) in
+                    actor
+                        .execution
+                        .ended(actor.stop.load(Ordering::Acquire), code, usage)
                 {
                     (actor.notify)(Update::Execution { run, update });
                 }
