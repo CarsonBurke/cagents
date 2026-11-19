@@ -748,6 +748,86 @@ fn a_refused_close_keeps_the_pane_and_says_so() {
     }
 }
 
+/// A Close the registry refuses without reporting the scope, as when its
+/// resend waited too long, says only what happened to the pane: kept while
+/// the observed view still holds it, nothing once it is gone. The
+/// registry's own wording stays in the trace.
+#[test]
+fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
+    use super::super::workspace_model_sync::ModelUpdate;
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for retired in [false, true] {
+        let (mut app, original) = close_fixture(directory.path(), false, false);
+        let (operation, scope, _) = published_close(&mut app, "browser in a channel", &original);
+        if retired {
+            let held = app
+                .workspace_model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
+            held.apply(&Change::Remove { id: original.id }).unwrap();
+            held.revision += 1;
+            drop(app.reconcile_shared_views());
+        }
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+            scope,
+            operation,
+            error: "The pane change waited too long for the daemon to be resent".into(),
+        }));
+        let expected: Vec<String> = if retired {
+            Vec::new()
+        } else {
+            vec![PANE_KEPT.to_owned()]
+        };
+        assert_eq!(notices(&app), expected, "retired={retired}");
+        assert_eq!(
+            app.workspace.order().any(|id| id == original.id),
+            !retired,
+            "retired={retired}"
+        );
+        assert!(
+            !app.shared_views
+                .pending
+                .iter()
+                .any(|(id, ..)| *id == operation),
+            "retired={retired}"
+        );
+    }
+}
+
+/// A terminal whose shell this Close already ended can't be closed again
+/// until #3266, so its kept notice doesn't ask; a terminal still running
+/// keeps the request. Both arrive through the registry's refusal and
+/// through this window's own check of the source it captured.
+#[test]
+fn a_kept_terminal_asks_to_be_closed_again_only_while_its_shell_runs() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for ended in [false, true] {
+        let expected = if ended {
+            ENDED_TERMINAL_KEPT
+        } else {
+            PANE_KEPT
+        };
+        let (mut app, original) = close_fixture(directory.path(), true, false);
+        let (operation, scope, change) =
+            published_close(&mut app, "terminal in a channel", &original);
+        if ended {
+            app.closed_terminal_cards.insert(original.id);
+        }
+        let held = view_holding(&app, &scope);
+        registry_refuses(&mut app, operation, change, held);
+        assert_eq!(notices(&app), [expected.to_owned()], "ended={ended}");
+
+        let (mut app, original) = close_fixture(directory.path(), true, false);
+        if ended {
+            app.closed_terminal_cards.insert(original.id);
+        }
+        app.shared_removal_refused(original.id);
+        assert_eq!(notices(&app), [expected.to_owned()], "ended={ended}");
+    }
+}
+
 /// When the pane changed to a successor in the registry, as another window
 /// navigating it does, the Close is refused and the successor is shown.
 #[test]

@@ -268,7 +268,7 @@ impl Cagents {
                 true
             }
             Err(()) => {
-                self.shared_removal_refused();
+                self.shared_removal_refused(card);
                 false
             }
         }
@@ -290,8 +290,8 @@ impl Cagents {
         })
     }
 
-    fn shared_removal_refused(&mut self) {
-        self.status = Some(TransientNotice::warning(PANE_KEPT));
+    pub(super) fn shared_removal_refused(&mut self, card: CardId) {
+        self.status = Some(TransientNotice::warning(self.pane_kept_notice(card)));
     }
 
     pub(in crate::app) fn prepare_shared_removal(&mut self, card: CardId) -> bool {
@@ -328,7 +328,7 @@ impl Cagents {
                     .is_some_and(|current| views::same_removal_source(before, &current))
         });
         if !valid {
-            self.shared_removal_refused();
+            self.shared_removal_refused(card);
         }
         valid
     }
@@ -353,7 +353,7 @@ impl Cagents {
         if valid {
             *terminal = Some(receipt.basis);
         } else {
-            self.shared_removal_refused();
+            self.shared_removal_refused(card);
         }
         valid
     }
@@ -376,7 +376,7 @@ impl Cagents {
         if valid {
             *terminal = Some(basis);
         } else {
-            self.shared_removal_refused();
+            self.shared_removal_refused(card);
         }
         valid
     }
@@ -524,7 +524,7 @@ impl Cagents {
             || matches!(self.shared_views.removals.get(&card), Some(Some(source))
                 if views::removal_source_retired(&self.workspace_model, &source.scope, &source.change));
         if !ready {
-            self.shared_removal_refused();
+            self.shared_removal_refused(card);
         }
         ready
     }
