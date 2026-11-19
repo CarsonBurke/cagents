@@ -93,8 +93,11 @@ fn probed(label: &str, opened: Opened, observed_at: u64) -> Probed {
             None,
         );
     }
+    // A working sign-in with no limits to report: the account is there to
+    // use, so it is listed, and its chip says it reports no limits. An
+    // `Unavailable` system account is one that isn't set up, and isn't shown.
     let mut snapshot = UsageSnapshot::state(
-        UsageStatus::Unavailable,
+        UsageStatus::Ok,
         format!("{label} does not report usage limits"),
         observed_at,
     );
@@ -318,7 +321,8 @@ mod tests {
             },
             7,
         );
-        assert_eq!(signed_in.snapshot.status, UsageStatus::Unavailable);
+        assert_eq!(signed_in.snapshot.status, UsageStatus::Ok);
+        assert!(signed_in.snapshot.windows.is_empty());
         assert_eq!(
             signed_in.snapshot.plan_display_name.as_deref(),
             Some("Google AI Pro")
