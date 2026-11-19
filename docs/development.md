@@ -359,6 +359,11 @@ How the runner works:
   database, transcripts, application lease, and
   `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it runs beside an installed
   production instance.
+- A development daemon stops by itself once it has had nothing to do for 30
+  minutes: no connected UI or CLI, no terminal (attached or detached), no chat
+  or agent work, no scheduled automation and no terminal holders or cleanup
+  left. `CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS` changes the 30 minutes. A
+  production daemon never stops this way.
 - Browserless and integrated development sessions share that state; do not run
   them at the same time. Use [parallel instances](#parallel-instances) instead.
 
