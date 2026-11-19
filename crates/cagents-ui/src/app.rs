@@ -19,6 +19,7 @@ mod device_ui;
 pub(crate) mod dialog_ui;
 #[cfg(test)]
 mod dispatch_tests;
+mod inspector_activity;
 use crate::file_manager;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
@@ -2705,9 +2706,15 @@ struct WindowView {
     #[serde(default)]
     context_inspector_open: bool,
     /// The panes whose inspectors are open. Absent from a window saved
-    /// before each pane had its own.
+    /// before each pane had its own. Still written, for an older version
+    /// reading this back; this one reads `inspector_choices` when present.
     #[serde(default)]
     open_inspectors: Option<Vec<CardId>>,
+    /// The panes whose inspectors the user opened or closed. Absent from a
+    /// window saved while inspectors were closed until opened, where a
+    /// closed one was not a choice.
+    #[serde(default)]
+    inspector_choices: Option<pane_inspector::Choices>,
     #[serde(default)]
     context_sections: context_sections::Sections,
     sidebar: sidebar::SidebarView,
@@ -2816,6 +2823,7 @@ pub enum SettingsCategory {
     Terminal,
     Editor,
     NativeChat,
+    Inspector,
     Links,
     Keyboard,
     Accounts,
@@ -2823,12 +2831,13 @@ pub enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::General,
         Self::Notifications,
         Self::Appearance,
         Self::Editor,
         Self::NativeChat,
+        Self::Inspector,
         Self::Terminal,
         Self::Links,
         Self::Keyboard,
@@ -2844,6 +2853,7 @@ impl SettingsCategory {
             Self::Terminal => "Terminal",
             Self::Editor => "Editor",
             Self::NativeChat => "Native chat",
+            Self::Inspector => "Inspector",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
             Self::Accounts => "Accounts",
@@ -3433,6 +3443,10 @@ pub enum SettingsField {
     AccountUsageDisplay,
     ShowWorktreeChangesIcons,
     ShowMentionedPullRequests,
+    InspectorOpenByDefault,
+    InspectorShowActivity,
+    InspectorShowWork,
+    InspectorWidth,
     RelaunchAgentsOnUpgrade,
     CheckForUpdates,
     EditorSyntaxTheme,
@@ -3592,6 +3606,10 @@ impl SettingsField {
             Self::AccountUsageDisplay => "Account usage",
             Self::ShowWorktreeChangesIcons => "Worktree changes icons",
             Self::ShowMentionedPullRequests => "Mentioned pull requests",
+            Self::InspectorOpenByDefault => "Open with each pane",
+            Self::InspectorShowActivity => "Activity",
+            Self::InspectorShowWork => "Work",
+            Self::InspectorWidth => "Inspector width",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
             Self::CheckForUpdates => "Automatic checks",
@@ -3630,7 +3648,6 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
-            | Self::ShowMentionedPullRequests
             | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
@@ -3658,6 +3675,11 @@ impl SettingsField {
                 SettingsCategory::NativeChat
             }
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
+            Self::InspectorOpenByDefault
+            | Self::InspectorShowActivity
+            | Self::InspectorShowWork
+            | Self::InspectorWidth
+            | Self::ShowMentionedPullRequests => SettingsCategory::Inspector,
             Self::EditorAutoSave
             | Self::EditorWrapLines
             | Self::EditorSyntaxTheme
@@ -3856,6 +3878,10 @@ struct SettingsDraft {
     account_usage_display: settings::AccountUsageDisplay,
     show_worktree_changes_icons: bool,
     show_mentioned_pull_requests: bool,
+    inspector_open_by_default: bool,
+    inspector_show_activity: bool,
+    inspector_show_work: bool,
+    inspector_width: String,
     relaunch_agents_on_upgrade: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
@@ -3924,6 +3950,10 @@ impl SettingsDraft {
             account_usage_display: settings.account_usage_display,
             show_worktree_changes_icons: settings.show_worktree_changes_icons,
             show_mentioned_pull_requests: settings.show_mentioned_pull_requests,
+            inspector_open_by_default: settings.inspector_open_by_default,
+            inspector_show_activity: settings.inspector_show_activity,
+            inspector_show_work: settings.inspector_show_work,
+            inspector_width: settings.inspector_width.to_string(),
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
@@ -3999,6 +4029,12 @@ impl SettingsDraft {
             SettingsField::ShowMentionedPullRequests => {
                 self.show_mentioned_pull_requests = value == "true"
             }
+            SettingsField::InspectorOpenByDefault => {
+                self.inspector_open_by_default = value == "true"
+            }
+            SettingsField::InspectorShowActivity => self.inspector_show_activity = value == "true",
+            SettingsField::InspectorShowWork => self.inspector_show_work = value == "true",
+            SettingsField::InspectorWidth => self.inspector_width = value,
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
             }
@@ -4259,6 +4295,25 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.show_mentioned_pull_requests = enabled)
             .map_err(|_| "Choose whether mentioned pull requests are listed.".to_owned()),
+        SettingsField::InspectorOpenByDefault => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_open_by_default = enabled)
+            .map_err(|_| "Choose whether inspectors open with each pane.".to_owned()),
+        SettingsField::InspectorShowActivity => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_show_activity = enabled)
+            .map_err(|_| "Choose whether the inspector shows activity.".to_owned()),
+        SettingsField::InspectorShowWork => value
+            .parse::<bool>()
+            .map(|enabled| next.inspector_show_work = enabled)
+            .map_err(|_| "Choose whether the inspector lists work.".to_owned()),
+        SettingsField::InspectorWidth => value
+            .parse::<f32>()
+            .map(|width| {
+                next.inspector_width =
+                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+            })
+            .map_err(|_| "Inspector width must be a number.".to_owned()),
         SettingsField::AutoDeleteMergedWorktrees => value
             .parse::<bool>()
             .map(|enabled| next.auto_delete_merged_worktrees = enabled)
@@ -14565,11 +14620,17 @@ impl Cagents {
     fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
         match action {
             InspectorAction::Resize { width } => {
-                self.settings.inspector_width =
-                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                // Whole pixels, as Settings shows and steps them.
+                self.settings.inspector_width = width
+                    .round()
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
                 Task::none()
             }
-            InspectorAction::ResizeFinished => self.save_settings_task(false),
+            InspectorAction::ResizeFinished => {
+                // Settings, if open, steps from the dragged width.
+                self.settings_draft.inspector_width = self.settings.inspector_width.to_string();
+                self.save_settings_task(false)
+            }
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
                 chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
@@ -15212,6 +15273,7 @@ impl Cagents {
                 .focused()
                 .is_some_and(|card| self.pane_inspectors.is_open(card)),
             open_inspectors: Some(self.saved_open_inspectors()),
+            inspector_choices: Some(self.saved_inspector_choices()),
             context_sections: self.context_sections,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
@@ -15601,6 +15663,13 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.inspector_open_by_default != self.settings.inspector_open_by_default {
+            // Panes whose inspector the user never opened or closed follow
+            // the default; the rest keep what was chosen for them.
+            self.set_inspectors_open_by_default(self.settings.inspector_open_by_default);
+            self.sync_pane_inspectors();
+            tasks.push(self.rebind_source_control());
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
@@ -15902,10 +15971,13 @@ impl Application for Cagents {
             session.save_worktrees(retired);
         }
         let window_view = startup.window_view;
+        let inspector_open_by_default = settings.inspector_open_by_default;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
+            // Whole pixels, as a drag leaves it, so Settings steps from it.
             settings.inspector_width = if view.inspector_width.is_finite() {
                 view.inspector_width
+                    .round()
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
             } else {
                 AppSettings::default().inspector_width
@@ -16149,17 +16221,23 @@ impl Application for Cagents {
             latency_fixture,
             #[cfg(feature = "latency-harness")]
             latency_fixture_started: false,
-            // A window saved before each pane had its own inspector, or none
-            // saved at all, opens the focused pane's as the window's was.
-            pane_inspectors: window_view.as_ref().map_or_else(
-                || pane_inspector::PaneInspectors::restore(None, true),
-                |view| {
-                    pane_inspector::PaneInspectors::restore(
+            // A window saved before each pane had its own inspector opens the
+            // focused pane's as the window's was. Every pane nobody opened or
+            // closed one in, as in a window never saved, follows the default.
+            pane_inspectors: window_view
+                .as_ref()
+                .map_or_else(pane_inspector::PaneInspectors::default, |view| match &view
+                    .inspector_choices
+                {
+                    Some(choices) => {
+                        pane_inspector::PaneInspectors::restore_choices(choices.clone())
+                    }
+                    None => pane_inspector::PaneInspectors::restore(
                         view.open_inspectors.clone(),
                         view.context_inspector_open,
-                    )
-                },
-            ),
+                    ),
+                })
+                .with_default(inspector_open_by_default),
             context_sections: window_view
                 .as_ref()
                 .map_or_else(context_sections::Sections::default, |view| {

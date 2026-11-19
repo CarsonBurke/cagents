@@ -902,6 +902,18 @@ const fn default_show_worktree_changes_icons() -> bool {
     true
 }
 
+const fn default_inspector_open_by_default() -> bool {
+    true
+}
+
+const fn default_inspector_show_activity() -> bool {
+    true
+}
+
+const fn default_inspector_show_work() -> bool {
+    true
+}
+
 const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
@@ -1214,6 +1226,18 @@ pub struct AppSettings {
     /// little about what the channel did.
     #[serde(default)]
     pub show_mentioned_pull_requests: bool,
+    /// Whether a pane's inspector opens with it, unless the user closed
+    /// that pane's. On: the inspector shows what the agent does and where.
+    #[serde(default = "default_inspector_open_by_default")]
+    pub inspector_open_by_default: bool,
+    /// Whether a chat or terminal inspector leads with what its agent is
+    /// doing and where.
+    #[serde(default = "default_inspector_show_activity")]
+    pub inspector_show_activity: bool,
+    /// Whether a chat's inspector lists the pull requests and worktrees its
+    /// conversation worked on.
+    #[serde(default = "default_inspector_show_work")]
+    pub inspector_show_work: bool,
     /// Whether a daemon upgrade relaunches an agent whose conversation cannot
     /// be resumed exactly - into its provider's resume picker, or a fresh
     /// conversation when it had none yet - rather than refusing to upgrade
@@ -1333,6 +1357,9 @@ impl Default for AppSettings {
             usage_preview_rows: HashMap::new(),
             show_worktree_changes_icons: default_show_worktree_changes_icons(),
             show_mentioned_pull_requests: false,
+            inspector_open_by_default: default_inspector_open_by_default(),
+            inspector_show_activity: default_inspector_show_activity(),
+            inspector_show_work: default_inspector_show_work(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
