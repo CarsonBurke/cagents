@@ -2083,15 +2083,14 @@ impl Cagents {
                 panes,
             },
         );
-        let close = cosmic::task::future(async move {
+        cosmic::task::future(async move {
             let result =
                 tokio::task::spawn_blocking(move || close_sessions_retiring_agents(sessions))
                     .await
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
             Message::ChannelUi(Action::SessionsClosed(id, operation, result))
-        });
-        close
+        })
     }
 
     fn channel_close_targets_current(&self, id: ChannelId, attempt: &ChannelCloseAttempt) -> bool {
