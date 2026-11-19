@@ -401,6 +401,152 @@ fn observe(
     Ok(())
 }
 
+/// Delivers this window's presence, preferences and acknowledgements each
+/// time `wake` says some are pending, until the window goes.
+///
+/// One connection is kept between wakes. Presence is republished on every
+/// workspace change and focus move, so connecting and handshaking for each
+/// would put a round trip through the daemon's accept path behind every
+/// pane switch. The kept connection is used only while it is quiet: a daemon
+/// that exits tells it so and one that crashes closes it, so a quiet one
+/// never reaches a replaced daemon.
+fn deliver_control(
+    wake: &crossbeam_channel::Receiver<()>,
+    pending: &Mutex<Pending>,
+    sender: &async_channel::Sender<Action>,
+    mut connect: impl FnMut() -> Result<ControlClient, String>,
+) {
+    let mut kept: Option<ControlClient> = None;
+    'control: while wake.recv().is_ok() {
+        let mut last_error = None;
+        loop {
+            if sender.is_closed() {
+                break 'control;
+            }
+            let requests = std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
+            let result = match kept.take().filter(ControlClient::is_quiet) {
+                Some(mut client) => match deliver(&mut client, &requests) {
+                    Ok(()) => Ok(client),
+                    // The daemon can go between the quiet check and the
+                    // request. Every command is idempotent, so they are sent
+                    // again on a new connection before anything is reported.
+                    Err(Undelivered {
+                        connection: Connection::Lost,
+                        ..
+                    }) => {
+                        tracing::debug!("kept notification connection lost; reconnecting");
+                        deliver_connected(&mut connect, &requests)
+                    }
+                    Err(undelivered) => Err((undelivered, Some(client))),
+                },
+                None => deliver_connected(&mut connect, &requests),
+            };
+            let undelivered = match result {
+                Ok(client) => {
+                    kept = Some(client);
+                    break;
+                }
+                Err((undelivered, client)) => {
+                    kept = client.filter(|_| undelivered.connection == Connection::Answered);
+                    undelivered
+                }
+            };
+            // Retain the commands across a daemon restart, but let a newer
+            // focus/settings update win.
+            let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
+            newer.presence = newer.presence.take().or(requests.presence);
+            newer.preferences = newer.preferences.or(requests.preferences);
+            newer.acknowledged.extend(requests.acknowledged);
+            drop(newer);
+            if let Some(error) = undelivered.notice
+                && last_error.as_ref() != Some(&error)
+            {
+                last_error = Some(error.clone());
+                let _ = sender.send_blocking(Action::Failed(error));
+            }
+            if let Err(crossbeam_channel::RecvTimeoutError::Disconnected) =
+                wake.recv_timeout(crate::daemon_health::retry_delay())
+            {
+                break 'control;
+            }
+        }
+    }
+}
+
+/// Commands the daemon did not take, and what that says of the connection
+/// they were sent on.
+struct Undelivered {
+    /// What the window reports, unless sending them again settles it.
+    notice: Option<String>,
+    connection: Connection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    /// The daemon answered on it, so it can be kept.
+    Answered,
+    /// A request or its answer ran out of time. A late answer can't be
+    /// read in order, and a write cut short may have left part of a frame
+    /// on the stream, so it is not kept, but nothing shows the daemon gone.
+    Unanswered,
+    /// It failed as a connection does: the daemon may be gone or replaced.
+    Lost,
+}
+
+impl Undelivered {
+    fn of(error: &crate::control::ControlError, notice: Option<String>) -> Self {
+        use crate::control::ControlError;
+        let connection = match error {
+            ControlError::Remote { .. } => Connection::Answered,
+            // A reply, or a write the daemon is not reading, that ran out
+            // of time.
+            error if crate::control::is_timeout_error(error) => Connection::Unanswered,
+            _ => Connection::Lost,
+        };
+        Self { notice, connection }
+    }
+}
+
+/// [`deliver`] over a new connection, which is returned to be kept. A failed
+/// delivery returns the connection where it can still be kept.
+fn deliver_connected(
+    connect: &mut impl FnMut() -> Result<ControlClient, String>,
+    requests: &Pending,
+) -> Result<ControlClient, (Undelivered, Option<ControlClient>)> {
+    let mut client = connect().map_err(|error| {
+        let undelivered = Undelivered {
+            notice: Some(error),
+            connection: Connection::Lost,
+        };
+        (undelivered, None)
+    })?;
+    match deliver(&mut client, requests) {
+        Ok(()) => Ok(client),
+        Err(undelivered) => Err((undelivered, Some(client))),
+    }
+}
+
+/// Sends `requests` over `client`. A refusal that settles on its own when
+/// sent again fails without a notice.
+fn deliver(client: &mut ControlClient, requests: &Pending) -> Result<(), Undelivered> {
+    if let Some(presence) = requests.presence.clone() {
+        client
+            .notification_presence(presence)
+            .map_err(|error| Undelivered::of(&error, presence_refusal_notice(&error)))?;
+    }
+    if requests.preferences.is_some() {
+        client
+            .notification_preferences(requests.preferences)
+            .map_err(|error| Undelivered::of(&error, Some(error.to_string())))?;
+    }
+    for id in &requests.acknowledged {
+        client
+            .acknowledge_notification(*id)
+            .map_err(|error| Undelivered::of(&error, Some(error.to_string())))?;
+    }
+    Ok(())
+}
+
 impl Cagents {
     pub(super) fn start_notifications(&mut self) {
         self.sync_notification_presence();
@@ -426,60 +572,7 @@ impl Cagents {
         let pending = self.notification_ui.pending.clone();
         let _ = thread::Builder::new()
             .name("cagents-notification-control".into())
-            .spawn(move || {
-                'control: while receiver.recv().is_ok() {
-                    let mut last_error = None;
-                    loop {
-                        if sender.is_closed() {
-                            break 'control;
-                        }
-                        let requests =
-                            std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
-                        let result = (|| {
-                            let mut client = connect().map_err(Some)?;
-                            if let Some(presence) = requests.presence.clone() {
-                                client
-                                    .notification_presence(presence)
-                                    .map_err(|error| presence_refusal_notice(&error))?;
-                            }
-                            if requests.preferences.is_some() {
-                                client
-                                    .notification_preferences(requests.preferences)
-                                    .map_err(|error| Some(error.to_string()))?;
-                            }
-                            for id in &requests.acknowledged {
-                                client
-                                    .acknowledge_notification(*id)
-                                    .map_err(|error| Some(error.to_string()))?;
-                            }
-                            Ok::<_, Option<String>>(())
-                        })();
-                        if let Err(error) = result {
-                            // Every command is idempotent. Retain it across a daemon
-                            // restart, but let a newer focus/settings update win.
-                            let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
-                            newer.presence = newer.presence.take().or(requests.presence);
-                            newer.preferences = newer.preferences.or(requests.preferences);
-                            newer.acknowledged.extend(requests.acknowledged);
-                            drop(newer);
-                            if let Some(error) = error
-                                && last_error.as_ref() != Some(&error)
-                            {
-                                last_error = Some(error.clone());
-                                let _ = sender.send_blocking(Action::Failed(error));
-                            }
-                            match receiver.recv_timeout(crate::daemon_health::retry_delay()) {
-                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                    break 'control;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            });
+            .spawn(move || deliver_control(&receiver, &pending, &sender, connect));
         self.notification_ui
             .preferences(self.settings.notifications);
     }
@@ -1474,6 +1567,7 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     mod authority;
+    mod control_connection;
 
     use super::*;
     use crate::agent::Provider;
