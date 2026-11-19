@@ -2937,7 +2937,9 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
         ControlError::Frame(error)
     }
 }
-pub(crate) fn is_timeout_error(error: &ControlError) -> bool {
+/// Whether `error` is a read or write that ran out of time, rather than a
+/// connection the daemon ended or a reply it gave.
+pub fn is_timeout_error(error: &ControlError) -> bool {
     matches!(error, ControlError::ReplyTimeout { .. })
         || matches!(
             error,

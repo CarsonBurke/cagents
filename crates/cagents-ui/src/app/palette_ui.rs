@@ -433,9 +433,9 @@ impl Cagents {
                 let navigation = if self.workspace.order().any(|candidate| candidate == id) {
                     Task::none()
                 } else if let Some(channel) = channel {
-                    self.select_channel(channel)
+                    self.navigate_to_channel(channel)
                 } else if let Some(path) = path {
-                    let (selected, task) = self.select_worktree_checked(path, false);
+                    let (selected, task) = self.navigate_to_worktree_checked(path, false);
                     if !selected {
                         return task;
                     }

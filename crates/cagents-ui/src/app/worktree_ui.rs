@@ -1129,8 +1129,18 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        self.navigate_to_worktree_checked(path, create_if_empty).1
+    }
+
+    /// The navigation counterpart of [`Self::select_worktree_checked`], keeping
+    /// its success witness so callers focus a pane only after scope selection
+    /// succeeds.
+    pub(super) fn navigate_to_worktree_checked(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> (bool, Task<Message>) {
         self.show_worktree(path, create_if_empty, DurableChange::Navigation)
-            .1
     }
 
     fn show_worktree(
