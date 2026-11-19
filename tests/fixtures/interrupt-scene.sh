@@ -40,7 +40,7 @@ config=$fixture/home/.claude
 
 log() { printf '== %s %s\n' "$(date +%T)" "$*"; }
 shot() {
-    "$ne" drive move 1,1 >/dev/null 2>&1
+    "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
     "$ne" shot "$1" >/dev/null && log "shot $1" || log "shot failed: $1"
 }
@@ -71,7 +71,7 @@ converse() {
         --repository "$fixture/project" --prompt "$1" >/dev/null || log "spawn failed: $1"
     for _ in $(seq 20); do
         sleep 3
-        "$ne" drive move 1,1 >/dev/null 2>&1
+        "$ne" drive hover 1,1 >/dev/null 2>&1
         row=$(place "New channel|${1:0:12}" "$("$ne" drive observe 2>/dev/null)")
         [ -n "$row" ] || continue
         "$ne" drive click "$row" >/dev/null 2>&1
@@ -133,7 +133,7 @@ say 'Have a reviewer look over this change.' 'myself instead|handles the|reviewe
 # the call in full; it is put back before the next turn.
 refused=$(place "Couldn" "$("$ne" drive observe 2>/dev/null)")
 if [ -n "$refused" ]; then
-    "$ne" drive move "$refused" >/dev/null 2>&1 || log "hover failed"
+    "$ne" drive hover "$refused" >/dev/null 2>&1 || log "hover failed"
     sleep 3
     "$ne" shot failed-call-hover >/dev/null && log "shot failed-call-hover"
     "$ne" drive click "$refused" >/dev/null 2>&1 || log "opening the row failed"
