@@ -123,3 +123,51 @@ and exact terminal/chat sessions. Creating, moving or closing a pane updates the
 other clients live. Focus, scrolling and unsent drafts belong to each window.
 When another client removes a pane with local unsaved work, that work stays
 available here until it is saved or discarded.
+
+## Agents on a device
+
+An agent running in cagents on this computer can start and drive agents on a
+saved device, once you allow it. Link the device and allow agents from a system
+terminal outside cagents:
+
+```console
+cagents device link build-host --allow-agents
+```
+
+Then a session on this computer uses the device as you would:
+
+```console
+cagents --device build-host agent spawn --provider codex --project /home/user/projects/example 'Run the tests'
+cagents --device build-host agent wait AGENT
+cagents --device build-host agent send AGENT 'Fix the failure too'
+cagents --device build-host agent close AGENT
+```
+
+On the device, the session has a session's scope: it may start, message, wait
+for and close its own agents and terminals there, read listings, and message
+other sessions. It may not change accounts, the daemon, installations or device
+links, and, as on this computer, it may only use a project already open on the
+device. Its agents there are its children: they belong to the session that
+started them, not to the device's own sessions.
+
+| Command | What it does |
+| --- | --- |
+| `cagents device list` | Saved devices, whether each is linked, and whether agents here may use it. |
+| `cagents device link NAME [--allow-agents]` | Links a saved device. Linking again replaces the earlier link. |
+| `cagents device allow-agents NAME` | Lets sessions on this computer use a linked device. |
+| `cagents device deny-agents NAME` | Stops them. Agents they already started there keep running. |
+| `cagents device unlink NAME` | Forgets the link here and on the device. |
+
+Only a person may link, allow, deny or unlink: these commands refuse a cagents
+session, so an agent can never grant itself a device. A session that tries a
+device it may not use is told so, with the command a person can run, rather
+than a connection error.
+
+Linking stores a random key in `device-trust.json`, readable only by you, in
+each daemon's data directory. A session's own capability never leaves this
+computer, and SSH never carries it. For each connection, the device asks for a
+fresh challenge to be signed; this computer's daemon signs it only for a live
+session and only while agents are allowed, and the device then issues a
+capability that ends with that connection. Denying agents takes effect at the
+next connection. Unlinking deletes the key here at once, so the link can no
+longer be used even when the device cannot be reached to forget it.
