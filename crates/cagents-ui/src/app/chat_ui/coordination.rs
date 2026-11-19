@@ -820,6 +820,9 @@ struct Row {
     shown: String,
     /// The start of what was said, or the started agent's type.
     preview: String,
+    /// The preview is one term, the agent's type, which the row shows whole
+    /// or leaves out: the agent's name and how it stands come first.
+    term: bool,
     /// The whole of it, for the tooltip.
     full: String,
     state: RowStatus,
@@ -872,7 +875,7 @@ impl Row {
         }
         let name = [
             format!("{} {}", self.verb, self.label),
-            self.state.text.to_owned(),
+            self.state.text.to_string(),
             self.state.detail.clone().unwrap_or_default(),
             if matches!(&self.open, Some(Action::OpenAgent(_))) {
                 format!("Open {}", self.label)
@@ -912,7 +915,7 @@ fn live_dot() -> Element<'static, Message> {
 /// A row's trailing status: a word or two, with the whole account of it in
 /// the tooltip.
 struct RowStatus {
-    text: &'static str,
+    text: Cow<'static, str>,
     tone: Tone,
     /// Still under way, which a still dot beside its caption marks.
     live: bool,
@@ -920,24 +923,24 @@ struct RowStatus {
 }
 
 impl RowStatus {
-    fn with(text: &'static str, tone: Tone, live: bool) -> Self {
+    fn with(text: impl Into<Cow<'static, str>>, tone: Tone, live: bool) -> Self {
         Self {
-            text,
+            text: text.into(),
             tone,
             live,
             detail: None,
         }
     }
-    fn plain(text: &'static str) -> Self {
+    fn plain(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Plain, false)
     }
-    fn live(text: &'static str) -> Self {
+    fn live(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Plain, true)
     }
-    fn warning(text: &'static str) -> Self {
+    fn warning(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Warning, false)
     }
-    fn error(text: &'static str) -> Self {
+    fn error(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Error, false)
     }
 }
@@ -1011,12 +1014,12 @@ enum Tone {
 }
 
 /// A tracked task's state is independent of the tool that launched it.
-#[derive(Clone, Copy)]
 enum BackgroundState {
     Working,
     Waiting,
     /// Alive, with its result so far delivered: nothing is asked of anyone.
-    OnBackgroundWork,
+    /// It names what it waits on where that is known.
+    OnBackgroundWork(Option<String>),
     Failed,
     Stopped,
     Ended,
@@ -1024,16 +1027,17 @@ enum BackgroundState {
 }
 
 impl BackgroundState {
-    fn caption(self) -> &'static str {
-        match self {
+    fn caption(self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
             Self::Working => "Working",
             Self::Waiting => "Waiting",
-            Self::OnBackgroundWork => "Waiting on background work",
+            Self::OnBackgroundWork(Some(work)) => return Cow::Owned(format!("Waiting on {work}")),
+            Self::OnBackgroundWork(None) => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
             Self::Ended => "Ended",
             Self::Finished => "Finished",
-        }
+        })
     }
 
     /// The row's status for this state: a live caption while the agent works,
@@ -1224,6 +1228,7 @@ impl Runtime {
             label: recipient_whole.plain(),
             shown,
             preview,
+            term: false,
             full: full.join("\n\n").trim().to_owned(),
             state,
             several: open.is_none() && listed.len() > 1,
@@ -1283,11 +1288,15 @@ impl Runtime {
                 |title| format!("in channel “{title}”"),
             )
         });
+        let mut term = false;
         let mut preview = if let Some((_, task)) = &cli_label {
             task.clone().unwrap_or_default()
         } else {
             match spawn.agents.as_slice() {
-                [agent] if agent.kind.trim() != label => agent.kind.trim().to_owned(),
+                [agent] if agent.kind.trim() != label => {
+                    term = true;
+                    agent.kind.trim().to_owned()
+                }
                 [_] => String::new(),
                 agents => agents
                     .iter()
@@ -1314,6 +1323,7 @@ impl Runtime {
                         .as_deref()
                         == Some(title)
                 });
+            term = false;
             preview = if preview.is_empty() || duplicate_task {
                 destination.clone()
             } else {
@@ -1348,7 +1358,7 @@ impl Runtime {
             Some(state) => {
                 glyph = match state {
                     BackgroundState::Waiting => Icon::AgentWaiting,
-                    BackgroundState::OnBackgroundWork => Icon::AgentBackground,
+                    BackgroundState::OnBackgroundWork(_) => Icon::AgentBackground,
                     _ => Icon::Agent,
                 };
                 state.status()
@@ -1388,6 +1398,7 @@ impl Runtime {
             label,
             shown,
             preview,
+            term,
             full: full.join("\n\n"),
             state,
             several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
@@ -1434,17 +1445,20 @@ impl Runtime {
                 .size(design::TEXT_BODY)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            crate::ui_controls::fade_text(row.preview.clone())
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill)
-                .into(),
+            {
+                let preview = crate::ui_controls::fade_text(row.preview.clone())
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .width(Length::Fill);
+                if row.term { preview.whole() } else { preview }.into()
+            },
         ];
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
         if row.state.live && matches!(row.state.tone, Tone::Plain) {
             line.push(live_dot());
         }
-        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        let status =
+            design::body(row.state.text.clone()).wrapping(iced::widget::text::Wrapping::None);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
@@ -1556,7 +1570,15 @@ impl Runtime {
         } else if any(ToolStatus::Running) {
             Some(BackgroundState::Working)
         } else if any(ToolStatus::Waiting) {
-            Some(BackgroundState::OnBackgroundWork)
+            // One agent's work can be named; several agents' are their own.
+            let mut waiting = agents
+                .iter()
+                .filter(|agent| agent.status == ToolStatus::Waiting);
+            let work = match (waiting.next(), waiting.next()) {
+                (Some(agent), None) => Runtime::background_work(agent),
+                _ => None,
+            };
+            Some(BackgroundState::OnBackgroundWork(work))
         } else if any(ToolStatus::Failed) {
             Some(BackgroundState::Failed)
         } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
@@ -1884,6 +1906,85 @@ mod identity_tests {
         }
     }
 
+    fn running_command(id: &str, command: &str) -> chat::Item {
+        chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: "Run the check".into(),
+                command: command.into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+            started_at: None,
+            at: None,
+        }
+    }
+
+    /// A background agent's row says what it waits on in the words its tab
+    /// uses, and shows its type whole or not at all.
+    #[test]
+    fn a_waiting_agents_row_names_what_it_waits_on_and_its_type_is_a_whole_term() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let reading = claude_step(
+            "Agent",
+            serde_json::json!({
+                "description": "Review restart safety",
+                "subagent_type": "general-purpose",
+                "prompt": "Review restart safety.",
+                "run_in_background": true
+            }),
+            "Async agent launched successfully.",
+        );
+        let Kind::Spawn(spawn) = reading.reading.kind.clone() else {
+            panic!("an Agent call starts an agent");
+        };
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "toolu_step".into(),
+            kind: String::new(),
+            description: "Review restart safety".into(),
+            status: ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: vec![running_command("check", "scripts/restart-check\n--verbose").into()],
+        }];
+        let row =
+            |runtime: &Runtime| runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
+        let started = row(&runtime);
+        assert_eq!(started.shown, "Review restart safety");
+        assert_eq!(started.preview, "general-purpose");
+        assert!(started.term, "the type is drawn whole or left out");
+        assert_eq!(started.state.text, "Waiting on scripts/restart-check");
+        let agent = &runtime.snapshot.subagents[0];
+        assert_eq!(
+            Runtime::native_child_status(agent),
+            started.state.text,
+            "the row and the agent's tab say the same"
+        );
+        // A second command is counted, and work it never showed is unnamed.
+        let snapshot = std::sync::Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents[0]
+            .items
+            .push(running_command("soak", "scripts/soak").into());
+        assert_eq!(
+            row(&runtime).state.text,
+            "Waiting on scripts/restart-check and 1 more"
+        );
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
+            .items
+            .clear();
+        assert_eq!(row(&runtime).state.text, "Waiting on background work");
+        // Settled, it names no work.
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].status = ToolStatus::Succeeded;
+        assert_eq!(row(&runtime).state.text, "Finished");
+    }
+
     fn claude_step(name: &str, input: serde_json::Value, output: &str) -> Coordinated {
         let item = chat::Item {
             id: "toolu_step".into(),
@@ -2108,15 +2209,15 @@ mod identity_tests {
     fn a_message_taken_as_a_run_reads_as_queued_or_delivered_and_an_unknown_end_is_unconfirmed() {
         let word = |arrival| {
             let status = received(arrival);
-            (status.text, status.tone == Tone::Warning)
+            (status.text.into_owned(), status.tone == Tone::Warning)
         };
         for waiting in [Arrival::Queued, Arrival::Behind, Arrival::NoSlot] {
-            assert_eq!(word(waiting), ("Queued", false));
+            assert_eq!(word(waiting), ("Queued".to_owned(), false));
         }
         for given in [Arrival::Started, Arrival::Ended] {
-            assert_eq!(word(given), ("Delivered", false));
+            assert_eq!(word(given), ("Delivered".to_owned(), false));
         }
-        assert_eq!(word(Arrival::Unknown), ("Not confirmed", true));
+        assert_eq!(word(Arrival::Unknown), ("Not confirmed".to_owned(), true));
         assert_eq!(
             received(Arrival::Unknown).detail.as_deref(),
             Some(arrival(Arrival::Unknown))
@@ -2201,6 +2302,7 @@ mod identity_tests {
             label: label.to_owned(),
             shown: shown.to_owned(),
             preview: "The repo is now at /srv".to_owned(),
+            term: false,
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
             state,
             open,

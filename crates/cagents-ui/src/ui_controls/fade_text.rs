@@ -66,6 +66,7 @@ pub struct FadeText<'a> {
     width: Length,
     edge: FadeEdge,
     limit: Option<usize>,
+    whole: bool,
 }
 
 /// The [`design`] text a line is set as, whose size, line box and face it
@@ -90,6 +91,7 @@ pub fn fade_text<'a>(content: impl Into<Cow<'a, str>>) -> FadeText<'a> {
         width: Length::Shrink,
         edge: FadeEdge::End,
         limit: None,
+        whole: false,
     }
 }
 
@@ -160,6 +162,14 @@ impl<'a> FadeText<'a> {
         self.limit = Some(chars);
         self
     }
+
+    /// Draws the text only where it fits whole, and nothing where it would
+    /// fade: for a term such as a type name, whose start alone reads as a
+    /// different word or as text cut off, and which its row can do without.
+    pub fn whole(mut self) -> Self {
+        self.whole = true;
+        self
+    }
 }
 
 impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
@@ -190,6 +200,7 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
             class: Some(text.class),
             edge: text.edge,
             cut,
+            whole: text.whole,
         })
     }
 }
@@ -228,6 +239,8 @@ struct Faded<'a, Message> {
     edge: FadeEdge,
     /// The text was cut to a budget, so it fades even where it fits.
     cut: bool,
+    /// The text is drawn whole or not at all.
+    whole: bool,
 }
 
 /// The line's natural width, measured at layout.
@@ -237,6 +250,26 @@ struct Natural(f32);
 type TextState = cosmic::iced::advanced::widget::text::State<
     <Renderer as cosmic::iced::advanced::text::Renderer>::Paragraph,
 >;
+
+/// How a line is drawn in the room it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drawn {
+    Whole,
+    Faded,
+    Nothing,
+}
+
+impl Drawn {
+    /// For a line `natural` wide in `room`, `cut` to a budget, that may be
+    /// drawn only `whole`.
+    fn of(natural: f32, room: f32, cut: bool, whole: bool) -> Self {
+        match (!cut && natural <= room + 0.5, whole) {
+            (true, _) => Self::Whole,
+            (false, false) => Self::Faded,
+            (false, true) => Self::Nothing,
+        }
+    }
+}
 
 /// The clip of each fading step across `fade`, faintest last, with the share
 /// of the colour's alpha it keeps.
@@ -425,9 +458,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Faded<'_, Message> {
             .and_then(|class| theme.style(class).color)
             .unwrap_or(style.text_color);
         let Natural(natural) = *tree.state.downcast_ref::<Natural>();
+        let drawn = Drawn::of(natural, bounds.width, self.cut, self.whole);
+        if drawn == Drawn::Nothing {
+            return;
+        }
         // Text that fits is drawn as any text is, clipped only to the
         // viewport, so ink above or below its line box is kept.
-        if !self.cut && natural <= bounds.width + 0.5 {
+        if drawn == Drawn::Whole {
             let style = renderer::Style {
                 text_color: color,
                 ..*style
@@ -560,6 +597,16 @@ mod tests {
         let (narrow, width) = measure(fade_text(title).into(), 80.0);
         assert!((narrow - natural).abs() < 0.5, "measured whatever the room");
         assert!(width <= 80.0 && narrow > width + 0.5, "{narrow} in {width}");
+    }
+
+    #[test]
+    fn a_whole_term_is_left_out_rather_than_faded() {
+        assert_eq!(Drawn::of(100.0, 120.0, false, false), Drawn::Whole);
+        assert_eq!(Drawn::of(100.0, 120.0, false, true), Drawn::Whole);
+        assert_eq!(Drawn::of(100.0, 80.0, false, false), Drawn::Faded);
+        assert_eq!(Drawn::of(100.0, 80.0, false, true), Drawn::Nothing);
+        // A line held to a budget always fades, so is never whole.
+        assert_eq!(Drawn::of(100.0, 120.0, true, true), Drawn::Nothing);
     }
 
     #[test]

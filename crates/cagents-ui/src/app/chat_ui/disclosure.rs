@@ -38,8 +38,10 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
     match status {
         Some(chat::ToolStatus::Failed) => Icon::Error,
         Some(chat::ToolStatus::Denied) => Icon::Unavailable,
-        Some(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Icon::Cancel,
+        Some(chat::ToolStatus::Stopped) => Icon::Stop,
         Some(chat::ToolStatus::Waiting) => Icon::AgentBackground,
+        // Work that ended without saying how it went has not failed: it keeps
+        // its own glyph, as finished work does, and its badge says it ended.
         _ => kind,
     }
 }
@@ -238,13 +240,15 @@ mod tests {
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Denied)),
             Icon::Unavailable
         );
+        // Stopping is not failing, and nor is ending unreported, which is
+        // drawn as work that is done.
         assert_eq!(
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Stopped)),
-            Icon::Cancel
+            Icon::Stop
         );
         assert_eq!(
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Ended)),
-            Icon::Cancel
+            Icon::Terminal
         );
         assert_eq!(
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Waiting)),

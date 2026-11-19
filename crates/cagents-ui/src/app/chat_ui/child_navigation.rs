@@ -56,7 +56,9 @@ fn child_icon(child: &chat::Subagent) -> Icon {
         chat::ToolStatus::Running => Icon::AgentWorking,
         chat::ToolStatus::Failed | chat::ToolStatus::Denied => Icon::Warning,
         chat::ToolStatus::Succeeded => Icon::Check,
-        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Icon::Cancel,
+        chat::ToolStatus::Stopped => Icon::Stop,
+        // Done, without a word on how it went: neither a success nor a failure.
+        chat::ToolStatus::Ended => Icon::Agent,
     }
 }
 
@@ -256,7 +258,7 @@ impl Picker {
                             Runtime::native_child_task(child).unwrap_or_default(),
                             &child.id,
                             child.model.as_deref().unwrap_or_default(),
-                            Runtime::native_child_status(child),
+                            &Runtime::native_child_status(child),
                         ]
                         .iter()
                         .any(|part| part.to_lowercase().contains(&query)))
@@ -470,7 +472,7 @@ impl Runtime {
                     format!("{label} · {status}"),
                 )
             } else {
-                (label.into_owned(), status.to_owned())
+                (label.into_owned(), status.into_owned())
             };
             let row = widget::button::custom(
                 widget::row::with_children(vec![
@@ -1071,6 +1073,20 @@ mod tests {
         );
         children[0].description = " \n".into();
         assert_eq!(Runtime::native_child_name(&children[0]), "Subagent");
+    }
+
+    /// Only a failure is drawn as one: a stopped agent shows the stop mark,
+    /// and one that ended without saying how it went shows the plain agent.
+    #[test]
+    fn only_a_failed_child_is_marked_as_failing() {
+        use chat::ToolStatus::*;
+        assert_eq!(child_icon(&child("failed", Failed, false)), Icon::Warning);
+        assert_eq!(child_icon(&child("stopped", Stopped, false)), Icon::Stop);
+        assert_eq!(child_icon(&child("ended", Ended, false)), Icon::Agent);
+        assert_eq!(
+            child_icon(&child("finished", Succeeded, false)),
+            Icon::Check
+        );
     }
 
     #[test]

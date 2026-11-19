@@ -1442,6 +1442,10 @@ struct Place {
     branch: Option<String>,
 }
 
+/// How much of a command an agent waits on its caption names. The caption
+/// shares its row with the agent's name, which comes first.
+const BACKGROUND_WORK_CHARS: usize = 32;
+
 fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
     let (title, outcome) = heading
         .strip_prefix("Background command ")
@@ -1460,6 +1464,17 @@ fn delivery_command_failed(heading: &str) -> bool {
     delivery_command_outcome(heading).is_some_and(|(_, outcome)| outcome.starts_with("failed"))
 }
 
+/// `text` as it reads after other words: a badge continues its row's title.
+fn lowercase_initial(text: Cow<'static, str>) -> Cow<'static, str> {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(initial) if initial.is_uppercase() => {
+            Cow::Owned(initial.to_lowercase().chain(chars).collect())
+        }
+        _ => text,
+    }
+}
+
 fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str, &'a str)> {
     if !from.is_empty()
         || !["Agent ", "Workflow "]
@@ -1475,6 +1490,16 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
                 .strip_suffix(outcome)
                 .map(|title| (title, outcome.trim()))
         })
+}
+
+/// How a delivery's one line reads; see [`Runtime::delivery_outcome`].
+#[derive(Debug, PartialEq)]
+struct DeliveryOutcome<'a> {
+    title: &'a str,
+    outcome: Option<Cow<'a, str>>,
+    failed: bool,
+    glyph: Icon,
+    heading: String,
 }
 
 impl Runtime {
@@ -1513,17 +1538,48 @@ impl Runtime {
         Self::native_child_task(agent) == Some(Self::native_child_name(agent))
     }
 
-    pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
-        match agent.status {
+    /// How `agent` stands now, in the words every row, tab and notice about
+    /// it uses, so that none of them contradicts another.
+    pub(super) fn native_child_status(agent: &chat::Subagent) -> Cow<'static, str> {
+        Cow::Borrowed(match agent.status {
             chat::ToolStatus::Running if agent.waiting => "Waiting",
-            chat::ToolStatus::Waiting => "Waiting on background work",
+            chat::ToolStatus::Waiting => {
+                return match Self::background_work(agent) {
+                    Some(work) => Cow::Owned(format!("Waiting on {work}")),
+                    None => Cow::Borrowed("Waiting on background work"),
+                };
+            }
             chat::ToolStatus::Running => "Working",
             chat::ToolStatus::Succeeded => "Finished",
             chat::ToolStatus::Failed => "Failed",
             chat::ToolStatus::Denied => "Denied",
             chat::ToolStatus::Stopped => "Stopped",
             chat::ToolStatus::Ended => "Ended",
+        })
+    }
+
+    /// What an agent left waiting on its own background work is waiting on,
+    /// where its transcript shows it: the command still running, as its row
+    /// names it, or how many are. Its turn has ended, so any command of its
+    /// own still running is one it left in the background.
+    pub(super) fn background_work(agent: &chat::Subagent) -> Option<String> {
+        if agent.status != chat::ToolStatus::Waiting {
+            return None;
         }
+        let mut running = agent.items.iter().filter_map(|item| match &item.content {
+            content @ ItemContent::Command {
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                ..
+            } => Some(super::turn::step_label(content)),
+            _ => None,
+        });
+        let first = running.next()?;
+        let first = Self::short_description(first.trim(), BACKGROUND_WORK_CHARS);
+        Some(match running.count() {
+            0 => first,
+            more => format!("{first} and {more} more"),
+        })
     }
 
     pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
@@ -1780,7 +1836,7 @@ impl Runtime {
             if agent.status == chat::ToolStatus::Waiting {
                 return Some((
                     Icon::AgentBackground,
-                    Self::native_child_status(agent).to_owned(),
+                    Self::native_child_status(agent).into_owned(),
                 ));
             }
             return (agent.status == chat::ToolStatus::Running).then(|| {
@@ -2048,7 +2104,7 @@ impl Runtime {
             let label = self.finished_label();
             (
                 Some(match label {
-                    "Interrupted" => Icon::Cancel,
+                    "Interrupted" => Icon::Stop,
                     "Finished" => Icon::Check,
                     _ => Icon::Warning,
                 }),
@@ -5190,21 +5246,20 @@ impl Runtime {
         };
         if coordinating {
             for agent in &self.snapshot.subagents {
-                (
-                    &agent.id,
-                    &agent.kind,
-                    &agent.description,
-                    agent.status,
-                    &agent.model,
-                    agent.waiting,
-                )
-                    .hash(&mut hasher);
+                (&agent.id, &agent.kind, &agent.description, &agent.model).hash(&mut hasher);
+                Self::hash_agent_state(agent, &mut hasher);
             }
             // The client replaces its map whenever it learns an address, and a
             // new handle brings its own.
             std::sync::Arc::as_ptr(&self.agent_addresses).hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    /// What a row saying how `agent` stands draws from it.
+    fn hash_agent_state(agent: &chat::Subagent, hasher: &mut std::hash::DefaultHasher) {
+        use std::hash::Hash;
+        (agent.status, agent.waiting, Self::background_work(agent)).hash(hasher);
     }
 
     /// What one item of an exchange, drawn from `cached`, contributes to its
@@ -5280,6 +5335,15 @@ impl Runtime {
         // preview that finished decoding redraws the row showing it.
         if cached.is_some_and(CachedItem::shows_figures) {
             self.figures.version().hash(hasher);
+        }
+        // An agent's report says how the agent stands now.
+        if let ItemContent::Delivery { sender, .. } = &item.content
+            && !sender.is_empty()
+        {
+            if let Some(agent) = self.subagent(sender) {
+                Self::hash_agent_state(agent, hasher);
+            }
+            std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
         }
         // A coordinating step names agents by what this conversation calls
         // them, links their transcripts while it lists them, tells how those
@@ -5963,6 +6027,73 @@ impl Runtime {
         .into()
     }
 
+    /// How a delivery's one line reads: its title, the outcome its badge
+    /// gives, whether that is a failure, its glyph and the whole heading for
+    /// its tooltip and accessible name. `first` is the heading's first line.
+    ///
+    /// Only explicit command and report outcomes are errors; a peer's prose
+    /// mentioning a failure is ordinary delivered content. A report from an
+    /// agent this conversation lists says how the agent stands now, as its
+    /// row and tab do, so that a report it sent before it went on waiting for
+    /// its own work, or that a later run settled otherwise, contradicts
+    /// neither.
+    fn delivery_outcome<'a>(
+        &self,
+        kind: chat::DeliveryKind,
+        monitor: bool,
+        from: &str,
+        sender: &str,
+        first: &'a str,
+        heading: &str,
+    ) -> DeliveryOutcome<'a> {
+        let notice = kind == chat::DeliveryKind::Notice && !monitor;
+        let command = notice.then(|| delivery_command_outcome(first)).flatten();
+        let report = command
+            .is_none()
+            .then(|| delivery_report_outcome(from, first))
+            .flatten();
+        let agent = report
+            .and_then(|_| (!sender.is_empty()).then(|| self.subagent(sender)))
+            .flatten();
+        let failed = match agent {
+            Some(agent) => agent.status == chat::ToolStatus::Failed,
+            None => {
+                (notice && delivery_command_failed(heading))
+                    || report.is_some_and(|(_, outcome)| outcome == "failed")
+            }
+        };
+        let glyph = if failed {
+            Icon::Error
+        } else if notice && delivery_command_outcome(heading).is_some() {
+            Icon::Terminal
+        } else if kind == chat::DeliveryKind::Notice {
+            Icon::Attention
+        } else {
+            Icon::Chat
+        };
+        let (title, outcome) = match (command, report, agent) {
+            (Some((title, outcome)), ..) => (title, Some(Cow::Borrowed(outcome))),
+            (None, Some((title, _)), Some(agent)) => (
+                title,
+                Some(lowercase_initial(Self::native_child_status(agent))),
+            ),
+            (None, Some((title, outcome)), None) => (title, Some(Cow::Borrowed(outcome))),
+            (None, None, _) => (first, None),
+        };
+        // Its tooltip and accessible name say it in the same words.
+        let heading = match (agent, &outcome) {
+            (Some(_), Some(outcome)) => format!("{title} {outcome}{}", &heading[first.len()..]),
+            _ => heading.to_owned(),
+        };
+        DeliveryOutcome {
+            title,
+            outcome,
+            failed,
+            glyph,
+            heading,
+        }
+    }
+
     /// A delivery stays at the point where it prompted the next reply. The
     /// one-line disclosure names its source or outcome; literal notice output
     /// and full reports are available on demand.
@@ -6019,32 +6150,13 @@ impl Runtime {
             || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
             |notice| notice.body.full.len() != 0,
         );
-        // Only explicit command/report outcomes are errors. A peer's prose
-        // mentioning a failure is ordinary delivered content.
-        let report_outcome = (*kind == chat::DeliveryKind::Report)
-            .then(|| delivery_report_outcome(from, first))
-            .flatten();
-        let failed =
-            (*kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading))
-                || report_outcome.is_some_and(|(_, outcome)| outcome == "failed");
-        let glyph = if failed {
-            Icon::Error
-        } else if *kind == chat::DeliveryKind::Notice
-            && !monitor
-            && delivery_command_outcome(&heading).is_some()
-        {
-            Icon::Terminal
-        } else if *kind == chat::DeliveryKind::Notice {
-            Icon::Attention
-        } else {
-            Icon::Chat
-        };
-        let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
-            delivery_command_outcome(first)
-                .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
-        } else {
-            report_outcome.map_or((first, None), |(title, outcome)| (title, Some(outcome)))
-        };
+        let DeliveryOutcome {
+            title,
+            outcome,
+            failed,
+            glyph,
+            heading,
+        } = self.delivery_outcome(*kind, monitor, from, sender, first, &heading);
         // Bound synchronous text shaping. The original remains in the tooltip,
         // copy action and expanded detail; fades never introduce an ellipsis.
         let short: String = title.chars().take(1024).collect();
@@ -6061,7 +6173,7 @@ impl Runtime {
             },
             glyph,
             failed.then_some(chat::ToolStatus::Failed),
-            outcome.map(str::to_owned),
+            outcome.map(Cow::into_owned),
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );

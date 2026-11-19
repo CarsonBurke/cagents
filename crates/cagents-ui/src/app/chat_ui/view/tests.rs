@@ -7689,6 +7689,94 @@ fn report_outcomes_require_a_canonical_task_heading() {
     }
 }
 
+/// An agent's report or notice says how the agent stands now, as its row and
+/// tab do, so that one saying it finished never sits beside a row saying it
+/// still waits; and only a failed agent's is marked as an error.
+#[test]
+fn an_agents_report_says_how_the_agent_stands_now() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let mut agent = native_child_fixture();
+    agent.id = "toolu_review".into();
+    agent.status = chat::ToolStatus::Waiting;
+    agent.items = vec![
+        chat::Item {
+            id: "check".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: "Run the restart check".into(),
+                command: "scripts/restart-check".into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+            started_at: None,
+            at: None,
+        }
+        .into(),
+    ];
+    Arc::make_mut(&mut runtime.snapshot).subagents = vec![agent];
+    // The notice names the agent by the task ID its provider gave it.
+    runtime.agent_addresses = Arc::new([("a-review".to_owned(), "toolu_review".to_owned())].into());
+    let heading = "Agent \"Review restart safety\" finished\nThe check is still running.";
+    let first = heading.lines().next().unwrap();
+    let read = |runtime: &Runtime, kind, sender: &str| {
+        runtime.delivery_outcome(kind, false, "", sender, first, heading)
+    };
+    for kind in [chat::DeliveryKind::Notice, chat::DeliveryKind::Report] {
+        let waiting = read(&runtime, kind, "a-review");
+        assert_eq!(waiting.title, "Agent \"Review restart safety\"");
+        assert_eq!(
+            waiting.outcome.as_deref(),
+            Some("waiting on scripts/restart-check")
+        );
+        assert!(!waiting.failed);
+        assert_eq!(
+            waiting.heading,
+            "Agent \"Review restart safety\" waiting on scripts/restart-check\nThe check is still running."
+        );
+    }
+    let set = |runtime: &mut Runtime, status| {
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status = status;
+    };
+    set(&mut runtime, chat::ToolStatus::Failed);
+    let failed = read(&runtime, chat::DeliveryKind::Report, "a-review");
+    assert_eq!(failed.outcome.as_deref(), Some("failed"));
+    assert!(failed.failed);
+    assert_eq!(failed.glyph, Icon::Error);
+    // Run again and finished, its earlier failure no longer reads as its state.
+    set(&mut runtime, chat::ToolStatus::Succeeded);
+    let finished = read(&runtime, chat::DeliveryKind::Report, "a-review");
+    assert_eq!(finished.outcome.as_deref(), Some("finished"));
+    assert!(!finished.failed);
+    assert_eq!(finished.glyph, Icon::Chat);
+    set(&mut runtime, chat::ToolStatus::Stopped);
+    assert_eq!(
+        read(&runtime, chat::DeliveryKind::Notice, "a-review")
+            .outcome
+            .as_deref(),
+        Some("stopped")
+    );
+    // An agent this conversation doesn't list keeps the heading's own word.
+    let unknown = read(&runtime, chat::DeliveryKind::Report, "a-other");
+    assert_eq!(unknown.outcome.as_deref(), Some("finished"));
+    assert_eq!(unknown.heading, heading);
+    // A background command's notice keeps its own outcome.
+    let command = "Run the restart check · failed (exit 1)";
+    let notice = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        "",
+        "brestart",
+        command,
+        command,
+    );
+    assert_eq!(notice.outcome.as_deref(), Some("failed (exit 1)"));
+    assert!(notice.failed);
+}
+
 #[test]
 fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
     use iced::advanced::{layout, widget::Tree};
