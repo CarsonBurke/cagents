@@ -513,6 +513,8 @@ pub(crate) fn create_history_for_start(
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
         crate::agent::Provider::Claude => claude::create_history_for_start(launch),
+        // An ACP agent replays a conversation only to the process serving it,
+        // and keeps no history cagents could read without starting one.
         _ => {
             Err("This provider does not support restoring a local read-only history reader".into())
         }
@@ -541,8 +543,10 @@ pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
             codex::align_resume_identity(&mut launch.recipe.arguments, &id)
         }
         crate::agent::Provider::Omp => Ok(()),
-        // Never created as native chat (see `Provider::has_native_chat`).
-        crate::agent::Provider::Antigravity | crate::agent::Provider::Muse => Ok(()),
+        provider @ (crate::agent::Provider::Antigravity | crate::agent::Provider::Muse) => {
+            acp::align_resume_identity(provider, &mut launch.recipe.arguments, id);
+            Ok(())
+        }
     }
 }
 

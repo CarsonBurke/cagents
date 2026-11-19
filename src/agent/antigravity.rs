@@ -71,6 +71,22 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     resume_picker: false,
     latest_selectors: &["--continue", "-c"],
     native_chat: false,
+    acp: Some(super::Acp {
+        mode_option: "--mode",
+        effort_option: "--effort",
+        // Its own words for them: "Ask before edits and commands", "Approve
+        // file edits in the workspace without asking", "Approve edits and
+        // safe commands; ask before irreversible actions" and "Plan
+        // carefully before executing a task".
+        modes: &[
+            ("default", "default"),
+            ("accept-edits", "acceptEdits"),
+            ("auto", "auto"),
+            ("plan", "plan"),
+        ],
+        // `--mode` takes only the other three.
+        default_mode: "default",
+    }),
     #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]

@@ -6813,3 +6813,38 @@ fn locked_mailbox_requests_are_retryable_without_accepting_or_consuming_mail() {
         );
     }
 }
+
+#[test]
+fn an_acp_agent_s_launch_names_its_mode_in_its_own_words() {
+    use crate::agent::Provider;
+    use crate::agent_execution::{Spec, Surface, Target};
+    let spec = |mode: &str| Spec {
+        provider: Provider::Antigravity,
+        account: None,
+        target: Target {
+            repository: "/work".into(),
+            directory: "/work".into(),
+            placement: None,
+        },
+        surface: Surface::Chat,
+        model: Some("gemini-3.8-flash".into()),
+        permission_mode: Some(mode.into()),
+        reasoning_effort: Some("low".into()),
+    };
+    assert_eq!(
+        launch_options(&spec("acceptEdits")),
+        [
+            "--model",
+            "gemini-3.8-flash",
+            "--mode",
+            "accept-edits",
+            "--effort",
+            "low"
+        ]
+    );
+    // `agy --mode` does not take its default by name.
+    assert_eq!(
+        launch_options(&spec("default")),
+        ["--model", "gemini-3.8-flash", "--effort", "low"]
+    );
+}

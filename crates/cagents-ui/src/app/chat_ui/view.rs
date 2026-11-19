@@ -1347,7 +1347,9 @@ impl Cagents {
                 let offers = if runtime.is_draft() {
                     std::iter::once(current)
                         .chain(MODEL_FAMILIES.into_iter().filter(|provider| {
-                            *provider != current && self.account_ui.offers(*provider)
+                            *provider != current
+                                && provider.has_native_chat()
+                                && self.account_ui.offers(*provider)
                         }))
                         .map(|provider| {
                             let catalog = self.account_ui.catalog(provider);
@@ -1471,7 +1473,14 @@ fn reasoning_elapsed(
 
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
-const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
+/// A provider without native chat is never offered.
+const MODEL_FAMILIES: [Provider; 5] = [
+    Provider::Codex,
+    Provider::Claude,
+    Provider::Antigravity,
+    Provider::Muse,
+    Provider::Omp,
+];
 
 /// One provider's models, as a draft's picker offers them.
 struct Offer<'a> {
