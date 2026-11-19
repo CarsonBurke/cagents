@@ -11253,7 +11253,7 @@ impl Cagents {
             }
             HistoryNavigation::Latest => Task::none(),
             HistoryNavigation::NewerEdge
-                if runtime.parent_scroll().at_bottom() && runtime.snapshot.has_later =>
+                if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
             }
@@ -11261,7 +11261,7 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.parent_scroll().at_top() && runtime.snapshot.has_earlier =>
+                if runtime.parent_scroll().prefetch_earlier() && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
@@ -15424,13 +15424,15 @@ impl Cagents {
                     return Task::none();
                 }
                 runtime.scroll = scroll;
-                let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
-                if at_bottom && !runtime.snapshot.has_later {
+                if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
                 }
-                // Leaving an end is what arms the page at it, so a reader who
-                // scrolls away and comes back asks again, while one who stays
-                // put asks once.
+                // Pages are fetched ahead of the reader, within a couple of
+                // screens of a loaded edge rather than at it.
+                let (at_top, at_bottom) = (scroll.prefetch_earlier(), scroll.prefetch_later());
+                // Leaving that reach is what arms the page at it, so a reader
+                // who scrolls away and comes back asks again, while one who
+                // stays put asks once.
                 if !at_top || direction == Some(view::Page::Newer) {
                     if runtime.deferred_page == Some(HistoryNavigation::EarlierEdge) {
                         runtime.deferred_page = None;

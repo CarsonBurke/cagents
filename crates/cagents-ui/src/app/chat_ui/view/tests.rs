@@ -10122,11 +10122,7 @@ fn an_attachment_is_named_by_something_a_reader_recognises() {
 }
 
 fn scroll(from_top: f32, content: f32, window: f32) -> Scroll {
-    Scroll {
-        from_top,
-        content,
-        window,
-    }
+    Scroll::new(from_top, content, window)
 }
 
 /// History arrives by gesture now, so the two ends of the loaded window
