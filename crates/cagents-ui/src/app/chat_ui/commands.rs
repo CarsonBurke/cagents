@@ -74,6 +74,10 @@ pub(super) struct PendingCommand {
     /// Whether this command waited for a turn a message on its way was to
     /// start, so that it was given for that turn.
     held: bool,
+    /// Whether this is a stop given while the conversation waited for that
+    /// turn to begin, which goes at once: the provider holds it until the
+    /// turn has begun, and it is how the reader gets out of one slow to.
+    at_once: bool,
 }
 
 impl PendingCommand {
@@ -116,6 +120,7 @@ impl PendingCommand {
             ))
             .then(|| command.clone()),
             held: false,
+            at_once: false,
         }
     }
 
@@ -237,6 +242,13 @@ pub(super) struct Outgoing {
     /// Whether the conversation shows it already, though the provider has
     /// yet to answer for it.
     arrived: bool,
+    /// Its place among what the reader wrote, which orders it with the held
+    /// follow-ups when both come back to the composer.
+    pub(super) written: u64,
+    /// Whether the reader stopped the turn it was to start before that turn
+    /// began, so that a turn which never comes gives it back rather than
+    /// letting it go.
+    stopped: bool,
 }
 
 impl Outgoing {
@@ -257,6 +269,8 @@ impl Outgoing {
             generation: 0,
             busy_seen: false,
             arrived: false,
+            written: 0,
+            stopped: false,
         };
         outgoing.leaves_after(snapshot);
         outgoing
@@ -498,10 +512,12 @@ impl Commands {
     /// nothing is ahead of it and it can go, as [`Self::next`] says.
     pub(super) fn push(
         &mut self,
-        pending: PendingCommand,
+        mut pending: PendingCommand,
         command: Command,
         snapshot: &Snapshot,
     ) -> Option<(u64, Command)> {
+        pending.at_once =
+            command == Command::Interrupt && snapshot.busy && self.turn_coming(snapshot);
         self.waiting.push_back((pending, command));
         self.next(snapshot)
     }
@@ -536,7 +552,7 @@ impl Commands {
         let coming = self.turn_coming(snapshot);
         loop {
             let (pending, command) = self.waiting.front_mut()?;
-            if acts_on_turn(command) {
+            if acts_on_turn(command) && !pending.at_once {
                 if coming {
                     pending.held = true;
                     return None;
@@ -564,6 +580,19 @@ impl Commands {
             let id = pending.id;
             self.in_flight = Some(pending);
             return Some((id, command));
+        }
+    }
+
+    /// Marks the messages the provider took whose turn has yet to begin as
+    /// stopped by the reader, as [`Outgoing::stopped`] says.
+    fn stop_before_turn(&mut self, snapshot: &Snapshot) {
+        for settling in &mut self.settling {
+            if let Effect::Outgoing(outgoing) = &mut settling.effect
+                && outgoing.in_transcript()
+                && snapshot.turn_generation == outgoing.turns
+            {
+                outgoing.stopped = true;
+            }
         }
     }
 
@@ -638,8 +667,9 @@ impl Commands {
                 }
                 Effect::Outgoing(mut outgoing) => {
                     let waited = settling.accepted.elapsed() >= TURN_PATIENCE;
-                    if outgoing.settled_by(snapshot, items) || outgoing.quiet_in(snapshot, waited) {
-                    } else if outgoing.failed_in(snapshot, waited) {
+                    let quiet = outgoing.quiet_in(snapshot, waited);
+                    if outgoing.settled_by(snapshot, items) || (quiet && !outgoing.stopped) {
+                    } else if outgoing.failed_in(snapshot, waited) || quiet {
                         settled.failed.push(outgoing);
                     } else {
                         outgoing.busy_seen |= snapshot.busy;
@@ -778,9 +808,10 @@ impl Runtime {
         if !self.snapshot.busy || !self.commands.turn_coming(&self.snapshot) {
             return false;
         }
-        self.restore_followups();
+        let snapshot = self.snapshot.clone();
+        self.commands.stop_before_turn(&snapshot);
         let messages = self.commands.withdraw_messages();
-        self.restore_outgoing(messages);
+        self.take_back_lined_up(messages);
         self.prepare_local_prompt();
         true
     }
@@ -795,36 +826,71 @@ impl Runtime {
         if settled.failed.is_empty() {
             return settled.changed;
         }
-        self.return_followups();
         let mut messages = settled.failed;
         messages.extend(self.commands.withdraw_messages());
-        self.restore_outgoing(messages);
+        self.take_back_lined_up(messages);
         true
+    }
+
+    /// Returns `messages` the provider did not take to the composer with the
+    /// held follow-ups, all in the order they were written, ahead of
+    /// whatever has been written since. Neither goes on without the other:
+    /// sent apart, they would arrive out of order.
+    pub(super) fn take_back_lined_up(&mut self, messages: Vec<Outgoing>) {
+        let followups = std::mem::take(&mut self.followups);
+        let returned = !followups.is_empty();
+        let mut parts: Vec<_> = followups
+            .into_iter()
+            .map(|followup| (followup.id, followup.text, followup.attachments))
+            .chain(messages.into_iter().map(|outgoing| {
+                let text = outgoing.prompt.text().to_owned();
+                (outgoing.written, text, outgoing.prompt.attachments)
+            }))
+            .collect();
+        parts.sort_by_key(|(written, ..)| *written);
+        self.prepend_parts(
+            parts
+                .into_iter()
+                .map(|(_, text, attachments)| (text, attachments)),
+        );
+        if returned {
+            let _ = self.present();
+        }
     }
 
     /// Returns messages the provider did not take to the composer, in the
     /// order they were written, ahead of whatever has been written since.
     pub(super) fn restore_outgoing(&mut self, messages: Vec<Outgoing>) {
-        if messages.is_empty() {
-            return;
-        }
+        self.prepend_parts(messages.into_iter().map(|outgoing| {
+            let text = outgoing.prompt.text().to_owned();
+            (text, outgoing.prompt.attachments)
+        }));
+    }
+
+    /// Puts `parts`, each a message's text and files, in the composer in
+    /// order, ahead of whatever is written there, each file once.
+    fn prepend_parts(&mut self, parts: impl IntoIterator<Item = (String, Vec<Attachment>)>) {
         let mut text = String::new();
         let mut attachments: Vec<Attachment> = Vec::new();
-        for outgoing in messages {
-            let part = outgoing.prompt.text().trim_end();
+        let mut any = false;
+        for (part, files) in parts {
+            any = true;
+            let part = part.trim_end();
             if !part.is_empty() {
                 if !text.is_empty() {
                     text.push('\n');
                 }
                 text.push_str(part);
             }
-            for attachment in &outgoing.prompt.attachments {
-                if !attachments.contains(attachment) {
-                    attachments.push(attachment.clone());
+            for attachment in files {
+                if !attachments.contains(&attachment) {
+                    attachments.push(attachment);
                 }
             }
         }
-        self.prepend_to_draft(&text, attachments);
+        if any {
+            self.prepend_to_draft(&text, attachments);
+        }
     }
 
     /// The model and effort the reader last chose for this conversation,
@@ -1339,16 +1405,11 @@ mod tests {
         }
     }
 
-    /// Stop is offered whenever the conversation works, also while it waits
-    /// for a message's turn to begin, which can be slow or never come.
-    /// Pressed then, it tells the provider to stop and takes back into the
-    /// composer, in order, what was lined up behind that turn: a message not
-    /// yet sent and the held follow-ups, which would otherwise go as a turn
-    /// of their own. The message the provider has stays where it is: the
-    /// turn it begins shows it, stopped, so it is neither written twice nor
-    /// sent again by accident. Nothing reads as refused.
-    #[test]
-    fn stop_before_the_turn_begins_takes_back_what_was_lined_up_behind_it() {
+    /// A conversation working while the provider has a message whose turn
+    /// has yet to begin, with `lined_up` written behind it in order: a
+    /// message to steer that turn, which waits for it, and one to queue,
+    /// held here since the provider keeps no queue.
+    fn waiting_for_its_turn(lined_up: [(&str, PromptMode); 2]) -> (Cagents, CardId, Target) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
@@ -1359,10 +1420,7 @@ mod tests {
         sending(&mut app, card, "Look at the logs");
         settle(&mut app, card, Ok(()));
         publish(&mut app, card, |snapshot| snapshot.busy = true);
-        for (text, mode) in [
-            ("Then fix them", PromptMode::Steer),
-            ("And add a test", PromptMode::Queue),
-        ] {
+        for (text, mode) in lined_up {
             app.chat_runtime_mut(target)
                 .unwrap()
                 .replace_draft(text_editor::Content::with_text(text));
@@ -1372,40 +1430,86 @@ mod tests {
         assert!(!runtime.turn_running(), "no turn to steer yet");
         assert_eq!(runtime.commands.waiting(), 1);
         assert_eq!(runtime.followups.len(), 1, "held for the next turn");
+        (app, card, target)
+    }
 
+    /// Stop is offered whenever the conversation works, also while it waits
+    /// for a message's turn to begin, which can be slow or never come.
+    /// Pressed then, it goes to the provider at once, which holds it until
+    /// the turn has begun, and takes back into the composer what was lined
+    /// up behind that turn, in the order written: a message not yet sent,
+    /// and the held follow-up, which would otherwise go as a turn of its
+    /// own. The message the provider has stays where it is: the turn it
+    /// begins shows it, stopped, so it is neither written twice nor sent
+    /// again by accident. Nothing reads as refused.
+    #[test]
+    fn stop_before_the_turn_begins_takes_back_what_was_lined_up_behind_it() {
+        let steer = ("Then fix them", PromptMode::Steer);
+        let queue = ("And add a test", PromptMode::Queue);
+        for (lined_up, returned) in [
+            ([steer, queue], "Then fix them\nAnd add a test"),
+            ([queue, steer], "And add a test\nThen fix them"),
+        ] {
+            let (mut app, card, target) = waiting_for_its_turn(lined_up);
+            drop(app.update(Message::ChatUi(Action::Interrupt(target))));
+            let runtime = chat_runtime(&app, card);
+            let stop = runtime.commands.in_flight().expect("the provider is told");
+            assert_eq!(stop.repeat, Some(Command::Interrupt));
+            assert_eq!(runtime.commands.waiting(), 0);
+            let shown: Vec<_> = runtime
+                .commands
+                .outgoing()
+                .map(|outgoing| outgoing.prompt.text().to_owned())
+                .collect();
+            assert_eq!(shown, ["Look at the logs"], "the provider has it");
+            assert_eq!(runtime.composer.text().trim_end(), returned);
+            assert!(runtime.followups.is_empty());
+            assert!(runtime.error.is_none());
+
+            // The turn begins and is stopped, showing the message; nothing
+            // lined up behind it goes in its place.
+            settle(&mut app, card, Ok(()));
+            publish(&mut app, card, |snapshot| {
+                snapshot.turn_generation += 1;
+                snapshot.items.push(user_text("u-logs", "Look at the logs"));
+            });
+            publish(&mut app, card, |snapshot| snapshot.busy = false);
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.commands.outgoing().count(), 0);
+            assert!(runtime.commands.is_idle());
+            assert!(runtime.followups.is_empty());
+            assert_eq!(runtime.composer.text().trim_end(), returned);
+        }
+    }
+
+    /// A turn stopped before it began may never begin. The message the
+    /// provider had then shows nowhere, so once its turn has had its time,
+    /// it comes back to the composer ahead of what was written after it.
+    #[test]
+    fn a_message_whose_stopped_turn_never_begins_comes_back() {
+        let (mut app, card, target) = waiting_for_its_turn([
+            ("Then fix them", PromptMode::Steer),
+            ("And add a test", PromptMode::Queue),
+        ]);
         drop(app.update(Message::ChatUi(Action::Interrupt(target))));
-        let runtime = chat_runtime(&app, card);
-        let shown: Vec<_> = runtime
-            .commands
-            .outgoing()
-            .map(|outgoing| outgoing.prompt.text().to_owned())
-            .collect();
-        assert_eq!(shown, ["Look at the logs"], "the provider has it");
-        assert_eq!(
-            runtime.composer.text().trim_end(),
-            "Then fix them\nAnd add a test"
-        );
-        assert!(runtime.followups.is_empty());
-        let stop = runtime.commands.in_flight().expect("the provider is told");
-        assert_eq!(stop.repeat, Some(Command::Interrupt));
-        assert_eq!(runtime.commands.waiting(), 0);
-        assert!(runtime.error.is_none());
-
-        // The turn begins and is stopped, showing the message; nothing
-        // lined up behind it goes in its place.
         settle(&mut app, card, Ok(()));
-        publish(&mut app, card, |snapshot| {
-            snapshot.turn_generation += 1;
-            snapshot.items.push(user_text("u-logs", "Look at the logs"));
-        });
         publish(&mut app, card, |snapshot| snapshot.busy = false);
+        assert_eq!(
+            chat_runtime(&app, card).commands.outgoing().count(),
+            1,
+            "a report may lag"
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .commands
+            .age(TURN_PATIENCE);
+        drop(app.update(Message::ChatUi(Action::CommandsDue(target))));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.commands.outgoing().count(), 0);
         assert!(runtime.commands.is_idle());
-        assert!(runtime.followups.is_empty());
         assert_eq!(
             runtime.composer.text().trim_end(),
-            "Then fix them\nAnd add a test"
+            "Look at the logs\nThen fix them\nAnd add a test"
         );
     }
 

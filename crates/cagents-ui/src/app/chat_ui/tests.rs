@@ -1574,7 +1574,7 @@ fn a_rejected_combined_followup_restores_order_without_consuming_an_inflight_dra
         followup(0, "first", &["first.png"]),
         followup(1, "second", &[]),
     ];
-    runtime.next_followup = 2;
+    runtime.next_written = 2;
     drop(app.dispatch_queued(target));
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.replace_draft(text_editor::Content::with_text("later"));
@@ -1619,7 +1619,7 @@ fn a_followup_written_while_others_are_sent_waits_for_the_next_turn() {
     let target = chat_runtime(&app, card).target;
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.followups = vec![followup(0, "first", &[])];
-    runtime.next_followup = 1;
+    runtime.next_written = 1;
     drop(app.dispatch_queued(target));
     let runtime = app.chat_runtime_mut(target).unwrap();
     assert!(runtime.turn_under_way(), "the held follow-up starts a turn");

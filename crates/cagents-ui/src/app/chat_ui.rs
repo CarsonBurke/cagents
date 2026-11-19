@@ -3066,7 +3066,10 @@ pub(super) struct Runtime {
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
-    next_followup: u64,
+    /// The place of the next thing the reader writes: a held follow-up's ID,
+    /// or a message's, so that what comes back to the composer from both
+    /// comes back in the order written.
+    next_written: u64,
     /// Provider queue entries asked back, until the provider says whether it
     /// let go of each.
     recalling: Vec<Recall>,
@@ -4267,7 +4270,7 @@ impl Runtime {
             agent_addresses: Default::default(),
             queued: None,
             followups: Vec::new(),
-            next_followup: 0,
+            next_written: 0,
             recalling: Vec::new(),
             taken_back: Vec::new(),
             resend: None,
@@ -11444,12 +11447,10 @@ impl Cagents {
                 Command::Prompt { mode, .. } => *mode,
                 _ => PromptMode::Send,
             };
-            pending.outgoing = Some(commands::Outgoing::new(
-                text,
-                attachments,
-                mode,
-                &runtime.snapshot,
-            ));
+            let mut outgoing = commands::Outgoing::new(text, attachments, mode, &runtime.snapshot);
+            outgoing.written = runtime.next_written;
+            runtime.next_written += 1;
+            pending.outgoing = Some(outgoing);
             runtime.prepare_local_prompt();
         }
         runtime.error = None;
@@ -13613,8 +13614,8 @@ impl Cagents {
                         );
                         return Task::none();
                     }
-                    let id = runtime.next_followup;
-                    runtime.next_followup += 1;
+                    let id = runtime.next_written;
+                    runtime.next_written += 1;
                     let text = runtime.composer.text().trim_end().to_owned();
                     let followup = Followup {
                         id,
@@ -14280,17 +14281,16 @@ impl Cagents {
                         // Held follow-ups were written after it too, or are
                         // what it carried.
                         let unsent = pending.take_unsent();
-                        if !pending.followups.is_empty() || unsent.is_some() {
-                            runtime.restore_followups();
-                        }
                         if let Some(id) = &pending.take_back {
                             runtime.recalling.retain(|recall| &recall.message.id != id);
                         }
                         if let Some(outgoing) = unsent {
                             let mut messages = vec![outgoing];
                             messages.extend(runtime.commands.withdraw_messages());
-                            runtime.restore_outgoing(messages);
+                            runtime.take_back_lined_up(messages);
                             runtime.prepare_local_prompt();
+                        } else if !pending.followups.is_empty() {
+                            runtime.restore_followups();
                         }
                         runtime.note(error.clone());
                         runtime.fork_requested = false;

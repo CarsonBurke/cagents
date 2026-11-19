@@ -4052,7 +4052,7 @@ impl Runtime {
             Cow::Borrowed("Cancel active turn (Esc)")
         } else {
             Cow::Borrowed(
-                "Stop the turn about to begin (Esc). Messages not yet sent come back to the composer",
+                "Stop before the turn begins (Esc). Unsent messages return to the composer.",
             )
         };
         let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
