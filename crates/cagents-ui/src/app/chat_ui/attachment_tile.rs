@@ -26,7 +26,7 @@ pub(super) struct Tile<'a, Message> {
     name: String,
     marked: bool,
     on_open: Option<Message>,
-    on_remove: Message,
+    on_remove: Option<Message>,
 }
 
 pub(super) fn tile<'a, Message: Clone + 'a>(
@@ -35,7 +35,7 @@ pub(super) fn tile<'a, Message: Clone + 'a>(
     label: impl Into<Element<'a, Message>>,
     close: impl Into<Element<'a, Message>>,
     name: String,
-    on_remove: Message,
+    on_remove: Option<Message>,
 ) -> Tile<'a, Message> {
     Tile {
         id,
@@ -217,16 +217,23 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
                     shell.request_redraw();
                 }
             }
-            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
-                if state.focused && !modifiers.command() && !modifiers.alt() =>
-            {
-                use keyboard::key::Named;
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if state.focused && !modifiers.command() && !modifiers.alt() => {
+                use keyboard::key::{Code, Named, Physical};
+                // The space bar has no named key here; its physical code is
+                // the reliable signal, and its text the fallback.
+                let space = matches!(physical_key, Physical::Code(Code::Space))
+                    || matches!(key.as_ref(), keyboard::Key::Character(" "));
                 let message = match key.as_ref() {
                     keyboard::Key::Named(Named::Enter) => self.on_open.clone(),
-                    keyboard::Key::Character(" ") => self.on_open.clone(),
                     keyboard::Key::Named(Named::Delete | Named::Backspace) => {
-                        Some(self.on_remove.clone())
+                        self.on_remove.clone()
                     }
+                    _ if space => self.on_open.clone(),
                     _ => return,
                 };
                 if let Some(message) = message {
