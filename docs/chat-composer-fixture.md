@@ -195,8 +195,8 @@ conversation or evidence about the provider's answer prose.
 For subagent tab checks, create `fixture-subagents` before spawning the agent
 (`touch "$fixture_root/home/.claude/fixture-subagents"`). Each turn starts
 five Agent calls before its answer: Scout keeps working in the background,
-Planner waits on a rate limit in the background, Builder fails, and two
-unnamed Explore agents finish. The tabs beside Conversation must read Scout,
+Planner hits a rate limit in the background and says so on its tab, Builder
+fails, and two unnamed Explore agents finish. The tabs beside Conversation must read Scout,
 Planner, Builder, Explore and Explore 2, in that order, each with its state's
 mark; hovering a tab shows its state and task. A selected agent's Stop ends
 just that agent.

@@ -4684,12 +4684,16 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
                 id: parent.into(),
                 kind: String::new(),
                 description: String::new(),
-                // A retryable API error is not proof that the task stopped.
-                // Keep its exact status, but expose that it needs attention.
+                // A retryable API error is not proof that the task stopped, so
+                // its status stays. Nor is it a question for the person: only
+                // a request, or a provider asking for input, waits on them. A
+                // usage limit is the account's, which the conversation reports
+                // as limited until it resets; the error stays the agent's
+                // detail until it shows signs of life or its task settles.
                 status: None,
                 background: None,
                 model: None,
-                waiting: Some(true),
+                waiting: None,
                 detail: Some(message),
             },
             event => event,

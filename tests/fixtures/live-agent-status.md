@@ -36,12 +36,12 @@ row on After; Before still counts unresolved historical launches and the nested
 helper. This does not claim that the earlier failed checks were repaired.
 
 After loading history, no agent has evidence of current work. After the live
-phase, the direct conversation depends on three working agents, one paused
-agent, and one agent waiting on background work. Only **Check installer rollback**
+phase, the direct conversation depends on four running agents, one of them
+paused on a rate limit, and one agent waiting on background work. Only **Check installer rollback**
 is a current failure. Retry's earlier failure is superseded, the killed agent
 is stopped, and the nested helper belongs to Worker 1's task. Planner's recorded
-rate-limit frame tests a general waiting state, not an actual question to the
-reader.
+rate-limit frame is that agent's own state, said on its row; it is not a
+question to the reader, so the conversation does not read as waiting for input.
 
 The history file uses persisted `toolUseResult`; live frames use stream-json
 `tool_use_result`. The synthetic provider's `_live` directives keep forwarded
