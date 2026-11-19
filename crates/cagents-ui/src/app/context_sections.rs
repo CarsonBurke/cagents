@@ -962,9 +962,9 @@ fn empty_text(section: Section, coverage: Option<&TranscriptCoverage>) -> EmptyT
         Some(TranscriptCoverage::Partial) => (
             "Only the latest part of this chat was read",
             if work {
-                "It's long, and no pull requests or worktrees were found in that part."
+                "It's long, and it worked on no pull requests or worktrees in that part."
             } else {
-                "It's long, and no pull requests were mentioned in that part."
+                "It's long, and it named no other pull requests in that part."
             },
             None,
         ),
@@ -1034,6 +1034,14 @@ mod tests {
             let partial = empty_text(section, Some(&TranscriptCoverage::Partial));
             assert_eq!(partial.title, "Only the latest part of this chat was read");
             assert!(partial.detail.contains("in that part"), "{partial:?}");
+            // Each says what its own list holds, so neither contradicts the
+            // other's rows.
+            let holds = if section == Section::Work {
+                "worked on"
+            } else {
+                "named no other"
+            };
+            assert!(partial.detail.contains(holds), "{partial:?}");
             for text in [partial.title, partial.detail] {
                 assert!(
                     !text.contains("No pull requests"),
