@@ -108,6 +108,7 @@ pub(super) fn read(
                         row.account.id(),
                         Entry {
                             identity: Some(row.identity),
+                            inventory_observed_at: Some(row.snapshot.observed_at),
                             snapshot: row.snapshot,
                         },
                     );
@@ -204,6 +205,7 @@ pub(super) fn read(
                     &mut info,
                     Entry {
                         identity,
+                        inventory_observed_at: Some(snapshot.observed_at),
                         snapshot: *snapshot,
                     },
                     crate::chat::now_ms().unwrap_or(now),
