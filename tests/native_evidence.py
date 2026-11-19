@@ -969,6 +969,16 @@ class Evidence(unittest.TestCase):
                 self.assertEqual((self.logs / "ui-trace").read_text(), f"{expected}\n")
                 self.run_tool("stop")
 
+    def test_launch_handshake_reaches_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        for options, expected in (([], False), (["--launch-handshake"], True), ([], False)):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                environment = (self.logs / "ui-env").read_text().splitlines()
+                self.assertEqual("CAGENTS_UI_LAUNCH_HANDSHAKE=1" in environment, expected)
+                self.run_tool("stop")
+
     def test_projection_oracle_reaches_only_the_session_that_asked_for_it(self) -> None:
         self.built()
         for options, expected in (([], False), (["--projection-oracle"], True), ([], False)):

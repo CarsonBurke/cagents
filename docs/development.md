@@ -2165,7 +2165,14 @@ harness, it provides:
   `--projection-oracle` to check every narrowed update projection against the
   full one; such a session repairs what it finds and so behaves like one that
   projects everything, and its log is the evidence. See "Busy terminals and
-  the update tail" in `docs/performance.md`.
+  the update tail" in `docs/performance.md`. Add `--launch-handshake` to
+  start the app as `cagents ui` does, so its startup gate checks the restored
+  panes and shows the startup recovery notice for any that did not reconnect.
+  A saved terminal its fresh daemon confirms is gone settles as a saved pane
+  and is not reported. To show the notice, save a seed with an open chat pane,
+  then write a delay longer than the gate's budget, such as `120`, to
+  `fixture-seed/home/.claude/fixture-slow-start` in the task: the restored
+  chat's provider does not start in time, so the pane is reported by name.
   These flags apply to the requested session and its relaunches; ordinary
   sessions keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.

@@ -56,6 +56,7 @@ both use the same fixture data and selected providers.
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
         [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
         [--projection-oracle] [--wayland-debug] [--restore-existing-only]
+        [--launch-handshake]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -90,6 +91,10 @@ both use the same fixture data and selected providers.
                   --restore-existing-only opens the session's first window as
                   relaunch --restore-existing-only does; later relaunches
                   choose again.
+                  --launch-handshake runs the app as `cagents ui` launches it,
+                  with CAGENTS_UI_LAUNCH_HANDSHAKE=1, so its startup gate checks
+                  every restored pane and shows the notice for any that did not
+                  reconnect; it persists like the traces.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -1109,6 +1114,7 @@ run_app() {
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
     [ "$(cat "$state/projection-oracle" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_PROJECTION_ORACLE=1)
     [ "$(cat "$state/wayland-debug" 2>/dev/null)" != 1 ] || stage_environment+=(WAYLAND_DEBUG=client)
+    [ "$(cat "$state/launch-handshake" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_LAUNCH_HANDSHAKE=1)
     local scoped_ui=
     [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" != 1 ] || scoped_ui=1
     # A recovery window only attaches, so it never starts the daemon it needs.
@@ -1303,7 +1309,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug= restore_existing_only=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug= restore_existing_only= launch_handshake=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1326,6 +1332,7 @@ cmd_start() {
             --projection-oracle) projection_oracle=1; shift ;;
             --wayland-debug) wayland_debug=1; shift ;;
             --restore-existing-only) restore_existing_only=1; shift ;;
+            --launch-handshake) launch_handshake=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1379,6 +1386,7 @@ cmd_start() {
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf '%s\n' "$projection_oracle" >"$state/projection-oracle"
     printf '%s\n' "$wayland_debug" >"$state/wayland-debug"
+    printf '%s\n' "$launch_handshake" >"$state/launch-handshake"
     printf '%s\n' "$restore_existing_only" >"$state/start-restore-existing-only"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
