@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -327,8 +327,9 @@ fi
 
 # A long agentic turn as Claude sends it: most thoughts are only a signature
 # (or redacted), between commands, with one summarized thought. Captured
-# while a signature-only thought is live, then finished, then with the first
-# command group open.
+# while a signature-only thought is live, twice while the 8-second thought
+# after a finished command runs, then finished, then with each command group
+# open.
 if [ "$scene" = contentless ]; then
     cp "$here/reasoning-row-scene/contentless.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
@@ -344,6 +345,17 @@ if [ "$scene" = contentless ]; then
     sleep 2
     scroll_top
     shot contentless-working
+    thinking=false
+    for _ in $(seq 40); do
+        if rg -q '"uuid":"contentless-verify-1-result"' "$config/projects"; then thinking=true; break; fi
+        sleep 1
+    done
+    [ "$thinking" = true ] || { printf '%s\n' 'reasoning-row-scene: the probe was not verified' >&2; exit 1; }
+    sleep 2
+    scroll_top
+    shot contentless-thinking-early
+    sleep 4
+    shot contentless-thinking-later
     finished=false
     for _ in $(seq 90); do
         if rg -q '"uuid":"contentless-answer-1"' "$config/projects"; then finished=true; break; fi
@@ -356,7 +368,33 @@ if [ "$scene" = contentless ]; then
     click_row '\bcommands?\b'
     scroll_top
     shot contentless-finished-expanded
+    click_row '\bcommands?\b'
+    click_row '\bcommands?\b' 1
+    scroll_top
+    shot contentless-finished-expanded-second
     printf '%s\n' 'Captured a turn of signature-only thoughts working, finished and expanded.'
+    exit 0
+fi
+
+# A subagent whose only work so far is a thought with nothing to read, opened
+# from the lead's transcript.
+if [ "$scene" = hidden-subagent ]; then
+    cp "$here/reasoning-row-scene/hidden-subagent.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: map the worktree with a scout.' \
+        "$fixture/state/reasoning-hidden-subagent-spawn.json" 'Thinking scout'
+    ready=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"hidden-scout-1-thought"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the scout did not start' >&2; exit 1; }
+    sleep 2
+    click_row 'Fixture scout'
+    sleep 2
+    shot hidden-subagent-thinking
+    printf '%s\n' 'Captured a subagent that has only thought so far.'
     exit 0
 fi
 

@@ -2777,7 +2777,12 @@ impl Runtime {
                     heading
                 },
             );
-            if agent.items.is_empty()
+            // Thoughts with nothing to read draw no row, so a subagent with
+            // only those has shown nothing yet and says it is working.
+            if agent
+                .items
+                .iter()
+                .all(|item| reasoning::contentless(&item.content))
                 && !(agent.status == chat::ToolStatus::Failed && !agent.detail.trim().is_empty())
             {
                 transcript.push(transcript_body(
@@ -5431,6 +5436,7 @@ impl Runtime {
                     .hash(&mut hasher);
                 self.opened.get(&turn.key).hash(&mut hasher);
                 self.tool_groups_expanded.hash(&mut hasher);
+                turn.pauses.hash(&mut hasher);
                 // A running group's duration counts up, so its strip changes
                 // with the clock; a finished one's is fixed at how long the
                 // work took.
@@ -5635,35 +5641,50 @@ impl Runtime {
                     .into();
                 }
                 let strip = self.step_strip(turn, || {
-                    turn.steps
-                        .iter()
-                        .filter_map(|placed_step| placed(placed_step.index))
-                        .filter(|(item, _)| self.failure_ui.item(&item.id).is_none())
-                        .map(|(item, cached)| {
-                            let key = selection::logical_identity(&item.id, &[9]);
-                            let revision = cached.revision;
-                            // Header elements are cheap owned metadata; only a
-                            // mounted row creates their widget tree and geometry.
-                            let row = self.step_view(item, cached, settings);
-                            let id = item.id.clone();
-                            let mut row = virtualized::Row::once(
-                                key,
-                                revision,
-                                step::GAP_XS + TIMELINE_ROW,
-                                Some(scroll::item_id(&id)),
-                                // The air above each row, so the strip's
-                                // rows keep the pitch of the rows around
-                                // it at both of its ends.
-                                move || {
-                                    widget::container(scroll::item(&id, row))
-                                        .padding(iced::Padding::ZERO.top(step::GAP_XS))
-                                        .into()
-                                },
-                            );
-                            row.anchor = true;
-                            row
-                        })
-                        .collect()
+                    let mut rows = Vec::with_capacity(turn.steps.len() + turn.pauses.len());
+                    let mut pauses = turn.pauses.iter().peekable();
+                    // Thinking with nothing to read is listed where it fell
+                    // among the steps, as a line of its own.
+                    let mut think = |rows: &mut Vec<_>, before: usize| {
+                        while let Some(pause) = pauses.next_if(|pause| pause.after <= before) {
+                            if let Some(item) = items.get(pause.index) {
+                                rows.push(pause_row(&item.id, pause.millis));
+                            }
+                        }
+                    };
+                    for (at, placed_step) in turn.steps.iter().enumerate() {
+                        think(&mut rows, at);
+                        let Some((item, cached)) = placed(placed_step.index) else {
+                            continue;
+                        };
+                        if self.failure_ui.item(&item.id).is_some() {
+                            continue;
+                        }
+                        let key = selection::logical_identity(&item.id, &[9]);
+                        let revision = cached.revision;
+                        // Header elements are cheap owned metadata; only a
+                        // mounted row creates their widget tree and geometry.
+                        let row = self.step_view(item, cached, settings);
+                        let id = item.id.clone();
+                        let mut row = virtualized::Row::once(
+                            key,
+                            revision,
+                            step::GAP_XS + TIMELINE_ROW,
+                            Some(scroll::item_id(&id)),
+                            // The air above each row, so the strip's
+                            // rows keep the pitch of the rows around
+                            // it at both of its ends.
+                            move || {
+                                widget::container(scroll::item(&id, row))
+                                    .padding(iced::Padding::ZERO.top(step::GAP_XS))
+                                    .into()
+                            },
+                        );
+                        row.anchor = true;
+                        rows.push(row);
+                    }
+                    think(&mut rows, turn.steps.len());
+                    rows
                 });
                 // One measured strip supplies aliases for folded steps;
                 // expanded rows below it supply their own, more precise item
@@ -6735,6 +6756,34 @@ impl Runtime {
     }
 }
 
+/// A stretch of thinking with nothing to read, as an open strip lists it
+/// among its steps: a finished thought's line, which only its time names.
+/// It keeps a step row's height and the air above it, so the strip's pitch
+/// is unchanged.
+fn pause_row<'a>(id: &str, millis: u64) -> virtualized::Row<'a> {
+    let label = format!("Thought for {}", disclosure::duration(millis));
+    virtualized::Row::once(
+        selection::logical_identity(id, &[9]),
+        millis,
+        step::GAP_XS + TIMELINE_ROW,
+        None,
+        move || {
+            let name = format!("Reasoning: {label}");
+            let line = disclosure::row(label, name, Icon::Agent, None, None, None, None);
+            widget::container(line)
+                .width(Length::Fill)
+                .padding(iced::Padding::ZERO.top(step::GAP_XS))
+                .class(cosmic::theme::Container::custom(|theme| {
+                    widget::container::Style {
+                        text_color: Some(design::muted_color(theme)),
+                        ..Default::default()
+                    }
+                }))
+                .into()
+        },
+    )
+}
+
 pub(super) fn permission_mode_label(mode: &str) -> &str {
     match mode {
         "default" | "manual" => "Ask before edits",
@@ -7565,6 +7614,9 @@ mod user_image_preview_tests;
 
 #[cfg(test)]
 mod figure_tests;
+
+#[cfg(test)]
+mod hidden_thinking_tests;
 
 #[cfg(test)]
 mod user_bubble_tests;

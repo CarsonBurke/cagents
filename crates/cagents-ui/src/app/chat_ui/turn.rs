@@ -69,6 +69,10 @@ pub(super) struct Turn {
     pub(super) prompt: Vec<usize>,
     pub(super) steps: Vec<Placed>,
     pub(super) prose: Vec<Placed>,
+    /// Stretches of reasoning with nothing to read that took long enough to
+    /// account for, where they fell among the steps. An open strip lists
+    /// them so its total does not hide that much of it was thinking.
+    pub(super) pauses: Vec<Pause>,
     /// Set while any step in this group is still running, which is what marks
     /// the live group without needing a separate global flag.
     pub(super) running: bool,
@@ -107,6 +111,7 @@ impl Turn {
             prompt: if prompt { vec![index] } else { Vec::new() },
             steps: Vec::new(),
             prose: Vec::new(),
+            pauses: Vec::new(),
             running: false,
             newest_running: false,
             outcome: None,
@@ -241,6 +246,57 @@ impl Turn {
     }
 }
 
+/// Consecutive reasoning with nothing to read, inside a group's steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct Pause {
+    /// How many of the group's steps came before it.
+    pub(super) after: usize,
+    /// The first thought's index into the snapshot's item list, which names
+    /// the pause's row.
+    pub(super) index: usize,
+    /// How long the agent thought, from the first thought's start to the
+    /// last one's latest observation.
+    pub(super) millis: u64,
+}
+
+impl Pause {
+    /// Shorter thinking is the ordinary gap between steps; it stays as
+    /// hidden as the thoughts themselves.
+    pub(super) const SHOWN_FROM_MS: u64 = 2_000;
+}
+
+/// A run of hidden thoughts being gathered into a [`Pause`].
+#[derive(Debug, Clone, Copy)]
+struct Thinking {
+    lies: Lies,
+    after: usize,
+    index: usize,
+    span: Span,
+}
+
+/// Where a run of hidden thoughts is listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lies {
+    /// Among the steps of the group at this index.
+    Among(usize),
+    /// At the head of the strip of the work it led to, once the agent had
+    /// handed control back.
+    Ahead,
+    /// Nowhere: it followed its group's prose, below the strip.
+    Unlisted,
+}
+
+impl Thinking {
+    fn pause(self) -> Option<Pause> {
+        let millis = self.span.end?.saturating_sub(self.span.start?);
+        (millis >= Pause::SHOWN_FROM_MS).then_some(Pause {
+            after: self.after,
+            index: self.index,
+            millis,
+        })
+    }
+}
+
 /// When some work happened: its earliest start and latest observation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Span {
@@ -354,13 +410,42 @@ pub(super) fn group<'c, T: Borrow<Item>>(
     // work, it counts toward that group; once the agent has handed control
     // back, by speaking or asking, toward the group the work it led to opens.
     let mut unplaced: Option<Span> = None;
+    // The hidden thoughts since the last drawn item, and the group whose
+    // steps they fall among; a drawn item ends the run.
+    let mut thinking: Option<Thinking> = None;
+    // The group a hidden thought at the very end was counted toward.
+    let mut thinking_in = None;
     for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
+        thinking_in = None;
         if !renders(&item.content) {
             if matches!(item.content, ItemContent::Text { thinking: true, .. }) {
-                match turns.last_mut() {
-                    Some(turn) if state == Open::Taking => turn.spans(item),
-                    _ => unplaced.get_or_insert_default().takes_in(Span::of(item)),
-                }
+                let (lies, after) = match turns.last_mut() {
+                    Some(turn) if state == Open::Taking => {
+                        turn.spans(item);
+                        thinking_in = Some(turns.len() - 1);
+                        // Thinking after the group's prose fell below its
+                        // strip, so the strip does not list it.
+                        let lies = if turn.prose.is_empty() {
+                            Lies::Among(turns.len() - 1)
+                        } else {
+                            Lies::Unlisted
+                        };
+                        (lies, turn.steps.len())
+                    }
+                    _ => {
+                        unplaced.get_or_insert_default().takes_in(Span::of(item));
+                        (Lies::Ahead, 0)
+                    }
+                };
+                thinking
+                    .get_or_insert(Thinking {
+                        lies,
+                        after,
+                        index,
+                        span: Span::default(),
+                    })
+                    .span
+                    .takes_in(Span::of(item));
             }
             // A question asked after it still ends the group, though the
             // item draws nothing.
@@ -370,6 +455,16 @@ pub(super) fn group<'c, T: Borrow<Item>>(
             continue;
         }
         let asked = asked_after.contains(item.id.as_str());
+        // Thinking among a group's steps lies where it fell, whatever group
+        // this item goes on to join.
+        let ahead = thinking.take().and_then(|run| match run.lies {
+            Lies::Among(at) => {
+                turns[at].pauses.extend(run.pause());
+                None
+            }
+            Lies::Ahead => run.pause(),
+            Lies::Unlisted => None,
+        });
         // A message from outside this stretch of work - the reader's own
         // prompt, a steering message, anything the harness delivers on their
         // behalf - is a new instruction, so the work that follows it is
@@ -409,6 +504,14 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         // the states that skip it only occur once a group exists.
         let at = turns.len() - 1;
         let turn = turns.last_mut().expect("a group is open");
+        // Thinking once the agent had spoken counts toward the work it led
+        // to, and so opens that work's strip.
+        if slot == Slot::Step
+            && turn.steps.is_empty()
+            && let Some(pause) = ahead
+        {
+            turn.pauses.push(pause);
+        }
         let status = item.content.status();
         match coordinated(item) {
             // A card shows how it went itself; the strip summarizes only the
@@ -448,6 +551,21 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         } else {
             Open::Taking
         };
+    }
+    // Thinking that is still going on keeps its group's clock running,
+    // though it draws nothing and its steps have finished.
+    if presented.working()
+        && let Some(turn) = thinking_in.and_then(|at| turns.get_mut(at))
+    {
+        turn.running = true;
+    }
+    // Thinking at the end of a group that is still going on is what the
+    // working indicator shows; once it is over, it closes the strip.
+    if let Some(run) = thinking
+        && let Lies::Among(at) = run.lies
+        && !(presented.working() && thinking_in.is_some())
+    {
+        turns[at].pauses.extend(run.pause());
     }
     for turn in &mut turns {
         turn.describe(items, &presented);
@@ -507,6 +625,11 @@ pub(super) trait Presented<'c> {
     /// prompt whose latest typed message is `typed`, which has no activity
     /// yet. Parts of one message still share their prompt.
     fn separates(&self, _typed: &Item, _incoming: &Item) -> bool {
+        false
+    }
+    /// Whether the agent is still at work on the newest of these items, so a
+    /// thought with nothing to read at the end is thinking still going on.
+    fn working(&self) -> bool {
         false
     }
 }
@@ -1575,6 +1698,153 @@ mod tests {
         assert_eq!(thinking.len(), 1);
         assert_eq!(slots(&thinking[0]), [(1, Slot::Prose)]);
         assert!(group(&[thought("alone", "", 0, 1)], &unasked(), plain).is_empty());
+    }
+
+    /// Grouping for an agent still at work on the newest item.
+    struct Working;
+
+    impl<'c> Presented<'c> for Working {
+        fn coordinated(&self, _item: &Item) -> Option<&'c Coordinated> {
+            None
+        }
+        fn working(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_group_keeps_counting_while_the_agent_thinks_after_its_steps() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(command("c2", ToolStatus::Succeeded), 2_000, 3_000),
+            thought("t", "", 3_000, 4_000),
+        ];
+        let turns = group(&items, &unasked(), Working);
+        assert!(
+            turns[0].running,
+            "the hidden thought is work still going on"
+        );
+        assert_eq!(turns[0].working_for(20_000), Some(19_000));
+        assert_eq!(turns[0].summary, "Ran 2 commands · working");
+        // Once the agent stops, the group ends where its thinking did.
+        let turns = group(&items, &unasked(), plain);
+        assert!(!turns[0].running);
+        assert_eq!(turns[0].working_for(20_000), Some(3_000));
+        // A thought that is not the newest item has finished.
+        let mut later = items.clone();
+        later.push(timed(command("c3", ToolStatus::Succeeded), 4_000, 5_000));
+        assert!(!group(&later, &unasked(), Working)[0].running);
+    }
+
+    #[test]
+    fn thinking_after_the_agent_spoke_does_not_restart_its_group() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(
+                text("said", Role::Assistant, Phase::Final, false),
+                2_000,
+                3_000,
+            ),
+            thought("t", "", 3_000, 4_000),
+        ];
+        let turns = group(&items, &unasked(), Working);
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].running, "the thought belongs to work not begun");
+    }
+
+    fn pauses(turn: &Turn) -> Vec<(usize, usize, u64)> {
+        turn.pauses
+            .iter()
+            .map(|pause| (pause.after, pause.index, pause.millis))
+            .collect()
+    }
+
+    #[test]
+    fn an_open_strip_lists_long_hidden_thinking_where_it_fell() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            thought("t0", "", 500, 1_000),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            // A run of two thoughts is one stretch of thinking.
+            thought("t1", "", 2_000, 9_000),
+            thought("t2", "[Redacted thinking]", 9_000, 19_000),
+            timed(command("c2", ToolStatus::Succeeded), 19_000, 20_000),
+            // The ordinary pause between steps stays hidden.
+            thought("t3", "", 20_000, 21_500),
+            timed(command("c3", ToolStatus::Succeeded), 21_500, 22_000),
+            thought("t4", "", 22_000, 25_000),
+            timed(
+                text("answer", Role::Assistant, Phase::Final, false),
+                25_000,
+                26_000,
+            ),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(steps(&turns[0]), [2, 5, 7]);
+        assert_eq!(pauses(&turns[0]), [(1, 3, 17_000), (3, 8, 3_000)]);
+        assert_eq!(
+            turns[0].summary, "Ran 3 commands",
+            "the header is unchanged"
+        );
+        assert_eq!(turns[0].working_for(u64::MAX), Some(25_500));
+    }
+
+    #[test]
+    fn thinking_still_going_on_is_not_listed_until_it_ends() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(command("c2", ToolStatus::Succeeded), 2_000, 3_000),
+            thought("t", "", 3_000, 9_000),
+        ];
+        assert!(pauses(&group(&items, &unasked(), Working)[0]).is_empty());
+        assert_eq!(
+            pauses(&group(&items, &unasked(), plain)[0]),
+            [(2, 3, 6_000)]
+        );
+    }
+
+    #[test]
+    fn thinking_after_an_answer_opens_the_strip_of_the_work_it_led_to() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(
+                text("said", Role::Assistant, Phase::Final, false),
+                2_000,
+                3_000,
+            ),
+            thought("t", "", 3_000, 9_000),
+            timed(command("c2", ToolStatus::Succeeded), 9_000, 10_000),
+            timed(command("c3", ToolStatus::Succeeded), 10_000, 11_000),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns.len(), 2);
+        assert!(pauses(&turns[0]).is_empty());
+        assert_eq!(pauses(&turns[1]), [(0, 3, 6_000)]);
+        assert_eq!(turns[1].working_for(u64::MAX), Some(8_000));
+    }
+
+    #[test]
+    fn thinking_below_a_strip_is_not_listed_in_it() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(command("c2", ToolStatus::Succeeded), 2_000, 3_000),
+            timed(
+                text("progress", Role::Assistant, Phase::Commentary, false),
+                3_000,
+                4_000,
+            ),
+            thought("t", "", 4_000, 9_000),
+            timed(command("c3", ToolStatus::Succeeded), 9_000, 10_000),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|turn| turn.pauses.is_empty()));
     }
 
     #[test]
