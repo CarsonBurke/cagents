@@ -95,8 +95,6 @@ const COMPOSER_INSET_Y: f32 =
 /// How far a scrolled draft runs on into the editor's vertical inset (#2824):
 /// up to the composer's border, never over it.
 const COMPOSER_TEXT_REACH: f32 = COMPOSER_INSET_Y - design::BORDER_WIDTH;
-/// The composer editor's padding: its vertical inset, and its sides with the
-/// rail for the vertical scrollbar.
 /// The side of an image's square tile in the composer's tray.
 const ATTACHMENT_TILE: f32 = 56.0;
 /// The height of a file's chip in the tray, centred against the tiles.
@@ -155,6 +153,8 @@ fn attachment_close<'a>(remove: Option<Message>) -> Element<'a, Message> {
     .into()
 }
 
+/// The composer editor's padding: its vertical inset, and its sides with the
+/// rail for the vertical scrollbar.
 fn composer_editor_padding() -> iced::Padding {
     design::with_vertical_rail(iced::Padding::from([COMPOSER_INSET_Y, space::XS]))
 }
@@ -4800,8 +4800,10 @@ impl Runtime {
             } else {
                 attachment.label()
             };
-        let remove = action(Action::RemoveAttachment(target, index));
-        let close = attachment_close((!transitioning).then(|| remove.clone()));
+        // While the provider starts or changes session the draft's
+        // attachments are fixed, for the keyboard as for the ×.
+        let remove = (!transitioning).then(|| action(Action::RemoveAttachment(target, index)));
+        let close = attachment_close(remove.clone());
         let id = attachment_tile_id(target.card, index);
         // The file's own name, which the tile's short label leaves out, as
         // the attachment rows showed it.

@@ -222,6 +222,45 @@ mod tests {
     }
 
     #[test]
+    fn a_long_draft_with_many_images_detaches_only_the_reference_it_lost() {
+        attachment_assets::with_test_image(|first| {
+            let mut all = vec![first];
+            all.extend((2..=8).map(|n| attachment_assets::test_image(&format!("{n}.png"))));
+            let token = |a: &Attachment| a.reference.as_ref().unwrap().token();
+            let paragraph = "A long line of prose that surrounds each image. ".repeat(500);
+            let draft = |skip: Option<usize>| {
+                all.iter()
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != skip)
+                    .map(|(_, image)| format!("{paragraph}{}\n", token(image)))
+                    .collect::<String>()
+            };
+            let full = draft(None);
+            assert!(full.len() > 190_000, "the draft is long");
+            let mut attachments = all.clone();
+            let mut detached = Vec::new();
+
+            let before = inline(&full, &attachments);
+            let typed = format!("{full}and one more sentence");
+            assert!(!reconcile(&typed, &before, &mut attachments, &mut detached));
+            assert_eq!(attachments, all, "an edit elsewhere keeps every image");
+
+            let without = draft(Some(4));
+            assert!(reconcile(
+                &without,
+                &before,
+                &mut attachments,
+                &mut detached
+            ));
+            let mut expected = all.clone();
+            let removed = expected.remove(4);
+            assert_eq!(attachments, expected);
+            assert_eq!(detached.len(), 1);
+            assert_eq!(detached[0].attachment, removed);
+        });
+    }
+
+    #[test]
     fn an_image_whose_reference_was_never_in_the_draft_stays() {
         attachment_assets::with_test_image(|image| {
             let mut attachments = vec![image.clone(), Attachment::file("/notes.txt")];
