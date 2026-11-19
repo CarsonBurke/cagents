@@ -544,12 +544,12 @@ impl State {
                 now: name(current),
             });
         }
-        let home = account.account.resolved_home();
+        let home = resolved_home(&account.account);
         let others = self
             .of(account.account.provider)
             .filter(|other| other.id != account.id && !other.account.is_brokered());
         for other in others {
-            if home.is_some() && other.account.resolved_home() == home {
+            if home.is_some() && resolved_home(&other.account) == home {
                 return Some(LoginConflict::SameHome {
                     with: self.referred_name(other),
                 });
@@ -2262,6 +2262,9 @@ struct Choice {
     listed: bool,
     present: bool,
     system: bool,
+    /// Whether no other login contradicts this one (see
+    /// [`State::login_conflict`]), which its usage reset needs.
+    conflict_free: bool,
 }
 
 impl ProviderChoices {
@@ -2319,6 +2322,7 @@ impl ProviderChoices {
                 listed,
                 present: account.present,
                 system,
+                conflict_free: state.login_conflict(account).is_none(),
             });
         }
         choices
