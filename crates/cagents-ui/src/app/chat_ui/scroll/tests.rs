@@ -4141,3 +4141,70 @@ fn moving_into_unloaded_history_lands_where_the_reader_asked() {
     settle(&mut anchor, &prepended, Some(7_800.0), spaced(None));
     assert_eq!(anchor.contexts[0].top, Some(8_800.0));
 }
+
+/// A reader taken to the conversation's start while its earliest history is
+/// still on its way, as the top of the track or Home take them, stays at the
+/// top as each page arrives, rather than with the rows they saw there (#3102).
+#[test]
+fn a_reader_sent_to_the_start_waits_there_for_its_pages() {
+    fn settle(anchor: &mut Anchor, rows: &[(&str, Rectangle)], before: f32) -> Option<f32> {
+        let history = History {
+            unloaded: view::Unloaded { before, after: 0.0 },
+            ..History::default()
+        };
+        match anchor.layout_following(
+            None,
+            rows,
+            &HashSet::new(),
+            geometry(10_000.0),
+            None,
+            false,
+            true,
+            history,
+        ) {
+            Placement::Settled(bottom) => bottom,
+            Placement::Estimated(_) => unreachable!("a settling pass decides"),
+        }
+    }
+    let travel = 10_000.0 - 400.0;
+    let mut anchor = Anchor::default();
+    settle(
+        &mut anchor,
+        &rows(&[("a", 8_000.0, 1_000.0), ("b", 9_000.0, 1_000.0)]),
+        8_000.0,
+    );
+    let context = anchor.context_index(None);
+    anchor.contexts[context].edge = Some(Edge::Start);
+    // At the top of the space; the start is not loaded yet.
+    assert_eq!(
+        settle(
+            &mut anchor,
+            &rows(&[("a", 8_000.0, 1_000.0), ("b", 9_000.0, 1_000.0)]),
+            8_000.0
+        ),
+        Some(travel)
+    );
+    assert_eq!(anchor.contexts[context].edge, Some(Edge::Start));
+    // A page arrives above the rows the reader saw, and still is not the
+    // start: they stay at the top rather than above the page.
+    assert_eq!(
+        settle(
+            &mut anchor,
+            &rows(&[("p", 4_000.0, 4_000.0), ("a", 8_000.0, 2_000.0)]),
+            4_000.0
+        ),
+        Some(travel)
+    );
+    assert_eq!(anchor.contexts[context].edge, Some(Edge::Start));
+    // The start arrives: the reader is on it, and the edge is spent.
+    assert_eq!(
+        settle(
+            &mut anchor,
+            &rows(&[("first", 0.0, 4_000.0), ("p", 4_000.0, 6_000.0)]),
+            0.0
+        ),
+        Some(travel)
+    );
+    assert_eq!(anchor.contexts[context].top, Some(0.0));
+    assert_eq!(anchor.contexts[context].edge, None);
+}

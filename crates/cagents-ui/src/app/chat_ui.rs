@@ -8680,11 +8680,7 @@ impl Cagents {
                     && runtime.snapshot.history.earlier() > 0
                 {
                     let target = runtime.target;
-                    let start = if runtime.snapshot.history.unfetched.unwrap_or(0) > 0 {
-                        view::Sought::Unfetched
-                    } else {
-                        view::Sought::Cached { index: 0, at: 0.0 }
-                    };
+                    let start = runtime.history_start();
                     return Some(Task::batch([snap, self.follow_into_history(target, start)]));
                 }
                 return Some(snap);
@@ -11612,8 +11608,16 @@ impl Cagents {
         {
             return Task::none();
         }
-        let Some(page) = runtime.deferred_page.take() else {
-            return Task::none();
+        let page = match runtime.deferred_page.take() {
+            Some(page) => page,
+            // A reader held at the start while its history is fetched is
+            // what asks for the next page. A refresh, a reconnect or a
+            // subagent read meanwhile can drop what was deferred; the reader
+            // still waiting there resumes it.
+            None if runtime.scroll_memory.edge(None) == Some(scroll::Edge::Start) => {
+                HistoryNavigation::Seek
+            }
+            None => return Task::none(),
         };
         match page {
             HistoryNavigation::Latest
@@ -11637,7 +11641,12 @@ impl Cagents {
                     LatestReader::Preserve,
                 )
             }
-            HistoryNavigation::Latest => Task::none(),
+            // Home since: the reader waits at the start instead.
+            HistoryNavigation::Latest
+                if runtime.scroll_memory.edge(None) != Some(scroll::Edge::Start) =>
+            {
+                Task::none()
+            }
             HistoryNavigation::NewerEdge
                 if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
@@ -11651,10 +11660,12 @@ impl Cagents {
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
-            HistoryNavigation::Seek => match runtime.history_index(runtime.parent_scroll()) {
-                Some(sought) => self.follow_into_history(target, sought),
-                None => Task::none(),
-            },
+            HistoryNavigation::Seek | HistoryNavigation::Latest => {
+                match runtime.history_index(runtime.parent_scroll()) {
+                    Some(sought) => self.follow_into_history(target, sought),
+                    None => Task::none(),
+                }
+            }
             _ => Task::none(),
         }
     }
@@ -11694,6 +11705,24 @@ impl Cagents {
                     return Task::none();
                 }
                 self.chat_send(target, Command::LoadEarlier, false)
+            }
+            // The reader at the conversation's start stays there, as Home
+            // keeps them, while the window moves to its first item: the
+            // space standing for unloaded history above them is gone once
+            // it is all loaded, and nothing else would place them.
+            view::Sought::Start => {
+                runtime
+                    .scroll_memory
+                    .request_edge(runtime.selected_subagent.as_deref(), scroll::Edge::Start);
+                let start = runtime.history_start();
+                self.follow_into_history(target, start)
+            }
+            // The reader at the conversation's end is at its newest history,
+            // as End takes them there.
+            view::Sought::Latest => {
+                runtime.scroll_memory.cancel_landing();
+                runtime.sought = None;
+                self.handle_chat_action(Action::Latest(target))
             }
         }
     }
@@ -12834,6 +12863,10 @@ impl Cagents {
                             // restarted daemon can begin again at generation 1.
                             runtime.page_request = None;
                             runtime.deferred_page = None;
+                            // A seek the old handle took may never have
+                            // reached the daemon, so the same one is sent
+                            // again rather than awaited.
+                            runtime.sought = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                             runtime.error = None;
@@ -14760,17 +14793,18 @@ impl Cagents {
                     }
                     Err(error) => {
                         if pending.page == Some(view::Page::Latest) {
-                            runtime.scroll_memory.clear_latest();
+                            runtime.scroll_memory.release(scroll::Edge::Latest);
                             runtime.scroll_memory.cancel_preserve(pending.id);
                         }
-                        if pending.page.is_some() {
+                        if pending.page.is_some() || pending.seeks() {
                             runtime.page_request = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                             // A reader waiting in history that could not be
                             // brought in is not asked for again until they
-                            // move.
+                            // move, including one waiting at the start.
                             runtime.sought = None;
+                            runtime.scroll_memory.release(scroll::Edge::Start);
                             if runtime.deferred_page == Some(HistoryNavigation::Seek) {
                                 runtime.deferred_page = None;
                             }
@@ -15055,12 +15089,21 @@ impl Cagents {
                         }
                         runtime.refresh_find();
                     }
-                    runtime.deferred_page = None;
+                    // Paging toward a reader waiting in the main transcript's
+                    // history waits while they read a subagent, and resumes
+                    // once they are back there; paging at an edge they
+                    // scrolled to does not.
+                    if runtime.deferred_page != Some(HistoryNavigation::Seek) {
+                        runtime.deferred_page = None;
+                    }
                     runtime.selection_document.get_mut().take();
                     let snapshot = runtime.snapshot.clone();
                     runtime.prepare_transcript_cache(&snapshot);
                     runtime.refresh_find();
                     images::sync(runtime);
+                    if runtime.selected_subagent.is_none() {
+                        return self.resume_history_navigation(target);
+                    }
                 }
             }
             Action::CopyMessage(target, id, source) => {

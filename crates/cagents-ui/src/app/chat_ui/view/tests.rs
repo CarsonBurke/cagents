@@ -12467,14 +12467,84 @@ fn history_counts_a_long_messages_parts_as_one_item() {
     let unloaded = runtime.unloaded_history();
     let window = 800.0;
     let content = unloaded.before + 6_000.0 + unloaded.after;
-    // The middle of the viewport in the last of the space after the window.
-    let from_top = content - window / 2.0 - 1.0;
-    let Some(Sought::Cached { index, .. }) =
-        runtime.history_index(Scroll::new(from_top, content, window).with_unloaded(unloaded))
-    else {
+    // Just short of the end, the item beside the middle of the viewport, in
+    // the last of the space after the window.
+    let short = window / 2.0 + PAGE_REACH + 1.0;
+    let Some(Sought::Cached { index, .. }) = runtime.history_index(
+        Scroll::new(content - window - PAGE_REACH - 1.0, content, window).with_unloaded(unloaded),
+    ) else {
         panic!("the end of the space after the window is cached");
     };
-    assert_eq!(index, 10 + 5 + 19, "the last item after the window");
+    let offset = ((1.0 - short / unloaded.after) * 20.0).floor() as u64;
+    assert_eq!(index, 10 + 5 + offset, "counted after the window's items");
+}
+
+/// The ends of the space standing for unloaded history are the ends of the
+/// conversation: a reader who drags the thumb to the top lands on its first
+/// item at the top, rather than on the item an estimate puts beside the
+/// middle of the viewport, and one who drags it to the bottom is at its
+/// newest history.
+#[test]
+fn the_ends_of_unloaded_history_are_the_conversations_ends() {
+    let (mut runtime, _) = furnished_runtime();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.has_earlier = true;
+    snapshot.has_later = true;
+    snapshot.history = chat::HistoryExtent {
+        before: 100,
+        after: 100,
+        unfetched: Some(0),
+    };
+    let unloaded = runtime.unloaded_history();
+    let window = 800.0;
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    let at = |from_top: f32| {
+        runtime.history_index(Scroll::new(from_top, content, window).with_unloaded(unloaded))
+    };
+    assert_eq!(at(0.0), Some(Sought::Start));
+    // A fling that settles a few points short has arrived too.
+    assert_eq!(at(PAGE_REACH), Some(Sought::Start));
+    assert_eq!(
+        runtime.history_start(),
+        Sought::Cached { index: 0, at: 0.0 }
+    );
+    let Some(Sought::Cached { index, .. }) = at(PAGE_REACH + 1.0) else {
+        panic!("short of the top, the reader is among the cached history");
+    };
+    assert!(index > 0, "the item beside the middle of the viewport");
+    assert_eq!(at(content - window), Some(Sought::Latest));
+    assert!(matches!(
+        at(content - window - PAGE_REACH - 1.0),
+        Some(Sought::Cached { .. })
+    ));
+
+    // History the provider still holds is where the conversation starts.
+    Arc::make_mut(&mut runtime.snapshot).history.unfetched = Some(300);
+    let unloaded = runtime.unloaded_history();
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    assert_eq!(
+        runtime.history_index(Scroll::new(0.0, content, window).with_unloaded(unloaded)),
+        Some(Sought::Start)
+    );
+    assert_eq!(runtime.history_start(), Sought::Unfetched);
+
+    // An item or so either side stands for less space than half the
+    // viewport, so at either end its middle is among the loaded rows; the
+    // reader there has still reached the conversation's end.
+    Arc::make_mut(&mut runtime.snapshot).history = chat::HistoryExtent {
+        before: 1,
+        after: 1,
+        unfetched: Some(0),
+    };
+    let unloaded = runtime.unloaded_history();
+    assert!(unloaded.before < window / 2.0 && unloaded.after < window / 2.0);
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    let at = |from_top: f32| {
+        runtime.history_index(Scroll::new(from_top, content, window).with_unloaded(unloaded))
+    };
+    assert_eq!(at(0.0), Some(Sought::Start));
+    assert_eq!(at(content - window), Some(Sought::Latest));
+    assert_eq!(at(content / 2.0), None, "among the loaded rows");
 }
 
 /// The space before the window stands for the history the provider has not

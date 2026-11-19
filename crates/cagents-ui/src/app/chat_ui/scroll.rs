@@ -106,13 +106,15 @@ impl Memory {
     pub(super) fn landing(&self) -> Option<u64> {
         self.0.borrow().landing.map(|landing| landing.index)
     }
-    pub(super) fn clear_latest(&self) {
+    /// Let the main transcript's reader go from `edge`, if they are held
+    /// there.
+    pub(super) fn release(&self, edge: Edge) {
         if let Some(context) = self
             .0
             .borrow_mut()
             .contexts
             .iter_mut()
-            .find(|context| context.subagent.is_none() && context.edge == Some(Edge::Latest))
+            .find(|context| context.subagent.is_none() && context.edge == Some(edge))
         {
             context.edge = None;
         }
@@ -1535,8 +1537,11 @@ impl Anchor {
         context.spaced = history.unloaded != view::Unloaded::default();
         // Either explicit edge remains deliberate while a nonempty prepared
         // source fits, including a child that would otherwise start on growth.
-        // A genuine empty reset consumes it.
-        if next.travel() > 0.0 || rows.is_empty() {
+        // A genuine empty reset consumes it. The start is not here yet while
+        // space stands for history before the window: the reader waits at
+        // its top as each page arrives, until moving lets them go.
+        let start_pending = edge == Some(Edge::Start) && history.unloaded.before > 0.0;
+        if (next.travel() > 0.0 || rows.is_empty()) && !start_pending {
             context.edge = None;
         }
         context.follow_end = follow_end && (rows.is_empty() || edge != Some(Edge::Start));

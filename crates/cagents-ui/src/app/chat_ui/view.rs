@@ -1172,6 +1172,12 @@ pub(super) enum Sought {
     /// History the provider has still to hand over, a page at a time back
     /// from the newest of it.
     Unfetched,
+    /// The conversation's first item, which the reader reads down from its
+    /// start, as Home takes them there.
+    Start,
+    /// The conversation's newest history, which the reader reads up from
+    /// its end.
+    Latest,
 }
 
 /// Where in the unloaded history the reader is looking.
@@ -1867,10 +1873,23 @@ impl Runtime {
     }
 
     /// Where `scroll` has the reader in history outside the loaded window.
+    ///
+    /// At either end of the conversation that is its first or newest item,
+    /// where the reader reads on from it, rather than the item an estimate
+    /// puts beside the middle of the viewport. That holds however little
+    /// history the space at that end stands for, even when the middle of
+    /// the viewport is past it among the loaded rows.
     pub(super) fn history_index(&self, scroll: Scroll) -> Option<Sought> {
         let history = self.snapshot.history;
         let unfetched = history.unfetched.unwrap_or(0);
-        let (first, count, fraction) = match scroll.unseen()? {
+        if scroll.unloaded.before > 0.0 && history.earlier() > 0 && scroll.at_top() {
+            return Some(Sought::Start);
+        }
+        if scroll.unloaded.after > 0.0 && history.after > 0 && scroll.at_bottom() {
+            return Some(Sought::Latest);
+        }
+        let unseen = scroll.unseen()?;
+        let (first, count, fraction) = match unseen {
             Unseen::Before(fraction) => (0, history.earlier(), fraction),
             Unseen::After(fraction) => (
                 unfetched + history.before + self.window_items().count() as u64,
@@ -1892,6 +1911,16 @@ impl Runtime {
             index,
             at: scroll.window_height() * 0.5 - within,
         })
+    }
+
+    /// The conversation's first item, which is the provider's when it has
+    /// history still to hand over.
+    pub(super) fn history_start(&self) -> Sought {
+        if self.snapshot.history.unfetched.unwrap_or(0) > 0 {
+            Sought::Unfetched
+        } else {
+            Sought::Cached { index: 0, at: 0.0 }
+        }
     }
 
     /// The loaded item the reader asked to land on in history that was not
