@@ -4249,7 +4249,7 @@ fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
                 );
             }
             let result = adapter.receive(json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
-            let expected = if compaction {
+            let expected = if compaction || marker == "isMeta" {
                 "Launching skill: example"
             } else {
                 body
