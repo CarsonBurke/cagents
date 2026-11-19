@@ -1856,7 +1856,7 @@ impl Runtime {
             return Unloaded::default();
         }
         let estimate = self.history_estimate.get().update(
-            (history.before, self.snapshot.items.len()),
+            (history.before, self.window_items().count()),
             self.parent_scroll().loaded(),
         );
         self.history_estimate.set(estimate);
@@ -1873,7 +1873,7 @@ impl Runtime {
         let (first, count, fraction) = match scroll.unseen()? {
             Unseen::Before(fraction) => (0, history.earlier(), fraction),
             Unseen::After(fraction) => (
-                unfetched + history.before + self.snapshot.items.len() as u64,
+                unfetched + history.before + self.window_items().count() as u64,
                 history.after,
                 fraction,
             ),
@@ -1899,10 +1899,23 @@ impl Runtime {
     pub(super) fn landing_item(&self) -> Option<&str> {
         let index = self.scroll_memory.landing()?;
         let offset = index.checked_sub(self.snapshot.history.before)?;
-        self.snapshot
-            .items
-            .get(usize::try_from(offset).ok()?)
-            .map(|item| item.id.as_str())
+        let row = self.window_items().nth(usize::try_from(offset).ok()?)?;
+        Some(self.snapshot.items[row].id.as_str())
+    }
+
+    /// The row each of the window's items starts at. History counts a long
+    /// message once, where the window has a row for each of its parts; the
+    /// first row stands for its item even when it is a later part.
+    pub(super) fn window_items(&self) -> impl Iterator<Item = usize> + '_ {
+        fn base(id: &str) -> &str {
+            chat::TranscriptPart::parse(id).map_or(id, |part| part.item)
+        }
+        let items = &self.snapshot.items;
+        (0..items.len()).filter(move |&row| {
+            row == 0
+                || chat::TranscriptPart::parse(&items[row].id)
+                    .is_none_or(|part| part.item != base(&items[row - 1].id))
+        })
     }
 
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {

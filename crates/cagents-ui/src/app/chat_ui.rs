@@ -11601,7 +11601,7 @@ impl Cagents {
         if runtime.sought.is_some_and(|index| {
             index
                 .checked_sub(history.before)
-                .is_some_and(|offset| offset < runtime.snapshot.items.len() as u64)
+                .is_some_and(|offset| offset < runtime.window_items().count() as u64)
         }) {
             runtime.sought = None;
         }

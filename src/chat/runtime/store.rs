@@ -1304,19 +1304,41 @@ impl Store {
             .db
             .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
-        let start = index.saturating_sub(WINDOW_ITEMS as u64 / 4);
         if index.saturating_add(WINDOW_ITEMS as u64 / 2) >= total as u64 {
             self.latest();
             return Ok(true);
         }
-        let ordinal: i64 = self
+        // Up to a quarter of the window's items and bytes go before the
+        // item, so a window of large items still reaches it. Every byte an
+        // item holds is counted, more than an excerpt carries of it.
+        let mut statement = self
             .db
-            .query_row(
-                "SELECT ordinal FROM items ORDER BY ordinal LIMIT 1 OFFSET ?1",
-                [start as i64],
-                |row| row.get(0),
+            .prepare(
+                "SELECT ordinal, len0 + len1 + length(metadata) FROM items
+                 WHERE ordinal <= (SELECT ordinal FROM items ORDER BY ordinal LIMIT 1 OFFSET ?1)
+                 ORDER BY ordinal DESC LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
+        let mut rows = statement
+            .query(params![index as i64, WINDOW_ITEMS as i64 / 4 + 1])
+            .map_err(|e| e.to_string())?;
+        let (mut ordinal, mut bytes) = (None, 0usize);
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let at: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let size: i64 = row.get(1).map_err(|e| e.to_string())?;
+            if ordinal.is_some() {
+                bytes += usize::try_from(size).unwrap_or(usize::MAX);
+                if bytes > WINDOW_BYTES / 4 {
+                    break;
+                }
+            }
+            ordinal = Some(at);
+        }
+        drop(rows);
+        drop(statement);
+        let Some(ordinal) = ordinal else {
+            return Ok(false);
+        };
         self.forward = Some((ordinal, 0));
         self.end = None;
         self.slide = None;
@@ -2710,6 +2732,28 @@ mod tests {
         assert!(!end.has_later);
         assert_eq!(end.items.last().unwrap().id, "row-399");
         assert_eq!(end.history.after, 0);
+    }
+
+    /// A window of large items holds fewer than the quarter of a window a
+    /// seek would otherwise start before its item, and still reaches it.
+    #[test]
+    fn a_seek_among_large_items_reaches_its_item() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let body = "x".repeat(100 * 1024);
+        for n in 0..110 {
+            store
+                .apply(Event::Item(history_item(&format!("row-{n:03}"), &body)))
+                .unwrap();
+        }
+        store.seek(40).unwrap();
+        let window = store.window().unwrap();
+        assert!(
+            window.items.len() <= WINDOW_ITEMS / 4,
+            "the bytes bound the window"
+        );
+        assert!(window.items.iter().any(|item| item.id == "row-040"));
+        assert!(window.history.before > 40 - WINDOW_ITEMS as u64 / 4);
+        assert_eq!(window.history.total(window.items.len()), 110);
     }
 
     /// History the provider has not handed over is counted as it reported

@@ -12417,6 +12417,66 @@ fn history_estimate_follows_the_measured_window_only_when_it_changes() {
     assert_eq!(again.update((80, 128), 128.0 * 300.0).per_item(), 300.0);
 }
 
+/// History counts items, where the window has a row for each part of a long
+/// message. The window's items, the history after it, and where a reader
+/// asked to land are all counted in items, not rows.
+#[test]
+fn history_counts_a_long_messages_parts_as_one_item() {
+    let (mut runtime, _) = furnished_runtime();
+    let part = |item: &str, index| {
+        chat::TranscriptPart {
+            item,
+            index,
+            layout: "text",
+            fields: [(index * 10, index * 10 + 10), (0, 0)],
+        }
+        .id()
+    };
+    let rows = [
+        // The window starts partway through a message.
+        part("a", 2),
+        part("a", 3),
+        "b".to_owned(),
+        "c".to_owned(),
+        part("c", 1),
+        part("c", 2),
+        // A provider ID that happens to look like another item's part.
+        part("z", 1),
+        "d".to_owned(),
+    ];
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.items = rows
+        .iter()
+        .map(|id| Arc::new(message(id, chat::Role::Assistant, "text", false, 0)))
+        .collect();
+    snapshot.has_later = true;
+    snapshot.history = chat::HistoryExtent {
+        before: 10,
+        after: 20,
+        unfetched: Some(0),
+    };
+    assert_eq!(runtime.window_items().collect::<Vec<_>>(), [0, 2, 3, 6, 7]);
+
+    runtime.scroll_memory.land(13, 0.0);
+    assert_eq!(runtime.landing_item(), Some(rows[6].as_str()));
+    runtime.scroll_memory.land(14, 0.0);
+    assert_eq!(runtime.landing_item(), Some("d"));
+    runtime.scroll_memory.land(15, 0.0);
+    assert_eq!(runtime.landing_item(), None, "past the window");
+
+    let unloaded = runtime.unloaded_history();
+    let window = 800.0;
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    // The middle of the viewport in the last of the space after the window.
+    let from_top = content - window / 2.0 - 1.0;
+    let Some(Sought::Cached { index, .. }) =
+        runtime.history_index(Scroll::new(from_top, content, window).with_unloaded(unloaded))
+    else {
+        panic!("the end of the space after the window is cached");
+    };
+    assert_eq!(index, 10 + 5 + 19, "the last item after the window");
+}
+
 /// The space before the window stands for the history the provider has not
 /// handed over too, so the scrollbar spans the conversation from when it is
 /// opened. A reader in that part of it is waiting for the provider; one in
