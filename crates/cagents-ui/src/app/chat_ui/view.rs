@@ -97,6 +97,64 @@ const COMPOSER_INSET_Y: f32 =
 const COMPOSER_TEXT_REACH: f32 = COMPOSER_INSET_Y - design::BORDER_WIDTH;
 /// The composer editor's padding: its vertical inset, and its sides with the
 /// rail for the vertical scrollbar.
+/// The side of an image's square tile in the composer's tray.
+const ATTACHMENT_TILE: f32 = 56.0;
+/// The height of a file's chip in the tray, centred against the tiles.
+const ATTACHMENT_CHIP: f32 = 40.0;
+/// The × in a tile's corner.
+const ATTACHMENT_CLOSE: f32 = 18.0;
+
+/// The keyboard's stop on the tray's `index`th attachment.
+pub(super) fn attachment_tile_id(card: CardId, index: usize) -> iced::widget::Id {
+    card_control_id(card, &format!("chat-attachment-{index}"))
+}
+
+/// Whether the tray shows `attachment` as a picture that opens, rather than
+/// a file's chip.
+pub(super) fn is_image_attachment(attachment: &Attachment) -> bool {
+    attachment.reference.is_some()
+        || attachment
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                chat::IMAGE_EXTENSIONS
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known))
+            })
+}
+
+/// The tray's small remove button, which sits inside its tile's corner.
+fn attachment_close<'a>(remove: Option<Message>) -> Element<'a, Message> {
+    let style = |hovered: bool| {
+        move |_focused: bool, _theme: &cosmic::Theme| widget::button::Style {
+            background: Some(iced::Background::Color(iced::Color {
+                a: if hovered { 0.9 } else { 0.7 },
+                ..iced::Color::BLACK
+            })),
+            icon_color: Some(iced::Color::WHITE),
+            text_color: Some(iced::Color::WHITE),
+            border_radius: (ATTACHMENT_CLOSE / 2.0).into(),
+            ..design::button_style()
+        }
+    };
+    widget::button::custom(
+        widget::container(widget::icon(Icon::Close.handle()).size(10))
+            .center(Length::Fixed(ATTACHMENT_CLOSE)),
+    )
+    .padding(0)
+    .width(Length::Fixed(ATTACHMENT_CLOSE))
+    .height(Length::Fixed(ATTACHMENT_CLOSE))
+    .on_press_maybe(remove)
+    .class(cosmic::theme::Button::Custom {
+        active: Box::new(style(false)),
+        disabled: Box::new(move |theme| style(false)(false, theme)),
+        hovered: Box::new(style(true)),
+        pressed: Box::new(style(true)),
+    })
+    .into()
+}
+
 fn composer_editor_padding() -> iced::Padding {
     design::with_vertical_rail(iced::Padding::from([COMPOSER_INSET_Y, space::XS]))
 }
@@ -3559,50 +3617,7 @@ impl Runtime {
                     .into(),
             );
         }
-        let mut attachment_chips = Vec::new();
-        for (index, attachment) in self.attachments.iter().enumerate() {
-            let chip = widget::row::with_children(vec![
-                if let Some(handle) = self.thumbnails.handle(&attachment.path) {
-                    iced::widget::image(handle.clone())
-                        .width(design::DENSE_ROW_HEIGHT)
-                        .height(design::DENSE_ROW_HEIGHT)
-                        .content_fit(iced::ContentFit::Cover)
-                        .into()
-                } else {
-                    crate::ui_controls::passive_icon(Icon::Attachment, design::ROW_ICON_SIZE)
-                },
-                crate::design::caption(
-                    if attachment.reference.is_none()
-                        && clipboard_image::is_pasted(&attachment.path)
-                    {
-                        "Pasted image".into()
-                    } else {
-                        attachment.label()
-                    },
-                )
-                .width(Length::Fill)
-                .into(),
-                icon(
-                    Icon::Delete,
-                    "Remove attachment",
-                    !transitioning,
-                    Action::RemoveAttachment(target, index),
-                ),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(step::GAP_XS);
-            attachment_chips.push(
-                widget::tooltip(
-                    chip,
-                    design::caption(attachment.reference.as_ref().map_or_else(
-                        || attachment.path.display().to_string(),
-                        |reference| reference.name.clone(),
-                    )),
-                    widget::tooltip::Position::Top,
-                )
-                .into(),
-            );
-        }
+        let attachment_tray = self.attachment_tray(target, transitioning);
         if self.pastes_pending > 0 {
             content.push(
                 design::caption("Pasting…")
@@ -3783,6 +3798,17 @@ impl Runtime {
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
                     }
+                    // The message has its own undo history, which takes these
+                    // chords ahead of the workspace's (Ctrl+Shift+Z reopens a
+                    // closed pane anywhere else).
+                    if let Some(command) =
+                        crate::repository_widget::text_editor::history_command(&press)
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::ComposerUndo(
+                            target,
+                            command == crate::repository_widget::text_editor::HistoryCommand::Redo,
+                        ))));
+                    }
                     if !press.modifiers.shift()
                         && !press.modifiers.control()
                         && !press.modifiers.alt()
@@ -3946,12 +3972,7 @@ impl Runtime {
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
                             .chain(self.stop_confirmation())
-                            .chain((!attachment_chips.is_empty()).then(|| {
-                                widget::column::with_children(attachment_chips)
-                                    .spacing(step::GAP_XS)
-                                    .padding([0, step::GAP_M as u16])
-                                    .into()
-                            })),
+                            .chain(attachment_tray),
                     )
                     .spacing(step::GAP_XS)
                     .into(),
@@ -4376,6 +4397,152 @@ impl Runtime {
             .padding(iced::Padding::from([space::XS, COMPOSER_PADDING]))
             .into()
         })
+    }
+
+    /// The draft's attachments as one compact strip above the message: a
+    /// square thumbnail per image and a chip per file, wrapping onto more
+    /// rows in a narrow pane rather than hiding any off its edge.
+    fn attachment_tray(&self, target: Target, transitioning: bool) -> Option<Element<'_, Message>> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let tiles = self
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                self.attachment_tile(target, index, attachment, transitioning)
+            });
+        Some(
+            widget::row::with_children(tiles.collect::<Vec<_>>())
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .padding([step::GAP_XS, step::GAP_M])
+                .wrap()
+                .vertical_spacing(step::GAP_S)
+                .into(),
+        )
+    }
+
+    fn attachment_tile<'a>(
+        &'a self,
+        target: Target,
+        index: usize,
+        attachment: &'a Attachment,
+        transitioning: bool,
+    ) -> Element<'a, Message> {
+        let label =
+            if attachment.reference.is_none() && clipboard_image::is_pasted(&attachment.path) {
+                "Pasted image".to_owned()
+            } else {
+                attachment.label()
+            };
+        let remove = action(Action::RemoveAttachment(target, index));
+        let close = attachment_close((!transitioning).then(|| remove.clone()));
+        let id = attachment_tile_id(target.card, index);
+        // The file's own name, which the tile's short label leaves out, as
+        // the attachment rows showed it.
+        let named = |tile: Element<'a, Message>| -> Element<'a, Message> {
+            widget::tooltip(
+                tile,
+                design::caption(attachment.reference.as_ref().map_or_else(
+                    || attachment.path.display().to_string(),
+                    |reference| reference.name.clone(),
+                )),
+                widget::tooltip::Position::Top,
+            )
+            .into()
+        };
+        if !is_image_attachment(attachment) {
+            let face = widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::TextFile, design::ROW_ICON_SIZE),
+                    crate::ui_controls::FadeText::caption(label.clone())
+                        .limit(32)
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
+            )
+            // Room at the trailing end for the × it reveals.
+            .padding(iced::Padding::from([0.0, step::GAP_S]).right(ATTACHMENT_CLOSE + 6.0))
+            .height(Length::Fixed(ATTACHMENT_CHIP))
+            .align_y(iced::alignment::Vertical::Center)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_S; 4],
+                true,
+            ));
+            return named(
+                attachment_tile::tile(
+                    id,
+                    face,
+                    widget::Space::new(),
+                    widget::container(close).center_y(Length::Fixed(ATTACHMENT_CHIP - 6.0)),
+                    label,
+                    remove,
+                )
+                .into(),
+            );
+        }
+        let size = Length::Fixed(ATTACHMENT_TILE);
+        let face: Element<'_, Message> = match self.thumbnails.handle(&attachment.path) {
+            Some(handle) => iced::widget::image(handle.clone())
+                .width(size)
+                .height(size)
+                .content_fit(iced::ContentFit::Cover)
+                .border_radius([design::RADIUS_S; 4])
+                .into(),
+            None => widget::container(crate::ui_controls::passive_icon(
+                Icon::Image,
+                design::ROW_ICON_SIZE,
+            ))
+            .center(size)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_S; 4],
+                true,
+            ))
+            .into(),
+        };
+        let caption = widget::container(
+            design::caption(label.clone()).class(cosmic::theme::Text::Color(iced::Color::WHITE)),
+        )
+        .center_x(Length::Fill)
+        .padding([1, 2])
+        .class(cosmic::theme::Container::custom(|_theme| {
+            widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.62,
+                    ..iced::Color::BLACK
+                })),
+                border: iced::Border {
+                    radius: [0.0, 0.0, design::RADIUS_S, design::RADIUS_S].into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }));
+        let marked = attachment
+            .reference
+            .as_ref()
+            .is_some_and(|reference| self.caret_reference == Some(reference.id));
+        named(
+            attachment_tile::tile(
+                id,
+                face,
+                widget::container(caption)
+                    .width(size)
+                    .height(size)
+                    .align_y(iced::alignment::Vertical::Bottom),
+                close,
+                label,
+                remove,
+            )
+            .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
+            .marked(marked)
+            .into(),
+        )
     }
 
     /// The `+` at the composer's leading edge, and the menu it opens while it

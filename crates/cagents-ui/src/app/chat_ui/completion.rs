@@ -410,12 +410,13 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
 /// A space follows the name, so the reader can go on writing and a word the
 /// sigil was typed against is not run into it. Mid-sentence the caret steps
 /// over the space already there rather than doubling it, and punctuation
-/// right after the word stays against it.
+/// right after the word stays against it. Answers the measured edit, for the
+/// composer's undo history.
 pub(super) fn apply(
     composer: &mut text_editor::Content<cosmic::Renderer>,
     token: &Token,
     insertion: &str,
-) {
+) -> Result<Option<crate::editor_history::TextChange>, ()> {
     let next = composer
         .line(token.line)
         .and_then(|line| line.text.get(token.end..)?.chars().next());
@@ -424,12 +425,14 @@ pub(super) fn apply(
         _ => format!("{insertion} "),
     };
     composer.move_to(token.selection());
-    composer.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-        std::sync::Arc::new(text),
-    )));
+    let change = super::attachment_draft::edit(
+        composer,
+        text_editor::Edit::Paste(std::sync::Arc::new(text)),
+    );
     if next.is_some_and(char::is_whitespace) {
         composer.perform(text_editor::Action::Move(text_editor::Motion::Right));
     }
+    change
 }
 
 /// Whether `character` can be part of a skill's name where it is named in a
@@ -1205,7 +1208,7 @@ mod tests {
         let mut found = token(&composer.text(), at).expect("a token");
         let snapshot = snapshot();
         found.fit(&candidates(&snapshot, &found));
-        apply(&mut composer, &found, insertion);
+        let _ = apply(&mut composer, &found, insertion);
         (composer.text(), composer.cursor().position)
     }
 

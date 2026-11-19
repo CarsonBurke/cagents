@@ -10726,11 +10726,10 @@ impl Cagents {
                 Projection::Full,
             );
         }
-        match workspace_widget::global_shortcut(
-            &event,
-            &self.settings.keyboard_shortcuts,
-            self.focused_pane(),
-        ) {
+        let focused = self.focused_pane();
+        match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts, focused)
+            .filter(|_| !workspace_widget::deferred_shortcut_taken(&event, captured, focused))
+        {
             Some(command) => {
                 let modifiers = match event {
                     keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
