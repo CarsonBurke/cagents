@@ -1994,6 +1994,49 @@ fn native_child_identity_uses_its_reported_model_and_waiting_state() {
     assert_eq!(Runtime::native_child_status(&child), "Finished");
 }
 
+/// A Claude agent stopped by its account's usage limit says so on its own
+/// row, while the conversation reads as working, not as waiting for input.
+#[test]
+fn a_child_on_a_usage_limit_says_so_without_the_conversation_waiting_on_the_reader() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let limit = "Claude: rate_limit\nYou've hit your weekly limit · resets Nov 23, 9am";
+    let mut error = chat::Item {
+        id: "claude-limit:0".into(),
+        role: chat::Role::Assistant,
+        at: None,
+        started_at: None,
+        content: ItemContent::Text {
+            text: limit.into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        },
+    };
+    assert!(chat::failure::mark_provider_error(
+        runtime.session.launch.provider,
+        &mut error
+    ));
+    let mut child = native_child_fixture();
+    child.detail = limit.into();
+    child.items.push(Arc::new(error));
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(child.clone());
+    let summary = chat::failure::summary(runtime.session.launch.provider, limit).into_owned();
+    assert!(summary.contains("weekly limit reached"), "{summary}");
+    assert_eq!(
+        runtime.timeline_activity(false, Some(&child)),
+        Some((Icon::AgentWorking, summary.clone()))
+    );
+    assert!(runtime.native_child_identity(&child).contains(&summary));
+    assert_eq!(
+        runtime.snapshot.activity(),
+        crate::agent::ActivityState::Working
+    );
+    let (glyph, label) = runtime.conversation_status(false);
+    assert_eq!(glyph, Some(Icon::AgentWorking), "{label}");
+    assert!(!label.contains("waiting"), "{label}");
+}
+
 #[test]
 fn cold_child_find_acceptance_changes_retained_revision_without_another_query_edit() {
     use iced::advanced::{layout, widget::Tree};

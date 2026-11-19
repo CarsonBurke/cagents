@@ -1506,6 +1506,51 @@ fn a_stopped_update_leads_with_its_steps_whichever_build_wrote_it() {
 }
 
 #[test]
+fn a_pane_named_with_the_details_label_keeps_its_whole_name_in_the_message() {
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry. Details: refused.";
+    let notice = incomplete_notice(report);
+    assert_eq!(
+        notice.message,
+        "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry."
+    );
+    assert_eq!(notice.details.as_deref(), Some("refused"));
+}
+
+#[test]
+fn an_update_failure_keeps_a_quoted_name_holding_the_details_label() {
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry. Details: refused.";
+    let failure = update_failure(&format!("primary: {report}; window-2: {report}"));
+    assert_eq!(
+        failure.notice.message,
+        "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry."
+    );
+    assert_eq!(failure.notice.details.as_deref(), Some("refused"));
+}
+
+#[test]
+fn a_name_without_details_keeps_no_details() {
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry.";
+    let message = "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry.";
+    let notice = incomplete_notice(report);
+    assert_eq!(notice.message, message);
+    assert_eq!(notice.details, None);
+    let failure = update_failure(&format!("primary: {report}; window-2: {report}"));
+    assert_eq!(failure.notice.message, message);
+    assert_eq!(failure.notice.details, None);
+}
+
+#[test]
+fn pane_titles_cannot_close_their_own_quotes() {
+    for title in ["a\u{201d} Details: b", "a\u{201c} Details: b"] {
+        let title = pane_title(title);
+        assert!(!title.contains(['\u{201c}', '\u{201d}']));
+        let message = format!("1 saved pane could not reconnect: \u{201c}{title}\u{201d}.");
+        let report = format!("{message} Details: refused.");
+        assert_eq!(split_details(&report), (message.as_str(), Some("refused.")));
+    }
+}
+
+#[test]
 fn a_failed_update_reads_without_window_slots_or_the_handshake_prefix() {
     let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry. Details: refused; try later.";
     let failure = update_failure(&format!("primary: {report}; window-2: {report}"));

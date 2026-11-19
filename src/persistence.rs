@@ -34,11 +34,15 @@ use crate::{
 mod refusal;
 #[cfg(feature = "ui")]
 mod review_cache;
+#[cfg(feature = "ui")]
+mod update_resume;
 
 #[cfg(test)]
 mod history_scale;
 pub(crate) use refusal::invalid_state;
 pub use refusal::{RefusedCheck, Violation};
+#[cfg(feature = "ui")]
+pub use update_resume::{Taken, UpdateResumeStore};
 
 // Format 12 introduces retained Claude descriptors that older readers cannot
 // decode safely. Admission must reject them before partial workspace loading

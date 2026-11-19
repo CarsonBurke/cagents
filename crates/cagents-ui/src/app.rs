@@ -69,6 +69,7 @@ mod terminal_failure;
 mod terminal_output_tests;
 mod terminal_save;
 mod terminal_ui;
+mod update_resume;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
@@ -1261,6 +1262,11 @@ struct OwedProjection {
     /// The shared workspace model changed, so the replica snapshot is
     /// materialized before chrome reads it.
     model_update: bool,
+    /// The window's saved view changed. It is captured once the projection
+    /// has rebound what the view shows, such as the source-control panel's
+    /// worktree and its filter, so the save never holds the binding being
+    /// replaced.
+    save_view: bool,
 }
 
 impl OwedProjection {
@@ -1271,6 +1277,15 @@ impl OwedProjection {
             camera_only: false,
             reconcile_row_selection: false,
             model_update: false,
+            save_view: false,
+        }
+    }
+
+    /// This projection, then a save of the window's view.
+    fn saving_view(self) -> Self {
+        Self {
+            save_view: true,
+            ..self
         }
     }
 
@@ -1283,6 +1298,7 @@ impl OwedProjection {
             projection,
             reconcile_row_selection: self.reconcile_row_selection || other.reconcile_row_selection,
             model_update: self.model_update || other.model_update,
+            save_view: self.save_view || other.save_view,
         }
     }
 
@@ -5189,6 +5205,7 @@ pub enum Message {
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
     UpdateUi(update_ui::Action),
+    UpdateResume(update_resume::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
     SidebarSelection(sidebar_selection_ui::Action),
@@ -5897,6 +5914,7 @@ pub struct Cagents {
     chat_ui: chat_ui::State,
     resume_ui: resume_ui::State,
     update_ui: update_ui::State,
+    update_resume: update_resume::State,
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
@@ -12973,6 +12991,8 @@ impl Cagents {
     /// a session restoring, a project list arriving. Rebinding drops the
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
+        #[cfg(test)]
+        terminal_output_tests::record_source_control_rebind();
         // Work chosen in the inspector binds the panel without moving the
         // list's selection, which stays with the focused card.
         self.sidebar_state
@@ -15270,6 +15290,8 @@ impl Cagents {
     }
 
     fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
+        #[cfg(test)]
+        terminal_output_tests::record_settings_capture();
         if self.settings_write_blocked {
             return Err(
                 "settings were not loaded successfully; use Reset all settings to replace them"
@@ -15306,6 +15328,8 @@ impl Cagents {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
+        #[cfg(test)]
+        terminal_output_tests::record_captured_view(&view.sidebar);
         self.settings_save_generation += 1;
         Ok(SettingsSave {
             generation: self.settings_save_generation,
@@ -16058,6 +16082,12 @@ impl Application for Cagents {
                 .copied()
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
+        // A window that keeps no state records nothing for the others.
+        let update_resume = if session.is_some() {
+            update_resume::State::shared()
+        } else {
+            update_resume::State::default()
+        };
         let mut app = Self {
             startup_gate: startup_gate::State::default(),
             core,
@@ -16157,6 +16187,7 @@ impl Application for Cagents {
             chat_ui,
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
+            update_resume,
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
@@ -17130,6 +17161,7 @@ impl Application for Cagents {
                 .view()
                 .map(Message::OperationRecovery),
             self.daemon_health_banner(),
+            self.update_resume_banner(),
             self.automation_approval_banner(),
             bar,
         ])
@@ -17993,6 +18025,7 @@ impl Cagents {
                 self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
+            Message::UpdateResume(action) => self.update_update_resume(action),
             Message::StartupWindowOpened(window) => {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
@@ -19486,7 +19519,7 @@ impl Cagents {
                 committed,
             } => handled!(self.source_control_mutated(key, operation, report, committed)),
         };
-        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update });
+        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
         task
             })();
         Task::batch([settled, task])
@@ -19513,7 +19546,7 @@ impl Cagents {
         } = entry;
         #[rustfmt::skip]
         let task = (|| {
-        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update }) = self.owed_projection.take() else {
+        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update, save_view }) = self.owed_projection.take() else {
             return task;
         };
         // Scoped proof was established during dispatch. Settings commit and
@@ -19626,9 +19659,15 @@ impl Cagents {
                 reconcile_row_selection,
             ),
         ]);
+        let saved = if save_view {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         Task::batch([
             task,
             projected,
+            saved,
             self.release_deferred_navigation_if_unblocked(),
         ])
             })();

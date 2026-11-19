@@ -536,6 +536,15 @@ pub(super) fn scope_focus<'a>(
         .or_else(|| cards.clone().next().map(|card| card.id))
 }
 
+/// The cards some channel holds, which no worktree's strip shows.
+fn channeled_cards(state: &WorkspaceState) -> HashSet<CardId> {
+    state
+        .channels
+        .iter()
+        .flat_map(|channel| channel.cards.iter().copied())
+        .collect()
+}
+
 /// A view descriptor, not a replacement for the persisted workspace. Global
 /// cards stay available; closing a card and hiding its worktree are unrelated.
 fn scope_descriptor(
@@ -548,13 +557,7 @@ fn scope_descriptor(
     let selected_channel = state
         .active_channel
         .and_then(|id| state.channels.iter().find(|channel| channel.id == id));
-    let channel_cards = selected_channel.is_none().then(|| {
-        state
-            .channels
-            .iter()
-            .flat_map(|channel| channel.cards.iter().copied())
-            .collect::<HashSet<_>>()
-    });
+    let channel_cards = selected_channel.is_none().then(|| channeled_cards(state));
     let cards = state.cards.filtered(|card| {
         selected_channel.map_or_else(
             || {
@@ -937,12 +940,7 @@ impl Cagents {
         self.worktree_paths
             .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
         let index = &self.worktree_paths;
-        let channeled = self
-            .durable
-            .channels
-            .iter()
-            .flat_map(|channel| channel.cards.iter().copied())
-            .collect::<HashSet<_>>();
+        let channeled = channeled_cards(&self.durable);
         // One resolution per pane serves both occupancy and where the pane
         // rows place a pane that has nothing to show.
         let mut occupied = HashSet::new();
@@ -998,7 +996,12 @@ impl Cagents {
         self.refresh_attention_projection();
     }
 
+    /// The worktree `card` belongs to, if it is in no channel. This searches
+    /// every channel for the card; a pass over many cards looks them up in
+    /// [`channeled_cards`] and calls [`Self::unchanneled_card_worktree_indexed`].
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
+        #[cfg(test)]
+        tests::CHANNEL_SEARCHES.set(tests::CHANNEL_SEARCHES.get() + 1);
         if self
             .durable
             .channels
@@ -1164,18 +1167,21 @@ impl Cagents {
             .iter()
             .map(PathBuf::as_path)
             .collect::<Vec<_>>();
+        // Each pane is looked up in the channels' members, collected once,
+        // and in the root index refreshed with the owners above, rather than
+        // searching every channel and every known root for it.
+        let channeled = channeled_cards(&self.durable);
+        let worktree_roots = &self.worktree_paths;
+        let in_selected_worktree = |card: &CardState| {
+            !channeled.contains(&card.id)
+                && self.unchanneled_card_worktree_indexed(card, &worktree_roots)
+                    == Some(path.as_path())
+        };
         // Ownership and selected scope were resolved against the same canonical roots.
         let has_terminal = self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
-                && !self
-                    .durable
-                    .channels
-                    .iter()
-                    .any(|channel| channel.cards.contains(&card.id))
-                && self
-                    .card_worktree(card)
-                    .is_some_and(|directory| directory == path)
+                && in_selected_worktree(card)
         });
         let was_channel = self.durable.active_channel.is_some();
         if self.active_workspace.as_ref() == Some(&path)
@@ -1185,11 +1191,7 @@ impl Cagents {
                 .cards
                 .iter()
                 .filter(|card| {
-                    !self
-                        .durable
-                        .channels
-                        .iter()
-                        .any(|channel| channel.cards.contains(&card.id))
+                    !channeled.contains(&card.id)
                         && belongs_to_scope(card, &path, &roots, &self.worktree_owners)
                 })
                 .map(|card| card.id))
@@ -1212,7 +1214,7 @@ impl Cagents {
                     && self.durable.cards.iter().any(|card| {
                         card.existence.is_open()
                             && card_directory(card) == Some(previous.as_path())
-                            && self.card_worktree(card) == Some(path.as_path())
+                            && in_selected_worktree(card)
                     })
             });
         if !was_channel && let Some(previous) = &self.active_workspace {
@@ -1553,6 +1555,68 @@ impl Cagents {
 mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectChannel};
+
+    thread_local! {
+        /// How many cards this thread has searched every channel for.
+        pub(super) static CHANNEL_SEARCHES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// Showing a worktree asks of every pane whether it is in a channel and
+    /// which worktree it belongs to. It answers from one set of channel
+    /// members and one root index, never by searching every channel for
+    /// each pane, which made a switch cost panes times channel members.
+    #[test]
+    fn showing_a_worktree_never_searches_the_channels_for_each_pane() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
+        let project_id = app.sidebar_model.projects[0].id;
+        let mut cards = Vec::new();
+        for index in 0..48 {
+            cards.push(terminal(if index % 2 == 0 {
+                "/repo"
+            } else {
+                "/repo/worktree"
+            }));
+        }
+        let channels = cards
+            .chunks(8)
+            .take(3)
+            .map(|chunk| ProjectChannel {
+                title_source: Default::default(),
+                id: ChannelId::new(),
+                project_id,
+                title: "Channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: chunk[..4].iter().map(|card| card.id).collect(),
+                focused: None,
+            })
+            .collect::<Vec<_>>();
+        let card_count = cards.len();
+        app.durable = Arc::new(WorkspaceState {
+            cards: cards.into(),
+            active_worktree: Some("/repo".into()),
+            channels,
+            ..WorkspaceState::default()
+        });
+        let _ = app.restore_worktree_scope();
+
+        CHANNEL_SEARCHES.set(0);
+        // Each worktree has a terminal of its own, so none gains a default
+        // pane: entering one, and showing the one already shown.
+        let (shown, _) = app.select_worktree_checked("/repo/worktree".into(), true);
+        assert!(shown);
+        let (shown, _) = app.select_worktree_checked("/repo/worktree".into(), true);
+        assert!(shown);
+        let (shown, _) = app.navigate_to_worktree_checked("/repo".into(), true);
+        assert!(shown);
+        assert_eq!(CHANNEL_SEARCHES.get(), 0);
+        assert_eq!(app.durable.cards.len(), card_count);
+        assert_eq!(app.active_workspace.as_deref(), Some(Path::new("/repo")));
+        // Of the twenty-four terminals in /repo, the channels hold six.
+        assert_eq!(app.workspace.order().count(), 18);
+    }
 
     #[test]
     fn selected_worktrees_and_channels_never_mix_unrelated_panes() {

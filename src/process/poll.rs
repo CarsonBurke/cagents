@@ -205,11 +205,37 @@ fn timeout_milliseconds(deadline: Option<Instant>, now: Instant) -> i32 {
     })
 }
 
+/// A just-written executable may be held open for writing by another thread's
+/// fork until its child execs. Retry with the same bounded policy as
+/// `account::probe::Group::spawn` while that executable is briefly busy.
+fn spawn_unless_busy(spec: &CommandSpec, cancellation: &CancellationToken) -> io::Result<Child> {
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match spec.to_command().spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && delay <= Duration::from_millis(160) =>
+            {
+                if cancellation.is_cancelled() {
+                    return Err(error);
+                }
+                thread::sleep(delay);
+                if cancellation.is_cancelled() {
+                    return Err(error);
+                }
+                delay *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(super) fn execute(
     spec: &CommandSpec,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessFailure> {
-    let mut child = spec.to_command().spawn().map_err(|error| {
+    let mut child = spawn_unless_busy(spec, cancellation).map_err(|error| {
         process_failure(spec, ProcessFailureKind::Spawn, &error.to_string(), false)
     })?;
     let identity = child_identity(&child);
@@ -466,6 +492,65 @@ pub(super) fn execute(
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn hold_executable_open_for_writing(path: &Path) -> Child {
+        fs::write(path, b"#!/bin/sh\nprintf started\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "exec 3>>\"$1\"; echo ready; read _", "writer"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(writer.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        writer
+    }
+
+    #[test]
+    fn a_briefly_busy_executable_starts_once_its_writer_closes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("run");
+        let mut writer = hold_executable_open_for_writing(&path);
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(writer.stdin.take());
+            writer.wait().unwrap();
+        });
+        let result = SystemProcessExecutor.execute(
+            &CommandSpec::new(&path).timeout(Duration::from_secs(5)),
+            &CancellationToken::new(),
+        );
+        release.join().unwrap();
+        let output = result.unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, b"started");
+    }
+
+    #[test]
+    fn an_executable_held_open_for_writing_fails_to_start_after_bounded_retries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("run");
+        let mut writer = hold_executable_open_for_writing(&path);
+        let start = Instant::now();
+        let result = SystemProcessExecutor.execute(
+            &CommandSpec::new(&path).timeout(Duration::from_secs(5)),
+            &CancellationToken::new(),
+        );
+        let elapsed = start.elapsed();
+        drop(writer.stdin.take());
+        writer.wait().unwrap();
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::Spawn);
+        assert!(!failure.started);
+        assert!(elapsed < Duration::from_secs(2));
+    }
 
     #[test]
     fn readiness_wait_uses_the_deadline_instead_of_a_polling_interval() {
