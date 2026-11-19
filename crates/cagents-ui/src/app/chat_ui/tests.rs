@@ -8027,6 +8027,46 @@ fn a_chooser_refusal_survives_a_deferred_account_change() {
     assert!(runtime.attachment_chooser_pending.is_none());
 }
 
+/// Another window switching the draft to Codex while the chooser is open
+/// decides which files the choice may attach, not the provider it opened on.
+#[test]
+fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.accepts_draft_attachments());
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+    let mut chosen = runtime.session.clone();
+    chosen.launch.provider = Provider::Codex;
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(chosen);
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session.launch.provider, Provider::Codex);
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+        )
+    );
+    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.pastes_pending, 0);
+    assert!(!ticket.active());
+    assert!(runtime.attachment_jobs.is_empty());
+}
+
 #[test]
 fn attach_files_still_stages_images_for_an_images_only_provider() {
     let _admission = attachment_draft::test_admission();

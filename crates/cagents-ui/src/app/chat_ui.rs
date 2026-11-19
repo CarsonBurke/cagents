@@ -15317,29 +15317,35 @@ impl Cagents {
                 });
             }
             Action::Attached(target, id, result) => {
+                // The draft takes up what another window chose while its
+                // chooser was open only once the choice has ended, so the
+                // files are judged by the provider it is about to adopt.
+                let provider = self
+                    .card_state(target.card)
+                    .and_then(|state| match &state.kind {
+                        CardKind::Chat(session) => Some(session.launch.provider),
+                        _ => None,
+                    });
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if runtime.attachment_chooser_pending != Some(id.id) {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
-                    let adopted = self.adopt_stored_draft_session(target.card);
-                    let Some(runtime) = self.chat_runtime_mut(target) else {
-                        return adopted;
-                    };
+                    let mut refusal = None;
                     let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
                         Task::none()
                     } else {
                         match result {
                             Ok(Some(paths)) => {
                                 let rules = chat::AttachmentRules::for_provider(
-                                    runtime.session.launch.provider,
+                                    provider.unwrap_or(runtime.session.launch.provider),
                                 );
                                 if rules.images_only
                                     && paths.iter().any(|path| !chat::is_image_path(path))
                                 {
-                                    runtime.cancel_attachment_insert(
-                                        id.id,
-                                        Some("This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.".into()),
+                                    runtime.cancel_attachment_insert(id.id, None);
+                                    refusal = Some(
+                                        "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.",
                                     );
                                     Task::none()
                                 } else {
@@ -15356,7 +15362,17 @@ impl Cagents {
                             }
                         }
                     };
-                    return Task::batch([adopted, staged]);
+                    // With the choice settled the draft can catch up, which
+                    // may attach it to a conversation another window started.
+                    let adopted = self.adopt_stored_draft_session(target.card);
+                    // Adopting another account clears its failed start's
+                    // reason, but a refusal is about the files just chosen.
+                    if let Some(refusal) = refusal
+                        && let Some(runtime) = self.chat_runtime_mut(target)
+                    {
+                        runtime.error = Some(refusal.into());
+                    }
+                    return Task::batch([staged, adopted]);
                 }
             }
             Action::Dropped(target, payload) => {
