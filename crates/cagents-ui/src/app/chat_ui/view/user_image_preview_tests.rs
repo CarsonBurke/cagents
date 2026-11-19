@@ -48,6 +48,8 @@ struct Clicked {
     labels: Vec<(String, Rectangle)>,
     previews: Vec<Rectangle>,
     messages: Vec<Message>,
+    /// The whole prompt's laid out size.
+    size: Size,
 }
 
 /// Lay out the actual prompt widget, inspect its displayed text and
@@ -141,6 +143,7 @@ fn click_prompt(renderer: &cosmic::Renderer, runtime: &Runtime, item: &chat::Ite
         labels: prompt.labels,
         previews,
         messages,
+        size: node.size(),
     }
 }
 
@@ -153,10 +156,13 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
     let Clicked {
         texts, messages, ..
     } = click_prompt(&renderer, &runtime, &item);
+    // The picture is the control; it names itself in its tooltip rather
+    // than in a caption repeated under every image.
     assert!(
-        texts
+        !texts
             .iter()
-            .any(|text| text == "Image 17 · Click to enlarge")
+            .any(|text| text.contains("Image 17") || text.contains("Click to enlarge")),
+        "{texts:?}"
     );
     assert!(
         !texts
@@ -306,9 +312,8 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
         texts, messages, ..
     } = click_prompt(&renderer, runtime, &child);
     assert!(
-        texts
-            .iter()
-            .any(|text| text == "Image 47 · Click to enlarge")
+        !texts.iter().any(|text| text.contains("Click to enlarge")),
+        "{texts:?}"
     );
     assert!(matches!(messages.as_slice(),
         [Message::ChatUi(Action::OpenImage(found, id))] if *found == target && id == &child.id));
@@ -352,7 +357,7 @@ fn uncached_managed_user_image_keeps_its_stable_label() {
 }
 
 #[test]
-fn a_wide_short_attachment_hugs_its_picture_with_the_caption_beneath() {
+fn a_wide_short_attachment_hugs_its_picture_with_no_caption_beneath() {
     let item = image("wide-user-image", 5);
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
     ready_sized(runtime.cache.get_mut(&item.id).unwrap(), 2400, 300);
@@ -363,9 +368,12 @@ fn a_wide_short_attachment_hugs_its_picture_with_the_caption_beneath() {
         messages,
         ..
     } = click_prompt(&renderer, &runtime, &item);
-    let [preview] = previews.as_slice() else {
+    let [button] = previews.as_slice() else {
         panic!("one preview button: {previews:?}");
     };
+    // The button rings the picture with its hover and focus highlight.
+    let inset = f32::from(images::tiles::INSET);
+    let preview = &button.shrink(inset);
     // The prompt draws within 600 px, less its own padding: the picture
     // fills that width at its own ratio, with no letterbox bands around it.
     assert!(
@@ -376,15 +384,9 @@ fn a_wide_short_attachment_hugs_its_picture_with_the_caption_beneath() {
         (preview.width / preview.height - 8.0).abs() < 0.05,
         "the button is the picture's own shape: {preview:?}"
     );
-    let caption = labels
-        .iter()
-        .find(|(text, _)| text == "Image 5 · Click to enlarge")
-        .map(|(_, bounds)| *bounds)
-        .expect("the preview keeps its caption");
-    let gap = caption.y - (preview.y + preview.height);
     assert!(
-        (0.0..=step::GAP_S).contains(&gap),
-        "the caption sits just beneath the picture: {gap} px"
+        !labels.iter().any(|(text, _)| text.contains("Image 5")),
+        "the picture alone, with no caption: {labels:?}"
     );
     assert!(matches!(messages.as_slice(),
         [Message::ChatUi(Action::OpenImage(target, id))]
@@ -398,9 +400,11 @@ fn a_tall_attachment_keeps_to_the_height_cap_at_its_own_ratio() {
     ready_sized(runtime.cache.get_mut(&item.id).unwrap(), 400, 2000);
     let renderer = crate::app::tests::headless_renderer();
     let Clicked { previews, .. } = click_prompt(&renderer, &runtime, &item);
-    let [preview] = previews.as_slice() else {
+    let [button] = previews.as_slice() else {
         panic!("one preview button: {previews:?}");
     };
+    // The picture, within the ring its focus and hover draw.
+    let preview = &button.shrink(f32::from(images::tiles::INSET));
     assert!(
         (preview.height - images::preview::MAX_HEIGHT).abs() < 0.5
             && (preview.width - 72.0).abs() < 0.5,
@@ -430,15 +434,7 @@ fn an_attachment_read_again_keeps_its_room_until_its_pixels_return() {
         )),
     );
     let renderer = crate::app::tests::headless_renderer();
-    let caption = |runtime: &Runtime, text: &str| {
-        click_prompt(&renderer, runtime, &item)
-            .labels
-            .into_iter()
-            .find(|(label, _)| label == text)
-            .map(|(_, bounds)| bounds)
-            .unwrap_or_else(|| panic!("{text:?} is shown"))
-    };
-    let shown = caption(&runtime, "Image 7 · Click to enlarge");
+    let shown = click_prompt(&renderer, &runtime, &item).size;
 
     // Leaving the conversation releases the pixels; returning reads them again.
     runtime.visible.store(false, Ordering::Relaxed);
@@ -447,9 +443,17 @@ fn an_attachment_read_again_keeps_its_room_until_its_pixels_return() {
     images::sync(&mut runtime);
     let cached = &runtime.cache[&item.id];
     assert!(cached.image.is_none() && cached.image_source.is_some());
-    let loading = caption(&runtime, "Image 7 · Loading preview…");
+    let loading = click_prompt(&renderer, &runtime, &item);
+    assert!(
+        loading
+            .texts
+            .iter()
+            .any(|text| text == "Image 7 · Loading preview…"),
+        "{:?}",
+        loading.texts
+    );
     assert_eq!(
-        loading.y, shown.y,
-        "the caption stays where the returning picture puts it"
+        loading.size, shown,
+        "the prompt keeps the size the returning picture gives it"
     );
 }

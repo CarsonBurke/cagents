@@ -460,6 +460,9 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
     let mut cached = CachedItem::new(&content, runtime.syntax_theme);
     let shown = iced::widget::image::Handle::from_rgba(1, 1, vec![9, 8, 7, 255]);
     cached.image = Some(shown.clone());
+    // Pixels small enough to be the whole picture, so copying them reads
+    // nothing again.
+    cached.image_whole = true;
     runtime.cache.insert("image".into(), cached);
     Arc::make_mut(&mut runtime.snapshot).items = vec![
         chat::Item {
@@ -494,6 +497,26 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
     assert_eq!(copied(&mut app, effects), ["image/png"]);
     assert_eq!(notice(&app).1, "Copied image");
 
+    // A preview reduced to its tile is copied whole from its file, read
+    // again; this one's file is gone, so it says so rather than copying the
+    // reduced pixels.
+    let cached = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .cache
+        .get_mut("image")
+        .unwrap();
+    cached.image_whole = false;
+    let effects = run(app.image_command(preview, images::ImageCommand::Copy));
+    assert!(copied(&mut app, effects).is_empty());
+    assert_ne!(notice(&app).1, "Copied image");
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .cache
+        .get_mut("image")
+        .unwrap()
+        .image_whole = true;
+
     // A menu opened on pixels that have since been replaced acts on nothing.
     app.chat_runtime_mut(target)
         .unwrap()
@@ -516,7 +539,13 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
 
     // Open image from the menu opens the viewer on the same pixels.
     drop(app.image_command(preview, images::ImageCommand::Open));
-    let viewer = app.chat_ui.image_viewer.as_ref().unwrap().selected_image();
+    let viewer = app
+        .chat_ui
+        .image_viewer
+        .as_ref()
+        .unwrap()
+        .selected_image()
+        .unwrap();
     assert_eq!(viewer, images::ImageRef::Viewer(shown.id()));
     assert!(Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
     assert!(Action::ImageCopied(text_copy::Intent::begin(), Ok(None)).allowed_while_modal());
@@ -1049,7 +1078,7 @@ fn preview_interest_bounds_manual_requests_and_suppresses_over_budget_recent_can
                 .values()
                 .filter(|cached| cached.image_source.is_some())
                 .count()
-                <= 9
+                <= images::RECENT_IMAGES + 1
         );
     }
     assert!(runtime.cache[&items[0].id].image_source.is_none());
