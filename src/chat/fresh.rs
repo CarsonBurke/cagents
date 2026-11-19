@@ -77,8 +77,9 @@ fn arity(provider: Provider, flag: &str) -> Option<ArgumentArity> {
             | "--yolo" => Some(Switch),
             _ => None,
         },
-        Provider::Omp => {
-            if provider.is_value_option(flag) || flag == "--mode" {
+        // An ACP agent's terminal options are all it is started with.
+        Provider::Omp | Provider::Antigravity | Provider::Muse => {
+            if provider.is_value_option(flag) || (provider == Provider::Omp && flag == "--mode") {
                 Some(Value)
             } else if provider.is_switch(flag) {
                 Some(Switch)
@@ -86,8 +87,6 @@ fn arity(provider: Provider, flag: &str) -> Option<ArgumentArity> {
                 None
             }
         }
-        // No native conversation of theirs exists to start afresh.
-        Provider::Antigravity | Provider::Muse => None,
     }
 }
 

@@ -255,9 +255,9 @@ fn foreign_originals(
             original.owner.holder
         );
         let stat = fs::read_to_string(format!("/proc/{}/stat", original.owner.holder.pid)).unwrap();
-        let fields = stat.rsplit_once(')').unwrap().1.split_whitespace();
+        let mut fields = stat.rsplit_once(')').unwrap().1.split_whitespace();
         assert_eq!(
-            fields.skip(1).next().unwrap().parse::<u32>().unwrap(),
+            fields.nth(1).unwrap().parse::<u32>().unwrap(),
             std::process::id(),
             "the isolated fixture must own its orphaned holder's final wait"
         );

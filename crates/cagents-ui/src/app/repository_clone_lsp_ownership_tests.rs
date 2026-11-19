@@ -451,8 +451,8 @@ fn settle_navigation(
         .as_widget_mut()
         .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
     let _ = probe.finish();
-    let answer = found.lock().expect("the probe survived").clone();
-    answer
+
+    found.lock().expect("the probe survived").clone()
 }
 
 #[test]

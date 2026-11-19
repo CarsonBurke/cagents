@@ -123,10 +123,9 @@ fn append_display_output(
     // single-line output preserve a UTF-8-safe suffix instead.
     if start > 0
         && let Some(line) = tail[start..].find('\n')
+        && start + line + 1 < tail.len()
     {
-        if start + line + 1 < tail.len() {
-            start += line + 1;
-        }
+        start += line + 1;
     }
     window.omitted = window.omitted.saturating_add(start);
     window.head = head.len();
@@ -159,7 +158,7 @@ fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
 /// Record a provider-confirmed rotation in the recipe: rewrites the `resume`
 /// thread ID `create()` validates so a checkpointed launch stays
 /// self-consistent. Only call with the live provider's own identity.
-pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         if arguments[index] == "resume" {
@@ -1596,23 +1595,21 @@ impl Codex {
                 return Err("Codex did not return full turn items as requested; history cannot be hydrated safely".into());
             }
             for value in array(turn, "items")? {
-                if !active && value["type"] == "userMessage" {
-                    if let Some(label) = value["content"]
+                if !active
+                    && value["type"] == "userMessage"
+                    && let Some(label) = value["content"]
                         .as_array()
                         .into_iter()
                         .flatten()
                         .find_map(|input| input["text"].as_str())
                         .and_then(crate::account::clean_label)
-                    {
-                        if !self.branch_points.iter().any(|point| point.id == turn_id)
-                            && self.branch_points.len() < 128
-                        {
-                            self.branch_points.push(chat::BranchPoint {
-                                id: turn_id.into(),
-                                label,
-                            });
-                        }
-                    }
+                    && !self.branch_points.iter().any(|point| point.id == turn_id)
+                    && self.branch_points.len() < 128
+                {
+                    self.branch_points.push(chat::BranchPoint {
+                        id: turn_id.into(),
+                        label,
+                    });
                 }
                 if value["type"] == "collabAgentToolCall" {
                     for id in value["receiverThreadIds"]
@@ -3345,12 +3342,10 @@ impl Codex {
                     // it. Retain any known terminal proof for that exact ACK.
                     if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                         matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
-                    {
-                        if let Some(context) = early.get_mut(turn_id) {
+                        && let Some(context) = early.get_mut(turn_id) {
                             step.notification_preview = Some(std::mem::take(&mut context.preview).at_observed_start());
                             context.preview_transferred = true;
                         }
-                    }
                     self.notification_revision = self.notification_revision.wrapping_add(1);
                     self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
@@ -3572,7 +3567,7 @@ impl Codex {
                     };
                     format!("{base}/{kind}/{index}")
                 } else {
-                    base.into()
+                    base
                 };
                 step.events.push(Event::TextDelta {
                     id,
@@ -3638,11 +3633,11 @@ impl Codex {
                 // The patch is parsed only once there is an item to hold it, so
                 // a notification for an item this adapter never tracked cannot
                 // fail the session over a patch nothing would render.
-                if let Some(item) = self.active_items.get_mut(&id) {
-                    if let ItemContent::Changes { changes, .. } = &mut item.content {
-                        *changes = file_changes(params)?;
-                        step.events.push(Event::Item(item.clone()));
-                    }
+                if let Some(item) = self.active_items.get_mut(&id)
+                    && let ItemContent::Changes { changes, .. } = &mut item.content
+                {
+                    *changes = file_changes(params)?;
+                    step.events.push(Event::Item(item.clone()));
                 }
             }
             "serverRequest/resolved" => {
@@ -3790,9 +3785,9 @@ impl Codex {
             // requests are visibly rejected above.
             _ => {}
         }
-        if step.suppress_current_notification {
-            if let Some(turn) = notification_frame_turn {
-                if let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
+        if step.suppress_current_notification
+            && let Some(turn) = notification_frame_turn
+                && let Some(Pending::Turn { early, .. }) = self.pending.values_mut().find(|pending|
                     matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
                 {
                     if !early.contains_key(&turn) && early.len() >= 8 {
@@ -3801,8 +3796,6 @@ impl Codex {
                     let context = early.entry(turn).or_default();
                     for event in &step.events { context.preview.observe(event); }
                 }
-            }
-        }
         Ok(step)
     }
 }
@@ -4685,15 +4678,14 @@ fn parse_item_with_windows(
         } else {
             MAX_ITEM_BYTES
         };
-        if bytes > MAX_ITEM_BYTES {
-            if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
+        if bytes > MAX_ITEM_BYTES
+            && let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
                 &mut item.content
-            {
-                let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
-                // Completed items replace streamed items, so apply the same bound.
-                let full = std::mem::take(output);
-                append_display_output(output, &full, limit, &mut window);
-            }
+        {
+            let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+            // Completed items replace streamed items, so apply the same bound.
+            let full = std::mem::take(output);
+            append_display_output(output, &full, limit, &mut window);
         }
         if item.content.byte_len() > limit {
             return Err("Codex item exceeds native client size bound".into());

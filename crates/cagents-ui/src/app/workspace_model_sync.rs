@@ -998,11 +998,10 @@ impl Cagents {
                         .any(|held| held.repository == order.repository)
             });
             model.views.retain(|view| {
-                !self
-                    .shared_views
+                self.shared_views
                     .scope_absences
                     .get(&view.scope)
-                    .is_some_and(|absence| *absence > sequence)
+                    .is_none_or(|absence| *absence <= sequence)
             });
             for view in &self.workspace_model.views {
                 let previous = model.views.iter().find(|held| held.scope == view.scope);
@@ -2211,8 +2210,8 @@ impl Cagents {
     /// rather than by a request of its own.
     ///
     /// Nothing happens at all until a registry has answered. The window
-    /// reconciles on its own events too - a repository finishing loading is one
-    /// - and the cached model starts out as a [`WorkspaceModel::default`], whose
+    /// reconciles on its own events too - a repository finishing loading is one -
+    /// and the cached model starts out as a [`WorkspaceModel::default`], whose
     /// emptiness is not a registry's emptiness. Publishing against it would be
     /// premature and retiring against it would be destruction.
     pub(super) fn reconcile_workspace_model(&mut self) -> Task<Message> {

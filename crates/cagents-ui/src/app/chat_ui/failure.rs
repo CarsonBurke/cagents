@@ -738,7 +738,7 @@ impl State {
                 runtime,
                 &child.items,
                 |item| Source::ChildItem(child.id.clone(), item.id.clone()),
-                &item_context,
+                item_context,
             );
             let mut latest = None;
             for item in &child.items {

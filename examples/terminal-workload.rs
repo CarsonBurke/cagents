@@ -393,17 +393,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     finished[index] = exited[index] && complete[index];
                     observations += 1;
                     generations[index] = snapshot.generation;
-                    if input_mode && index == 0 && probe < 30 {
-                        if text.contains(&format!("PROBE:{probe}")) {
-                            latencies.push(sent_at.elapsed().as_nanos() as u64);
-                            probe += 1;
-                            sent_at = Instant::now();
-                            handle.input(if probe == 30 {
-                                b"exit\n".to_vec()
-                            } else {
-                                format!("{probe}\n").into_bytes()
-                            })?;
-                        }
+                    if input_mode
+                        && index == 0
+                        && probe < 30
+                        && text.contains(&format!("PROBE:{probe}"))
+                    {
+                        latencies.push(sent_at.elapsed().as_nanos() as u64);
+                        probe += 1;
+                        sent_at = Instant::now();
+                        handle.input(if probe == 30 {
+                            b"exit\n".to_vec()
+                        } else {
+                            format!("{probe}\n").into_bytes()
+                        })?;
                     }
                     handle.acknowledge_redraw(snapshot.generation);
                 }
@@ -429,14 +431,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|bytes| u128::from(bytes) * 1_000_000_000 >= 50 * 1024 * 1024 * wall_ns);
         let batches: u64 = if let Some(control) = &mut control {
             let ids: Vec<_> = handles.iter().filter_map(BenchTerminal::id).collect();
-            let batches = control
+
+            control
                 .list()?
                 .iter()
                 .filter(|terminal| ids.contains(&terminal.session.id))
                 .filter_map(|terminal| terminal.activity)
                 .map(|fact| fact.sequence)
-                .sum();
-            batches
+                .sum()
         } else {
             handles
                 .iter()

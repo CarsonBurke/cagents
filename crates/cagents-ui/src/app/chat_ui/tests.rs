@@ -1126,7 +1126,7 @@ fn preview_hide_and_subagent_switch_release_owners_and_fence_late_attempts() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(target).unwrap();
-    preview_items(runtime, &[parent.clone()]);
+    preview_items(runtime, std::slice::from_ref(&parent));
     let parent_attempt = runtime.cache[&parent.id].image_attempt;
     finish_preview(
         runtime,
@@ -1196,13 +1196,16 @@ fn explicit_preview_pressure_can_retire_automatic_owners_in_other_panes() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(owner_target).unwrap();
-    preview_items(runtime, &[old.clone()]);
+    preview_items(runtime, std::slice::from_ref(&old));
     finish_preview(
         runtime,
         &old,
         images::bounded_handle(bytes.clone(), &budget),
     );
-    preview_items(app.chat_runtime_mut(target).unwrap(), &[requested.clone()]);
+    preview_items(
+        app.chat_runtime_mut(target).unwrap(),
+        std::slice::from_ref(&requested),
+    );
     drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
     let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
     drop(app.handle_chat_ui(Action::ImageLoaded(
@@ -2183,7 +2186,7 @@ fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
         1,
         "only parent source is prepared before child selection"
     );
-    assert!(runtime.cache["body-2"].markdown.items().len() > 0);
+    assert!(!runtime.cache["body-2"].markdown.items().is_empty());
     for selected in [Some("child-2"), Some("child-3"), None] {
         drop(app.handle_chat_ui(Action::SelectSubagent(target, selected.map(str::to_owned))));
         let runtime = app.chat_runtime_mut(target).unwrap();
@@ -4639,7 +4642,7 @@ fn a_pane_inspector_overlay_excludes_covered_widgets_and_keeps_other_panes_reach
     let composer = card_control_id(card, "chat-composer");
     let sibling = widget::Id::new("inspector-test.other-pane");
     let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 720.0));
-    let mut tree = Tree::new(&view(&app, card));
+    let mut tree = Tree::new(view(&app, card));
     {
         let mut element = view(&app, card);
         let node = element.as_widget_mut().layout(
@@ -6852,9 +6855,8 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                 .composer
                 .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
 
-            let mut moved = 0;
             let mut boundary = None;
-            for _ in 0..256 {
+            for moved in 0..256 {
                 let before = chat_runtime(&app, card).composer.cursor();
                 composer_history_key(&mut app, card, width, Named::ArrowUp, &renderer);
                 let runtime = chat_runtime(&app, card);
@@ -6872,7 +6874,6 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                     before,
                     "Up must move within the draft"
                 );
-                moved += 1;
             }
             let boundary = boundary.expect("Up eventually reaches native history");
             assert_eq!(
@@ -12587,7 +12588,7 @@ fn stopped_agent_terminal(app: &mut Cagents, arguments: &[&str], exited: bool) -
     terminal.launch = launch.clone();
     terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
         recipe: launch,
-        last_exit: exited.then(|| crate::model::TerminalExit {
+        last_exit: exited.then_some(crate::model::TerminalExit {
             code: Some(0),
             signal: None,
             occurred_at_unix_ms: 1,
@@ -13196,7 +13197,7 @@ fn a_draft_moved_to_another_provider_or_account_is_saved_as_its_new_conversation
     assert_eq!(stored.launch.session_id.as_deref(), Some(fresh_id));
     // A late or repeated press, once nothing offers it, keeps it.
     let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
-    assert!(!app.chat_ui.attempt(card).is_some());
+    assert!(app.chat_ui.attempt(card).is_none());
     assert_eq!(flushed(&app), stored);
 }
 
@@ -17235,7 +17236,7 @@ fn nonretryable_failed_resume_preserves_an_explicit_fresh_start_offer() {
         stopped.secondary,
         Some(("Close", stopped::Press::Close, true))
     );
-    assert_eq!(runtime.stopped(true, false).primary.unwrap().2, false);
+    assert!(!runtime.stopped(true, false).primary.unwrap().2);
     assert!(
         matches!(stopped.primary.unwrap().1.message(runtime.target), Message::ChatUi(Action::StartFresh(fresh)) if fresh == card)
     );

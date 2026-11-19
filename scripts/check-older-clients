@@ -12,28 +12,33 @@ re-proof still needs the Rust test.
 """
 
 import argparse
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 IPC = Path("src/terminal/ipc.rs")
 OLDER_CLIENTS = Path("src/terminal/ipc/older_clients.rs")
 RECORDINGS = Path("tests/fixtures/wire-formats")
+# Variables that would point `git -C ROOT` at another repository.
+GIT_LOCATION = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
 
 
-def problems(root: Path) -> list[str]:
-    ipc = (root / IPC).read_text()
-    version = re.search(r"^pub const PROTOCOL_VERSION: u16 = (\d+);$", ipc, re.MULTILINE)
+def problems_from(ipc: str | None, older: str | None, recording_names: list[str]) -> list[str]:
+    version = re.search(r"^pub const PROTOCOL_VERSION: u16 = (\d+);$", ipc or "", re.MULTILINE)
     if version is None:
         return [f"{IPC}: PROTOCOL_VERSION not found"]
     protocol = int(version.group(1))
-    older = root / OLDER_CLIENTS
-    if not older.is_file():
+    if older is None:
         # Moving the list must move this check with it, not switch it off.
         return [f"{OLDER_CLIENTS} not found: point this check at the older client list"]
     found = []
     recordings = sorted(
-        int(path.stem) for path in (root / RECORDINGS).glob("*.json") if path.stem.isdigit()
+        int(Path(name).stem)
+        for name in recording_names
+        if name.endswith(".json") and Path(name).stem.isdigit()
     )
     if protocol not in recordings:
         found.append(
@@ -44,7 +49,7 @@ def problems(root: Path) -> list[str]:
         found.append(
             f"{RECORDINGS}/{recordings[-1]}.json is newer than PROTOCOL_VERSION {protocol}"
         )
-    proven = [int(value) for value in re.findall(r"\bproven_at: (\d+),", older.read_text())]
+    proven = [int(value) for value in re.findall(r"\bproven_at: (\d+),", older)]
     if not proven:
         found.append(f"{OLDER_CLIENTS}: no literal proven_at found")
     for value in proven:
@@ -54,6 +59,43 @@ def problems(root: Path) -> list[str]:
                 f"{protocol}. Re-prove it against {RECORDINGS}/{protocol}.json, or remove it."
             )
     return found
+
+
+def problems(root: Path) -> list[str]:
+    ipc = (root / IPC).read_text()
+    older = root / OLDER_CLIENTS
+    return problems_from(
+        ipc,
+        older.read_text() if older.is_file() else None,
+        [path.name for path in (root / RECORDINGS).glob("*.json")],
+    )
+
+
+def problems_in_tree(git_root: Path, tree: str) -> list[str] | None:
+    env = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION}
+
+    def git(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(git_root), *args], check=check,
+                              capture_output=True, text=True, env=env)
+
+    def read(path: Path) -> str | None:
+        result = git("cat-file", "-p", f"{tree}:{path}")
+        if result.returncode == 0:
+            return result.stdout
+        listed = git("ls-tree", "--name-only", tree, "--", str(path), check=True)
+        if listed.stdout:
+            result.check_returncode()
+        return None
+
+    ipc = read(IPC)
+    if ipc is None:
+        return None
+    recordings = git("ls-tree", "--name-only", tree, f"{RECORDINGS}/", check=True)
+    return problems_from(
+        ipc,
+        read(OLDER_CLIENTS),
+        [Path(name).name for name in recordings.stdout.splitlines()],
+    )
 
 
 def main() -> int:

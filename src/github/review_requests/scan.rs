@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn long_history_does_not_starve_requests_after_first_fifty() {
         let mut scan = Scan::default();
-        let work = scan.next();
+        let work = scan.next_work();
         page(
             &mut scan,
             &work,
@@ -74,7 +74,7 @@ mod tests {
                 .collect(),
             Some("page2"),
         );
-        let history = scan.next();
+        let history = scan.next_work();
         assert!(matches!(history, Work::History { number: 1, .. }));
         scan.history(
             &history,
@@ -86,7 +86,7 @@ mod tests {
             },
         )
         .unwrap();
-        let work = scan.next();
+        let work = scan.next_work();
         assert_eq!(
             work,
             Work::Page {
@@ -107,14 +107,14 @@ mod tests {
     fn rerequest_requires_two_distinct_events_for_exact_current_reviewer() {
         let mut scan = Scan::default();
         let current = request("active");
-        let work = scan.next();
+        let work = scan.next_work();
         page(
             &mut scan,
             &work,
             vec![entry(1, Some(current.clone()))],
             None,
         );
-        let work = scan.next();
+        let work = scan.next_work();
         scan.history(
             &work,
             HistoryPage {
@@ -135,14 +135,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan.requested[&1].history, History::Unknown);
-        let work = scan.next();
+        let work = scan.next_work();
         page(
             &mut scan,
             &work,
             vec![entry(1, Some(current.clone()))],
             None,
         );
-        let work = scan.next();
+        let work = scan.next_work();
         scan.history(
             &work,
             HistoryPage {
@@ -162,14 +162,14 @@ mod tests {
     #[test]
     fn changed_request_and_viewer_discard_old_history_authority() {
         let mut scan = Scan::default();
-        let work = scan.next();
+        let work = scan.next_work();
         page(
             &mut scan,
             &work,
             vec![entry(1, Some(request("old")))],
             Some("next"),
         );
-        let work = scan.next();
+        let work = scan.next_work();
         scan.history(
             &work,
             HistoryPage {
@@ -185,7 +185,7 @@ mod tests {
         .unwrap();
         assert_eq!(scan.requested[&1].current.id, "new");
         assert_eq!(scan.requested[&1].history, History::Unknown);
-        let work = scan.next();
+        let work = scan.next_work();
         scan.page(
             &work,
             Page {
@@ -196,17 +196,17 @@ mod tests {
         )
         .unwrap();
         assert!(scan.requested.is_empty());
-        assert_eq!(scan.next(), Work::Page { cursor: None });
+        assert_eq!(scan.next_work(), Work::Page { cursor: None });
     }
 
     #[test]
     fn settles_only_after_a_census_and_its_histories_for_the_current_viewer() {
         let mut scan = Scan::default();
         assert!(!scan.settled());
-        let work = scan.next();
+        let work = scan.next_work();
         page(&mut scan, &work, vec![entry(1, None)], Some("page2"));
         assert!(!scan.settled());
-        let work = scan.next();
+        let work = scan.next_work();
         page(
             &mut scan,
             &work,
@@ -214,7 +214,7 @@ mod tests {
             None,
         );
         assert!(!scan.settled(), "the new request's history is unread");
-        let history = scan.next();
+        let history = scan.next_work();
         scan.history(
             &history,
             HistoryPage {
@@ -226,9 +226,9 @@ mod tests {
         )
         .unwrap();
         assert!(scan.settled());
-        let work = scan.next();
+        let work = scan.next_work();
         page(&mut scan, &work, Vec::new(), Some("page2"));
-        let work = scan.next();
+        let work = scan.next_work();
         scan.page(
             &work,
             Page {
@@ -244,17 +244,17 @@ mod tests {
     #[test]
     fn timeline_failure_preserves_request_and_completed_scan_retires_missing_requests() {
         let mut scan = Scan::default();
-        let work = scan.next();
+        let work = scan.next_work();
         page(
             &mut scan,
             &work,
             vec![entry(1, Some(request("active")))],
             None,
         );
-        let history = scan.next();
+        let history = scan.next_work();
         scan.failed_history(&history);
         assert_eq!(scan.requested[&1].current.id, "active");
-        let work = scan.next();
+        let work = scan.next_work();
         page(&mut scan, &work, Vec::new(), None);
         assert!(scan.requested.is_empty());
     }
@@ -263,14 +263,14 @@ mod tests {
     fn repeated_history_cursor_retries_and_can_later_classify() {
         let mut scan = Scan::default();
         let current = request("active");
-        let discovery = scan.next();
+        let discovery = scan.next_work();
         page(
             &mut scan,
             &discovery,
             vec![entry(1, Some(current.clone()))],
             None,
         );
-        let first = scan.next();
+        let first = scan.next_work();
         scan.history(
             &first,
             HistoryPage {
@@ -300,14 +300,14 @@ mod tests {
         );
         scan.failed_history(&repeated);
         assert_eq!(scan.requested[&1].history, History::Unknown);
-        let discovery = scan.next();
+        let discovery = scan.next_work();
         page(
             &mut scan,
             &discovery,
             vec![entry(1, Some(current.clone()))],
             None,
         );
-        let retry = scan.next();
+        let retry = scan.next_work();
         assert_eq!(
             retry,
             Work::History {
@@ -335,16 +335,16 @@ mod tests {
     #[test]
     fn repeated_cursor_restarts_discovery_without_losing_current_requests() {
         let mut scan = Scan::default();
-        let first = scan.next();
+        let first = scan.next_work();
         page(
             &mut scan,
             &first,
             vec![entry(1, Some(request("active")))],
             Some("repeated"),
         );
-        let history = scan.next();
+        let history = scan.next_work();
         scan.failed_history(&history);
-        let next = scan.next();
+        let next = scan.next_work();
         assert!(
             scan.page(
                 &next,
@@ -357,9 +357,9 @@ mod tests {
             .is_err()
         );
         assert!(scan.requested.contains_key(&1));
-        let history = scan.next();
+        let history = scan.next_work();
         scan.failed_history(&history);
-        assert_eq!(scan.next(), Work::Page { cursor: None });
+        assert_eq!(scan.next_work(), Work::Page { cursor: None });
     }
 }
 
@@ -405,7 +405,7 @@ pub struct Scan {
 }
 
 impl Scan {
-    pub fn next(&mut self) -> Work {
+    pub fn next_work(&mut self) -> Work {
         if self.history_next {
             self.history_next = false;
             if let Some(history) = self.histories.front() {

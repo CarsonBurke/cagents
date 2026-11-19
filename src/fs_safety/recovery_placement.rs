@@ -342,7 +342,9 @@ mod tests {
         let (directory, source, outside) = roots();
         let initial = std::fs::read_dir(directory.path()).unwrap().count();
         assert!(validate_recovery_parent(&source, &source, &[]).is_err());
-        assert!(validate_recovery_parent(&outside, &source, &[outside.clone()]).is_err());
+        assert!(
+            validate_recovery_parent(&outside, &source, std::slice::from_ref(&outside)).is_err()
+        );
         assert_eq!(
             std::fs::read_dir(directory.path()).unwrap().count(),
             initial

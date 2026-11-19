@@ -1418,15 +1418,15 @@ mod tests {
                 let mut stream =
                     iced::runtime::task::into_stream(task).expect("actual creation task");
                 while let Some(action) = stream.next().await {
-                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
-                        if matches!(
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action
+                        && matches!(
                             &message,
                             Message::WorktreeInputResolved { .. }
                                 | Message::WorktreeOperationFinished { .. }
                                 | Message::WorktreeCreated { .. }
-                        ) {
-                            return message;
-                        }
+                        )
+                    {
+                        return message;
                     }
                 }
                 panic!("the actual creation worker must publish its next callback");

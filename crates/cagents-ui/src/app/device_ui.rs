@@ -544,10 +544,11 @@ impl Cagents {
                 })
             }
             Action::Panel(panel) => {
-                if panel == Panel::Changes && self.device_ui.pathspec_auto {
-                    if let Some(file) = &self.device_ui.file {
-                        self.device_ui.pathspec = file.display().to_string();
-                    }
+                if panel == Panel::Changes
+                    && self.device_ui.pathspec_auto
+                    && let Some(file) = &self.device_ui.file
+                {
+                    self.device_ui.pathspec = file.display().to_string();
                 }
                 self.device_ui.panel = panel;
                 match panel {
@@ -941,8 +942,7 @@ impl Cagents {
                                 } else {
                                     format!("Switch this window to {label}")
                                 },
-                            )
-                            .into(),
+                            ),
                             open.into(),
                         ])
                         .align_y(Alignment::Center)
@@ -1281,7 +1281,7 @@ impl Cagents {
                 } else {
                     widget::container(
                         widget::column::with_children(vec![
-                            crate::ui_controls::passive_icon(Icon::Edit, 32).into(),
+                            crate::ui_controls::passive_icon(Icon::Edit, 32),
                             design::caption("Select a file").into(),
                         ])
                         .spacing(space::M)
@@ -1525,7 +1525,7 @@ mod tests {
             executable: "cagents".into(),
         })
         .unwrap();
-        crate::device::select(Some("navigation-test".into())).unwrap();
+        crate::device::select(Some("navigation-test")).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(false);
         drop(app.update(Message::GitUi(git_ui::Action::Changed)));
         drop(
@@ -1938,8 +1938,10 @@ mod tests {
 
     #[test]
     fn linked_coordinates_preserve_unicode_boundaries_and_clamp_to_the_file() {
-        let mut state = State::default();
-        state.content = text_editor::Content::with_text("first\néx");
+        let mut state = State {
+            content: text_editor::Content::with_text("first\néx"),
+            ..State::default()
+        };
         state.jump_to_fragment("L2:2");
         assert_eq!(
             state.content.cursor().position,

@@ -807,7 +807,7 @@ impl Snapshot {
     }
 
     /// Editor-native position to protocol UTF-16 position.
-    fn to_utf16(&self, position: LspPosition) -> Result<lsp_types::Position, LspError> {
+    fn utf16_position(&self, position: LspPosition) -> Result<lsp_types::Position, LspError> {
         let content = self
             .line_content(position.line)
             .ok_or_else(|| self.out_of_range(position.line, position.character))?;
@@ -829,7 +829,7 @@ impl Snapshot {
 
     /// Protocol UTF-16 position to editor-native position. An offset landing
     /// inside a surrogate pair is refused rather than rounded.
-    fn from_utf16(&self, position: lsp_types::Position) -> Result<LspPosition, LspError> {
+    fn native_position(&self, position: lsp_types::Position) -> Result<LspPosition, LspError> {
         if position.line >= self.line_count() {
             return Err(self.out_of_range(position.line, position.character));
         }
@@ -859,19 +859,19 @@ impl Snapshot {
         }
     }
 
-    fn range_to_utf16(&self, range: LspRange) -> Result<lsp_types::Range, LspError> {
+    fn utf16_range(&self, range: LspRange) -> Result<lsp_types::Range, LspError> {
         if range.start > range.end {
             return Err(LspError::InvertedRange);
         }
         Ok(lsp_types::Range::new(
-            self.to_utf16(range.start)?,
-            self.to_utf16(range.end)?,
+            self.utf16_position(range.start)?,
+            self.utf16_position(range.end)?,
         ))
     }
 
-    fn range_from_utf16(&self, range: lsp_types::Range) -> Result<LspRange, LspError> {
-        let start = self.from_utf16(range.start)?;
-        let end = self.from_utf16(range.end)?;
+    fn native_range(&self, range: lsp_types::Range) -> Result<LspRange, LspError> {
+        let start = self.native_position(range.start)?;
+        let end = self.native_position(range.end)?;
         if start > end {
             return Err(LspError::InvertedRange);
         }
@@ -995,7 +995,7 @@ fn native_incremental(
     for edit in edits {
         let snapshot = Snapshot::from_native(base.version, working.clone());
         changes.push(lsp_types::TextDocumentContentChangeEvent {
-            range: Some(snapshot.range_to_utf16(edit.range).ok()?),
+            range: Some(snapshot.utf16_range(edit.range).ok()?),
             range_length: None,
             text: edit.new_text.clone(),
         });
@@ -1026,7 +1026,7 @@ fn measure_edit(
     edit: &LspTextEdit,
     changes: &mut Vec<lsp_types::TextDocumentContentChangeEvent>,
 ) -> Result<(usize, usize), LspError> {
-    let range = working.range_to_utf16(edit.range)?;
+    let range = working.utf16_range(edit.range)?;
     let start = working.byte_offset(edit.range.start)?;
     let end = working.byte_offset(edit.range.end)?;
     changes.push(lsp_types::TextDocumentContentChangeEvent {
@@ -2491,10 +2491,10 @@ fn publish_diagnostics(state: &mut RouterState, params: lsp_types::PublishDiagno
     // on the wire and the server will republish against it. A server that
     // sends no version leaves the client no choice but the newest text, which
     // is why `version_support` is advertised in `initialize`.
-    if let Some(version) = params.version {
-        if version != snapshot.version {
-            return;
-        }
+    if let Some(version) = params.version
+        && version != snapshot.version
+    {
+        return;
     }
     let items: Vec<LspDiagnostic> = params
         .diagnostics
@@ -2515,7 +2515,7 @@ fn convert_diagnostic(
     diagnostic: lsp_types::Diagnostic,
 ) -> Option<LspDiagnostic> {
     // One unconvertible range must not discard the whole batch.
-    let range = snapshot.range_from_utf16(diagnostic.range).ok()?;
+    let range = snapshot.native_range(diagnostic.range).ok()?;
     Some(LspDiagnostic {
         range,
         severity: match diagnostic.severity {
@@ -3055,10 +3055,10 @@ impl SessionState {
                 // Only this binding's own requests are cancelled: another tab
                 // on the same file is still waiting for its answers.
                 self.cancel_for_doc(doc, &context.events).await;
-                if let Some(bound) = self.bindings.get_mut(&uri) {
-                    if let Some(index) = bound.iter().position(|entry| *entry == doc) {
-                        bound.remove(index);
-                    }
+                if let Some(bound) = self.bindings.get_mut(&uri)
+                    && let Some(index) = bound.iter().position(|entry| *entry == doc)
+                {
+                    bound.remove(index);
                 }
                 let remaining = match self.open.get_mut(&uri) {
                     Some(count) => {
@@ -3087,19 +3087,19 @@ impl SessionState {
             }
             SessionCommand::Request(request) => self.dispatch(request, context, done).await,
             SessionCommand::Cancel { request } => {
-                if let Some(slot) = self.by_request.remove(&request) {
-                    if let Some(entry) = self.in_flight.remove(&slot) {
-                        self.cancel_wire(entry.wire_id);
-                        entry.abort.abort();
-                        context
-                            .events
-                            .emit(LspEvent::RequestFailed {
-                                request: entry.id,
-                                doc: entry.doc,
-                                error: LspError::Cancelled,
-                            })
-                            .await;
-                    }
+                if let Some(slot) = self.by_request.remove(&request)
+                    && let Some(entry) = self.in_flight.remove(&slot)
+                {
+                    self.cancel_wire(entry.wire_id);
+                    entry.abort.abort();
+                    context
+                        .events
+                        .emit(LspEvent::RequestFailed {
+                            request: entry.id,
+                            doc: entry.doc,
+                            error: LspError::Cancelled,
+                        })
+                        .await;
                 }
             }
             SessionCommand::Shutdown => {}
@@ -3189,7 +3189,7 @@ impl SessionState {
         });
         let _ = started_rx.await;
         self.in_flight.insert(
-            slot.clone(),
+            slot,
             InFlight {
                 id,
                 doc,
@@ -3209,14 +3209,13 @@ impl SessionState {
     }
 
     fn forget(&mut self, request: LspRequestId) {
-        if let Some(slot) = self.by_request.remove(&request) {
-            if self
+        if let Some(slot) = self.by_request.remove(&request)
+            && self
                 .in_flight
                 .get(&slot)
                 .is_some_and(|entry| entry.id == request)
-            {
-                self.in_flight.remove(&slot);
-            }
+        {
+            self.in_flight.remove(&slot);
         }
     }
 
@@ -3386,7 +3385,7 @@ fn convert_result(snapshots: &SnapshotStore, request: &PendingRequest, raw: RawR
             range: None,
         },
         RawResult::Hover(Some(hover)) => {
-            let range = match hover.range.map(|range| snapshot.range_from_utf16(range)) {
+            let range = match hover.range.map(|range| snapshot.native_range(range)) {
                 None => None,
                 Some(Ok(range)) => Some(range),
                 Some(Err(error)) => {
@@ -3466,7 +3465,7 @@ fn convert_locations(
             // ranges can be converted to editor coordinates.
             let (range, coordinates) = if location.uri == *request.uri {
                 (
-                    snapshot.range_from_utf16(location.range).ok()?,
+                    snapshot.native_range(location.range).ok()?,
                     LspCoordinates::Scalar,
                 )
             } else {
@@ -3548,19 +3547,19 @@ fn convert_completion(
     // `insertText`, which wins over `label`.
     let edit = match &item.text_edit {
         Some(lsp_types::CompletionTextEdit::Edit(text_edit)) => LspCompletionEdit {
-            range: snapshot.range_from_utf16(text_edit.range)?,
+            range: snapshot.native_range(text_edit.range)?,
             replace_range: None,
             new_text: text_edit.new_text.clone(),
             snippet: None,
         },
         Some(lsp_types::CompletionTextEdit::InsertAndReplace(both)) => LspCompletionEdit {
-            range: snapshot.range_from_utf16(both.insert)?,
-            replace_range: Some(snapshot.range_from_utf16(both.replace)?),
+            range: snapshot.native_range(both.insert)?,
+            replace_range: Some(snapshot.native_range(both.replace)?),
             new_text: both.new_text.clone(),
             snippet: None,
         },
         None => {
-            let position = snapshot.from_utf16(at)?;
+            let position = snapshot.native_position(at)?;
             LspCompletionEdit {
                 range: snapshot.identifier_prefix(position),
                 replace_range: None,
@@ -3575,7 +3574,7 @@ fn convert_completion(
     let mut additional_edits = Vec::new();
     for text_edit in item.additional_text_edits.iter().flatten() {
         additional_edits.push(LspCompletionEdit {
-            range: snapshot.range_from_utf16(text_edit.range)?,
+            range: snapshot.native_range(text_edit.range)?,
             replace_range: None,
             new_text: text_edit.new_text.clone(),
             snippet: None,
@@ -4278,12 +4277,12 @@ impl LspManager {
                 discovery::discover(&worker_path, &worker_worktree, &markers, &active_cancelled)
             })
             .await;
-            if !worker_cancelled.load(Ordering::Acquire) {
-                if let Ok(Some(root)) = root {
-                    events
-                        .emit(LspEvent::RootDiscovered { doc, ticket, root })
-                        .await;
-                }
+            if !worker_cancelled.load(Ordering::Acquire)
+                && let Ok(Some(root)) = root
+            {
+                events
+                    .emit(LspEvent::RootDiscovered { doc, ticket, root })
+                    .await;
             }
         });
         self.pending_opens.insert(
@@ -4448,19 +4447,18 @@ impl LspManager {
             .get(&key)
             .map(|handle| Arc::clone(&handle.retired));
         let handle = self.ensure_session(&key, &server, &root, worktree);
-        if let Ok(handle) = &handle {
-            if prior_session
+        if let Ok(handle) = &handle
+            && prior_session
                 .as_ref()
                 .is_none_or(|prior| !Arc::ptr_eq(prior, &handle.retired))
-            {
-                *owner
-                    .created_session
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = Some(CapturedSession {
-                    key: key.clone(),
-                    retired: Arc::clone(&handle.retired),
-                });
-            }
+        {
+            *owner
+                .created_session
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(CapturedSession {
+                key: key.clone(),
+                retired: Arc::clone(&handle.retired),
+            });
         }
 
         let uri = Arc::new(uri);
@@ -4795,11 +4793,10 @@ impl LspManager {
                 .sessions
                 .get(&captured.key)
                 .is_some_and(|current| Arc::ptr_eq(&current.retired, &captured.retired))
+                && let Some(handle) = self.sessions.remove(&captured.key)
             {
-                if let Some(handle) = self.sessions.remove(&captured.key) {
-                    self.retire_handle(handle);
-                    reopen.push(captured.key);
-                }
+                self.retire_handle(handle);
+                reopen.push(captured.key);
             }
         }
         for key in reopen {
@@ -4915,7 +4912,7 @@ impl LspManager {
         if let Some(pending) = self.pending_opens.get(&doc) {
             return pending
                 .text
-                .from_utf16(lsp_types::Position::new(at.line, at.character));
+                .native_position(lsp_types::Position::new(at.line, at.character));
         }
         let reference = self
             .documents
@@ -4925,7 +4922,7 @@ impl LspManager {
             .snapshots
             .latest(&reference.uri)
             .ok_or(LspError::UnknownDocument(doc.0))?;
-        snapshot.from_utf16(lsp_types::Position::new(at.line, at.character))
+        snapshot.native_position(lsp_types::Position::new(at.line, at.character))
     }
 
     /// Replaces the session backing `doc` with a fresh process and re-opens
@@ -5093,7 +5090,7 @@ impl LspManager {
         let Some(snapshot) = self.snapshots.latest(&reference.uri) else {
             return fail(&self.events, LspError::UnknownDocument(doc.0));
         };
-        let position = match snapshot.to_utf16(at) {
+        let position = match snapshot.utf16_position(at) {
             Ok(position) => position,
             Err(error) => return fail(&self.events, error),
         };
@@ -5133,10 +5130,10 @@ impl LspManager {
             .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
-            if let Some(handle) = self.sessions.remove(&key) {
-                if let Some(retiring) = handle.retire() {
-                    self.retiring.push(retiring);
-                }
+            if let Some(handle) = self.sessions.remove(&key)
+                && let Some(retiring) = handle.retire()
+            {
+                self.retiring.push(retiring);
             }
         }
     }
@@ -5378,19 +5375,18 @@ impl LspManager {
                         _ => None,
                     }
                 };
-                if let Some(pid) = pid {
-                    if let Ok(status) =
+                if let Some(pid) = pid
+                    && let Ok(status) =
                         tokio::fs::read_to_string(format!("/proc/{pid}/status")).await
-                    {
-                        let rss = status
-                            .lines()
-                            .find_map(|line| line.strip_prefix("VmRSS:"))
-                            .and_then(|value| value.split_whitespace().next())
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .unwrap_or(0)
-                            * 1024;
-                        watched.resident_bytes.store(rss, Ordering::Relaxed);
-                    }
+                {
+                    let rss = status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("VmRSS:"))
+                        .and_then(|value| value.split_whitespace().next())
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        * 1024;
+                    watched.resident_bytes.store(rss, Ordering::Relaxed);
                 }
                 let doc = watched
                     .activity

@@ -688,10 +688,10 @@ impl Cagents {
             return false;
         }
         let durable = Arc::make_mut(&mut self.durable);
-        if let Some((id, order)) = active_order {
-            if let Some(channel) = durable.channels.iter_mut().find(|channel| channel.id == id) {
-                channel.cards = order;
-            }
+        if let Some((id, order)) = active_order
+            && let Some(channel) = durable.channels.iter_mut().find(|channel| channel.id == id)
+        {
+            channel.cards = order;
         }
         for channel in &mut durable.channels {
             channel.cards.retain(|id| open.contains(id));
@@ -702,10 +702,10 @@ impl Cagents {
                 channel.focused = channel.cards.first().copied();
             }
         }
-        if let Some(id) = durable.active_channel {
-            if let Some(channel) = durable.channels.iter_mut().find(|channel| channel.id == id) {
-                channel.focused = focused.filter(|card| channel.cards.contains(card));
-            }
+        if let Some(id) = durable.active_channel
+            && let Some(channel) = durable.channels.iter_mut().find(|channel| channel.id == id)
+        {
+            channel.focused = focused.filter(|card| channel.cards.contains(card));
         }
         durable.active_worktree.clone_from(&self.active_workspace);
         durable.worktree_focus.clone_from(&self.worktree_focus);
@@ -721,13 +721,12 @@ impl Cagents {
                 .card_state(card)
                 .is_some_and(|state| matches!(state.kind, CardKind::Browser(_)))
                 && !self.durable.card_scopes.contains_key(&card)
+                && let Some(path) = &self.active_workspace
             {
-                if let Some(path) = &self.active_workspace {
-                    Arc::make_mut(&mut self.durable)
-                        .card_scopes
-                        .insert(card, path.clone());
-                    self.worktree_owners.insert(card, path.clone());
-                }
+                Arc::make_mut(&mut self.durable)
+                    .card_scopes
+                    .insert(card, path.clone());
+                self.worktree_owners.insert(card, path.clone());
             }
             return;
         };

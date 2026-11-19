@@ -878,8 +878,7 @@ fn an_earlier_boot_resume_keeps_the_account_home_it_ran_under() {
             source: source.clone(),
         },
     )
-    .err()
-    .expect("a remapped home prepared a resume");
+    .expect_err("a remapped home prepared a resume");
     assert_eq!(
         refused.message,
         super::retained_resume::PRIOR_BOOT_ACCOUNT_CHANGED
@@ -908,8 +907,7 @@ fn an_earlier_boot_resume_keeps_the_account_home_it_ran_under() {
             execution_environment: Default::default(),
         },
     )
-    .err()
-    .expect("a remapped home started in place");
+    .expect_err("a remapped home started in place");
     assert_eq!(
         refused.message,
         super::retained_resume::PRIOR_BOOT_ACCOUNT_CHANGED

@@ -456,6 +456,28 @@ impl KeyboardShortcuts {
         }
     }
 
+    fn yield_conflicts_to(&mut self, preferred: &KeyboardShortcuts) {
+        while let Some(ShortcutFault {
+            action,
+            conflicts_with: Some(owner),
+            ..
+        }) = self.fault()
+        {
+            let mut changed = false;
+            for index in [action, owner] {
+                if self.actions()[index] != preferred.actions()[index] {
+                    self.set_action(index, preferred.actions()[index].clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            // Each continuing pass makes at least one more action equal to
+            // preferred and never changes it again, so the loop terminates.
+        }
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
         self.fault().map_or(Ok(()), |fault| Err(fault.error))
     }
@@ -2184,7 +2206,7 @@ impl AppSettings {
             || !(0.25..=1.0).contains(&self.default_native_pane_fraction)
         {
             return Err(SettingsError::Invalid(
-                "Native pane and chat content widths must be between 0.25 and 1.0".into(),
+                "Native pane and chat content widths must be between 0.25 and 1.0",
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
@@ -2405,6 +2427,7 @@ fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsErro
 /// Applies only fields this window changed since its last successful save.
 /// Nested shortcut tables merge by action; list-valued preferences and
 /// [`ATOMIC_SETTINGS`] are replaced whole.
+/// A chord this window bound replaces another window's conflicting binding.
 pub fn save_merged(
     path: impl AsRef<Path>,
     base: &AppSettings,
@@ -2420,7 +2443,11 @@ pub fn save_merged(
         &mut current,
         &ATOMIC_SETTINGS,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let mut merged = current.try_into::<AppSettings>()?;
+    merged
+        .keyboard_shortcuts
+        .yield_conflicts_to(&desired.keyboard_shortcuts);
+    save_unlocked(path, &merged.validate()?)
 }
 
 /// Settings chosen as a whole. Merging a palette color by color could save
@@ -3597,9 +3624,11 @@ mod tests {
 
     #[test]
     fn editor_font_inherits_terminal_until_overridden() {
-        let mut settings = super::AppSettings::default();
-        settings.terminal_font_family = "Test Mono".into();
-        settings.terminal_font_size = 19.0;
+        let mut settings = super::AppSettings {
+            terminal_font_family: "Test Mono".into(),
+            terminal_font_size: 19.0,
+            ..super::AppSettings::default()
+        };
         assert_eq!(settings.editor_font_family(), "Test Mono");
         assert_eq!(settings.editor_font_size(), 19.0);
         settings.editor_font_family = Some("Editor Mono".into());
@@ -3784,8 +3813,10 @@ mod tests {
     fn palette_recents_survive_save_and_old_settings_default_to_empty() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
-        let mut settings = AppSettings::default();
-        settings.palette_recents = vec!["command:open_settings".into(), "pane:original".into()];
+        let mut settings = AppSettings {
+            palette_recents: vec!["command:open_settings".into(), "pane:original".into()],
+            ..AppSettings::default()
+        };
         save(&path, &settings).unwrap();
         assert_eq!(
             load(&path).unwrap().palette_recents,
@@ -3822,9 +3853,11 @@ mod tests {
                 LinkOpenGesture::ControlClick,
                 LinkOpenGesture::ControlShiftClick,
             ] {
-                let mut settings = AppSettings::default();
-                settings.link_open_destination = destination;
-                settings.link_open_gesture = system_gesture;
+                let settings = AppSettings {
+                    link_open_destination: destination,
+                    link_open_gesture: system_gesture,
+                    ..AppSettings::default()
+                };
                 save(&path, &settings).unwrap();
                 let settings = load(&path).unwrap();
                 assert_eq!(settings.link_destination(None), destination);
@@ -3905,6 +3938,101 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn a_stale_windows_shortcut_save_wins_the_chord_another_window_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+
+        let mut a = base.clone();
+        a.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        // An unrelated binding of A's must survive B winning the chord.
+        a.keyboard_shortcuts.cycle_pane_width = vec!["Alt+Shift+R".into()];
+        save_merged(&path, &base, &a).unwrap();
+
+        let mut b = base.clone();
+        b.keyboard_shortcuts.search_projects = vec!["Ctrl+K".into()];
+        save_merged(&path, &base, &b).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.keyboard_shortcuts.search_projects, ["Ctrl+K"]);
+        assert_eq!(
+            restored.keyboard_shortcuts.command_palette,
+            base.keyboard_shortcuts.command_palette
+        );
+        assert_eq!(
+            restored.keyboard_shortcuts.cycle_pane_width,
+            ["Alt+Shift+R"]
+        );
+    }
+
+    #[test]
+    fn after_winning_a_chord_a_windows_unrelated_save_still_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+
+        let mut a = base.clone();
+        a.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        save_merged(&path, &base, &a).unwrap();
+
+        let mut b = base.clone();
+        b.keyboard_shortcuts.search_projects = vec!["Ctrl+K".into()];
+        save_merged(&path, &base, &b).unwrap();
+        let won = load(&path).unwrap();
+
+        let mut b2 = b.clone();
+        b2.terminal_font_size = 19.0;
+        save_merged(&path, &b, &b2).unwrap();
+
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.terminal_font_size, 19.0);
+        assert_eq!(restored.keyboard_shortcuts, won.keyboard_shortcuts);
+        assert_eq!(restored.keyboard_shortcuts.search_projects, ["Ctrl+K"]);
+        assert_eq!(
+            restored.keyboard_shortcuts.command_palette,
+            base.keyboard_shortcuts.command_palette
+        );
+    }
+
+    #[test]
+    fn a_conflict_inside_one_windows_own_table_is_still_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let mut desired = base.clone();
+        desired.keyboard_shortcuts.command_palette = vec!["Ctrl+K".into()];
+        desired.keyboard_shortcuts.search_projects = vec!["Ctrl+K".into()];
+        assert!(matches!(
+            save_merged(&path, &base, &desired),
+            Err(SettingsError::InvalidShortcut(
+                "keyboard shortcuts must not conflict"
+            ))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn yielding_reaches_a_conflict_free_table_through_chained_conflicts() {
+        let preferred = KeyboardShortcuts::default();
+        let mut merged = preferred.clone();
+        merged.new_terminal = vec!["Ctrl+K".into()];
+        merged.new_channel = vec!["Ctrl+K".into()];
+        merged.clone_pane = preferred.new_channel.clone();
+
+        merged.yield_conflicts_to(&preferred);
+
+        assert!(merged.fault().is_none());
+        assert_eq!(merged.new_terminal, preferred.new_terminal);
+        assert_eq!(merged.new_channel, preferred.new_channel);
+        assert_eq!(merged.clone_pane, preferred.clone_pane);
     }
 
     #[test]

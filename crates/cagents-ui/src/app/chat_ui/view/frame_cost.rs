@@ -1289,10 +1289,9 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
 #[test]
 #[ignore = "optimized viewport scaling measurement; records fixed budget and size ratio"]
 fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
-    assert!(
-        !cfg!(debug_assertions),
-        "use optimized dev-runtime with opt-level2"
-    );
+    if cfg!(debug_assertions) {
+        panic!("use optimized dev-runtime with opt-level2");
+    }
     let medians = viewport_workloads(&[
         ("small", 16_usize * 1024, 10, 0),
         ("giant paragraph", 1024 * 1024, 300, 0),
@@ -1322,10 +1321,9 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
 #[test]
 #[ignore = "optimized attribution measurement; not a substitute for the combined viewport budget"]
 fn viewport_cost_factorial_attribution() {
-    assert!(
-        !cfg!(debug_assertions),
-        "use optimized dev-runtime with opt-level2"
-    );
+    if cfg!(debug_assertions) {
+        panic!("use optimized dev-runtime with opt-level2");
+    }
     viewport_workloads(&[
         ("small", 16 * 1024, 10, 0),
         ("many tools only", 16 * 1024, 300, 0),

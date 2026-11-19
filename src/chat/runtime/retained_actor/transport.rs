@@ -1299,10 +1299,11 @@ impl RemoteActor {
                         actor.publish_unavailable(error);
                         break;
                     }
-                    if let Ok(Some(state)) = response {
-                        if !actor.publish_resident(state) && actor.0.stop.load(Ordering::Acquire) {
-                            break;
-                        }
+                    if let Ok(Some(state)) = response
+                        && !actor.publish_resident(state)
+                        && actor.0.stop.load(Ordering::Acquire)
+                    {
+                        break;
                     }
                     retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
                     let identities: Vec<_> = actor

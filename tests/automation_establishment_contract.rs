@@ -695,14 +695,14 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if !self.cleaned {
-            if let Err(error) = self.cleanup() {
-                self.root.disable_cleanup(true);
-                eprintln!(
-                    "Private establishment cleanup remains unproved at {}: {error}",
-                    self.root.path().display()
-                );
-            }
+        if !self.cleaned
+            && let Err(error) = self.cleanup()
+        {
+            self.root.disable_cleanup(true);
+            eprintln!(
+                "Private establishment cleanup remains unproved at {}: {error}",
+                self.root.path().display()
+            );
         }
     }
 }

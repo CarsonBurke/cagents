@@ -39,9 +39,10 @@ impl Action {
 }
 
 /// What the inspector's changes and files show.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) enum WorkScope {
     /// The worktree the pane's card names, as without a conversation.
+    #[default]
     Focus,
     /// The worktree of the work shown, named by its branch.
     Worktree { path: PathBuf, label: String },
@@ -91,12 +92,6 @@ pub(super) struct WorkSummary {
     pub mentioned_height: conversation::Height,
     shown: Option<WorkKey>,
     pub scope: WorkScope,
-}
-
-impl Default for WorkScope {
-    fn default() -> Self {
-        Self::Focus
-    }
 }
 
 #[derive(Debug, Default)]

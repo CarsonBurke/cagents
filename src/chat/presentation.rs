@@ -380,7 +380,7 @@ mod tests {
     fn patches_preserve_order_remove_items_and_append_only_the_suffix() {
         let old = text("answer", &"α".repeat(32 * 1024));
         let mut new = old.clone();
-        body_mut(&mut new.content).unwrap().push_str("β");
+        body_mut(&mut new.content).unwrap().push('β');
         new.at = Some(2);
         let change = ItemChange::between(Some(&old), &new);
         assert!(

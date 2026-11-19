@@ -74,13 +74,12 @@ impl Cagents {
                 }
             }
             Err(error) => {
-                if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                    if source.head_oid.as_deref() == Some(head.as_str())
-                        && source.next_history_page == page
-                        && source.history_loading
-                    {
-                        source.history_failed(format!("Could not read history: {error}"));
-                    }
+                if let Some(source) = self.sidebar_model.source_control.as_mut()
+                    && source.head_oid.as_deref() == Some(head.as_str())
+                    && source.next_history_page == page
+                    && source.history_loading
+                {
+                    source.history_failed(format!("Could not read history: {error}"));
                 }
             }
         }

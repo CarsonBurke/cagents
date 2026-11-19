@@ -260,9 +260,10 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
         .unwrap();
     assert!(capabilities.model_selection && capabilities.reasoning_selection);
     assert!(!capabilities.steer && !capabilities.queue && !capabilities.compact);
+    // By meaning: the test profile's `acceptEdits` is agy's `accept-edits`.
     assert_eq!(
         capabilities.permission_modes,
-        ["default", "accept-edits", "auto", "plan"]
+        ["default", "acceptEdits", "auto", "plan"]
     );
     assert!(!acp.initialization_pending());
 }
@@ -1284,4 +1285,137 @@ fn approvals_beyond_the_bound_are_cancelled_without_being_shown() {
         }
     }
     assert_eq!(acp.permissions.len(), MAX_PERMISSIONS);
+}
+
+#[test]
+fn modes_reach_the_reader_by_meaning_and_the_agent_in_its_own_words() {
+    let mut acp = adapter(&[], None);
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), agy_initialize()))
+        .unwrap();
+    let step = acp.receive(reply(only_write(&opened), agy_new())).unwrap();
+    let modes = step.events.iter().find_map(|event| match event {
+        Event::Capabilities(capabilities) => Some(capabilities.permission_modes.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        modes.unwrap(),
+        ["default", "acceptEdits", "auto", "plan"],
+        "the profile's meaning replaces the agent's own identifier"
+    );
+    let session = acp.session.clone().unwrap();
+    let step = acp
+        .command(Command::SetPermissionMode {
+            mode: "acceptEdits".into(),
+        })
+        .unwrap();
+    let set = only_write(&step).clone();
+    assert_eq!(set["method"], "session/set_config_option");
+    assert_eq!(set["params"]["value"], "accept-edits");
+    acp.receive(reply(
+        &set,
+        json!({"configOptions": agy_new()["configOptions"].clone()}),
+    ))
+    .unwrap();
+    let step = acp
+        .receive(update(
+            &session,
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": "accept-edits"}),
+        ))
+        .unwrap();
+    assert!(step.events.iter().any(|event| matches!(event,
+        Event::PermissionMode(Some(mode)) if mode == "acceptEdits")));
+    // A mode the profile does not name keeps its identifier both ways.
+    let step = acp
+        .command(Command::SetPermissionMode {
+            mode: "plan".into(),
+        })
+        .unwrap();
+    assert_eq!(only_write(&step)["params"]["value"], "plan");
+}
+
+#[test]
+fn models_the_profile_does_not_offer_are_never_listed_or_chosen() {
+    let mut acp = adapter(&[], None);
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), agy_initialize()))
+        .unwrap();
+    let mut new = agy_new();
+    new["configOptions"][0]["options"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"value": "gemini-4-neon-contributor", "name": "Shared"}));
+    let step = acp.receive(reply(only_write(&opened), new)).unwrap();
+    let models = step
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Models { models, .. } => Some(models.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        models
+            .iter()
+            .all(|model| !model.id.ends_with("-contributor")),
+        "{models:?}"
+    );
+    assert!(
+        acp.command(Command::SetModel {
+            model: "gemini-4-neon-contributor".into(),
+            reasoning: None,
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn a_model_naming_its_reasoning_level_is_applied_as_both() {
+    let mut acp = adapter(&["--model", "gemini-3.8-flash-low"], None);
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), agy_initialize()))
+        .unwrap();
+    let step = acp.receive(reply(only_write(&opened), agy_new())).unwrap();
+    let model = only_write(&step);
+    assert_eq!(model["params"]["configId"], "model");
+    assert_eq!(model["params"]["value"], "gemini-3.8-flash");
+    let options = agy_new()["configOptions"].clone();
+    let step = acp
+        .receive(reply(model, json!({"configOptions": options})))
+        .unwrap();
+    let level = only_write(&step);
+    assert_eq!(level["params"]["configId"], "thought_level");
+    assert_eq!(level["params"]["value"], "low");
+}
+
+#[test]
+fn a_confirmed_identity_replaces_the_conversation_a_terminal_resumes() {
+    use crate::agent::Provider;
+    let mut arguments = ["--model", "m", "--conversation", "old", "--mode", "plan"]
+        .map(String::from)
+        .to_vec();
+    align_resume_identity(Provider::Antigravity, &mut arguments, "new".into());
+    assert_eq!(
+        arguments,
+        ["--model", "m", "--mode", "plan", "--conversation", "new"]
+    );
+    let mut arguments = ["--conversation=old"].map(String::from).to_vec();
+    align_resume_identity(Provider::Antigravity, &mut arguments, "new".into());
+    assert_eq!(arguments, ["--conversation", "new"]);
+    let mut arguments = ["resume", "old", "--model", "m"].map(String::from).to_vec();
+    align_resume_identity(Provider::Muse, &mut arguments, "new".into());
+    assert_eq!(arguments, ["resume", "new", "--model", "m"]);
+    // Neither the most recent conversation nor an option's value that reads
+    // like an identity option survives or is taken for one.
+    let mut arguments = ["--continue", "--agent", "--conversation", "-c"]
+        .map(String::from)
+        .to_vec();
+    align_resume_identity(Provider::Antigravity, &mut arguments, "new".into());
+    assert_eq!(
+        arguments,
+        ["--agent", "--conversation", "--conversation", "new"]
+    );
 }
