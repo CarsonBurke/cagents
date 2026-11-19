@@ -11870,6 +11870,22 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             output: String::new(),
         },
     );
+    // A second command, so that the open group is one: a lone step is
+    // drawn as itself.
+    let notes = item(
+        "notes",
+        chat::Role::Assistant,
+        ItemContent::Command {
+            label: "Read the notes".into(),
+            command: "cat notes".into(),
+            working_directory: "/project".into(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: None,
+            output: String::new(),
+        },
+    );
     // What a finished background agent reports, which opens an exchange of
     // its own and is drawn as a row of the timeline.
     let finished = |n: usize| {
@@ -11885,7 +11901,7 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             },
         )
     };
-    let sequence = |between: Option<chat::Item>, reports: usize| {
+    let sequence = |between: Vec<chat::Item>, reports: usize| {
         let mut items = vec![text(
             "prompt",
             chat::Role::User,
@@ -11910,39 +11926,44 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
     let scenarios = [
         (
             "a hidden thought between",
-            sequence(Some(thought.clone()), 0),
+            sequence(vec![thought.clone()], 0),
             false,
             780.0,
         ),
         (
             "a thought between",
-            sequence(Some(headline), 0),
+            sequence(vec![headline], 0),
             false,
             780.0,
         ),
-        ("nothing between", sequence(None, 0), false, 780.0),
+        ("nothing between", sequence(Vec::new(), 0), false, 780.0),
         (
             "a group boundary",
-            sequence(Some(command.clone()), 0),
+            sequence(vec![command.clone()], 0),
             false,
             780.0,
         ),
-        ("an open group", sequence(Some(command), 0), true, 780.0),
+        (
+            "an open group",
+            sequence(vec![command, notes], 0),
+            true,
+            780.0,
+        ),
         (
             "agents reporting",
-            sequence(Some(thought.clone()), 2),
+            sequence(vec![thought.clone()], 2),
             false,
             780.0,
         ),
         (
             "a narrow pane",
-            sequence(Some(thought.clone()), 0),
+            sequence(vec![thought.clone()], 0),
             false,
             220.0,
         ),
         (
             "agents reporting in a narrow pane",
-            sequence(Some(thought), 2),
+            sequence(vec![thought], 2),
             false,
             220.0,
         ),
@@ -12009,7 +12030,7 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
                     || text.starts_with("Sidebar direction ")
                     || text.starts_with("Thought")
                     || text.starts_with("Thinking")
-                    || text.contains("the fixture")
+                    || text.starts_with("Ran cat ")
                     || text.starts_with("Weighing the drafts")
                     || summary.as_deref() == Some(text.as_str())
             })
@@ -12018,7 +12039,7 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             5 + usize::from(matches!(
                 scenario,
                 "a thought between" | "a group boundary" | "an open group"
-            )) + usize::from(open)
+            )) + 2 * usize::from(open)
                 + 2 * usize::from(scenario.starts_with("agents reporting"));
         assert_eq!(rows.len(), expected, "{scenario}: {rows:?}");
         // A report names its agent as a row names any agent, without the
