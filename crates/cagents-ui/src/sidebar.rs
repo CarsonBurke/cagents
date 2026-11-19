@@ -82,8 +82,9 @@ const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
-// Sidebar identities use a smaller glyph while retaining the shared row grid.
-const ROW_ICON_SIZE: u16 = 14;
+// Sidebar identities lead their rows' labels, so they take the leading glyph
+// size rather than the panel rows' while retaining the shared row grid.
+const ROW_ICON_SIZE: u16 = design::LEADING_ICON_SIZE;
 const CHILD_ROW_ICON_SIZE: u16 = ROW_ICON_SIZE;
 const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
 // Controls and status indicators retain the shared workspace chrome sizes.
@@ -97,6 +98,14 @@ const ROW_GUTTER: f32 = space::XS;
 /// this frame. A spinner, an attention badge and a chat count all land here,
 /// so a label cannot reflow when an agent starts working or a chat opens.
 const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
+/// The status slot of a channel row, whose hover reveals a delete control
+/// over its end, where the slot is. The control is laid over the row
+/// without moving anything, so the slot is reserved at rest as wide as the
+/// control reaches past the row's inset and the gutter before the slot: the
+/// control then covers the slot and never the title or facepile beside it. The indicator keeps its own
+/// column at the slot's end, in line with every other row's.
+const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
+const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
 /// The project header's hover-revealed commands: disclose, new channel, new
 /// worktree. Reserved inside the header row so a long project name ellipsizes
 /// instead of running under them, and read by `row_interaction::header_at` so
@@ -6735,6 +6744,9 @@ struct RowGrid {
     /// The rail renders one centred glyph per row, with its status pinned to
     /// the glyph's corners; see [`rail`].
     compact: bool,
+    /// The row's hover reveals a delete control over its end; see
+    /// [`ROW_DELETE_STATUS_WIDTH`].
+    deletable: bool,
 }
 
 /// One row's content while its slots are being filled.
@@ -6745,6 +6757,7 @@ impl RowGrid {
         Self {
             kind: RowKind::Project,
             compact,
+            deletable: false,
         }
     }
 
@@ -6752,6 +6765,15 @@ impl RowGrid {
         Self {
             kind: RowKind::Child,
             compact,
+            deletable: false,
+        }
+    }
+
+    /// The same grid for a row whose end a hover-revealed delete covers.
+    const fn deletable(self) -> Self {
+        Self {
+            deletable: true,
+            ..self
         }
     }
 
@@ -6811,11 +6833,16 @@ impl RowGrid {
             content = content.push(label);
         }
         if matches!(self.kind, RowKind::Child) {
-            content = content.push(
-                widget::container(slot(status))
-                    .center_x(Length::Fixed(ROW_STATUS_WIDTH))
-                    .center_y(Length::Fill),
-            );
+            let status = widget::container(slot(status))
+                .center_x(Length::Fixed(ROW_STATUS_WIDTH))
+                .center_y(Length::Fill);
+            content = content.push(if self.deletable {
+                widget::container(status)
+                    .align_right(Length::Fixed(ROW_DELETE_STATUS_WIDTH))
+                    .center_y(Length::Fill)
+            } else {
+                status
+            });
         }
         content
     }
@@ -8206,6 +8233,38 @@ pub(crate) fn workspace_mark<Message: 'static>(
         .into()
 }
 
+/// A channel's name followed by the facepile of the members after its lead,
+/// sharing the slot as they do in the channel's expanded sidebar row, so the
+/// workspace switcher shows who is in a channel as the sidebar does.
+/// `title` draws the name in body text at the width it is given; `face_id`
+/// names each face. `None` when there is no pile to show, and the name
+/// stands alone.
+pub(crate) fn channel_name_with_company<'a, Message: 'static>(
+    channel: &SidebarChannel,
+    name: &'a str,
+    ink: RowInk,
+    title: impl Fn(f32) -> Element<'a, Message> + 'a,
+    face_id: impl Fn(usize) -> Id + 'a,
+) -> Option<Element<'a, Message>> {
+    let (font, _) = search_label_fonts(false);
+    let pile = channel_pile(channel)?;
+    Some(pile.beside(
+        ink,
+        move || search_spans_width(name, "", design::TEXT_BODY, font, font),
+        title,
+        face_id,
+    ))
+}
+
+/// The facepile of the members after a channel's lead, with its counts
+/// measured; `None` when there is nobody to show after it.
+fn channel_pile(channel: &SidebarChannel) -> Option<members::Pile> {
+    let (font, _) = search_label_fonts(false);
+    members::Pile::new(&channel.members, |label| {
+        search_spans_width(label, "", design::TEXT_CAPTION, font, font)
+    })
+}
+
 /// Any other glyph that stands in a row's glyph column, in the row's `ink`.
 fn ink_glyph<'a, Message: 'a>(
     icon: widget::icon::Handle,
@@ -8402,7 +8461,7 @@ fn channel_view(
     selection_count: Option<usize>,
     query: &str,
 ) -> Element<'static, SidebarAction> {
-    let grid = RowGrid::child(compact);
+    let grid = RowGrid::child(compact).deletable();
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let ink = channel_ink(channel, listing);
@@ -8437,16 +8496,11 @@ fn channel_view(
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
-        let label = search_label(
-            &channel.title,
-            query,
-            CHILD_ROW_TEXT_SIZE,
-            channel_ink(channel, listing).text_class(),
-            false,
-        );
+        let label = channel_label(channel, query, ink, has_members);
         let indicator = match deletion {
             Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-            // The mark's badge already counts who is there.
+            // The mark and the facepile after the title show who is there,
+            // and the tooltip lists them, so the row's end keeps to news.
             _ if has_members => attention_indicator(attention),
             _ => channel_indicator(attention, channel.chats),
         };
@@ -8494,6 +8548,7 @@ fn channel_view(
         ),
         channel.delete_id.clone(),
         compact,
+        channel.selected,
     );
     crate::reorder::channel_target(
         grid.mount(with_deletion_retry(
@@ -8512,6 +8567,64 @@ fn channel_view(
         channel.id,
         !inert,
     )
+}
+
+/// A channel row's title, followed by the facepile of the members after its
+/// lead when there are any.
+///
+/// The title keeps priority; see [`members::Pile::fit`] for how the two
+/// share the row. Both are measured once per build of the row, not on every
+/// layout. The row's delete button covers its end rather than narrowing it,
+/// so the title and the pile are laid out across the same width whether the
+/// pointer is over the row or not, and neither moves when it enters.
+fn channel_label(
+    channel: &SidebarChannel,
+    query: &str,
+    ink: RowInk,
+    has_members: bool,
+) -> Element<'static, SidebarAction> {
+    let (font, emphasis) = search_label_fonts(false);
+    let pile = has_members.then(|| channel_pile(channel)).flatten();
+    let Some(pile) = pile else {
+        return search_label(
+            &channel.title,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            ink.text_class(),
+            false,
+        );
+    };
+    let text = std::rc::Rc::new((channel.title.clone(), query.to_owned()));
+    let measured = text.clone();
+    let channel_id = channel.id;
+    pile.beside(
+        ink,
+        move || {
+            search_spans_width(
+                &measured.0,
+                &measured.1,
+                CHILD_ROW_TEXT_SIZE,
+                font,
+                emphasis,
+            )
+        },
+        move |width| {
+            search_label_within(
+                &text.0,
+                &text.1,
+                CHILD_ROW_TEXT_SIZE,
+                ink.text_class(),
+                false,
+                Length::Fixed(width),
+            )
+        },
+        move |index| channel_face_id(channel_id, index),
+    )
+}
+
+/// The face at `index` in a channel row's facepile.
+fn channel_face_id(channel: ChannelId, index: usize) -> Id {
+    entity_id("channel.face", format_args!("{channel}.{index}"))
 }
 
 /// A child row's leading glyph, in the row's tone.
@@ -8597,7 +8710,10 @@ fn titled_label(
         .width(Length::Fill)
         .into()
     })
-    .height(CHILD_ROW_TEXT_SIZE * 1.5)
+    // As tall as the title's text, as a title on its own is, so the
+    // two share a pixel row; a height of their own would centre them
+    // between two and blur them.
+    .height(Length::Shrink)
     .into()
 }
 
@@ -8856,14 +8972,18 @@ fn in_progress_row(
 }
 
 /// Keep the row's primary button and its destructive quick action separate.
-/// An expanded row reserves the button width so the label continues to
-/// ellipsize correctly; the rail has no room for the action at all.
+/// An expanded row shows the button on hover or focus, over the end of the
+/// row on the row's own hovered fill, `selected` saying whether that is the
+/// selected row's. The content keeps its whole width either way, so nothing
+/// in the row moves when the pointer enters it. The rail has no room for the
+/// action at all.
 fn row_quick_delete<'a>(
     content: Element<'static, SidebarAction>,
     label: &str,
     action: Option<SidebarAction>,
     id: Id,
     compact: bool,
+    selected: bool,
 ) -> Element<'static, SidebarAction> {
     // A rail cell is one glyph wide: a hover-revealed delete would land on
     // the badges and next to the glyph a press means to open. The row's
@@ -8877,15 +8997,33 @@ fn row_quick_delete<'a>(
         .id(id)
         .name(label.to_owned())
         .on_press_maybe(action);
-    let controls = widget::container(
-        widget::container(crate::interaction::tooltip(control, label.to_owned()))
-            .class(theme::Container::Primary)
-            .width(width)
-            .height(WORKTREE_ROW_HEIGHT),
-    )
-    .align_right(Length::Fill)
-    .into();
-    RowInteraction::actions(content, controls, width)
+    let ground = widget::container(crate::interaction::tooltip(control, label.to_owned()))
+        .width(width)
+        .height(WORKTREE_ROW_HEIGHT)
+        .class(hovered_row_end(selected));
+    let controls = widget::container(ground).align_right(Length::Fill).into();
+    RowInteraction::actions(content, controls, 0.0)
+}
+
+/// The opaque fill of a hovered row's trailing end: the row's hovered fill
+/// laid over the sidebar's ground, rounded on the right as the row is.
+fn hovered_row_end(selected: bool) -> theme::Container<'static> {
+    theme::Container::custom(move |theme| {
+        let ground: cosmic::iced::Color = theme.cosmic().primary(false).base.into();
+        let ink: cosmic::iced::Color = theme.current_container().on.into();
+        let alpha = HOVERED_ROW_ALPHA + if selected { SELECTED_ROW_ALPHA } else { 0.0 };
+        let radius = theme.cosmic().corner_radii.radius_s;
+        cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(design::mix(
+                ground, ink, alpha,
+            ))),
+            border: cosmic::iced::Border {
+                radius: [0.0, radius[1], radius[2], 0.0].into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    })
 }
 
 /// The commands a channel row offers on right-click.
@@ -9057,6 +9195,15 @@ fn worktree_view<'a>(
         ..
     } = row_state;
     let chrome = &worktree.chrome;
+    // A merged pull request's worktree has served its purpose, so hovering
+    // it offers to delete it.
+    let quick_delete = !primary
+        && worktree
+            .pull_request()
+            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged));
+    // Unlike a channel row's, the grid keeps its usual status slot: a
+    // worktree's badges follow the slot, so the delete covers them rather
+    // than the slot, and widening it would cost the name room for nothing.
     let grid = RowGrid::child(compact);
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
@@ -9197,11 +9344,7 @@ fn worktree_view<'a>(
     };
     let action =
         crate::interaction::tooltip(action, rail_tooltip(&chrome.tooltip, deletion, compact));
-    let action = if !primary
-        && worktree
-            .pull_request()
-            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged))
-    {
+    let action = if quick_delete {
         row_quick_delete(
             action,
             &chrome.delete_name,
@@ -9215,6 +9358,7 @@ fn worktree_view<'a>(
             ),
             chrome.delete_id.clone(),
             compact,
+            selected,
         )
     } else {
         action
@@ -12492,6 +12636,8 @@ pub fn navigation_row_style(selected: bool) -> theme::Button {
 
 /// How strongly a selected navigation row is tinted with the text color.
 pub const SELECTED_ROW_ALPHA: f32 = 0.10;
+/// How much more strongly a hovered sidebar row is.
+const HOVERED_ROW_ALPHA: f32 = 0.06;
 
 /// Inset navigation fills use the theme radius; project labels remain plain on hover.
 fn row_button_style<const HOVER: bool>(selected: bool) -> theme::Button {
@@ -12539,7 +12685,7 @@ fn row_button_style<const HOVER: bool>(selected: bool) -> theme::Button {
                     theme,
                     focused,
                     SELECTED,
-                    if HOVER { 0.06 } else { 0.0 },
+                    if HOVER { HOVERED_ROW_ALPHA } else { 0.0 },
                     false,
                 )
             }),
@@ -13520,6 +13666,20 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
+    search_label_within(label, query, size, class, heading, Length::Fill)
+}
+
+/// [`search_label`] at `width` rather than filling its slot. The label sets
+/// its own width rather than taking a container's, which would draw its
+/// text in the container's colour instead of the row's.
+fn search_label_within(
+    label: &str,
+    query: &str,
+    size: f32,
+    class: theme::Text,
+    heading: bool,
+    width: Length,
+) -> Element<'static, SidebarAction> {
     let (font, emphasis) = search_label_fonts(heading);
     let highlights = search_highlight_ranges(label, query);
     if highlights.is_empty() {
@@ -13531,7 +13691,7 @@ fn search_label(
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
             ))
-            .width(Length::Fill)
+            .width(width)
             .into();
     }
     let label = label.to_owned();
@@ -13568,7 +13728,10 @@ fn search_label(
         .clip(true)
         .into()
     })
-    .height(size * 1.5)
+    .width(width)
+    // As tall as its text, so a highlighted title sits on the same pixel
+    // row as a plain one rather than blurred between two.
+    .height(Length::Shrink)
     .into()
 }
 

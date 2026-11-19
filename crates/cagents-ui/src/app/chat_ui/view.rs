@@ -5959,7 +5959,9 @@ impl Runtime {
                 self.image_preview(item, cached)
             } else {
                 widget::row::with_children(vec![
-                    widget::icon(Icon::Attachment.handle()).size(12).into(),
+                    widget::icon(Icon::Attachment.handle())
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into(),
                     if let Some(text) = image_text {
                         prose::paragraph(
                             design::markdown_settings(
