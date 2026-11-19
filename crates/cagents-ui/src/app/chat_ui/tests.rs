@@ -14653,6 +14653,133 @@ fn reasoning_action_draft(app: &mut Cagents, provider: Provider) -> CardId {
 }
 
 #[test]
+fn saved_draft_model_is_restored_through_shared_startup() {
+    use crate::model::BootId;
+    for save_while_awaiting in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let started = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        drop(app.observe_listed_models(
+            Provider::Claude,
+            vec![fixture_model("other-model", &["low", "high"])],
+            None,
+        ));
+        drop(
+            app.update(Message::ChromeUi(super::super::chrome_ui::Action::Launch(
+                super::super::chrome_ui::NewTab::Thread,
+            ))),
+        );
+        let card = app.workspace.focused().unwrap();
+        assert_ne!(card, started);
+        assert_eq!(app.workspace.cards().len(), 2);
+        let target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::DraftModel(
+            target,
+            Provider::Claude,
+            Some("other-model".into()),
+        ))));
+        drop(app.update(Message::ChatUi(Action::Reasoning(
+            target,
+            "other-model".into(),
+            Some("low".into()),
+        ))));
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(uuid::Uuid::new_v4());
+        let saved = app.persistent_workspace();
+        let chosen = saved.chat_draft_models[&card].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("window.sqlite3");
+        let store =
+            crate::persistence::StateStore::open(&path, BootId::new("draft-startup")).unwrap();
+        store
+            .save_workspace(
+                &saved,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &Default::default(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        let store =
+            crate::persistence::StateStore::open(&path, BootId::new("draft-startup")).unwrap();
+        let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+        assert_eq!(loaded.chat_draft_models[&card], chosen);
+
+        // Use startup's state constructor and runtime initialization, without
+        // executing its tasks or connecting to a provider or the user's daemon.
+        let mut restored = crate::app::tests::context_inspector_test_app(false);
+        restored.chat_ui = State::for_workspace(&loaded);
+        restored.shared_views = super::super::shared_views::State::for_workspace(&loaded);
+        restored.workspace = Cagents::rebuild_workspace(&loaded);
+        restored.durable = Arc::new(loaded);
+        drop(restored.initialize_runtimes());
+        assert!(restored.chat_ui.last_models.is_empty());
+        assert!(restored.chat_awaiting_admission(card));
+        assert!(restored.chat_awaiting_admission(started));
+        if save_while_awaiting {
+            assert_eq!(
+                restored.persistent_workspace().chat_draft_models[&card],
+                chosen
+            );
+        }
+        let pane = crate::workspace_model::views::Pane::from_card(
+            restored.card_state(card).unwrap(),
+            restored.durable.card_scopes.get(&card).cloned(),
+        )
+        .unwrap();
+        drop(restored.admit_shared_chat(&pane));
+        let runtime = chat_runtime(&restored, card);
+        assert!(runtime.is_draft());
+        assert_eq!(runtime.snapshot.selected_model, chosen.model);
+        assert_eq!(runtime.snapshot.reasoning, chosen.reasoning);
+        assert_eq!(
+            restored.persistent_workspace().chat_draft_models[&card],
+            chosen
+        );
+        write(&mut restored, card, "hello");
+        submit(&mut restored, card);
+        assert_eq!(
+            chat_runtime(&restored, card).queued.as_ref().unwrap().model,
+            Some(("other-model".into(), Some("low".into())))
+        );
+    }
+}
+
+#[test]
+fn saved_draft_model_picks_schedule_their_own_save() {
+    use crate::app::terminal_output_tests::persists;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    // Finish setup's save so each pick must request its own next save.
+    app.save_snapshot();
+    for (action, effort) in [
+        (
+            Action::DraftModel(target, Provider::Claude, Some("other-model".into())),
+            "high",
+        ),
+        (
+            Action::Reasoning(target, "other-model".into(), Some("low".into())),
+            "low",
+        ),
+    ] {
+        let before = persists();
+        assert!(app.navigation_save.is_none());
+        drop(app.update(Message::ChatUi(action)));
+        assert!(app.navigation_save.is_some(), "a pick must request a save");
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), before + 1);
+        assert_eq!(
+            app.durable.chat_draft_models[&card],
+            ChatDraftModel {
+                provider: Provider::Claude,
+                model: Some("other-model".into()),
+                reasoning: Some(effort.into()),
+            }
+        );
+    }
+}
+
+#[test]
 fn a_drafts_model_and_effort_survive_reopening_the_window() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = reasoning_action_draft(&mut app, Provider::Claude);

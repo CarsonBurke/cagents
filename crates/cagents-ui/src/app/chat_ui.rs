@@ -1393,6 +1393,15 @@ impl Default for State {
     }
 }
 impl State {
+    pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
+        Self::with_draft_attachments(
+            workspace.chat_drafts.clone(),
+            workspace.chat_draft_attachments.clone(),
+        )
+        .with_waiting_messages(workspace.chat_waiting_messages.clone())
+        .with_draft_models(workspace.chat_draft_models.clone())
+    }
+
     #[cfg(test)]
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
@@ -7803,6 +7812,7 @@ impl Cagents {
         };
         Task::batch([
             skills,
+            self.save_snapshot_soon(),
             iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
                 .map(cosmic::Action::App),
         ])
@@ -8825,6 +8835,9 @@ impl Cagents {
             .filter(|(card, draft)| open_cards.contains(card) && !draft.is_empty())
             .map(|(card, draft)| (*card, draft.clone()))
             .collect();
+        // Pending admission has no draft snapshot yet. Its saved choice stays
+        // authoritative until open_chat_draft restores it, including if a save
+        // happens while the shared scope is still loading.
         let mut chat_draft_models = self
             .chat_ui
             .draft_models
@@ -8848,7 +8861,7 @@ impl Cagents {
             if open_cards.contains(card) {
                 if let Some(model) = runtime.draft_model() {
                     chat_draft_models.insert(*card, model);
-                } else {
+                } else if !runtime.session.is_unstarted() {
                     chat_draft_models.remove(card);
                 }
                 let (draft, attachments) = runtime.persistent_draft();
@@ -8870,7 +8883,7 @@ impl Cagents {
             {
                 if let Some(model) = runtime.draft_model() {
                     chat_draft_models.insert(*card, model);
-                } else {
+                } else if !runtime.session.is_unstarted() {
                     chat_draft_models.remove(card);
                 }
                 let (draft, attachments) = runtime.persistent_draft();
@@ -9364,7 +9377,10 @@ impl Cagents {
         self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.blocked_details.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        if let Some(saved) = self.chat_ui.draft_models.remove(&card)
+        let saved_model = self.chat_ui.draft_models.remove(&card);
+        tracing::debug!(target: "cagents::draft_model", ?card,
+            provider = ?session.launch.provider, ?saved_model, "opening draft");
+        if let Some(saved) = saved_model
             && saved.provider == session.launch.provider
         {
             snapshot.selected_model = saved.model;
@@ -9679,7 +9695,7 @@ impl Cagents {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
             if let Some(model) = runtime.draft_model() {
                 self.chat_ui.draft_models.insert(card, model);
-            } else {
+            } else if !runtime.session.is_unstarted() {
                 self.chat_ui.draft_models.remove(&card);
             }
             let (draft, attachments) = runtime.persistent_draft();
@@ -15567,7 +15583,7 @@ impl Cagents {
                     snapshot.selected_model = Some(model.clone());
                     snapshot.reasoning = reasoning.clone();
                     self.remember_chat_model(provider, Some(model), reasoning);
-                    return Task::none();
+                    return self.save_snapshot_soon();
                 }
                 let command = Command::SetModel { model, reasoning };
                 return self.chat_send(target, command, false);
