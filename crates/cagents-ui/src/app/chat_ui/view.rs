@@ -1907,15 +1907,20 @@ impl Runtime {
     /// message once, where the window has a row for each of its parts; the
     /// first row stands for its item even when it is a later part.
     pub(super) fn window_items(&self) -> impl Iterator<Item = usize> + '_ {
-        fn base(id: &str) -> &str {
-            chat::TranscriptPart::parse(id).map_or(id, |part| part.item)
-        }
-        let items = &self.snapshot.items;
-        (0..items.len()).filter(move |&row| {
-            row == 0
-                || chat::TranscriptPart::parse(&items[row].id)
-                    .is_none_or(|part| part.item != base(&items[row - 1].id))
-        })
+        // The item the rows so far belong to; a part of it continues it.
+        let mut current = None;
+        self.snapshot
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(move |(row, item)| {
+                let part = chat::TranscriptPart::parse(&item.id);
+                if part.as_ref().is_some_and(|part| current == Some(part.item)) {
+                    return None;
+                }
+                current = Some(part.map_or(item.id.as_str(), |part| part.item));
+                Some(row)
+            })
     }
 
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {

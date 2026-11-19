@@ -1702,9 +1702,11 @@ impl HistoryExtent {
         }
         Self::deserialize(deserializer)
     }
-    /// How many items the whole cached conversation holds, given the window's.
-    pub fn total(self, window: usize) -> u64 {
-        self.before + window as u64 + self.after
+    /// How many items the whole cached conversation holds, given how many
+    /// the window holds. That is items, not rows: a long message the window
+    /// shows as several parts is one item.
+    pub fn total(self, window_items: usize) -> u64 {
+        self.before + window_items as u64 + self.after
     }
     /// How many items, cached or not, are known to come before the window.
     pub fn earlier(self) -> u64 {
