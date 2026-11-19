@@ -2042,12 +2042,14 @@ mod tests {
     }
 
     /// Runs `task`'s focus changes against the pane's mounted view, then
-    /// delivers `events` to it, as the native runtime does. Returns what the
-    /// view published and the control left with focus.
+    /// delivers `events` to it, as the native runtime does, keeping widget
+    /// state in `cache` from one call to the next. Returns what the view
+    /// published and the control left with focus.
     fn pane_keyboard(
         app: &Cagents,
         card: CardId,
         size: iced::Size,
+        cache: &mut cosmic::iced::runtime::user_interface::Cache,
         task: Task<Message>,
         events: &[iced::Event],
     ) -> (Vec<Message>, Option<widget::Id>) {
@@ -2076,7 +2078,7 @@ mod tests {
         let mut ui = UserInterface::build(
             app.card_view(card, true, false),
             size,
-            Cache::new(),
+            std::mem::replace(cache, Cache::new()),
             &mut renderer,
         );
         iced::futures::executor::block_on(async {
@@ -2106,6 +2108,7 @@ mod tests {
         ));
         let mut focused = Focused(None);
         ui.operate(&renderer, &mut focused);
+        *cache = ui.into_cache();
         (messages, focused.0)
     }
 
@@ -2121,25 +2124,6 @@ mod tests {
                 event: WorkspaceViewportEvent::Resized(width),
             }));
         };
-        // Open where it docks, then collapsed to its rail by a narrower pane.
-        resize(&mut app, 1200.0);
-        app.open_pane_inspector_now(card);
-        resize(&mut app, narrow.width);
-        assert!(app.pane_inspectors.is_railed(card));
-        drop(app.update(Message::ExpandPaneInspector(card)));
-        app.settle_pane_inspectors();
-        assert!(app.pane_inspectors.is_expanded(card));
-
-        // Escape slides the panel away, and the rail it leaves takes the
-        // keyboard, as the toggle does once a panel closes.
-        drop(app.close_pane_inspector_overlay(card));
-        let settled =
-            app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
-        assert!(app.pane_inspectors.is_railed(card));
-        assert_eq!(app.pane_inspector_layout(card), None);
-        let (_, focused) = pane_keyboard(&app, card, narrow, settled, &[]);
-        assert_eq!(focused, Some(app.pane_inspector_rail_id(card)));
-
         let press = |key: Key, modifiers: Modifiers, repeat: bool| {
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 modified_key: key.clone(),
@@ -2153,6 +2137,53 @@ mod tests {
                 repeat,
             })
         };
+        // One window's widget state, kept through the whole sequence.
+        let mut cache = cosmic::iced::runtime::user_interface::Cache::new();
+
+        // Open where it docks, then collapsed to its rail by a narrower pane.
+        resize(&mut app, 1200.0);
+        app.open_pane_inspector_now(card);
+        resize(&mut app, narrow.width);
+        assert!(app.pane_inspectors.is_railed(card));
+        drop(pane_keyboard(
+            &app,
+            card,
+            narrow,
+            &mut cache,
+            Task::none(),
+            &[],
+        ));
+
+        // Expanded, the overlay's toggle takes the keyboard from the rail.
+        let expand = app.update(Message::ExpandPaneInspector(card));
+        app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_expanded(card));
+        let (_, focused) = pane_keyboard(&app, card, narrow, &mut cache, expand, &[]);
+        assert_eq!(focused, Some(app.pane_inspector_toggle_id(card)));
+
+        // Escape there slides the panel away, and the rail it leaves takes
+        // the keyboard, as the toggle does once a panel closes.
+        let (messages, _) = pane_keyboard(
+            &app,
+            card,
+            narrow,
+            &mut cache,
+            Task::none(),
+            &[press(Key::Named(Named::Escape), Modifiers::empty(), false)],
+        );
+        let escape = messages
+            .into_iter()
+            .find(|message| matches!(message, Message::ClosePaneInspector(id) if *id == card))
+            .expect("Escape in the overlay closes it");
+        let sliding = app.update(escape);
+        drop(pane_keyboard(&app, card, narrow, &mut cache, sliding, &[]));
+        let settled =
+            app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.pane_inspector_layout(card), None);
+        let (_, focused) = pane_keyboard(&app, card, narrow, &mut cache, settled, &[]);
+        assert_eq!(focused, Some(app.pane_inspector_rail_id(card)));
+
         let space = || Key::Character(" ".into());
         let focus_rail = || widget::button::focus(app.pane_inspector_rail_id(card));
         for (event, expands) in [
@@ -2165,7 +2196,14 @@ mod tests {
             (press(space(), Modifiers::CTRL, false), false),
             (press(space(), Modifiers::empty(), true), false),
         ] {
-            let (messages, _) = pane_keyboard(&app, card, narrow, focus_rail(), &[event.clone()]);
+            let (messages, _) = pane_keyboard(
+                &app,
+                card,
+                narrow,
+                &mut cache,
+                focus_rail(),
+                &[event.clone()],
+            );
             let pressed = messages
                 .iter()
                 .filter(
@@ -2179,6 +2217,7 @@ mod tests {
             &app,
             card,
             narrow,
+            &mut cosmic::iced::runtime::user_interface::Cache::new(),
             Task::none(),
             &[press(space(), Modifiers::empty(), false)],
         );
