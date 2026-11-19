@@ -4679,6 +4679,81 @@ fn a_retracted_skill_call_never_takes_later_instructions() {
     );
 }
 
+/// A reopened chat replays a helper's own transcript, where its skill's
+/// instructions are its step's output, as they were live.
+#[test]
+fn a_helpers_saved_skill_instructions_are_its_steps_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = "00000000-0000-4000-8000-000000000001";
+    let records = [
+        json!({"type":"user","uuid":"prompt","parentUuid":null,"sessionId":session,"message":{"role":"user","content":"Write release notes."}}),
+        json!({"type":"assistant","uuid":"agent","parentUuid":"prompt","sessionId":session,"message":{"id":"msg-agent","role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{"description":"Notes","prompt":"Write release notes.","subagent_type":"general-purpose"}}]}}),
+        json!({"type":"user","uuid":"agent-result","parentUuid":"agent","sessionId":session,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"Done."}]}}),
+    ];
+    let root = directory.path().join("root.jsonl");
+    std::fs::write(
+        &root,
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut history = History::index(File::open(root).unwrap(), session).unwrap();
+    let children = directory.path().join("subagents");
+    std::fs::create_dir(&children).unwrap();
+    history.subagent_dir = Some(children.clone());
+    std::fs::write(
+        children.join("agent-one.meta.json"),
+        json!({"toolUseId":"agent-call","agentType":"general-purpose","description":"Notes"})
+            .to_string(),
+    )
+    .unwrap();
+    let child = |uuid: &str, frame: Value| {
+        let mut frame = frame;
+        frame["uuid"] = json!(uuid);
+        frame["sessionId"] = json!(session);
+        frame["agentId"] = json!("one");
+        frame["isSidechain"] = json!(true);
+        format!("{frame}\n")
+    };
+    std::fs::write(
+        children.join("agent-one.jsonl"),
+        [
+            child("child-call", json!({"type":"assistant","message":{"id":"child-message","role":"assistant","content":[{"type":"tool_use","id":"child-skill","name":"Skill","input":{"skill":"release-notes"}}]}})),
+            child("child-result", json!({"type":"user","toolUseResult":{"success":true,"commandName":"release-notes"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"child-skill","content":"Launching skill: release-notes"}]}})),
+            child("child-instructions", json!({"type":"user","isMeta":true,"sourceToolUseID":"child-skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}})),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let mut adapter = Claude {
+        history: Some(history),
+        ..Claude::default()
+    };
+    let replayed = adapter.initialize().unwrap();
+    let events = format!("{:?}", replayed.events);
+    let shown = replayed
+        .events
+        .iter()
+        .flat_map(|event| match event {
+            Event::History { items, .. } => items.iter().collect::<Vec<_>>(),
+            Event::Item(item) => vec![item],
+            _ => Vec::new(),
+        })
+        .chain(replayed.events.iter().filter_map(|event| match event {
+            Event::SubagentItem { id, item } if id == "agent-call" => Some(item),
+            _ => None,
+        }))
+        .filter(|item| item.id == "child-skill")
+        .last()
+        .unwrap_or_else(|| panic!("{events}"));
+    assert!(
+        matches!(&shown.content, ItemContent::Tool { name, output, .. } if name == "Skill" && output == SKILL_BODY),
+        "{shown:?}"
+    );
+}
+
 /// Saved instructions whose call is on no branch they share, such as one
 /// Claude retracted, load into no call, even one reusing that call's ID.
 #[test]

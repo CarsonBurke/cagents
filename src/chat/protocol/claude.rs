@@ -1084,9 +1084,10 @@ impl Claude {
         step: &mut Step,
     ) {
         let call = match frame["sourceToolUseID"].as_str() {
-            // Saved instructions load only into the call their page found
-            // on their own branch; another branch's call may share its ID.
-            Some(_) if frame[SKILL_CALL].is_null() => return,
+            // The main chat's saved instructions load only into the call
+            // their page found on their own branch; another branch's call may
+            // share its ID. A helper's are replayed in order with its calls.
+            Some(_) if child.is_none() && frame[SKILL_CALL].is_null() => return,
             Some(id) => ScopedId::new(child, id),
             None => {
                 let scope = ScopedId::new(child, "").parent;
