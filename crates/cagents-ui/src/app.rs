@@ -15069,11 +15069,9 @@ impl Cagents {
         if generation != self.pull_request_dialog_generation || self.pull_request_dialog.is_some() {
             return Task::none();
         }
+        let covered = self.modal_is_open();
         self.pull_request_dialog = Some(dialog);
-        if self.dirty_repository_close.is_some()
-            || self.sidebar_state.pending_discard().is_some()
-            || self.worktree_dialog.is_some()
-        {
+        if covered {
             return Task::none();
         }
         iced::widget::operation::focus(pull_request_dialog_focus_id()).map(cosmic::Action::App)
