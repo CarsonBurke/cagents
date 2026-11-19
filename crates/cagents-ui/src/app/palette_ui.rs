@@ -209,8 +209,20 @@ fn entry_key(message: &Message) -> Option<String> {
 
 mod matching;
 
+#[cfg(test)]
+thread_local! {
+    static SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 fn match_score(label: &str, query: &str) -> Option<usize> {
-    crate::search_match::score(&matching::lowercase(label), &matching::lowercase(query))
+    match_score_lowered(label, &matching::lowercase(query))
+}
+
+fn match_score_lowered(label: &str, lowered_query: &str) -> Option<usize> {
+    #[cfg(test)]
+    SCORES.with(|scores| scores.set(scores.get() + 1));
+    crate::search_match::score(&matching::lowercase(label), lowered_query)
 }
 
 fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static, Message> {
@@ -995,40 +1007,39 @@ impl Cagents {
 
     fn filter_palette_entries(
         &self,
-        mut entries: Vec<(String, String, Message)>,
+        entries: Vec<(String, String, Message)>,
     ) -> Vec<(String, String, Message)> {
-        let (category, query) = palette_mode_query(
-            self.palette.query.as_deref().unwrap_or(""),
-            self.palette.move_pane.is_some(),
-        );
-        entries.retain(|(label, _, message)| {
-            category.is_none_or(|category| entry_category(message) == category)
-                && match_score(search_label(label, self.palette.move_pane.is_some()), query)
-                    .is_some()
-        });
-        entries.sort_by_cached_key(|(label, _, message)| {
-            let recent = entry_key(message)
-                .and_then(|key| {
-                    self.settings
-                        .palette_recents
-                        .iter()
-                        .position(|recent| *recent == key)
-                })
-                .unwrap_or(usize::MAX);
-            let common = match message {
-                Message::RunCommand(Command::NewTerminal) => 0,
-                Message::RunCommand(Command::NewThread) => 1,
-                Message::RunCommand(Command::OpenSettings) => 2,
-                _ => 3,
-            };
-            (
-                match_score(search_label(label, self.palette.move_pane.is_some()), query)
-                    .unwrap_or(usize::MAX),
-                recent,
-                common,
-            )
-        });
-        entries
+        let moving = self.palette.move_pane.is_some();
+        let (category, query) =
+            palette_mode_query(self.palette.query.as_deref().unwrap_or(""), moving);
+        let query = matching::lowercase(query);
+        let mut scored: Vec<_> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let (label, _, message) = &entry;
+                if category.is_some_and(|category| entry_category(message) != category) {
+                    return None;
+                }
+                let score = match_score_lowered(search_label(label, moving), &query)?;
+                let recent = entry_key(message)
+                    .and_then(|key| {
+                        self.settings
+                            .palette_recents
+                            .iter()
+                            .position(|recent| *recent == key)
+                    })
+                    .unwrap_or(usize::MAX);
+                let common = match message {
+                    Message::RunCommand(Command::NewTerminal) => 0,
+                    Message::RunCommand(Command::NewThread) => 1,
+                    Message::RunCommand(Command::OpenSettings) => 2,
+                    _ => 3,
+                };
+                Some(((score, recent, common), entry))
+            })
+            .collect();
+        scored.sort_by_key(|(key, _)| *key);
+        scored.into_iter().map(|(_, entry)| entry).collect()
     }
 
     pub(super) fn palette_surface(&self) -> Option<Element<'_, Message>> {
@@ -1922,6 +1933,119 @@ mod tests {
         let _ = app.update_palette(Action::Close);
         assert!(!app.palette.is_open());
     }
+    #[test]
+    fn palette_filter_scores_each_entry_once() {
+        let mut app = settings_focus_fixture();
+        drop(app.update_palette(Action::Open));
+        app.palette.query = Some("se".into());
+        let entry = |label: &str| {
+            (
+                label.into(),
+                String::new(),
+                Message::RunCommand(Command::OpenSettings),
+            )
+        };
+        let entries = vec![entry("Settings"), entry("New session"), entry("Unmatched")];
+        let count = entries.len();
+        SCORES.with(|scores| scores.set(0));
+        let filtered = app.filter_palette_entries(entries);
+        assert_eq!(SCORES.with(|scores| scores.get()), count);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn palette_filter_order_is_unchanged() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        let other = CardId::new();
+        let channel = crate::model::ChannelId::new();
+        let other_channel = crate::model::ChannelId::new();
+        let entry = |label: &str, message| (label.to_owned(), String::new(), message);
+        let entries = vec![
+            entry("Settings", Message::RunCommand(Command::OpenSettings)),
+            entry("Settings", Message::RunCommand(Command::ToggleInspector)),
+            entry("Settings", Message::RunCommand(Command::CommandPalette)),
+            entry("Settings", Message::RunCommand(Command::NewThread)),
+            entry("Settings", Message::RunCommand(Command::NewTerminal)),
+            entry(
+                "Focus pane: Settings",
+                Message::Palette(Action::FocusPane(card)),
+            ),
+            entry(
+                "Focus pane: Settings",
+                Message::Palette(Action::FocusPane(other)),
+            ),
+            entry(
+                "Open channel: release",
+                Message::Sidebar(SidebarAction::OpenChannel {
+                    channel_id: channel,
+                }),
+            ),
+            entry(
+                "Open channel: release",
+                Message::Sidebar(SidebarAction::OpenChannel {
+                    channel_id: other_channel,
+                }),
+            ),
+            entry(
+                "Move pane to channel: #release",
+                Message::MovePaneToChannel { card, channel },
+            ),
+            entry("ΟΣ", Message::RunCommand(Command::ReopenPane)),
+            entry("ΟΣ extra", Message::RunCommand(Command::MovePaneLeft)),
+            entry("ΟΣΑ", Message::RunCommand(Command::MovePaneRight)),
+        ];
+        app.settings.palette_recents = [8, 6, 3]
+            .map(|index| entry_key(&entries[index].2).unwrap())
+            .into();
+        let identities = |entries: Vec<(String, String, Message)>| {
+            entries
+                .into_iter()
+                .map(|(label, hint, message)| (label, hint, EntryIdentity::capture(&message)))
+                .collect::<Vec<_>>()
+        };
+        for move_pane in [None, Some(card)] {
+            app.palette.move_pane = move_pane;
+            for raw_query in ["", "set", ">set", "@", "#rel", "ΟΣ"] {
+                app.palette.query = Some(raw_query.into());
+                let moving = move_pane.is_some();
+                let (category, query) = palette_mode_query(raw_query, moving);
+                // Reference the previous retain + cached-key sort, including both scores.
+                let mut expected = entries.clone();
+                expected.retain(|(label, _, message)| {
+                    category.is_none_or(|category| entry_category(message) == category)
+                        && match_score(search_label(label, moving), query).is_some()
+                });
+                expected.sort_by_cached_key(|(label, _, message)| {
+                    let recent = entry_key(message)
+                        .and_then(|key| {
+                            app.settings
+                                .palette_recents
+                                .iter()
+                                .position(|recent| *recent == key)
+                        })
+                        .unwrap_or(usize::MAX);
+                    let common = match message {
+                        Message::RunCommand(Command::NewTerminal) => 0,
+                        Message::RunCommand(Command::NewThread) => 1,
+                        Message::RunCommand(Command::OpenSettings) => 2,
+                        _ => 3,
+                    };
+                    (
+                        match_score(search_label(label, moving), query).unwrap_or(usize::MAX),
+                        recent,
+                        common,
+                    )
+                });
+                assert_eq!(
+                    identities(app.filter_palette_entries(entries.clone())),
+                    identities(expected),
+                    "query {raw_query:?}, moving {moving}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn palette_ranks_useful_matches_and_restores_bounded_recent_commands() {
         assert!(match_score("feature login", "feat") < match_score("alpha-wt-feat", "feat"));
