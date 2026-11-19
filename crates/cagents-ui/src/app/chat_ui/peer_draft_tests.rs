@@ -1316,6 +1316,7 @@ fn a_copy_of_the_first_message_leaves_the_composer_and_other_writing_stays() {
 /// along to the attached conversation.
 #[test]
 fn a_file_chosen_while_another_window_sends_comes_along() {
+    let _admission = super::attachment_draft::test_admission();
     const FILE: &str = "/repo/notes.txt";
     let mut peer = peer();
     write(&mut peer.app, peer.card, "notes");
@@ -1342,7 +1343,6 @@ fn a_file_chosen_while_another_window_sends_comes_along() {
         "the chooser holds the draft"
     );
 
-    let _admission = super::attachment_draft::test_admission();
     drop(peer.app.handle_chat_ui(Action::Attached(
         target,
         ticket.clone(),
