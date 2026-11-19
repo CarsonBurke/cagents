@@ -2782,6 +2782,10 @@ struct ChannelRowLayout {
     faces: Vec<Rectangle>,
     /// Every text the row lays out.
     texts: Vec<String>,
+    /// The count after the faces, if any.
+    count: Option<Rectangle>,
+    /// The delete button laid over the row's end.
+    delete: Rectangle,
     /// What a click where the delete button appears does.
     end_click: Vec<SidebarAction>,
 }
@@ -2792,6 +2796,8 @@ struct FacesAndTexts {
     faces: Vec<Id>,
     found: Vec<(usize, Rectangle)>,
     texts: Vec<(String, Rectangle)>,
+    /// The focusable controls, by id.
+    controls: Vec<(Id, Rectangle)>,
 }
 
 impl FacesAndTexts {
@@ -2807,6 +2813,7 @@ impl FacesAndTexts {
             faces,
             found: Vec::new(),
             texts: Vec::new(),
+            controls: Vec::new(),
         };
         element.as_widget_mut().operate(
             tree,
@@ -2837,6 +2844,16 @@ impl cosmic::iced::advanced::widget::Operation for FacesAndTexts {
     }
     fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
         self.texts.push((text.to_owned(), bounds));
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        _: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+    ) {
+        if let Some(id) = id {
+            self.controls.push((id.clone(), bounds));
+        }
     }
 }
 
@@ -2907,10 +2924,22 @@ fn channel_row_layout(channel: &SidebarChannel, width: f32, hovered: bool) -> Ch
         .find(|(text, _)| *text == channel.title)
         .unwrap_or_else(|| panic!("{:?} is laid out", channel.title))
         .1;
+    let delete = collect
+        .controls
+        .iter()
+        .find(|(id, _)| *id == channel.delete_id)
+        .expect("the row mounts its delete button")
+        .1;
     ChannelRowLayout {
         title,
         faces: collect.faces(),
+        count: collect
+            .texts
+            .iter()
+            .find(|(text, _)| text.starts_with('+'))
+            .map(|(_, bounds)| *bounds),
         texts: collect.texts.into_iter().map(|(text, _)| text).collect(),
+        delete,
         end_click,
     }
 }
@@ -3073,31 +3102,88 @@ fn one_other_channel_member_shows_as_its_face() {
     }
 }
 
-/// A channel whose members are all of the lead's kind, such as one of
-/// terminals alone, draws no pile that would only repeat its mark.
+/// A channel whose members are all of one kind still shows who else is
+/// there: the pile stands for the other members whatever their kind.
 #[test]
-fn a_channel_of_one_kind_does_not_repeat_its_mark() {
+fn a_channel_of_one_kind_shows_its_other_members() {
     use crate::agent::Provider;
-    for channel in [
-        channel_with("Shell farm", &[], 10),
-        channel_with(
-            "Three Claudes",
-            &[
-                (Provider::Claude, ChannelMemberState::Working),
-                (Provider::Claude, ChannelMemberState::Idle),
-                (Provider::Claude, ChannelMemberState::Idle),
-            ],
-            0,
+    let claude = |state| (Provider::Claude, state);
+    for (channel, faces, count) in [
+        (channel_with("Shell farm", &[], 10), 1, Some("+8")),
+        (
+            channel_with(
+                "Release prep",
+                &[
+                    claude(ChannelMemberState::Working),
+                    claude(ChannelMemberState::Idle),
+                    claude(ChannelMemberState::Idle),
+                ],
+                0,
+            ),
+            2,
+            None,
+        ),
+        (
+            channel_with(
+                "Pair",
+                &[
+                    claude(ChannelMemberState::Working),
+                    claude(ChannelMemberState::Idle),
+                ],
+                0,
+            ),
+            1,
+            None,
         ),
     ] {
         let row = channel_row_layout(&channel, 260.0, false);
-        assert!(row.faces.is_empty(), "{:?}", channel.title);
-        assert!(
-            !row.texts.iter().any(|text| text.starts_with('+')),
-            "{:?}",
+        assert_eq!(row.faces.len(), faces, "{:?}", channel.title);
+        assert_eq!(
             row.texts
+                .iter()
+                .find(|text| text.starts_with('+'))
+                .map(String::as_str),
+            count,
+            "{:?}",
+            channel.title
         );
-        assert!(row.title.width >= natural_title_width(&channel.title));
+        assert_eq!(row.title.width, natural_title_width(&channel.title));
+    }
+}
+
+/// The delete button a hover lays over a channel row's end covers only the
+/// slot the row keeps for it, never the facepile or the title, so no face
+/// or count is half hidden while the pointer is on the row.
+#[test]
+fn a_channel_rows_delete_button_never_covers_its_facepile() {
+    use crate::agent::Provider;
+    let channels = [
+        crowded("Channel switch perf"),
+        crowded("Investigate why switching channels stalls with many agents open"),
+        channel_with("Shell farm", &[], 10),
+        channel_with(
+            "Shell and agent",
+            &[(Provider::Claude, ChannelMemberState::Idle)],
+            1,
+        ),
+    ];
+    for channel in &channels {
+        let mut piled = false;
+        for width in (120..=360).step_by(2) {
+            let width = width as f32;
+            let row = channel_row_layout(channel, width, true);
+            let pile = row.faces.iter().chain(&row.count);
+            for bounds in pile.chain([&row.title]) {
+                assert!(
+                    bounds.x + bounds.width <= row.delete.x,
+                    "{:?} at {width}px: {bounds:?} runs under {:?}",
+                    channel.title,
+                    row.delete
+                );
+            }
+            piled |= !row.faces.is_empty();
+        }
+        assert!(piled, "{:?} shows a pile at some width", channel.title);
     }
 }
 
@@ -3178,7 +3264,7 @@ fn a_channel_name_elsewhere_takes_the_rows_facepile() {
     assert_eq!(faces_beside(&lone, 260.0), None);
     assert_eq!(
         faces_beside(&channel_with("Shell farm", &[], 10), 260.0),
-        None
+        Some(1)
     );
     assert_eq!(faces_beside(&crowded("Review sweep"), 260.0), Some(3));
     assert_eq!(

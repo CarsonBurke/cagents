@@ -98,6 +98,14 @@ const ROW_GUTTER: f32 = space::XS;
 /// this frame. A spinner, an attention badge and a chat count all land here,
 /// so a label cannot reflow when an agent starts working or a chat opens.
 const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
+/// The status slot of a channel row, whose hover reveals a delete control
+/// over its end, where the slot is. The control is laid over the row
+/// without moving anything, so the slot is reserved at rest as wide as the
+/// control reaches past the row's inset and the gutter before the slot: the
+/// control then covers the slot and never the title or facepile beside it. The indicator keeps its own
+/// column at the slot's end, in line with every other row's.
+const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
+const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
 /// The project header's hover-revealed commands: disclose, new channel, new
 /// worktree. Reserved inside the header row so a long project name ellipsizes
 /// instead of running under them, and read by `row_interaction::header_at` so
@@ -6736,6 +6744,9 @@ struct RowGrid {
     /// The rail renders one centred glyph per row, with its status pinned to
     /// the glyph's corners; see [`rail`].
     compact: bool,
+    /// The row's hover reveals a delete control over its end; see
+    /// [`ROW_DELETE_STATUS_WIDTH`].
+    deletable: bool,
 }
 
 /// One row's content while its slots are being filled.
@@ -6746,6 +6757,7 @@ impl RowGrid {
         Self {
             kind: RowKind::Project,
             compact,
+            deletable: false,
         }
     }
 
@@ -6753,6 +6765,15 @@ impl RowGrid {
         Self {
             kind: RowKind::Child,
             compact,
+            deletable: false,
+        }
+    }
+
+    /// The same grid for a row whose end a hover-revealed delete covers.
+    const fn deletable(self) -> Self {
+        Self {
+            deletable: true,
+            ..self
         }
     }
 
@@ -6812,11 +6833,16 @@ impl RowGrid {
             content = content.push(label);
         }
         if matches!(self.kind, RowKind::Child) {
-            content = content.push(
-                widget::container(slot(status))
-                    .center_x(Length::Fixed(ROW_STATUS_WIDTH))
-                    .center_y(Length::Fill),
-            );
+            let status = widget::container(slot(status))
+                .center_x(Length::Fixed(ROW_STATUS_WIDTH))
+                .center_y(Length::Fill);
+            content = content.push(if self.deletable {
+                widget::container(status)
+                    .align_right(Length::Fixed(ROW_DELETE_STATUS_WIDTH))
+                    .center_y(Length::Fill)
+            } else {
+                status
+            });
         }
         content
     }
@@ -8435,7 +8461,7 @@ fn channel_view(
     selection_count: Option<usize>,
     query: &str,
 ) -> Element<'static, SidebarAction> {
-    let grid = RowGrid::child(compact);
+    let grid = RowGrid::child(compact).deletable();
     let deletion = channel.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let ink = channel_ink(channel, listing);
@@ -9169,6 +9195,15 @@ fn worktree_view<'a>(
         ..
     } = row_state;
     let chrome = &worktree.chrome;
+    // A merged pull request's worktree has served its purpose, so hovering
+    // it offers to delete it.
+    let quick_delete = !primary
+        && worktree
+            .pull_request()
+            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged));
+    // Unlike a channel row's, the grid keeps its usual status slot: a
+    // worktree's badges follow the slot, so the delete covers them rather
+    // than the slot, and widening it would cost the name room for nothing.
     let grid = RowGrid::child(compact);
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
@@ -9309,11 +9344,7 @@ fn worktree_view<'a>(
     };
     let action =
         crate::interaction::tooltip(action, rail_tooltip(&chrome.tooltip, deletion, compact));
-    let action = if !primary
-        && worktree
-            .pull_request()
-            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged))
-    {
+    let action = if quick_delete {
         row_quick_delete(
             action,
             &chrome.delete_name,

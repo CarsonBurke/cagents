@@ -11,11 +11,11 @@
 //!
 //! An expanded row leads with one mark, whole and centred in the glyph
 //! column like every other row's glyph. The others follow the title as a
-//! facepile: a face for each kind of member among them, overlapping only by
-//! a few pixels, then how many more there are. Faces show the kinds the lead
-//! does not, first, so a channel of terminals does not draw its terminal
-//! twice. The glyph column is one glyph wide; a second mark and a count
-//! squeezed into it covered each other and pushed the lead out of line.
+//! facepile: a face for each of them, up to a few, overlapping only by a few
+//! pixels, then how many more there are. Faces show the kinds the lead does
+//! not, first, then more of the kinds already shown. The glyph column is one
+//! glyph wide; a second mark and a count squeezed into it covered each other
+//! and pushed the lead out of line.
 //!
 //! The title keeps priority. A title that fits the row is never cut for the
 //! pile: the pile shows as many faces as fit beside it, or nothing. A title
@@ -180,13 +180,18 @@ impl Members {
         self.iter().next()
     }
 
-    /// The members after the lead, as the facepile shows them: one face per
-    /// kind of member, at most [`MAX_FACES`], and how many members there are
-    /// after the lead. Kinds the lead's mark does not already show come
-    /// first, in display order; the lead's own kind comes last, so it is the
-    /// first face a narrow row gives up. Where every member is of the lead's
-    /// kind, such as a channel of terminals alone, there are no faces: the
-    /// pile would only draw the lead's mark again.
+    /// The members after the lead, as the facepile shows them: a face for
+    /// each of them, at most [`MAX_FACES`], and how many members there are
+    /// after the lead.
+    ///
+    /// The faces say who else is there, so each kind among them gets a face
+    /// before any kind gets a second: first the kinds the lead's mark does
+    /// not show, in display order, then the lead's own kind, then the
+    /// remaining members in display order. A channel of three Claude Code
+    /// agents shows two Claude Code faces after its lead; a channel of
+    /// terminals shows one terminal face and counts the rest. One terminal
+    /// face is the most a pile draws: it is a themed glyph that cannot be
+    /// cut for a neighbour, so two of them could not overlap.
     pub fn company(&self) -> Company {
         let Some(lead) = self.lead().map(Face::of) else {
             return Company {
@@ -206,14 +211,22 @@ impl Members {
         // A stable sort: the lead's kind moves to the end, the others keep
         // their display order.
         kinds.sort_by_key(|face| *face == lead);
-        if kinds == [lead] {
-            kinds.clear();
+        let mut faces = kinds.clone();
+        faces.truncate(MAX_FACES);
+        // Each kind's first member already has its face; the members after
+        // those fill what room is left.
+        let mut first = kinds;
+        for face in self.iter().skip(1).map(Face::of) {
+            if faces.len() == MAX_FACES {
+                break;
+            }
+            if let Some(index) = first.iter().position(|kind| *kind == face) {
+                first.swap_remove(index);
+            } else if face != Face::Terminal {
+                faces.push(face);
+            }
         }
-        kinds.truncate(MAX_FACES);
-        Company {
-            faces: kinds,
-            others,
-        }
+        Company { faces, others }
     }
 
     /// A provider other than the lead's, the first in display order, which
@@ -250,13 +263,14 @@ impl Face {
 /// The members after a row's lead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Company {
-    /// One per kind of member, those the lead does not show first.
+    /// The faces the pile may show, in the order a narrowing row keeps
+    /// them; see [`Members::company`].
     pub faces: Vec<Face>,
     /// How many members there are after the lead.
     pub others: usize,
 }
 
-/// The most faces a pile shows; any more kinds are counted.
+/// The most faces a pile shows; any more members are counted.
 pub const MAX_FACES: usize = 3;
 /// A face. Provider artwork fills its square, where the terminal's symbolic
 /// glyph leaves a margin, so the two read at about the same weight here.
@@ -894,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn the_company_shows_first_the_kinds_the_lead_does_not() {
+    fn the_company_shows_every_other_member_the_kinds_the_lead_does_not_first() {
         let mixed = members(
             &[
                 (Claude, MemberState::Working),
@@ -925,13 +939,63 @@ mod tests {
         let shells = members(&[], 10).company();
         assert_eq!(
             (shells.faces, shells.others),
-            (vec![], 9),
-            "a channel of terminals does not draw its terminal again"
+            (vec![Face::Terminal], 9),
+            "a channel of terminals shows one of the others and counts the rest"
+        );
+        let claudes = members(
+            &[
+                (Claude, MemberState::Working),
+                (Claude, MemberState::Idle),
+                (Claude, MemberState::Idle),
+            ],
+            0,
+        )
+        .company();
+        assert_eq!(
+            (claudes.faces, claudes.others),
+            (vec![Face::Provider(Claude); 2], 2),
+            "the others are shown whatever their kind"
+        );
+        let twin = members(
+            &[(Codex, MemberState::Working), (Codex, MemberState::Idle)],
+            0,
+        )
+        .company();
+        assert_eq!((twin.faces, twin.others), (vec![Face::Provider(Codex)], 1));
+        let repeats = members(
+            &[
+                (Claude, MemberState::Working),
+                (Codex, MemberState::Idle),
+                (Codex, MemberState::Idle),
+                (Codex, MemberState::Idle),
+                (Claude, MemberState::Idle),
+            ],
+            2,
+        )
+        .company();
+        assert_eq!(
+            (repeats.faces, repeats.others),
+            (
+                vec![
+                    Face::Provider(Codex),
+                    Face::Terminal,
+                    Face::Provider(Claude)
+                ],
+                6
+            ),
+            "every kind gets a face before any kind gets a second"
+        );
+        let shells_and_agent = members(&[(Codex, MemberState::Working)], 3).company();
+        assert_eq!(
+            shells_and_agent.faces,
+            vec![Face::Terminal],
+            "one terminal face at most: neither of two could be cut for the other"
         );
         let alone = members(&[(Claude, MemberState::Working)], 0).company();
         assert_eq!((alone.faces.len(), alone.others), (0, 0));
-        assert!(Pile::new(&members(&[], 10), |_| 10.0).is_none());
+        assert!(Pile::new(&members(&[], 1), |_| 10.0).is_none());
         assert!(Pile::new(&members(&[(Claude, MemberState::Working)], 0), |_| 10.0).is_none());
+        assert!(Pile::new(&members(&[], 10), |_| 10.0).is_some());
     }
 
     /// Claude Code leading Codex, Oh My Pi and three terminals: three faces
