@@ -380,6 +380,10 @@ pub(super) struct State {
     observed_chats: HashMap<CardId, crate::chat::Session>,
     observed_terminals: HashMap<CardId, TerminalSession>,
     applying: bool,
+    /// Panes `detach_shared_pane` detached that are still in the strip. The
+    /// active strip's projection takes them out in its one edit, and
+    /// `finish_shared_viewport_projection` takes out any left.
+    strip_detached: HashSet<CardId>,
     pub creating_default: bool,
     /// An automatic empty pane waiting for this scope's shared panes, bound
     /// to the scope and directory that asked so navigating elsewhere cannot
@@ -539,6 +543,7 @@ impl State {
             observed_chats,
             observed_terminals,
             applying,
+            strip_detached,
             creating_default,
             deferred_default,
             defaults,
@@ -577,6 +582,7 @@ impl State {
             observed_chats: observed_chats.clone(),
             observed_terminals: observed_terminals.clone(),
             applying: *applying,
+            strip_detached: strip_detached.clone(),
             creating_default: *creating_default,
             deferred_default: deferred_default.clone(),
             defaults: defaults.clone(),
@@ -3506,6 +3512,9 @@ impl Cagents {
             root_paths.iter().map(PathBuf::as_path),
         ));
         self.prepare_shared_aliases_in(views, owned, None, &topology);
+        // Outside a reconciliation, no projection follows to take the
+        // detached aliases out of the strip.
+        self.remove_detached_from_strip();
     }
 
     fn prepare_shared_aliases_in(
@@ -3588,7 +3597,6 @@ impl Cagents {
                 }
             }
         }
-        let mut detached = HashSet::new();
         for (scope, alias, shared) in adoptions {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
@@ -3618,10 +3626,8 @@ impl Cagents {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
             self.detach_shared_pane(alias);
-            detached.insert(alias);
             self.remove_shared_channel_member(alias);
         }
-        self.remove_detached_from_strip(&detached);
     }
 
     /// Removing an alias or moving a pane to a worktree must leave a valid
@@ -3742,7 +3748,6 @@ impl Cagents {
         let mut retained_upgrades = Vec::new();
         let local_order = current.clone();
         let local_members = current.iter().copied().collect::<HashSet<_>>();
-        let mut detached = HashSet::new();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
@@ -3802,7 +3807,6 @@ impl Cagents {
             }
             if self.absence_closes_pane(id, view) {
                 self.detach_shared_pane(id);
-                detached.insert(id);
                 continue;
             }
             // Nobody closed this pane: a snapshot only says what the registry
@@ -4205,14 +4209,13 @@ impl Cagents {
             }
         }
         self.normalize_projected_card_order(&visible);
-        // The active strip's one edit also takes out the detached panes.
         if active {
+            // The strip's one edit also takes out every pane detached so far.
+            let detached = std::mem::take(&mut self.shared_views.strip_detached);
             self.project_shared_strip(&strip, &visible, &detached);
             if !detached.is_empty() {
                 self.settle_focus();
             }
-        } else {
-            self.remove_detached_from_strip(&detached);
         }
         if !self.shared_views.applying {
             self.persist();
@@ -4413,8 +4416,8 @@ impl Cagents {
     }
 
     /// Passive removal detaches surfaces; it never calls a host close request.
-    /// The caller then takes the pane out of the strip, in one edit for every
-    /// pane it detaches: see [`Self::remove_detached_from_strip`].
+    /// The pane leaves the strip later, in one edit with everything else the
+    /// projection changes there: see `SharedViews::strip_detached`.
     fn detach_shared_pane(&mut self, id: CardId) {
         self.shared_views.defaults.remove(&id);
         Arc::make_mut(&mut self.durable)
@@ -4436,15 +4439,17 @@ impl Cagents {
             card.existence = super::project_ui::removed_existence("pane closed in another client");
         }
         self.sidebar_state.forget_card_attention(id);
+        self.shared_views.strip_detached.insert(id);
     }
 
-    /// Takes the panes [`Self::detach_shared_pane`] detached out of the strip
-    /// in one edit, however many there are.
-    fn remove_detached_from_strip(&mut self, detached: &HashSet<CardId>) {
+    /// Takes the panes [`Self::detach_shared_pane`] detached, and no
+    /// projection has yet, out of the strip in one edit.
+    fn remove_detached_from_strip(&mut self) {
+        let detached = std::mem::take(&mut self.shared_views.strip_detached);
         if detached.is_empty() {
             return;
         }
-        let _ = self.workspace.remove_cards(detached);
+        let _ = self.workspace.remove_cards(&detached);
         // The strip handed a removed pane's focus to a neighbour, with no
         // viewport update to tell the saved state.
         self.settle_focus();
@@ -4475,6 +4480,7 @@ impl Cagents {
         &mut self,
         anchor: crate::workspace::ViewportAnchor,
     ) -> Task<Message> {
+        self.remove_detached_from_strip();
         let update = self.workspace.restore_viewport_anchor(anchor);
         // Most snapshots leave the strip and its focus alone and need no
         // viewport pass; the sweep still settles descriptors they replaced.
@@ -4502,7 +4508,14 @@ impl Cagents {
         visible: &[CardId],
         detached: &HashSet<CardId>,
     ) {
-        let visible = visible.iter().copied().collect::<HashSet<_>>();
+        let mut visible = visible.iter().copied().collect::<HashSet<_>>();
+        // A pane the user is closing here stays until that close finishes,
+        // which a transfer elsewhere must not turn into a failed one.
+        visible.extend(
+            self.workspace
+                .pending_close()
+                .map(|pending| pending.unmounting),
+        );
         let removed = self
             .workspace
             .order()

@@ -1287,12 +1287,17 @@ impl Workspace {
                 .iter()
                 .find(|(_, id)| *id == focused)
                 .map(|(index, _)| *index)?;
-            let survivor = |card: &&WorkspaceCard| kept.contains(&card.id);
+            // A pane already closing cannot take focus it would then leave
+            // behind, unless nothing else is left to take it.
+            let closing = self.pending_close.map(|pending| pending.id);
+            let survivor =
+                |card: &&WorkspaceCard| kept.contains(&card.id) && Some(card.id) != closing;
             Some(
                 self.cards[index + 1..]
                     .iter()
                     .find(survivor)
                     .or_else(|| self.cards[..index].iter().rev().find(survivor))
+                    .or_else(|| cards.iter().find(|card| Some(card.id) != closing))
                     .or_else(|| cards.first())
                     .map(|card| card.id),
             )
@@ -1321,6 +1326,13 @@ impl Workspace {
             self.focused = target;
             self.pending_widget_focus = target;
             self.focus_handoff = target;
+            // Focused only for want of another pane, the closing one hands
+            // focus on when its close finishes, as a focused pane's close does.
+            if let Some(pending) = &mut self.pending_close
+                && Some(pending.id) == target
+            {
+                pending.handoff.target = FocusTarget::WorkspaceToolbar;
+            }
         } else if self.focused.is_none() {
             // Like the first card added to an empty strip.
             self.focused = self.cards.first().map(|card| card.id);
@@ -2765,6 +2777,39 @@ mod tests {
         assert_eq!(workspace.pending_close().unwrap().unmounting, ids[2]);
         workspace.commit_close(ids[2]).unwrap();
         assert_eq!(workspace.order().collect::<Vec<_>>(), [ids[0]]);
+    }
+
+    #[test]
+    fn a_focus_handoff_passes_over_a_pane_the_user_is_closing() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 3], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.request_close(ids[1]).unwrap();
+        let cards = workspace.cards()[1..].to_vec();
+        workspace.arrange(cards).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+        workspace.commit_close(ids[1]).unwrap();
+        assert_eq!(workspace.focused(), Some(ids[2]));
+        workspace.check_invariants().unwrap();
+
+        // With only the closing pane left, it holds focus until its close
+        // hands focus on, to a pane that arrived meanwhile or to none.
+        for arrives in [false, true] {
+            let mut workspace = workspace_with_widths(&[CardWidth::Fixed(400.0); 2], 1_000.0);
+            let ids = workspace.order().collect::<Vec<_>>();
+            workspace.request_close(ids[1]).unwrap();
+            workspace.arrange([workspace.cards()[1].clone()]).unwrap();
+            assert_eq!(workspace.focused(), Some(ids[1]));
+            let arrived = card(CardWidth::Fixed(400.0));
+            if arrives {
+                workspace.add_card(arrived.clone(), 1, false).unwrap();
+            }
+            workspace.take_widget_focus_request();
+            workspace.commit_close(ids[1]).unwrap();
+            let expected = arrives.then_some(arrived.id);
+            assert_eq!(workspace.focused(), expected);
+            assert_eq!(workspace.take_widget_focus_request(), expected);
+            workspace.check_invariants().unwrap();
+        }
     }
 
     #[test]

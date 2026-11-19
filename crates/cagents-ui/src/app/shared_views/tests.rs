@@ -5868,10 +5868,11 @@ fn a_peer_editing_many_panes_rebuilds_the_strip_once() {
     }
     view.panes = panes;
     app.workspace_model.views = vec![view.clone()];
-    let (_, laid_out, _) = crate::workspace::Workspace::rebuild_counts();
+    let (indexed, laid_out, _) = crate::workspace::Workspace::rebuild_counts();
     drop(app.reconcile_shared_views());
-    let (_, after, _) = crate::workspace::Workspace::rebuild_counts();
-    assert_eq!(after - laid_out, 1, "the strip is laid out once");
+    let (indexed_after, laid_out_after, _) = crate::workspace::Workspace::rebuild_counts();
+    assert_eq!(indexed_after - indexed, 1, "the strip is indexed once");
+    assert_eq!(laid_out_after - laid_out, 1, "the strip is laid out once");
 
     assert_eq!(
         app.workspace.order().collect::<Vec<_>>(),
@@ -5929,6 +5930,33 @@ fn transfer_preserves_runtime_when_destination_is_projected_first() {
         );
     }
 }
+
+#[test]
+fn a_transfer_leaves_a_pane_the_user_is_closing_to_that_close() {
+    let (mut app, a, b, pane) = fixture();
+    Arc::make_mut(&mut app.durable).active_channel = Some(a);
+    let owned = HashSet::from([pane.id]);
+    let mut source = View::empty(a);
+    source.panes.push(pane.clone());
+    app.shared_views.applying = true;
+    drop(app.project_shared_view(&source, &owned));
+    app.shared_views.applying = false;
+    app.workspace.request_close(pane.id).unwrap();
+
+    let mut target = View::empty(b);
+    target.panes.push(pane.clone());
+    app.workspace_model.views = vec![target, View::empty(a)];
+    drop(app.reconcile_shared_views());
+    assert!(app.workspace.card(pane.id).is_some());
+    assert_eq!(
+        app.workspace
+            .pending_close()
+            .map(|pending| pending.unmounting),
+        Some(pane.id)
+    );
+    app.workspace.commit_close(pane.id).unwrap();
+}
+
 #[test]
 fn peer_channel_deletion_retains_local_chat_work_in_worktree() {
     let (mut app, a, _, _) = fixture();
