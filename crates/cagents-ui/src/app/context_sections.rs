@@ -542,7 +542,8 @@ impl Cagents {
         Pane {
             section: Section::Mentioned,
             title: "Mentioned".into(),
-            count: listed.then(|| (count.to_string(), design::faint_text as _)),
+            // As Work's, absent rather than 0 when there is none.
+            count: (listed && count > 0).then(|| (count.to_string(), design::faint_text as _)),
             scope: None,
             description: listed.then(|| {
                 format!(
