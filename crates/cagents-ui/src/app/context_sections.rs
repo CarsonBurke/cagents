@@ -244,14 +244,12 @@ impl Cagents {
         card: CardId,
         section: Section,
     ) -> Task<Message> {
-        let expanded = !self.context_sections.is_open(section);
-        self.context_sections.set_open(section, true);
-        let open = self.set_pane_inspector_open(card, true);
-        if expanded {
-            Task::batch([open, self.save_settings_task(false)])
-        } else {
-            open
+        if !self.context_sections.is_open(section) {
+            self.context_sections.set_open(section, true);
+            // The same save as the inspector's, if it opens too.
+            self.owe_projection(OwedProjection::full().saving_view());
         }
+        self.set_pane_inspector_open(card, true)
     }
 
     /// `card`'s inspector's sections, the first of whose headers ends with

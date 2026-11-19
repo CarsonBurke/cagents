@@ -724,6 +724,12 @@ impl Cagents {
 
     /// Opens or closes the pane's inspector. A pane without one never opens
     /// it.
+    ///
+    /// The update owes the full projection for it, which syncs the
+    /// inspectors and then rebinds source control to the pane drawing it,
+    /// and then saves which inspectors are open; doing any of these here
+    /// would only be done again there, and a save made here would hold the
+    /// binding the projection replaces.
     pub(super) fn set_pane_inspector_open(&mut self, card: CardId, open: bool) -> Task<Message> {
         if open && !self.pane_has_inspector(card) {
             return Task::none();
@@ -741,19 +747,17 @@ impl Cagents {
             return Task::none();
         }
         self.frame_clock.reset();
-        self.sync_pane_inspectors();
-        let binding = self.rebind_source_control();
+        self.owe_projection(OwedProjection::full().saving_view());
         // An inspector opened over the pane's content takes the keyboard
         // from it, so typing never lands in content it hides.
-        let focus = if closing_overlay
+        if closing_overlay
             || (open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay))
         {
             iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
                 .map(cosmic::Action::App)
         } else {
             Task::none()
-        };
-        Task::batch([binding, self.save_settings_task(false), focus])
+        }
     }
 
     pub(super) fn toggle_pane_inspector(&mut self, card: CardId) -> Task<Message> {
@@ -1999,6 +2003,83 @@ mod tests {
         app.sidebar_state
             .active_worktree()
             .map(|key| key.canonical_path.clone())
+    }
+
+    /// Toggling an inspector, by its shortcut or its button, saves the
+    /// window's view once and rebinds source control once: the update's
+    /// projection syncs the inspectors and rebinds after them, so the toggle
+    /// itself does neither.
+    #[test]
+    fn toggling_an_inspector_saves_and_rebinds_once() {
+        use super::super::terminal_output_tests::{settings_captures, source_control_rebinds};
+        let (mut app, card) = worktree_app();
+        for (message, open) in [
+            (Message::ToggleContextInspector, true),
+            (Message::ToggleContextInspector, false),
+            (Message::TogglePaneInspector(card), true),
+            (Message::TogglePaneInspector(card), false),
+        ] {
+            let (captures, rebinds) = (settings_captures(), source_control_rebinds());
+            drop(app.update(message));
+            assert_eq!(app.pane_inspectors.is_open(card), open);
+            assert_eq!(settings_captures() - captures, 1, "settings captured");
+            assert_eq!(
+                source_control_rebinds() - rebinds,
+                1,
+                "source control rebound"
+            );
+            app.settle_pane_inspectors();
+        }
+        // Still bound to what the pane's inspector draws.
+        assert_eq!(active_worktree(&app).as_deref(), Some(Path::new(FIX)));
+    }
+
+    /// The view an inspector toggle saves is the one its rebind leaves. A
+    /// browser's inspector in the main worktree's workspace takes source
+    /// control from the fix worktree, whose file filter does not carry over,
+    /// so the one save holds no trace of it.
+    #[test]
+    fn an_inspector_toggle_saves_the_view_it_rebinds() {
+        use super::super::terminal_output_tests::{captured_sidebar_view, settings_captures};
+        let (mut app, browser) = worktree_app();
+        let settings = tempfile::tempdir().unwrap();
+        app.settings_write_blocked = false;
+        app.settings_path = Some(settings.path().join("settings.toml"));
+        let url = Url::parse("http://localhost:8080/").unwrap();
+        app.card_state_mut(browser).unwrap().kind =
+            CardKind::Browser(crate::model::BrowserSession {
+                id: crate::model::BrowserId::new(),
+                current_url: url.clone(),
+                history: vec![url],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            });
+        drop(app.workspace.resize_viewport(1200.0));
+        app.active_workspace = Some(MAIN.into());
+        app.sync_pane_inspectors();
+        let key = app.sidebar_state.active_worktree().cloned().unwrap();
+        assert_eq!(key.canonical_path, Path::new(FIX));
+        app.sidebar_state.apply(&SidebarAction::FilesQueryChanged {
+            key,
+            query: "draft".into(),
+        });
+        drop(captured_sidebar_view());
+
+        let captures = settings_captures();
+        drop(app.update(Message::ToggleContextInspector));
+        assert!(app.pane_inspectors.is_open(browser));
+        assert_eq!(active_worktree(&app).as_deref(), Some(Path::new(MAIN)));
+        assert_eq!(settings_captures() - captures, 1);
+        let mut restored = crate::sidebar::SidebarState::default();
+        restored.restore_view(captured_sidebar_view().expect("the toggle saved the view"));
+        assert_eq!(
+            restored.files_query(),
+            "",
+            "the fix worktree's filter was saved"
+        );
+        assert!(!restored.files_filter_open());
     }
 
     /// A terminal app with `page` opened beside its terminal and focused.
