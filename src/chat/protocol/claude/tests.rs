@@ -14648,14 +14648,18 @@ fn the_turn_after_a_stopped_one_goes_idle_as_usual() {
     adapter
         .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
         .unwrap();
-    let settled = adapter
-        .receive(json!({"type":"result","uuid":"next","subtype":"success","is_error":false}))
-        .unwrap();
-    assert_eq!(last_status(&settled), Some((false, "Claude turn complete")));
+    // Starting the next turn forgets the stop, before any result arrives.
     let idle = adapter
         .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
         .unwrap();
     assert_eq!(last_status(&idle), Some((false, "Claude is idle")));
+    adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"next","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, "Claude turn complete")));
 }
 
 /// An adapter whose turn the reader stopped, acknowledged and settled.
