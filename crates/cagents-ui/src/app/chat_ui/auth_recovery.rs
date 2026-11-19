@@ -2,10 +2,13 @@
 use super::*;
 
 pub(super) struct Recovery {
-    account: Account,
+    pub(super) account: Account,
     label: String,
     signing_in: bool,
     login_change: Option<String>,
+    /// Whether the conversation never started: its first message went
+    /// back to the composer, and resuming sends it again.
+    pub(super) draft: bool,
 }
 impl Runtime {
     pub(super) fn auth_error(&self) -> Option<&str> {
@@ -34,6 +37,10 @@ impl Runtime {
             )
             && chat::requires_sign_in(self.session.launch.provider, message)
     }
+    /// Whether a draft has a message to send again once signed in.
+    fn has_unsent_draft(&self) -> bool {
+        !self.composer.text().trim().is_empty() || !self.attachments.is_empty()
+    }
     fn recovery_available(&self) -> bool {
         self.auth_error().is_some()
             && self.commands.is_idle()
@@ -46,16 +53,17 @@ impl Cagents {
     fn auth_account(&self, runtime: &Runtime) -> Option<Account> {
         let launch = &runtime.session.launch;
         let recipe = &launch.recipe;
-        let variable = account::home_variable(launch.provider)?;
+        let variable = account::home_variable(launch.provider);
         // ProcessSpec removes explicitly unset bindings before spawning, so
         // an unset home is no home: the CLI resolves its default from HOME,
         // as the system Claude login launches it. A recipe with no bound
         // provider home must name the same HOME as this window's known
         // system account, which `chat_account` then requires to resolve
-        // that default too.
-        let bound = (!recipe.unset_environment.contains(variable))
-            .then(|| recipe.environment.get(variable))
-            .flatten();
+        // that default too. A provider with no home variable of its own
+        // always resolves that default.
+        let bound = variable
+            .filter(|variable| !recipe.unset_environment.contains(*variable))
+            .and_then(|variable| recipe.environment.get(variable));
         match bound {
             Some(home) if home.is_empty() => return None,
             Some(_) => {}
@@ -70,7 +78,12 @@ impl Cagents {
                 }
             }
         }
-        let id = self.chat_account(launch.provider, recipe)?;
+        let id = match variable {
+            Some(_) => self.chat_account(launch.provider, recipe)?,
+            // Nothing tells its logins apart, so under this window's HOME it
+            // runs on its system sign-in.
+            None => Account::system(launch.provider).id(),
+        };
         let account = self.known_account(&id)?;
         account.resolved_home()?;
         Some(account)
@@ -79,7 +92,10 @@ impl Cagents {
         runtime.auth_error()?;
         let account = self.auth_account(runtime)?;
         Some(Recovery {
-            label: self.resume_account_label(&runtime.session),
+            label: self
+                .account_label(&account.id())
+                .unwrap_or_else(|| self.resume_account_label(&runtime.session)),
+            draft: runtime.is_draft(),
             signing_in: self.account_sign_in_running(&account),
             login_change: self.account_login_change(&account),
             account,
@@ -99,7 +115,8 @@ impl Cagents {
     pub(super) fn chat_auth_resume_enabled(&self, target: Target) -> bool {
         self.chat_auth_recovery_enabled(target)
             && matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
-                if self.auth_account(runtime).is_some_and(|account| self.account_login_change(&account).is_none()))
+                if (!runtime.is_draft() || runtime.has_unsent_draft())
+                    && self.auth_account(runtime).is_some_and(|account| self.account_login_change(&account).is_none()))
     }
     pub(super) fn resume_after_sign_in(&mut self, target: Target) -> Task<Message> {
         if self.chat_retry_blocked(target.card) || !self.chat_auth_resume_enabled(target) {
@@ -108,6 +125,13 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
             return Task::none();
         };
+        // A draft has no conversation to resume: its start failed before it
+        // took the first message, which went back to the composer. Sending
+        // that again starts the conversation anew, on the account just
+        // signed in.
+        if runtime.is_draft() {
+            return self.handle_chat_ui(Action::Submit(target, PromptMode::Send));
+        }
         if runtime.disconnected || runtime.snapshot.exited {
             return self.handle_chat_ui(Action::Reconnect(target));
         }
@@ -148,9 +172,12 @@ pub(super) fn view<'a>(
     let mut controls = Vec::new();
     let known = recovery.is_some();
     let mut login_change = None;
+    let mut draft = false;
     let label = if let Some(recovery) = recovery {
         let enabled = enabled && runtime.recovery_available() && !recovery.signing_in;
-        let resume_enabled = enabled && recovery.login_change.is_none();
+        draft = recovery.draft;
+        let resume_enabled =
+            enabled && recovery.login_change.is_none() && (!draft || runtime.has_unsent_draft());
         login_change = recovery.login_change;
         controls.push(
             crate::ui_controls::button::primary("Sign in")
@@ -159,7 +186,7 @@ pub(super) fn view<'a>(
                 .into(),
         );
         controls.push(
-            crate::ui_controls::button::secondary("Resume chat")
+            crate::ui_controls::button::secondary(if draft { "Send again" } else { "Resume chat" })
                 .on_press_maybe(resume_enabled.then_some(action(Action::ResumeAfterSignIn(target))))
                 .into(),
         );
@@ -168,9 +195,15 @@ pub(super) fn view<'a>(
                 .on_press(Message::AccountUi(account_ui::Action::OpenPane))
                 .into(),
         );
+        // A start that failed may never have had a sign-in to lose.
         format!(
-            "{} sign-in is no longer valid · {}",
+            "{} {} · {}",
             runtime.session.launch.provider.label(),
+            if draft {
+                "sign-in required"
+            } else {
+                "sign-in is no longer valid"
+            },
             recovery.label
         )
     } else {
@@ -183,7 +216,7 @@ pub(super) fn view<'a>(
     };
     let mut rows = vec![
         design::body(label).into(),
-        design::caption(if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
+        design::caption(if draft { "Sign in, then send your message again. It is still in the composer." } else if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
         widget::flex_row(controls)
             .spacing(step::GAP_S as u16)
             .into(),
