@@ -4561,10 +4561,10 @@ fn parse_item_with_windows(
         // unfinished, or one replayed from a turn still running, never reads
         // as still compacting once it is not.
         "contextCompaction" => tool_call("Compact context".into(), String::new(), String::new()),
-        // Context the hooks added for the model, in their own words, shown
-        // as a notice of where it came from rather than as the agent's prose;
-        // the run IDs the fragments are keyed by are Codex's bookkeeping.
-        // Hooks that added nothing leave no row.
+        // Context the hooks added for the model, in their own words, as a
+        // step among the turn's work rather than as the agent's prose or a
+        // notice; the run IDs the fragments are keyed by are Codex's
+        // bookkeeping. Hooks that added nothing leave no row.
         "hookPrompt" => {
             let added = value["fragments"]
                 .as_array()
@@ -4578,19 +4578,7 @@ fn parse_item_with_windows(
             if added.is_empty() {
                 Vec::new()
             } else {
-                vec![Item {
-                    id: id.into(),
-                    role: Role::System,
-                    content: ItemContent::Delivery {
-                        kind: chat::DeliveryKind::Notice,
-                        from: String::new(),
-                        sender: String::new(),
-                        summary: "Context from a hook".into(),
-                        body: added,
-                    },
-                    started_at: None,
-                    at: None,
-                }]
+                tool_call("Hook context".into(), String::new(), added)
             }
         }
         // The agent pausing, named as a pause. As with compaction, the status
