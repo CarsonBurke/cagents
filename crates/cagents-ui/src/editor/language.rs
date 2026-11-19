@@ -30,21 +30,20 @@ impl DocumentLanguage {
 /// Whether `path` is Markdown by its name alone, or `None` when the name says
 /// nothing and the content decides.
 ///
-/// Dotfiles (`.env`, `.gitignore`, `.bashrc`) have no extension as far as
-/// [`Path::extension`] is concerned, but their name is their type.
+/// A dotfile with no further extension (`.env`, `.gitignore`, `.bashrc`)
+/// has none as far as [`Path::extension`] is concerned, but its name is its
+/// type. One that has one, such as `.notes.md`, is typed by it.
 pub fn markdown_by_name(path: &Path) -> Option<bool> {
     let name = path.file_name()?.to_str()?;
     if name.eq_ignore_ascii_case("README") {
         return Some(true);
     }
-    if name.starts_with('.') {
-        return Some(false);
+    if let Some(extension) = path.extension() {
+        return Some(extension.to_str().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        }));
     }
-    let extension = path.extension()?.to_str()?;
-    Some(matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "md" | "markdown"
-    ))
+    name.starts_with('.').then_some(false)
 }
 
 /// How much of a buffer inference reads: enough for any reply or note to
@@ -58,13 +57,19 @@ pub struct InferencePrefix(String);
 
 impl InferencePrefix {
     /// Adds the next line, answering whether there is room for another.
-    /// The first line is always taken, however long, so a one-line buffer
-    /// is still read.
+    ///
+    /// A first line longer than the bound is cut at it rather than skipped,
+    /// so a one-line buffer is still read, and still costs no more than the
+    /// bound.
     pub fn push_line(&mut self, line: &str) -> bool {
-        if !self.0.is_empty() && self.0.len() + line.len() + 1 > INFERENCE_PREFIX_BYTES {
+        if self.0.is_empty() {
+            let end = line.floor_char_boundary(INFERENCE_PREFIX_BYTES - 1);
+            self.0.push_str(&line[..end]);
+        } else if self.0.len() + line.len() + 1 > INFERENCE_PREFIX_BYTES {
             return false;
+        } else {
+            self.0.push_str(line);
         }
-        self.0.push_str(line);
         self.0.push('\n');
         self.0.len() < INFERENCE_PREFIX_BYTES
     }
@@ -221,6 +226,10 @@ See [the workflow](https://example.com/ci.yml) for details.
             ("notes.txt", Some(false)),
             (".env", Some(false)),
             (".gitignore", Some(false)),
+            // A dotfile's extension still types it.
+            (".notes.md", Some(true)),
+            (".release.MARKDOWN", Some(true)),
+            (".bashrc.local", Some(false)),
             ("Untitled", None),
             ("Untitled-2", None),
             ("LICENSE", None),
@@ -309,11 +318,20 @@ See [the workflow](https://example.com/ci.yml) for details.
         assert!(prefix.len() <= INFERENCE_PREFIX_BYTES);
         assert!(prefix.len() > INFERENCE_PREFIX_BYTES - 1001);
         assert!(prefix.lines().all(|read| read == line));
-        // One line longer than the bound is still read rather than nothing.
+        // One line longer than the bound is read up to it, rather than
+        // whole or not at all, and never split inside a character.
         let long = "y".repeat(INFERENCE_PREFIX_BYTES * 2);
-        assert_eq!(
-            inference_prefix([long.as_str()]).as_str().len(),
-            long.len() + 1
+        let read = inference_prefix([long.as_str(), "next"]);
+        assert_eq!(read.as_str().len(), INFERENCE_PREFIX_BYTES);
+        assert!(read.as_str().trim_end().bytes().all(|byte| byte == b'y'));
+        let wide = "λ".repeat(INFERENCE_PREFIX_BYTES);
+        let read = inference_prefix([wide.as_str()]);
+        assert!(read.as_str().len() <= INFERENCE_PREFIX_BYTES);
+        assert!(
+            read.as_str()
+                .trim_end()
+                .chars()
+                .all(|character| character == 'λ')
         );
     }
 }
