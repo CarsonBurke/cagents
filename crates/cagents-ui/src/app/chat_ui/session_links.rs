@@ -61,7 +61,7 @@ impl Cagents {
             ));
         }
         match agent.channel() {
-            Some(channel) => self.select_channel(channel),
+            Some(channel) => self.navigate_to_channel(channel),
             None => {
                 self.status = Some(TransientNotice::warning(
                     "This agent has not started yet; open it once it has.",
