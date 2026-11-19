@@ -70,7 +70,7 @@ fi
 }
 
 shot() {
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     sleep 1
     evidence shot "$1"
 }
@@ -202,7 +202,7 @@ wide)
     # over it, which shows its copy and time.
     at=$(find_text last Consolidate)
     [ -n "$at" ] || { printf '%s\n' 'transcript-rhythm-scene: no empty report row' >&2; exit 1; }
-    evidence drive move "$at" >/dev/null
+    evidence drive hover "$at" >/dev/null
     sleep 2
     evidence shot "rhythm-${label}quiet-hover"
     # The first agent's report opened, with the pointer over it. A report's
