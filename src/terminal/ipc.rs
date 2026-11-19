@@ -864,12 +864,26 @@ pub enum TerminalScroll {
     Row(u64),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ServerEnvelope {
     pub version: u16,
     pub request_id: Option<u64>,
     pub proof: HostSessionProof,
     pub message: ServerMessage,
+}
+
+/// Encoded as its [`ServerEnvelopeRef`] is, so an envelope in an older
+/// client's version encodes its message as that client decodes it.
+impl Serialize for ServerEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ServerEnvelopeRef {
+            version: self.version,
+            request_id: self.request_id,
+            proof: &self.proof,
+            message: &self.message,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// A host reply whose transcript may already be encoded by a retained helper.
@@ -2970,7 +2984,8 @@ mod tests {
 
     /// The daemon's writer serializes `ServerEnvelopeRef`, but every peer
     /// decodes `ServerEnvelope`. A field reorder or type change on either side
-    /// would silently mis-decode, so pin the encoding rather than the shape.
+    /// would silently mis-decode, so pin that what one encodes the other
+    /// decodes, rather than the shape.
     #[test]
     fn borrowed_envelope_encodes_identically() {
         let envelope = ServerEnvelope {
@@ -2996,6 +3011,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(owned, borrowed);
+        let decoded: ServerEnvelope = read_frame(&mut borrowed.as_slice()).unwrap().unwrap();
+        assert_eq!(decoded, envelope);
     }
 
     #[test]
