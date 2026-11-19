@@ -2250,8 +2250,7 @@ impl Adapter for Codex {
                     Pending::Other,
                 )?;
             } else if !self.starting_turn() {
-                // The start failed, or its turn came and went unnamed:
-                // there is nothing left to stop.
+                // The start failed: there is nothing left to stop.
                 self.stop_on_start = false;
             }
         }
@@ -2842,6 +2841,21 @@ impl Codex {
                     let owns_current = notification_revision == self.notification_revision
                         || self.notification_turn.as_deref() == Some(id);
                     let early_completion = early.remove(id);
+                    // The answer names the very turn a stop given while it
+                    // was unanswered was for, whichever lifecycle it now
+                    // belongs to. One that already finished needs none.
+                    if std::mem::take(&mut self.stop_on_start)
+                        && !early_completion
+                            .as_ref()
+                            .is_some_and(|early| early.completed.is_some())
+                    {
+                        self.call(
+                            &mut step,
+                            "turn/interrupt",
+                            json!({"threadId":self.thread,"turnId":id}),
+                            Pending::Other,
+                        )?;
+                    }
                     // An active-status update may announce newer work before
                     // its turn ID arrives. The old request's correlation alone
                     // cannot assign that lifecycle to its acknowledged turn.

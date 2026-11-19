@@ -2594,6 +2594,13 @@ impl Actor {
                 if busy && !interrupt_sent && self.pending.is_empty() {
                     match self.adapter.command(Command::Interrupt) {
                         Ok(step) => {
+                            // A provider that names a turn only once it has
+                            // started holds the stop until then, and sends it
+                            // as it drains.
+                            if step.writes.is_empty() {
+                                interrupt_error =
+                                    "the provider had not yet started the turn to stop".into();
+                            }
                             self.step(step)?;
                             interrupt_sent = true;
                         }
@@ -2614,8 +2621,13 @@ impl Actor {
                     if settled {
                         return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
                     }
+                    let reason = if interrupt_error.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({interrupt_error})")
+                    };
                     return Err(format!(
-                        "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
+                        "Provider interruption was not confirmed within 30 seconds{reason}; backend work may still be active. Inspect exact provider session before recovery"
                     ));
                 }
             }

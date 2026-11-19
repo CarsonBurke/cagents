@@ -2908,7 +2908,8 @@ fn child_terminal_outcomes_survive_idle_and_closure_and_new_turn_restarts_work()
 
 /// Codex names a turn only once it has started. A stop given while the
 /// turn's start is unanswered waits for that name, whichever of the start's
-/// answer or its notification brings it, and is sent once. A start that
+/// answer or its notification brings it first, even once the thread has
+/// reported itself active, and is sent once. A start that
 /// fails leaves nothing to stop.
 #[test]
 fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
@@ -2968,6 +2969,38 @@ fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
         .unwrap();
     assert!(interrupts(&answered).is_empty(), "stopped once");
     adapter.receive(finish("turn-b")).unwrap();
+
+    // The thread can report itself active before the start's answer, which
+    // then no longer owns the lifecycle; the answer still names the turn.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"active","activeFlags":[]}}}),
+        )
+        .unwrap();
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-c"}}}))
+        .unwrap();
+    assert_eq!(
+        interrupts(&answered),
+        vec![json!({"threadId":"thread-exact","turnId":"turn-c"})]
+    );
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-c","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&started).is_empty(), "stopped once");
+    adapter.receive(finish("turn-c")).unwrap();
+    adapter
+        .receive(
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact",
+            "status":{"type":"idle"}}}),
+        )
+        .unwrap();
 
     let request = prompt(&mut adapter);
     adapter.command(Command::Interrupt).unwrap();
