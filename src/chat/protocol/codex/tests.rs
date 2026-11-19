@@ -4597,6 +4597,80 @@ fn command_output_reaches_the_transcript_without_terminal_escapes() {
 }
 
 #[test]
+fn paired_live_and_saved_history_preserves_command_and_answer_through_store() {
+    use crate::chat::runtime::history_test::HistoryHarness;
+
+    let command = json!({"id":"paired-command","type":"commandExecution",
+        "command":"printf hello","cwd":"/work/project","status":"completed",
+        "aggregatedOutput":"hello","exitCode":0});
+    let answer = json!({"id":"paired-answer","type":"agentMessage","text":"Hello"});
+    let mut live_adapter = adapter();
+    let mut live = HistoryHarness::default();
+    for frame in [
+        json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"paired-turn","status":"inProgress","items":[]}}}),
+        json!({"method":"item/started","params":{"threadId":"thread-exact",
+            "turnId":"paired-turn","item":{"id":"paired-command",
+                "type":"commandExecution","command":"printf hello","cwd":"/work/project",
+                "status":"inProgress","aggregatedOutput":""}}}),
+        json!({"method":"item/commandExecution/outputDelta","params":{
+            "threadId":"thread-exact","turnId":"paired-turn",
+            "itemId":"paired-command","delta":"hello"}}),
+        json!({"method":"item/completed","params":{"threadId":"thread-exact",
+            "turnId":"paired-turn","item":command.clone()}}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+            "turnId":"paired-turn","itemId":"paired-answer","delta":"Hel"}}),
+        json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+            "turnId":"paired-turn","itemId":"paired-answer","delta":"lo"}}),
+        json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"paired-turn","status":"completed",
+                "items":[command.clone(),answer.clone()]}}}),
+    ] {
+        live.apply(live_adapter.receive(frame).unwrap().events);
+    }
+
+    let mut saved_adapter = adapter();
+    let mut saved_step = Step::default();
+    saved_adapter
+        .page(
+            &json!({"data":[{"id":"paired-turn","status":"completed",
+                "items":[command,answer]}],"nextCursor":null}),
+            &mut saved_step,
+            false,
+        )
+        .unwrap();
+    let mut saved = HistoryHarness::default();
+    saved.apply(saved_step.events);
+
+    // Loading a completed turn restores its transcript without announcing a
+    // fresh completion. Live observation times are the only item difference.
+    assert!(matches!(
+        live.completions.as_slice(),
+        [Event::TurnFinished {
+            outcome: crate::notifications::Kind::Succeeded,
+            ..
+        }]
+    ));
+    live.assert_matches(&mut saved);
+    assert_eq!(live.snapshot.items.len(), 2);
+    assert_eq!(live.snapshot.items[0].id, "paired-turn/paired-command");
+    assert_eq!(live.snapshot.items[0].role, Role::Assistant);
+    assert!(
+        matches!(&live.snapshot.items[0].content, ItemContent::Command {
+        command, action: CommandAction::Run, status: ToolStatus::Succeeded,
+        output, exit_code: Some(0), working_directory, ..
+    } if command == "printf hello" && output == "hello" && working_directory == "/work/project")
+    );
+    assert_eq!(live.snapshot.items[1].id, "paired-turn/paired-answer");
+    assert_eq!(live.snapshot.items[1].role, Role::Assistant);
+    assert!(
+        matches!(&live.snapshot.items[1].content, ItemContent::Text {
+        text, thinking: false, phase: Phase::Final,
+    } if text == "Hello")
+    );
+}
+
+#[test]
 fn resumed_step_and_final_history_use_same_turn_scoped_identity() {
     let mut adapter = adapter();
     adapter.busy = true;

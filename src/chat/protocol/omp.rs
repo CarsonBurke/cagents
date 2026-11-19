@@ -3134,6 +3134,86 @@ mod tests {
     }
 
     #[test]
+    fn paired_live_and_saved_history_preserves_command_and_answer_through_store() {
+        use crate::chat::runtime::history_test::HistoryHarness;
+
+        let user = json!({"role":"user","timestamp":1,"content":"Print hello"});
+        let call = json!({"role":"assistant","timestamp":2,"content":[{
+            "type":"toolCall","id":"paired-command","name":"bash",
+            "arguments":{"command":"printf hello"}}]});
+        let result = json!({"role":"toolResult","timestamp":3,
+            "toolCallId":"paired-command","toolName":"bash","isError":false,
+            "content":[{"type":"text","text":"hello"}],"details":{"exitCode":0}});
+        let answer = json!({"role":"assistant","timestamp":4,"stopReason":"stop",
+            "content":[{"type":"text","text":"Hello"}]});
+        let mut live_adapter = Omp::default();
+        let mut live = HistoryHarness::default();
+        for frame in [
+            json!({"type":"message_start","message":user.clone()}),
+            json!({"type":"agent_start"}),
+            json!({"type":"tool_execution_start","toolCallId":"paired-command",
+                "toolName":"bash","args":{"command":"printf hello"}}),
+            json!({"type":"tool_execution_end","toolCallId":"paired-command",
+                "toolName":"bash","isError":false,"result":{
+                    "content":[{"type":"text","text":"hello"}],"details":{"exitCode":0}}}),
+            json!({"type":"message_update","message":{"role":"assistant","timestamp":4},
+                "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hel"}}),
+            json!({"type":"message_update","message":{"role":"assistant","timestamp":4},
+                "assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"lo"}}),
+            json!({"type":"message_end","message":answer.clone()}),
+            json!({"type":"agent_end","isTerminal":true,"messages":[answer.clone()]}),
+        ] {
+            live.apply(live_adapter.receive(frame).unwrap().events);
+        }
+
+        let mut saved_adapter = Omp::default();
+        let page = saved_adapter.history_page(None);
+        let mut saved = HistoryHarness::default();
+        saved.apply(
+            saved_adapter
+                .receive(json!({"type":"response","id":page["id"],
+                    "command":"get_messages_page","success":true,"data":{
+                        "messages":[user,call,result,answer],"nextCursor":null,"totalMessages":4}}))
+                .unwrap()
+                .events,
+        );
+
+        // Saved calls and results are separate messages, but restore the same
+        // command row; reading them must not announce a fresh completion.
+        assert!(matches!(
+            live.completions.as_slice(),
+            [Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }]
+        ));
+        live.assert_matches(&mut saved);
+        assert_eq!(live.snapshot.items.len(), 3);
+        assert_eq!(live.snapshot.items[0].id, "user:1:0");
+        assert_eq!(live.snapshot.items[0].role, Role::User);
+        assert!(
+            matches!(&live.snapshot.items[0].content, ItemContent::Text {
+            text, thinking: false, phase: Phase::Final,
+        } if text == "Print hello")
+        );
+        assert_eq!(live.snapshot.items[1].id, "tool:paired-command");
+        assert_eq!(live.snapshot.items[1].role, Role::Assistant);
+        assert!(
+            matches!(&live.snapshot.items[1].content, ItemContent::Command {
+            command, action: CommandAction::Run, status: ToolStatus::Succeeded,
+            output, exit_code: Some(0), ..
+        } if command == "printf hello" && output == "hello")
+        );
+        assert_eq!(live.snapshot.items[2].id, "assistant:4:0");
+        assert_eq!(live.snapshot.items[2].role, Role::Assistant);
+        assert!(
+            matches!(&live.snapshot.items[2].content, ItemContent::Text {
+            text, thinking: false, phase: Phase::Final,
+        } if text == "Hello")
+        );
+    }
+
+    #[test]
     fn streamed_and_completed_text_share_identity_and_commands_are_visible() {
         let mut adapter = Omp::default();
         let delta = adapter.receive(json!({"type":"message_update","message":{"role":"assistant","timestamp":123},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"hello"}})).unwrap();

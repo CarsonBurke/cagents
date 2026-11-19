@@ -1,4 +1,5 @@
 use super::*;
+use crate::chat::runtime::history_test::HistoryHarness;
 use base64::engine::general_purpose::STANDARD;
 
 /// Steering and queueing stay available on every release from the
@@ -5736,11 +5737,8 @@ fn recorded_current_agent_scene_counts_only_direct_current_work() {
         history: Some(history),
         ..Default::default()
     };
-    let mut snapshot = chat::Snapshot::default();
-    crate::chat::runtime::project_events_for_test(
-        &mut snapshot,
-        adapter.initialize().unwrap().events,
-    );
+    let mut snapshot = HistoryHarness::default();
+    snapshot.apply(adapter.initialize().unwrap().events);
     let activity = snapshot.subagent_activity();
     assert_eq!(
         (
@@ -5770,10 +5768,7 @@ fn recorded_current_agent_scene_counts_only_direct_current_work() {
             continue;
         }
         frame.as_object_mut().unwrap().remove("_live");
-        crate::chat::runtime::project_events_for_test(
-            &mut snapshot,
-            adapter.receive(frame).unwrap().events,
-        );
+        snapshot.apply(adapter.receive(frame).unwrap().events);
     }
     let activity = snapshot.subagent_activity();
     assert_eq!(
@@ -5813,14 +5808,14 @@ fn recorded_current_agent_scene_counts_only_direct_current_work() {
         .find(|agent| agent.id == "toolu_retry_old")
         .unwrap();
     assert_eq!(failed_transcript.status, ToolStatus::Ended);
-    crate::chat::runtime::project_events_for_test(&mut snapshot, vec![Event::TurnStarted]);
+    snapshot.apply(vec![Event::TurnStarted]);
     assert_eq!(snapshot.subagent_activity().failed.len(), 1);
 }
 
 #[test]
 fn explicit_agent_resume_retires_old_failure_and_ignores_late_old_receipts() {
     let mut adapter = Claude::default();
-    let mut snapshot = chat::Snapshot::default();
+    let mut snapshot = HistoryHarness::default();
     let frames = [
         scoped_call(
             None,
@@ -5844,10 +5839,7 @@ fn explicit_agent_resume_retires_old_failure_and_ignores_late_old_receipts() {
         json!({"type":"result","uuid":"late-old-failure","parent_tool_use_id":"old-agent","subtype":"error_during_execution","is_error":true,"errors":["Old attempt failed again"]}),
     ];
     for frame in frames {
-        crate::chat::runtime::project_events_for_test(
-            &mut snapshot,
-            adapter.receive(frame).unwrap().events,
-        );
+        snapshot.apply(adapter.receive(frame).unwrap().events);
     }
     assert_eq!(snapshot.subagent_activity().working, 1);
     assert!(snapshot.subagent_activity().failed.is_empty());
@@ -5881,11 +5873,8 @@ fn historical_same_agent_occurrences_keep_latest_binding_and_fresh_activity() {
             history: Some(correlation_history(frames)),
             ..Default::default()
         };
-        let mut state = chat::Snapshot::default();
-        crate::chat::runtime::project_events_for_test(
-            &mut state,
-            adapter.initialize().unwrap().events,
-        );
+        let mut state = HistoryHarness::default();
+        state.apply(adapter.initialize().unwrap().events);
         assert!(adapter.is_superseded("old-worker"));
         assert!(!adapter.is_superseded("current-worker"));
         assert_eq!(adapter.agent_calls.back().unwrap().1, "current-worker");
@@ -5897,15 +5886,12 @@ fn historical_same_agent_occurrences_keep_latest_binding_and_fresh_activity() {
         } else {
             json!({"type":"assistant","uuid":"fresh-current-carrier","parent_tool_use_id":"current-worker","message":{"id":"fresh-current-text","content":[{"type":"text","text":"Still reviewing"}]}})
         };
-        crate::chat::runtime::project_events_for_test(
-            &mut state,
-            adapter.receive(live).unwrap().events,
-        );
+        state.apply(adapter.receive(live).unwrap().events);
         assert_eq!(state.subagent_activity().working, 1);
         assert_eq!(adapter.agent_calls.back().unwrap().1, "current-worker");
         assert!(!adapter.is_superseded("current-worker"));
-        crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"shared-worker","task_type":"local_agent"})).unwrap().events);
-        crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"shared-worker","status":"completed"})).unwrap().events);
+        state.apply(adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"shared-worker","task_type":"local_agent"})).unwrap().events);
+        state.apply(adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"shared-worker","status":"completed"})).unwrap().events);
         assert_eq!(
             state
                 .subagents
@@ -5921,7 +5907,7 @@ fn historical_same_agent_occurrences_keep_latest_binding_and_fresh_activity() {
 #[test]
 fn nested_lifecycle_notices_never_promote_helpers_to_direct_workers() {
     let mut adapter = Claude::default();
-    let mut state = chat::Snapshot::default();
+    let mut state = HistoryHarness::default();
     for frame in [
         scoped_call(
             None,
@@ -5945,10 +5931,7 @@ fn nested_lifecycle_notices_never_promote_helpers_to_direct_workers() {
         json!({"type":"stream_event","parent_tool_use_id":"nested-helper","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"More grandchild progress"}}}),
         json!({"type":"result","uuid":"grandchild-result","parent_tool_use_id":"nested-helper","subtype":"error_during_execution","is_error":true,"errors":["Grandchild failure"]}),
     ] {
-        crate::chat::runtime::project_events_for_test(
-            &mut state,
-            adapter.receive(frame).unwrap().events,
-        );
+        state.apply(adapter.receive(frame).unwrap().events);
     }
     assert_eq!(state.subagents.len(), 1);
     assert_eq!(state.subagents[0].id, "parent-worker");
@@ -5965,7 +5948,7 @@ fn nested_lifecycle_notices_never_promote_helpers_to_direct_workers() {
 #[test]
 fn autonomous_parent_response_does_not_retire_a_fresh_background_failure() {
     let mut adapter = Claude::default();
-    let mut state = chat::Snapshot::default();
+    let mut state = HistoryHarness::default();
     for frame in [
         scoped_call(
             None,
@@ -5981,10 +5964,7 @@ fn autonomous_parent_response_does_not_retire_a_fresh_background_failure() {
         json!({"type":"assistant","uuid":"lead-response","message":{"id":"autonomous-response","content":[{"type":"text","text":"The validation worker needs attention."}]}}),
         json!({"type":"result","uuid":"lead-responded","subtype":"success","is_error":false}),
     ] {
-        crate::chat::runtime::project_events_for_test(
-            &mut state,
-            adapter.receive(frame).unwrap().events,
-        );
+        state.apply(adapter.receive(frame).unwrap().events);
     }
     assert_eq!(state.subagent_activity().failed.len(), 1);
     assert_eq!(state.subagent_activity().failed[0].id, "worker");
@@ -6019,8 +5999,8 @@ fn restored_failures_are_scoped_to_the_latest_actual_user_prompt() {
         history: Some(history),
         ..Default::default()
     };
-    let mut state = chat::Snapshot::default();
-    crate::chat::runtime::project_events_for_test(&mut state, adapter.initialize().unwrap().events);
+    let mut state = HistoryHarness::default();
+    state.apply(adapter.initialize().unwrap().events);
     let activity = state.subagent_activity();
     assert_eq!(activity.failed.len(), 1);
     assert_eq!(activity.failed[0].id, "recent-failure");
@@ -6035,7 +6015,7 @@ fn recent_failure_retires_only_when_human_input_is_consumed() {
             async_input: true,
             ..Default::default()
         };
-        let mut state = chat::Snapshot::default();
+        let mut state = HistoryHarness::default();
         for frame in [
             scoped_call(
                 None,
@@ -6046,25 +6026,18 @@ fn recent_failure_retires_only_when_human_input_is_consumed() {
             ),
             json!({"type":"user","uuid":"failed-result","message":{"content":[{"type":"tool_result","tool_use_id":"failed-worker","is_error":true,"content":"Validation failed"}]}}),
         ] {
-            crate::chat::runtime::project_events_for_test(
-                &mut state,
-                adapter.receive(frame).unwrap().events,
-            );
+            state.apply(adapter.receive(frame).unwrap().events);
         }
         assert_eq!(state.subagent_activity().failed.len(), 1);
         if queued {
             let submitted = adapter
                 .send_prompt("Next task".into(), vec![], PromptMode::Queue)
                 .unwrap();
-            crate::chat::runtime::project_events_for_test(&mut state, submitted.events);
+            state.apply(submitted.events);
             let echo = submitted.writes[0].clone();
             let id = echo["uuid"].clone();
-            crate::chat::runtime::project_events_for_test(
-                &mut state,
-                adapter.receive(echo.clone()).unwrap().events,
-            );
-            crate::chat::runtime::project_events_for_test(
-                &mut state,
+            state.apply(adapter.receive(echo.clone()).unwrap().events);
+            state.apply(
                 adapter
                     .receive(json!({"type":"command_lifecycle","command_uuid":id,"state":"queued"}))
                     .unwrap()
@@ -6075,8 +6048,7 @@ fn recent_failure_retires_only_when_human_input_is_consumed() {
                 1,
                 "queued input is not yet a new failure scope"
             );
-            crate::chat::runtime::project_events_for_test(
-                &mut state,
+            state.apply(
                 adapter
                     .receive(
                         json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}),
@@ -6085,7 +6057,7 @@ fn recent_failure_retires_only_when_human_input_is_consumed() {
                     .events,
             );
         } else {
-            crate::chat::runtime::project_events_for_test(&mut state, adapter.receive(json!({"type":"user","uuid":"actual-next-prompt","origin":{"kind":"human"},"message":{"content":"Next task"}})).unwrap().events);
+            state.apply(adapter.receive(json!({"type":"user","uuid":"actual-next-prompt","origin":{"kind":"human"},"message":{"content":"Next task"}})).unwrap().events);
         }
         assert!(state.subagent_activity().failed.is_empty());
         let old = state
@@ -6112,24 +6084,18 @@ fn foreground_same_address_replacement_retires_failures_live_and_on_restore() {
             ));
             frames.push(json!({"type":"user","uuid":format!("{tool}-result"),"tool_use_result":{"agentId":"shared-foreground"},"toolUseResult":{"agentId":"shared-foreground"},"message":{"content":[{"type":"tool_result","tool_use_id":tool,"is_error":failed,"content":format!("agentId: shared-foreground\n{tool} report")}]}}));
         }
-        let mut state = chat::Snapshot::default();
+        let mut state = HistoryHarness::default();
         if restored {
             let mut adapter = Claude {
                 history: Some(correlation_history(frames)),
                 ..Default::default()
             };
-            crate::chat::runtime::project_events_for_test(
-                &mut state,
-                adapter.initialize().unwrap().events,
-            );
+            state.apply(adapter.initialize().unwrap().events);
             assert_eq!(adapter.agent_calls.back().unwrap().1, "new-foreground");
         } else {
             let mut adapter = Claude::default();
             for frame in frames {
-                crate::chat::runtime::project_events_for_test(
-                    &mut state,
-                    adapter.receive(frame).unwrap().events,
-                );
+                state.apply(adapter.receive(frame).unwrap().events);
             }
         }
         assert!(state.subagent_activity().failed.is_empty());
@@ -12589,6 +12555,79 @@ fn correlation_result(id: &str, failed: bool) -> Value {
 fn actual_patch() -> Value {
     json!({"type":"update","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-old","+actually applied"]}]})
 }
+
+/// Both sides use the same conversation. The damaged variant deliberately
+/// drops only the saved tool result, leaving the invocation and final answer.
+fn paired_store_history_fixture(missing_result: bool) -> (HistoryHarness, HistoryHarness) {
+    let output = format!("{}\ncomplete tool result", "猫".repeat(24_000));
+    let frames = vec![
+        json!({"type":"user","uuid":"paired-prompt","message":{"content":"Look up the answer"}}),
+        json!({"type":"assistant","uuid":"paired-call","message":{"id":"paired-call","content":[{"type":"tool_use","id":"paired-tool","name":"mcp__fixture__lookup","input":{"query":"answer"}}]}}),
+        json!({"type":"user","uuid":"paired-result","message":{"content":[{"type":"tool_result","tool_use_id":"paired-tool","content":output}]}}),
+        json!({"type":"assistant","uuid":"paired-answer","message":{"id":"paired-answer","content":[{"type":"text","text":"The answer is ready."}]}}),
+    ];
+    let mut live_adapter = Claude::default();
+    let mut live = HistoryHarness::default();
+    for frame in &frames {
+        live.apply(live_adapter.receive(frame.clone()).unwrap().events);
+    }
+    live.apply(live_adapter.receive(json!({"type":"result","uuid":"paired-finished","subtype":"success","is_error":false})).unwrap().events);
+    assert!(matches!(
+        live.completions.as_slice(),
+        [Event::TurnFinished {
+            outcome: crate::notifications::Kind::Succeeded,
+            ..
+        }]
+    ));
+
+    let saved_frames = frames
+        .into_iter()
+        .filter(|frame| !missing_result || frame["uuid"] != "paired-result")
+        .collect();
+    let mut saved_adapter = Claude {
+        history: Some(correlation_history(saved_frames)),
+        ..Default::default()
+    };
+    let mut saved = HistoryHarness::default();
+    saved.apply(saved_adapter.initialize().unwrap().events);
+    while saved_adapter
+        .history
+        .as_ref()
+        .is_some_and(|history| history.offset > 0)
+    {
+        saved.apply(saved_adapter.command(Command::LoadEarlier).unwrap().events);
+    }
+    (live, saved)
+}
+
+#[test]
+fn paired_store_history_preserves_complete_claude_tool_results() {
+    let (mut live, mut saved) = paired_store_history_fixture(false);
+    let items = live.items();
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["paired-prompt:0", "paired-tool", "paired-answer:0"]
+    );
+    assert!(
+        matches!(&items[1].content, ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded }
+        if name == "mcp__fixture__lookup" && input == "{\"query\":\"answer\"}"
+            && output == &format!("{}\ncomplete tool result", "猫".repeat(24_000)))
+    );
+    // The only allowed item difference is live observation vs saved times;
+    // completion notifications belong exclusively to the live side.
+    live.assert_matches(&mut saved);
+}
+
+#[test]
+#[should_panic(expected = "paired live/saved history differs")]
+fn paired_store_history_rejects_a_tool_result_missing_from_saved_history() {
+    let (mut live, mut saved) = paired_store_history_fixture(true);
+    live.assert_matches(&mut saved);
+}
+
 #[test]
 fn claude_history_correlates_edits_across_every_100_record_page_boundary() {
     let mut frames = vec![json!({"type":"user","message":{"content":"fixture"}})];
@@ -12868,13 +12907,13 @@ fn claude_history_correlation_budget_counts_only_retained_rewritten_carriers() {
 #[derive(Default)]
 struct Lead {
     adapter: Claude,
-    snapshot: chat::Snapshot,
+    snapshot: HistoryHarness,
 }
 
 impl Lead {
     fn receive(&mut self, frame: Value) {
         let events = self.adapter.receive(frame).unwrap().events;
-        crate::chat::runtime::project_events_for_test(&mut self.snapshot, events);
+        self.snapshot.apply(events);
     }
 
     /// Feed a scene's frames, without its fixture directives, up to its end.
@@ -12925,17 +12964,14 @@ const LEAD_COMMAND: &str = "toolu_01HUi7AHnEFak4VugVSfa4E7";
 /// Feed recorded frames until `stop` matches one, inclusive.
 fn replay_until(
     adapter: &mut Claude,
-    snapshot: &mut chat::Snapshot,
+    snapshot: &mut HistoryHarness,
     frames: &mut std::str::Lines<'_>,
     stop: impl Fn(&Value) -> bool,
 ) {
     for line in frames.by_ref() {
         let frame: Value = serde_json::from_str(line).unwrap();
         let done = stop(&frame);
-        crate::chat::runtime::project_events_for_test(
-            snapshot,
-            adapter.receive(frame).unwrap().events,
-        );
+        snapshot.apply(adapter.receive(frame).unwrap().events);
         if done {
             return;
         }
@@ -12946,7 +12982,7 @@ fn replay_until(
 #[test]
 fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
     let mut adapter = Claude::default();
-    let mut snapshot = chat::Snapshot::default();
+    let mut snapshot = HistoryHarness::default();
     let mut frames = NESTED_AGENTS.lines();
     // Level three's own conversation is forwarded under a call made inside
     // level two, whose frames the lead never keeps. It used to become a
@@ -12969,8 +13005,7 @@ fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
     assert_eq!(agent_counts(&snapshot), (1, 0, 0, 0));
 
     for line in frames {
-        crate::chat::runtime::project_events_for_test(
-            &mut snapshot,
+        snapshot.apply(
             adapter
                 .receive(serde_json::from_str(line).unwrap())
                 .unwrap()
@@ -13005,7 +13040,7 @@ fn nested_agents_at_every_depth_stay_out_of_the_lead_conversation() {
 #[test]
 fn an_agent_that_completes_with_its_own_work_still_live_is_waiting_on_it() {
     let mut adapter = Claude::default();
-    let mut snapshot = chat::Snapshot::default();
+    let mut snapshot = HistoryHarness::default();
     let mut frames = NESTED_AGENTS.lines();
     // Level one's first notice says only that it completed: its summary is
     // its own last words, with no note that it is waiting.

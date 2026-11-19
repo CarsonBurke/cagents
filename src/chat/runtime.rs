@@ -3861,19 +3861,8 @@ fn recover_history_error(
     }
 }
 
-/// Protocol regressions project through the same reducer as a resident actor.
 #[cfg(test)]
-pub(crate) fn project_events_for_test(state: &mut Snapshot, events: Vec<Event>) {
-    let mut indices = state
-        .items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| (item.id.clone(), index))
-        .collect();
-    for event in events {
-        apply_event(state, &mut indices, event);
-    }
-}
+pub(crate) use store::history_test;
 
 #[cfg(test)]
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {

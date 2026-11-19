@@ -2,6 +2,8 @@
 //! keep both long conversations and a single enormous message pageable, and
 //! let one enormous tool result be shown as an excerpt and copied whole.
 mod file_changes;
+#[cfg(test)]
+pub(crate) mod history_test;
 mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};

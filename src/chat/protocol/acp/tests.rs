@@ -740,6 +740,120 @@ fn a_busy_or_unready_conversation_refuses_another_prompt() {
 }
 
 #[test]
+fn paired_live_and_saved_history_preserves_command_and_answer_through_store() {
+    use crate::chat::runtime::history_test::HistoryHarness;
+
+    let updates = [
+        json!({"sessionUpdate":"tool_call","toolCallId":"paired-command",
+            "title":"Print hello","kind":"execute","status":"in_progress",
+            "rawInput":{"command":"printf hello","cwd":"/work/project"}}),
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"paired-command",
+            "status":"completed","rawOutput":{"exitCode":0},
+            "content":[{"type":"content","content":{"type":"text","text":"hello"}}]}),
+        json!({"sessionUpdate":"agent_message_chunk","messageId":"paired-answer",
+            "content":{"type":"text","text":"Hel"}}),
+        json!({"sessionUpdate":"agent_message_chunk","messageId":"paired-answer",
+            "content":{"type":"text","text":"lo"}}),
+    ];
+    let mut live_adapter = adapter(&[], None);
+    let session = ready(&mut live_adapter);
+    let mut live = HistoryHarness::default();
+    let prompted = live_adapter
+        .command(Command::Prompt {
+            text: "Print hello".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    let prompt_request = only_write(&prompted).clone();
+    live.apply(prompted.events);
+    for content in &updates {
+        live.apply(
+            live_adapter
+                .receive(update(&session, content.clone()))
+                .unwrap()
+                .events,
+        );
+    }
+    live.apply(
+        live_adapter
+            .receive(reply(&prompt_request, json!({"stopReason":"end_turn"})))
+            .unwrap()
+            .events,
+    );
+
+    let mut saved_adapter = adapter(&[], Some(&session));
+    let initialize = saved_adapter.initialize().unwrap();
+    let opening = saved_adapter
+        .receive(reply(only_write(&initialize), muse_initialize()))
+        .unwrap();
+    let load = only_write(&opening).clone();
+    assert_eq!(load["method"], "session/load");
+    let mut saved = HistoryHarness::default();
+    saved.apply(initialize.events);
+    saved.apply(opening.events);
+    saved.apply(
+        saved_adapter
+            .receive(update(
+                &session,
+                json!({"sessionUpdate":"user_message_chunk",
+                    "content":{"type":"text","text":"Print hello"}}),
+            ))
+            .unwrap()
+            .events,
+    );
+    for content in updates {
+        saved.apply(
+            saved_adapter
+                .receive(update(&session, content))
+                .unwrap()
+                .events,
+        );
+    }
+    saved.apply(
+        saved_adapter
+            .receive(reply(&load, json!({"sessionId":session})))
+            .unwrap()
+            .events,
+    );
+
+    // ACP replays session updates during load, then publishes one history;
+    // that restored conversation must not announce a fresh turn completion.
+    assert!(matches!(
+        live.completions.as_slice(),
+        [Event::TurnFinished {
+            outcome: crate::notifications::Kind::Succeeded,
+            ..
+        }]
+    ));
+    live.assert_matches(&mut saved);
+    assert_eq!(live.snapshot.items.len(), 3);
+    assert_eq!(live.snapshot.items[0].id, "acp:1");
+    assert_eq!(live.snapshot.items[0].role, Role::User);
+    assert!(
+        matches!(&live.snapshot.items[0].content, ItemContent::Text {
+        text, thinking: false, phase: chat::Phase::Final,
+    } if text == "Print hello")
+    );
+    assert_eq!(live.snapshot.items[1].id, "tool:paired-command");
+    assert_eq!(live.snapshot.items[1].role, Role::Assistant);
+    assert!(
+        matches!(&live.snapshot.items[1].content, ItemContent::Command {
+        command, label, action: CommandAction::Run, status: ToolStatus::Succeeded,
+        output, exit_code: Some(0), working_directory, ..
+    } if command == "printf hello" && label == "Print hello"
+        && output == "hello" && working_directory == "/work/project")
+    );
+    assert_eq!(live.snapshot.items[2].id, "acp-message:paired-answer");
+    assert_eq!(live.snapshot.items[2].role, Role::Assistant);
+    assert!(
+        matches!(&live.snapshot.items[2].content, ItemContent::Text {
+        text, thinking: false, phase: chat::Phase::Final,
+    } if text == "Hello")
+    );
+}
+
+#[test]
 fn a_resumed_conversation_replays_into_one_bounded_history() {
     let mut acp = adapter(&[], Some("01a1f155-1f9e-7081-b35f-88ead0a9187d"));
     let session = "01a1f155-1f9e-7081-b35f-88ead0a9187d";
