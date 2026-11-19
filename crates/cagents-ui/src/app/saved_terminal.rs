@@ -657,9 +657,9 @@ impl Cagents {
                 Command::Transcript if self.saved_terminal_diagnostics_allowed(card) => {
                     self.update_terminal_failure(terminal_failure::Action::Reveal(card))
                 }
-                Command::Folder => self.update(Message::OpenRepository),
-                Command::NewTerminal => self.update(Message::NewTerminal),
-                Command::Close => self.update(Message::CloseCard(card)),
+                Command::Folder => self.dispatch(Message::OpenRepository),
+                Command::NewTerminal => self.dispatch(Message::NewTerminal),
+                Command::Close => self.dispatch(Message::CloseCard(card)),
                 _ => Task::none(),
             };
         };

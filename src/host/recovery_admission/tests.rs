@@ -620,3 +620,22 @@ fn recovery_holds_every_identity_its_checkpoint_names() {
         codex.launch.session_id.as_deref().unwrap()
     ));
 }
+
+#[test]
+fn a_confirmed_project_close_waits_for_the_hold_like_any_project_close() {
+    let repository = std::path::PathBuf::from("/fixture/project");
+    for edit in [
+        ModelEdit::CloseProject {
+            repository: repository.clone(),
+        },
+        ModelEdit::CloseConfirmedProject {
+            repository: repository.clone(),
+            channels: Default::default(),
+        },
+    ] {
+        assert!(
+            matches!(model_access(&edit), Access::Held),
+            "{edit:?} removes the project's panes, retained originals' among them"
+        );
+    }
+}

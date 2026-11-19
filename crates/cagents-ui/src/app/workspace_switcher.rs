@@ -265,7 +265,7 @@ impl Cagents {
                         .iter()
                         .any(|available| available == action)
             })
-            .map_or_else(Task::none, |action| self.update(Message::Sidebar(action)));
+            .map_or_else(Task::none, |action| self.dispatch(Message::Sidebar(action)));
         self.workspace_history
             .finish(self.active_workspace_destination());
         self.workspace_history

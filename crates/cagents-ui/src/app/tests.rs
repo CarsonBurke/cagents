@@ -11397,6 +11397,8 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         worktree_operations: HashMap::new(),
         pending_panel_open: None,
         deferred_navigation: VecDeque::new(),
+        owed_projection: None,
+        dispatching: 0,
         frame_clock: FrameClock::default(),
         latency: crate::performance::InteractionLatency::default(),
         latency_focus: None,

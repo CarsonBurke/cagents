@@ -1530,13 +1530,16 @@ mise run test:ui -- --test session_restore_contract
 For focused library tests, `scripts/test-lib` builds one lane's library test
 harness and runs exactly the tests you name, through one `scripts/cargo-gate test`
 command. The `ui` lane runs the application's tests (`-p cagents-ui`);
-`shared-ui` runs the shared library's tests under `--features ui`:
+`shared-ui` runs the shared library's tests under `--features ui`, and `browser`
+runs the application's tests with the integrated browser, which is the only
+lane that compiles its `browser::` modules:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
 scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 scripts/test-lib shared-ui --prefix settings::
+scripts/test-lib browser --prefix browser::
 ```
 
 Prefer `test-lib` while iterating on UI library tests.

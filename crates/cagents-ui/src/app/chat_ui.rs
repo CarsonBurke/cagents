@@ -11963,7 +11963,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::ResumeCommitted(target, ready, result) => {
                 match result {
@@ -11990,11 +11990,11 @@ impl Cagents {
                         });
                         return Task::batch([
                             retire,
-                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                            self.dispatch(Message::ChatUi(Action::Ready(target, ready))),
                         ]);
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::AccountCommitted(target, ready, result) => {
                 match result {
@@ -12015,7 +12015,7 @@ impl Cagents {
                         )));
                     }
                 }
-                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+                return self.dispatch(Message::ChatUi(Action::Ready(target, ready)));
             }
             Action::DraftStartCheckpointed(target, attempt, result) => {
                 return self.draft_start_checkpointed(target, attempt, result);
@@ -14054,7 +14054,7 @@ impl Cagents {
                 // Through the app's own dispatch, so every guard a pressed row
                 // passes, such as a remote device refusing local files, holds
                 // for Enter too.
-                let task = self.update(Message::ChatUi(chosen));
+                let task = self.dispatch(Message::ChatUi(chosen));
                 if !refocus {
                     return task;
                 }
