@@ -96,7 +96,9 @@ fn usage(
             UsageStatus::Limited,
             "This Muse login has no subscription allowance",
         ),
-        _ => (UsageStatus::Unavailable, "Muse does not report its limits"),
+        // A login that works is shown, though its limits are not known: an
+        // unavailable system account is taken for one not set up, and hidden.
+        _ => (UsageStatus::Ok, "Muse does not report its limits"),
     };
     Ok(Probed::state(status, detail, observed_at, catalog))
 }
@@ -194,10 +196,11 @@ mod tests {
         assert!(usage(b"", b"network unreachable", 7, None).is_err());
         assert!(usage(b"{}", b"", 7, None).is_err());
         let other = br#"{"allowance":{"remaining":3},"reason":null,"schemaVersion":1}"#;
-        assert_eq!(
-            usage(other, b"", 7, None).unwrap().snapshot.status,
-            UsageStatus::Unavailable
-        );
+        // An allowance of a shape not yet seen is a working login of
+        // unknown limits, which keeps the account shown.
+        let working = usage(other, b"", 7, None).unwrap().snapshot;
+        assert_eq!(working.status, UsageStatus::Ok);
+        assert!(working.windows.is_empty());
     }
 
     #[test]

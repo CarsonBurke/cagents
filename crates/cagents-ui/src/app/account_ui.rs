@@ -1904,8 +1904,11 @@ fn chip_with_window(
                 .clone()
                 .unwrap_or_else(|| format!("{name} reports no usage")),
         },
+        // A limit with no window to show, as for a login with no allowance at
+        // all, is still a limit.
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
-            if snapshot.ordinary_usage_allowed == Some(false) =>
+            if snapshot.ordinary_usage_allowed == Some(false)
+                || (snapshot.status == UsageStatus::Limited && window_of(snapshot).is_none()) =>
         {
             Chip {
                 text: "Limited".into(),
@@ -1916,7 +1919,10 @@ fn chip_with_window(
                     ChipTone::Attention
                 },
                 essential: true,
-                tooltip: format!("{name} reports usage is limited"),
+                tooltip: snapshot
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| format!("{name} reports usage is limited")),
             }
         }
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
@@ -1926,7 +1932,9 @@ fn chip_with_window(
                     usage_fraction: None,
                     tone: ChipTone::Current,
                     essential: false,
-                    tooltip: format!("{name} reports no usage limits for this account"),
+                    tooltip: snapshot.detail.clone().unwrap_or_else(|| {
+                        format!("{name} reports no usage limits for this account")
+                    }),
                 };
             };
             let stale = is_stale(snapshot, now);
@@ -2068,8 +2076,15 @@ fn login_launch_with_path(
 /// did; or names none, as one on the system account does (see
 /// [`Account::launch_home`]).
 fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
-    let Some(variable) = account::home_variable(account.provider) else {
+    // Another provider's login signs in none of this one's accounts, though
+    // neither names a home.
+    if sign_in_provider(recipe) != Some(account.provider) {
         return false;
+    }
+    // A provider without a home of its own, as Muse, has only its system
+    // account, which every one of its sign-ins signs in.
+    let Some(variable) = account::home_variable(account.provider) else {
+        return account.is_system();
     };
     let named = recipe
         .environment
@@ -2104,18 +2119,19 @@ fn signed_in(session: &TerminalSession) -> bool {
 /// Whether `recipe` runs a provider's sign-in, as [`login_launch`] builds
 /// it or as a reader types it.
 pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
-    let program = Path::new(&recipe.program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let arguments: Vec<&str> = recipe.arguments.iter().map(String::as_str).collect();
-    matches!(
-        (program, arguments.as_slice()),
-        ("claude", ["auth", "login"])
-            | ("claude", ["auth", "login", "--claudeai"])
-            | ("codex", ["login"])
-            | ("codex", ["login", "--device-auth"])
-    )
+    sign_in_provider(recipe).is_some()
+}
+
+/// The provider whose login `recipe` runs, if it runs one: the command
+/// [`login_arguments`] gives, or Claude's older `auth login`.
+fn sign_in_provider(recipe: &LaunchRecipe) -> Option<Provider> {
+    let (provider, arguments) = Provider::launched(recipe)?;
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let login = [false, true]
+        .into_iter()
+        .filter_map(|device| login_arguments(provider, device))
+        .any(|login| login == arguments.as_slice());
+    (login || (provider == Provider::Claude && arguments == ["auth", "login"])).then_some(provider)
 }
 
 #[cfg(test)]
@@ -8025,6 +8041,34 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_without_a_window_reads_as_limited_not_unlimited() {
+        // Muse reports a login with no subscription allowance this way.
+        let mut limited = snapshot(Vec::new(), NOW);
+        limited.status = UsageStatus::Limited;
+        limited.detail = Some("This Muse login has no subscription allowance".into());
+        let summary = chip(
+            &state_with(Some(limited)),
+            "Muse",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(summary.text, "Limited");
+        assert_eq!(summary.tone, ChipTone::Attention);
+        assert_eq!(
+            summary.tooltip,
+            "This Muse login has no subscription allowance"
+        );
+
+        let unlimited = chip(
+            &state_with(Some(snapshot(Vec::new(), NOW))),
+            "Muse",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(unlimited.text, "No limits");
+    }
+
+    #[test]
     fn old_figures_and_figures_from_before_a_reset_are_shown_as_of_when_they_were_read() {
         let observed = NOW - schedule::DISPLAY_STALE_AFTER - 1;
         let old = chip(
@@ -8156,6 +8200,31 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_sign_in_signs_in_its_system_account() {
+        let system = Account::system(Provider::Muse);
+        let launch = login_launch(
+            &system,
+            Path::new("/opt/bin/muse-upstream"),
+            PathBuf::from("/h"),
+            false,
+        )
+        .expect("Muse logs in");
+        assert_eq!(launch.arguments, ["login"]);
+        assert_eq!(Provider::recognize_launch(&launch), None);
+        assert!(is_sign_in(&launch));
+        assert!(signs_in(&system, &launch));
+        assert!(!signs_in(&Account::system(Provider::Codex), &launch));
+        let claude = login_launch(
+            &Account::system(Provider::Claude),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/h"),
+            false,
+        )
+        .expect("Claude logs in");
+        assert!(!signs_in(&Account::system(Provider::Codex), &claude));
+    }
+
+    #[test]
     fn only_a_providers_sign_in_is_kept_off_the_disk() {
         let recipe = |program: &str, arguments: &[&str]| LaunchRecipe {
             unset_environment: Default::default(),
@@ -8174,6 +8243,12 @@ mod tests {
         )));
         assert!(is_sign_in(&recipe("codex", &["login"])));
         assert!(is_sign_in(&recipe("codex", &["login", "--device-auth"])));
+        // Muse's login runs through its upstream executable, as cagents
+        // starts it, or through the `muse` a reader types.
+        assert!(is_sign_in(&recipe("/opt/bin/muse-upstream", &["login"])));
+        assert!(is_sign_in(&recipe("muse", &["login"])));
+        assert!(!is_sign_in(&recipe("muse-upstream", &["acp"])));
+        assert!(!is_sign_in(&recipe("agy", &["login"])));
         assert!(!is_sign_in(&recipe("claude", &[])));
         assert!(!is_sign_in(&recipe("claude", &["login"])));
         assert!(!is_sign_in(&recipe(

@@ -389,7 +389,7 @@ impl Provider {
     /// The provider a launch runs, whatever it runs it for, and the arguments
     /// it passes that provider: a known executable, or an interpreter running
     /// one of the provider's known entrypoints.
-    pub(crate) fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
+    pub fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
         if Self::is_interpreter(&launch.program) {
             let script = Path::new(launch.arguments.first()?);
             let provider = ADAPTERS
