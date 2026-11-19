@@ -409,11 +409,10 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
         "and newer images still join after it"
     );
 
-    images::sync(app.chat_runtime_mut(target).unwrap());
     assert_eq!(
         step(&mut app, target, 1),
         Some(images::ImageRef::Viewer(host, images[1].1)),
-        "the paged-out image left once the viewer moved off it"
+        "the paged-out image left as the viewer moved off it"
     );
     step(&mut app, target, 1);
 
@@ -461,6 +460,34 @@ fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
             "the image the viewer doesn't show is gone from it"
         );
     }
+}
+
+/// The shown image keeps its pixels through memory pressure only while it is
+/// shown: stepping off it lets them go, so they don't hold the budget a
+/// newer image's decode waits on.
+#[test]
+fn stepping_off_an_evicted_image_lets_its_pixels_go() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    // The oldest image, the one shown, is the first to go.
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert_eq!(images::evict_ready(runtime, 1), 0);
+    assert!(runtime.cache[&images[0].0].image.is_none());
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, images[0].1)),
+        "the viewer keeps the image it shows"
+    );
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, images[1].1))
+    );
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, images[1].1)),
+        "the evicted image left as the viewer moved off it"
+    );
 }
 
 #[test]

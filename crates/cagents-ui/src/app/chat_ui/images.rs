@@ -1316,6 +1316,13 @@ impl Cagents {
                 if let Some(gallery) = self.image_viewer_mut(host) {
                     gallery.next(forward);
                 }
+                // The image it moves off keeps its own pixels only while
+                // shown: one the transcript has let go leaves the viewer now.
+                if let ViewerHost::Pane(target) = host
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    sync_viewer(runtime);
+                }
                 Some(Task::none())
             }
             Action::ImageFit(host) => {
