@@ -464,6 +464,7 @@ def main():
         "build.rs", "src/modules.rs", "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
         "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
         "crates/iced-contracts/src/lib.rs",
+        "crates/cosmic-text-contracts/src/lib.rs",
     ):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source
     guard_vendor_hooks()

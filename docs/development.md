@@ -48,6 +48,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
+| `test:contracts` | Test the focused vendored-crate contract packages |
 | `test` | The three lane test suites, one after another |
 | `test:lib` | Build one lane's library tests once and run the named ones ([`scripts/test-lib`](#testing)) |
 | `test:scripts` | Verify and run every script contract suite CI runs, or one `JOB [SHARD]` |
@@ -1702,6 +1703,10 @@ changing the tree contract or UI integration:
 ```sh
 scripts/cargo-gate test --locked --no-default-features --features ui --test iced_tree_reconciliation
 ```
+
+The vendored cosmic-text `wrapped_ellipsis` regressions run through the workspace
+member package `cagents-cosmic-text-contracts` (`mise run test:contracts`). Cargo
+refuses to test a crate under the workspace that is not a member.
 
 Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
