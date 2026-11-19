@@ -638,6 +638,16 @@ does not sandbox the real executable's network access.
 | --- | --- |
 | A populated saved Claude conversation before starting a provider | [`tests/fixtures/claude-resume-history.py`](#saved-claude-history) |
 | A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
+| A pane Close the registry refuses and keeps the pane through | [`.cagents-fixture-refuse-close`](#a-refused-pane-close) |
+
+### A refused pane close
+
+A debug daemon refuses the next pane Close as it refuses one whose pane
+changed while closing, when its `HOME` lies inside a native-evidence task and
+holds `.cagents-fixture-refuse-close`. The marker is removed, so the Close
+after it goes through. Create it between steps, for example with
+`scripts/native-evidence env sh -c 'touch "$HOME/.cagents-fixture-refuse-close"'`,
+then close a pane to see the window keep it and say so.
 
 ### Close a hosted legacy Codex actor without removing its pane
 

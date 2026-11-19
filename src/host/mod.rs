@@ -13,6 +13,8 @@ pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
 #[cfg(debug_assertions)]
+mod fixture_close_refusal;
+#[cfg(debug_assertions)]
 mod fixture_hold;
 mod lifecycle;
 mod lock;
