@@ -1317,6 +1317,9 @@ impl Cagents {
         } else {
             0.0
         };
+        if let Some(done) = self.unnamed_agent_view(card) {
+            return done;
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime))
                 if runtime.awaiting_admission()
