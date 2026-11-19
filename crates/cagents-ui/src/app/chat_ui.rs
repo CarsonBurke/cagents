@@ -1342,6 +1342,9 @@ pub(super) struct State {
     /// A message to resume a conversation's stopped work, held for a card
     /// reopening without a chat runtime until its conversation attaches.
     held_for_start: HashMap<CardId, String>,
+    /// Cards given such a message while reopening. Once attached, one whose
+    /// provider is still stopped takes its pane's way back to send it.
+    resuming_on_attach: HashSet<CardId>,
     /// What the daemon last said about its update restore, for the panes
     /// that wait on it.
     update_recovery: update_recovery::Watch,
@@ -1384,6 +1387,7 @@ impl Default for State {
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
             held_for_start: HashMap::new(),
+            resuming_on_attach: HashSet::new(),
             update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
@@ -9736,6 +9740,7 @@ impl Cagents {
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.held_for_start.remove(&card);
+        self.chat_ui.resuming_on_attach.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
         self.chat_ui.confirmed_losses.remove(&card);
@@ -11258,56 +11263,77 @@ impl Cagents {
     /// Asks the conversation in `card` to pick up the work an update stopped,
     /// with `text`. The message is held like a queued follow-up, which the
     /// reader can see, change or take back, and goes out once the provider
-    /// is ready and idle; a conversation the update stopped or ended is
-    /// started again to take it. `None` when the card cannot take a message.
+    /// is ready and idle. A conversation whose provider stopped first takes
+    /// the way back its pane offers, as pressing it would. `None` when the
+    /// card cannot take a message.
     pub(super) fn resume_lost_work(&mut self, card: CardId, text: String) -> Option<Task<Message>> {
-        if self.chat_closed_elsewhere(card) {
+        if !self.chat_takes_resume(card) {
             return None;
         }
         let starting = self.chat_start_pending(card);
-        let blocked = self
-            .blocked_failure(card)
-            .is_some_and(|blocked| blocked.reopen.reopens());
+        let fresh = self.chat_offers_fresh_conversation(card);
         match self.cards.get_mut(&card) {
-            Some(CardRuntime::Chat(runtime)) => {
-                // Saved history read without a provider takes no messages, and
-                // a draft has no conversation to resume.
-                if runtime.is_draft()
-                    || runtime.snapshot.read_only_reason.is_some() && !runtime.snapshot.exited
-                {
-                    return None;
-                }
+            Some(CardRuntime::Chat(runtime)) if starting => {
+                // What it attaches to says whether it takes the message.
                 runtime.hold_followup(text);
-                let target = runtime.target;
-                if starting {
-                    // It goes out once the conversation attaches.
-                    self.persist();
-                    return Some(Task::none());
-                }
-                let reopen = runtime
-                    .start_blocked
-                    .is_some_and(blocked_recovery::Reopen::reopens);
-                let restart = runtime.snapshot.exited || runtime.disconnected;
-                self.persist();
-                Some(if reopen {
-                    self.reopen_stopped(card)
-                } else if restart {
-                    self.handle_chat_ui(Action::Reconnect(target))
-                } else {
-                    self.dispatch_queued(target)
-                })
-            }
-            _ if starting => {
-                self.chat_ui.held_for_start.insert(card, text);
+                self.chat_ui.resuming_on_attach.insert(card);
                 self.persist();
                 Some(Task::none())
             }
-            _ if blocked => {
-                self.chat_ui.held_for_start.insert(card, text);
+            Some(CardRuntime::Chat(runtime)) => {
+                let readiness = runtime.readiness(false, fresh);
+                runtime.hold_followup(text);
+                let target = runtime.target;
                 self.persist();
-                Some(self.reopen_stopped(card))
+                Some(match readiness {
+                    stopped::Readiness::Recovers(press) => self.take_chat_recovery(target, press),
+                    _ => self.dispatch_queued(target),
+                })
             }
-            _ => None,
+            _ => {
+                self.chat_ui.held_for_start.insert(card, text);
+                self.chat_ui.resuming_on_attach.insert(card);
+                self.persist();
+                Some(if starting {
+                    Task::none()
+                } else {
+                    self.reopen_stopped(card)
+                })
+            }
+        }
+    }
+
+    /// Whether [`Self::resume_lost_work`] would take a message for `card`.
+    pub(super) fn chat_takes_resume(&self, card: CardId) -> bool {
+        if self.chat_closed_elsewhere(card) {
+            return false;
+        }
+        let starting = self.chat_start_pending(card);
+        match self.cards.get(&card) {
+            // A draft has no conversation to resume.
+            Some(CardRuntime::Chat(runtime)) if starting => !runtime.is_draft(),
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.readiness(false, self.chat_offers_fresh_conversation(card))
+                    != stopped::Readiness::Cannot
+            }
+            _ => {
+                starting
+                    || self
+                        .blocked_failure(card)
+                        .is_some_and(|blocked| blocked.reopen.reopens())
+            }
+        }
+    }
+
+    /// Takes a stopped card's way back, as its pane's button would.
+    fn take_chat_recovery(&mut self, target: Target, press: stopped::Press) -> Task<Message> {
+        match press {
+            stopped::Press::Reconnect => self.handle_chat_ui(Action::Reconnect(target)),
+            stopped::Press::ResumeSaved => self.handle_chat_ui(Action::ResumeSaved(target)),
+            stopped::Press::Reopen => self.reopen_stopped(target.card),
+            stopped::Press::StartFresh | stopped::Press::SendAgain | stopped::Press::Close => {
+                Task::none()
+            }
         }
     }
 
@@ -11331,6 +11357,34 @@ impl Cagents {
         if let Some(text) = held {
             runtime.hold_followup(text);
         }
+        // A message to resume stopped work, held while its conversation
+        // reopened, may find it reopened stopped: saved history read without
+        // a provider, say. It then takes the pane's way back first. While
+        // nothing can bring one back yet (its history still loading, say),
+        // it waits for the change that can, as the message does.
+        if !self.chat_start_pending(target.card)
+            && self.chat_ui.resuming_on_attach.contains(&target.card)
+        {
+            let fresh = self.chat_offers_fresh_conversation(target.card);
+            let readiness = self
+                .chat_card_runtime_mut(target)
+                .filter(|runtime| !runtime.followups.is_empty())
+                .map(|runtime| runtime.readiness(false, fresh));
+            match readiness {
+                Some(stopped::Readiness::Cannot) => {}
+                Some(stopped::Readiness::Recovers(press)) => {
+                    self.chat_ui.resuming_on_attach.remove(&target.card);
+                    return self.take_chat_recovery(target, press);
+                }
+                // Taken back, or it takes the message as it is.
+                Some(stopped::Readiness::Takes) | None => {
+                    self.chat_ui.resuming_on_attach.remove(&target.card);
+                }
+            }
+        }
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            return Task::none();
+        };
         let Some(handle) = runtime.handle().cloned() else {
             return Task::none();
         };

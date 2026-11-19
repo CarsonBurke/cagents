@@ -10211,6 +10211,141 @@ fn saved_history_admits_attachment_chooser_and_completion_without_starting_or_se
     });
 }
 
+/// A tab reading `card`'s conversation as saved history, with no provider:
+/// how a conversation whose provider an update ended can reopen.
+fn reading_saved_history(app: &mut Cagents, card: CardId) -> chat::Session {
+    let mut source = chat_runtime(app, card).session.clone();
+    source.launch.session_id = Some(KNOWN_THREAD.into());
+    source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+    app.replace_chat_conversation(card, source.clone());
+    let target = chat_runtime(app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.session = source.clone();
+    let snapshot = saved_history_snapshot(&source);
+    runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+        source.clone(),
+        snapshot.clone(),
+    )));
+    runtime.snapshot = Arc::new(snapshot);
+    assert!(chat_runtime(app, card).has_connected_saved_history(&chat_runtime(app, card).snapshot));
+    source
+}
+
+fn saved_history_snapshot(source: &chat::Session) -> Snapshot {
+    Snapshot {
+        session_id: source.launch.session_id.clone(),
+        exited: true,
+        read_only_reason: Some("Saved history; no provider was started".into()),
+        ..Default::default()
+    }
+}
+
+/// A provider ready for its first message on `source`'s conversation.
+fn ready_provider(source: &chat::Session) -> Arc<ClientHandle> {
+    Arc::new(ClientHandle::fixture(
+        source.clone(),
+        Snapshot {
+            ready: true,
+            session_id: source.launch.session_id.clone(),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Resuming work an update stopped, in a tab reading saved history, starts
+/// a provider as the tab's own Resume would; reattaching the reader would
+/// leave the message unsent.
+#[test]
+fn resuming_stopped_work_on_saved_history_starts_a_provider_to_send_it() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    assert!(app.chat_takes_resume(card));
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    let attempt = app.chat_ui.attempt(card).expect("a provider starts");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+    assert_eq!(attempt.session, source);
+    let started = attempt.target;
+    assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
+    assert_eq!(sent(&app, card), None);
+
+    answer_start(&mut app, started, Ok(ready_provider(&source)));
+    assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
+}
+
+/// Taken while the tab reopens, the message waits for what it attaches to.
+/// Saved history read without a provider then starts one to send it.
+#[test]
+fn a_resume_held_while_reopening_starts_a_provider_if_it_reopens_as_saved_history() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    // The reader reattaches, as a tab does when it opens.
+    let target = chat_runtime(&app, card).target;
+    drop(app.handle_chat_ui(Action::Reconnect(target)));
+    let attempt = app.chat_ui.attempt(card).expect("the reader reattaches");
+    assert_eq!(attempt.intent, chat::Intent::Restore);
+    let restoring = attempt.target;
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
+
+    answer_start(
+        &mut app,
+        restoring,
+        Ok(Arc::new(ClientHandle::fixture(
+            source.clone(),
+            saved_history_snapshot(&source),
+        ))),
+    );
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("reopened as saved history, it starts a provider");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+    let started = attempt.target;
+    assert_eq!(sent(&app, card), None);
+
+    answer_start(&mut app, started, Ok(ready_provider(&source)));
+    assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
+}
+
+/// A reader that attaches still loading its history can't start a provider
+/// yet. The message waits for the history, then starts one.
+#[test]
+fn a_resume_held_while_reopening_waits_for_saved_history_to_load() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    let target = chat_runtime(&app, card).target;
+    drop(app.handle_chat_ui(Action::Reconnect(target)));
+    let restoring = app.chat_ui.attempt(card).unwrap().target;
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    let loading = Snapshot {
+        history_loading: true,
+        ..saved_history_snapshot(&source)
+    };
+    answer_start(
+        &mut app,
+        restoring,
+        Ok(Arc::new(ClientHandle::fixture(source.clone(), loading))),
+    );
+    assert!(app.chat_ui.attempt(card).is_none(), "nothing starts yet");
+    assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
+
+    // Its history arrives.
+    let target = chat_runtime(&app, card).target;
+    let loaded = saved_history_snapshot(&source);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+        source.clone(),
+        loaded.clone(),
+    )));
+    runtime.snapshot = Arc::new(loaded);
+    drop(app.dispatch_queued(target));
+    let attempt = app.chat_ui.attempt(card).expect("then a provider starts");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+}
+
 #[test]
 fn saved_history_explicit_resume_keeps_the_pane_draft_and_image_unsent() {
     chat::attachment_assets::with_test_image(|image| {
@@ -22470,12 +22605,17 @@ fn late_connection_callbacks_cannot_change_a_reconnected_card() {
     );
 }
 
-/// What the conversation in `card` is sending, or else holds to send next.
-pub(in crate::app) fn outgoing(app: &Cagents, card: CardId) -> Option<String> {
-    let runtime = chat_runtime(app, card);
-    runtime
+/// What the conversation in `card` has sent its provider and awaits.
+pub(in crate::app) fn sent(app: &Cagents, card: CardId) -> Option<String> {
+    chat_runtime(app, card)
         .commands
         .iter()
         .find_map(|pending| pending.sent.clone())
-        .or_else(|| (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0))
+}
+
+/// What the conversation in `card` holds to send once its provider can
+/// take it.
+pub(in crate::app) fn held(app: &Cagents, card: CardId) -> Option<String> {
+    let runtime = chat_runtime(app, card);
+    (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0)
 }

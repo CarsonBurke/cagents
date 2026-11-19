@@ -34,11 +34,15 @@ use crate::{
 mod refusal;
 #[cfg(feature = "ui")]
 mod review_cache;
+#[cfg(feature = "ui")]
+mod update_resume;
 
 #[cfg(test)]
 mod history_scale;
 pub(crate) use refusal::invalid_state;
 pub use refusal::{RefusedCheck, Violation};
+#[cfg(feature = "ui")]
+pub use update_resume::{Taken, UpdateResumeStore};
 
 // Format 12 introduces retained Claude descriptors that older readers cannot
 // decode safely. Admission must reject them before partial workspace loading
@@ -869,37 +873,6 @@ impl StateStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         set_metadata(&transaction, "dismissed_update_v1", identity)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// What the windows have done with the latest update's offer to resume
-    /// the conversations whose work it stopped, as the UI records it.
-    pub fn load_update_resume(&self) -> Result<Option<String>> {
-        let inner = self.lock_inner()?;
-        ensure_open(&inner)?;
-        metadata(&inner.connection, "update_resume_v1")
-    }
-
-    /// Replaces the record with what `merge` makes of the stored one, in one
-    /// transaction, so windows recording the same update keep each other's
-    /// entries. A `None` from `merge` leaves the record as it is.
-    pub fn merge_update_resume(
-        &self,
-        merge: impl FnOnce(Option<String>) -> Option<String>,
-    ) -> Result<()> {
-        let mut inner = self.lock_inner()?;
-        ensure_open(&inner)?;
-        let transaction = inner
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(value) = merge(metadata(&transaction, "update_resume_v1")?) else {
-            return Ok(());
-        };
-        if value.is_empty() || value.len() > 64 * 1024 {
-            return Err(invalid_state!("invalid update resume record"));
-        }
-        set_metadata(&transaction, "update_resume_v1", &value)?;
         transaction.commit()?;
         Ok(())
     }
@@ -6869,31 +6842,6 @@ mod tests {
 
     const VISITOR_TEST: &str = "persistence::tests::another_process_visits_the_store";
     const VISITOR_ENV: &str = "CAGENTS_STORE_VISITOR_DATABASE";
-
-    /// Two stores on one file stand for two windows recording the same
-    /// update's resume offer: each merge sees what the other committed.
-    #[test]
-    fn update_resume_merges_see_what_another_window_saved() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("resume.sqlite3");
-        let first = StateStore::open(&path, boot("first")).unwrap();
-        let second = StateStore::open(&path, boot("second")).unwrap();
-        assert_eq!(first.load_update_resume().unwrap(), None);
-        first
-            .merge_update_resume(|stored| {
-                assert_eq!(stored, None);
-                Some("a".into())
-            })
-            .unwrap();
-        second
-            .merge_update_resume(|stored| Some(format!("{}b", stored.unwrap())))
-            .unwrap();
-        // Declining to merge leaves the record alone.
-        first.merge_update_resume(|_| None).unwrap();
-        assert_eq!(first.load_update_resume().unwrap().as_deref(), Some("ab"));
-        assert!(first.merge_update_resume(|_| Some(String::new())).is_err());
-        assert_eq!(second.load_update_resume().unwrap().as_deref(), Some("ab"));
-    }
 
     /// Run only as the child of `an_open_store_keeps_its_wal_from_other_processes`:
     /// another process - a second window, `sqlite3`, a backup - that opens the

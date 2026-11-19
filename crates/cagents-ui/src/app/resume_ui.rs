@@ -2382,7 +2382,7 @@ mod tests {
             Ok(Some(Box::new(successor(&entry.session)))),
         )));
         assert!(app.chat_start_began(card));
-        assert!(app.cards.get(&card).is_none(), "nothing has attached yet");
+        assert!(!app.cards.contains_key(&card), "nothing has attached yet");
 
         assert!(
             app.resume_lost_work(card, "Carry on".into()).is_some(),

@@ -16046,6 +16046,12 @@ impl Application for Cagents {
                 .copied()
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
+        // A window that keeps no state records nothing for the others.
+        let update_resume = if session.is_some() {
+            update_resume::State::shared()
+        } else {
+            update_resume::State::default()
+        };
         let mut app = Self {
             startup_gate: startup_gate::State::default(),
             core,
@@ -16146,7 +16152,7 @@ impl Application for Cagents {
                 .with_waiting_messages(chat_waiting_messages),
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
-            update_resume: update_resume::State::default(),
+            update_resume,
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),

@@ -8,92 +8,84 @@
 //! sees in the conversation like any queued message.
 use super::*;
 use crate::model::TerminalId;
+use crate::persistence::{Taken, UpdateResumeStore};
 use crate::update::UpdateJob;
 use crate::update::in_flight::{InFlight, Outcome, TaskKind};
-use serde::{Deserialize, Serialize};
 
 /// The most conversations the offer lists by name; the rest are counted.
 const LISTED: usize = 6;
 
 #[derive(Default)]
 pub(super) struct State {
-    /// What the windows have done with the latest update's offer, once read.
-    record: Option<Record>,
-    /// The terminal update job the offer is for, until its record is read.
+    /// What every window has taken off the offer, kept apart from their own
+    /// databases because one conversation can show in several windows.
+    /// Without it the offer is made in this window alone.
+    store: Option<Arc<UpdateResumeStore>>,
+    /// The terminal update job the offer is for.
     job: Option<UpdateJob>,
+    /// The conversations no window offers any more for `job`, once read.
+    handled: Option<Vec<TerminalId>>,
+    /// Those asked to resume here, until the shared record says this window
+    /// took them first.
+    taking: Vec<TerminalId>,
     /// What is still on offer, in the update's order.
     offers: Vec<Outcome>,
 }
 
-/// What became of an update's offer, kept with the other windows' state so
-/// it is made once per update, not once per window or start.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Record {
-    job: String,
-    /// Conversations no longer on offer: resumed from it, continued by
-    /// hand, or dismissed by the window that showed them.
-    #[serde(default)]
-    handled: Vec<TerminalId>,
-}
-
 #[derive(Clone, Debug)]
 pub enum Action {
-    Loaded(String, Result<Option<String>, String>),
+    Loaded(String, Result<Vec<TerminalId>, String>),
+    /// The shared record's answer to taking conversations off the update's
+    /// offer, with the ones among them to resume.
+    Taken(String, Vec<Resume>, Result<Taken, String>),
     Show(TerminalId),
     Resume(TerminalId),
     ResumeAll,
     Dismiss,
 }
 
-impl Record {
-    /// This window's record, with what `stored` says of the same update.
-    fn merged(mut self, stored: Option<Record>) -> Self {
-        if let Some(stored) = stored.filter(|stored| stored.job == self.job) {
-            for id in stored.handled {
-                if !self.handled.contains(&id) {
-                    self.handled.push(id);
-                }
-            }
-        }
-        self
-    }
+/// A conversation to resume once this window has taken it off the offer.
+#[derive(Clone, Debug)]
+pub struct Resume {
+    id: TerminalId,
+    prompt: String,
+    label: String,
 }
 
 impl State {
+    /// The offer as every window records it, in the data directory.
+    pub(super) fn shared() -> Self {
+        Self {
+            store: instance::project_dirs().map(|dirs| {
+                Arc::new(UpdateResumeStore::at(
+                    dirs.data_dir().join("update-resume.sqlite3"),
+                ))
+            }),
+            ..Self::default()
+        }
+    }
+
     fn rebuild(&mut self) {
-        let (Some(job), Some(record)) = (&self.job, &self.record) else {
+        let (Some(job), Some(handled)) = (&self.job, &self.handled) else {
             self.offers.clear();
             return;
         };
         self.offers = job
             .in_flight
             .iter()
-            .filter(|outcome| outcome.lost())
-            .filter(|outcome| record.job != job.id || !record.handled.contains(&outcome.work.id))
+            .filter(|outcome| outcome.lost() && !handled.contains(&outcome.work.id))
             .cloned()
             .collect();
     }
 
-    /// Takes `id` off the offer, for this window and the others.
+    /// Takes `id` off the offer here; the shared record is told apart.
     fn handle(&mut self, id: TerminalId) {
         self.offers.retain(|offered| offered.work.id != id);
-        if let Some(record) = self.record_for()
-            && !record.handled.contains(&id)
+        if let Some(handled) = &mut self.handled
+            && !handled.contains(&id)
         {
-            record.handled.push(id);
+            handled.push(id);
         }
-    }
-
-    fn record_for(&mut self) -> Option<&mut Record> {
-        let job = self.job.as_ref()?;
-        let record = self.record.get_or_insert_with(Record::default);
-        if record.job != job.id {
-            *record = Record {
-                job: job.id.clone(),
-                ..Record::default()
-            };
-        }
-        Some(record)
     }
 }
 
@@ -149,20 +141,33 @@ fn continue_prompt(work: &InFlight) -> String {
     if work.turn {
         lines.push("- your turn in progress".to_owned());
     }
-    for task in &work.tasks {
-        let kind = match task.kind {
-            TaskKind::Subagent => "subagent",
-            TaskKind::Command => "background command",
-            TaskKind::Step => "background step",
-            TaskKind::Unknown => "background task",
+    // The reader sees this message too, so a task is named as the provider
+    // named it, never by its identifier; those it left unnamed are counted.
+    for kind in [
+        TaskKind::Subagent,
+        TaskKind::Command,
+        TaskKind::Step,
+        TaskKind::Unknown,
+    ] {
+        let (one, many) = match kind {
+            TaskKind::Subagent => ("subagent", "subagents"),
+            TaskKind::Command => ("background command", "background commands"),
+            TaskKind::Step => ("background step", "background steps"),
+            TaskKind::Unknown => ("background task", "background tasks"),
         };
-        // The reader sees this message too: a name says more to both than
-        // the provider's identifier, which is the fallback.
-        lines.push(if task.name.is_empty() {
-            format!("- {kind} {}", task.id)
-        } else {
-            format!("- {kind} \"{}\"", task.name)
-        });
+        let mut unnamed = 0;
+        for task in work.tasks.iter().filter(|task| task.kind == kind) {
+            if task.name.trim().is_empty() {
+                unnamed += 1;
+            } else {
+                lines.push(format!("- {one} \"{}\"", task.name.trim()));
+            }
+        }
+        match unnamed {
+            0 => {}
+            1 => lines.push(format!("- 1 {one}")),
+            count => lines.push(format!("- {count} {many}")),
+        }
     }
     if work.unlisted > 0 {
         lines.push(format!(
@@ -183,6 +188,19 @@ fn continue_prompt(work: &InFlight) -> String {
     lines.join("\n")
 }
 
+/// What the notice says of the conversations another window had already
+/// resumed or dismissed when this one asked.
+fn elsewhere_notice(labels: &[String]) -> String {
+    match labels {
+        [one] => format!("{one} was already resumed or dismissed in another window."),
+        [rest @ .., last] => format!(
+            "{} and {last} were already resumed or dismissed in another window.",
+            rest.join(", ")
+        ),
+        [] => String::new(),
+    }
+}
+
 /// What the notice says of the conversations that could not take the
 /// message to resume.
 fn refused_notice(labels: &[String]) -> String {
@@ -199,36 +217,29 @@ fn refused_notice(labels: &[String]) -> String {
 impl Cagents {
     /// Takes the latest update job into the offer once it has ended.
     pub(super) fn offer_update_resume(&mut self, job: &UpdateJob) -> Task<Message> {
+        let state = &mut self.update_resume;
         if !job.phase.is_terminal() || !job.in_flight.iter().any(Outcome::lost) {
-            let state = &mut self.update_resume;
             state.job = None;
+            state.handled = None;
             state.offers.clear();
             return Task::none();
         }
-        let state = &mut self.update_resume;
         if state.job.as_ref().is_some_and(|known| known.id == job.id) {
             return Task::none();
         }
-        // Read afresh for each update: another window may have taken up its
-        // offer since this one last read the record.
         state.job = Some(job.clone());
+        state.handled = None;
         state.offers.clear();
-        let Some(store) = self
-            .session
-            .as_ref()
-            .map(|session| session.operation_store())
-        else {
-            // Without the shared state the offer is made in this window alone.
-            state.record = Some(Record::default());
+        let Some(store) = state.store.clone() else {
+            state.handled = Some(Vec::new());
             state.rebuild();
             return Task::none();
         };
         let id = job.id.clone();
         cosmic::task::future(async move {
+            let read = id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                store
-                    .load_update_resume()
-                    .map_err(|error| error.to_string())
+                store.handled(&read).map_err(|error| error.to_string())
             })
             .await
             .map_err(|error| error.to_string())
@@ -241,28 +252,22 @@ impl Cagents {
         match action {
             Action::Loaded(job, result) => {
                 let state = &mut self.update_resume;
-                let record = match result {
-                    Ok(value) => value
-                        .and_then(|value| {
-                            serde_json::from_str::<Record>(&value)
-                                .inspect_err(|error| {
-                                    tracing::warn!(%error, "unreadable update resume record");
-                                })
-                                .ok()
-                        })
-                        .unwrap_or_default(),
-                    Err(error) => {
-                        tracing::warn!(%error, "could not read the update resume record");
-                        Record::default()
-                    }
-                };
                 // An answer for an update since replaced is for nothing shown.
-                if state.job.as_ref().is_some_and(|known| known.id == job) {
-                    state.record = Some(record);
-                    state.rebuild();
+                if state.job.as_ref().is_none_or(|known| known.id != job) {
+                    return Task::none();
                 }
+                let handled = result.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "could not read the update resume record");
+                    Vec::new()
+                });
+                // What this window took off while it read stays off.
+                let mut merged = state.handled.take().unwrap_or_default();
+                merged.retain(|id| !handled.contains(id));
+                state.handled = Some(handled.into_iter().chain(merged).collect());
+                state.rebuild();
                 Task::none()
             }
+            Action::Taken(job, resumes, result) => self.update_resume_taken(job, resumes, result),
             Action::Show(id) => {
                 let Some((card, channel)) = self.session_card(id) else {
                     return Task::none();
@@ -271,27 +276,28 @@ impl Cagents {
                     channel.map_or_else(Task::none, |channel| self.navigate_to_channel(channel));
                 Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
             }
-            Action::Resume(id) => self.resume_offered_all([id]),
+            Action::Resume(id) => self.resume_offered([id]),
             Action::ResumeAll => {
                 let ids: Vec<_> = self.offered_here().map(|outcome| outcome.work.id).collect();
-                self.resume_offered_all(ids)
+                self.resume_offered(ids)
             }
             Action::Dismiss => {
                 // Only what this window showed: another window's conversations
                 // stay on offer there.
                 let ids: Vec<_> = self.offered_here().map(|outcome| outcome.work.id).collect();
-                for id in ids {
-                    self.update_resume.handle(id);
+                for id in &ids {
+                    self.update_resume.handle(*id);
                 }
-                self.save_update_resume()
+                self.take_update_offer(ids, Vec::new())
             }
         }
     }
 
-    /// Resumes each offered conversation in `ids`, taking it off the offer,
-    /// and says which could not take the message.
-    fn resume_offered_all(&mut self, ids: impl IntoIterator<Item = TerminalId>) -> Task<Message> {
-        let mut tasks = Vec::new();
+    /// Resumes each offered conversation in `ids` that can take the message,
+    /// once this window is the first to take it off the offer, and says
+    /// which could not.
+    fn resume_offered(&mut self, ids: impl IntoIterator<Item = TerminalId>) -> Task<Message> {
+        let mut resumes = Vec::new();
         let mut refused = Vec::new();
         for id in ids {
             let Some(outcome) = self
@@ -299,29 +305,154 @@ impl Cagents {
                 .offers
                 .iter()
                 .find(|outcome| outcome.work.id == id)
-                .cloned()
+                .filter(|_| !self.update_resume.taking.contains(&id))
             else {
                 continue;
             };
             let Some((card, _)) = self.session_card(id) else {
                 continue;
             };
-            match self.resume_lost_work(card, continue_prompt(&outcome.work)) {
-                Some(task) => {
-                    self.update_resume.handle(id);
-                    tasks.push(task);
-                }
-                // It stays on offer, to resume once it can take a message.
-                None => refused.push(self.offer_label(&outcome)),
+            let label = self.offer_label(outcome);
+            // It stays on offer, to resume once it can take a message.
+            if !self.chat_takes_resume(card) {
+                refused.push(label);
+                continue;
             }
+            resumes.push(Resume {
+                id,
+                prompt: continue_prompt(&outcome.work),
+                label,
+            });
         }
         if !refused.is_empty() {
             self.status = Some(TransientNotice::warning(refused_notice(&refused)));
         }
-        if tasks.is_empty() {
+        if resumes.is_empty() {
             return Task::none();
         }
-        Task::batch(tasks.into_iter().chain([self.save_update_resume()]))
+        let Some(job) = self.update_resume.job.as_ref().map(|job| job.id.clone()) else {
+            return Task::none();
+        };
+        if self.update_resume.store.is_none() {
+            let first = resumes.iter().map(|resume| resume.id).collect();
+            return self.update_resume_taken(
+                job,
+                resumes,
+                Ok(Taken {
+                    first,
+                    handled: Vec::new(),
+                }),
+            );
+        }
+        let ids = resumes.iter().map(|resume| resume.id).collect::<Vec<_>>();
+        // Off the offer at once; sent once the shared record answers.
+        self.update_resume.taking.extend(ids.iter().copied());
+        self.take_update_offer(ids, resumes)
+    }
+
+    /// Takes `ids` off the update's offer in every window, then resumes
+    /// those of `resumes` this window took first.
+    fn take_update_offer(&self, ids: Vec<TerminalId>, resumes: Vec<Resume>) -> Task<Message> {
+        let (Some(store), Some(job)) = (
+            self.update_resume.store.clone(),
+            self.update_resume.job.as_ref().map(|job| job.id.clone()),
+        ) else {
+            return Task::none();
+        };
+        if ids.is_empty() {
+            return Task::none();
+        }
+        cosmic::task::future(async move {
+            let taking = job.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                store.take(&taking, &ids).map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::UpdateResume(Action::Taken(job, resumes, result))
+        })
+    }
+
+    fn update_resume_taken(
+        &mut self,
+        job: String,
+        resumes: Vec<Resume>,
+        result: Result<Taken, String>,
+    ) -> Task<Message> {
+        let state = &mut self.update_resume;
+        state
+            .taking
+            .retain(|id| !resumes.iter().any(|resume| resume.id == *id));
+        let current = state.job.as_ref().is_some_and(|known| known.id == job);
+        let first = match result {
+            Ok(taken) => {
+                if current && let Some(handled) = &mut state.handled {
+                    for id in taken.handled {
+                        if !handled.contains(&id) {
+                            handled.push(id);
+                        }
+                    }
+                }
+                taken.first
+            }
+            // Unable to ask the other windows, it resumes them as asked.
+            Err(error) => {
+                tracing::warn!(%error, "could not record the update resume offer");
+                resumes.iter().map(|resume| resume.id).collect()
+            }
+        };
+        if current {
+            state.rebuild();
+        }
+        let mut tasks = Vec::new();
+        let mut elsewhere = Vec::new();
+        let mut refused = Vec::new();
+        for resume in resumes {
+            if !first.contains(&resume.id) {
+                elsewhere.push(resume.label);
+                continue;
+            }
+            let sent = self
+                .session_card(resume.id)
+                .and_then(|(card, _)| self.resume_lost_work(card, resume.prompt.clone()));
+            match sent {
+                Some(task) => {
+                    self.update_resume.handle(resume.id);
+                    tasks.push(task);
+                }
+                None => refused.push(resume),
+            }
+        }
+        if !refused.is_empty() {
+            // Changed while the record was asked: back on offer, here and in
+            // the other windows.
+            let ids: Vec<_> = refused.iter().map(|resume| resume.id).collect();
+            if current && let Some(handled) = &mut self.update_resume.handled {
+                handled.retain(|id| !ids.contains(id));
+                self.update_resume.rebuild();
+            }
+            let labels: Vec<_> = refused.into_iter().map(|resume| resume.label).collect();
+            self.status = Some(TransientNotice::warning(refused_notice(&labels)));
+            if let Some(store) = self.update_resume.store.clone() {
+                tasks.push(
+                    iced::Task::future(async move {
+                        let restored =
+                            tokio::task::spawn_blocking(move || store.restore(&job, &ids))
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result.map_err(|error| error.to_string()));
+                        if let Err(error) = restored {
+                            tracing::warn!(%error, "could not put a conversation back on offer");
+                        }
+                    })
+                    .discard(),
+                );
+            }
+        } else if !elsewhere.is_empty() {
+            self.status = Some(TransientNotice::warning(elsewhere_notice(&elsewhere)));
+        }
+        Task::batch(tasks)
     }
 
     /// Takes the conversation in `card` off the offer once the reader writes
@@ -341,50 +472,16 @@ impl Cagents {
             return Task::none();
         }
         self.update_resume.handle(id);
-        self.save_update_resume()
-    }
-
-    fn save_update_resume(&self) -> Task<Message> {
-        let Some(record) = self.update_resume.record.clone() else {
-            return Task::none();
-        };
-        let Some(store) = self
-            .session
-            .as_ref()
-            .map(|session| session.operation_store())
-        else {
-            return Task::none();
-        };
-        iced::Task::future(async move {
-            let saved = tokio::task::spawn_blocking(move || {
-                // Each window takes the conversations it holds off the offer,
-                // so what the others recorded for the same update is kept.
-                let mut encoded = Ok(());
-                let merged = store.merge_update_resume(|stored| {
-                    let stored = stored.and_then(|value| serde_json::from_str(&value).ok());
-                    serde_json::to_string(&record.merged(stored))
-                        .map_err(|error| encoded = Err(error.to_string()))
-                        .ok()
-                });
-                encoded.and(merged.map_err(|error| error.to_string()))
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-            if let Err(error) = saved {
-                tracing::warn!(%error, "could not save the update resume record");
-            }
-        })
-        .discard()
+        self.take_update_offer(vec![id], Vec::new())
     }
 
     /// The offered conversations this window holds a tab for. Another
     /// window's are offered there.
     fn offered_here(&self) -> impl Iterator<Item = &Outcome> {
-        self.update_resume
-            .offers
-            .iter()
-            .filter(|outcome| self.session_card(outcome.work.id).is_some())
+        self.update_resume.offers.iter().filter(|outcome| {
+            !self.update_resume.taking.contains(&outcome.work.id)
+                && self.session_card(outcome.work.id).is_some()
+        })
     }
 
     fn offer_label(&self, outcome: &Outcome) -> String {
