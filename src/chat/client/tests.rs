@@ -6403,3 +6403,234 @@ fn retirement_initialization_retries_after_a_thread_factory_error() {
         worker
     );
 }
+
+/// A fixture daemon end of one connection: answers each `Connect` as
+/// `live`, refuses everything else with `refusal`, and returns, once the
+/// chat closes the connection, how many `Connect`s it read and the other
+/// requests in order.
+fn count_handshakes(
+    mut peer: UnixStream,
+    live: HostSessionProof,
+    refusal: &'static str,
+) -> (usize, Vec<ClientRequest>) {
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut connects = 0;
+    let mut requests = Vec::new();
+    while let Some(envelope) = ipc::read_frame::<ClientEnvelope>(&mut peer).unwrap() {
+        let message = match envelope.request {
+            ClientRequest::Connect { .. } => {
+                connects += 1;
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: live.clone(),
+                        resumed: Vec::new(),
+                    },
+                }
+            }
+            request => {
+                requests.push(request);
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::InvalidRequest,
+                    refusal,
+                    false,
+                ))
+            }
+        };
+        ipc::write_frame(
+            &mut peer,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(envelope.request_id),
+                proof: live.clone(),
+                message,
+            },
+        )
+        .unwrap();
+    }
+    (connects, requests)
+}
+
+/// A chat handed the connection that proved its daemon ready goes on over
+/// it: its first request follows that handshake, with no second `Connect`
+/// (#3155).
+#[test]
+fn a_chat_on_its_readiness_connection_handshakes_once() {
+    const REFUSAL: &str = "fixture refuses the start";
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let live = host_proof("current");
+    let daemon = thread::spawn(move || count_handshakes(peer, live, REFUSAL));
+    let ready = crate::control::ControlClient::from_stream(stream).unwrap();
+    let failure = ClientHandle::connect_on(
+        ready,
+        omp_card(None, None),
+        Intent::Start,
+        None,
+        false,
+        None,
+        None,
+        None,
+        |_| {},
+    )
+    .err()
+    .expect("the fixture refuses the start");
+    assert_eq!(failure.message, REFUSAL);
+    let (connects, requests) = daemon.join().unwrap();
+    assert_eq!(connects, 1, "the chat handshook again: {requests:?}");
+    assert_eq!(requests.len(), 1, "{requests:?}");
+}
+
+/// A proven connection to a daemon other than the one a chat must reach
+/// fails as that daemon's own refusal of the chat's `Connect` would, and
+/// asks it nothing.
+#[test]
+fn a_proven_connection_to_another_daemon_fails_as_its_refusal_would() {
+    let expected = host_proof("source");
+    let live = host_proof("current");
+    // The daemon's refusal of a `Connect` naming another incarnation.
+    let (bare, mut peer) = UnixStream::pair().unwrap();
+    let refused = live.clone();
+    let daemon = thread::spawn(move || {
+        let hello: ClientEnvelope = ipc::read_frame(&mut peer).unwrap().unwrap();
+        let ClientRequest::Connect { expected_host, .. } = hello.request else {
+            panic!("expected the chat's handshake");
+        };
+        ipc::write_frame(
+            &mut peer,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(hello.request_id),
+                proof: refused.clone(),
+                message: ServerMessage::Error(
+                    ipc::validate_proof(expected_host.as_ref(), &refused).unwrap_err(),
+                ),
+            },
+        )
+        .unwrap();
+    });
+    let start = |stream: ChatStream| {
+        ClientHandle::connect_on(
+            stream,
+            omp_card(None, None),
+            Intent::Start,
+            Some(expected.clone()),
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+        .err()
+        .expect("another daemon refuses the chat")
+    };
+    let refusal = start(ChatStream::Bare(bare));
+    daemon.join().unwrap();
+
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let daemon = thread::spawn(move || count_handshakes(peer, live, "asked after the refusal"));
+    let ready = crate::control::ControlClient::from_stream(stream).unwrap();
+    assert_eq!(start(ready.into()), refusal);
+    let (connects, requests) = daemon.join().unwrap();
+    assert_eq!(connects, 1);
+    assert!(requests.is_empty(), "{requests:?}");
+}
+
+/// Starting a chat makes one connection to the daemon, the one whose
+/// handshake proved it ready, rather than a readiness check and then a
+/// connection of its own (#3155).
+#[test]
+fn starting_a_chat_connects_to_the_daemon_once() {
+    const CHILD: &str = "CAGENTS_TEST_CHAT_START_CONNECTS_ONCE";
+    const REFUSAL: &str = "fixture refuses the start";
+    if std::env::var_os(CHILD).is_some() {
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&paths.directory)
+            .unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let returned = Arc::new(AtomicBool::new(false));
+        let chat_returned = returned.clone();
+        let daemon = thread::spawn(move || {
+            // Every connection the chat made, read until it closed each.
+            let mut connections: Vec<thread::JoinHandle<_>> = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let live = host_proof("current");
+                        connections.push(thread::spawn(move || {
+                            count_handshakes(stream, live, REFUSAL)
+                        }));
+                    }
+                    // The chat has returned, so all its connections were
+                    // made: none is still to come once the backlog is empty.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && chat_returned.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            connections
+                .into_iter()
+                .map(|connection| connection.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let failure = ClientHandle::connect(
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            |_| {},
+        )
+        .err()
+        .expect("the fixture refuses the start");
+        returned.store(true, Ordering::Release);
+        assert_eq!(failure.message, REFUSAL);
+        let handshakes = daemon.join().unwrap();
+        assert_eq!(
+            handshakes.len(),
+            1,
+            "a chat start connected more than once: {handshakes:?}"
+        );
+        assert_eq!(handshakes[0].0, 1, "{handshakes:?}");
+        assert_eq!(handshakes[0].1.len(), 1, "{handshakes:?}");
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    for directory in ["home", "runtime", "config", "data", "cache"] {
+        std::fs::create_dir(root.path().join(directory)).unwrap();
+    }
+    let name = std::thread::current().name().unwrap().to_owned();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &name, "--nocapture"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", root.path().join("home"))
+        .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_CACHE_HOME", root.path().join("cache"))
+        .env(CHILD, "1");
+    if let Some(authority) = std::env::var_os(crate::agent_execution::AUTHORITY_ENV) {
+        command.env(crate::agent_execution::AUTHORITY_ENV, authority);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -31,7 +31,7 @@ pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ReadyDaemon, connect_ready_daemon,
     connect_ready_daemon_for, ensure_daemon_ready, ensure_daemon_ready_for,
 };
-pub use hosted::{ensure_daemon_ready_for_explicit_action, existing_daemon_socket_path};
+pub use hosted::{connect_ready_daemon_for_explicit_action, existing_daemon_socket_path};
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
     RowSnapshot, ScrollSnapshot, Underline,
