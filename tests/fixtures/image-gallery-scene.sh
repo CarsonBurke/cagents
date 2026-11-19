@@ -13,8 +13,9 @@
 #   tests/fixtures/image-gallery-scene.sh open
 #   tests/fixtures/image-gallery-scene.sh shots light-wide
 #
-# A narrow window (--width 640) leaves the transcript about 360 px wide; set
-# IMAGE_GALLERY_SCROLL_AT to a point over its transcript, such as 400,500.
+# The narrowest window the app allows (--width 900, with the sidebar and the
+# right panel open) leaves a narrow transcript; set IMAGE_GALLERY_SCROLL_AT to
+# a point over it, such as 430,500.
 #
 # The chat's one turn replays frames the way Claude Code 2.1 streams them
 # (see tests/fixtures/claude-read-images-live.jsonl, recorded from the real
