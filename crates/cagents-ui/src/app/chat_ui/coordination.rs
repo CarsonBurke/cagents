@@ -843,14 +843,14 @@ impl Row {
     /// name where the row cut it, the outcome's reason, what pressing does
     /// where it opens no agent, and then the message or prompt.
     fn described(&self) -> (String, String) {
-        let reason = self
-            .state
-            .detail
-            .as_deref()
-            .map(|detail| match self.state.tone {
-                Tone::Error => format!("{}: {detail}", self.state.text),
-                _ => detail.to_owned(),
-            });
+        // A warning or a failure names itself, as a narrow row keeps only
+        // its mark; a plain state is either drawn or the working dot.
+        let reason = match (self.state.tone, self.state.detail.as_deref()) {
+            (Tone::Plain, detail) => detail.map(str::to_owned),
+            (_, Some(detail)) => Some(format!("{}: {detail}", self.state.text)),
+            (_, None) => Some(self.state.text.to_string()),
+        }
+        .filter(|reason| !reason.trim().is_empty());
         let pressing = match (&self.open, self.several) {
             (Some(_), _) => "Opens the agent",
             (None, false) => OPENS_DETAIL,
@@ -887,26 +887,6 @@ impl Row {
         .join(" · ");
         (tip.join("\n\n"), name)
     }
-}
-
-/// The still mark beside a live caption: the accent, in a dot the size of
-/// the caption's lowercase letters.
-fn live_dot() -> Element<'static, Message> {
-    const SIZE: f32 = 6.0;
-    widget::container(widget::Space::new())
-        .width(Length::Fixed(SIZE))
-        .height(Length::Fixed(SIZE))
-        .class(cosmic::theme::Container::custom(|theme| {
-            widget::container::Style {
-                background: Some(iced::Background::Color(design::accent_color(theme))),
-                border: iced::Border {
-                    radius: (SIZE / 2.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
 }
 
 /// A row's trailing status: a word or two, with the whole account of it in
@@ -1426,34 +1406,67 @@ impl Runtime {
         // The preview fades out where the pane runs short, as a step row's
         // summary does, on whatever the row is painted with; the agent keeps
         // its tab's words, cut as the tab cuts them.
-        let mut line: Vec<Element<'static, Message>> = vec![
-            lead,
-            design::body(row.verb)
+        let words = widget::row::with_children(vec![
+            design::transcript(row.verb)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            chat_title(label)
-                .size(design::TEXT_BODY)
+            design::transcript_name(label.clone())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            crate::ui_controls::fade_text(row.preview.clone())
+            crate::ui_controls::FadeText::transcript(row.preview.clone())
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
-        ];
+        ])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        // What must not be cut for the state's sake: the verb and the agent.
+        let kept = widget::row::with_children(vec![
+            design::transcript(row.verb)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            design::transcript_name(label)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ])
+        .spacing(step::GAP_S);
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
-        if row.state.live && matches!(row.state.tone, Tone::Plain) {
-            line.push(live_dot());
+        let live = row.state.live && matches!(row.state.tone, Tone::Plain);
+        let mut state = Vec::new();
+        if live {
+            state.push(disclosure::state_dot(design::accent_color));
         }
-        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        let status =
+            design::transcript(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
             Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
         };
-        line.push(status.into());
-        let content = widget::row::with_children(line)
+        state.push(status.into());
+        // Where the agent's name and its state no longer both fit, the state
+        // keeps only its mark: the dot of work under way, or one in the
+        // warning colour. A failure is told by the row's leading glyph, and
+        // a settled state by the absence of either. A warning's words stay
+        // in the row's tooltip, and every state's in its accessible name.
+        let compact = match row.state.tone {
+            Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
+            Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
+            Tone::Plain | Tone::Error => None,
+        };
+        let content = crate::ui_controls::yielding(
+            words,
+            kept,
+            widget::row::with_children(state)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            compact,
+            step::GAP_S,
+        );
+        let content = widget::row::with_children(vec![lead, content])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .width(Length::Fill);
