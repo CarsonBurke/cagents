@@ -401,6 +401,101 @@ fn observe(
     Ok(())
 }
 
+/// Delivers this window's presence, preferences and acknowledgements each
+/// time `wake` says some are pending, until the window goes.
+///
+/// One connection is kept between wakes. Presence is republished on every
+/// workspace change and focus move, so connecting and handshaking for each
+/// would put a round trip through the daemon's accept path behind every
+/// pane switch. The kept connection is used only while it is quiet: a daemon
+/// that exits tells it so and one that crashes closes it, so a quiet one
+/// never reaches a replaced daemon.
+fn deliver_control(
+    wake: &crossbeam_channel::Receiver<()>,
+    pending: &Mutex<Pending>,
+    sender: &async_channel::Sender<Action>,
+    mut connect: impl FnMut() -> Result<ControlClient, String>,
+) {
+    let mut kept: Option<ControlClient> = None;
+    'control: while wake.recv().is_ok() {
+        let mut last_error = None;
+        loop {
+            if sender.is_closed() {
+                break 'control;
+            }
+            let requests = std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
+            let reused = kept.take().filter(ControlClient::is_quiet);
+            let result = match reused {
+                Some(mut client) => match deliver(&mut client, &requests) {
+                    Ok(()) => Ok(client),
+                    // The daemon can go between the quiet check and the
+                    // request. Every command is idempotent, so a fresh
+                    // connection tells that apart from a refusal.
+                    Err(_) => deliver_connected(&mut connect, &requests),
+                },
+                None => deliver_connected(&mut connect, &requests),
+            };
+            match result {
+                Ok(client) => {
+                    kept = Some(client);
+                    break;
+                }
+                Err(error) => {
+                    // Retain the commands across a daemon restart, but let a
+                    // newer focus/settings update win.
+                    let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
+                    newer.presence = newer.presence.take().or(requests.presence);
+                    newer.preferences = newer.preferences.or(requests.preferences);
+                    newer.acknowledged.extend(requests.acknowledged);
+                    drop(newer);
+                    if let Some(error) = error
+                        && last_error.as_ref() != Some(&error)
+                    {
+                        last_error = Some(error.clone());
+                        let _ = sender.send_blocking(Action::Failed(error));
+                    }
+                    if let Err(crossbeam_channel::RecvTimeoutError::Disconnected) =
+                        wake.recv_timeout(crate::daemon_health::retry_delay())
+                    {
+                        break 'control;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`deliver`] over a new connection, which is returned to be kept.
+fn deliver_connected(
+    connect: &mut impl FnMut() -> Result<ControlClient, String>,
+    requests: &Pending,
+) -> Result<ControlClient, Option<String>> {
+    let mut client = connect().map_err(Some)?;
+    deliver(&mut client, requests)?;
+    Ok(client)
+}
+
+/// Sends `requests` over `client`. A refusal that settles on its own when
+/// sent again fails without a notice.
+fn deliver(client: &mut ControlClient, requests: &Pending) -> Result<(), Option<String>> {
+    if let Some(presence) = requests.presence.clone() {
+        client
+            .notification_presence(presence)
+            .map_err(|error| presence_refusal_notice(&error))?;
+    }
+    if requests.preferences.is_some() {
+        client
+            .notification_preferences(requests.preferences)
+            .map_err(|error| Some(error.to_string()))?;
+    }
+    for id in &requests.acknowledged {
+        client
+            .acknowledge_notification(*id)
+            .map_err(|error| Some(error.to_string()))?;
+    }
+    Ok(())
+}
+
 impl Cagents {
     pub(super) fn start_notifications(&mut self) {
         self.sync_notification_presence();
@@ -426,60 +521,7 @@ impl Cagents {
         let pending = self.notification_ui.pending.clone();
         let _ = thread::Builder::new()
             .name("cagents-notification-control".into())
-            .spawn(move || {
-                'control: while receiver.recv().is_ok() {
-                    let mut last_error = None;
-                    loop {
-                        if sender.is_closed() {
-                            break 'control;
-                        }
-                        let requests =
-                            std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
-                        let result = (|| {
-                            let mut client = connect().map_err(Some)?;
-                            if let Some(presence) = requests.presence.clone() {
-                                client
-                                    .notification_presence(presence)
-                                    .map_err(|error| presence_refusal_notice(&error))?;
-                            }
-                            if requests.preferences.is_some() {
-                                client
-                                    .notification_preferences(requests.preferences)
-                                    .map_err(|error| Some(error.to_string()))?;
-                            }
-                            for id in &requests.acknowledged {
-                                client
-                                    .acknowledge_notification(*id)
-                                    .map_err(|error| Some(error.to_string()))?;
-                            }
-                            Ok::<_, Option<String>>(())
-                        })();
-                        if let Err(error) = result {
-                            // Every command is idempotent. Retain it across a daemon
-                            // restart, but let a newer focus/settings update win.
-                            let mut newer = pending.lock().unwrap_or_else(|p| p.into_inner());
-                            newer.presence = newer.presence.take().or(requests.presence);
-                            newer.preferences = newer.preferences.or(requests.preferences);
-                            newer.acknowledged.extend(requests.acknowledged);
-                            drop(newer);
-                            if let Some(error) = error
-                                && last_error.as_ref() != Some(&error)
-                            {
-                                last_error = Some(error.clone());
-                                let _ = sender.send_blocking(Action::Failed(error));
-                            }
-                            match receiver.recv_timeout(crate::daemon_health::retry_delay()) {
-                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                    break 'control;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            });
+            .spawn(move || deliver_control(&receiver, &pending, &sender, connect));
         self.notification_ui
             .preferences(self.settings.notifications);
     }
@@ -1474,6 +1516,7 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 #[cfg(test)]
 mod tests {
     mod authority;
+    mod control_connection;
 
     use super::*;
     use crate::agent::Provider;
