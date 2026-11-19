@@ -269,6 +269,72 @@ fn a_resume_refused_after_the_record_answered_goes_back_on_offer() {
     );
 }
 
+/// Without the shared record's answer this window can't know whether
+/// another already sent the same message, so it sends nothing and keeps
+/// the row to try again.
+#[test]
+fn a_record_that_cannot_be_asked_resumes_nothing() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let _record = shared(&mut app);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some("unrecorded"));
+    let id = session_id(&app, card);
+    let update = job(
+        UpdatePhase::Complete,
+        vec![outcome(id, Fate::Interrupted, |work| work.turn = true)],
+    );
+    offer(&mut app, &update, &[]);
+    drop(app.update_update_resume(Action::Resume(id)));
+    let resume = taken_request(&mut app, id).unwrap();
+    drop(app.update_update_resume(Action::Taken(
+        update.id.clone(),
+        vec![resume],
+        Err("database is locked".into()),
+    )));
+    assert_eq!(sent(&app, card), None);
+    assert_eq!(held(&app, card), None);
+    assert_eq!(offered(&app), vec![id], "it stays on offer");
+    assert!(app.update_resume.taking.is_empty());
+    let notice = app.status.as_ref().map(|notice| notice.message.clone());
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|notice| notice.starts_with("Couldn't check whether another window")),
+        "{notice:?}"
+    );
+}
+
+/// A reader who writes to the conversation while the record is asked has
+/// carried it on themselves; the message about stopped work is not sent
+/// after theirs.
+#[test]
+fn writing_while_the_record_is_asked_cancels_the_resume() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let _record = shared(&mut app);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some("raced"));
+    let id = session_id(&app, card);
+    let update = job(
+        UpdatePhase::Complete,
+        vec![outcome(id, Fate::Interrupted, |work| work.turn = true)],
+    );
+    offer(&mut app, &update, &[]);
+    drop(app.update_update_resume(Action::Resume(id)));
+    let resume = taken_request(&mut app, id).unwrap();
+    write(&mut app, card, "Where were we?");
+    submit(&mut app, card);
+    drop(app.update_update_resume(Action::Taken(
+        update.id.clone(),
+        vec![resume],
+        Ok(Taken {
+            first: vec![id],
+            handled: vec![id],
+        }),
+    )));
+    assert_eq!(sent(&app, card).as_deref(), Some("Where were we?"));
+    assert_eq!(held(&app, card), None, "nothing else waits to go");
+    assert!(app.update_resume.taking.is_empty());
+    assert!(offered(&app).is_empty());
+}
+
 #[test]
 fn the_message_names_tasks_as_their_provider_did_and_counts_the_unnamed() {
     let mut work = InFlight {

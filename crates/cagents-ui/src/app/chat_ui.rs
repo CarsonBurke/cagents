@@ -1342,9 +1342,12 @@ pub(super) struct State {
     /// A message to resume a conversation's stopped work, held for a card
     /// reopening without a chat runtime until its conversation attaches.
     held_for_start: HashMap<CardId, String>,
-    /// Cards given such a message while reopening. Once attached, one whose
-    /// provider is still stopped takes its pane's way back to send it.
-    resuming_on_attach: HashSet<CardId>,
+    /// Cards given a message to resume stopped work that are on their way
+    /// to taking it, with how many more of their pane's ways back they may
+    /// still take for it. Once attached, one whose provider is still stopped
+    /// takes the way back to send it, as a reconnect that comes back as saved
+    /// history then starts a provider.
+    resuming_on_attach: HashMap<CardId, u8>,
     /// What the daemon last said about its update restore, for the panes
     /// that wait on it.
     update_recovery: update_recovery::Watch,
@@ -1387,7 +1390,7 @@ impl Default for State {
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
             held_for_start: HashMap::new(),
-            resuming_on_attach: HashSet::new(),
+            resuming_on_attach: HashMap::new(),
             update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
@@ -7335,6 +7338,12 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 /// going to the provider's default instead.
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
+/// How many of its pane's ways back a conversation may take, one after
+/// another, to send a message resuming stopped work: a reconnect that comes
+/// back as saved history, and then the provider that history starts.
+/// Bounded, so a way back that keeps failing is not taken without end.
+const RESUME_RECOVERIES: u8 = 2;
+
 /// What a chat's pull request labels were built from: the generations of
 /// the window's pull request and worktree indexes, the conversation, and
 /// whether the inspector held a current list of it.
@@ -11276,7 +11285,9 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) if starting => {
                 // What it attaches to says whether it takes the message.
                 runtime.hold_followup(text);
-                self.chat_ui.resuming_on_attach.insert(card);
+                self.chat_ui
+                    .resuming_on_attach
+                    .insert(card, RESUME_RECOVERIES);
                 self.persist();
                 Some(Task::none())
             }
@@ -11286,13 +11297,20 @@ impl Cagents {
                 let target = runtime.target;
                 self.persist();
                 Some(match readiness {
-                    stopped::Readiness::Recovers(press) => self.take_chat_recovery(target, press),
+                    stopped::Readiness::Recovers(press) => {
+                        self.chat_ui
+                            .resuming_on_attach
+                            .insert(card, RESUME_RECOVERIES - 1);
+                        self.take_chat_recovery(target, press)
+                    }
                     _ => self.dispatch_queued(target),
                 })
             }
             _ => {
                 self.chat_ui.held_for_start.insert(card, text);
-                self.chat_ui.resuming_on_attach.insert(card);
+                self.chat_ui
+                    .resuming_on_attach
+                    .insert(card, RESUME_RECOVERIES);
                 self.persist();
                 Some(if starting {
                     Task::none()
@@ -11305,7 +11323,10 @@ impl Cagents {
 
     /// Whether [`Self::resume_lost_work`] would take a message for `card`.
     pub(super) fn chat_takes_resume(&self, card: CardId) -> bool {
-        if self.chat_closed_elsewhere(card) {
+        // A pane still reopening a conversation is not saved until it starts
+        // (see `persistent_workspace`), so a message held there would not
+        // outlive the window closing first.
+        if self.chat_closed_elsewhere(card) || self.reopen_pending(card) {
             return false;
         }
         let starting = self.chat_start_pending(card);
@@ -11363,7 +11384,7 @@ impl Cagents {
         // nothing can bring one back yet (its history still loading, say),
         // it waits for the change that can, as the message does.
         if !self.chat_start_pending(target.card)
-            && self.chat_ui.resuming_on_attach.contains(&target.card)
+            && self.chat_ui.resuming_on_attach.contains_key(&target.card)
         {
             let fresh = self.chat_offers_fresh_conversation(target.card);
             let readiness = self
@@ -11373,7 +11394,13 @@ impl Cagents {
             match readiness {
                 Some(stopped::Readiness::Cannot) => {}
                 Some(stopped::Readiness::Recovers(press)) => {
-                    self.chat_ui.resuming_on_attach.remove(&target.card);
+                    if let Some(left) = self.chat_ui.resuming_on_attach.remove(&target.card)
+                        && left > 1
+                    {
+                        self.chat_ui
+                            .resuming_on_attach
+                            .insert(target.card, left - 1);
+                    }
                     return self.take_chat_recovery(target, press);
                 }
                 // Taken back, or it takes the message as it is.

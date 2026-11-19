@@ -10309,6 +10309,42 @@ fn a_resume_held_while_reopening_starts_a_provider_if_it_reopens_as_saved_histor
     assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
 }
 
+/// A reader that lost its connection reconnects first, as its pane offers.
+/// Reconnected to saved history, it then starts a provider to send the
+/// message.
+#[test]
+fn a_resume_on_a_disconnected_reader_reconnects_then_starts_a_provider() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().disconnected = true;
+    assert!(app.chat_takes_resume(card));
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    let attempt = app.chat_ui.attempt(card).expect("the reader reconnects");
+    assert_eq!(attempt.intent, chat::Intent::Restore);
+    let restoring = attempt.target;
+
+    answer_start(
+        &mut app,
+        restoring,
+        Ok(Arc::new(ClientHandle::fixture(
+            source.clone(),
+            saved_history_snapshot(&source),
+        ))),
+    );
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("reconnected to saved history, it starts a provider");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+    let started = attempt.target;
+
+    answer_start(&mut app, started, Ok(ready_provider(&source)));
+    assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
+    assert!(!app.chat_ui.resuming_on_attach.contains_key(&card));
+}
+
 /// A reader that attaches still loading its history can't start a provider
 /// yet. The message waits for the history, then starts one.
 #[test]

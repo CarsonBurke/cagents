@@ -201,6 +201,19 @@ fn elsewhere_notice(labels: &[String]) -> String {
     }
 }
 
+/// What the notice says of the conversations not resumed because whether
+/// another window had already resumed them could not be read.
+fn unchecked_notice(labels: &[String]) -> String {
+    let names = match labels {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => return String::new(),
+    };
+    format!(
+        "Couldn't check whether another window had already resumed {names}, so nothing was sent. Try again."
+    )
+}
+
 /// What the notice says of the conversations that could not take the
 /// message to resume.
 fn refused_notice(labels: &[String]) -> String {
@@ -333,8 +346,12 @@ impl Cagents {
         let Some(job) = self.update_resume.job.as_ref().map(|job| job.id.clone()) else {
             return Task::none();
         };
+        let ids = resumes.iter().map(|resume| resume.id).collect::<Vec<_>>();
+        // Off the offer at once; sent once the shared record answers, unless
+        // the reader writes to the conversation first.
+        self.update_resume.taking.extend(ids.iter().copied());
         if self.update_resume.store.is_none() {
-            let first = resumes.iter().map(|resume| resume.id).collect();
+            let first = ids;
             return self.update_resume_taken(
                 job,
                 resumes,
@@ -344,9 +361,6 @@ impl Cagents {
                 }),
             );
         }
-        let ids = resumes.iter().map(|resume| resume.id).collect::<Vec<_>>();
-        // Off the offer at once; sent once the shared record answers.
-        self.update_resume.taking.extend(ids.iter().copied());
         self.take_update_offer(ids, resumes)
     }
 
@@ -381,6 +395,12 @@ impl Cagents {
         result: Result<Taken, String>,
     ) -> Task<Message> {
         let state = &mut self.update_resume;
+        // One the reader wrote to while the record was asked is under way
+        // again, and no longer being taken.
+        let resumes: Vec<_> = resumes
+            .into_iter()
+            .filter(|resume| state.taking.contains(&resume.id))
+            .collect();
         state
             .taking
             .retain(|id| !resumes.iter().any(|resume| resume.id == *id));
@@ -396,10 +416,18 @@ impl Cagents {
                 }
                 taken.first
             }
-            // Unable to ask the other windows, it resumes them as asked.
+            // Unable to ask the other windows, it resumes none: another may
+            // have sent the same message. They stay on offer to try again.
             Err(error) => {
                 tracing::warn!(%error, "could not record the update resume offer");
-                resumes.iter().map(|resume| resume.id).collect()
+                if current {
+                    state.rebuild();
+                }
+                let labels: Vec<_> = resumes.into_iter().map(|resume| resume.label).collect();
+                if !labels.is_empty() {
+                    self.status = Some(TransientNotice::warning(unchecked_notice(&labels)));
+                }
+                return Task::none();
             }
         };
         if current {
@@ -471,6 +499,8 @@ impl Cagents {
         {
             return Task::none();
         }
+        // A resume still asking the record is not sent after their message.
+        self.update_resume.taking.retain(|taking| *taking != id);
         self.update_resume.handle(id);
         self.take_update_offer(vec![id], Vec::new())
     }

@@ -2391,6 +2391,21 @@ mod tests {
         assert_eq!(app.persistent_workspace().chat_drafts[&card], "Carry on");
     }
 
+    /// Until it is prepared, a reopening pane is not saved, so a message
+    /// held there would not outlive the window. It refuses the resume, which
+    /// stays on offer.
+    #[test]
+    fn a_pane_still_being_prepared_refuses_a_resume_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        drop(app.resume_saved_conversation(entry));
+        let (card, _) = reopening(&app);
+        assert!(app.reopen_preparing(card));
+        assert!(!app.chat_takes_resume(card));
+        assert!(app.resume_lost_work(card, "Carry on".into()).is_none());
+    }
+
     #[test]
     fn reopening_a_closed_chat_puts_its_pane_back_before_any_answer() {
         let directory = tempfile::tempdir().unwrap();
