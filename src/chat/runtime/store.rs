@@ -87,11 +87,11 @@ impl From<StoreError> for crate::chat::protocol::SetupError {
 const PART_BYTES: usize = crate::chat::TRANSCRIPT_PART_BYTES;
 const WINDOW_BYTES: usize = crate::chat::TRANSCRIPT_WINDOW_BYTES;
 const WINDOW_ITEMS: usize = 128;
-/// What a window charges for an item, at most: every byte of its fields, and
-/// the metadata and overhead of each of its rows, a part being one for each
-/// `PART_BYTES` (`?1`) of its text. An excerpt or an attachment a window
-/// leaves out costs less. Listed with the rows it takes.
-const CHARGE: &str = "len0 + len1 + len2 + MAX(1, (len0 + ?1 - 1) / ?1) * (length(metadata) + 128),
+/// What a window charges for an item, at most: every byte of its text, and
+/// the metadata, overhead and attachment of each of its rows, a part being
+/// one for each `PART_BYTES` (`?1`) of its text. An excerpt or an attachment
+/// a window leaves out costs less. Listed with the rows it takes.
+const CHARGE: &str = "len0 + len1 + MAX(1, (len0 + ?1 - 1) / ?1) * (length(metadata) + 128 + len2),
      MAX(1, (len0 + ?1 - 1) / ?1)";
 // Leave room between provider items for overlapping history pages to supply
 // missing records without renumbering the whole conversation on every page.
@@ -1300,8 +1300,9 @@ impl Store {
     }
     /// Present the window around the item at `index` of the cached
     /// conversation, for a reader who moved straight there. Up to a quarter
-    /// of a window's rows and bytes go before it, so the item is in the
-    /// window even when the items around it are large, with room both ways to
+    /// of a window's rows and bytes go before it, and never so many that its
+    /// own first row is left out, so the item is in the window even when it
+    /// or the items around it are large, with room both ways to
     /// read on before the next page. Where the latest window holds it, this is
     /// the latest window, which keeps following the conversation.
     pub fn seek(&mut self, index: u64) -> Result<bool, String> {
@@ -1322,20 +1323,33 @@ impl Store {
             self.latest();
             return Ok(true);
         }
-        let ordinal: Option<i64> = self
+        // The item, and what the window charges for its first row: its
+        // metadata, the first part of its text or its excerpts, and its
+        // attachment when the row has room for it.
+        let sought: Option<(i64, i64, i64, i64)> = self
             .db
             .query_row(
-                "SELECT ordinal FROM items ORDER BY ordinal LIMIT 1 OFFSET ?1",
-                [index as i64],
-                |row| row.get(0),
+                "SELECT ordinal, length(metadata), MIN(len0 + len1, ?2), len2
+                 FROM items ORDER BY ordinal LIMIT 1 OFFSET ?1",
+                params![index as i64, PART_BYTES as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        let Some(ordinal) = ordinal else {
+        let Some((ordinal, metadata, shown, attachment)) = sought else {
             return Ok(false);
         };
+        let row = [metadata, shown, 128]
+            .into_iter()
+            .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add);
+        let attachment = usize::try_from(attachment).unwrap_or(usize::MAX);
+        let row = match row.saturating_add(attachment) {
+            attached if attached <= WINDOW_BYTES => attached,
+            _ => row,
+        };
         // The items just before it, newest first, as many as fit a quarter
-        // of the window.
+        // of the window and leave room for it.
         let before = self.fitting(
             &format!(
                 "SELECT {CHARGE}, ordinal FROM items WHERE ordinal < ?3
@@ -1343,7 +1357,7 @@ impl Store {
             ),
             params![PART_BYTES as i64, WINDOW_ITEMS as i64 / 4, ordinal],
             WINDOW_ITEMS / 4,
-            WINDOW_BYTES / 4,
+            (WINDOW_BYTES / 4).min(WINDOW_BYTES.saturating_sub(row)),
         )?;
         self.forward = Some((before.1.unwrap_or(ordinal), 0));
         self.end = None;
@@ -2775,20 +2789,12 @@ mod tests {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         for n in 0..200 {
             let id = format!("row-{n:03}");
-            let item = if [100, 105, 110].contains(&n) {
-                Item {
-                    id,
-                    role: Role::Assistant,
-                    at: None,
-                    started_at: None,
-                    content: ItemContent::Image {
-                        path: "x".repeat(1_200_000 + n * 1_000),
-                        description: "image".into(),
-                        reference: None,
-                    },
-                }
-            } else {
-                history_item(&id, "message")
+            let item = match n {
+                100 | 105 | 110 => image(&id, 5, 1_200_000 + n * 1_000),
+                // Newest images the latest window cannot reach past, so the
+                // seek places the window itself.
+                190 | 195 => image(&id, 5, 1_600_000),
+                _ => history_item(&id, "message"),
             };
             store.apply(Event::Item(item)).unwrap();
         }
@@ -2800,6 +2806,73 @@ mod tests {
             window.items.iter().map(|item| &item.id).collect::<Vec<_>>()
         );
         assert_eq!(window.items[0].id, "row-111", "the images stay before it");
+    }
+
+    fn image(id: &str, description: usize, data: usize) -> Item {
+        Item {
+            id: id.into(),
+            role: Role::Assistant,
+            at: None,
+            started_at: None,
+            content: ItemContent::Image {
+                path: "x".repeat(data),
+                description: "d".repeat(description),
+                reference: None,
+            },
+        }
+    }
+
+    /// The items before a sought one leave room for it: one nearly as large
+    /// as a window is in the window, after as many of them as fit beside it.
+    #[test]
+    fn a_seek_leaves_room_for_a_large_sought_item() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let body = "x".repeat(24 * 1024);
+        for n in 0..60 {
+            let id = format!("row-{n:03}");
+            let item = match n {
+                50 => image(&id, 16, 2_400_000),
+                // Newest images the latest window cannot reach past, so the
+                // seek places the window itself.
+                58 | 59 => image(&id, 16, 1_600_000),
+                _ => history_item(&id, &body),
+            };
+            store.apply(Event::Item(item)).unwrap();
+        }
+        store.seek(50).unwrap();
+        let window = store.window().unwrap();
+        let ids: Vec<_> = window.items.iter().map(|item| item.id.as_str()).collect();
+        let at = ids.iter().position(|id| *id == "row-050");
+        let at = at.unwrap_or_else(|| panic!("{ids:?}"));
+        assert!(at > 0, "the items that fit beside it go before it: {ids:?}");
+        let ItemContent::Image { path, .. } = &window.items[at].content else {
+            panic!("{:?}", window.items[at]);
+        };
+        assert_eq!(path.len(), 2_400_000, "its image is shown whole");
+    }
+
+    /// An image whose description is paged repeats its attachment in each of
+    /// its rows, and a seek counts it in each: counted once, the image before
+    /// the sought one would fit the quarter of the window that goes before it.
+    #[test]
+    fn a_seek_counts_a_paged_images_attachment_in_each_of_its_rows() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        for n in 0..60 {
+            let id = format!("row-{n:03}");
+            let item = match n {
+                49 => image(&id, 4 * PART_BYTES, 200_000),
+                50 => image(&id, 16, 1_750_000),
+                // Newest images the latest window cannot reach past, so the
+                // seek places the window itself.
+                58 | 59 => image(&id, 16, 1_600_000),
+                _ => history_item(&id, "message"),
+            };
+            store.apply(Event::Item(item)).unwrap();
+        }
+        store.seek(50).unwrap();
+        let window = store.window().unwrap();
+        let ids: Vec<_> = window.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&"row-050"), "{ids:?}");
     }
 
     /// Near the end, a seek is answered by the latest window only when that
