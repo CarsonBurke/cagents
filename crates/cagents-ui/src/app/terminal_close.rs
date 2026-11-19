@@ -693,10 +693,9 @@ impl Cagents {
                 self.card_removal(handoff)
             }
             Err(error) => {
-                let kept = self.pane_kept_notice(card);
                 self.abandon_removal(card);
                 tracing::warn!(%error, "pane removal was refused");
-                self.status = Some(TransientNotice::error(kept));
+                self.status = Some(TransientNotice::error(super::shared_views::PANE_KEPT));
                 // Nothing will settle this close, so the queue moves on now. It
                 // waits by itself for a removal still on its way.
                 self.next_queued_card_close()
@@ -779,6 +778,10 @@ impl Cagents {
                 self.recently_closed.remove(0);
             }
         }
+        // Its daemon's answer was only for this close. A pane the registry
+        // keeps after all comes back as one that hasn't been closed, so
+        // Close works on it again and it shows its ended shell (#3266).
+        self.closed_terminal_cards.remove(&id);
         self.retire_lsp_card(id);
         self.sidebar_state.forget_card_attention(id);
         // A closed chat's conversation can be reopened; what it had not sent
