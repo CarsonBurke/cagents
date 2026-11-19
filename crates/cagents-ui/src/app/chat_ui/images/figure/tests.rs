@@ -181,7 +181,7 @@ fn an_unreadable_image_is_retried_after_permissions_change_without_a_content_cha
     let path = directory.path().join("mockup.png");
     std::fs::write(&path, png(3, 2)).unwrap();
     let before = std::fs::metadata(&path).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
     // An elevated test process can read a mode-000 file; that environment
     // cannot exercise permission recovery.
     if std::fs::read(&path).is_ok() {

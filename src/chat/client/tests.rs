@@ -1765,14 +1765,14 @@ fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
                 let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                 let response = match (step, request.request) {
                     (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
-                        sessions: if state < 3 || state >= 5 {
+                        sessions: if !(3..5).contains(&state) {
                             vec![expected.clone()]
                         } else {
                             vec![]
                         },
                     },
                     (1, ClientRequest::ChatPrepareResume { source })
-                        if (state < 3 || state >= 5) && source == expected =>
+                        if !(3..5).contains(&state) && source == expected =>
                     {
                         ServerResponse::ChatResumePrepared {
                             session: expected.clone(),

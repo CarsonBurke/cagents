@@ -130,7 +130,7 @@ fn every_user_message_is_anchored_on_the_right_at_any_length_and_fold() {
     for (name, text, unfolded) in cases {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[prompt(text)]);
         if unfolded == Some(true) {
-            runtime.expanded.insert("prompt".into());
+            runtime.expanded.edit().insert("prompt".into());
         }
         for width in WIDTHS {
             let Drawn { text, disclosure } = draw(&runtime, width);

@@ -1,4 +1,5 @@
 //! Local transcript matching and temporary search disclosure ownership.
+use super::revised::Revised;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
@@ -217,6 +218,10 @@ pub(super) fn contains(text: &str, query: &str) -> bool {
 
 /// Save only choices changed by search. A manual toggle relinquishes search
 /// ownership before editing the visible choice, so closing search preserves it.
+///
+/// Item and group choices are [`Revised`], and each is edited only when its
+/// content actually changes, so a search that reveals or restores nothing
+/// leaves their stamps, and whatever is derived from them, as they were.
 #[derive(Default)]
 pub(super) struct Disclosure {
     items: HashSet<String>,
@@ -225,25 +230,25 @@ pub(super) struct Disclosure {
     turns: HashMap<String, Option<bool>>,
 }
 impl Disclosure {
-    pub(super) fn item(&mut self, id: &str, expanded: &mut HashSet<String>) -> bool {
-        if expanded.insert(id.to_owned()) {
-            self.items.insert(id.to_owned());
-            true
-        } else {
-            false
+    pub(super) fn item(&mut self, id: &str, expanded: &mut Revised<HashSet<String>>) -> bool {
+        if expanded.contains(id) {
+            return false;
         }
+        expanded.edit().insert(id.to_owned());
+        self.items.insert(id.to_owned());
+        true
     }
     pub(super) fn part(&mut self, key: &str, unfolded: &mut HashSet<String>) {
         if unfolded.insert(key.to_owned()) {
             self.parts.insert(key.to_owned());
         }
     }
-    pub(super) fn turn(&mut self, key: &str, opened: &mut HashMap<String, bool>) {
+    pub(super) fn turn(&mut self, key: &str, opened: &mut Revised<HashMap<String, bool>>) {
         if opened.get(key) != Some(&true) {
             self.turns
                 .entry(key.to_owned())
                 .or_insert_with(|| opened.get(key).copied());
-            opened.insert(key.to_owned(), true);
+            opened.edit().insert(key.to_owned(), true);
         }
     }
     /// Read the reader's choice beneath any temporary search disclosure.
@@ -259,12 +264,12 @@ impl Disclosure {
         &mut self,
         key: &str,
         choice: bool,
-        opened: &mut HashMap<String, bool>,
+        opened: &mut Revised<HashMap<String, bool>>,
     ) {
         if let Some(previous) = self.turns.get_mut(key) {
             *previous = Some(choice);
-        } else {
-            opened.insert(key.to_owned(), choice);
+        } else if opened.get(key) != Some(&choice) {
+            opened.edit().insert(key.to_owned(), choice);
         }
     }
     pub(super) fn manual_item(&mut self, id: &str) {
@@ -295,22 +300,26 @@ impl Disclosure {
     }
     pub(super) fn restore(
         &mut self,
-        expanded: &mut HashSet<String>,
+        expanded: &mut Revised<HashSet<String>>,
         unfolded: &mut HashSet<String>,
-        opened: &mut HashMap<String, bool>,
+        opened: &mut Revised<HashMap<String, bool>>,
     ) {
         for id in self.items.drain() {
-            expanded.remove(&id);
+            if expanded.contains(&id) {
+                expanded.edit().remove(&id);
+            }
         }
         for key in self.parts.drain() {
             unfolded.remove(&key);
         }
         for (key, previous) in self.turns.drain() {
-            if let Some(previous) = previous {
-                opened.insert(key, previous);
-            } else {
-                opened.remove(&key);
+            if opened.get(&key) == previous.as_ref() {
+                continue;
             }
+            match previous {
+                Some(previous) => opened.edit().insert(key, previous),
+                None => opened.edit().remove(&key),
+            };
         }
     }
 }
@@ -321,17 +330,17 @@ mod tests {
     #[test]
     fn pruning_choices_retires_search_owners_without_undoing_live_manual_choices() {
         let mut disclosure = Disclosure::default();
-        let mut expanded = HashSet::from(["manual".to_owned()]);
+        let mut expanded = Revised::new(HashSet::from(["manual".to_owned()]));
         let mut unfolded = HashSet::new();
-        let mut opened = HashMap::from([("live-turn".to_owned(), false)]);
+        let mut opened = Revised::new(HashMap::from([("live-turn".to_owned(), false)]));
         for item in ["retired", "live"] {
             disclosure.item(item, &mut expanded);
             disclosure.part(&format!("{item}#body"), &mut unfolded);
             disclosure.turn(&format!("{item}-turn"), &mut opened);
         }
-        expanded.remove("retired");
+        expanded.edit().remove("retired");
         unfolded.remove("retired#body");
-        opened.remove("retired-turn");
+        opened.edit().remove("retired-turn");
         disclosure.retain(&expanded, &unfolded, &opened);
         assert_eq!(disclosure.owned_count(), 3);
         disclosure.restore(&mut expanded, &mut unfolded, &mut opened);
@@ -448,8 +457,8 @@ mod tests {
 
     #[test]
     fn search_restores_only_its_disclosures_and_preserves_manual_changes() {
-        let mut expanded = HashSet::from(["manual".to_owned()]);
-        let mut opened = HashMap::from([("closed".to_owned(), false)]);
+        let mut expanded = Revised::new(HashSet::from(["manual".to_owned()]));
+        let mut opened = Revised::new(HashMap::from([("closed".to_owned(), false)]));
         let mut unfolded = HashSet::from(["card#manual".to_owned()]);
         let mut search = Disclosure::default();
         search.part("card#manual", &mut unfolded);
@@ -477,9 +486,45 @@ mod tests {
         );
         assert!(search.item("automatic", &mut expanded));
         search.manual_item("automatic");
-        expanded.remove("automatic");
+        expanded.edit().remove("automatic");
         search.restore(&mut expanded, &mut unfolded, &mut opened);
         assert!(!expanded.contains("automatic"));
+    }
+
+    #[test]
+    fn disclosure_stamps_move_only_when_search_changes_a_choice() {
+        let mut expanded = Revised::new(HashSet::from(["open".to_owned()]));
+        let mut opened = Revised::new(HashMap::from([("open".to_owned(), true)]));
+        let mut unfolded = HashSet::new();
+        let mut search = Disclosure::default();
+        let stamps = |expanded: &Revised<HashSet<String>>,
+                      opened: &Revised<HashMap<String, bool>>| {
+            (expanded.stamp(), opened.stamp())
+        };
+        let before = stamps(&expanded, &opened);
+        search.restore(&mut expanded, &mut unfolded, &mut opened);
+        assert_eq!(
+            stamps(&expanded, &opened),
+            before,
+            "nothing owned, nothing restored"
+        );
+        assert!(!search.item("open", &mut expanded));
+        search.turn("open", &mut opened);
+        search.inherit_turn("open", true, &mut opened);
+        assert_eq!(stamps(&expanded, &opened), before, "already open");
+        assert!(search.item("closed", &mut expanded));
+        search.turn("closed", &mut opened);
+        let revealed = stamps(&expanded, &opened);
+        assert!(revealed.0 != before.0 && revealed.1 != before.1);
+        search.restore(&mut expanded, &mut unfolded, &mut opened);
+        let restored = stamps(&expanded, &opened);
+        assert!(restored.0 != revealed.0 && restored.1 != revealed.1);
+        search.restore(&mut expanded, &mut unfolded, &mut opened);
+        assert_eq!(
+            stamps(&expanded, &opened),
+            restored,
+            "a second restore owns nothing"
+        );
     }
 }
 

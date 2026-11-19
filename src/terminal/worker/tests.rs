@@ -2559,8 +2559,10 @@ fn parser_metadata_storm_is_collapsed_before_semantic_delivery() {
 #[test]
 fn bells_publish_promptly_then_keep_one_pending_reminder() {
     let now = std::time::Instant::now();
-    let mut bell = Bell::default();
-    bell.pending = true;
+    let mut bell = Bell {
+        pending: true,
+        ..Bell::default()
+    };
     assert!(bell.take_ready(now));
     for _ in 0..10_000 {
         bell.pending = true;

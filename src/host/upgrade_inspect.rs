@@ -237,51 +237,50 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         let mut cold_history = Vec::new();
         for (_, kind) in &saved {
             check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
-            if let CardKind::Chat(source) = kind {
-                if !source.is_unstarted()
-                    && (source.proof.as_ref() != request.proof.as_ref()
-                        || !initial_inventory.iter().any(|live| live.id == source.id))
-                    && !resolutions.iter().any(|(issued, _)| issued == source)
-                    && !request.proof.as_ref().is_some_and(|proof| {
-                        relisted_codex_conversation(
-                            source,
-                            &initial_inventory,
-                            proof,
-                            request.require_resumable,
-                        )
-                    })
+            if let CardKind::Chat(source) = kind
+                && !source.is_unstarted()
+                && (source.proof.as_ref() != request.proof.as_ref()
+                    || !initial_inventory.iter().any(|live| live.id == source.id))
+                && !resolutions.iter().any(|(issued, _)| issued == source)
+                && !request.proof.as_ref().is_some_and(|proof| {
+                    relisted_codex_conversation(
+                        source,
+                        &initial_inventory,
+                        proof,
+                        request.require_resumable,
+                    )
+                })
+            {
+                let missing = !initial_inventory.iter().any(|live| live.id == source.id);
+                if missing
+                    && matches!(
+                        evidence.classify(source),
+                        SavedExecution::Ended | SavedExecution::Unrecorded
+                    )
                 {
-                    let missing = !initial_inventory.iter().any(|live| live.id == source.id);
-                    if missing
-                        && matches!(
-                            evidence.classify(source),
-                            SavedExecution::Ended | SavedExecution::Unrecorded
-                        )
-                    {
-                        continue;
-                    }
-                    let result = if missing && request.reconcile_retained {
-                        reader.resolve(source)
-                    } else if missing {
-                        Err("Saved owner changed after preview".into())
-                    } else {
-                        reader.resolve(source)
-                    };
-                    if missing
-                        && source.is_saved_claude_history()
-                        && !result
-                            .as_ref()
-                            .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
-                    {
-                        match reader.inspect_saved_history(source) {
-                            Ok(()) => cold_history.push(source.clone()),
-                            Err(reason) => {
-                                tracing::warn!(chat = %source.id, %reason, "saved history inspection failed");
-                            }
+                    continue;
+                }
+                let result = if missing && request.reconcile_retained {
+                    reader.resolve(source)
+                } else if missing {
+                    Err("Saved owner changed after preview".into())
+                } else {
+                    reader.resolve(source)
+                };
+                if missing
+                    && source.is_saved_claude_history()
+                    && !result
+                        .as_ref()
+                        .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
+                {
+                    match reader.inspect_saved_history(source) {
+                        Ok(()) => cold_history.push(source.clone()),
+                        Err(reason) => {
+                            tracing::warn!(chat = %source.id, %reason, "saved history inspection failed");
                         }
                     }
-                    resolutions.push((source.clone(), result));
                 }
+                resolutions.push((source.clone(), result));
             }
         }
         let inventory = reader.list().map_err(InspectionFailure::Unchecked)?;
@@ -722,15 +721,13 @@ impl ExecutionEvidence {
                     return Some(pid);
                 }
             }
-            if source.launch.provider == crate::agent::Provider::Codex {
-                if let Ok(Threads::Arguments(arguments)) = process_arguments(&entry.path()) {
-                    if arguments
-                        .windows(marker.len())
-                        .any(|window| window == marker.as_bytes())
-                    {
-                        return Some(pid);
-                    }
-                }
+            if source.launch.provider == crate::agent::Provider::Codex
+                && let Ok(Threads::Arguments(arguments)) = process_arguments(&entry.path())
+                && arguments
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+            {
+                return Some(pid);
             }
         }
         None
@@ -1374,9 +1371,7 @@ fn serves_listener(socket: &Path, argv: &[u8]) -> bool {
     let mut joined = b"--listen=".to_vec();
     joined.extend_from_slice(&endpoint);
     let arguments: Vec<&[u8]> = argv.split(|byte| *byte == 0).collect();
-    arguments
-        .iter()
-        .any(|argument| *argument == joined.as_slice())
+    arguments.contains(&joined.as_slice())
         || arguments
             .windows(2)
             .any(|pair| pair[0] == b"--listen" && pair[1] == endpoint.as_slice())
@@ -1390,12 +1385,13 @@ fn settled_arguments(path: &Path, settle: Duration) -> Result<Option<Vec<u8>>, S
     settled_process_arguments(
         || {
             let observation = process_arguments(path)?;
-            if matches!(observation, Threads::Unsettled) && Instant::now() >= deadline {
-                if process_executable(path)?.is_none() {
-                    // Recheck every thread after exe: publication between
-                    // the reads must not look like a kernel thread.
-                    return process_arguments_after_settle(path);
-                }
+            if matches!(observation, Threads::Unsettled)
+                && Instant::now() >= deadline
+                && process_executable(path)?.is_none()
+            {
+                // Recheck every thread after exe: publication between
+                // the reads must not look like a kernel thread.
+                return process_arguments_after_settle(path);
             }
             Ok(observation)
         },
@@ -2069,7 +2065,7 @@ mod tests {
         );
         record_live_panes(
             &mut inspection,
-            &[source.clone()],
+            std::slice::from_ref(&source),
             &[terminal],
             &proof,
             false,
@@ -3172,8 +3168,11 @@ mod tests {
             matches!(table.codex_execution(&stale), CodexExecution::Unproved { reason } if reason == CODEX_PROCESS_STARTING)
         );
         // Permission-denied process entries must not poison the entire census.
-        std::fs::set_permissions(&process, std::os::unix::fs::PermissionsExt::from_mode(0))
-            .unwrap();
+        std::fs::set_permissions(
+            &process,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
         if crate::daemon::current_uid() != 0 {
             assert_eq!(table.codex_execution(&card), CodexExecution::Ended);
         }
@@ -4250,15 +4249,14 @@ fn retain_floor_entry() -> Option<Result<(), String>> {
                 crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
             {
                 for pane in panes {
-                    if let CardKind::Chat(saved) = pane.kind {
-                        if record
+                    if let CardKind::Chat(saved) = pane.kind
+                        && record
                             .chats
                             .iter()
                             .any(|source| crate::upgrade::floor::same_allocation(source, &saved))
-                            && !record.aliases.contains(&saved)
-                        {
-                            record.aliases.push(saved);
-                        }
+                        && !record.aliases.contains(&saved)
+                    {
+                        record.aliases.push(saved);
                     }
                 }
             }

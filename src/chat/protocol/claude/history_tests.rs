@@ -78,8 +78,7 @@ fn initialize_refuses_history_whose_session_changed_after_open() {
     fixture.replace_session();
     let error = adapter
         .initialize()
-        .err()
-        .expect("foreign history must not initialize");
+        .expect_err("foreign history must not initialize");
     assert!(error.contains("session identity"), "{error}");
 }
 
@@ -94,8 +93,7 @@ fn earlier_history_refuses_changed_session_and_can_retry_the_original_source() {
     fixture.replace_session();
     let error = adapter
         .command(Command::LoadEarlier)
-        .err()
-        .expect("foreign older page must be refused");
+        .expect_err("foreign older page must be refused");
     assert!(error.contains("session identity"), "{error}");
     std::fs::write(&fixture.path, &fixture.bytes).unwrap();
     let earlier = adapter.command(Command::LoadEarlier).unwrap();
@@ -132,8 +130,7 @@ fn initialize_refuses_a_changed_off_page_tool_dependency() {
     std::fs::write(&fixture.path, replacement).unwrap();
     let error = adapter
         .initialize()
-        .err()
-        .expect("foreign off-page tool dependency must be refused");
+        .expect_err("foreign off-page tool dependency must be refused");
     assert!(error.contains("session identity"), "{error}");
 }
 

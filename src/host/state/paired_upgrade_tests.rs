@@ -469,6 +469,9 @@ fn run_pair(mode: &str) {
     fs::create_dir(&proc_root).unwrap();
     for generation in 1..=2 {
         let replacement = host(&format!("replacement-{generation}"));
+        replacement.lock().unwrap().install_model(
+            crate::host::model::Registry::at(&cwd.join("replacement-model.sqlite3")).unwrap(),
+        );
         restore_upgrade_from(
             &replacement,
             Store::open(&store_path).unwrap(),
@@ -550,8 +553,36 @@ fn run_pair(mode: &str) {
             assert!(current_actor.is_completed());
             source = resolved;
         } else {
-            super::super::chat::close_for_terminal(&replacement, id).unwrap();
-            current_terminal.shutdown().unwrap();
+            super::super::client::process_request(
+                &replacement,
+                1,
+                ClientRequest::Attach {
+                    terminal_id: id,
+                    after_generation: 0,
+                    after_event_sequence: 0,
+                },
+            )
+            .unwrap();
+            super::super::client::process_request(
+                &replacement,
+                1,
+                ClientRequest::ShutdownTerminal { terminal_id: id },
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if current_terminal.is_completed()
+                    && current_actor.is_completed()
+                    && !replacement.lock().unwrap().terminals.contains_key(&id)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "paired terminal close did not retire both workers and the terminal record"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
     let methods = peer.finish();

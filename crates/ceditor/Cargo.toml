@@ -6,6 +6,9 @@ rust-version = "1.93"
 license = "MIT"
 publish = false
 
+[lints]
+workspace = true
+
 [features]
 default = []
 development = ["cagents/development", "cagents-ui/development"]

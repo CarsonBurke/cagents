@@ -641,6 +641,78 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_replayed_pane_edit_returns_its_result_after_a_first_send_claims_the_pane() {
+        let fixture = Fixture::new();
+        let b = fixture.candidate();
+        let model = fixture.model();
+        let before = model.views[0].panes[0].clone();
+        let mut pane = before.clone();
+        pane.kind = CardKind::Chat(b.clone());
+        let edit = ModelEdit::ChangeView {
+            scope: fixture.scope.clone(),
+            expected_revision: model.views[0].revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Update { before, pane },
+        };
+        crate::host::workspace::edit_delta(&fixture.host, 2, edit.clone()).unwrap();
+
+        let c = fixture.candidate();
+        let request = PaneChatStart {
+            source: b,
+            ..fixture.request.clone()
+        };
+        let _admission = capacity::Reservation::new(&fixture.host, &c).unwrap();
+        let _claim = Reservation::new(&fixture.host, &request, &c).unwrap();
+        let model = fixture.model();
+        assert_eq!(model.views[0].panes[0].kind, CardKind::Chat(c.clone()));
+
+        let receipt = crate::host::workspace::edit_delta(&fixture.host, 2, edit).unwrap();
+        assert_eq!(receipt.sequence, model.sequence);
+        assert!(receipt.effects.is_empty(), "{receipt:?}");
+        assert_eq!(fixture.model().views[0].panes[0].kind, CardKind::Chat(c));
+    }
+
+    #[test]
+    fn a_new_operation_with_the_same_change_is_still_refused_while_claimed() {
+        let fixture = Fixture::new();
+        let b = fixture.candidate();
+        let model = fixture.model();
+        let before = model.views[0].panes[0].clone();
+        let mut pane = before.clone();
+        pane.kind = CardKind::Chat(b.clone());
+        let mut edit = ModelEdit::ChangeView {
+            scope: fixture.scope.clone(),
+            expected_revision: model.views[0].revision,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Update { before, pane },
+        };
+        crate::host::workspace::edit_delta(&fixture.host, 2, edit.clone()).unwrap();
+
+        let c = fixture.candidate();
+        let request = PaneChatStart {
+            source: b,
+            ..fixture.request.clone()
+        };
+        let _admission = capacity::Reservation::new(&fixture.host, &c).unwrap();
+        let _claim = Reservation::new(&fixture.host, &request, &c).unwrap();
+        assert_eq!(
+            fixture.model().views[0].panes[0].kind,
+            CardKind::Chat(c.clone())
+        );
+
+        let ModelEdit::ChangeView { operation, .. } = &mut edit else {
+            unreachable!()
+        };
+        *operation = uuid::Uuid::new_v4();
+        let failure = crate::host::workspace::edit_delta(&fixture.host, 2, edit).unwrap_err();
+        assert!(
+            failure.message.contains("starting or running"),
+            "{failure:?}"
+        );
+        assert_eq!(fixture.model().views[0].panes[0].kind, CardKind::Chat(c));
+    }
+
+    #[test]
     fn shared_edits_preserve_a_claimed_launch_and_allow_presentation_changes() {
         let fixture = Fixture::new();
         let first = fixture.candidate();

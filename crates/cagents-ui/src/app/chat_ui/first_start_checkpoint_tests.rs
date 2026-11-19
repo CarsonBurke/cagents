@@ -1588,7 +1588,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             retired.sequence += 1;
             retired.views[0].retired.push(card);
             drop(app.apply_workspace_model_update(ModelUpdate::Read(retired)));
-            assert!(app.cards.get(&card).is_none());
+            assert!(!app.cards.contains_key(&card));
             assert!(!app.card_state(card).unwrap().existence.is_open());
         }
     }

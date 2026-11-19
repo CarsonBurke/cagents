@@ -264,7 +264,7 @@ impl State {
             let source = aligned_sources.and_then(|sources| sources[index].as_ref());
             let key = source.and_then(Key::of);
             let run = run_at(&raw.items, index, aligned_sources);
-            let hydrated = run.as_ref().and_then(|run| {
+            let hydrated = run.as_ref().map(|run| {
                 let complete =
                     source.is_none_or(|source| run.start == 0 && source.bytes as usize <= run.end);
                 let readable =
@@ -293,7 +293,7 @@ impl State {
                     .as_ref()
                     .and_then(|key| self.failures.get(key))
                     .is_some_and(|failed| *failed >= ATTEMPTS);
-                Some((hydrated, readable && !exhausted))
+                (hydrated, readable && !exhausted)
             });
             let mut unjoined = index + 1;
             // Joining never makes a message larger than preparation accepts,
@@ -952,8 +952,10 @@ mod tests {
         other.token += 1;
         let mut sources: Vec<_> = cut.iter().map(|_| Some(source(message.len()))).collect();
         *sources.last_mut().unwrap() = Some(other);
-        let mut raw = Snapshot::default();
-        raw.items = cut.clone();
+        let mut raw = Snapshot {
+            items: cut.clone(),
+            ..Snapshot::default()
+        };
         raw.text_copy_sources.conversation = sources;
         let projected = State::default().project(Arc::new(raw));
         assert_eq!(
@@ -974,8 +976,10 @@ mod tests {
     #[test]
     fn joining_without_aligned_sources_leaves_copy_to_what_is_shown() {
         let message = message();
-        let mut raw = Snapshot::default();
-        raw.items = parts("answer", &message, 0..usize::MAX);
+        let mut raw = Snapshot {
+            items: parts("answer", &message, 0..usize::MAX),
+            ..Snapshot::default()
+        };
         raw.text_copy_sources.conversation = vec![Some(source(message.len()))];
         let projected = State::default().project(Arc::new(raw));
         assert_eq!(body(&projected.items[0]), message);

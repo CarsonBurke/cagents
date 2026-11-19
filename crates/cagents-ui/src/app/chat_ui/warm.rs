@@ -217,9 +217,9 @@ mod tests {
         let (mut runtime, _handle) = shown(items());
         runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
         runtime.scroll = view::Scroll::new(200.0, 1000.0, 400.0);
-        runtime.expanded.insert("answer-2".into());
+        runtime.expanded.edit().insert("answer-2".into());
         let turn = runtime.turns[0].key.clone();
-        runtime.opened.insert(turn.clone(), false);
+        runtime.opened.edit().insert(turn.clone(), false);
         runtime.unseen_activity = false;
         let scroll = runtime.scroll;
         let turns: Vec<_> = runtime.turns.iter().map(|turn| turn.key.clone()).collect();

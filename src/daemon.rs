@@ -1845,16 +1845,13 @@ mod tests {
             "executable",
             "owner",
             "terminate",
+            #[cfg(feature = "host")]
             "acquire",
+            #[cfg(feature = "host")]
             "maintenance",
+            #[cfg(feature = "ui")]
             "recovery",
-        ]
-        .into_iter()
-        .filter(|case| match *case {
-            "acquire" | "maintenance" => cfg!(feature = "host"),
-            "recovery" => cfg!(feature = "ui"),
-            _ => true,
-        }) {
+        ] {
             let mut child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
                 .env(CASE, case)

@@ -80,7 +80,7 @@ fn publish(runtime: &mut Runtime, handle: &ClientHandle, edit: impl FnOnce(&mut 
 
 fn notice_before_prompt(runtime: &mut Runtime, key: &str, prompt: &str) {
     preparation::drain_fixture(runtime);
-    runtime.failure_ui.expanded.insert(key.into());
+    runtime.failure_ui.expanded.edit().insert(key.into());
     runtime.cache_failure_preview(key);
     let (catalog, _) = runtime.selection_document();
     let notice = catalog
@@ -169,7 +169,11 @@ fn the_same_error_after_later_work_retains_both_attempts_in_order() {
         let second_key = runtime.failure_ui.incidents[1].key.clone();
         assert_ne!(first_key, second_key);
         notice_before_prompt(&mut runtime, &first_key, &next);
-        runtime.failure_ui.expanded.insert(second_key.clone());
+        runtime
+            .failure_ui
+            .expanded
+            .edit()
+            .insert(second_key.clone());
         runtime.cache_failure_preview(&second_key);
         let (catalog, _) = runtime.selection_document();
         assert!(

@@ -554,13 +554,12 @@ fn tokens(sql: &str) -> Result<Vec<String>, String> {
     } else {
         None
     };
-    if let Some(p) = position {
-        if out
+    if let Some(p) = position
+        && out
             .get(p..p + 3)
             .is_some_and(|v| v == ["if", "not", "exists"])
-        {
-            out.drain(p..p + 3);
-        }
+    {
+        out.drain(p..p + 3);
     }
     while out.last().is_some_and(|v| v == ";") {
         out.pop();
@@ -2253,8 +2252,7 @@ mod tests {
             "1" => {
                 let error = db
                     .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .err()
-                    .expect("the original writer must remain excluded");
+                    .expect_err("the original writer must remain excluded");
                 assert!(
                     matches!(error,rusqlite::Error::SqliteFailure(ref code,_) if matches!(code.code,rusqlite::ErrorCode::DatabaseBusy|rusqlite::ErrorCode::DatabaseLocked)),
                     "{error}"

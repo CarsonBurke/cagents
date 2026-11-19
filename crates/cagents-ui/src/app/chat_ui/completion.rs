@@ -340,7 +340,7 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
         // reader typing OMP's `/skill:re` still gets `/skill:review`.
         let spelled = bare(&skill.invocation)
             .filter(|bare| *bare != skill.name)
-            .and_then(|bare| rank(bare));
+            .and_then(&rank);
         if let Some(rank) = rank(&skill.name).into_iter().chain(spelled).min() {
             let linked = skill.invocation.starts_with("[$");
             let unique = snapshot

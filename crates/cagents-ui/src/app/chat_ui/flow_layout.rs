@@ -2539,8 +2539,7 @@ fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_rel
         .configure(400.0, iced::Pixels(16.0), iced::Font::DEFAULT);
     let request = entry.borrow_mut().request().unwrap();
     let epoch = run_with_slots(target, request.clone(), slots.clone())
-        .err()
-        .expect("old output owns actual slot");
+        .expect_err("old output owns actual slot");
     entry.borrow_mut().defer(&request, epoch);
     let events = availability_stream();
     let mut events = Box::pin(events);
@@ -2558,8 +2557,7 @@ fn stale_output_reclamation_wakes_a_deferred_idle_reader_after_actual_permit_rel
     // rather than a guessed epoch value, is the control's authority.
     for retry in deferred_requests(target) {
         let epoch = run_with_slots(target, retry.clone(), slots.clone())
-            .err()
-            .expect("stalled destructor still owns admission");
+            .expect_err("stalled destructor still owns admission");
         entry.borrow_mut().defer(&retry, epoch);
     }
     release.send(()).unwrap();

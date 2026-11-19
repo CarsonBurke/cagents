@@ -574,12 +574,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                         estimate,
                         cross,
                     },
-                ) {
-                    if let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits()) {
-                        *count -= 1;
-                        if *count == 0 {
-                            state.cross_extents.remove(&previous.cross.to_bits());
-                        }
+                ) && let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits())
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        state.cross_extents.remove(&previous.cross.to_bits());
                     }
                 }
                 *state.cross_extents.entry(cross.to_bits()).or_default() += 1;
@@ -1344,7 +1343,7 @@ mod tests {
         let mut rows: Vec<(u64, f32)> = (1..=200)
             .map(|key| (key, 20.0 + (key % 3) as f32))
             .collect();
-        let mut tree = Tree::new(&build(&rows));
+        let mut tree = Tree::new(build(&rows));
         let reindexes = || REINDEXES.with(Cell::get);
         let mut check = |rows: &[(u64, f32)]| {
             let mut element = build(rows);
@@ -1429,7 +1428,7 @@ mod tests {
             )
         };
         let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
-        let mut tree = Tree::new(&build(1, 20.0));
+        let mut tree = Tree::new(build(1, 20.0));
         let mut placed = |revision: u64, estimate: f32| {
             let mut element = build(revision, estimate);
             tree.diff(element.as_widget_mut());

@@ -677,8 +677,8 @@ impl HostedPublishedState {
     /// credit the daemon withholds its next capture for.
     ///
     /// It deliberately re-arms nothing. Every published generation announces
-    /// itself exactly once, so there is no announcement for a draw to release
-    /// - and no window between clearing a flag and re-reading the published
+    /// itself exactly once, so there is no announcement for a draw to release -
+    /// and no window between clearing a flag and re-reading the published
     /// generation for a publication to fall into.
     fn acknowledge(&self, observed_generation: u64) {
         let previous = self
@@ -2967,7 +2967,7 @@ fn serve_connection(
                     if let Some(reason) = refusal {
                         // Version, proof and exact request correlation have
                         // passed. Never replay this refused command.
-                        published.reject_input(events, *operation, reason);
+                        published.reject_input(events, operation, reason);
                         continue;
                     }
                 }

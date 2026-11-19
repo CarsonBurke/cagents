@@ -360,7 +360,7 @@ mod tests {
     fn cache_keeps_unfetched_viewed_states_distinct_from_unviewed() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(
-            &dir.path().join("state.sqlite3"),
+            dir.path().join("state.sqlite3"),
             crate::model::BootId::new("boot"),
         )
         .unwrap();

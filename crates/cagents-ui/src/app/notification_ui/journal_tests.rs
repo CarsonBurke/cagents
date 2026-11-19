@@ -841,7 +841,14 @@ fn retained_pointer_press_cannot_activate_the_incident_that_replaces_its_row() {
         let pressed = iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
         let released = iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
         let cursor = mouse::Cursor::Available(point_a);
-        let (cache, messages, _) = step(&app, &mut renderer, cache, cursor, &[pressed.clone()], a);
+        let (cache, messages, _) = step(
+            &app,
+            &mut renderer,
+            cache,
+            cursor,
+            std::slice::from_ref(&pressed),
+            a,
+        );
         assert!(messages.is_empty(), "a press alone is not activation");
         match change {
             "replace-id" => snapshot(&mut app, vec![notice(1)]),
@@ -871,7 +878,7 @@ fn retained_pointer_press_cannot_activate_the_incident_that_replaces_its_row() {
             &mut renderer,
             cache,
             cursor,
-            &[released.clone()],
+            std::slice::from_ref(&released),
             current,
         );
         assert_eq!(

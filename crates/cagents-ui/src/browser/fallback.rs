@@ -36,7 +36,7 @@ pub enum CapabilityProbe {
 
 enum FactoryHost {
     Uninitialized,
-    Checking(WaylandPreparation),
+    Checking(Box<WaylandPreparation>),
     Ready(Arc<WaylandHost>),
     Unavailable(BrowserUnavailable),
     Retired,
@@ -190,7 +190,7 @@ impl RawWaylandSubsurfaceFactory {
                 self.parent_surface,
                 self.probe_span.clone(),
             ) {
-                Ok(preparation) => *slot = FactoryHost::Checking(preparation),
+                Ok(preparation) => *slot = FactoryHost::Checking(Box::new(preparation)),
                 Err(reason) => *slot = FactoryHost::Unavailable(reason),
             }
         }

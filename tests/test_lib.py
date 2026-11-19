@@ -593,7 +593,7 @@ class TestLib(unittest.TestCase):
                 (self.root / "checked.jsonl").unlink(missing_ok=True)
                 result = self.invoke(lane, "module::one", "--profile", "dev-runtime")
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(self.checks(), [["check", *selection, "--lib", "--bins", "--examples"]])
+                self.assertEqual(self.checks(), [["clippy", *selection, "--lib", "--bins", "--examples"]])
         # Its status is the task's.
         (self.root / "checked.jsonl").unlink()
         self.configure(check_exit=1)

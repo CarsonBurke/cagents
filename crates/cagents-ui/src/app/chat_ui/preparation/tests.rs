@@ -2972,7 +2972,7 @@ fn large_coordination_runtime_admits_worker_and_retires_real_graphs() {
         let closed = runtime.selection_document().0;
         assert!(contents.iter().flat_map(|(blocks, _)| blocks).all(|(identity, _)| closed.text(*identity).is_none()), "a closed row's detail is not selectable");
         drop(closed);
-        runtime.expanded.insert("message".into());
+        runtime.expanded.edit().insert("message".into());
         let catalog = runtime.selection_document().0;
         for (blocks, text) in contents {
             for (identity, plain) in blocks {
@@ -2981,7 +2981,7 @@ fn large_coordination_runtime_admits_worker_and_retires_real_graphs() {
             assert!(text.contains("λ") || text.contains("Report"));
         }
         drop(catalog);
-        runtime.expanded.remove("message");
+        runtime.expanded.edit().remove("message");
         let previous = runtime.cache.remove("message").unwrap();
         let rebuilt = CachedItem::updated(&source.content, runtime.syntax_theme, Some(previous), true, false, None);
         assert_eq!(rebuilt.coordination.as_ref().unwrap().address(), address, "disclosure reuses the same prepared canonical graphs/palettes");

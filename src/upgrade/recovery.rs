@@ -281,7 +281,7 @@ impl Census {
             .iter()
             .zip(&bases)
             .filter(|(bound, _)| !bound.fits())
-            .map(|(bound, base)| (bound, bound.to_close(chats, base.needed)))
+            .map(|(bound, base)| (bound, bound.chats_to_close(chats, base.needed)))
             .max_by_key(|(_, close)| close.map_or(usize::MAX, |close| close))
             .expect("a bound that does not fit");
         Ok(Some(bound.refusal(chats, close)))
@@ -657,7 +657,7 @@ impl Bound {
     /// How many of `chats` to close for this bound to fit, estimated from
     /// their average share; `base` is what it needs without any chat. None
     /// when closing chats alone cannot make it fit.
-    fn to_close(&self, chats: usize, base: usize) -> Option<usize> {
+    fn chats_to_close(&self, chats: usize, base: usize) -> Option<usize> {
         let excess = self.reserved().saturating_sub(self.limit);
         let per_chat = self.needed.saturating_sub(base) / chats.max(1);
         (per_chat > 0 && base.saturating_add(FIT_MARGIN) <= self.limit)
@@ -3696,10 +3696,10 @@ fn commit_archive(
                 file.write_all(&bytes)
                     .and_then(|()| file.as_file().sync_all())
                     .map_err(|e| e.to_string())?;
-                if let Err(error) = file.persist_noclobber(&path) {
-                    if read_checkpoint(&path)?.as_deref() != Some(&bytes) {
-                        return Err(error.to_string());
-                    }
+                if let Err(error) = file.persist_noclobber(&path)
+                    && read_checkpoint(&path)?.as_deref() != Some(&bytes)
+                {
+                    return Err(error.to_string());
                 }
                 sync_directory(directory)?;
             }

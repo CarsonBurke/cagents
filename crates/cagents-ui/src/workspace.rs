@@ -1064,9 +1064,9 @@ impl Workspace {
     /// so a neighbour the new width leaves unable to share the viewport fills
     /// it once the pointer lets go.
     pub fn finish_card_resize(&mut self, id: CardId) -> ViewportUpdate {
-        if !self
+        if self
             .resize_limits
-            .is_some_and(|(resizing, _)| resizing == id)
+            .is_none_or(|(resizing, _)| resizing != id)
         {
             return ViewportUpdate::unchanged();
         }
