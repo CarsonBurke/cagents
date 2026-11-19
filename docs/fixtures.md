@@ -22,6 +22,7 @@ person.
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
+| An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -1085,6 +1086,50 @@ side's steps. `{fixture}` in a steps file means the fixture's root on the
 host. `pair` can wait 30 minutes for a native slot, so run it in the
 background rather than under a short command timeout, and run `clean` once the
 PR merges to remove the task's checkouts from the host.
+
+## An offline ACP agent
+
+[`tests/fixtures/fake-acp-agent.py`](../tests/fixtures/fake-acp-agent.py)
+speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
+does, with its configuration options for model, thinking level and mode and
+its older `models` and `modes` lists. Run as `muse...` or with
+`FAKE_ACP_SHAPE=muse`, it offers Muse's model and mode options instead, with
+no thinking level. It ignores its arguments, so a launch recipe written for
+the real agent runs it unchanged. It contacts no model, account or network.
+
+It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
+replays a conversation from an earlier process and `session/list` finds it.
+Point it at the fixture's own directory; without it, sessions go to a
+directory in the system's temporary directory.
+
+The first of these words a prompt contains chooses what it does:
+
+| Word | The agent |
+| --- | --- |
+| `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
+| `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
+| `hold` | runs a long step and thinks until stopped |
+| `garbage` | writes a line that is not JSON between two parts of its answer |
+| `files` | asks the client to read a file and reports the error it got |
+| `mode` | moves to the next mode and reports it |
+| `title` | names the conversation |
+| `refuse` | ends the turn as a refusal |
+| `auth` | answers that sign-in is required |
+| `/compact`, at the start | compacts the conversation |
+
+Anything else gets a thought and `Fake answer to: ...`. These variables add
+failures:
+
+| Variable | Effect |
+| --- | --- |
+| `FAKE_ACP_AUTH=initialize`, `new`, `load` or `prompt` | that request answers that sign-in is required |
+| `FAKE_ACP_NO_LOAD=1` | the agent does not offer to load a session |
+| `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
+| `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
+| `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+
+The ACP adapter's runtime test in `src/chat/runtime/tests.rs` drives it
+through a real pipe.
 
 ## Saved Codex history
 
