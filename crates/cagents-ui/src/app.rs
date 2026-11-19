@@ -6084,7 +6084,7 @@ impl Cagents {
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
         // A pane hidden while it closes is gone as far as the reader knows;
         // asking for it does nothing, as asking for any closed pane does.
-        if self.workspace.is_hidden(id) {
+        if self.hidden_closes.contains(&id) {
             return Task::none();
         }
         match self.workspace.focus(id) {
@@ -8970,7 +8970,7 @@ impl Cagents {
         }
         let Some(card) = self
             .card_state(id)
-            .filter(|card| card.existence.is_open() && !self.workspace.is_hidden(id))
+            .filter(|card| card.existence.is_open() && !self.hidden_closes.contains(&id))
             .cloned()
         else {
             return Task::none();
@@ -14548,6 +14548,15 @@ impl Cagents {
         self.update_ui.confirmation.is_some() || self.other_modal_is_open()
     }
 
+    /// Whether a dialog other than the terminal close's own is open: one a
+    /// terminal close's answer waits behind. Its own dialog is where that
+    /// answer is shown, so waiting for it to close would wait forever.
+    fn modal_beside_terminal_close_is_open(&self) -> bool {
+        self.update_ui.confirmation.is_some()
+            || self.form_dialog_is_open()
+            || self.modal_over_form_dialogs_beside_terminal_close()
+    }
+
     fn other_modal_is_open(&self) -> bool {
         self.form_dialog_is_open() || self.modal_over_form_dialogs()
     }
@@ -14606,6 +14615,10 @@ impl Cagents {
     /// The dialogs `dialog` mounts above the form dialogs, besides the
     /// update confirmation, which `modal_is_open` adds.
     fn modal_over_form_dialogs(&self) -> bool {
+        self.modal_over_form_dialogs_beside_terminal_close() || self.terminal_close_dialog_visible()
+    }
+
+    fn modal_over_form_dialogs_beside_terminal_close(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
         if self.browser_import.open() {
             return true;
@@ -14618,7 +14631,6 @@ impl Cagents {
             || self.automation_ui.draft_dialog_open()
             || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
-            || self.terminal_close_dialog_visible()
             || self.chat_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()

@@ -162,7 +162,7 @@ impl Cagents {
             self.bring_back_closing_pane(card);
         }
         // An answer held behind another dialog is heard once that closes.
-        let held = if self.modal_is_open() {
+        let held = if self.modal_beside_terminal_close_is_open() {
             None
         } else {
             self.held_close_answer.take()
@@ -1220,8 +1220,10 @@ impl Cagents {
         }
         // A hidden pane that has to come back with a question or a report
         // waits for another pane's open dialog, rather than open beneath it.
+        // Its own close's dialog, still open after the person confirmed
+        // closing beside an active process, is where that report goes.
         if self.hidden_closes.contains(&card)
-            && self.modal_is_open()
+            && self.modal_beside_terminal_close_is_open()
             && !matches!(
                 outcome,
                 CloseOutcome::Closed
@@ -2548,6 +2550,63 @@ pub(in crate::app) mod tests {
         assert!(app.held_close_answer.is_none());
     }
 
+    /// A pane closed beside an active process, once the person confirmed it,
+    /// leaves while its own dialog shows the close under way. A close that
+    /// then fails brings it back with the report in that dialog at once: the
+    /// dialog it is shown in is not one it waits behind.
+    #[test]
+    fn a_confirmed_active_close_that_fails_comes_back_with_its_report() {
+        for outcome in [
+            CloseOutcome::Unreachable("reply lost".into()),
+            CloseOutcome::Stale,
+        ] {
+            let (mut app, card) = retry_close_fixture();
+            app.settings.confirm_terminal_close = true;
+            let _other = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            drop(app.update(Message::CloseCard(card)));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            assert!(in_sight(&app, card), "it stays while the daemon checks");
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome: CloseOutcome::Active,
+            }));
+            assert!(app.terminal_close_dialog_visible(), "it asks");
+
+            drop(app.update(Message::ConfirmTerminalClose));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            assert!(intent.pending);
+            assert!(app.workspace.is_hidden(card), "{outcome:?}: it leaves");
+            assert!(
+                app.terminal_close_dialog_visible(),
+                "with the close under way"
+            );
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome: outcome.clone(),
+            }));
+            drop(app.settle_close_queue());
+            assert!(
+                app.held_close_answer.is_none(),
+                "{outcome:?}: nothing waits"
+            );
+            assert!(!app.workspace.is_hidden(card), "{outcome:?}: it is back");
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(
+                app.terminal_close
+                    .as_ref()
+                    .is_some_and(|intent| !intent.pending && intent.detail.is_some()),
+                "{outcome:?}: with what happened"
+            );
+        }
+    }
+
     /// Nothing that leads to a pane reaches one hidden while it closes:
     /// Ctrl+Tab passes over it, and a request to focus it, from the sidebar
     /// or anywhere else, does nothing and says nothing.
@@ -2597,6 +2656,20 @@ pub(in crate::app) mod tests {
         assert!(
             app.status.is_none() && app.notices.entries.is_empty(),
             "nothing says a closed pane is pending removal"
+        );
+
+        // Shown another strip, as another worktree's, it is still closing and
+        // still no place to go.
+        let _ = app.workspace.remove_cards(&HashSet::from([card]));
+        assert!(!app.workspace.is_hidden(card));
+        let before = app.workspace.focused();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenCard { card })));
+        drop(app.update(Message::FocusCard(card)));
+        assert_eq!(app.workspace.focused(), before);
+        assert!(
+            app.status.is_none() && app.notices.entries.is_empty(),
+            "{:?}",
+            app.status
         );
     }
 

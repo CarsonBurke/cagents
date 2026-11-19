@@ -1489,7 +1489,11 @@ impl Workspace {
             return Ok(ViewportUpdate::unchanged());
         }
 
-        let current = self.focused_index().unwrap_or(0);
+        // Nothing has the keyboard only while every pane is hidden, and a
+        // hidden pane is no place to go.
+        let Some(current) = self.focused_index() else {
+            return Ok(ViewportUpdate::unchanged());
+        };
         let id = self.cards[self.next_shown(current, direction)].id;
         if self.focused == Some(id) {
             // There is no neighbour past an end of the strip. The pane is
@@ -5087,6 +5091,11 @@ mod tests {
         assert_eq!(workspace.focused(), None);
         assert_eq!(workspace.take_widget_focus_request(), None);
         workspace.check_invariants().unwrap();
+        // With nothing in sight, moving along the strip goes nowhere.
+        for direction in [FocusDirection::Left, FocusDirection::Right] {
+            workspace.focus_adjacent(direction).unwrap();
+            assert_eq!(workspace.focused(), None);
+        }
         workspace.show_card(ids[0]).unwrap();
         assert_eq!(workspace.focused(), Some(ids[0]));
         workspace.check_invariants().unwrap();
