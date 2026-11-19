@@ -127,6 +127,16 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                     items.push(item(id, entry));
                 }
             }
+            // The person stopped the turn: the same quiet marker a live stop
+            // leaves. Any other reason is news, and names itself.
+            (Some("event_msg"), Some("turn_aborted"))
+                if payload["reason"].as_str() == Some("interrupted") =>
+            {
+                items.push(Item {
+                    at,
+                    ..crate::chat::stopped_notice(line_id())
+                })
+            }
             (Some("event_msg"), Some("turn_aborted")) => items.push(item(
                 line_id(),
                 (
@@ -550,9 +560,7 @@ mod tests {
             "See this\n[Image 1]",
             "a labelled image is not marked twice"
         );
-        assert!(
-            matches!(&items[10].content, ItemContent::Delivery { summary, .. } if summary == "Turn interrupted")
-        );
+        assert!(crate::chat::is_stopped_notice(&items[10].content));
         let serialized = serde_json::to_string(&items).unwrap();
         for hidden in [
             "AGENTS.md",
@@ -628,7 +636,7 @@ mod tests {
                 "Replayed request",
                 "tool replayed",
                 "tool replayed again",
-                "Turn interrupted",
+                crate::chat::STOPPED,
                 "Run the old checks",
                 "tool older",
                 "Old checks pass.",

@@ -61,7 +61,7 @@ pub(super) fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Messag
 fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, Message> {
     widget::container(selectable_prose::plain(
         text,
-        design::TEXT_BODY,
+        design::TEXT_TRANSCRIPT,
         iced::Font::default(),
         target,
     ))
@@ -130,6 +130,73 @@ const NARROW_FOOTER_LABEL: usize = 20;
 /// its place while the session switches.
 const TIGHT_FOOTER_LABEL: usize = 14;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
+/// What one row of the timeline draws: its line box and the padding above
+/// and below it. Rows are [`step::GAP_XS`] apart, so this plus that gap is
+/// the timeline's pitch.
+const TIMELINE_ROW: f32 = design::LINE_TRANSCRIPT + 2.0 * step::GAP_XS;
+
+/// How tall a row is taken to be until it is first measured, so a long
+/// transcript scrolls without the rows below a mounted one jumping: one
+/// timeline row for a line of the timeline, and otherwise its prose, as
+/// many lines as its length would fill at `width`, set as answers are.
+/// Either way with the room its actions reserve beneath it.
+fn row_estimate(item: &chat::Item, rhythm: Rhythm, footer: f32, width: f32) -> f32 {
+    let drawn = match (rhythm, CachedItem::prose(&item.content)) {
+        (Rhythm::Line, _) | (_, None) => TIMELINE_ROW,
+        (_, Some(body)) => {
+            // About half an em a character, on average, at the prose size.
+            let per_line = (width / (design::TEXT_TRANSCRIPT / 2.0)).max(20.0);
+            let line = iced::widget::text::LineHeight::default()
+                .to_absolute(design::TEXT_TRANSCRIPT.into())
+                .0;
+            (body.len() as f32 / per_line).ceil().max(1.0) * line
+        }
+    };
+    drawn + footer
+}
+
+/// What a transcript row is to the rows around it, which alone decides the
+/// space above it.
+///
+/// The space is a property of the two rows it separates, never of the group
+/// or exchange either belongs to, so a column of timeline rows keeps one
+/// pitch whether or not a group boundary, or an item that draws nothing,
+/// falls between two of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rhythm {
+    /// One line of the timeline: a step, the strip that folds a group of
+    /// them, a thought, an agent started or messaged.
+    Line,
+    /// Something read as a whole: an answer, narration, an image.
+    Block,
+    /// What sets itself apart: the message that opens an exchange, or a part
+    /// of the transcript of its own, such as a failure or the closing line.
+    Opening,
+}
+
+impl Rhythm {
+    /// The space between a row of this kind and a row of `next` drawn
+    /// beneath it.
+    fn gap(self, next: Rhythm) -> f32 {
+        match (self, next) {
+            (_, Rhythm::Opening) => step::GAP_L,
+            (Rhythm::Line, Rhythm::Line) => step::GAP_XS,
+            _ => step::GAP_M,
+        }
+    }
+
+    /// How a transcript item draws, by its role, slot and what it holds.
+    fn of(item: &chat::Item, slot: turn::Slot, card: bool) -> Self {
+        match (&item.content, slot) {
+            _ if card => Self::Line,
+            (ItemContent::Text { .. }, turn::Slot::Thinking) => Self::Line,
+            (ItemContent::Text { .. } | ItemContent::Image { .. }, _) => Self::Block,
+            // A step, or a notice the grouping placed among the prose, is
+            // drawn as a step's row.
+            _ => Self::Line,
+        }
+    }
+}
 
 /// The loaded transcript keeps row descriptions; only its visible rows create
 /// widget trees, and a visible row is kept between frames by retained::kept.
@@ -138,25 +205,25 @@ const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
 /// next semantic boundary instead of adding another gap after an invisible row.
 struct VirtualRows<'a> {
     children: Vec<virtualized::Row<'a>>,
-    gap: f32,
+    /// The kind of the last row drawn, which the next row's gap is measured
+    /// from. A row that draws nothing leaves it as it was.
+    last: Option<Rhythm>,
     trailing_footer: f32,
 }
 impl<'a> VirtualRows<'a> {
-    fn new(gap: f32) -> Self {
+    fn new() -> Self {
         Self {
             children: vec![],
-            gap,
+            last: None,
             trailing_footer: 0.0,
         }
     }
+    /// A part of the transcript of its own, set apart from what is above it.
     fn push(&mut self, row: Element<'a, Message>) -> usize {
-        self.message(row, 0.0)
-    }
-    fn message(&mut self, row: Element<'a, Message>, footer: f32) -> usize {
         self.append(
             virtualized::Row::once(0, 0, 80.0, None, move || row),
-            self.gap,
-            footer,
+            Some(Rhythm::Opening),
+            0.0,
         )
     }
     fn lazy(
@@ -165,13 +232,13 @@ impl<'a> VirtualRows<'a> {
         revision: u64,
         estimate: f32,
         aliases: Vec<iced::advanced::widget::Id>,
-        gap: f32,
+        rhythm: Option<Rhythm>,
         footer: f32,
         build: impl Fn() -> Element<'a, Message> + 'a,
     ) -> usize {
         let mut row = virtualized::Row::new(key, revision, estimate, None, build);
         row.aliases = aliases;
-        self.append(row, gap, footer)
+        self.append(row, rhythm, footer)
     }
     /// Lets the newest row also stand for `id`, which draws nothing of its
     /// own.
@@ -180,9 +247,17 @@ impl<'a> VirtualRows<'a> {
             row.aliases.push(id);
         }
     }
-    fn append(&mut self, mut row: virtualized::Row<'a>, gap: f32, footer: f32) -> usize {
-        if !self.children.is_empty() {
-            let gap = (gap - self.trailing_footer).max(0.0);
+    /// Appends `row`, after the gap its kind takes from the last row drawn.
+    /// A row without a kind draws nothing: it takes no gap, and the next row
+    /// is spaced from the one before it as if it were not there.
+    fn append(
+        &mut self,
+        mut row: virtualized::Row<'a>,
+        rhythm: Option<Rhythm>,
+        footer: f32,
+    ) -> usize {
+        if let (Some(last), Some(next)) = (self.last, rhythm) {
+            let gap = (last.gap(next) - self.trailing_footer).max(0.0);
             if gap > 0.0 {
                 // A gap is keyed by the row it precedes, so history loaded
                 // above it does not hand it another gap's measured height.
@@ -199,7 +274,10 @@ impl<'a> VirtualRows<'a> {
             row.key = index as u64;
         }
         self.children.push(row);
-        self.trailing_footer = footer;
+        if rhythm.is_some() {
+            self.last = rhythm;
+            self.trailing_footer = footer;
+        }
         index
     }
 }
@@ -884,7 +962,7 @@ fn bounded<'a>(
 /// How a turn that finished with `snapshot` ended, as its provider said.
 pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     match snapshot.detail.as_str() {
-        "Turn interrupted" => "Interrupted",
+        chat::TURN_INTERRUPTED => "Interrupted",
         "Turn failed" => "Failed",
         _ => "Finished",
     }
@@ -1505,6 +1583,51 @@ fn family_label(provider: Provider) -> &'static str {
 /// The worktree a conversation runs in.
 struct Place {
     branch: Option<String>,
+}
+
+/// Whether a delivery draws its message actions: while its detail shows,
+/// or always when it cannot be opened, so a message that is only its row
+/// still offers its copy and its time on hover.
+fn delivery_actions(has_body: bool, monitor: bool, long: bool, expanded: bool) -> bool {
+    let shown = (expanded || monitor) && has_body;
+    shown || !delivery_opens(has_body, monitor, long)
+}
+
+/// Whether a delivery's row opens its detail: it has one, and it is not a
+/// monitor event short enough to be shown whole.
+fn delivery_opens(has_body: bool, monitor: bool, long: bool) -> bool {
+    has_body && (!monitor || long)
+}
+
+/// A monitor's event, whose body is shown without being opened.
+fn delivery_monitor(kind: chat::DeliveryKind, summary: &str) -> bool {
+    kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ")
+}
+
+/// Whether a delivery has more to show than its heading's first line: a
+/// prepared notice's body, or a message's body, the rest of its heading or
+/// its sender.
+fn delivery_has_body(
+    notice: Option<&literal_content::NoticeData>,
+    body: &str,
+    remainder: &str,
+    sender: &str,
+) -> bool {
+    notice.map_or_else(
+        || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
+        |notice| notice.body.full.len() != 0,
+    )
+}
+
+/// The agent a report's title names, as `Agent "NAME"` or `Agent NAME`
+/// say it.
+fn delivery_agent_name(title: &str) -> Option<&str> {
+    let name = title.strip_prefix("Agent ")?;
+    let name = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+        .unwrap_or(name);
+    (!name.trim().is_empty()).then_some(name)
 }
 
 fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
@@ -2564,13 +2687,13 @@ impl Runtime {
         // ten pixels.
         let dark = cosmic::theme::is_dark();
         let markdown_settings =
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         let selected = self
             .selected_subagent
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let anchors = Vec::new();
-        let mut transcript = VirtualRows::new(step::GAP_L);
+        let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
             let provider = match self.session.launch.provider {
@@ -2589,7 +2712,7 @@ impl Runtime {
                 .filter(|model| !model.is_empty());
             let mut heading = vec![
                 widget::row::with_children(vec![
-                    chat_title(self.child_label(agent, 80))
+                    design::transcript_name(self.child_label(agent, 80))
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
@@ -2703,7 +2826,16 @@ impl Runtime {
                 if reasoning::contentless(&item.content) {
                     continue;
                 }
-                let footer = if (item.role == chat::Role::User && !item.content.is_step())
+                // Drawn by delivery_view, as in the main transcript.
+                let delivery = item.role == chat::Role::User
+                    && matches!(item.content, ItemContent::Delivery { .. });
+                let footer = if delivery {
+                    if self.delivery_carries_actions(item) {
+                        MESSAGE_ACTION_FOOTER
+                    } else {
+                        0.0
+                    }
+                } else if (item.role == chat::Role::User && !item.content.is_step())
                     || matches!(item.content, ItemContent::Text { .. })
                 {
                     MESSAGE_ACTION_FOOTER
@@ -2721,19 +2853,26 @@ impl Runtime {
                     dark,
                     self.source_now_ms(),
                 );
-                let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
-                    (body.len() as f32 / (content_width / 8.0).max(20.0))
-                        .ceil()
-                        .max(1.0)
-                        * 22.0
-                        + footer
-                });
+                // The subagent's own messages to it open its exchanges; the
+                // rest of its work keeps the main transcript's rhythm.
+                let rhythm = if delivery {
+                    Rhythm::Line
+                } else if item.role == chat::Role::User && !item.content.is_step() {
+                    Rhythm::Opening
+                } else {
+                    let card = cached
+                        .coordination
+                        .as_deref()
+                        .is_some_and(|coordinated| coordinated.is_card());
+                    Rhythm::of(item, turn::slot_of(item), card)
+                };
+                let estimate = row_estimate(item, rhythm, footer, content_width);
                 let row_index = transcript.lazy(
                     key.finish(),
                     revision,
                     estimate,
                     vec![scroll::item_id(&item.id), self.find_anchor(&item.id)],
-                    step::GAP_L,
+                    Some(rhythm),
                     footer,
                     move || {
                         scroll::item(
@@ -2810,7 +2949,7 @@ impl Runtime {
                 // first message, so it does not invite one while it comes up.
                 transcript.push(
                     widget::container(
-                        design::body(if self.provider_coming_up() {
+                        design::transcript(if self.provider_coming_up() {
                             "This conversation is starting."
                         } else {
                             "Your conversation appears here. Send a message to begin."
@@ -4926,27 +5065,12 @@ impl Runtime {
         let items = &self.snapshot.items;
         let now = self.source_now_ms();
         let common = self.turn_common_hasher(turn, dark);
-        let estimate = |item: &chat::Item| {
-            CachedItem::prose(&item.content).map_or(60.0, |body| {
-                ((body.len() as f32 / (content_width / 8.0).max(20.0))
-                    .ceil()
-                    .max(1.0)
-                    * 22.0)
-                    + 40.0
-            })
-        };
-        let opening_gap = if turn.prompt.is_empty() {
-            step::GAP_M
-        } else {
-            step::GAP_L
-        };
         // Find reaches an exchange through its first row, whether or not
         // that row is mounted, and so does anything drawn before it.
         // Room for the row's own item too, which is usually all it holds.
         let mut leading = Vec::with_capacity(2);
         leading.push(self.find_anchor(&turn.key));
         let mut rows = 0;
-        let mut after_card = false;
         self.for_each_turn_part(turn, |placement| {
             let (part, cached) = match placement {
                 // An item that draws nothing of its own, such as one still
@@ -4966,7 +5090,7 @@ impl Runtime {
                 0 => std::mem::take(&mut leading),
                 _ => Vec::with_capacity(1),
             };
-            let (estimate, footer) = match part {
+            let (item, footer) = match part {
                 TurnPart::Steps => {
                     aliases.reserve(turn.steps.len());
                     aliases.extend(
@@ -4975,12 +5099,16 @@ impl Runtime {
                             .filter_map(|placed| items.get(placed.index))
                             .map(|item| scroll::item_id(&item.id)),
                     );
-                    (48.0, 0.0)
+                    (None, 0.0)
                 }
                 TurnPart::Prompt(index) => {
                     let item = &items[index];
                     aliases.push(scroll::item_id(&item.id));
-                    (estimate(item), MESSAGE_ACTION_FOOTER)
+                    let footer = match item.content {
+                        ItemContent::Delivery { .. } if !self.delivery_carries_actions(item) => 0.0,
+                        _ => MESSAGE_ACTION_FOOTER,
+                    };
+                    (Some(item), footer)
                 }
                 TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                     let placed = &turn.prose[prose];
@@ -4992,19 +5120,32 @@ impl Runtime {
                         }
                         _ => 0.0,
                     };
-                    (estimate(item), footer)
+                    (Some(item), footer)
                 }
             };
-            // A run of coordination rows reads as one list, as the step
-            // strip's rows do, rather than as blocks set apart from one
-            // another.
-            let card = matches!(part, TurnPart::Card(_));
-            let gap = match rows {
-                0 => opening_gap,
-                _ if card && after_card => step::GAP_XS,
-                _ => step::GAP_M,
+            // An exchange the reader or another agent opened is set apart
+            // from the one before it. Every other row is spaced by what it
+            // and the row above it are, so the timeline reads as one list
+            // across the groups it is folded into.
+            let rhythm = match part {
+                // What another agent or a background task sent is a line
+                // of the timeline, like the steps that started it.
+                TurnPart::Prompt(index)
+                    if matches!(items[index].content, ItemContent::Delivery { .. }) =>
+                {
+                    Rhythm::Line
+                }
+                _ if rows == 0 && !turn.prompt.is_empty() => Rhythm::Opening,
+                TurnPart::Prompt(_) => Rhythm::Block,
+                TurnPart::Steps | TurnPart::Card(_) => Rhythm::Line,
+                TurnPart::Prose(prose) => {
+                    let placed = &turn.prose[prose];
+                    Rhythm::of(&items[placed.index], placed.slot, false)
+                }
             };
-            after_card = card;
+            let estimate = item.map_or(TIMELINE_ROW, |item| {
+                row_estimate(item, rhythm, footer, content_width)
+            });
             rows += 1;
             let fingerprint = self.turn_part_fingerprint(turn, part, key, cached, &common, now);
             transcript.lazy(
@@ -5012,7 +5153,7 @@ impl Runtime {
                 fingerprint,
                 estimate,
                 aliases,
-                gap,
+                Some(rhythm),
                 footer,
                 move || {
                     retained::kept(fingerprint, move || {
@@ -5022,6 +5163,9 @@ impl Runtime {
             );
         });
         if rows == 0 {
+            // An exchange that draws nothing yet is still reached through a
+            // row of its own, which takes no room: the rows around it are
+            // spaced as if it were not there.
             let mut key = std::hash::DefaultHasher::new();
             (0u8, &turn.key).hash(&mut key);
             transcript.lazy(
@@ -5029,7 +5173,7 @@ impl Runtime {
                 common.finish(),
                 0.0,
                 leading,
-                opening_gap,
+                None,
                 0.0,
                 || widget::Space::new().into(),
             );
@@ -5046,8 +5190,8 @@ impl Runtime {
         }
         let dark = cosmic::theme::is_dark();
         let markdown_settings =
-            design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
-        let mut transcript = VirtualRows::new(step::GAP_L);
+            design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
+        let mut transcript = VirtualRows::new();
         // The preview shows the end of the conversation, which the last few
         // exchanges fill however long it has run.
         let tail = self.turns.len().saturating_sub(PREVIEW_TURNS);
@@ -5098,7 +5242,7 @@ impl Runtime {
         dark: bool,
         viewport: virtualized::Viewport,
     ) -> Element<'a, Message> {
-        let mut rows = VirtualRows::new(step::GAP_L);
+        let mut rows = VirtualRows::new();
         self.push_turn_rows(
             &mut rows,
             turn,
@@ -5112,7 +5256,7 @@ impl Runtime {
 
     #[cfg(test)]
     pub(super) fn find_turn_view_for_test(&self) -> Element<'_, Message> {
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         self.turn_view(&self.turns[0], settings, cosmic::theme::is_dark())
     }
 
@@ -5505,11 +5649,14 @@ impl Runtime {
                             let mut row = virtualized::Row::once(
                                 key,
                                 revision,
-                                56.0 + step::GAP_XS,
+                                step::GAP_XS + TIMELINE_ROW,
                                 Some(scroll::item_id(&id)),
+                                // The air above each row, so the strip's
+                                // rows keep the pitch of the rows around
+                                // it at both of its ends.
                                 move || {
                                     widget::container(scroll::item(&id, row))
-                                        .padding(iced::Padding::ZERO.bottom(step::GAP_XS))
+                                        .padding(iced::Padding::ZERO.top(step::GAP_XS))
                                         .into()
                                 },
                             );
@@ -5926,7 +6073,7 @@ impl Runtime {
         };
         let body: Element<'a, Message> = if let Some(prepared) = prepared {
             let mut settings =
-                design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+                design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
             settings.style.font = iced::Font::default();
             if prepared.full.len() > 2048 {
                 let flow = local.presentation.flow.markdown_entry(
@@ -5954,7 +6101,7 @@ impl Runtime {
             }
         } else {
             widget::text(prompt::preview(local.text()).0)
-                .size(design::TEXT_PROSE)
+                .size(design::TEXT_TRANSCRIPT)
                 .into()
         };
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
@@ -6115,7 +6262,7 @@ impl Runtime {
             let text = if let Some(prompt) = prepared {
                 let text = prompt.shown(expanded);
                 let mut settings =
-                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
                 settings.style.font = iced::Font::default();
                 if text.len() > 2048 {
                     let flow = self.presentation_cache()[&item.id]
@@ -6142,7 +6289,7 @@ impl Runtime {
             } else {
                 // This bounded nonselectable preview cannot certify a full
                 // source/catalog before preparation accepts the current Item.
-                widget::text(fallback).size(design::TEXT_PROSE).into()
+                widget::text(fallback).size(design::TEXT_TRANSCRIPT).into()
             };
             if long {
                 widget::column::with_children(vec![
@@ -6225,21 +6372,26 @@ impl Runtime {
             .map_or((heading.as_str(), ""), |(first, rest)| {
                 (first, rest.trim_start_matches(['\r', '\n']))
             });
-        let monitor = *kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ");
-        let has_body = notice.map_or_else(
-            || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
-            |notice| notice.body.full.len() != 0,
-        );
+        let monitor = delivery_monitor(*kind, summary);
+        let has_body = delivery_has_body(notice, body, remainder, sender);
         // Only explicit command/report outcomes are errors. A peer's prose
-        // mentioning a failure is ordinary delivered content.
-        let report_outcome = (*kind == chat::DeliveryKind::Report)
-            .then(|| delivery_report_outcome(from, first))
-            .flatten();
+        // mentioning a failure is ordinary delivered content. An agent that
+        // ended with nothing to report, or whose result is shown elsewhere,
+        // arrives as a notice under the same heading, and reads as a report.
+        let report_outcome = match kind {
+            chat::DeliveryKind::Report => true,
+            chat::DeliveryKind::Notice => !monitor && delivery_command_outcome(first).is_none(),
+            _ => false,
+        }
+        .then(|| delivery_report_outcome(from, first))
+        .flatten();
         let failed =
             (*kind == chat::DeliveryKind::Notice && !monitor && delivery_command_failed(&heading))
                 || report_outcome.is_some_and(|(_, outcome)| outcome == "failed");
         let glyph = if failed {
             Icon::Error
+        } else if chat::is_stopped_notice(&item.content) {
+            Icon::Stop
         } else if *kind == chat::DeliveryKind::Notice
             && !monitor
             && delivery_command_outcome(&heading).is_some()
@@ -6251,17 +6403,29 @@ impl Runtime {
             Icon::Chat
         };
         let (title, outcome) = if *kind == chat::DeliveryKind::Notice && !monitor {
-            delivery_command_outcome(first)
-                .map_or((first, None), |(title, outcome)| (title, Some(outcome)))
+            delivery_command_outcome(first).or(report_outcome)
         } else {
-            report_outcome.map_or((first, None), |(title, outcome)| (title, Some(outcome)))
-        };
+            report_outcome
+        }
+        .map_or((first, None), |(title, outcome)| (title, Some(outcome)));
         // Bound synchronous text shaping. The original remains in the tooltip,
         // copy action and expanded detail; fades never introduce an ellipsis.
         let short: String = title.chars().take(1024).collect();
-        let disclosure = has_body && (!monitor || notice.is_some_and(|notice| notice.body.long));
+        // An agent's report is told by its glyph and outcome, so its row
+        // names the agent as every row of the timeline does, by weight,
+        // without the "Agent" and quotes the provider's heading wraps it in.
+        // Its tooltip and accessible name keep the heading whole.
+        let headline = match report_outcome.and_then(|_| delivery_agent_name(&short)) {
+            Some(name) => disclosure::Headline::Name(name.to_owned()),
+            None => disclosure::Headline::Text(short),
+        };
+        let disclosure = delivery_opens(
+            has_body,
+            monitor,
+            notice.is_some_and(|notice| notice.body.long),
+        );
         let heading_row = disclosure::row_named(
-            short,
+            headline,
             if disclosure {
                 format!(
                     "{} delivery details: {heading}",
@@ -6272,11 +6436,12 @@ impl Runtime {
             },
             glyph,
             failed.then_some(chat::ToolStatus::Failed),
-            outcome.map(str::to_owned),
+            outcome.map(|outcome| disclosure::Trailing::Outcome(outcome.to_owned())),
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
-        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone())];
+        let heading_row = crate::interaction::tooltip(heading_row, heading.clone());
+        let mut rows = Vec::new();
         if (expanded || monitor) && has_body {
             if expanded
                 && *kind != chat::DeliveryKind::Notice
@@ -6344,16 +6509,82 @@ impl Runtime {
                 );
             }
         }
-        widget::container(message_actions(
-            widget::column::with_children(rows)
-                .spacing(step::GAP_XS)
-                .into(),
-            self.message_copy(item),
-            Alignment::Start,
-        ))
-        .max_width(design::READABLE_MEASURE)
-        .width(Length::Fill)
-        .into()
+        // Like a step or a thought, a delivery that opens is a line of the
+        // timeline until its detail is open. Open, or when it has nothing to
+        // open, the whole message, its row included, carries the message's
+        // actions beneath it, so hovering the row shows them.
+        debug_assert_eq!(
+            !rows.is_empty(),
+            (expanded || monitor) && has_body,
+            "delivery_actions mirrors the detail drawn here"
+        );
+        let body: Element<'static, Message> = if !delivery_actions(
+            has_body,
+            monitor,
+            notice.is_some_and(|notice| notice.body.long),
+            expanded,
+        ) {
+            heading_row
+        } else {
+            rows.insert(0, heading_row);
+            message_actions(
+                widget::column::with_children(rows)
+                    .spacing(step::GAP_XS)
+                    .into(),
+                self.message_copy(item),
+                Alignment::Start,
+            )
+        };
+        widget::container(body)
+            .max_width(design::READABLE_MEASURE)
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Whether a delivered message draws its actions, and so reserves the
+    /// room for them beneath it: while its detail is shown, or always when
+    /// it has no detail to open, as a message does.
+    fn delivery_carries_actions(&self, item: &chat::Item) -> bool {
+        let ItemContent::Delivery {
+            kind,
+            from,
+            sender,
+            summary,
+            body,
+        } = &item.content
+        else {
+            return false;
+        };
+        let monitor = delivery_monitor(*kind, summary);
+        let (has_body, long) = if *kind == chat::DeliveryKind::Notice {
+            // Drawn as loading, without actions, until it is prepared.
+            let Some(notice) = self
+                .prepared_literal(item)
+                .and_then(literal_content::Content::notice)
+            else {
+                return false;
+            };
+            (
+                delivery_has_body(Some(notice), body, "", sender),
+                notice.body.long,
+            )
+        } else {
+            let heading = chat::delivery_heading(
+                *kind,
+                from,
+                sender,
+                if !body.is_empty() && body.trim() == summary.trim() {
+                    ""
+                } else {
+                    summary
+                },
+            );
+            let remainder = heading
+                .split_once(['\r', '\n'])
+                .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
+            (delivery_has_body(None, body, remainder, sender), false)
+        };
+        delivery_actions(has_body, monitor, long, self.item_expanded(&item.id))
     }
 
     /// An assistant answer, its reasoning, its narration, or a system notice.

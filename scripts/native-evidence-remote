@@ -556,7 +556,8 @@ cmd_pair() {
                 options+=("$1" "$2")
                 shift 2
                 ;;
-            --keep-state | --acp | --ui-trace | --workspace-trace | --projection-oracle | --ui-scoped-fixture | --wayland-debug) options+=("$1"); shift ;;
+            --keep-state | --acp | --ui-trace | --workspace-trace | --projection-oracle | --ui-scoped-fixture | --wayland-debug | \
+                --restore-existing-only | --launch-handshake) options+=("$1"); shift ;;
             --integrated) build_options+=("$1"); shift ;;
             --codex-executable)
                 [ "$#" -ge 2 ] || die "$1 needs a value" 2

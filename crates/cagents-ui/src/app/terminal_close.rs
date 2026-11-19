@@ -693,11 +693,10 @@ impl Cagents {
                 self.card_removal(handoff)
             }
             Err(error) => {
+                let kept = self.pane_kept_notice(card);
                 self.abandon_removal(card);
                 tracing::warn!(%error, "pane removal was refused");
-                self.status = Some(TransientNotice::error(
-                    "This pane couldn't be removed right now, so it was kept. Close it again.",
-                ));
+                self.status = Some(TransientNotice::error(kept));
                 // Nothing will settle this close, so the queue moves on now. It
                 // waits by itself for a removal still on its way.
                 self.next_queued_card_close()

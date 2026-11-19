@@ -2579,6 +2579,41 @@ impl DeliveryKind {
     }
 }
 
+/// The summary of the notice that marks where the person stopped a turn.
+pub const STOPPED: &str = "Stopped";
+
+/// The status detail of a conversation whose last turn was stopped before it
+/// finished, whichever provider ran it.
+pub const TURN_INTERRUPTED: &str = "Turn interrupted";
+
+/// Where the person stopped a turn: a quiet marker in the timeline, in place
+/// of the provider's own record of the interruption, which reads as a
+/// message the person never typed or as a failure when nothing failed.
+pub fn stopped_notice(id: String) -> Item {
+    Item {
+        id,
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: STOPPED.into(),
+            body: String::new(),
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+/// Whether `content` is the marker [`stopped_notice`] makes.
+pub fn is_stopped_notice(content: &ItemContent) -> bool {
+    matches!(
+        content,
+        ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body }
+            if summary == STOPPED && body.is_empty() && from.is_empty() && sender.is_empty()
+    )
+}
+
 /// Who sent a delivery, as one phrase: its name, or failing that its
 /// identifier, which is shortened because a task ID is only ever needed to
 /// tell two senders apart at a glance.

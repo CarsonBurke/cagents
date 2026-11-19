@@ -29,8 +29,7 @@ pub struct LinkedIssue {
 #[serde(deny_unknown_fields)]
 struct StoredLink {
     version: u32,
-    /// Version 2 can retain an explicit unlink. Absence is reserved for a
-    /// pristine worktree, so interrupted creation cannot resurrect that link.
+    /// Version 2 records an explicit unlink; version 1 always names an issue.
     issue: Option<LinkedIssue>,
 }
 
@@ -121,7 +120,7 @@ fn read_stored_link(root: &Root) -> Result<Option<StoredLink>, Error> {
     Ok(Some(stored))
 }
 
-/// A stable lock name serializes every explicit edit with creator recovery.
+/// A stable lock name serializes every link and unlink edit.
 /// Never unlink this file: replacing the lock inode would split authority.
 fn lock_link(root: &Root) -> Result<crate::instance::OwnedLock, Error> {
     // Install without replacing an existing lock, resolving every operation
@@ -225,68 +224,6 @@ fn linked_issue(issue_id: &str, workspace: Option<&str>) -> Result<LinkedIssue, 
     };
     validate(&issue)?;
     Ok(issue)
-}
-
-/// Complete creator intent without replacing later explicit link/unlink edits.
-pub fn ensure_link_at(
-    worktree: &Path,
-    issue_id: &str,
-    workspace: Option<&str>,
-) -> Result<LinkedIssue, Error> {
-    let issue = linked_issue(issue_id, workspace)?;
-    let root = git_directory(worktree)?;
-    let _guard = lock_link(&root)?;
-    ensure_link(&root, &issue)?;
-    Ok(issue)
-}
-
-/// Creator authority belongs to the administrative directory retained during
-/// ownership verification, not whichever checkout a path later resolves to.
-#[cfg(test)]
-pub(crate) fn ensure_link_for_creation(
-    worktree: &Path,
-    expected: &Root,
-    issue_id: &str,
-    workspace: Option<&str>,
-) -> Result<LinkedIssue, Error> {
-    let issue = linked_issue(issue_id, workspace)?;
-    let _guard = lock_link(expected)?;
-    let actual = git_directory(worktree)?;
-    let expected_identity = expected.metadata().map_err(storage)?;
-    let actual_identity = actual.metadata().map_err(storage)?;
-    if (expected_identity.dev(), expected_identity.ino())
-        != (actual_identity.dev(), actual_identity.ino())
-    {
-        return Err(Error::new(
-            "linear_link_context_changed",
-            "The checkout's Git administrative identity changed during creation. Its Linear link was preserved; inspect the checkout before reconciling.",
-        ));
-    }
-    // Every read/write remains relative to the proven descriptor, including
-    // if an external Git edit retargets the checkout after the comparison.
-    ensure_link(expected, &issue)?;
-    Ok(issue)
-}
-
-fn ensure_link(root: &Root, issue: &LinkedIssue) -> Result<(), Error> {
-    match read_stored_link(root)? {
-        None => write_link(root, issue),
-        Some(stored) if stored.issue.as_ref() == Some(issue) => {
-            // A prior writer may have crashed after rename but before directory
-            // sync; make the already matching record durable before Applied.
-            let file = fs_safety::open_beneath(root, Path::new(LINK_FILE)).map_err(storage)?;
-            file.sync_all().map_err(storage)?;
-            fs_safety::sync_directory(root).map_err(storage)
-        }
-        Some(stored) => Err(Error::new(
-            "linear_link_conflict",
-            if stored.issue.is_some() {
-                "A different Linear ticket or workspace was linked after creation started; the later link was preserved. Review it with cagents linear issue --current, then explicitly link the requested ticket before reconciling creation."
-            } else {
-                "This worktree was explicitly unlinked after creation started; that choice was preserved. Explicitly link the requested ticket before reconciling creation."
-            },
-        )),
-    }
 }
 
 fn write_link(root: &Root, issue: &LinkedIssue) -> Result<(), Error> {
@@ -442,178 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn creator_link_refuses_a_retargeted_checkout_without_touching_either_link() {
-        let checkout = tempfile::tempdir().unwrap();
-        let unrelated = tempfile::tempdir().unwrap();
-        git(checkout.path(), &["init", "-q"]);
-        git(unrelated.path(), &["init", "-q"]);
-        let expected = git_directory(checkout.path()).unwrap();
-        let other = git_directory(unrelated.path()).unwrap();
-        let original = checkout.path().join("original-admin");
-        std::fs::rename(checkout.path().join(".git"), &original).unwrap();
-        std::fs::write(
-            checkout.path().join(".git"),
-            format!("gitdir: {}\n", other.path().display()),
-        )
-        .unwrap();
-        let error =
-            ensure_link_for_creation(checkout.path(), &expected, "ENG-123", None).unwrap_err();
-        assert_eq!(error.kind, "linear_link_context_changed");
-        assert!(read_stored_link(&expected).unwrap().is_none());
-        assert!(read_stored_link(&other).unwrap().is_none());
-        std::fs::remove_file(checkout.path().join(".git")).unwrap();
-        std::fs::rename(original, checkout.path().join(".git")).unwrap();
-        ensure_link_for_creation(checkout.path(), &expected, "ENG-123", None).unwrap();
-        assert_eq!(resolve_at(checkout.path()).unwrap().issue_id, "ENG-123");
-        assert!(read_stored_link(&other).unwrap().is_none());
-    }
-
-    #[test]
-    fn creator_links_preserve_explicit_ticket_workspace_and_unlink_intent() {
-        let directory = tempfile::tempdir().unwrap();
-        git(directory.path(), &["init", "-q"]);
-        let expected = LinkedIssue {
-            issue_id: "ENG-123".into(),
-            workspace: Some("TEST".into()),
-        };
-        ensure_link_at(
-            directory.path(),
-            &expected.issue_id,
-            expected.workspace.as_deref(),
-        )
-        .unwrap();
-        for later in [
-            Some(LinkedIssue {
-                issue_id: "ENG-999".into(),
-                workspace: Some("TEST".into()),
-            }),
-            Some(LinkedIssue {
-                issue_id: "ENG-123".into(),
-                workspace: Some("OTHER".into()),
-            }),
-            None,
-        ] {
-            if let Some(later) = &later {
-                link_at(
-                    directory.path(),
-                    &later.issue_id,
-                    later.workspace.as_deref(),
-                )
-                .unwrap();
-            } else {
-                unlink_at(directory.path()).unwrap();
-            }
-            let root = git_directory(directory.path()).unwrap();
-            let before = std::fs::read(root.path().join(LINK_FILE)).unwrap();
-            assert_eq!(
-                ensure_link_at(
-                    directory.path(),
-                    &expected.issue_id,
-                    expected.workspace.as_deref()
-                )
-                .unwrap_err()
-                .kind,
-                "linear_link_conflict"
-            );
-            assert_eq!(std::fs::read(root.path().join(LINK_FILE)).unwrap(), before);
-            assert_eq!(read_stored_link(&root).unwrap().unwrap().issue, later);
-            if later.is_none() {
-                assert_eq!(
-                    resolve_at(directory.path()).unwrap_err().kind,
-                    "linear_issue_required"
-                );
-            }
-            // Explicitly choosing the requested issue reconciles the conflict.
-            link_at(
-                directory.path(),
-                &expected.issue_id,
-                expected.workspace.as_deref(),
-            )
-            .unwrap();
-            let before = std::fs::read(root.path().join(LINK_FILE)).unwrap();
-            assert_eq!(
-                ensure_link_at(
-                    directory.path(),
-                    &expected.issue_id,
-                    expected.workspace.as_deref()
-                )
-                .unwrap(),
-                expected
-            );
-            assert_eq!(
-                std::fs::read(root.path().join(LINK_FILE)).unwrap(),
-                before,
-                "same existing intent must not be rewritten"
-            );
-        }
-    }
-
-    #[test]
-    fn creator_and_explicit_link_edits_share_one_serialization_lock() {
-        for creator_first in [false, true] {
-            for later in [
-                Some(LinkedIssue {
-                    issue_id: "ENG-999".into(),
-                    workspace: None,
-                }),
-                Some(LinkedIssue {
-                    issue_id: "ENG-123".into(),
-                    workspace: Some("OTHER".into()),
-                }),
-                None,
-            ] {
-                let directory = tempfile::tempdir().unwrap();
-                git(directory.path(), &["init", "-q"]);
-                let root = git_directory(directory.path()).unwrap();
-                let expected = LinkedIssue {
-                    issue_id: "ENG-123".into(),
-                    workspace: None,
-                };
-                let guard = lock_link(&root).unwrap();
-                let path = directory.path().to_path_buf();
-                let expected_worker = expected.clone();
-                let later_worker = later.clone();
-                let (started, ready) = std::sync::mpsc::channel();
-                let worker = std::thread::spawn(move || {
-                    started.send(()).unwrap();
-                    if creator_first {
-                        match later_worker {
-                            Some(issue) => {
-                                link_at(&path, &issue.issue_id, issue.workspace.as_deref())
-                                    .map(|_| ())
-                            }
-                            None => unlink_at(&path),
-                        }
-                    } else {
-                        ensure_link_at(
-                            &path,
-                            &expected_worker.issue_id,
-                            expected_worker.workspace.as_deref(),
-                        )
-                        .map(|_| ())
-                    }
-                });
-                ready.recv().unwrap();
-                // The real lock fixes the linearization order without sleeps;
-                // the worker uses the actual public API on another descriptor.
-                if creator_first {
-                    ensure_link(&root, &expected).unwrap();
-                } else {
-                    write_stored_link(&root, later.as_ref()).unwrap();
-                }
-                drop(guard);
-                let result = worker.join().unwrap();
-                if creator_first {
-                    result.unwrap();
-                } else {
-                    assert_eq!(result.unwrap_err().kind, "linear_link_conflict");
-                }
-                assert_eq!(read_stored_link(&root).unwrap().unwrap().issue, later);
-            }
-        }
-    }
-
-    #[test]
     fn link_lock_releases_despite_a_copied_descriptor() {
         let directory = tempfile::tempdir().unwrap();
         git(directory.path(), &["init", "-q"]);
@@ -644,12 +409,6 @@ mod tests {
         std::fs::remove_file(root.path().join(LINK_LOCK)).unwrap();
         let guard = lock_link(&root).unwrap();
         assert_eq!(
-            ensure_link_at(directory.path(), "ENG-123", None)
-                .unwrap_err()
-                .kind,
-            "linear_link_busy"
-        );
-        assert_eq!(
             link_at(directory.path(), "ENG-999", None).unwrap_err().kind,
             "linear_link_busy"
         );
@@ -659,6 +418,6 @@ mod tests {
         );
         assert!(!root.path().join(LINK_FILE).exists());
         drop(guard);
-        ensure_link_at(directory.path(), "ENG-123", None).unwrap();
+        link_at(directory.path(), "ENG-123", None).unwrap();
     }
 }

@@ -42,6 +42,8 @@ CAGENTS_CHECKOUT_ROOT identity anchor, paired with the source-hook entry in
 scripts/qualify-checkout-cache.py. Snapshot constructors, full-context ownership,
 projections and original source-byte mappings remain unchanged from PR1316.
 
+Incongruent spans traverse words backward and use an exclusive end index. When glyph wrapping starts the last row inside a word, its remaining glyphs are included in width admission. An empty fit ends at that partial-word boundary rather than the full word end, so a row with room only for the ellipsis cannot create an inverted glyph slice (cagents 357e4af2b).
+
 All eight upstream integration-test targets, both benchmarks, development
 dependencies, test profile, fonts and rendering fixtures remain available. The
 wrapped_ellipsis target adds the peer's three bundled-font regressions; the UI

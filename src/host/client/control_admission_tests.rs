@@ -235,15 +235,23 @@ fn an_exclusive_request_is_admitted_under_steady_request_traffic() {
     let fixture = fixture("exclusive-under-traffic");
     let gate = control_gate(&fixture.host);
     let running = Arc::new(AtomicBool::new(true));
+    // Each traffic thread reports once it is under way, so the exclusive
+    // request arrives into the traffic rather than before it starts.
+    let (flowing, started) = mpsc::channel();
     // Staggered shared requests keep the gate held at every instant, while
     // the typist keeps sending input through the same dispatcher.
     let requests = (0..3)
         .map(|offset| {
-            let (gate, running) = (Arc::clone(&gate), Arc::clone(&running));
+            let (gate, running, flowing) =
+                (Arc::clone(&gate), Arc::clone(&running), flowing.clone());
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(offset * 10));
+                let mut flowing = Some(flowing);
                 while running.load(Ordering::Relaxed) {
                     let _shared = gate.shared();
+                    if let Some(flowing) = flowing.take() {
+                        let _ = flowing.send(());
+                    }
                     thread::sleep(Duration::from_millis(30));
                 }
             })
@@ -252,17 +260,26 @@ fn an_exclusive_request_is_admitted_under_steady_request_traffic() {
     let typist = {
         let (host, running) = (Arc::clone(&fixture.host), Arc::clone(&running));
         let request = input(&fixture, b"x");
+        let mut flowing = Some(flowing);
         thread::spawn(move || {
             let mut accepted = 0_u32;
             while running.load(Ordering::Relaxed) {
                 let reply = process_request(&host, TYPIST, request.clone());
                 assert!(matches!(reply, Ok((ServerResponse::Accepted, _, _))));
                 accepted += 1;
+                if let Some(flowing) = flowing.take() {
+                    let _ = flowing.send(());
+                }
                 thread::sleep(Duration::from_millis(2));
             }
             accepted
         })
     };
+    for _ in 0..4 {
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request traffic did not start");
+    }
     let admitted = process_request(&fixture.host, OPERATOR, preflight());
     assert!(
         matches!(admitted, Ok((ServerResponse::ShutdownPreflight(_), _, _))),

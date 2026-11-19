@@ -504,3 +504,399 @@ fn a_refused_own_update_leaves_close_to_the_registrys_pane() {
         Some(Change::RemoveSource { before, .. }) if before == replacement
     ));
 }
+
+/// Closes `original` in this window and returns the Close it published.
+fn published_close(app: &mut Cagents, name: &str, original: &Pane) -> (uuid::Uuid, Scope, Change) {
+    let (tx, _published) = async_channel::unbounded();
+    app.workspace_model_tx = tx;
+    assert!(
+        app.capture_shared_removal(original.id),
+        "{name}: the close captures its source"
+    );
+    app.workspace.request_close(original.id).unwrap();
+    drop(app.commit_card_removal(original.id, None));
+    app.publish_view_changes();
+    app.shared_views
+        .pending
+        .iter()
+        .find_map(|(operation, scope, change)| {
+            matches!(change, Change::RemoveSource { before, .. } if before == original)
+                .then(|| (*operation, scope.clone(), change.clone()))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{name}: the close is published: pending {:?}, status {:?}, removals {:?}",
+                app.shared_views.pending,
+                app.status,
+                app.shared_views.removals.keys().collect::<Vec<_>>()
+            )
+        })
+}
+
+/// The registry refuses `change` and reports `view` as the scope it now
+/// holds, as the publisher delivers a refused Close or source update.
+fn registry_refuses(app: &mut Cagents, operation: uuid::Uuid, change: Change, mut view: View) {
+    use super::super::workspace_model_sync::ModelUpdate;
+    view.revision += 1;
+    let scope = view.scope.clone();
+    let identity = app.workspace_model.identity;
+    drop(
+        app.apply_workspace_model_update(ModelUpdate::ScopeConflicted {
+            identity: Some(identity),
+            scope,
+            operation,
+            change,
+            views: crate::workspace_model::delta::ViewChanges {
+                sequence: 1_000,
+                views: vec![view],
+                ..Default::default()
+            },
+            error: crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT.into(),
+        }),
+    );
+}
+
+fn notices(app: &Cagents) -> Vec<String> {
+    app.status
+        .iter()
+        .chain(app.notices.recent().map(|entry| &entry.notice))
+        .map(|notice| notice.message.to_string())
+        .collect()
+}
+
+/// Each pane a Close is tested on: a browser or a terminal, shown in its
+/// channel or in a worktree's own view.
+const CLOSE_CASES: [(&str, bool, bool); 4] = [
+    ("browser in a channel", false, false),
+    ("browser in a worktree", false, true),
+    ("terminal in a channel", true, false),
+    ("terminal in a worktree", true, true),
+];
+
+fn close_fixture(directory: &std::path::Path, terminal: bool, worktree: bool) -> (Cagents, Pane) {
+    let kind = terminal.then(moving_terminal_kind);
+    let (mut app, channel, _, mut pane) = channel_move_fixture_with_kind(kind);
+    if worktree {
+        let scope = Scope::Worktree {
+            repository: PathBuf::from("/repo/.git"),
+            path: PathBuf::from("/repo/worktree"),
+        };
+        pane.scope = Some(PathBuf::from("/repo/worktree"));
+        let view = app
+            .workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(channel))
+            .unwrap();
+        view.scope = scope.clone();
+        view.panes[0] = pane.clone();
+        // The registry and this window agree: the pane is the worktree's,
+        // and its old channel is empty.
+        let mut emptied = View::empty(channel);
+        emptied.revision = 17;
+        app.workspace_model.views.push(emptied);
+        app.shared_views.initialize(scope, vec![pane.clone()]);
+        app.shared_views.initialize(Scope::Channel(channel), vec![]);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            PathBuf::from("/repo/.git"),
+            vec![],
+            vec![],
+        ));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = None;
+        for channel in &mut durable.channels {
+            channel.cards.retain(|card| *card != pane.id);
+        }
+        durable
+            .card_scopes
+            .insert(pane.id, PathBuf::from("/repo/worktree"));
+        drop(app.reconcile_shared_views());
+    }
+    if let CardKind::Terminal(session) = &pane.kind {
+        // A live terminal's Close captures the worker it closes.
+        let owner = session.continuity.live_proof().unwrap();
+        let surface = crate::app::tests::unconnected_surface(directory, session.id);
+        surface.set_worker_receipt_for_test(&owner, uuid::Uuid::new_v4());
+        app.cards.insert(pane.id, CardRuntime::Terminal(surface));
+    }
+    // Only what the Close itself reports matters here.
+    app.status = None;
+    app.notices.entries.clear();
+    assert!(
+        app.workspace.order().any(|id| id == pane.id),
+        "terminal {terminal}, worktree {worktree}: the pane is shown"
+    );
+    (app, pane)
+}
+
+fn view_holding(app: &Cagents, scope: &Scope) -> View {
+    app.workspace_model
+        .views
+        .iter()
+        .find(|view| &view.scope == scope)
+        .unwrap()
+        .clone()
+}
+
+/// Projecting while a Close is on its way overlays it once, without
+/// reporting anything: the pane is simply gone (#2905).
+#[test]
+fn a_pending_close_projects_without_a_notice() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for (name, terminal, worktree) in CLOSE_CASES {
+        let (mut app, original) = close_fixture(directory.path(), terminal, worktree);
+        let (operation, ..) = published_close(&mut app, name, &original);
+        drop(app.reconcile_shared_views());
+        drop(app.reconcile_shared_views());
+        assert_eq!(notices(&app), Vec::<String>::new(), "{name}");
+        assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
+        assert!(
+            app.shared_views
+                .pending
+                .iter()
+                .any(|(id, ..)| *id == operation),
+            "{name}: the Close still waits for its answer"
+        );
+    }
+}
+
+/// Closing an agent's conversation retires its pane in the registry as
+/// well, which can land before this window's own Close is answered (#2905).
+#[test]
+fn a_close_retired_first_reports_nothing() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for (name, terminal, worktree) in CLOSE_CASES {
+        let (mut app, original) = close_fixture(directory.path(), terminal, worktree);
+        let (operation, scope, change) = published_close(&mut app, name, &original);
+        let mut retired = view_holding(&app, &scope);
+        retired.apply(&Change::Remove { id: original.id }).unwrap();
+        retired.revision += 1;
+        let held = app
+            .workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        *held = retired.clone();
+        drop(app.reconcile_shared_views());
+        registry_refuses(&mut app, operation, change, retired);
+        assert_eq!(notices(&app), Vec::<String>::new(), "{name}");
+        assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
+        assert!(
+            !app.shared_views
+                .pending
+                .iter()
+                .any(|(id, ..)| *id == operation),
+            "{name}"
+        );
+    }
+}
+
+/// A refused Close whose pane the registry no longer holds at all, as when
+/// its scope's last pane went with another window's edit, left the pane
+/// closed, as the person asked.
+#[test]
+fn a_refused_close_of_a_pane_already_gone_reports_nothing() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for (name, terminal, worktree) in CLOSE_CASES {
+        let (mut app, original) = close_fixture(directory.path(), terminal, worktree);
+        let (operation, scope, change) = published_close(&mut app, name, &original);
+        let mut gone = view_holding(&app, &scope);
+        gone.panes.clear();
+        registry_refuses(&mut app, operation, change, gone);
+        assert_eq!(notices(&app), Vec::<String>::new(), "{name}");
+        assert!(!app.workspace.order().any(|id| id == original.id), "{name}");
+    }
+}
+
+/// A Close the registry refused while it still holds the pane keeps the
+/// pane, and says so in plain words rather than as a session update.
+#[test]
+fn a_refused_close_keeps_the_pane_and_says_so() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for (name, terminal, worktree) in CLOSE_CASES {
+        let (mut app, original) = close_fixture(directory.path(), terminal, worktree);
+        let (operation, scope, change) = published_close(&mut app, name, &original);
+        let held = view_holding(&app, &scope);
+        assert!(held.panes.contains(&original), "{name}");
+        registry_refuses(&mut app, operation, change, held);
+        // A worktree's pane comes back only once something shows that
+        // worktree again, so the notice says only that it may.
+        let shown = app.workspace.order().any(|id| id == original.id);
+        assert_eq!(shown, !worktree, "{name}");
+        let expected = if shown {
+            PANE_KEPT
+        } else {
+            PANE_KEPT_ELSEWHERE
+        };
+        assert_eq!(notices(&app), [expected.to_owned()], "{name}");
+        assert!(
+            app.card_state(original.id)
+                .is_some_and(|card| card.existence.is_open()),
+            "{name}"
+        );
+        assert!(
+            !app.shared_views
+                .pending
+                .iter()
+                .any(|(id, ..)| *id == operation),
+            "{name}"
+        );
+    }
+}
+
+/// A Close the registry refuses without reporting the scope, as when its
+/// resend waited too long, says only what happened to the pane: kept while
+/// the observed view still holds it, nothing once it is gone. The
+/// registry's own wording stays in the trace.
+#[test]
+fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
+    use super::super::workspace_model_sync::ModelUpdate;
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for retired in [false, true] {
+        let (mut app, original) = close_fixture(directory.path(), false, false);
+        let (operation, scope, _) = published_close(&mut app, "browser in a channel", &original);
+        if retired {
+            let held = app
+                .workspace_model
+                .views
+                .iter_mut()
+                .find(|view| view.scope == scope)
+                .unwrap();
+            held.apply(&Change::Remove { id: original.id }).unwrap();
+            held.revision += 1;
+            drop(app.reconcile_shared_views());
+        }
+        drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+            scope,
+            operation,
+            error: "The pane change waited too long for the daemon to be resent".into(),
+        }));
+        let expected: Vec<String> = if retired {
+            Vec::new()
+        } else {
+            vec![PANE_KEPT.to_owned()]
+        };
+        assert_eq!(notices(&app), expected, "retired={retired}");
+        assert_eq!(
+            app.workspace.order().any(|id| id == original.id),
+            !retired,
+            "retired={retired}"
+        );
+        assert!(
+            !app.shared_views
+                .pending
+                .iter()
+                .any(|(id, ..)| *id == operation),
+            "retired={retired}"
+        );
+    }
+}
+
+/// A terminal whose shell this Close already ended can't be closed again
+/// until #3266, so its kept notice doesn't ask; a terminal still running
+/// keeps the request. Both arrive through the registry's refusal and
+/// through this window's own check of the source it captured.
+#[test]
+fn a_kept_terminal_asks_to_be_closed_again_only_while_its_shell_runs() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for ended in [false, true] {
+        let expected = if ended {
+            ENDED_TERMINAL_KEPT
+        } else {
+            PANE_KEPT
+        };
+        let (mut app, original) = close_fixture(directory.path(), true, false);
+        let (operation, scope, change) =
+            published_close(&mut app, "terminal in a channel", &original);
+        if ended {
+            app.closed_terminal_cards.insert(original.id);
+        }
+        let held = view_holding(&app, &scope);
+        registry_refuses(&mut app, operation, change, held);
+        assert_eq!(notices(&app), [expected.to_owned()], "ended={ended}");
+
+        let (mut app, original) = close_fixture(directory.path(), true, false);
+        if ended {
+            app.closed_terminal_cards.insert(original.id);
+        }
+        app.shared_removal_refused(original.id);
+        assert_eq!(notices(&app), [expected.to_owned()], "ended={ended}");
+    }
+}
+
+/// When the pane changed to a successor in the registry, as another window
+/// navigating it does, the Close is refused and the successor is shown.
+#[test]
+fn a_close_refused_for_a_successor_shows_it_and_says_so() {
+    let (mut app, channel, _, original) = channel_move_fixture();
+    let (operation, scope, change) = published_close(&mut app, "browser in a channel", &original);
+    let mut successor = view_holding(&app, &scope);
+    let CardKind::Browser(browser) = &mut successor.panes[0].kind else {
+        panic!("browser fixture")
+    };
+    browser.current_url = "https://example.com/next".parse().unwrap();
+    let shown = successor.panes[0].kind.clone();
+    assert_eq!(scope, Scope::Channel(channel));
+    registry_refuses(&mut app, operation, change, successor);
+    assert_eq!(notices(&app), [PANE_KEPT.to_owned()]);
+    assert!(app.workspace.order().any(|id| id == original.id));
+    assert_eq!(app.card_state(original.id).unwrap().kind, shown);
+}
+
+/// A terminal's refused source update says nothing once the person has
+/// closed its pane, and plainly that the pane changed elsewhere while it is
+/// still shown.
+#[test]
+fn a_refused_terminal_source_update_speaks_only_for_a_shown_pane() {
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    for close in [false, true] {
+        for (name, terminal, worktree) in CLOSE_CASES {
+            let (mut app, original) = close_fixture(directory.path(), terminal, worktree);
+            if !matches!(original.kind, CardKind::Terminal(_)) {
+                continue;
+            }
+            let scope = app
+                .workspace_model
+                .views
+                .iter()
+                .find(|view| view.panes.iter().any(|pane| pane.id == original.id))
+                .unwrap()
+                .scope
+                .clone();
+            let mut updated = original.clone();
+            updated.pending_terminal_start = true;
+            let change = Change::UpdateTerminalSource {
+                before: original.clone(),
+                pane: updated,
+                worker: views::TerminalRemovalBasis::Absent {
+                    owner: HostSessionProof {
+                        host_session_id: "fixture".into(),
+                        boot_id: "boot".into(),
+                        host_incarnation: "incarnation".into(),
+                    },
+                    latest_worker: None,
+                    history_epoch: 0,
+                },
+            };
+            let operation = uuid::Uuid::new_v4();
+            app.shared_views
+                .pending
+                .push((operation, scope.clone(), change.clone()));
+            if close {
+                published_close(&mut app, name, &original);
+            }
+            let held = view_holding(&app, &scope);
+            registry_refuses(&mut app, operation, change, held);
+            let expected: &[&str] = if close {
+                &[]
+            } else {
+                &[PANE_CHANGED_ELSEWHERE]
+            };
+            assert_eq!(notices(&app), expected, "{name}, closed {close}");
+        }
+    }
+}
