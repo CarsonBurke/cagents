@@ -1704,9 +1704,11 @@ mod tests {
             antigravity.home_directory(&environment(&[("HOME", "/home/a")])),
             Some(PathBuf::from("/home/a/.gemini"))
         );
+        // Its launches resolve that home on their own; with no variable to
+        // export, binding a recipe to it leaves the recipe unchanged.
         assert_eq!(
             antigravity.launch_home_in(&environment(&[("HOME", "/home/a")])),
-            None
+            Some(PathBuf::from("/home/a/.gemini"))
         );
         assert_eq!(claude.probe_environment(), None);
         // The system Claude login exports no home of its own, so the CLI
