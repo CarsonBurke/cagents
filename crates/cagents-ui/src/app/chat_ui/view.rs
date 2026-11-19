@@ -3898,7 +3898,8 @@ impl Runtime {
                                     .spacing(step::GAP_XS)
                                     .padding([0, step::GAP_M as u16])
                                     .into()
-                            })),
+                            }))
+                            .chain(self.attachment_notice_view()),
                     )
                     .spacing(step::GAP_XS)
                     .into(),
@@ -5718,6 +5719,28 @@ impl Runtime {
         } else {
             description
         }
+    }
+
+    fn attachment_notice_view(&self) -> Option<Element<'_, Message>> {
+        let notice = self.attachment_notice.as_deref()?;
+        Some(
+            widget::row::with_children(vec![
+                design::caption(notice)
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .width(Length::Fill)
+                    .into(),
+                small_icon(
+                    Icon::Close,
+                    "Dismiss",
+                    Action::DismissAttachmentNotice(self.target),
+                ),
+            ])
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center)
+            .padding([0, step::GAP_M as u16])
+            .into(),
+        )
     }
 
     /// Says, where the queue was, that what a provider which did not come
