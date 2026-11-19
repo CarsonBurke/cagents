@@ -5725,6 +5725,9 @@ pub struct Cagents {
     /// numbers against, pinned as `card_indices_source` is.
     terminal_ordinals_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
+    /// Where each folder Projects lists sits, for the inspectors' activity
+    /// blocks to name a pane's place without scanning every project.
+    place_index: inspector_activity::PlaceIndex,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     /// Where each open pane is on screen and what its runtime holds. Both
@@ -16061,6 +16064,7 @@ impl Application for Cagents {
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
+            place_index: inspector_activity::PlaceIndex::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
             presence: HashMap::new(),

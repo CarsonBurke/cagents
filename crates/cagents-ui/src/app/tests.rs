@@ -11259,6 +11259,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         card_indices_source: std::sync::Weak::new(),
         terminal_ordinals_source: std::sync::Weak::new(),
         navigation_cache: sidebar::NavigationCache::default(),
+        place_index: inspector_activity::PlaceIndex::default(),
         palette: palette_ui::State::default(),
         recently_closed: Vec::new(),
         presence: HashMap::new(),
