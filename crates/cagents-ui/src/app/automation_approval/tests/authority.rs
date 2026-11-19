@@ -91,40 +91,38 @@ fn private_listener() -> UnixListener {
 
 fn accept_request(listener: &UnixListener) -> (UnixStream, ClientEnvelope) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let (mut peer, _) = loop {
-            match listener.accept() {
-                Ok(accepted) => break accepted,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "App did not connect");
-                    thread::sleep(Duration::from_millis(2));
-                }
-                Err(error) => panic!("private listener: {error}"),
+    let (mut peer, _) = loop {
+        match listener.accept() {
+            Ok(accepted) => break accepted,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "App did not connect");
+                thread::sleep(Duration::from_millis(2));
             }
-        };
-        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        peer.set_write_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-        assert!(matches!(hello.request, ClientRequest::Connect { .. }));
-        assert!(hello.proof.is_none());
-        reply(
-            &mut peer,
-            &hello,
-            ServerMessage::Response {
-                response: ServerResponse::Connected {
-                    proof: proof(),
-                    resumed: Vec::new(),
-                },
+            Err(error) => panic!("private listener: {error}"),
+        }
+    };
+    peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    peer.set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+    assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+    assert!(hello.proof.is_none());
+    reply(
+        &mut peer,
+        &hello,
+        ServerMessage::Response {
+            response: ServerResponse::Connected {
+                proof: proof(),
+                resumed: Vec::new(),
             },
-        );
-        // A connection that only handshakes would be a separate readiness
-        // probe; readiness hands its connection to the request instead.
-        let request = read_frame::<ClientEnvelope>(&mut peer)
-            .unwrap()
-            .expect("no separate readiness handshake or User fallback");
-        return (peer, request);
-    }
+        },
+    );
+    // A connection that only handshakes would be a separate readiness
+    // probe; readiness hands its connection to the request instead.
+    let request = read_frame::<ClientEnvelope>(&mut peer)
+        .unwrap()
+        .expect("no separate readiness handshake or User fallback");
+    (peer, request)
 }
 
 struct Peer {
@@ -394,7 +392,7 @@ fn exercise_app() {
     // the daemon ready, starting it when it is gone.
     let readiness = !scoped && std::env::var(ROLE).as_deref() != Ok("user-no-start");
     for approved in [None, Some(false), Some(true)] {
-        let error = absent_daemon_error(&runtime, approved);
+        let error = absent_daemon_error(&runtime, approved, None);
         assert_eq!(
             error.contains(&request_failure::update_refusal()),
             readiness,
@@ -422,13 +420,21 @@ fn effect(app: &mut Cagents, proposal: &Proposal, approved: Option<bool>) -> Tas
 }
 
 /// What the `approved` effect reports with the daemon gone from its stale
-/// socket while the update launch fence is held. Starts no daemon.
-fn absent_daemon_error(runtime: &tokio::runtime::Runtime, approved: Option<bool>) -> String {
+/// socket while the update launch fence is held. Starts no daemon. A read
+/// given the `kept` connection finds it closed and reconnects.
+fn absent_daemon_error(
+    runtime: &tokio::runtime::Runtime,
+    approved: Option<bool>,
+    kept: Option<transport::Connection>,
+) -> String {
     let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
     assert!(UnixStream::connect(&socket).is_err(), "the daemon is gone");
     let _fence = request_failure::hold_launch_fence();
     let (mut app, proposal) = reviewing();
     let task = effect(&mut app, &proposal, approved);
+    // Seeded after `effect`, which may cancel and so drop a kept reader.
+    let reconnects = kept.is_some();
+    *app.automation_approval.reader.lock().unwrap() = kept;
     let error = match complete(runtime, task) {
         Action::Read { result, .. } => result.as_ref().as_ref().unwrap_err().clone(),
         Action::Finished { result, .. } => result.as_ref().as_ref().unwrap_err().clone(),
@@ -438,7 +444,35 @@ fn absent_daemon_error(runtime: &tokio::runtime::Runtime, approved: Option<bool>
         UnixStream::connect(&socket).is_err(),
         "no daemon was started"
     );
+    if reconnects {
+        assert!(
+            app.automation_approval.reader.lock().unwrap().is_none(),
+            "the closed connection was given up for a new one"
+        );
+    }
     error
+}
+
+/// A connection, made by `authority`, whose daemon has since closed it.
+fn closed_connection(authority: Authority) -> transport::Connection {
+    let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+    let server = thread::spawn(move || {
+        let hello: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+        reply(
+            &mut server_stream,
+            &hello,
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof(),
+                    resumed: Vec::new(),
+                },
+            },
+        );
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+    let client = crate::control::ControlClient::from_stream(client_stream).unwrap();
+    server.join().unwrap();
+    transport::Connection::from_client(client, authority)
 }
 
 /// Drive event-owed App reads across refusal, reuse, and daemon disconnect.
@@ -458,7 +492,7 @@ fn exercise_cache(role: &str) {
     let (mut app, proposal) = reviewing();
     drop(app.cancel_automation_approval());
     app.automation_approval.available = None;
-    let (peer, closure) = Peer::cached_reads(proposal.clone(), authority);
+    let (peer, closure) = Peer::cached_reads(proposal.clone(), authority.clone());
     for read in 0..3 {
         if read == 2 {
             // The second reply can reach the App before the server closes.
@@ -505,9 +539,8 @@ fn exercise_cache(role: &str) {
     }
     drop(app);
     peer.finished();
-    // The replacement connection is made as the first one is, through the
-    // read's own connect, so its route shows the same way.
-    let error = absent_daemon_error(&runtime, None);
+    // A read whose kept connection closed reconnects under the same policy.
+    let error = absent_daemon_error(&runtime, None, Some(closed_connection(authority)));
     assert_eq!(
         error.contains(&request_failure::update_refusal()),
         role == "user",

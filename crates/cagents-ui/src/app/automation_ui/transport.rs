@@ -22,6 +22,12 @@ pub(in crate::app) struct Connection {
 }
 
 impl Connection {
+    /// A connection a fixture made itself, such as one whose daemon is gone.
+    #[cfg(test)]
+    pub(in crate::app) fn from_client(client: ControlClient, authority: Authority) -> Self {
+        Self { client, authority }
+    }
+
     pub(in crate::app) fn proof(&self) -> &crate::model::HostSessionProof {
         self.client.proof()
     }
