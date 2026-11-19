@@ -104,7 +104,8 @@ impl FailureRequest {
     }
 }
 
-/// The item of `snapshot` whose whole text `source` copies.
+/// The item of `snapshot` whose whole text `source` copies. Its text may
+/// have grown since `source` was captured.
 fn item_with_source<'a>(
     snapshot: &'a Snapshot,
     source: &chat::TextCopySource,
@@ -122,9 +123,11 @@ fn item_with_source<'a>(
             snapshot.text_copy_sources.children.get(id)?,
         ),
     };
-    let index = sources
-        .iter()
-        .position(|candidate| candidate.as_ref() == Some(source))?;
+    let index = sources.iter().position(|candidate| {
+        candidate
+            .as_ref()
+            .is_some_and(|current| compatible(source, current))
+    })?;
     items.get(index).map(AsRef::as_ref)
 }
 
@@ -900,6 +903,31 @@ mod tests {
         let started = read_by(task, target);
         assert_eq!(started.source, request.source);
         assert_eq!(started.prefix, "cargo build");
+    }
+
+    /// A publication can be handled before a copy captured from the
+    /// interface it replaced. Output appended in it leaves the copy valid.
+    #[test]
+    fn a_step_copy_starts_when_its_output_grew_before_the_copy_was_handled() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            let grown = chat::TextCopySource {
+                bytes: request.source.bytes + 1024,
+                ..request.source.clone()
+            };
+            publish(&handle, &scope, Some((step("cargo build"), grown)));
+            app.chat_runtime_mut(target).unwrap().refresh();
+            let task = app.start_message_copy(
+                target,
+                "step".into(),
+                Some(CopyPart::Text),
+                Some(request.source.clone()),
+            );
+            let started = read_by(task, target);
+            assert_eq!(started.source, request.source, "{scope:?}");
+            assert_eq!(started.prefix, "cargo build", "{scope:?}");
+        }
     }
 
     /// A conversation item's ID can repeat in the window: a long message's
