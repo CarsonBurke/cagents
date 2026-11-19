@@ -179,7 +179,7 @@ evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/
 evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
 evidence drive click 'Locale cache work' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
-evidence drive move 1,1 >/dev/null
+evidence drive hover 1,1 >/dev/null
 # Open the pane's inspector (Ctrl+Shift+I) unless it already is.
 observed=$(evidence drive observe)
 if ! grep -Eq 'Source control|Work [0-9]' <<<"$observed"; then
@@ -196,7 +196,7 @@ sleep 3
 evidence shot work-populated
 evidence drive click 'Mentioned' >/dev/null
 sleep 1
-evidence drive move 1,1 >/dev/null
+evidence drive hover 1,1 >/dev/null
 evidence shot work-mentioned
 # A seed saved after this should not keep GitHub slow.
 evidence env sh -c 'rm -f "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge-delay"'
@@ -649,6 +649,16 @@ does not sandbox the real executable's network access.
 | --- | --- |
 | A populated saved Claude conversation before starting a provider | [`tests/fixtures/claude-resume-history.py`](#saved-claude-history) |
 | A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
+| A pane Close the registry refuses and keeps the pane through | [`.cagents-fixture-refuse-close`](#a-refused-pane-close) |
+
+### A refused pane close
+
+A debug daemon refuses the next pane Close as it refuses one whose pane
+changed while closing, when its `HOME` lies inside a native-evidence task and
+holds `.cagents-fixture-refuse-close`. The marker is removed, so the Close
+after it goes through. Create it between steps, for example with
+`scripts/native-evidence env sh -c 'touch "$HOME/.cagents-fixture-refuse-close"'`,
+then close a pane to see the window keep it and say so.
 
 ### Close a hosted legacy Codex actor without removing its pane
 

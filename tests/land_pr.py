@@ -163,14 +163,42 @@ class LandTests(unittest.TestCase):
     def status(self, *answers):
         (self.root / "status.json").write_text(json.dumps(list(answers)))
 
-    def advance_main(self, path="shared.txt", text="two\n"):
+    def write_protocol(self, where, protocol, proven, recordings):
+        (where / "src/terminal/ipc").mkdir(parents=True, exist_ok=True)
+        (where / "src/terminal/ipc.rs").write_text(
+            f"pub const PROTOCOL_VERSION: u16 = {protocol};\n")
+        clients = [f"const C{index}: OlderClient = OlderClient {{\n    proven_at: {value},\n}};\n"
+                   for index, value in enumerate(proven)]
+        # Leave stable context between the proof main updates and an added client.
+        separator = "\nconst OTHER_VERSIONS: &[u16] = &[\n" + "".join(
+            f"    {version},\n" for version in range(8)) + "];\n\n"
+        (where / "src/terminal/ipc/older_clients.rs").write_text(
+            clients[0] + separator + "".join(clients[1:]))
+        (where / "tests/fixtures/wire-formats").mkdir(parents=True, exist_ok=True)
+        for recording in recordings:
+            (where / f"tests/fixtures/wire-formats/{recording}.json").write_text("")
+        self.commit(f"test: record protocol {protocol} and older-client proofs", where)
+
+    def protocol_feature(self):
+        self.git(self.repo, "switch", "-q", "main")
+        self.write_protocol(self.repo, 5, [5], [5])
+        self.git(self.repo, "push", "-q", "origin", "main")
+        self.git(self.repo, "switch", "-q", "feature")
+        self.git(self.repo, "merge", "-q", "--no-edit", "main")
+        self.write_protocol(self.repo, 5, [5, 5], [5])
+        self.git(self.repo, "push", "-q", "origin", "feature")
+
+    def advance_main(self, path="shared.txt", text="two\n", protocol=None):
         """Land an unrelated or conflicting change on origin's main."""
         other = self.root / "other"
         if not other.exists():
             self.git(self.root, "clone", "-q", str(self.origin), str(other))
         self.git(other, "pull", "-q", "origin", "main")
-        (other / path).write_text(text)
-        self.commit("chore: move main", other)
+        if protocol is None:
+            (other / path).write_text(text)
+            self.commit("chore: move main", other)
+        else:
+            self.write_protocol(other, *protocol)
         self.git(other, "push", "-q", "origin", "main")
 
     def run_land(self, *args):
@@ -198,6 +226,42 @@ class LandTests(unittest.TestCase):
         self.assertEqual(merged["commit_message"], "* feat: add a feature\n\nWhy it matters.")
         self.assertEqual(self.remote_head(), head)
         self.assertIn("landed #7", self.output)
+
+    def test_a_protocol_bump_on_main_after_ci_refuses_the_landing(self):
+        self.protocol_feature()
+        head = self.remote_head()
+        original = land.wait_for_ci
+
+        def main_moves_after_ci(*args):
+            verdict = original(*args)
+            self.advance_main(protocol=(6, [6], [5, 6]))
+            return verdict
+
+        with patch.object(land, "wait_for_ci", main_moves_after_ci):
+            self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertIn("fails the older-client check", self.output)
+        self.assertIn("proven at protocol 5, not 6", self.output)
+        self.assertEqual(self.remote_head(), head)
+        self.assertIsNone(self.merged())
+
+    def test_a_current_protocol_lands(self):
+        self.protocol_feature()
+        head = self.remote_head()
+        self.assertEqual(self.run_land(), 0, self.output)
+        self.assertEqual(self.merged()["sha"], head)
+        self.assertEqual(self.remote_head(), head)
+
+    def test_a_dry_run_reports_the_older_client_refusal(self):
+        self.protocol_feature()
+        self.advance_main(protocol=(6, [6], [5, 6]))
+        head = self.remote_head()
+        main = self.git(self.origin, "rev-parse", "refs/heads/main")
+        self.assertEqual(self.run_land("--dry-run"), land.REFUSED, self.output)
+        self.assertIn("fails the older-client check", self.output)
+        self.assertIn("proven at protocol 5, not 6", self.output)
+        self.assertEqual(self.remote_head(), head)
+        self.assertEqual(self.git(self.origin, "rev-parse", "refs/heads/main"), main)
+        self.assertIsNone(self.merged())
 
     def test_waits_through_pending_and_unknown_checks(self):
         # One clock for the fake's reads and land-pr's waits, so each wait is
@@ -561,6 +625,23 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.git(self.origin, "rev-parse", f"{new}^1"), old)
         self.assertEqual(self.merge_attempts(), [old, new])
         self.assertIn("now conflicts with main", self.output)
+
+    def test_a_protocol_bump_while_merging_is_checked_before_the_retry(self):
+        self.protocol_feature()
+        head = self.remote_head()
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}]))
+        original = land.merge
+
+        def main_moves_during_the_merge(*args):
+            if not self.merge_attempts():
+                self.advance_main(protocol=(6, [6], [5, 6]))
+            return original(*args)
+
+        with patch.object(land, "merge", main_moves_during_the_merge):
+            self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertIn("fails the older-client check", self.output)
+        self.assertEqual(self.merge_attempts(), [head])
+        self.assertIsNone(self.merged())
 
     def test_a_conflict_github_was_still_computing_takes_the_conflict_path(self):
         old = self.remote_head()

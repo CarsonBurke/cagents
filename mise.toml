@@ -145,6 +145,11 @@ run = [
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.ui}} --lib --bins --examples ;; esac',
 ]
 
+[tasks."test:contracts"]
+description = "Test the focused vendored-crate contract packages"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" help="Additional Cargo arguments, after --"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test --locked -p cagents-iced-contracts -p cagents-cosmic-text-contracts "$@"'
+
 [tasks.test]
 description = "Test every target of the CLI, host and UI lanes, one lane after another"
 # In sequence: each lane's tests run outside the build slot, and three suites

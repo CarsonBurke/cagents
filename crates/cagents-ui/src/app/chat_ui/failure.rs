@@ -1560,7 +1560,7 @@ impl Runtime {
         let mut rows = vec![
             widget::row::with_children(vec![
                 crate::ui_controls::passive_icon(Icon::Warning, design::LEADING_ICON_SIZE),
-                design::body(if let Some(reopen) = blocked_start {
+                design::transcript(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
                         reopen.draft_headline()
                     } else {

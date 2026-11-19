@@ -1593,7 +1593,7 @@ fn report_surface(runtime: &Runtime, id: &str) -> ReportSurface {
     let mut element = runtime.delivery_view(
         item,
         &runtime.presentation_cache()[id],
-        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
     );
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
@@ -1669,16 +1669,23 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .accessible
                 .contains(&format!("Show delivery details: {heading}"))
         );
-        assert!(surface.accessible.contains(&"Copy this message".to_owned()));
-        let title = heading.strip_suffix(outcome).unwrap();
+        // A closed report is a line of the timeline, like a closed step: its
+        // message actions come with its detail, and Copy still publishes the
+        // original bytes below.
+        assert!(
+            !surface.accessible.contains(&"Copy this message".to_owned()),
+            "a closed report reserves no action footer"
+        );
+        // The row names the agent, without the heading's "Agent" and
+        // quotes, which its tooltip and accessible name keep.
         assert_eq!(
             surface
                 .text
                 .iter()
-                .filter(|text| text.as_str() == title)
+                .filter(|text| text.as_str() == long_name)
                 .count(),
             1,
-            "the single-line title keeps its source for overflow fading"
+            "the single-line name keeps its source for overflow fading"
         );
         assert_eq!(
             surface
@@ -1686,8 +1693,9 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .iter()
                 .filter(|text| text.as_str() == outcome.trim())
                 .count(),
-            1,
-            "the outcome stays in its own trailing cell at narrow widths"
+            0,
+            "a name too long for the pane keeps the room its outcome would take, \
+             and the outcome is still read in the row's accessible name"
         );
         assert!(
             !surface.text.iter().any(|text| text == "Copy report"),
@@ -1736,6 +1744,70 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
             "Copy must not parse hidden Markdown"
         );
     }
+}
+
+/// A delivery with nothing to open is only its row, so the row itself
+/// offers the message's copy and time on hover, as any message does, and
+/// reserves the room for them in the transcript and in an agent's.
+#[test]
+fn a_delivery_that_cannot_open_keeps_its_copy_and_time() {
+    let mut quiet = task_report(
+        "quiet-report",
+        "Agent \"Quiet\" finished".into(),
+        String::new(),
+    );
+    if let ItemContent::Delivery { sender, .. } = &mut quiet.content {
+        sender.clear();
+    }
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&quiet));
+    let surface = report_surface(&runtime, "quiet-report");
+    assert!(
+        !surface
+            .accessible
+            .iter()
+            .any(|text| text.starts_with("Show delivery details")),
+        "nothing to open: {:?}",
+        surface.accessible
+    );
+    assert!(
+        surface.accessible.contains(&"Copy this message".to_owned()),
+        "{:?}",
+        surface.accessible
+    );
+    assert!(runtime.delivery_carries_actions(runtime.active_item("quiet-report").unwrap()));
+}
+
+/// An agent that ended with nothing to report arrives as a notice under a
+/// report's heading. Its row names the agent and its outcome as a report's
+/// does, not the provider's `Agent "…"` wording, and, having nothing to
+/// open, keeps its copy and time.
+#[test]
+fn an_agent_notice_reads_as_its_report() {
+    let mut notice = task_report(
+        "quiet-notice",
+        "Agent \"Quiet\" finished".into(),
+        String::new(),
+    );
+    if let ItemContent::Delivery { kind, .. } = &mut notice.content {
+        *kind = chat::DeliveryKind::Notice;
+    }
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&notice));
+    let surface = report_surface(&runtime, "quiet-notice");
+    assert!(
+        surface.text.contains(&"Quiet".to_owned()) && surface.text.contains(&"finished".to_owned()),
+        "{:?}",
+        surface.text
+    );
+    assert!(
+        !surface.text.iter().any(|text| text.contains("Agent \"")),
+        "{:?}",
+        surface.text
+    );
+    assert!(
+        surface.accessible.contains(&"Copy this message".to_owned()),
+        "{:?}",
+        surface.accessible
+    );
 }
 
 #[test]
@@ -1806,7 +1878,7 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                 surface
                     .text
                     .iter()
-                    .filter(|text| text.as_str() == "Agent \"Detailed review\"")
+                    .filter(|text| text.as_str() == "Detailed review")
                     .count(),
                 1,
                 "expansion retains one title rather than repeating the full heading"
@@ -1848,6 +1920,12 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
             assert!(!cached.source.provisional());
             assert_eq!(cached.source.retained_tail_capacity(), 0);
             let collapsed = report_surface(live, "disclosed-report");
+            assert!(
+                !collapsed
+                    .accessible
+                    .contains(&"Copy this message".to_owned()),
+                "closing the detail takes its actions with it"
+            );
             assert!(
                 !collapsed
                     .text
@@ -2090,7 +2168,7 @@ fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable(
                 let mut element = live.delivery_view(
                     &delivered,
                     &live.presentation_cache()[&delivered.id],
-                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+                    design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT),
                 );
                 let mut tree = Tree::new(element.as_widget());
                 let node = element.as_widget_mut().layout(

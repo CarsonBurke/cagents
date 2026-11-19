@@ -712,6 +712,22 @@ fn limit_matches(summary: &str, window: &UsageWindow) -> bool {
 
 impl Cagents {
     pub(super) fn usage_reset_controls(&self, state: &AccountState) -> Option<Controls> {
+        self.reset_controls(
+            state,
+            || self.account_ui.display_name(state),
+            || self.account_ui.login_conflict(state).is_none(),
+        )
+    }
+
+    /// [`Self::usage_reset_controls`], given how to name `state` and
+    /// whether another login contradicts it, which a conversation's view
+    /// reads from its account choices rather than working out each frame.
+    fn reset_controls(
+        &self,
+        state: &AccountState,
+        name: impl FnOnce() -> String,
+        conflict_free: impl FnOnce() -> bool,
+    ) -> Option<Controls> {
         let snapshot = state.snapshot.as_ref()?;
         let checking = state.queued == Some(Trigger::Limit)
             || state
@@ -733,9 +749,13 @@ impl Cagents {
         {
             return None;
         }
+        let recoverable = state.present
+            && !state.reset.in_flight()
+            && conflict_free()
+            && !self.account_sign_in_running(&state.account);
         Some(Controls {
             id: state.id.clone(),
-            name: self.account_ui.display_name(state),
+            name: name(),
             snapshot: snapshot.clone(),
             state: reset_state,
             identity: state.identity.clone(),
@@ -743,17 +763,11 @@ impl Cagents {
             limit_context: false,
             surface: "accounts".into(),
             now: self.account_ui.now_ms,
-            recovery_enabled: state.present
-                && !state.reset.in_flight()
-                && self.account_ui.login_conflict(state).is_none()
-                && !self.account_sign_in_running(&state.account),
-            enabled: state.present
+            recovery_enabled: recoverable,
+            enabled: recoverable
                 && !checking
-                && !state.reset.in_flight()
                 && state.failure.is_none()
-                && !is_stale(snapshot, self.account_ui.now_ms)
-                && self.account_ui.login_conflict(state).is_none()
-                && !self.account_sign_in_running(&state.account),
+                && !is_stale(snapshot, self.account_ui.now_ms),
         })
     }
 
@@ -763,7 +777,11 @@ impl Cagents {
         recipe: &LaunchRecipe,
     ) -> Option<Controls> {
         let running = self.running_account(provider, recipe)?;
-        self.usage_reset_controls(self.account_ui.account(&running.id)?)
+        self.reset_controls(
+            self.account_ui.account(&running.id)?,
+            || running.label.clone(),
+            || running.conflict_free,
+        )
     }
 
     pub(super) fn start_usage_reset(
@@ -1091,6 +1109,50 @@ pub(in crate::app) mod tests {
             span_secs: None,
             binding: false,
         }
+    }
+
+    #[test]
+    fn a_conversations_reset_controls_resolve_no_account_home_per_frame() {
+        let now = now_ms();
+        let id = Account::system(Provider::Claude).id();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![window(account::WindowKind::Session, "session", 0.9)];
+        snapshot.resets = vec![reset(ResetScope::AccountSession)];
+        let mut app = context_inspector_test_app(false);
+        // Another login of the same provider, which deciding whether this
+        // one is contradicted compares against.
+        app.account_ui.add_managed_fixture(Provider::Claude, 108);
+        let account = app.account_ui.account_mut(&id).unwrap();
+        account.present = true;
+        account.snapshot = Some(snapshot);
+        let recipe = LaunchRecipe {
+            unset_environment: Default::default(),
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: std::path::PathBuf::from("/w"),
+            environment: Default::default(),
+        };
+        let expected = app
+            .usage_reset_controls(app.account_ui.account(&id).unwrap())
+            .unwrap();
+        assert!(expected.enabled, "the reset can be spent");
+        app.account_ui
+            .settle_choices(app.settings.account_usage_display);
+        let resolved = super::super::home_resolutions();
+        for _ in 0..3 {
+            let controls = app
+                .chat_reset_controls(Provider::Claude, &recipe)
+                .expect("the conversation's account has a reset to offer");
+            assert_eq!(controls.id, id);
+            assert_eq!(controls.name, expected.name);
+            assert_eq!(controls.enabled, expected.enabled);
+            assert_eq!(controls.recovery_enabled, expected.recovery_enabled);
+        }
+        assert_eq!(
+            super::super::home_resolutions(),
+            resolved,
+            "a frame resolves no account's home"
+        );
     }
 
     /// A Claude account with one reset to spend on its nearly full session,

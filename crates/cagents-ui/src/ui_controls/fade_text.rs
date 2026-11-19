@@ -73,6 +73,7 @@ pub struct FadeText<'a> {
 #[derive(Clone, Copy)]
 enum Role {
     Body,
+    Transcript,
     Caption,
     Heading,
     Title,
@@ -99,6 +100,14 @@ impl<'a> FadeText<'a> {
         Self {
             role: Role::Caption,
             class: cosmic::theme::Text::Custom(design::muted_text),
+            ..fade_text(content)
+        }
+    }
+
+    /// A [`design::transcript`] line: a row of a conversation's transcript.
+    pub fn transcript(content: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            role: Role::Transcript,
             ..fade_text(content)
         }
     }
@@ -167,6 +176,7 @@ impl<'a, Message: 'a> From<FadeText<'a>> for Element<'a, Message> {
         let (content, cut) = within(one_line(text.content), text.limit);
         let mut line = match text.role {
             Role::Body => design::body(content),
+            Role::Transcript => design::transcript(content),
             Role::Caption => design::caption(content),
             Role::Heading => design::heading(content),
             Role::Title => design::title(content),

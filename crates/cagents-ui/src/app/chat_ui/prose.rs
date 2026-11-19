@@ -284,6 +284,10 @@ impl CodeBlock {
         }
     }
 
+    pub(super) fn is_settled(&self) -> bool {
+        self.tail.is_none()
+    }
+
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;
@@ -574,7 +578,7 @@ pub(super) fn items_for_test(
     }
     .items(
         items,
-        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
     )
 }
 
@@ -1382,6 +1386,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_new_block_is_settled_and_an_open_one_is_not() {
+        let theme = crate::settings::EditorSyntaxTheme::Mocha;
+        let code = "let value = 1;";
+        assert!(CodeBlock::new(Some("rust"), code, theme).is_settled());
+        assert!(!CodeBlock::open(Some("rust"), code, theme).is_settled());
+    }
+
+    #[test]
     fn ordered_tasks_keep_native_numbers_checked_state_and_copied_markers() {
         use iced::advanced::{Layout, layout, widget::Tree};
         use iced_accessibility::accesskit::Role;
@@ -1403,7 +1415,7 @@ mod tests {
             for width in [360.0, 900.0] {
                 let mut element = view(
                     &cached,
-                    design::markdown_settings(&theme, design::TEXT_PROSE),
+                    design::markdown_settings(&theme, design::TEXT_TRANSCRIPT),
                     target,
                     None,
                 );
@@ -1484,7 +1496,7 @@ mod tests {
             },
         ] {
             let mut settings =
-                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
             settings.style.font = font;
             assert_ne!(font, default_font, "fixture must expose renderer fallback");
             let mut element = view(&cached, settings, target, None);
@@ -1548,7 +1560,7 @@ mod tests {
             generation: 0,
         };
         for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
-            let settings = design::markdown_settings(&theme, design::TEXT_PROSE);
+            let settings = design::markdown_settings(&theme, design::TEXT_TRANSCRIPT);
             let line = iced::widget::text::LineHeight::default()
                 .to_absolute(settings.text_size)
                 .0 as f64;
@@ -1710,7 +1722,7 @@ mod tests {
         let before = markdown::materialized_bytes();
         let cache = flow_layout::Cache::default();
         let mut element = paragraph(
-            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
             text,
             Target {
                 card: CardId::new(),
@@ -1818,7 +1830,7 @@ mod tests {
             let cached = &runtime.cache["recursive-small-quotes"];
             let mut element = view(
                 cached,
-                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
                 target,
                 runtime.find.as_deref(),
             );
@@ -1968,7 +1980,7 @@ mod tests {
             let mut element = scroll::transcript(
                 view(
                     &cached,
-                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                    design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
                     target,
                     None,
                 ),
@@ -2378,7 +2390,7 @@ mod tests {
         );
         let mut element = view(
             &cached,
-            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+            design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
             Target {
                 card: CardId::new(),
                 generation: 0,
@@ -2411,7 +2423,7 @@ mod tests {
         })
         .join()
         .unwrap();
-        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
         let markdown::Item::Paragraph(text) = &content.items()[0] else {
             panic!("short linked paragraph")
         };
@@ -2511,7 +2523,8 @@ mod tests {
                 cached.markdown.items(),
                 [markdown::Item::Image { .. }]
             ));
-            let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+            let settings =
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
             let mut element = view(&cached, settings, target, None);
             let renderer = crate::app::tests::headless_renderer();
             let mut tree = Tree::new(element.as_widget());
@@ -2692,7 +2705,7 @@ mod tests {
     #[test]
     fn every_heading_level_differs_from_a_paragraph() {
         use markdown::HeadingLevel;
-        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT);
         for (level, size) in [
             (HeadingLevel::H1, settings.h1_size),
             (HeadingLevel::H2, settings.h2_size),

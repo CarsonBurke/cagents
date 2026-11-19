@@ -1303,6 +1303,122 @@ fn notification_observed_start_keeps_already_decoded_completion_for_exact_ack() 
 }
 
 #[test]
+fn a_history_page_answered_during_a_turn_start_does_not_take_a_held_stop() {
+    let mut adapter = adapter();
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    let history_id = history.writes[0]["id"].clone();
+    let submitted = adapter
+        .command(Command::Prompt {
+            text: "New turn".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    let start_id = submitted
+        .writes
+        .iter()
+        .find(|frame| frame["method"] == "turn/start")
+        .unwrap()["id"]
+        .clone();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    let stopped = adapter.command(Command::Interrupt).unwrap();
+    assert!(stopped.writes.is_empty());
+    let hydrated = adapter.receive(json!({"id":history_id,"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(
+        hydrated
+            .writes
+            .iter()
+            .all(|frame| frame["method"] != "turn/interrupt"),
+        "history must leave the held stop waiting for the new turn"
+    );
+    assert_eq!(adapter.held_stop(), HeldStop::Waiting);
+    assert!(adapter.turn.is_none());
+
+    let answered = adapter
+        .receive(json!({"id":start_id,"result":{"turn":{"id":"new"}}}))
+        .unwrap();
+    let interrupts = answered
+        .writes
+        .iter()
+        .filter(|frame| frame["method"] == "turn/interrupt")
+        .collect::<Vec<_>>();
+    assert_eq!(interrupts.len(), 1);
+    assert_eq!(interrupts[0]["params"]["turnId"], "new");
+    assert_eq!(adapter.held_stop(), HeldStop::Sent);
+}
+
+#[test]
+fn a_history_page_requested_during_a_turn_start_names_no_turn() {
+    let mut adapter = adapter();
+    adapter
+        .command(Command::Prompt {
+            text: "New turn".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    // Requested after the lifecycle moved, so only the unanswered start
+    // keeps the page's in-progress turn from being taken as the current one.
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+}
+
+#[test]
+fn history_names_the_newest_in_progress_turn_only() {
+    for (status, expected) in [("inProgress", Some("newer")), ("completed", None)] {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut history = Step::default();
+        adapter.history(&mut history, None).unwrap();
+        assert_eq!(history.writes[0]["params"]["sortDirection"], "desc");
+        adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"newer","status":status,"items":[]},{"id":"older","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+        assert_eq!(adapter.turn.as_deref(), expected);
+    }
+}
+
+#[test]
+fn an_earlier_history_page_never_names_the_current_turn() {
+    let mut adapter = adapter();
+    adapter.busy = true;
+    let mut history = Step::default();
+    adapter
+        .history(&mut history, Some("older-page".into()))
+        .unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+}
+
+#[test]
+fn a_history_page_requested_before_a_lifecycle_change_names_no_turn() {
+    let mut adapter = adapter();
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"other","status":"inProgress","items":[]}}})).unwrap();
+    adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"other","status":"completed","items":[]}}})).unwrap();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+    assert_eq!(
+        adapter.command(Command::Interrupt).err().as_deref(),
+        Some("There is no known active Codex turn to interrupt")
+    );
+}
+
+#[test]
+fn attach_still_names_its_active_turn() {
+    let mut adapter = adapter();
+    adapter
+        .pending
+        .insert(json!("attach").to_string(), Pending::Attach);
+    adapter.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[{"id":"newer","status":"inProgress","items":[]}],"nextCursor":null}}})).unwrap();
+    assert_eq!(adapter.turn.as_deref(), Some("newer"));
+}
+
+#[test]
 fn notification_history_and_scalar_idle_cannot_replace_exact_live_turn_proof() {
     let start = |id| {
         json!({"method":"turn/started","params":{"threadId":"thread-exact",
@@ -3496,6 +3612,60 @@ fn child_resume_without_embedded_turns_reads_history_and_settles_idle() {
             .any(|event| matches!(event, Event::SubagentItem { id, .. } if id == "child-exact"))
     );
     assert!(!adapter.child_buffer.contains_key("child-exact"));
+}
+
+#[test]
+fn active_child_history_fallback_names_the_newest_turn_to_stop() {
+    let mut parent = adapter();
+    let mut discovered = Step::default();
+    parent
+        .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+        .unwrap();
+    let resumed = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"},"turns":[]}}})).unwrap();
+    assert_eq!(resumed.writes[0]["method"], "thread/turns/list");
+    assert!(resumed.writes[0]["params"]["cursor"].is_null());
+    assert_eq!(resumed.writes[0]["params"]["sortDirection"], "desc");
+    assert!(parent.children["child-exact"].turn.is_none());
+    parent.receive(json!({"id":resumed.writes[0]["id"],"result":{"data":[{"id":"newer","status":"inProgress","items":[]},{"id":"older","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert_eq!(
+        parent.children["child-exact"].turn.as_deref(),
+        Some("newer")
+    );
+    let stopped = parent
+        .command(Command::StopSubagent {
+            id: "child-exact".into(),
+        })
+        .unwrap();
+    assert_eq!(stopped.writes.len(), 1);
+    assert_eq!(stopped.writes[0]["method"], "turn/interrupt");
+    assert_eq!(
+        stopped.writes[0]["params"],
+        json!({"threadId":"child-exact","turnId":"newer"})
+    );
+}
+
+#[test]
+fn active_child_history_fallback_with_completed_newest_turn_has_no_turn_to_stop() {
+    let mut parent = adapter();
+    let mut discovered = Step::default();
+    parent
+        .discover_child("child-exact", &json!({"status":"running"}), &mut discovered)
+        .unwrap();
+    let resumed = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child-exact","status":{"type":"active"},"turns":[]}}})).unwrap();
+    assert_eq!(resumed.writes[0]["method"], "thread/turns/list");
+    assert!(resumed.writes[0]["params"]["cursor"].is_null());
+    assert_eq!(resumed.writes[0]["params"]["sortDirection"], "desc");
+    parent.receive(json!({"id":resumed.writes[0]["id"],"result":{"data":[{"id":"newer","status":"completed","items":[]},{"id":"older","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(parent.children["child-exact"].turn.is_none());
+    assert_eq!(
+        parent
+            .command(Command::StopSubagent {
+                id: "child-exact".into(),
+            })
+            .err()
+            .as_deref(),
+        Some("This Codex subagent has no active turn to stop")
+    );
 }
 
 #[test]

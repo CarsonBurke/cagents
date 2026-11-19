@@ -1201,7 +1201,7 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
     assert_eq!(runtime.turns.len(), 2);
     let dark = cosmic::theme::is_dark();
     let settings =
-        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
+        crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_TRANSCRIPT);
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(
         runtime
