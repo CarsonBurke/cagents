@@ -1599,19 +1599,18 @@ impl Cagents {
                             } => Some(before.id),
                             _ => None,
                         });
-                    let kept = closed.map(|card| self.pane_kept_notice(card));
                     self.refuse_shared_view_edit(&scope, operation);
                     // The error is the registry's own wording, or a resend's
                     // deadline; the trace keeps it, and the person is told
                     // what happened to the pane.
-                    let (Some(card), Some(kept)) = (closed, kept) else {
+                    let Some(card) = closed else {
                         self.status = Some(TransientNotice::warning(
                             super::shared_views::PANE_CHANGE_NOT_SAVED,
                         ));
                         return self.reconcile_shared_views();
                     };
                     let projected = self.reconcile_shared_views();
-                    self.report_refused_close(&scope, operation, card, &error, kept);
+                    self.report_refused_close(&scope, operation, card, &error);
                     return projected;
                 }
                 self.reconcile_shared_views()

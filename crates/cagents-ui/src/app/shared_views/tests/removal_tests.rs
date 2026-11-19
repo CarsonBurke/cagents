@@ -796,35 +796,70 @@ fn a_close_refused_without_a_view_says_only_what_happened_to_the_pane() {
     }
 }
 
-/// A terminal whose shell this Close already ended can't be closed again
-/// until #3266, so its kept notice doesn't ask; a terminal still running
-/// keeps the request. Both arrive through the registry's refusal and
-/// through this window's own check of the source it captured.
+/// A terminal a refused Close kept can be closed again, at once or behind
+/// another pane's close. The refused Close had already ended its shell, so
+/// the kept pane mustn't still count as one whose removal is under way
+/// (#3266).
 #[test]
-fn a_kept_terminal_asks_to_be_closed_again_only_while_its_shell_runs() {
+fn a_terminal_kept_by_a_refused_close_can_be_closed_again() {
+    use crate::app::terminal_close::CloseOutcome;
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-    for ended in [false, true] {
-        let expected = if ended {
-            ENDED_TERMINAL_KEPT
-        } else {
-            PANE_KEPT
-        };
+    for queued in [false, true] {
         let (mut app, original) = close_fixture(directory.path(), true, false);
-        let (operation, scope, change) =
-            published_close(&mut app, "terminal in a channel", &original);
-        if ended {
-            app.closed_terminal_cards.insert(original.id);
-        }
+        let card = original.id;
+        let (tx, _published) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::CloseCard(card)));
+        let intent = app
+            .terminal_close
+            .clone()
+            .expect("the Close asks the daemon to end the terminal");
+        let authority = app.terminal_cleanup_authority(card);
+        let receipt = authority.receipt(authority.worker().cloned().unwrap());
+        drop(app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: CloseOutcome::ClosedWithBasis(receipt),
+        }));
+        drop(app.update(Message::CommitClose(card)));
+        app.publish_view_changes();
+        let (operation, scope, change) = app
+            .shared_views
+            .pending
+            .iter()
+            .find_map(|(operation, scope, change)| {
+                matches!(change, Change::RemoveSource { before, .. } if before.id == card)
+                    .then(|| (*operation, scope.clone(), change.clone()))
+            })
+            .expect("the Close is published");
         let held = view_holding(&app, &scope);
         registry_refuses(&mut app, operation, change, held);
-        assert_eq!(notices(&app), [expected.to_owned()], "ended={ended}");
+        assert_eq!(notices(&app), [PANE_KEPT.to_owned()], "queued={queued}");
+        assert!(
+            app.workspace.order().any(|id| id == card),
+            "queued={queued}"
+        );
+        assert!(
+            !app.closed_terminal_cards.contains(&card),
+            "queued={queued}: the kept pane is no longer closing"
+        );
 
-        let (mut app, original) = close_fixture(directory.path(), true, false);
-        if ended {
-            app.closed_terminal_cards.insert(original.id);
+        app.status = None;
+        app.notices.entries.clear();
+        if queued {
+            app.queue_card_close(card, false);
+            drop(app.next_queued_card_close());
+        } else {
+            drop(app.update(Message::CloseCard(card)));
         }
-        app.shared_removal_refused(original.id);
-        assert_eq!(notices(&app), [expected.to_owned()], "ended={ended}");
+        assert!(
+            app.pane_close_owned(card),
+            "queued={queued}: the second Close starts: status {:?}",
+            app.status
+        );
+        assert_eq!(notices(&app), Vec::<String>::new(), "queued={queued}");
     }
 }
 
