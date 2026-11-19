@@ -1210,7 +1210,6 @@ pub(super) fn execute_with_context(
     if let AgentCommand::Console { agent_id } = command {
         return run_console(agent_id);
     }
-    context.admit_remote()?;
     let mut session = Session::new(context);
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),

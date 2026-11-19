@@ -4708,6 +4708,68 @@ fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
 }
 
 #[test]
+fn a_linked_computers_session_reads_only_its_own_mail() {
+    use crate::{
+        agent_execution::{
+            Lineage,
+            mailbox::{Inbox, Message, Party, State as Delivery},
+        },
+        model::MessageId,
+    };
+
+    if isolated("a_linked_computers_session_reads_only_its_own_mail").is_some() {
+        return;
+    }
+    let (host, _, _) = fixture();
+    let registry = registry(&host).unwrap();
+    let peer = Lineage(TerminalId::new());
+    let message = |to: Party, body: &str| Message {
+        id: MessageId::new(),
+        from: Party {
+            lineage: Some(Lineage(TerminalId::new())),
+            session: None,
+            title: None,
+        },
+        to,
+        reply_to: None,
+        body: body.into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms: now(),
+    };
+    let personal = message(Party::user(), "For the person at this device");
+    let linked = message(
+        Party {
+            lineage: Some(peer),
+            session: None,
+            title: None,
+        },
+        "For the linked session",
+    );
+    {
+        let mut registry = registry.lock().unwrap();
+        registry.post_message(&personal).unwrap();
+        registry.post_message(&linked).unwrap();
+    }
+    let token = host.lock().unwrap().peers.issue(1, peer);
+    let Reply::Inbox(read) = process(
+        &host,
+        Authority::session(token),
+        Operation::PeekInbox(Inbox {
+            all: false,
+            replies_to: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("inbox reply");
+    };
+    assert_eq!(
+        read.iter().map(|message| message.id).collect::<Vec<_>>(),
+        vec![linked.id]
+    );
+}
+
+#[test]
 fn disconnected_blocked_inbox_poll_keeps_mail_pending() {
     use crate::{
         agent_execution::{

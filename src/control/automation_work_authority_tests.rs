@@ -325,10 +325,6 @@ fn exercise_remote() {
         assert!(crate::device::is_remote());
         assert_eq!(crate::device::selected().unwrap().name, "fixture-remote");
         assert_eq!(staged.get(), 0);
-        assert!(
-            !Path::new(&std::env::var_os(SSH_MARKER).unwrap()).exists(),
-            "scoped remote service must refuse before device preparation/SSH"
-        );
     }
 }
 
@@ -363,7 +359,7 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
         }
         let marker = private_root.join("ssh-called");
         let ssh = private_root.join("bin/ssh");
-        fs::write(&ssh, b"#!/bin/sh\nprintf 'unexpected ssh\\n' >> \"$CAGENTS_TEST_AUTOMATION_WORK_SSH_MARKER\"\nexit 1\n").unwrap();
+        fs::write(&ssh, b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; env; } >> \"$CAGENTS_TEST_AUTOMATION_WORK_SSH_MARKER\"\nexit 1\n").unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
         let stdout = private_root.join("stdout");
         let stderr = private_root.join("stderr");
@@ -450,7 +446,9 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
         for error in errors {
             assert_eq!(error["ok"], false);
             if role.starts_with("remote-") {
-                assert_eq!(error["error"]["kind"], "permission_denied");
+                // The session reaches the device, which this fixture's SSH
+                // cannot: a connection failure, not a refusal.
+                assert_eq!(error["error"]["kind"], "device", "{error}");
             } else {
                 assert_eq!(error["error"]["kind"], "protocol");
                 assert_eq!(
@@ -465,6 +463,14 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
                 );
             }
         }
-        assert!(!marker.exists());
+        if role.starts_with("remote-") {
+            let ssh = fs::read_to_string(&marker).expect("a hosted session reaches the device");
+            assert!(
+                !ssh.contains(TOKEN) && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
+                "SSH must never carry the session's capability: {ssh}"
+            );
+        } else {
+            assert!(!marker.exists());
+        }
     }
 }

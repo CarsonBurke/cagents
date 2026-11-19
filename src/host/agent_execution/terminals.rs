@@ -58,6 +58,15 @@ fn access(request: &ClientRequest) -> Access<'_> {
             | crate::work::Request::Snapshots { .. },
         )
         | R::WatchWork
+        // A linked computer's session resolves paths on this device as it
+        // starts agents; nothing else of a device's files is open to it.
+        | R::DeviceOperation {
+            operation:
+                crate::device_service::Operation::Home
+                | crate::device_service::Operation::Discover { .. },
+        }
+        | R::PeerChallenge
+        | R::PeerAuthenticate { .. }
         // Admitted only so its handler can explain that it was removed.
         | R::RetiredChannelWork => Access::Open,
         R::Input { terminal_id, .. }
@@ -78,6 +87,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
+        | R::DeviceTrust { .. }
+        | R::SignDeviceChallenge { .. }
         | R::Agent { .. }
         | R::Automation { .. }
         | R::Shutdown
