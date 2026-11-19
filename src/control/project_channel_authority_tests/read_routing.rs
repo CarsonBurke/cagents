@@ -62,6 +62,8 @@ fn exercise() {
                     assert!(hello.proof.is_none());
                     reply(&mut peer, &hello, connected());
                     let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() else {
+                        // A connection that only handshakes is a separate
+                        // readiness probe.
                         ready += 1;
                         assert!(ready <= 1, "no repeated readiness probe");
                         continue;
@@ -88,9 +90,8 @@ fn exercise() {
             assert_eq!(result, ExitCode::SUCCESS);
             assert_eq!(staged.get(), 1, "global reads retain staged-owner lookup");
             assert_eq!(
-                ready,
-                usize::from(!no_start),
-                "readiness is independent of scope"
+                ready, 0,
+                "readiness hands its connection to the request rather than handshaking twice"
             );
             assert_eq!(
                 raw,
@@ -130,6 +131,9 @@ fn exercise() {
             assert!(!socket.exists(), "missing daemon must remain absent");
             drop(lock);
         }
+        // Readiness is independent of scope: with the daemon gone, the read
+        // would start it, which the update's launch fence refuses.
+        startup_route::run_absent(arguments(command, false));
     }
 }
 
@@ -212,10 +216,28 @@ fn public_lists_preserve_readiness_and_no_start_errors_for_every_caller_scope() 
             [
                 "daemon_not_running",
                 "daemon_busy",
+                "daemon_start",
                 "daemon_not_running",
-                "daemon_busy"
+                "daemon_busy",
+                "daemon_start"
             ]
         );
+        for error in stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|error| error["error"]["kind"] == "daemon_start")
+        {
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(
+                    &crate::terminal::HostedTerminalStartError::UpdateInProgress(
+                        crate::instance::UpdateInProgress
+                    )
+                    .to_string()
+                ),
+                "{message}"
+            );
+        }
         let successes = stdout
             .lines()
             .filter_map(|line| line.find('{').map(|start| &line[start..]))

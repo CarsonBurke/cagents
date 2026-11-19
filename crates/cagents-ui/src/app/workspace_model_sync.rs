@@ -399,8 +399,9 @@ fn publish(
     // Unlike the observer, the publisher starts a daemon: a channel the user
     // just created has to reach the registry, and there is no registry without
     // a daemon to hold it.
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let mut client = crate::terminal::connect_ready_daemon()
+        .map_err(|error| error.to_string())?
+        .client;
     // This connection may reach a replaced registry. Its one baseline is a
     // reconnect read; subsequent edits and conflicts read affected scopes only.
     let (model, _) = client

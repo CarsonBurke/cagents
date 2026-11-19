@@ -108,9 +108,7 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
             false,
         ),
     };
-    let socket = control_daemon_socket()?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = control_daemon_client()?;
     let report = read_report(&mut client, Authority::from_environment(), query)?;
     if listing {
         return Ok(list::output(&report));

@@ -550,9 +550,7 @@ struct Mailbox {
 
 impl Mailbox {
     fn connect() -> Result<Self, AppError> {
-        let socket = control_daemon_socket()?;
-        let client =
-            ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+        let client = control_daemon_client()?;
         Ok(Self {
             authority: Authority::from_environment(),
             client,

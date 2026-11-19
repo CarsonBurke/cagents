@@ -478,10 +478,9 @@ impl Cagents {
             return cosmic::task::future(async move {
                 let source = session.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    let mut client =
-                        ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+                    let mut client = crate::terminal::connect_ready_daemon()
+                        .map_err(|error| error.to_string())?
+                        .client;
                     let basis = match authority.read_basis(&mut client, &source) {
                         Err(error) if is_source_close_refusal(&error) => {
                             return Ok(CompletedCloseOutcome::SourceChanged);

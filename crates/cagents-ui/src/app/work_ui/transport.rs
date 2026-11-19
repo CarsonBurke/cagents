@@ -34,32 +34,31 @@ impl Context {
         may_start: bool,
         purpose: Purpose,
     ) -> Result<ControlClient, String> {
+        let activity = match purpose {
+            Purpose::Read => Activity::ViewWork,
+            Purpose::Mutation => Activity::PinWork,
+        };
         self.connect_with(
             may_start,
             purpose,
             || crate::terminal::existing_daemon_socket_path().map_err(|error| error.to_string()),
-            || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+            || super::super::request_failure::connect_ready(activity),
             |socket| {
                 ControlClient::connect(socket).map_err(|error| {
-                    super::super::request_failure::message(
-                        error,
-                        match purpose {
-                            Purpose::Read => Activity::ViewWork,
-                            Purpose::Mutation => Activity::PinWork,
-                        },
-                        self.is_scoped(),
-                    )
+                    super::super::request_failure::message(error, activity, self.is_scoped())
                 })
             },
         )
     }
 
+    /// `start` connects to a daemon it may start, on the connection that
+    /// proved it ready; `connect` reaches the `existing` one.
     fn connect_with(
         &self,
         may_start: bool,
         purpose: Purpose,
         existing: impl FnOnce() -> Result<PathBuf, String>,
-        start: impl FnOnce() -> Result<PathBuf, String>,
+        start: impl FnOnce() -> Result<ControlClient, String>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, String>,
     ) -> Result<ControlClient, String> {
         let scoped = self.authority.token().is_some();
@@ -71,12 +70,11 @@ impl Context {
                 Purpose::Mutation => Activity::PinWork,
             }));
         }
-        let socket = if may_start && !scoped && !self.no_start {
+        let mut client = if may_start && !scoped && !self.no_start {
             start()?
         } else {
-            existing()?
+            connect(&existing()?)?
         };
-        let mut client = connect(&socket)?;
         if scoped && matches!(purpose, Purpose::Mutation) {
             // Only Pin binds its connection before the unchanged Work envelope.
             // Board/Refresh/WatchWork intentionally stay open even for invalid
