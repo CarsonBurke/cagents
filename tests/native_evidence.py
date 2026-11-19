@@ -181,8 +181,9 @@ STUBS = {
     "fixture-cli": """
         #!/bin/bash
         if [ "${0##*/}" = cagents-ui ]; then
-            # Match the public UI option shape: primary has no arguments;
-            # a named window uses two separate arguments. Unknown forms fail.
+            # Match the public UI option shape: primary has no arguments, or
+            # only the recovery-window flag; a named window uses two separate
+            # arguments. Unknown forms fail.
             arguments=("$@")
             slot=
             while [ "$#" -gt 0 ]; do
@@ -190,6 +191,7 @@ STUBS = {
                     --window)
                         [ "$#" -ge 2 ] && [ -n "$2" ] || { echo 'missing window name' >&2; exit 2; }
                         slot=$2; shift 2 ;;
+                    --restore-existing-only) shift ;;
                     *) echo "unsupported UI argument: $1" >&2; exit 2 ;;
                 esac
             done
@@ -1356,7 +1358,26 @@ class Evidence(unittest.TestCase):
     def test_relaunch_preserves_scoped_ui_fixture(self) -> None:
         self.assert_relaunch_keeps_built_products(workspace_trace=True, scoped=True)
 
-    def assert_relaunch_keeps_built_products(self, workspace_trace=False, scoped=False) -> None:
+    def test_relaunch_opens_the_updates_recovery_window_on_request(self) -> None:
+        self.assert_relaunch_keeps_built_products(recovery_window=True)
+
+    def test_start_opens_only_its_first_window_as_the_recovery_window(self) -> None:
+        self.built()
+        self.run_tool("start", "after", "--restore-existing-only")
+        self.wait_for(lambda: (self.logs / "runner").exists(), '(self.logs / "runner").exists()')
+        first = shlex.split((self.logs / "runner").read_text().splitlines()[0])
+        self.assertEqual(first[first.index("--"):], ["--", "--restore-existing-only"])
+        # A recovery window never starts its daemon, so the session restarts
+        # it first, as --fresh-daemon would, and the runner leaves it be.
+        self.assertNotIn("--fresh-daemon", first)
+        cli_lines = (self.logs / "cli").read_text().splitlines()
+        reset = "daemon stop-for-rebuild --including-subagents"
+        self.assertEqual(cli_lines.count(reset), 1)
+        self.assertLess(cli_lines.index(reset), cli_lines.index("daemon start"))
+        self.run_tool("stop")
+
+    def assert_relaunch_keeps_built_products(self, workspace_trace=False, scoped=False,
+                                             recovery_window=False) -> None:
         self.built()
         self.run_tool("start", "after", *(["--workspace-trace"] if workspace_trace else []),
                       *(["--ui-scoped-fixture"] if scoped else []))
@@ -1373,7 +1394,8 @@ class Evidence(unittest.TestCase):
         identity = (self.task / "fixture" / "home" / ".claude").stat().st_ino
         output = self.logs / "relaunch-output"
         with output.open("w") as sink:
-            process = subprocess.Popen([str(SCRIPT), "relaunch", "--chat-stages"], env=self.env,
+            process = subprocess.Popen([str(SCRIPT), "relaunch", "--chat-stages",
+                *(["--restore-existing-only"] if recovery_window else [])], env=self.env,
                 stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
         try:
             deadline = time.monotonic() + HANG_GUARD
@@ -1402,6 +1424,13 @@ class Evidence(unittest.TestCase):
             else:
                 self.assertIn("--fresh-daemon", shlex.split(runner_lines[0]))
             self.assertNotIn("--fresh-daemon", shlex.split(runner_lines[1]))
+            # Only the window asked for opens as the recovery window.
+            self.assertNotIn("--restore-existing-only", shlex.split(runner_lines[0]))
+            relaunched = shlex.split(runner_lines[1])
+            if recovery_window:
+                self.assertEqual(relaunched[relaunched.index("--"):], ["--", "--restore-existing-only"])
+            else:
+                self.assertNotIn("--", relaunched)
             if workspace_trace:
                 self.assertIn("cagents::workspace_projection=trace", (self.logs / "ui-rust-log").read_text())
             if scoped:

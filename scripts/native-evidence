@@ -55,7 +55,7 @@ both use the same fixture data and selected providers.
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
         [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
-        [--projection-oracle] [--wayland-debug]
+        [--projection-oracle] [--wayland-debug] [--restore-existing-only]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -87,6 +87,9 @@ both use the same fixture data and selected providers.
                   --wayland-debug sets WAYLAND_DEBUG=client for the app, so its
                   Wayland requests and events, such as popup grabs and keyboard
                   focus, go to logs/ui-SIDE.log; it persists like the traces.
+                  --restore-existing-only opens the session's first window as
+                  relaunch --restore-existing-only does; later relaunches
+                  choose again.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -106,11 +109,15 @@ both use the same fixture data and selected providers.
                   then stays in the foreground until that window exits. Writes
                   logs/ui-SIDE-SLOT.log and session/window-SLOT with its native
                   window ID. Uses the session's trace flags and never compiles.
-  relaunch [--chat-stages]
+  relaunch [--chat-stages] [--restore-existing-only]
                   After closing the app window, run the same built UI again in
                   this session, keeping its daemon and providers alive. Runs in
                   the foreground; stop still ends the complete session.
                   --chat-stages records UI stage timings on normal close.
+                  --restore-existing-only opens it as the recovery window
+                  that daemon recover-update opens after an update: its
+                  panes show existing conversations and retained history,
+                  and start a provider only when asked to in the pane.
   stop            End the session, its daemon and its processes; release its slot.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
@@ -1062,7 +1069,7 @@ CARGO
 }
 
 run_app() {
-    local side=$1 slot=${2:-} ui_log
+    local side=$1 slot=${2:-} restore_existing_only=${3:-} ui_log
     ui_log=$logs/ui-$side${slot:+-$slot}.log
     load_side "$side" "$state/source"
     # A session holds the native lock while others queue, so it must not wait on
@@ -1087,7 +1094,10 @@ run_app() {
     local status=0 stage_environment=() runner_instance=() runner_lifecycle=() window_arguments=() runner_lane=(--browserless)
     [ "$lane" != integrated ] || runner_lane=()
     [ -z "$instance_name" ] || runner_instance=(--instance "$instance_name" --in-session)
-    [ -z "$slot" ] || window_arguments=(-- --window "$slot")
+    [ -z "$slot" ] || window_arguments=(--window "$slot")
+    # From relaunch: open the window as the update's recovery window does.
+    [ -z "$restore_existing_only" ] || window_arguments+=(--restore-existing-only)
+    [ "${#window_arguments[@]}" -eq 0 ] || window_arguments=(-- "${window_arguments[@]}")
     # A new evidence session must use the matched daemon just built. Additional
     # windows and UI-only relaunches deliberately retain that session's actors.
     if [ -z "$slot" ] && [ ! -e "$state/replaying" ]; then
@@ -1097,12 +1107,16 @@ run_app() {
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
     [ "$(cat "$state/projection-oracle" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_PROJECTION_ORACLE=1)
     [ "$(cat "$state/wayland-debug" 2>/dev/null)" != 1 ] || stage_environment+=(WAYLAND_DEBUG=client)
-    if [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" = 1 ]; then
-        # Start the isolated daemon as User before adding the synthetic caller
-        # to the UI runner. It must not inherit even this invalid capability.
+    local scoped_ui=
+    [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" != 1 ] || scoped_ui=1
+    # A recovery window only attaches, so it never starts the daemon it needs.
+    if [ -n "$scoped_ui" ] || { [ -n "$restore_existing_only" ] && [ "${#runner_lifecycle[@]}" -gt 0 ]; }; then
+        # Start the isolated daemon as User before the UI runner, and before
+        # adding a scoped UI's synthetic caller to it: the daemon must not
+        # inherit even that invalid capability.
         if [ "${#runner_lifecycle[@]}" -gt 0 ]; then
             if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon stop-for-rebuild --including-subagents; then
-                printf 'could not reset the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+                printf 'could not reset the User fixture daemon for the UI; see %s\n' "$harness_root/session.log" >"$state/failed"
                 return 1
             fi
             # The before side runs its own revision's CLI, which may return
@@ -1110,7 +1124,7 @@ run_app() {
             local scoped_socket="$runtime/cagents-development${instance_name:+-$instance_name}/cagentsd.sock" remaining=100
             while [ -e "$scoped_socket" ]; do
                 if [ "$remaining" -eq 0 ]; then
-                    printf 'the scoped fixture daemon did not stop within 5 seconds\n' >"$state/failed"
+                    printf 'the fixture daemon did not stop within 5 seconds\n' >"$state/failed"
                     return 1
                 fi
                 remaining=$((remaining - 1))
@@ -1119,10 +1133,10 @@ run_app() {
         fi
         runner_lifecycle=()
         if ! fixture_env timeout -k 5 "$(cat "$state/startup-timeout")" "$target/dev-runtime/cagents" daemon start; then
-            printf 'could not start the User fixture daemon for the scoped UI; see %s\n' "$harness_root/session.log" >"$state/failed"
+            printf 'could not start the User fixture daemon for the UI; see %s\n' "$harness_root/session.log" >"$state/failed"
             return 1
         fi
-        stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
+        [ -z "$scoped_ui" ] || stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
     fi
     [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
         RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
@@ -1230,18 +1244,21 @@ cmd_open_window() {
 }
 
 cmd_relaunch() {
-    local side watcher observed status=0 chat_stage_output=
+    local side watcher observed status=0 chat_stage_output= restore_existing_only=
     side=$(current_side)
-    case ${1:-} in
-        --chat-stages)
-            [ "$#" -eq 1 ] || die 'relaunch accepts only --chat-stages'
-            mkdir -p -m 700 -- "$logs/chat-stages"
-            chat_stage_output=$logs/chat-stages/$side-$(date +%s)-$$.json
-            printf 'chat stages: %s\n' "$chat_stage_output"
-            ;;
-        '') ;;
-        *) die 'relaunch accepts only --chat-stages' ;;
-    esac
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --chat-stages)
+                [ -z "$chat_stage_output" ] || die 'relaunch takes --chat-stages once'
+                mkdir -p -m 700 -- "$logs/chat-stages"
+                chat_stage_output=$logs/chat-stages/$side-$(date +%s)-$$.json
+                printf 'chat stages: %s\n' "$chat_stage_output"
+                ;;
+            --restore-existing-only) restore_existing_only=1 ;;
+            *) die 'relaunch accepts only --chat-stages and --restore-existing-only' ;;
+        esac
+        shift
+    done
     [ -f "$harness_root/session.rc" ] || die 'close the app window before relaunching it'
     exec 7>"$state/relaunch.lock"
     flock -n 7 || die 'a relaunched app is already running'
@@ -1275,7 +1292,7 @@ cmd_relaunch() {
     watcher=$!
     trap 'rm -f -- "$state/replaying"; kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :' EXIT
     trap 'exit 143' TERM HUP
-    run_app "$side" 7>&- || status=$?
+    run_app "$side" "" "$restore_existing_only" 7>&- || status=$?
     if [ -e "$state/replaying" ]; then
         printf 'the relaunched app exited before its window appeared; see %s\n' "$logs/ui-$side.log" >"$state/failed"
         [ "$status" -ne 0 ] || status=1
@@ -1284,7 +1301,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug= restore_existing_only=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1306,6 +1323,7 @@ cmd_start() {
             --workspace-trace) workspace_trace=1; shift ;;
             --projection-oracle) projection_oracle=1; shift ;;
             --wayland-debug) wayland_debug=1; shift ;;
+            --restore-existing-only) restore_existing_only=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1359,6 +1377,7 @@ cmd_start() {
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf '%s\n' "$projection_oracle" >"$state/projection-oracle"
     printf '%s\n' "$wayland_debug" >"$state/wayland-debug"
+    printf '%s\n' "$restore_existing_only" >"$state/start-restore-existing-only"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" "$startup_timeout" \
@@ -1631,7 +1650,8 @@ case $command in
     __build) run_build "$@" ;;
     __session) run_session "$@" ;;
     __inner) run_inner "$@" ;;
-    __app) run_app "$@" ;;
+    # Only the session's first window takes start's --restore-existing-only.
+    __app) run_app "$1" "" "$(cat -- "$state/start-restore-existing-only" 2>/dev/null)" ;;
     *) usage >&2; exit 2 ;;
 esac
 exit

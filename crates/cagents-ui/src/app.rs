@@ -6456,6 +6456,9 @@ impl Cagents {
                 .0,
             self.attach_next_restored_agent(),
             Task::batch(repository_tasks),
+            // Saved panes waiting for their workspace say whether an update
+            // restore is why.
+            self.watch_update_recovery(),
         ])
     }
 
@@ -9884,6 +9887,16 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        self.retry_card_as(card, None)
+    }
+
+    /// Retries `card`; a chat starts with `chat_intent` when given, rather
+    /// than the intent a retry would choose for it.
+    fn retry_card_as(
+        &mut self,
+        card: CardId,
+        chat_intent: Option<crate::chat::Intent>,
+    ) -> Task<Message> {
         // A card whose close is already accepted never starts anything again.
         if self
             .card_state(card)
@@ -10028,7 +10041,7 @@ impl Cagents {
             CardKind::Repository(view) => self.attach_repository_pane(card, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
             CardKind::Chat(session) => {
-                let intent = self.chat_retry_intent(card, &session);
+                let intent = chat_intent.unwrap_or_else(|| self.chat_retry_intent(card, &session));
                 self.open_chat(card, session, intent)
             }
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
@@ -12479,6 +12492,21 @@ impl Cagents {
                                     crate::ui_controls::button::secondary(label)
                                 }
                             };
+                            if self
+                                .blocked_failure(id)
+                                .is_some_and(|blocked| blocked.reopen.reopens())
+                            {
+                                controls.push(
+                                    button(&controls, chat_ui::blocked_recovery::REOPEN_LABEL)
+                                        .id(card_control_id(id, "chat.reopen"))
+                                        .name(chat_ui::blocked_recovery::REOPEN_LABEL)
+                                        // Close owns the card until it settles.
+                                        .on_press_maybe((!closing).then_some(Message::ChatUi(
+                                            chat_ui::Action::ReopenStopped(id),
+                                        )))
+                                        .into(),
+                                );
+                            }
                             if self.chat_offers_fresh_conversation(id) {
                                 controls.push(
                                     button(&controls, "Start a new conversation")

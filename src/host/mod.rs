@@ -14,6 +14,8 @@ pub(crate) mod descriptor_limit;
 mod exit_drain_tests;
 #[cfg(debug_assertions)]
 mod fixture_hold;
+#[cfg(debug_assertions)]
+mod fixture_startup_recovery;
 mod lifecycle;
 mod lock;
 mod model;

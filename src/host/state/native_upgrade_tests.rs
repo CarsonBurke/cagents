@@ -1372,19 +1372,36 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         );
         assert_eq!(entry.conversation.as_deref(), Some(thread));
         assert!(entry.reason.contains(reason), "{:?}", entry.reason);
-        let refusal = super::super::client::process_request(
-            &updated,
-            0,
-            crate::terminal::ipc::ClientRequest::ResolveUpgradeChat {
-                source: saved(thread).source,
-            },
-        )
-        .unwrap_err();
+        let resolve = |source| {
+            super::super::client::process_request(
+                &updated,
+                0,
+                crate::terminal::ipc::ClientRequest::ResolveUpgradeChat { source },
+            )
+            .unwrap_err()
+            .message
+        };
+        // The descriptor was issued before its thread was named; the pane
+        // saved the confirmed alias once it was. Both learn why it stopped.
+        let issued = saved(thread);
+        assert_eq!(issued.source.launch.session_id, None);
+        let mut confirmed = issued.source.clone();
+        confirmed.launch.session_id = issued.launch.session_id.clone();
+        assert_eq!(confirmed.launch.session_id.as_deref(), Some(thread));
+        for source in [issued.source.clone(), confirmed.clone()] {
+            let refusal = resolve(source);
+            assert!(
+                refusal.starts_with(crate::chat::UPDATE_RESTART_STOPPED)
+                    && refusal.contains(reason),
+                "{refusal:?}"
+            );
+        }
+        // Another thread under the same pane is not the one that stopped.
+        let mut other = confirmed;
+        other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let refusal = resolve(other);
         assert!(
-            refusal
-                .message
-                .starts_with(crate::chat::UPDATE_RESTART_STOPPED)
-                && refusal.message.contains(reason),
+            !refusal.starts_with(crate::chat::UPDATE_RESTART_STOPPED),
             "{refusal:?}"
         );
     }

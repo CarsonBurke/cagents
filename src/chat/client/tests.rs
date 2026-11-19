@@ -248,6 +248,147 @@ fn only_the_daemons_busy_refusal_is_typed_busy() {
     );
 }
 
+/// A request the daemon's startup recovery does not admit is refused with
+/// the daemon's own sentence, as `host::client` words it, and only that
+/// unavailable, non-retryable refusal reads as waiting on update recovery.
+#[test]
+fn only_the_startup_recovery_refusal_waits_on_update_recovery() {
+    use super::super::{Recovery, STARTUP_RECOVERY_REFUSAL};
+    use ipc::ProtocolErrorCode;
+
+    let held = format!(
+        "{STARTUP_RECOVERY_REFUSAL}; inspect available sessions or explicitly Close the original actor: Codex server did not open its local socket within 15 seconds"
+    );
+    let failure = start_failure(ipc::ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        held.clone(),
+        false,
+    ));
+    assert_eq!(failure.recovery, Recovery::UpdateRecovery);
+    assert_eq!(
+        failure.message, held,
+        "the daemon's reason stays the details"
+    );
+    assert!(Recovery::UpdateRecovery.is_blocked());
+    // Another code, or a sentence that only quotes it, is an ordinary refusal.
+    for (code, message) in [
+        (ProtocolErrorCode::Internal, held.clone()),
+        (
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Provider said: {held}"),
+        ),
+    ] {
+        assert_eq!(
+            start_failure(ipc::ProtocolError::new(code, message, false)).recovery,
+            Recovery::Blocked
+        );
+    }
+}
+
+/// The daemon refuses a conversation whose restart after an update failed
+/// and was stopped with a retryable unavailable error, but repeating the
+/// same restore only meets it again. Only the daemon's own sentence reads
+/// as stopped by the update; a message that quotes it stays a retry.
+#[test]
+fn only_the_stopped_restart_refusal_reads_as_stopped_by_the_update() {
+    use super::super::{Recovery, update_restart_stopped};
+    use ipc::ProtocolErrorCode;
+
+    let stopped = update_restart_stopped("Codex server exited before opening its local socket");
+    let failure = start_failure(ipc::ProtocolError::new(
+        ProtocolErrorCode::TerminalUnavailable,
+        stopped.clone(),
+        true,
+    ));
+    assert_eq!(failure.recovery, Recovery::UpdateStopped);
+    assert_eq!(
+        failure.message, stopped,
+        "the daemon's reason stays the details"
+    );
+    assert!(Recovery::UpdateStopped.is_blocked());
+    assert_eq!(
+        start_failure(ipc::ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Provider said: {stopped}"),
+            true,
+        ))
+        .recovery,
+        Recovery::Retry
+    );
+}
+
+/// A recovery pane whose conversation the update stopped reports that, with
+/// the daemon's words, rather than a retry of the attachment it just made,
+/// and asks the daemon for nothing more.
+#[test]
+fn recovery_restore_reports_a_conversation_the_update_stopped() {
+    let stopped = super::super::update_restart_stopped(
+        "Codex server did not open its local socket within 15 seconds",
+    );
+    let (stream, mut server) = UnixStream::pair().unwrap();
+    let live = host_proof("recovery");
+    let mut saved = omp_card(Some(CONVERSATION), Some(host_proof("old")));
+    saved.launch.provider = crate::agent::Provider::Codex;
+    saved.launch.recipe.program = "codex".into();
+    let expected = saved.clone();
+    let refusal = stopped.clone();
+    let worker = thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        for step in 0..2 {
+            let envelope: ClientEnvelope = ipc::read_frame(&mut server).unwrap().unwrap();
+            let message = match (step, envelope.request) {
+                (0, ClientRequest::Connect { .. }) => ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: live.clone(),
+                        resumed: vec![],
+                    },
+                },
+                (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        refusal.clone(),
+                        true,
+                    ))
+                }
+                other => panic!("recovery must not prepare or start a provider: {other:?}"),
+            };
+            ipc::write_frame(
+                &mut server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(envelope.request_id),
+                    proof: live.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        }
+        let extra: Option<ClientEnvelope> = ipc::read_frame(&mut server).unwrap();
+        assert!(
+            extra.is_none(),
+            "a stopped conversation sent an extra request"
+        );
+    });
+    let failure = ClientHandle::connect_on(
+        stream,
+        saved,
+        Intent::RestoreExisting,
+        None,
+        false,
+        None,
+        None,
+        None,
+        |_| {},
+    )
+    .err()
+    .expect("the stopped conversation must refuse");
+    assert_eq!(failure.recovery, super::super::Recovery::UpdateStopped);
+    assert_eq!(failure.message, stopped);
+    worker.join().unwrap();
+}
+
 /// A daemon too busy to finish a switch's handshake refuses it as busy;
 /// one that can't be reached at all does not claim to be busy, and an
 /// update in progress is.

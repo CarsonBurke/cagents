@@ -400,13 +400,29 @@ pub enum Recovery {
     /// stop being the way back to it, rather than implying either a deletion
     /// or a round trip that is not there.
     Fresh,
+    /// The daemon is still restoring the conversations an update carried
+    /// over, or holds that restore for recovery
+    /// ([`STARTUP_RECOVERY_REFUSAL`]), and refused this before starting
+    /// anything. Nothing about this conversation is wrong: the same request
+    /// is admitted once the daemon's startup recovery has finished, which the
+    /// client learns by asking the daemon's startup state.
+    UpdateRecovery,
+    /// The update's restore restarted this conversation, the restart failed,
+    /// and the daemon stopped it again ([`UPDATE_RESTART_STOPPED`]). Nothing of
+    /// it runs and nothing was resent. Attaching to it again, which is all a
+    /// restore does, only meets the same refusal; an explicit start of the
+    /// saved conversation reopens it, and the reader has to ask for that.
+    UpdateStopped,
 }
 
 impl Recovery {
     /// Whether repeating the same start cannot help until something outside
     /// this card changes.
     pub fn is_blocked(self) -> bool {
-        matches!(self, Self::Blocked | Self::AfterRestart)
+        matches!(
+            self,
+            Self::Blocked | Self::AfterRestart | Self::UpdateRecovery | Self::UpdateStopped
+        )
     }
 }
 
