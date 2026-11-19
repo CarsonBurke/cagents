@@ -490,6 +490,46 @@ fn a_file_choice_holds_the_draft_until_it_ends_and_then_attaches() {
     assert!(peer.app.chat_ui.retiring.is_empty());
 }
 
+/// A file the conversation another window started cannot take is refused
+/// when the choice ends, though the draft that chose it is gone by then.
+#[test]
+fn a_refused_file_choice_is_told_after_the_draft_attaches_elsewhere() {
+    let mut peer = peer();
+    let ticket = {
+        let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+            panic!("expected a chat runtime");
+        };
+        let ticket = runtime.begin_attachment_insert();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+        ticket
+    };
+    let target = draft_runtime(&peer.app, peer.card).target;
+    let mut accepted = started(&peer.draft);
+    accepted.launch.provider = Provider::Codex;
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    let notes = peer._directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    peer.app.status = None;
+
+    drop(
+        peer.app
+            .handle_chat_ui(Action::Attached(target, ticket, Ok(Some(vec![notes])))),
+    );
+
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    let notice = peer.app.status.as_ref().expect("the refusal is told");
+    assert_eq!(notice.severity, NoticeSeverity::Warning);
+    assert_eq!(
+        notice.message,
+        "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+    );
+}
+
 #[test]
 fn a_paste_holds_the_draft_until_it_ends_and_then_attaches() {
     let mut peer = peer();
