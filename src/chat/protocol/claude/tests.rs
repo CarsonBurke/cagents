@@ -11250,18 +11250,40 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
             .unwrap_err()
             .contains("read-only")
     );
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 20")
-    ));
-    assert!(snapshot.has_earlier);
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")
-    ));
-    assert!(!snapshot.has_earlier);
+    // A window shows a run of the conversation: its prompts in order, with
+    // none missing or repeated.
+    let prompts = |snapshot: &crate::chat::Snapshot| -> std::ops::Range<usize> {
+        let indices: Vec<usize> = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match &item.content {
+                ItemContent::Text { text, .. } => text
+                    .strip_prefix("Saved prompt ")
+                    .and_then(|index| index.parse().ok()),
+                _ => None,
+            })
+            .collect();
+        assert!(!indices.is_empty(), "a window shows prompts");
+        let run = indices[0]..indices[0] + indices.len();
+        assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
+        run
+    };
+    assert_eq!(prompts(&snapshot), 120..220, "the newest history first");
+    // Each earlier page slides the window back by half of it, so the
+    // history is read a window at a time until its start, and every prompt
+    // is shown on the way.
+    let mut seen = std::collections::BTreeSet::from_iter(120..220);
+    let mut snapshot = snapshot;
+    let mut pages = 0;
+    while snapshot.has_earlier {
+        pages += 1;
+        assert!(pages <= 20, "paging back never reached the start");
+        handle.command(Command::LoadEarlier).unwrap();
+        snapshot = handle.snapshot(None).unwrap();
+        seen.extend(prompts(&snapshot));
+    }
+    assert_eq!(prompts(&snapshot).start, 0, "the window reaches the start");
+    assert!(seen.into_iter().eq(0..220), "every prompt was shown");
     handle.close().unwrap();
 
     let mut traversal = launch.clone();
