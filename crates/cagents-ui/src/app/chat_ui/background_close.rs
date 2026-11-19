@@ -182,6 +182,7 @@ impl Cagents {
         let refused = match result {
             Ok(()) => {
                 self.chat_ui.close_refused.remove(&id);
+                self.chat_ui.stopped_closes.insert(closing.card);
                 durable
                     .stopping_chats
                     .retain(|stopping| stopping.session.id != id);
@@ -323,6 +324,19 @@ impl Cagents {
             .find(|(_, closing)| shares_conversation(&closing.session, &session))
             .map(|(target, _)| *target);
         let Some(target) = target else {
+            // The view never heard that this pane closed, as when the window
+            // closed before the removal reached it. The conversation has
+            // stopped, so the pane goes again.
+            if self.chat_ui.stopped_closes.contains(&card) {
+                return self.remove_chat_card(card, None).unwrap_or_else(Task::none);
+            }
+            // The last window closed before hearing the stop: the launch asks
+            // again, and the pane waits for that answer, unattached (see
+            // `resume_stopping_chats`).
+            if self.awaits_stop(&session) {
+                self.cards.remove(&card);
+                return Task::none();
+            }
             return self.open_chat(card, session, chat::Intent::Restore);
         };
         if let Some(closing) = self.chat_ui.background_closes.get_mut(&target)

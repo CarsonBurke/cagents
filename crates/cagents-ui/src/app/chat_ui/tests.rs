@@ -23586,6 +23586,55 @@ fn a_close_the_exit_does_not_hear_is_reported_at_the_next_launch() {
     }
 }
 
+/// A shared view that never heard a chat close, because the window closed
+/// first, brings its pane back at the next launch. The pane does not attach
+/// to the conversation being stopped: it waits for the launch's answer and
+/// then goes, whether it came back before that answer or after it.
+#[test]
+fn a_closed_pane_a_view_brings_back_at_the_next_launch_goes_again() {
+    for before_answer in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let open = app.persistent_workspace();
+        let _ = app.update(Message::CloseCard(card));
+        let closed = app.persistent_workspace();
+        assert_eq!(stopping(&app), vec![(source.id, None)]);
+
+        // The next launch: the view still holds the pane, as the window
+        // saved the close but the view did not hear it.
+        let mut next = crate::app::tests::context_inspector_test_app(false);
+        next.durable = closed;
+        Arc::make_mut(&mut next.durable).cards = open.cards.clone();
+        next.workspace = Cagents::rebuild_workspace(&next.durable);
+        let came_back = |next: &mut Cagents| {
+            let task = next.attach_shared_chat(card, source.clone());
+            assert!(
+                !next.cards.contains_key(&card) && next.chat_ui.attempt(card).is_none(),
+                "before_answer={before_answer}: nothing attaches to the conversation being stopped"
+            );
+            task
+        };
+        if before_answer {
+            let _ = came_back(&mut next);
+        }
+        let _ = next.resume_stopping_chats();
+        let target = next.background_close_for_test(card).expect("asked again");
+        let _ = next.update(Message::ChatUi(Action::Retired(target, Ok(()))));
+        if !before_answer {
+            let _ = came_back(&mut next);
+        }
+        assert!(
+            !next
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open()),
+            "before_answer={before_answer}: the pane goes again"
+        );
+        assert!(next.durable.stopping_chats.is_empty());
+        assert!(!next.has_close_failure_notices());
+    }
+}
+
 /// A pane reopened while its conversation was still stopping is not saved
 /// while it waits, as no reopen is until its conversation starts. Closing
 /// the window then saves only the stop, which the next launch asks again

@@ -1302,6 +1302,10 @@ pub(super) struct State {
     /// Why a refused conversation's close failed, shown on the pane that
     /// reopens it once that pane is attached.
     refusals_to_show: HashMap<TerminalId, String>,
+    /// Closed panes whose conversation has stopped. A shared view that never
+    /// heard of the close, as when the window closed first, can bring one
+    /// back; it goes again rather than attach.
+    stopped_closes: HashSet<CardId>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -1384,6 +1388,7 @@ impl Default for State {
             background_closes: HashMap::new(),
             close_refused: HashSet::new(),
             refusals_to_show: HashMap::new(),
+            stopped_closes: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
