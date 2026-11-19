@@ -1349,6 +1349,25 @@ fn a_history_page_answered_during_a_turn_start_does_not_take_a_held_stop() {
 }
 
 #[test]
+fn a_history_page_requested_during_a_turn_start_names_no_turn() {
+    let mut adapter = adapter();
+    adapter
+        .command(Command::Prompt {
+            text: "New turn".into(),
+            attachments: vec![],
+            mode: PromptMode::Send,
+        })
+        .unwrap();
+    adapter.receive(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})).unwrap();
+    // Requested after the lifecycle moved, so only the unanswered start
+    // keeps the page's in-progress turn from being taken as the current one.
+    let mut history = Step::default();
+    adapter.history(&mut history, None).unwrap();
+    adapter.receive(json!({"id":history.writes[0]["id"],"result":{"data":[{"id":"old","status":"inProgress","items":[]}],"nextCursor":null}})).unwrap();
+    assert!(adapter.turn.is_none());
+}
+
+#[test]
 fn history_names_the_newest_in_progress_turn_only() {
     for (status, expected) in [("inProgress", Some("newer")), ("completed", None)] {
         let mut adapter = adapter();
