@@ -247,6 +247,19 @@ enum Placement<'a> {
     Unplaced(&'a chat::Item),
 }
 
+/// About how tall a gallery of `pictures` is in a column `content_width`
+/// wide, before it is drawn; the reader's own are within their bubble.
+fn gallery_height(pictures: &[&chat::Item], content_width: f32, from_reader: bool) -> f32 {
+    if from_reader {
+        images::tiles::height(
+            pictures,
+            content_width.min(PROMPT_MEASURE) - 2.0 * step::GAP_M,
+        ) + 2.0 * step::GAP_S
+    } else {
+        images::tiles::height(pictures, content_width)
+    }
+}
+
 /// The bubble a user's message is drawn in: the accent wash, or an outline
 /// for an attachment, held to [`PROMPT_MEASURE`].
 ///
@@ -2733,7 +2746,9 @@ impl Runtime {
                     continue;
                 }
                 let run = images::tiles::run_length(
-                    agent.items[index..].iter().map(|item| self.tiled(item)),
+                    agent.items[index..]
+                        .iter()
+                        .map(|next| self.tiled_from(next, item.role)),
                 );
                 if run > 1 {
                     use std::hash::{Hash, Hasher};
@@ -2741,6 +2756,7 @@ impl Runtime {
                         .iter()
                         .map(|item| &**item)
                         .collect();
+                    let from_reader = item.role == chat::Role::User;
                     let mut key = std::hash::DefaultHasher::new();
                     ("selected-child-gallery", &item.id).hash(&mut key);
                     let mut revision = std::hash::DefaultHasher::new();
@@ -2764,14 +2780,14 @@ impl Runtime {
                     transcript.lazy(
                         key.finish(),
                         revision.finish(),
-                        images::tiles::height(&pictures, content_width),
+                        gallery_height(&pictures, content_width, from_reader),
                         aliases,
                         step::GAP_L,
                         0.0,
                         move || {
                             scroll::item(
                                 &item.id,
-                                widget::container(self.image_tiles(&pictures))
+                                widget::container(self.gallery_view(&pictures, from_reader))
                                     .id(self.find_anchor(&item.id))
                                     .width(Length::Fill),
                             )
@@ -5689,18 +5705,7 @@ impl Runtime {
             }
             TurnPart::Gallery { prompt, .. } => {
                 let pictures = self.turn_gallery(turn, part);
-                let gallery = self.image_tiles(&pictures);
-                let body = if prompt {
-                    // The reader's own pictures, in the bubble one alone
-                    // would have, on their side.
-                    widget::container(user_bubble(gallery, true, false))
-                        .align_x(Alignment::End)
-                        .width(Length::Fill)
-                        .into()
-                } else {
-                    gallery
-                };
-                scroll::item(&pictures[0].id, body)
+                scroll::item(&pictures[0].id, self.gallery_view(&pictures, prompt))
             }
         }
     }
@@ -5708,16 +5713,25 @@ impl Runtime {
     /// About how tall a gallery row of `turn` is in a column `content_width`
     /// wide, before it is drawn.
     fn gallery_estimate(&self, turn: &turn::Turn, part: TurnPart, content_width: f32) -> f32 {
-        let pictures = self.turn_gallery(turn, part);
-        match part {
-            // The reader's pictures are within their bubble.
-            TurnPart::Gallery { prompt: true, .. } => {
-                images::tiles::height(
-                    &pictures,
-                    content_width.min(PROMPT_MEASURE) - 2.0 * step::GAP_M,
-                ) + 2.0 * step::GAP_S
-            }
-            _ => images::tiles::height(&pictures, content_width),
+        let from_reader = matches!(part, TurnPart::Gallery { prompt: true, .. });
+        gallery_height(&self.turn_gallery(turn, part), content_width, from_reader)
+    }
+
+    /// `pictures`, one after another from one sender, as one gallery. The
+    /// reader's own are in the bubble one alone would have, on their side.
+    fn gallery_view(
+        &self,
+        pictures: &[&chat::Item],
+        from_reader: bool,
+    ) -> Element<'static, Message> {
+        let gallery = self.image_tiles(pictures);
+        if from_reader {
+            widget::container(user_bubble(gallery, true, false))
+                .align_x(Alignment::End)
+                .width(Length::Fill)
+                .into()
+        } else {
+            gallery
         }
     }
 

@@ -15097,14 +15097,18 @@ impl Cagents {
                     gallery.reset = gallery.reset.wrapping_add(1);
                 }
             }
+            // The file opens elsewhere whether or not its pixels decoded here:
+            // one too large to show is exactly the one to open externally.
             Action::ImageExternal => {
-                if let Some(image) = self
+                if let Some(url) = self
                     .chat_ui
                     .image_viewer
                     .as_ref()
-                    .and_then(images::Gallery::selected_image)
+                    .and_then(images::Gallery::url)
                 {
-                    return self.image_command(image, images::ImageCommand::OpenExternally);
+                    return cosmic::task::future(async move {
+                        Message::ExternalLinkOpened(images::open_external(url).await)
+                    });
                 }
             }
             Action::Image(image, command) => return self.image_command(image, command),
