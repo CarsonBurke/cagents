@@ -791,7 +791,11 @@ fn a_resumed_conversation_replays_into_one_bounded_history() {
             .any(|event| matches!(event, Event::Plan { .. }))
     );
     let step = acp.receive(reply(&load, muse_new())).unwrap();
-    let Some(Event::History { items, has_earlier }) = step
+    let Some(Event::History {
+        items,
+        has_earlier,
+        unfetched,
+    }) = step
         .events
         .iter()
         .find(|event| matches!(event, Event::History { .. }))
@@ -799,6 +803,7 @@ fn a_resumed_conversation_replays_into_one_bounded_history() {
         panic!("{:?}", step.events);
     };
     assert!(!has_earlier);
+    assert_eq!(*unfetched, None, "a replay holds nothing back");
     assert_eq!(items.len(), exchanges + 1);
     assert_eq!(items[0].id, history::TRUNCATED_ID);
     let last = &items[items.len() - 2];
