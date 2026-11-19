@@ -626,6 +626,23 @@ class LandTests(unittest.TestCase):
         self.assertEqual(self.merge_attempts(), [old, new])
         self.assertIn("now conflicts with main", self.output)
 
+    def test_a_protocol_bump_while_merging_is_checked_before_the_retry(self):
+        self.protocol_feature()
+        head = self.remote_head()
+        (self.root / "merge-errors.json").write_text(json.dumps([{"error": self.BASE_MOVED}]))
+        original = land.merge
+
+        def main_moves_during_the_merge(*args):
+            if not self.merge_attempts():
+                self.advance_main(protocol=(6, [6], [5, 6]))
+            return original(*args)
+
+        with patch.object(land, "merge", main_moves_during_the_merge):
+            self.assertEqual(self.run_land(), land.REFUSED, self.output)
+        self.assertIn("fails the older-client check", self.output)
+        self.assertEqual(self.merge_attempts(), [head])
+        self.assertIsNone(self.merged())
+
     def test_a_conflict_github_was_still_computing_takes_the_conflict_path(self):
         old = self.remote_head()
         self.advance_main("unrelated.txt", "x\n")
