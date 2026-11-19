@@ -357,3 +357,36 @@ fn the_focused_composer_takes_undo_and_redo_chords() {
     }
     assert_eq!(chat_runtime(&app, card).composer.text(), "");
 }
+
+#[test]
+fn undo_keeps_the_line_endings_each_step_recorded() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    edit(
+        runtime,
+        text_editor::Edit::Paste(Arc::new("\r\nbody".into())),
+    );
+    let pasted = runtime.composer.text();
+    runtime.composer_undo.seal();
+    attachment_draft::move_to(
+        &mut runtime.composer,
+        text_editor::Cursor {
+            position: text_editor::Position { line: 0, column: 0 },
+            selection: None,
+        },
+    );
+    edit(runtime, text_editor::Edit::Enter);
+    runtime.composer_action(text_editor::Action::SelectAll);
+    edit(runtime, text_editor::Edit::Insert('x'));
+    assert_eq!(runtime.composer.text(), "x");
+
+    // Undoing the replacement puts back a newline the person typed beside
+    // a pasted CR LF, and undoing that takes out only the typed one.
+    for _ in 0..2 {
+        drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+    }
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert_eq!(runtime.composer.text(), pasted);
+}
