@@ -1326,13 +1326,6 @@ impl Workspace {
             self.focused = target;
             self.pending_widget_focus = target;
             self.focus_handoff = target;
-            // Focused only for want of another pane, the closing one hands
-            // focus on when its close finishes, as a focused pane's close does.
-            if let Some(pending) = &mut self.pending_close
-                && Some(pending.id) == target
-            {
-                pending.handoff.target = FocusTarget::WorkspaceToolbar;
-            }
         } else if self.focused.is_none() {
             // Like the first card added to an empty strip.
             self.focused = self.cards.first().map(|card| card.id);
@@ -1496,7 +1489,9 @@ impl Workspace {
         if self.focused == Some(id) {
             self.focused = match pending.handoff.target {
                 FocusTarget::Card(next) if self.index_of(next).is_some() => Some(next),
-                FocusTarget::Unchanged => self.focused,
+                // A close requested while another pane was focused, which
+                // then gave this one focus (a passive arrange can, when
+                // nothing else is left), hands focus on like any other.
                 _ => self
                     .cards
                     .get(index)
