@@ -4751,7 +4751,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<SourceControlRead, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -5228,6 +5228,16 @@ pub enum Message {
     ExpireNotices,
     /// The retiring notices control has finished its conditional focus handoff.
     NoticeControlRetired,
+}
+
+/// What a source-control reload read, compared with the snapshot the panel
+/// was built from.
+#[derive(Debug, Clone)]
+pub enum SourceControlRead {
+    /// The worktree differs from what the panel shows; rebuild from this.
+    Changed(Box<RepositorySnapshot>),
+    /// The read equals the snapshot the panel shows, so its model stands.
+    Unchanged,
 }
 
 /// An application exit in progress.
@@ -14115,13 +14125,15 @@ impl Cagents {
         };
         let browse_files =
             self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files);
-        let previous_errors = self
+        let bound = self
             .sidebar_model
             .source_control
             .as_ref()
-            .filter(|source| source.key == key)
-            .map(|source| source.ignored_directory_errors.clone())
+            .filter(|source| source.key == key);
+        let previous_errors = bound
+            .map(|source| source.ignored_directory_errors().clone())
             .unwrap_or_default();
+        let previous = bound.and_then(|source| source.source_snapshot().cloned());
         let expanded = self
             .sidebar_state
             .expanded_directory_paths()
@@ -14147,12 +14159,14 @@ impl Cagents {
                         &cancellation,
                     )?;
                 }
-                Ok(snapshot)
+                Ok(source_control_ui::source_control_read(
+                    previous.as_deref(),
+                    snapshot,
+                ))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
