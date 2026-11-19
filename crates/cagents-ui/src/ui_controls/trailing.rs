@@ -6,6 +6,10 @@
 //! pushes whatever follows it out of view. This lays out the trailing element
 //! first and gives the label what is left, while the pair still shrinks to a
 //! short label rather than stretching across its row.
+//!
+//! [`shared_line`] is the same for a line whose label and trailing element may
+//! both run long, such as a name and a status: they split the room between
+//! them, and what sits between them has only what both leave.
 
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
@@ -23,14 +27,106 @@ pub fn trailing<'a, Message: 'a>(
     spacing: f32,
 ) -> Element<'a, Message> {
     Element::new(Trailing {
-        children: [lead.into(), trail.into()],
+        children: vec![lead.into(), trail.into()],
         spacing,
+        shared: false,
     })
 }
 
-struct Trailing<'a, Message> {
-    children: [Element<'a, Message>; 2],
+/// `lead` at the line's start and `trail` at its end, across the room they
+/// are given, with `middle` filling what they leave between them.
+///
+/// Each of `lead` and `trail` keeps its own width where both fit. Where they
+/// do not, neither takes the other's half: one narrower than half keeps its
+/// width and the other has the rest, and two wider than half are held to
+/// half each. Give both a [`FadeText`](super::FadeText), which fades where it
+/// is held short, and `middle` what the line can do without.
+pub fn shared_line<'a, Message: 'a>(
+    lead: impl Into<Element<'a, Message>>,
+    middle: impl Into<Element<'a, Message>>,
+    trail: impl Into<Element<'a, Message>>,
     spacing: f32,
+) -> Element<'a, Message> {
+    Element::new(Trailing {
+        children: vec![lead.into(), middle.into(), trail.into()],
+        spacing,
+        shared: true,
+    })
+}
+
+/// How [`shared_line`] splits `room` between a lead and a trail that would like
+/// `lead` and `trail` of it, with `spacing` between them.
+fn split(room: f32, lead: f32, trail: f32, spacing: f32) -> (f32, f32) {
+    let room = (room - spacing).max(0.0);
+    let half = room / 2.0;
+    if lead + trail <= room {
+        (lead, trail)
+    } else if lead <= half {
+        (lead, room - lead)
+    } else if trail <= half {
+        (room - trail, trail)
+    } else {
+        (half, half)
+    }
+}
+
+struct Trailing<'a, Message> {
+    children: Vec<Element<'a, Message>>,
+    spacing: f32,
+    /// Laid out by [`shared_line`], with a middle child.
+    shared: bool,
+}
+
+impl<Message> Trailing<'_, Message> {
+    fn layout_shared(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let max = limits.max();
+        let compression = limits.compression();
+        let mut lay = |index: usize, width: f32| {
+            self.children[index].as_widget_mut().layout(
+                &mut tree.children[index],
+                renderer,
+                &layout::Limits::with_compression(
+                    Size::ZERO,
+                    Size::new(width, max.height),
+                    compression,
+                ),
+            )
+        };
+        // What each end would take with all the room it wants; unwrapped
+        // text only re-flows for that, it is not shaped again.
+        let wanted = |node: layout::Node| node.size().width;
+        let lead_wants = wanted(lay(0, f32::INFINITY));
+        let trail_wants = wanted(lay(2, f32::INFINITY));
+        let (lead_room, trail_room) = split(max.width, lead_wants, trail_wants, self.spacing);
+        let lead = lay(0, lead_room);
+        let trail = lay(2, trail_room);
+        // However wide an end reports itself, it ends where its room does.
+        let lead_width = lead.size().width.min(lead_room);
+        let trail_width = trail.size().width.min(trail_room);
+        let middle_x = lead_width + self.spacing;
+        let middle_room = (max.width - trail_width - self.spacing - middle_x).max(0.0);
+        let middle = lay(1, middle_room);
+        let height = [&lead, &middle, &trail]
+            .iter()
+            .map(|node| node.size().height)
+            .fold(0.0, f32::max);
+        let size = limits.resolve(Length::Fill, Length::Shrink, Size::new(max.width, height));
+        let centred = |node: &layout::Node| (size.height - node.size().height) / 2.0;
+        let (lead_y, middle_y, trail_y) = (centred(&lead), centred(&middle), centred(&trail));
+        layout::Node::with_children(
+            size,
+            vec![
+                lead.move_to(Point::new(0.0, lead_y)),
+                middle.move_to(Point::new(middle_x, middle_y)),
+                trail.move_to(Point::new(size.width - trail_width, trail_y)),
+            ],
+        )
+    }
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Trailing<'_, Message> {
@@ -43,7 +139,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Trailing<'_, Message> {
     }
 
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Shrink, Length::Shrink)
+        let width = if self.shared {
+            Length::Fill
+        } else {
+            Length::Shrink
+        };
+        Size::new(width, Length::Shrink)
     }
 
     fn layout(
@@ -52,6 +153,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Trailing<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
+        if self.shared {
+            return self.layout_shared(tree, renderer, limits);
+        }
         let max = limits.max();
         let compression = limits.compression();
         let trail = self.children[1].as_widget_mut().layout(
@@ -287,6 +391,58 @@ mod tests {
                 assert_eq!(trail.x + trail.width, available, "{available}");
             }
         }
+    }
+
+    /// The ends of a shared line split the room: each keeps its width where
+    /// both fit or it is the narrower, and neither takes the other's half.
+    #[test]
+    fn a_shared_line_splits_its_room_between_its_ends() {
+        assert_eq!(split(300.0, 100.0, 100.0, 10.0), (100.0, 100.0));
+        assert_eq!(split(210.0, 60.0, 300.0, 10.0), (60.0, 140.0));
+        assert_eq!(split(210.0, 300.0, 60.0, 10.0), (140.0, 60.0));
+        assert_eq!(split(210.0, 300.0, 300.0, 10.0), (100.0, 100.0));
+        assert_eq!(split(0.0, 300.0, 300.0, 10.0), (0.0, 0.0));
+    }
+
+    /// A shared line fills its room, keeps its trail at the end and its
+    /// middle between the ends, and gives the middle only what they leave.
+    #[test]
+    fn a_shared_line_keeps_its_trail_at_the_end_and_its_middle_between() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let laid = |lead: f32, trail: f32, available: f32| {
+            let mut element: Element<'_, ()> = shared_line(
+                fixed(lead, 16.0),
+                widget::Space::new().width(Length::Fill).height(16.0),
+                fixed(trail, 16.0),
+                8.0,
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(available, 600.0)),
+            );
+            let parts: Vec<_> = Layout::new(&node)
+                .children()
+                .map(|part| part.bounds())
+                .collect();
+            (node.size().width, parts)
+        };
+        let (width, parts) = laid(60.0, 40.0, 400.0);
+        assert_eq!(width, 400.0);
+        assert_eq!(parts[0].width, 60.0);
+        assert_eq!(parts[1].x, 68.0);
+        assert_eq!(parts[1].width, 400.0 - 60.0 - 40.0 - 16.0);
+        assert_eq!(parts[2].x + parts[2].width, 400.0);
+        // Too narrow for both: the middle is gone and the ends share.
+        let (_, parts) = laid(5000.0, 5000.0, 208.0);
+        assert!(parts[0].width <= 100.0, "{parts:?}");
+        assert_eq!(parts[1].width, 0.0);
+        assert_eq!(parts[2].x + parts[2].width, 208.0);
+        assert!(
+            parts[0].x + parts[0].width <= parts[2].x - 8.0 + 0.01,
+            "{parts:?}"
+        );
     }
 
     /// A short heading keeps the pair to its own width, so the header does

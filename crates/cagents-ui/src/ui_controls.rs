@@ -29,7 +29,7 @@ mod responsive;
 mod shrinkable;
 mod tabs;
 mod trailing;
-pub use trailing::trailing;
+pub use trailing::{shared_line, trailing};
 
 pub use display::{badge, bounded_badge, change_counts, comment_card};
 #[cfg(test)]
