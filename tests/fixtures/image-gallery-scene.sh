@@ -23,7 +23,7 @@
 #   reads   two screenshots read in parallel, each image in its Read's tool
 #           result and followed by Claude's synthetic note on how it scaled
 #           the picture for the model (the user's report in #3153)
-#   pasted  a message from the reader with a pasted screenshot
+#   pasted  a message from the reader with two pasted screenshots
 #   single  one tall image read alone
 #   five    a message asking for five breakpoints, and five Reads
 #
@@ -53,6 +53,7 @@ frames() {
     picture proposed-slow.png 1568 1045 '#1e293b' '#475569' 'Proposed: slow'
     picture proposed-fast.png 1568 1045 '#14532d' '#15803d' 'Proposed: fast'
     picture laptop.png 1440 900 '#312e81' '#6366f1' 'On my laptop'
+    picture phone.png 780 1688 '#3b0764' '#9333ea' 'On my phone'
     picture narrow.png 600 1200 '#7c2d12' '#ea580c' 'Narrow'
     picture bp-360.png 720 1440 '#0f172a' '#0369a1' '360 px'
     picture bp-768.png 1152 1536 '#164e63' '#0891b2' '768 px'
@@ -105,8 +106,9 @@ assistant("reads", [call("fast", "proposed-fast.png")])
 result("slow", "proposed-slow.png")
 result("fast", "proposed-fast.png")
 text("reads-answer", "The fast layout keeps the inspector visible; the slow one hides it behind a second panel.")
-# pasted: the reader answers with a screenshot of their own.
-user("pasted", [{"type": "text", "text": "Here's how the fast one looks on my laptop."}, image("laptop.png")])
+# pasted: the reader answers with screenshots of their own.
+user("pasted", [{"type": "text", "text": "Here's how the fast one looks on my laptop and my phone."},
+                image("laptop.png"), image("phone.png")])
 # single: one tall image.
 assistant("single", [call("narrow", "narrow.png")])
 result("narrow", "narrow.png", scaled=False)

@@ -107,15 +107,29 @@ pub(in crate::app::chat_ui) fn label(content: &ItemContent, number: usize) -> St
     }
 }
 
-/// About how tall a gallery of `count` tiles is in a column `width` wide,
-/// for placing it before it is drawn.
-pub(in crate::app::chat_ui) fn height(count: usize, width: f32) -> f32 {
+/// About how tall a gallery of `pictures` is in a column `width` wide, for
+/// placing it before it is drawn.
+pub(in crate::app::chat_ui) fn height(pictures: &[&chat::Item], width: f32) -> f32 {
+    let count = pictures.len();
     let columns = ((width + TILE_GAP) / (TILE_WIDTH + TILE_GAP))
         .ceil()
         .max(1.0) as usize;
     let rows = count.div_ceil(columns.min(count).max(1)) as f32;
-    let tile = TILE_HEIGHT + 2.0 * f32::from(INSET) + step::GAP_XS + CAPTION_HEIGHT;
+    let caption = if captioned(pictures) {
+        step::GAP_XS + CAPTION_HEIGHT
+    } else {
+        0.0
+    };
+    let tile = TILE_HEIGHT + 2.0 * f32::from(INSET) + caption;
     rows * tile + (rows - 1.0).max(0.0) * TILE_GAP
+}
+
+/// Whether a gallery's tiles are captioned: every one keeps a caption line
+/// once any is named, so its rows stay one height.
+fn captioned(pictures: &[&chat::Item]) -> bool {
+    pictures
+        .iter()
+        .any(|item| file_name(&item.content).is_some())
 }
 
 impl Runtime {
@@ -135,11 +149,7 @@ impl Runtime {
         &self,
         pictures: &[&chat::Item],
     ) -> Element<'static, Message> {
-        // Every tile keeps a caption line once any is named, so a gallery's
-        // rows stay one height.
-        let captioned = pictures
-            .iter()
-            .any(|item| file_name(&item.content).is_some());
+        let captioned = captioned(pictures);
         let tiles = pictures.iter().enumerate().map(|(position, item)| {
             let tile = self.image_tile(item, position + 1);
             if !captioned {
@@ -228,15 +238,23 @@ impl Runtime {
                 [design::RADIUS_S; 4],
                 false,
             ));
+        // A tile that loads rather than opens says so to assistive
+        // technology as it does on screen.
+        let name = if matches!(press, Some(Action::LoadImage(..))) {
+            tip.clone()
+        } else {
+            label
+        };
         let tile = crate::interaction::a11y_target(
             widget::button::custom(frame)
-                .name(label)
+                .name(name)
                 .class(crate::ui_controls::control_style(false, None))
                 .padding(INSET)
                 .width(Length::Fill)
                 .on_press_maybe(press.map(action)),
         );
-        let tile = crate::interaction::tooltip(tile, tip);
+        // Above, clear of the caption beneath that it would cover.
+        let tile = crate::interaction::tooltip_above(tile, tip);
         match cached.and_then(|cached| cached.image.as_ref()) {
             Some(handle) => {
                 let image = ImageRef::Transcript(self.target, handle.id());

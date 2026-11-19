@@ -2764,7 +2764,7 @@ impl Runtime {
                     transcript.lazy(
                         key.finish(),
                         revision.finish(),
-                        images::tiles::height(run, content_width),
+                        images::tiles::height(&pictures, content_width),
                         aliases,
                         step::GAP_L,
                         0.0,
@@ -5071,13 +5071,13 @@ impl Runtime {
                     };
                     (estimate(item), footer)
                 }
-                TurnPart::Gallery { len, .. } => {
+                TurnPart::Gallery { .. } => {
                     aliases.extend(
                         self.turn_gallery(turn, part)
                             .iter()
                             .map(|item| scroll::item_id(&item.id)),
                     );
-                    (images::tiles::height(len, content_width), 0.0)
+                    (self.gallery_estimate(turn, part, content_width), 0.0)
                 }
             };
             // A run of coordination rows reads as one list, as the step
@@ -5702,6 +5702,22 @@ impl Runtime {
                 };
                 scroll::item(&pictures[0].id, body)
             }
+        }
+    }
+
+    /// About how tall a gallery row of `turn` is in a column `content_width`
+    /// wide, before it is drawn.
+    fn gallery_estimate(&self, turn: &turn::Turn, part: TurnPart, content_width: f32) -> f32 {
+        let pictures = self.turn_gallery(turn, part);
+        match part {
+            // The reader's pictures are within their bubble.
+            TurnPart::Gallery { prompt: true, .. } => {
+                images::tiles::height(
+                    &pictures,
+                    content_width.min(PROMPT_MEASURE) - 2.0 * step::GAP_M,
+                ) + 2.0 * step::GAP_S
+            }
+            _ => images::tiles::height(&pictures, content_width),
         }
     }
 
