@@ -11,7 +11,7 @@
 #   scripts/native-evidence start before --width 1200 --height 1000
 #   tests/fixtures/transcript-rhythm-scene.sh wide dark
 #   scripts/native-evidence stop
-#   scripts/native-evidence start before --width 920 --height 1000
+#   scripts/native-evidence start before --width 930 --height 1000
 #   tests/fixtures/transcript-rhythm-scene.sh narrow dark
 #   scripts/native-evidence stop
 #
@@ -26,11 +26,13 @@
 #
 #   wide    rhythm-working (the turn mid-way, its rows live) and
 #           rhythm-finished (the same turn answered), then
-#           rhythm-report-open, one agent's report opened under the pointer
+#           rhythm-quiet-hover, the pointer over the report that has nothing
+#           to open, and rhythm-report-open, one agent's report opened under
+#           the pointer
 #   narrow  rhythm-narrow-working and rhythm-narrow-finished: the same, at
-#           two thirds of the strip beside a draft, in a window started 920
+#           two thirds of the strip beside a draft, in a window started 930
 #           pixels wide; then rhythm-narrow-pane-finished, the conversation
-#           at a third of it, about 220 pixels
+#           at a third of it, 220 pixels
 #   theme   KEY: writes the theme into the task's seed, which every later
 #           session starts from
 set -euo pipefail
@@ -107,6 +109,31 @@ open_channel() {
     sleep 2
 }
 
+# Where the first or last text run holding WORDS starts, as X,Y, from what the
+# session sees now.
+find_text() {
+    evidence drive --json observe >"$fixture/state/transcript-rhythm-observed.json"
+    /usr/bin/python3 -c '
+import json, sys
+
+def runs(node):
+    if isinstance(node, dict):
+        text = node.get("text")
+        if isinstance(text, str) and sys.argv[2] in text and "x" in node and "y" in node:
+            yield node
+        for value in node.values():
+            yield from runs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from runs(value)
+
+found = sorted(runs(json.load(sys.stdin)), key=lambda run: run["y"])
+if found:
+    run = found[0] if sys.argv[1] == "first" else found[-1]
+    print(run["x"] + 4, run["y"] + 4, sep=",")
+' "$1" "$2" <"$fixture/state/transcript-rhythm-observed.json"
+}
+
 scroll_top() {
     evidence drive scroll --at 400,400 v -- -40 >/dev/null
     sleep 1
@@ -129,7 +156,7 @@ start_turn() {
 # A preset is judged by the width it draws, so after one press each the
 # conversation sits at two thirds, beside one draft: the split pane. Two
 # more presses take it through the whole strip to a third, which in a
-# window 920 pixels wide leaves it about 220.
+# window 930 pixels wide leaves it 220.
 split_three() {
     evidence drive key ctrl+t >/dev/null
     sleep 2
@@ -171,26 +198,16 @@ case $scene in
 wide)
     start_turn
     working_and_finished ''
+    # The last agent reported nothing, so its row cannot open: the pointer
+    # over it, which shows its copy and time.
+    at=$(find_text last Consolidate)
+    [ -n "$at" ] || { printf '%s\n' 'transcript-rhythm-scene: no empty report row' >&2; exit 1; }
+    evidence drive move "$at" >/dev/null
+    sleep 2
+    evidence shot "rhythm-${label}quiet-hover"
     # The first agent's report opened, with the pointer over it. A report's
     # outcome is the only lowercase "finished" in the turn.
-    evidence drive --json observe >"$fixture/state/transcript-rhythm-observed.json"
-    at=$(/usr/bin/python3 -c '
-import json, sys
-
-def runs(node):
-    if isinstance(node, dict):
-        if node.get("text") == "finished" and "x" in node and "y" in node:
-            yield node
-        for value in node.values():
-            yield from runs(value)
-    elif isinstance(node, list):
-        for value in node:
-            yield from runs(value)
-
-for run in sorted(runs(json.load(sys.stdin)), key=lambda run: run["y"]):
-    print(run["x"] + 4, run["y"] + 4, sep=",")
-    break
-' <"$fixture/state/transcript-rhythm-observed.json")
+    at=$(find_text first finished)
     [ -n "$at" ] || { printf '%s\n' 'transcript-rhythm-scene: no report row' >&2; exit 1; }
     evidence drive click "$at" >/dev/null
     sleep 2
