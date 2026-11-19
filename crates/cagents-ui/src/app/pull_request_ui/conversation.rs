@@ -140,6 +140,60 @@ pub struct State {
     /// The daemon could not be asked for a list, and none has arrived. The
     /// watch keeps trying.
     lost: bool,
+    /// The Work rows in the order they were first shown, so a list that
+    /// fills in while GitHub answers never moves a row the user may be
+    /// about to click: work found later goes after what is shown, and a
+    /// worktree found to head a pull request becomes that pull request's row
+    /// where it is.
+    slots: Vec<Slot>,
+}
+
+/// What one Work row is known by: its pull request, its worktree, or both
+/// once the worktree is found to head the pull request.
+#[derive(Debug, Clone, Default)]
+struct Slot {
+    pull_request: Option<(GitHubRepoKey, u64)>,
+    worktree: Option<PathBuf>,
+}
+
+impl Slot {
+    fn of(work: &Work<'_>) -> Self {
+        Self {
+            pull_request: work
+                .pull_request()
+                .map(|row| (row.repository.clone(), row.number)),
+            worktree: work.worktree().map(Path::to_path_buf),
+        }
+    }
+
+    /// Whether `work` is this row's pull request or is in its worktree.
+    fn names(&self, work: &Work<'_>) -> bool {
+        self.knows(
+            work.pull_request().map(|row| (&row.repository, row.number)),
+            work.worktree(),
+        )
+    }
+
+    /// Whether `other` names the same pull request or the same worktree.
+    fn shares(&self, other: &Self) -> bool {
+        self.knows(
+            other
+                .pull_request
+                .as_ref()
+                .map(|(repository, number)| (repository, *number)),
+            other.worktree.as_deref(),
+        )
+    }
+
+    fn knows(&self, pull_request: Option<(&GitHubRepoKey, u64)>, worktree: Option<&Path>) -> bool {
+        let same_pull_request = matches!(
+            (&self.pull_request, pull_request),
+            (Some((known, known_number)), Some((repository, number)))
+                if *known_number == number && known.same_repository(repository)
+        );
+        let same_worktree = worktree.is_some() && self.worktree.as_deref() == worktree;
+        same_pull_request || same_worktree
+    }
 }
 
 /// Where the inspected conversation's list is, for what its sections show
@@ -184,6 +238,7 @@ impl State {
                 self.revision = revision;
                 self.list = Some(list);
                 self.lost = false;
+                self.place_rows();
             }
             // The last list stays: it is what was true, and the daemon's own
             // health is reported elsewhere.
@@ -233,25 +288,23 @@ impl State {
             .collect()
     }
 
-    /// Every piece of work the conversation did, pull requests first. `here`
-    /// is the worktree the conversation runs in, listed when none of the
-    /// work is in a worktree Projects lists, which `openable` says, so its
-    /// changes stay a click away.
+    /// Every piece of work the conversation did, in the order its rows were
+    /// first shown. `here` is the worktree the conversation runs in, listed
+    /// last when none of the work is in a worktree Projects lists, which
+    /// `openable` says, so its changes stay a click away.
     pub(crate) fn work<'a>(
         &'a self,
         here: Option<&'a Path>,
         openable: &dyn Fn(&Path) -> bool,
     ) -> Vec<Work<'a>> {
-        let mut work: Vec<Work<'a>> = self
-            .rows()
-            .iter()
-            .filter(|row| row.relation.worked_on())
-            .map(|row| Work::PullRequest {
-                row,
-                worktree: self.worktree_of(row),
-            })
-            .collect();
-        work.extend(self.worktrees_alone().map(Work::Worktree));
+        let mut work = self.listed_work();
+        // Every frame draws it, so it is placed without copying keys.
+        work.sort_by_cached_key(|work| {
+            self.slots
+                .iter()
+                .position(|slot| slot.names(work))
+                .unwrap_or(usize::MAX)
+        });
         if let Some(here) = here
             && !work.is_empty()
             && !work
@@ -291,6 +344,51 @@ impl State {
             })
             .or_else(|| work.first())
             .copied()
+    }
+
+    /// The work the latest list names, as the daemon orders it: pull
+    /// requests first, then the worktrees none of them heads.
+    fn listed_work(&self) -> Vec<Work<'_>> {
+        let mut work: Vec<Work<'_>> = self
+            .rows()
+            .iter()
+            .filter(|row| row.relation.worked_on())
+            .map(|row| Work::PullRequest {
+                row,
+                worktree: self.worktree_of(row),
+            })
+            .collect();
+        work.extend(self.worktrees_alone().map(Work::Worktree));
+        work
+    }
+
+    /// Fits the latest list into the rows already shown: a row keeps its
+    /// place while anything it is known by is still listed, taking on what
+    /// the list now knows it by; two rows the list finds are one piece of
+    /// work become one, in the earlier's place; and work the list names
+    /// for the first time goes last. A row whose work is no longer listed
+    /// leaves.
+    fn place_rows(&mut self) {
+        let mut next = self.slots.len();
+        let mut placed: Vec<(usize, Slot)> = self
+            .listed_work()
+            .iter()
+            .map(Slot::of)
+            .map(|slot| {
+                let place = self
+                    .slots
+                    .iter()
+                    .position(|known| known.shares(&slot))
+                    .unwrap_or_else(|| {
+                        next += 1;
+                        next - 1
+                    });
+                (place, slot)
+            })
+            .collect();
+        // Stable, so new work keeps the daemon's order among itself.
+        placed.sort_by_key(|(place, _)| *place);
+        self.slots = placed.into_iter().map(|(_, slot)| slot).collect();
     }
 
     fn chosen<'c>(&self, choices: &'c Choices) -> Option<&'c Chosen> {
@@ -1313,6 +1411,121 @@ mod tests {
             diff: None,
             pull_request,
         }
+    }
+
+    /// A list with `worktrees` beside its `rows`.
+    fn with_worktrees(
+        conversation: TerminalId,
+        revision: u64,
+        rows: Vec<ConversationPullRequest>,
+        worktrees: Vec<ConversationWorktree>,
+    ) -> Watch {
+        let Watch::Listed {
+            list, conversation, ..
+        } = listed(conversation, revision, rows, revision == 1)
+        else {
+            unreachable!()
+        };
+        Watch::Listed {
+            conversation,
+            revision,
+            list: Arc::new(ConversationPullRequests {
+                worktrees,
+                ..(*list).clone()
+            }),
+            first: revision == 1,
+        }
+    }
+
+    /// What each Work row is, top to bottom.
+    fn rows_of(state: &State) -> Vec<String> {
+        state
+            .work(None, &|_| true)
+            .iter()
+            .map(|work| match work.pull_request() {
+                Some(row) => format!("#{}", row.number),
+                None => work.scope_label(),
+            })
+            .collect()
+    }
+
+    /// While GitHub answers, a list fills in: its worktrees are found to head
+    /// pull requests, and more pull requests arrive. No row the user can see
+    /// moves to make room.
+    #[test]
+    fn rows_keep_their_places_while_the_list_fills_in() {
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some(conversation));
+        // What the transcript names before GitHub has answered.
+        state.update(with_worktrees(
+            conversation,
+            1,
+            vec![row(41, Relation::Created)],
+            vec![
+                worktree("/docs", None),
+                worktree("/retry", None),
+                worktree("/cache", None),
+            ],
+        ));
+        assert_eq!(rows_of(&state), ["#41", "docs", "retry", "cache"]);
+
+        // `/retry` heads #38, `/cache` heads #41, and #35 is found. The
+        // daemon lists pull requests first, which would move every row.
+        state.update(with_worktrees(
+            conversation,
+            2,
+            vec![
+                row(41, Relation::Created),
+                row(38, Relation::Pushed),
+                row(35, Relation::Updated),
+            ],
+            vec![
+                worktree("/docs", None),
+                worktree("/retry", Some(38)),
+                worktree("/cache", Some(41)),
+            ],
+        ));
+        // `/retry` became #38 where it was; `/cache` is #41's, so its row
+        // joined #41's, and #35 comes after what was shown.
+        assert_eq!(rows_of(&state), ["#41", "docs", "#38", "#35"]);
+
+        // A relation that changes the daemon's order moves nothing either.
+        state.update(with_worktrees(
+            conversation,
+            3,
+            vec![
+                row(35, Relation::Created),
+                row(38, Relation::Pushed),
+                row(41, Relation::Updated),
+            ],
+            vec![
+                worktree("/docs", None),
+                worktree("/retry", Some(38)),
+                worktree("/cache", Some(41)),
+            ],
+        ));
+        assert_eq!(rows_of(&state), ["#41", "docs", "#38", "#35"]);
+
+        // Work that leaves takes its row with it; what follows closes up.
+        state.update(with_worktrees(
+            conversation,
+            4,
+            vec![row(41, Relation::Created), row(35, Relation::Updated)],
+            vec![worktree("/cache", Some(41))],
+        ));
+        assert_eq!(rows_of(&state), ["#41", "#35"]);
+
+        // Another conversation starts from the daemon's order.
+        let other = TerminalId::new();
+        state.retarget(Some(other));
+        state.update(with_worktrees(
+            other,
+            1,
+            vec![row(7, Relation::Created)],
+            vec![worktree("/docs", None)],
+        ));
+        assert_eq!(rows_of(&state), ["#7", "docs"]);
     }
 
     /// The height the list reports is the height it lays out at, so its
