@@ -471,3 +471,41 @@ fn a_subagents_gallery_holds_one_senders_pictures() {
         "the transcript's gallery ends where the sender changes"
     );
 }
+
+/// A gallery is read as a whole, as one picture is: it keeps the space a
+/// block takes from the step strip above it and from the answer below it.
+#[test]
+fn a_gallery_is_spaced_as_a_block_of_the_transcript() {
+    use chat::Role::{Assistant, User};
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[
+        said("ask", User, "Compare the proposed layouts."),
+        read("read-slow", "proposed-slow.png"),
+        read("read-fast", "proposed-fast.png"),
+        picture("read-slow:image:0", Assistant, "proposed-slow.png"),
+        picture("read-fast:image:0", Assistant, "proposed-fast.png"),
+        said(
+            "answer",
+            Assistant,
+            "The fast layout keeps the inspector visible.",
+        ),
+    ]);
+    decoded(&mut runtime, &[(1568, 1045)]);
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
+    let mut transcript = VirtualRows::new();
+    runtime.push_turn_rows(
+        &mut transcript,
+        &runtime.turns[0],
+        super::super::layout::READING_COLUMN,
+        settings,
+        true,
+    );
+    let rows = &transcript.children;
+    let gallery = rows
+        .iter()
+        .position(|row| row.aliases.contains(&scroll::item_id("read-slow:image:0")))
+        .expect("the gallery's row");
+    assert_eq!(rows[gallery - 1].estimate, Rhythm::Line.gap(Rhythm::Block));
+    assert_eq!(rows[gallery + 1].estimate, Rhythm::Block.gap(Rhythm::Block));
+    assert_eq!(rows[gallery - 1].estimate, step::GAP_M);
+    assert_eq!(rows[gallery + 1].estimate, step::GAP_M);
+}
