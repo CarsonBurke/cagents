@@ -3224,6 +3224,9 @@ pub(super) struct Runtime {
     last_presented_tail: Option<(String, ChangeToken)>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
+    /// The rest of the requested preview's gallery, read with it so a tile
+    /// in an older gallery loads the gallery rather than one tile at a time.
+    preview_gallery: Vec<String>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
     /// How the conversation's pull request links read, from what the window
@@ -4444,6 +4447,7 @@ impl Runtime {
             presentation_evicted: false,
             last_presented_tail: None,
             preview_request: None,
+            preview_gallery: Vec::new(),
             syntax_theme,
             pull_request_labels: Arc::default(),
             pull_request_inspected: Default::default(),

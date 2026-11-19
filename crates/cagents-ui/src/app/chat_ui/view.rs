@@ -2902,7 +2902,7 @@ impl Runtime {
                     transcript.lazy(
                         key.finish(),
                         revision.finish(),
-                        images::tiles::height(run, content_width),
+                        images::tiles::height(&pictures, content_width),
                         aliases,
                         // The reader's pictures open an exchange, as their
                         // message would; the subagent's are blocks of its work.
@@ -5220,7 +5220,7 @@ impl Runtime {
                     };
                     (Some(item), footer)
                 }
-                TurnPart::Gallery { len, .. } => {
+                TurnPart::Gallery { .. } => {
                     aliases.extend(
                         self.turn_gallery(turn, part)
                             .iter()
@@ -5253,7 +5253,7 @@ impl Runtime {
             };
             let estimate = match (part, item) {
                 // Its tiles' room is known before any picture arrives.
-                (TurnPart::Gallery { len, .. }, _) => images::tiles::height(len, content_width),
+                (TurnPart::Gallery { .. }, _) => self.gallery_estimate(turn, part, content_width),
                 (_, Some(item)) => row_estimate(item, rhythm, footer, content_width),
                 (_, None) => TIMELINE_ROW,
             };
@@ -5875,6 +5875,22 @@ impl Runtime {
                 };
                 scroll::item(&pictures[0].id, body)
             }
+        }
+    }
+
+    /// About how tall a gallery row of `turn` is in a column `content_width`
+    /// wide, before it is drawn.
+    fn gallery_estimate(&self, turn: &turn::Turn, part: TurnPart, content_width: f32) -> f32 {
+        let pictures = self.turn_gallery(turn, part);
+        match part {
+            // The reader's pictures are within their bubble.
+            TurnPart::Gallery { prompt: true, .. } => {
+                images::tiles::height(
+                    &pictures,
+                    content_width.min(PROMPT_MEASURE) - 2.0 * step::GAP_M,
+                ) + 2.0 * step::GAP_S
+            }
+            _ => images::tiles::height(&pictures, content_width),
         }
     }
 
