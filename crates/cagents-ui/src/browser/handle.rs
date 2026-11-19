@@ -881,10 +881,11 @@ mod tests {
     fn pressure_evicts_only_telemetry_and_preserves_control_edges() {
         let events = EventBus::new();
         for sequence in 0..EVENT_CAPACITY - CRITICAL_EVENT_RESERVE - 2 {
-            assert!(events.semantic(BrowserEvent::InputHandled {
-                sequence: sequence as u64,
-                consumed: false,
-            }));
+            assert!(events.semantic(BrowserEvent::Delegate(
+                super::super::DelegateRequest::ClipboardRead {
+                    id: DelegateRequestId(sequence as u64 + 100),
+                },
+            )));
         }
         assert!(events.semantic(BrowserEvent::LoadStateChanged("Loading".into())));
         assert!(events.semantic(BrowserEvent::Delegate(
