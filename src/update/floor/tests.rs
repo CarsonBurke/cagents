@@ -2713,17 +2713,23 @@ fn in_flight_work_survives_only_a_provider_that_was_kept_and_reattached() {
             }
     }));
     survivors.record_prepared(&source.preview, &daemon);
-    // Until a successor confirms its restore, what became of the prepared
-    // conversations is not known, though the interruption stands.
-    let unconfirmed = survivors.in_flight_outcomes(|| unreachable!("nothing serves"));
-    assert!(unconfirmed.iter().all(|outcome| {
-        outcome.fate
-            == if outcome.work.id == interrupted {
-                Fate::Interrupted
-            } else {
-                Fate::Unknown
-            }
-    }));
+    // Without a successor, a provider the prepared source did not retain
+    // exited with it, while a retained one may still be running its work.
+    let unconfirmed: BTreeMap<_, _> = survivors
+        .in_flight_outcomes(|| unreachable!("nothing serves"))
+        .iter()
+        .map(|outcome| (outcome.work.id, outcome.fate))
+        .collect();
+    assert_eq!(
+        unconfirmed,
+        BTreeMap::from([
+            (interrupted, Fate::Interrupted),
+            (retained, Fate::Unknown),
+            (restarted, Fate::Stopped),
+            (unrestartable, Fate::Unknown),
+            (detached, Fate::Unknown),
+        ])
+    );
     survivors.successor_serving = true;
     let outcomes = survivors.in_flight_outcomes(|| {
         vec![
@@ -2816,6 +2822,22 @@ fn an_interruption_is_recorded_even_when_the_update_went_no_further() {
             (retained, Fate::Continued)
         ])
     );
+}
+
+#[test]
+fn an_interruption_is_recorded_when_the_update_failed_before_its_census() {
+    use super::super::in_flight::Fate;
+    let (source, interrupted) = interrupt_fixture();
+    let daemon = source.preview.daemon.clone().unwrap();
+    let mut survivors = Survivors::default();
+    survivors.record_interrupt_requests(&source.preview, &daemon);
+    survivors.record_settled_interruptions(&source.preview, &daemon, &[]);
+    let outcomes = survivors.in_flight_outcomes(|| unreachable!("nothing was restored"));
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].work.id, interrupted);
+    assert!(outcomes[0].work.turn);
+    assert_eq!(outcomes[0].fate, Fate::Interrupted);
+    assert!(!outcomes[0].label.is_empty());
 }
 
 #[test]

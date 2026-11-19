@@ -1593,7 +1593,25 @@ impl Survivors {
     ) -> Vec<super::in_flight::Outcome> {
         use super::in_flight::{Fate, Outcome};
         use crate::upgrade::handoff::UnattachedDisposition;
-        if self.in_flight.is_empty()
+        // An update that failed between settling its interruptions and taking
+        // the census still interrupted those turns.
+        let unrecorded = self
+            .interrupted
+            .iter()
+            .filter(|((kind, id), _)| {
+                *kind == impact::SessionKind::NativeChat
+                    && !self.in_flight.iter().any(|work| work.id == *id)
+            })
+            .map(|((_, id), turn)| {
+                let mut work = super::in_flight::InFlight {
+                    id: *id,
+                    ..Default::default()
+                };
+                work.interrupted(&turn.background_tasks);
+                work
+            });
+        let works: Vec<_> = self.in_flight.iter().cloned().chain(unrecorded).collect();
+        if works.is_empty()
             || !self.source_prepared
                 && !self.service_stopped
                 && self.ended.is_empty()
@@ -1623,8 +1641,8 @@ impl Survivors {
                 })
                 .or_else(|| self.capture_dispositions.get(&id).copied())
         };
-        self.in_flight
-            .iter()
+        works
+            .into_iter()
             .map(|work| {
                 let key = (impact::SessionKind::NativeChat, work.id);
                 let fate = if self.ended.contains_key(&key) || self.service_stopped {
@@ -1638,9 +1656,16 @@ impl Survivors {
                     // conversation the update did not end or interrupt.
                     Fate::Continued
                 } else if !self.successor_serving {
-                    // Preparation crossed the point of no return, but no
-                    // successor confirmed what it restored.
-                    Fate::Unknown
+                    // Preparation crossed the point of no return: the source
+                    // exited with every provider it did not retain, and no
+                    // successor confirmed restarting one. Only a retained
+                    // provider may still be running its work.
+                    match disposition(work.id) {
+                        Some(impact::Disposition::Resumes | impact::Disposition::ResumePicker) => {
+                            Fate::Stopped
+                        }
+                        _ => Fate::Unknown,
+                    }
                 } else if let Some(conversation) = unattached
                     .iter()
                     .find(|conversation| conversation.id == work.id)
@@ -1667,8 +1692,13 @@ impl Survivors {
                     }
                 };
                 Outcome {
-                    work: work.clone(),
-                    label: self.labels.get(&work.id).cloned().unwrap_or_default(),
+                    label: self
+                        .labels
+                        .get(&work.id)
+                        .or_else(|| self.interrupted.get(&key).map(|turn| &turn.label))
+                        .cloned()
+                        .unwrap_or_default(),
+                    work,
                     fate,
                 }
             })
