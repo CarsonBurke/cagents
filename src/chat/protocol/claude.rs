@@ -647,6 +647,14 @@ struct Claude {
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
+    /// Whether this turn has shown where it was stopped: Claude Code records
+    /// a stop as a user message, which is drawn as the marker in its place.
+    stop_marked: bool,
+    /// The calls the last tool results refused, in the conversation they
+    /// ran in. Claude Code words a call cut short by a stop as the person
+    /// declining it, and only the stop's record, which follows, tells the
+    /// two apart.
+    refused_calls: Vec<ScopedId>,
     attention_generation: u64,
     suggestion_turn: Option<(u64, String)>,
     /// Which result-delimited turn has already published its start. Busy may
@@ -983,6 +991,7 @@ impl Claude {
             self.suggestion_turn = None;
             step.events.push(Event::PromptSuggestionCleared);
             self.started_generation = Some(self.attention_generation);
+            self.stop_marked = false;
             step.events.push(Event::TurnStarted);
         }
     }
@@ -1725,6 +1734,37 @@ impl Claude {
         } else {
             Role::Assistant
         };
+        if role == Role::User && stop_record(&frame["message"]) {
+            let id = frame["message"]["id"].as_str().unwrap_or(carrier);
+            let marker = chat::stopped_notice(format!("{id}:0"));
+            self.track_carrier(carrier, vec![marker.id.clone()], child);
+            self.settle_stopped_calls(child, step);
+            step.events.push(Event::Item(marker));
+            match child {
+                // A subagent's own stop is drawn in its transcript.
+                Some(parent) => route_subagent_events(&mut step.events, event_start, parent),
+                None if !history => self.stop_marked = true,
+                None => {}
+            }
+            return Ok(());
+        }
+        // Claude Code answers each call of a parallel batch in a message of
+        // its own, so the refusals a stop leaves span the results that run
+        // up to its record; anything else in between, in the same
+        // conversation, means they were not. A subagent's frames interleave
+        // with the lead's and say nothing of its refusals.
+        if role == Role::Assistant
+            || !frame["message"]["content"]
+                .as_array()
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .all(|block| string(block, "type") == "tool_result")
+                })
+        {
+            self.refused_calls
+                .retain(|key| key.parent.as_deref() != child);
+        }
         if let Some(parent) = child
             && fresh_live_carrier
             && role == Role::Assistant
@@ -2182,6 +2222,9 @@ impl Claude {
                                     at: None,
                                 }));
                             }
+                        }
+                        if item.content.status() == Some(ToolStatus::Denied) {
+                            self.refused_calls.push(ScopedId::new(child, &item.id));
                         }
                         self.tool(child, item.clone());
                         step.events.push(Event::Item(item));
@@ -3051,6 +3094,81 @@ impl Claude {
             }
         }
     }
+    /// Settles the calls a stop cut short in the conversation `parent`
+    /// names: those its last results refused, which the stop's record shows
+    /// were stopped rather than declined, and, in the main conversation,
+    /// every call still running in the foreground, which a stopped turn
+    /// leaves without a result, with the calls running inside a foreground
+    /// agent it stops. A call running in the background outlives the turn
+    /// and reports its own end.
+    fn settle_stopped_calls(&mut self, parent: Option<&str>, step: &mut Step) {
+        let scope = parent.filter(|id| !id.is_empty());
+        let (mut settled, other): (Vec<ScopedId>, _) = std::mem::take(&mut self.refused_calls)
+            .into_iter()
+            .partition(|key| key.parent.as_deref() == scope);
+        self.refused_calls = other;
+        if scope.is_none() {
+            let is_agent = |key: &ScopedId| {
+                self.tools.get(key).is_some_and(
+                    |item| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"),
+                )
+            };
+            let mut conversations = vec![None::<String>];
+            let mut searched = HashSet::new();
+            while let Some(conversation) = conversations.pop() {
+                if !searched.insert(conversation.clone()) {
+                    continue;
+                }
+                for key in &self.tool_order {
+                    if key.parent == conversation
+                        && !settled.contains(key)
+                        && !self.launches.contains(key)
+                        && !self.background_agents.contains(&key.id)
+                        && self
+                            .tools
+                            .get(key)
+                            .is_some_and(|item| item.content.status() == Some(ToolStatus::Running))
+                    {
+                        settled.push(key.clone());
+                    }
+                }
+                conversations.extend(
+                    settled
+                        .iter()
+                        .filter(|key| key.parent == conversation && is_agent(key))
+                        .map(|key| Some(key.id.clone())),
+                );
+            }
+        }
+        for key in settled {
+            let Some(mut item) = self.tools.get(&key).cloned() else {
+                continue;
+            };
+            if !matches!(
+                item.content.status(),
+                Some(ToolStatus::Denied | ToolStatus::Running)
+            ) {
+                continue;
+            }
+            let Some(status) = item.content.status_mut() else {
+                continue;
+            };
+            *status = ToolStatus::Stopped;
+            if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent") {
+                step.events.push(subagent_status(
+                    item.id.clone(),
+                    ToolStatus::Stopped,
+                    None,
+                    false,
+                ));
+            }
+            self.tool(key.parent.as_deref(), item.clone());
+            step.events.push(match key.parent {
+                Some(parent) => Event::SubagentItem { id: parent, item },
+                None => Event::Item(item),
+            });
+        }
+    }
     fn update_usage(&mut self, value: &Value, step: &mut Step) {
         if !value.is_object() {
             return;
@@ -3486,8 +3604,9 @@ impl Adapter for Claude {
                 self.control(json!({"subtype":"stop_task", "task_id":task}))
             }
             Command::Interrupt => {
+                // A second stop asks for what the first already asked for.
                 if self.interruption.is_some() {
-                    return Err("Claude interruption is already pending for this turn".into());
+                    return Ok(Step::default());
                 }
                 let step = self.control(
                     json!({"subtype":"interrupt", "_cagents_turn": self.attention_generation}),
@@ -4184,9 +4303,27 @@ impl Claude {
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
                     && self.interruption.is_none()
+                    && !self.stop_marked
                     && self.started_generation == Some(self.attention_generation);
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
+                // A turn the person stopped ends as stopped, not failed: its
+                // calls settle, and a marker shows where, once. Only Claude
+                // Code's record of the stop or its acknowledgement says the
+                // stop took: a stop still unacknowledged when the turn ends
+                // may yet be refused, so the turn's own failure stands.
+                let stopped = self.stop_marked || interruption == Some(true);
+                if stopped {
+                    self.settle_stopped_calls(None, &mut step);
+                    if !std::mem::take(&mut self.stop_marked) {
+                        let id = frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        step.events
+                            .push(Event::Item(chat::stopped_notice(format!("{id}:stopped"))));
+                    }
+                }
                 if had_turn || frame["uuid"].as_str().is_some() {
                     step.events.push(Event::TurnSettled);
                     use crate::notifications::Kind;
@@ -4200,13 +4337,14 @@ impl Claude {
                             .map(str::to_owned)
                             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
                     ));
-                    let outcome = if interruption == Some(true) {
-                        Kind::Cancelled
-                    } else if frame["is_error"].as_bool() == Some(true) {
-                        Kind::Failed
-                    } else {
-                        Kind::Succeeded
-                    };
+                    let outcome =
+                        if interruption == Some(true) || (interruption.is_none() && stopped) {
+                            Kind::Cancelled
+                        } else if frame["is_error"].as_bool() == Some(true) {
+                            Kind::Failed
+                        } else {
+                            Kind::Succeeded
+                        };
                     let execution = self.execution.take();
                     if let Some(run) = execution {
                         step.events.push(Event::Execution {
@@ -4241,6 +4379,8 @@ impl Claude {
                     busy,
                     if busy {
                         "Claude turn ended; decisions remain"
+                    } else if stopped {
+                        chat::TURN_INTERRUPTED
                     } else {
                         "Claude turn complete"
                     },
@@ -4282,7 +4422,7 @@ impl Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) {
+                if frame["is_error"].as_bool() == Some(true) && !stopped {
                     let errors = content_text(&frame["errors"]);
                     let message = if !errors.is_empty() {
                         errors
@@ -4684,12 +4824,16 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
                 id: parent.into(),
                 kind: String::new(),
                 description: String::new(),
-                // A retryable API error is not proof that the task stopped.
-                // Keep its exact status, but expose that it needs attention.
+                // A retryable API error is not proof that the task stopped, so
+                // its status stays. Nor is it a question for the person: only
+                // a request, or a provider asking for input, waits on them. A
+                // usage limit is the account's, which the conversation reports
+                // as limited until it resets; the error stays the agent's
+                // detail until it shows signs of life or its task settles.
                 status: None,
                 background: None,
                 model: None,
-                waiting: Some(true),
+                waiting: None,
                 detail: Some(message),
             },
             event => event,
@@ -6091,6 +6235,23 @@ fn apply_result(
         | ItemContent::Delivery { .. } => {}
     }
 }
+/// Whether a user message is Claude Code's record that the person stopped
+/// the turn, which it adds as though the person had written it.
+fn stop_record(message: &Value) -> bool {
+    let text = match &message["content"] {
+        Value::String(text) => text.as_str(),
+        Value::Array(blocks) => match blocks.as_slice() {
+            [block] if string(block, "type") == "text" => string(block, "text"),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    matches!(
+        text.trim(),
+        "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+    )
+}
+
 /// Whether a failed result is the call being refused or cut short rather
 /// than failing: the person declined it, or it was interrupted before it
 /// finished. Claude Code reports both as errors, in fixed wording.

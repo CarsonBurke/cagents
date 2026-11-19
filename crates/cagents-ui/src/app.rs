@@ -1261,6 +1261,11 @@ struct OwedProjection {
     /// The shared workspace model changed, so the replica snapshot is
     /// materialized before chrome reads it.
     model_update: bool,
+    /// The window's saved view changed. It is captured once the projection
+    /// has rebound what the view shows, such as the source-control panel's
+    /// worktree and its filter, so the save never holds the binding being
+    /// replaced.
+    save_view: bool,
 }
 
 impl OwedProjection {
@@ -1271,6 +1276,15 @@ impl OwedProjection {
             camera_only: false,
             reconcile_row_selection: false,
             model_update: false,
+            save_view: false,
+        }
+    }
+
+    /// This projection, then a save of the window's view.
+    fn saving_view(self) -> Self {
+        Self {
+            save_view: true,
+            ..self
         }
     }
 
@@ -1283,6 +1297,7 @@ impl OwedProjection {
             projection,
             reconcile_row_selection: self.reconcile_row_selection || other.reconcile_row_selection,
             model_update: self.model_update || other.model_update,
+            save_view: self.save_view || other.save_view,
         }
     }
 
@@ -4751,7 +4766,7 @@ pub enum Message {
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<SourceControlRead, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -5228,6 +5243,16 @@ pub enum Message {
     ExpireNotices,
     /// The retiring notices control has finished its conditional focus handoff.
     NoticeControlRetired,
+}
+
+/// What a source-control reload read, compared with the snapshot the panel
+/// was built from.
+#[derive(Debug, Clone)]
+pub enum SourceControlRead {
+    /// The worktree differs from what the panel shows; rebuild from this.
+    Changed(Box<RepositorySnapshot>),
+    /// The read equals the snapshot the panel shows, so its model stands.
+    Unchanged,
 }
 
 /// An application exit in progress.
@@ -12963,6 +12988,8 @@ impl Cagents {
     /// a session restoring, a project list arriving. Rebinding drops the
     /// previous worktree's model outright, so a stale row can never be pressed.
     fn rebind_source_control(&mut self) -> Task<Message> {
+        #[cfg(test)]
+        terminal_output_tests::record_source_control_rebind();
         // Work chosen in the inspector binds the panel without moving the
         // list's selection, which stays with the focused card.
         self.sidebar_state
@@ -14115,13 +14142,15 @@ impl Cagents {
         };
         let browse_files =
             self.workspace_view_shown() == Some(context_sections::WorkspaceView::Files);
-        let previous_errors = self
+        let bound = self
             .sidebar_model
             .source_control
             .as_ref()
-            .filter(|source| source.key == key)
-            .map(|source| source.ignored_directory_errors.clone())
+            .filter(|source| source.key == key);
+        let previous_errors = bound
+            .map(|source| source.ignored_directory_errors().clone())
             .unwrap_or_default();
+        let previous = bound.and_then(|source| source.source_snapshot().cloned());
         let expanded = self
             .sidebar_state
             .expanded_directory_paths()
@@ -14147,12 +14176,14 @@ impl Cagents {
                         &cancellation,
                     )?;
                 }
-                Ok(snapshot)
+                Ok(source_control_ui::source_control_read(
+                    previous.as_deref(),
+                    snapshot,
+                ))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -15256,6 +15287,8 @@ impl Cagents {
     }
 
     fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
+        #[cfg(test)]
+        terminal_output_tests::record_settings_capture();
         if self.settings_write_blocked {
             return Err(
                 "settings were not loaded successfully; use Reset all settings to replace them"
@@ -15292,6 +15325,8 @@ impl Cagents {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
+        #[cfg(test)]
+        terminal_output_tests::record_captured_view(&view.sidebar);
         self.settings_save_generation += 1;
         Ok(SettingsSave {
             generation: self.settings_save_generation,
@@ -19475,7 +19510,7 @@ impl Cagents {
                 committed,
             } => handled!(self.source_control_mutated(key, operation, report, committed)),
         };
-        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update });
+        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
         task
             })();
         Task::batch([settled, task])
@@ -19502,7 +19537,7 @@ impl Cagents {
         } = entry;
         #[rustfmt::skip]
         let task = (|| {
-        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update }) = self.owed_projection.take() else {
+        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update, save_view }) = self.owed_projection.take() else {
             return task;
         };
         // Scoped proof was established during dispatch. Settings commit and
@@ -19615,9 +19650,15 @@ impl Cagents {
                 reconcile_row_selection,
             ),
         ]);
+        let saved = if save_view {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         Task::batch([
             task,
             projected,
+            saved,
             self.release_deferred_navigation_if_unblocked(),
         ])
             })();

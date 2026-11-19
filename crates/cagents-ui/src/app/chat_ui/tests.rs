@@ -7984,6 +7984,207 @@ fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
 }
 
 #[test]
+fn attach_files_refuses_a_non_image_for_an_images_only_provider() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes.txt");
+        let shot = directory.path().join("shot.png");
+        std::fs::write(&notes, "Meeting notes").unwrap();
+        std::fs::copy(&image.path, &shot).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = true;
+        assert!(runtime.accepts_draft_attachments());
+        let ticket = runtime.try_attachment_insert().unwrap();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+
+        let task = app.handle_chat_ui(Action::Attached(
+            target,
+            ticket.clone(),
+            Ok(Some(vec![notes, shot])),
+        ));
+
+        assert_eq!(task.units(), 0, "refused selection must stage no files");
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(!runtime.attachment_bookmarks.contains_key(&ticket.id));
+        assert!(runtime.attachment_jobs.is_empty());
+        assert!(runtime.attachment_order.is_empty());
+        assert!(runtime.attachment_chooser_pending.is_none());
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(
+                "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+            )
+        );
+    });
+}
+
+#[test]
+fn a_chooser_refusal_survives_a_deferred_account_change() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.accepts_draft_attachments());
+    let original = runtime.session.clone();
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+
+    let mut chosen = original.clone();
+    chosen.launch.recipe.environment.insert(
+        "CODEX_HOME".into(),
+        directory.path().join("other-account").display().to_string(),
+    );
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(chosen.clone());
+    drop(app.adopt_stored_draft_session(card));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime.session, original,
+        "the open chooser defers adoption"
+    );
+    assert!(ticket.active());
+    assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session, chosen);
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+        )
+    );
+    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.pastes_pending, 0);
+    assert!(!ticket.active());
+    assert!(!runtime.attachment_bookmarks.contains_key(&ticket.id));
+    assert!(runtime.attachment_jobs.is_empty());
+    assert!(runtime.attachment_order.is_empty());
+    assert!(runtime.attachment_chooser_pending.is_none());
+}
+
+/// Another window switching the draft to Codex while the chooser is open
+/// decides which files the choice may attach, not the provider it opened on.
+#[test]
+fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.accepts_draft_attachments());
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+    let mut chosen = runtime.session.clone();
+    chosen.launch.provider = Provider::Codex;
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(chosen);
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session.launch.provider, Provider::Codex);
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+        )
+    );
+    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.pastes_pending, 0);
+    assert!(!ticket.active());
+    assert!(runtime.attachment_jobs.is_empty());
+}
+
+#[test]
+fn attach_files_still_stages_images_for_an_images_only_provider() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let directory = tempfile::tempdir().unwrap();
+        let shot = directory.path().join("shot.png");
+        std::fs::copy(&image.path, &shot).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = true;
+        assert!(runtime.accepts_draft_attachments());
+        let ticket = runtime.try_attachment_insert().unwrap();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+
+        let task = app.handle_chat_ui(Action::Attached(
+            target,
+            ticket.clone(),
+            Ok(Some(vec![shot])),
+        ));
+
+        assert!(task.units() > 0, "accepted images must schedule staging");
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.pastes_pending, 1);
+        assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+        assert!(runtime.attachment_chooser_pending.is_none());
+    });
+}
+
+#[test]
+fn attach_files_takes_any_file_for_a_provider_that_accepts_files() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .attachments = true;
+    assert!(runtime.accepts_draft_attachments());
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    assert!(task.units() > 0, "accepted files must schedule staging");
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.pastes_pending, 1);
+    assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+    assert!(runtime.attachment_chooser_pending.is_none());
+}
+
+#[test]
 fn cancelled_chooser_and_repeated_drops_cannot_queue_unbounded_image_staging() {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::with_test_image(|image| {
@@ -12906,6 +13107,111 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
         draft_permission_mode(&recipe, Provider::Claude).as_deref(),
         Some("auto")
     );
+}
+
+#[test]
+fn draft_permission_preview_reads_config_once_per_recipe() {
+    let home = tempfile::tempdir().unwrap();
+    let account = home.path().join(".codex");
+    std::fs::create_dir_all(&account).unwrap();
+    let config = account.join("config.toml");
+    std::fs::write(
+        &config,
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+    )
+    .unwrap();
+    let mut recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: home.path().to_owned(),
+        environment: [
+            ("HOME".into(), home.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+        ]
+        .into(),
+    };
+    let mut preview = DraftPermissionPreview::default();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("yolo")
+    );
+    std::fs::write(
+        &config,
+        "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("yolo"),
+        "an unchanged recipe keeps its preview"
+    );
+    recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
+        .map(String::from)
+        .into();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("workspaceWrite")
+    );
+    assert_eq!(
+        preview.get(&recipe, Provider::Omp),
+        None,
+        "the provider is part of the key"
+    );
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("workspaceWrite")
+    );
+}
+
+#[test]
+fn codex_draft_publications_do_not_reread_provider_config() {
+    let home = tempfile::tempdir().unwrap();
+    let account = home.path().join(".codex");
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&account).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let config = account.join("config.toml");
+    std::fs::write(&config, "profile = 'x'\n").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, &project);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    // Only a presented draft falls back to its recipe's preview; a hidden
+    // one stores the publication as it came.
+    runtime.visible.store(true, Ordering::Relaxed);
+    // The draft helper selects its own account. Bind this fixture's recipe
+    // before its first publication and discard the earlier account's preview.
+    runtime.session.launch.recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: project,
+        environment: [
+            ("HOME".into(), home.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+        ]
+        .into(),
+    };
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = None;
+    let mut snapshot = (*runtime.snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.session_id = None;
+    snapshot.permission_mode = None;
+    runtime.install_snapshot(Arc::new(snapshot), None);
+    assert_eq!(runtime.snapshot.permission_mode, None);
+
+    std::fs::write(
+        config,
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+    )
+    .unwrap();
+    let mut snapshot = (*runtime.snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.session_id = None;
+    snapshot.permission_mode = None;
+    runtime.install_snapshot(Arc::new(snapshot), None);
+    assert_eq!(runtime.snapshot.permission_mode, None);
 }
 
 #[test]

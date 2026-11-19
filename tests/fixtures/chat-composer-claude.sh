@@ -302,6 +302,7 @@ long_history_turn() {
 frames_file=$config/fixture-frames.jsonl
 frames_ended=0
 frames_turn() {
+    open_tools=
     frames_ended=0
     frame_line=0
     busy=true
@@ -355,10 +356,23 @@ frames_turn() {
             continue
         fi
         case $(printf '%s' "$frame" | jq -r '.type') in
-            assistant|user) emit_record "$frame" ;;
+            assistant|user)
+                emit_record "$frame"
+                # The main conversation's calls still awaiting a result,
+                # which a stop cuts short.
+                if [ "$(printf '%s' "$frame" | jq -r '.parent_tool_use_id // empty')" = "" ]; then
+                    open_tools=$(printf '%s' "$frame" | jq -r --arg open "$open_tools" '
+                        ($open | split(" ") | map(select(. != ""))) as $known
+                        | [.message.content | if type == "array" then .[] else empty end] as $blocks
+                        | ($known + [$blocks[] | select(.type == "tool_use") | .id])
+                          - [$blocks[] | select(.type == "tool_result") | .tool_use_id]
+                        | join(" ")')
+                fi
+                ;;
             *) printf '%s\n' "$frame" ;;
         esac
     done < "$frames_file"
+    open_tools=
 }
 
 # Optional real command: every turn runs the first line of
@@ -576,12 +590,38 @@ handle_control() {
             esac
             ;;
         interrupt)
-            busy=false
             for tool in $background_agents; do stop_agent "$tool"; done
-            jq -cn --arg session "$session" --arg turn "$turn" \
-                '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+            if [ "$busy" = true ]; then
+                busy=false
+                record_stop
+            fi
             ;;
     esac
+}
+
+# Claude Code 2.1's record of a stop, as its sdk-cli transcripts and its
+# 2.1.317 stream hold it: a replayed call still running gets a result worded
+# as the person declining it, then a user message says the request was
+# interrupted, and the turn ends with an error result. Both messages are
+# recorded in the history.
+open_tools=
+record_stop() {
+    local tool marker="[Request interrupted by user]" reason=aborted_streaming stop=null
+    for tool in $open_tools; do
+        reason=aborted_tools
+        stop=tool_use
+        emit_record "$(jq -cn --arg turn "$turn" --arg tool "$tool" \
+            '{type:"user",uuid:("fixture-stop-result-"+$turn+"-"+$tool),tool_use_result:"User rejected tool use",message:{role:"user",content:[{type:"tool_result",tool_use_id:$tool,is_error:true,content:"The user doesn'"'"'t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."}]}}')"
+        marker="[Request interrupted by user for tool use]"
+    done
+    open_tools=
+    emit_record "$(jq -cn --arg turn "$turn" --arg text "$marker" \
+        '{type:"user",uuid:("fixture-stop-"+$turn),message:{role:"user",content:[{type:"text",text:$text}]}}')"
+    # Claude Code 2.1.317 names why the turn ended and adds a diagnostic.
+    jq -cn --arg session "$session" --arg turn "$turn" --arg reason "$reason" --arg stop "$stop" \
+        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,
+          terminal_reason:$reason,stop_reason:(if $stop == "null" then null else $stop end),
+          errors:["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason="+$stop],session_id:$session}'
 }
 
 queue_user() {

@@ -1537,6 +1537,11 @@ fn receive_handshake(
     }
     match envelope.message {
         ServerMessage::Response { response } => {
+            if let ServerResponse::Connected { proof, .. } = &response
+                && *proof != envelope.proof
+            {
+                return Err(HandshakeError::ProofChanged(None));
+            }
             #[cfg(feature = "ui")]
             crate::daemon_health::frame(stream, None, health_request);
             Ok(response)

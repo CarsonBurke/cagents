@@ -4,12 +4,15 @@
 //! saw it, including history a forked or resumed thread replays before its
 //! first turn. Codex's own harness context travels among the user messages
 //! and is left out. Tool calls come from the richer `item_completed` turn
-//! items, which carry exit codes and edited paths; turns written before Codex
-//! recorded turn items fall back to the raw calls. One rollout can hold both:
+//! items, which carry exit codes and edited paths. A raw call is kept unless
+//! an item in the same turn records its kind of tool work, so calls no item
+//! describes stay visible beside the richer items. Turns written before Codex
+//! recorded turn items keep all their raw calls. One rollout can hold both:
 //! a newer Codex appends to a conversation an older one began, and a forked
 //! thread replays its parent's turns with their raw calls alone.
 
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Read},
     path::Path,
 };
@@ -59,8 +62,7 @@ pub(crate) fn read(path: &Path) -> Result<Vec<Item>, String> {
 /// conversation.
 pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
     let mut items = Vec::new();
-    // Raw tool calls of turns without turn items, each with its place in
-    // `items`, and those of the current turn until it proves to have none.
+    // Raw calls no item in their turn describes, each with its place in `items`.
     let mut raw_tools = Vec::new();
     let mut turn = RawTurn::default();
     for (line, text) in BufReader::new(reader).split(b'\n').enumerate() {
@@ -101,9 +103,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                 }
             }
             (Some("event_msg"), Some("task_started")) => turn.finish(&mut raw_tools),
-            (Some("response_item"), Some("function_call" | "custom_tool_call"))
-                if !turn.superseded =>
-            {
+            (Some("response_item"), Some("function_call" | "custom_tool_call")) => {
                 let call = (
                     Role::Assistant,
                     ItemContent::Tool {
@@ -116,9 +116,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                 turn.calls.push((items.len(), item(line_id(), call)));
             }
             (Some("event_msg"), Some("item_completed")) => {
-                if records_tool_work(&payload["item"]) {
-                    turn.supersede();
-                }
+                turn.record(&payload["item"]);
                 if let Some(entry) = turn_item(&payload["item"]) {
                     let id = payload["item"]["id"]
                         .as_str()
@@ -126,6 +124,16 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                         .map_or_else(line_id, str::to_owned);
                     items.push(item(id, entry));
                 }
+            }
+            // The person stopped the turn: the same quiet marker a live stop
+            // leaves. Any other reason is news, and names itself.
+            (Some("event_msg"), Some("turn_aborted"))
+                if payload["reason"].as_str() == Some("interrupted") =>
+            {
+                items.push(Item {
+                    at,
+                    ..crate::chat::stopped_notice(line_id())
+                })
             }
             (Some("event_msg"), Some("turn_aborted")) => items.push(item(
                 line_id(),
@@ -180,28 +188,68 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
 /// One turn's raw tool calls. Codex writes a raw call for every tool the
 /// model invokes, and a writer that records tool turn items also records the
 /// same work as richer `item_completed` items, though not one for one: a
-/// single `exec` call can run several commands. A turn with any tool turn
-/// item is therefore read from its turn items alone, and a turn without one
-/// from its raw calls: one written by an older Codex, replayed from a parent
-/// thread, written by a Codex that records only message items, or
-/// interrupted before its first tool item completed. Turns begin at
-/// `task_started`; an interrupted turn ends at the next one.
+/// single `exec` call can run several commands. Each raw call is superseded
+/// only by an item recording that kind of tool work in the same turn. Calls
+/// no item describes keep their original positions, including all calls in
+/// turns written by an older Codex, replayed from a parent thread, or
+/// interrupted before a tool item completed. Turns begin at `task_started`;
+/// an interrupted turn ends at the next one.
 #[derive(Default)]
 struct RawTurn {
     calls: Vec<(usize, Item)>,
-    superseded: bool,
+    recorded: HashSet<Recorded>,
+    mcp_tools: HashSet<String>,
 }
 
 impl RawTurn {
-    fn supersede(&mut self) {
-        self.superseded = true;
-        self.calls.clear();
+    fn record(&mut self, item: &Value) {
+        let recorded = match item["type"].as_str() {
+            Some("CommandExecution") => Recorded::CommandExecution,
+            Some("FileChange") => Recorded::FileChange,
+            Some("ImageView") => Recorded::ImageView,
+            Some("WebSearch") => Recorded::WebSearch,
+            Some("CollabAgentToolCall") => Recorded::CollabAgentToolCall,
+            Some("SubAgentActivity") if item["kind"] == "started" => Recorded::SubAgentActivity,
+            Some("McpToolCall") => {
+                if let Some(tool) = item["tool"].as_str() {
+                    self.mcp_tools.insert(tool.to_owned());
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.recorded.insert(recorded);
     }
 
-    /// Ends this turn, keeping its raw calls unless turn items superseded them.
+    /// Ends this turn, keeping each raw call no turn item describes.
     fn finish(&mut self, kept: &mut Vec<(usize, Item)>) {
-        kept.append(&mut std::mem::take(self).calls);
+        let Self {
+            calls,
+            recorded,
+            mcp_tools,
+        } = std::mem::take(self);
+        kept.extend(calls.into_iter().filter(|(_, call)| {
+            let ItemContent::Tool { name, .. } = &call.content else {
+                return true;
+            };
+            !superseded_by(name).is_some_and(|kind| recorded.contains(&kind))
+                && !(name == "spawn_agent" && recorded.contains(&Recorded::SubAgentActivity))
+                && !mcp_tools.iter().any(|tool| {
+                    name.strip_suffix(tool)
+                        .is_some_and(|prefix| prefix.ends_with("__"))
+                })
+        }));
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Recorded {
+    CommandExecution,
+    FileChange,
+    ImageView,
+    WebSearch,
+    CollabAgentToolCall,
+    SubAgentActivity,
 }
 
 /// A person's or the agent's message. Developer instructions and the
@@ -262,16 +310,33 @@ fn agent_message(payload: &Value) -> Option<(Role, ItemContent)> {
     ))
 }
 
-/// Whether a turn item records tool work, which supersedes its turn's raw
-/// calls. Messages, reasoning and compaction say nothing about the tools the
-/// turn ran, and some Codex versions record only those.
-fn records_tool_work(item: &Value) -> bool {
-    item["type"].as_str().is_some_and(|kind| {
-        !matches!(
-            kind,
-            "UserMessage" | "AgentMessage" | "Reasoning" | "ContextCompaction"
-        )
-    })
+/// The turn-item kind that records a raw tool's work:
+/// - CommandExecution: shell, container.exec, local_shell, shell_command,
+///   exec_command, exec, write_stdin, unified_exec.
+/// - FileChange: apply_patch.
+/// - ImageView: view_image.
+/// - WebSearch: web_search.
+/// - CollabAgentToolCall: spawn_agent, send_input, wait, wait_agent,
+///   close_agent, resume_agent.
+///
+/// A SubAgentActivity item with kind "started" also supersedes spawn_agent.
+/// An McpToolCall supersedes raw names ending in "__" + its tool name,
+/// with or without an mcp__ prefix. RawTurn handles these additional rules.
+/// Every other name, including update_plan, send_message, followup_task and
+/// sleep, has no superseding kind. Keeping an unknown call twice is safer
+/// than hiding work that no item describes.
+fn superseded_by(raw_name: &str) -> Option<Recorded> {
+    match raw_name {
+        "shell" | "container.exec" | "local_shell" | "shell_command" | "exec_command" | "exec"
+        | "write_stdin" | "unified_exec" => Some(Recorded::CommandExecution),
+        "apply_patch" => Some(Recorded::FileChange),
+        "view_image" => Some(Recorded::ImageView),
+        "web_search" => Some(Recorded::WebSearch),
+        "spawn_agent" | "send_input" | "wait" | "wait_agent" | "close_agent" | "resume_agent" => {
+            Some(Recorded::CollabAgentToolCall)
+        }
+        _ => None,
+    }
 }
 
 fn turn_item(item: &Value) -> Option<(Role, ItemContent)> {
@@ -550,9 +615,7 @@ mod tests {
             "See this\n[Image 1]",
             "a labelled image is not marked twice"
         );
-        assert!(
-            matches!(&items[10].content, ItemContent::Delivery { summary, .. } if summary == "Turn interrupted")
-        );
+        assert!(crate::chat::is_stopped_notice(&items[10].content));
         let serialized = serde_json::to_string(&items).unwrap();
         for hidden in [
             "AGENTS.md",
@@ -589,6 +652,7 @@ mod tests {
                 json!({"type":"UserMessage","id":"u1","content":[{"type":"Text","text":"Run the new checks"}]}),
             ),
             raw("exec"),
+            raw("update_plan"),
             completed(
                 json!({"type":"CommandExecution","id":"c1","command":"cargo test","status":"completed","exit_code":0}),
             ),
@@ -596,6 +660,7 @@ mod tests {
                 json!({"type":"CommandExecution","id":"c2","command":"cargo clippy","status":"completed","exit_code":0}),
             ),
             raw("exec"),
+            raw("spawn_agent"),
             message("assistant", "New checks pass."),
             // A turn from a Codex that records only message items keeps its
             // raw calls, as does one interrupted before a tool item completed.
@@ -628,19 +693,120 @@ mod tests {
                 "Replayed request",
                 "tool replayed",
                 "tool replayed again",
-                "Turn interrupted",
+                crate::chat::STOPPED,
                 "Run the old checks",
                 "tool older",
                 "Old checks pass.",
                 "Run the new checks",
+                "tool update_plan",
                 "command cargo test",
                 "command cargo clippy",
+                "tool spawn_agent",
                 "New checks pass.",
                 "Tidy up",
                 "tool plan",
                 "Tidied.",
             ]
         );
+    }
+
+    fn tool_summary(rollout: &str) -> Vec<String> {
+        parse(rollout.as_bytes())
+            .into_iter()
+            .map(|item| match item.content {
+                ItemContent::Tool { name, .. } => format!("tool {name}"),
+                ItemContent::Command { command, .. } => format!("command {command}"),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raw_calls_no_item_describes_stay_beside_command_items() {
+        let rollout = lines(&[
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"call-first","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{}"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-first","command":"cargo test","status":"completed","exit_code":0}),
+            ),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"call-second","name":"exec_command","arguments":"{\"cmd\":\"cargo clippy\"}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"wait_agent","arguments":"{}"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-second","command":"cargo clippy","status":"completed","exit_code":0}),
+            ),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{}"}}),
+        ]);
+        assert_eq!(
+            tool_summary(&rollout),
+            [
+                "tool spawn_agent",
+                "command cargo test",
+                "tool wait_agent",
+                "command cargo clippy",
+                "tool update_plan",
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_activity_supersedes_only_the_spawn() {
+        let rollout = lines(&[
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{}"}}),
+            completed(
+                json!({"type":"SubAgentActivity","id":"agent-started","kind":"started","agent_path":"/root/review"}),
+            ),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"send_message","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-checks","command":"cargo test","status":"completed","exit_code":0}),
+            ),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"followup_task","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"sleep","arguments":"{}"}}),
+        ]);
+        assert_eq!(
+            tool_summary(&rollout),
+            [
+                "tool Agent",
+                "tool send_message",
+                "command cargo test",
+                "tool followup_task",
+                "tool sleep",
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_activity_other_than_a_start_keeps_the_raw_spawn() {
+        // Only a started activity renders, so only it describes the spawn.
+        let rollout = lines(&[
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{}"}}),
+            completed(
+                json!({"type":"SubAgentActivity","id":"agent-finished","kind":"finished","agent_path":"/root/review"}),
+            ),
+        ]);
+        assert_eq!(tool_summary(&rollout), ["tool spawn_agent"]);
+    }
+
+    #[test]
+    fn an_mcp_item_supersedes_its_own_raw_call_only() {
+        for prefix in ["", "mcp__"] {
+            let rollout = lines(&[
+                json!({"type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"type":"response_item","payload":{"type":"function_call","name":format!("{prefix}github__list_issues"),"arguments":"{}"}}),
+                json!({"type":"response_item","payload":{"type":"function_call","name":"linear__get_issue","arguments":"{}"}}),
+                completed(
+                    json!({"type":"McpToolCall","id":"mcp-issues","tool":"list_issues","arguments":{},"result":{"content":[]},"status":"completed"}),
+                ),
+            ]);
+            assert_eq!(
+                tool_summary(&rollout),
+                ["tool linear__get_issue", "tool list_issues"],
+                "prefix {prefix:?}",
+            );
+        }
     }
 
     #[test]

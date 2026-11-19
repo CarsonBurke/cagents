@@ -170,7 +170,8 @@ class Streaming(unittest.TestCase):
         peer.send(prompt(99))
         peer.until(lambda f: f.get("command_uuid") == "prompt-99" and f.get("state") == "queued")
         peer.interrupt()
-        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "replay-start-1"])
+        # Claude Code records the stop, as the person's message, after it.
+        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "replay-start-1", "fixture-stop-1"])
         self.assertEqual(sum(f.get("type") == "result" for f in peer.frames), 1)
         self.assertFalse(any(f.get("uuid", "").startswith("replay-never-") for f in peer.frames))
 
@@ -182,11 +183,33 @@ class Streaming(unittest.TestCase):
         peer.until(lambda f: f.get("type") == "result")
         history = self.history()
         self.assertEqual([f["uuid"] for f in history],
-                         ["prompt-1", "replay-start-1", "prompt-2", "fixture-message-2"])
+                         ["prompt-1", "replay-start-1", "fixture-stop-1", "prompt-2", "fixture-message-2"])
         self.assertEqual(history[2]["parentUuid"], "replay-start-1")
+        self.assertEqual(history[3]["parentUuid"], "fixture-stop-1")
         peer.process.stdin.close()
         self.assertEqual(peer.process.wait(timeout=HANG_GUARD), 0)
         self.assertEqual(peer.process.stderr.read(), b"")
+
+    def test_a_stop_during_a_replayed_call_is_recorded_as_claude_code_records_it(self):
+        call = {"type": "assistant", "uuid": "call-@TURN@", "parent_tool_use_id": None,
+                "message": {"id": "call-@TURN@", "role": "assistant",
+                            "content": [{"type": "tool_use", "id": "toolu-@TURN@", "name": "Bash",
+                                         "input": {"command": "sleep 600"}}]}}
+        peer = self.start_replay(call, {"_sleep": 600})
+        peer.until(lambda f: f.get("uuid") == "call-1")
+        peer.interrupt()
+        result = next(f for f in peer.frames if f.get("type") == "result")
+        self.assertEqual((result["subtype"], result["is_error"]), ("error_during_execution", True))
+        refusal = next(f for f in peer.frames if f.get("uuid") == "fixture-stop-result-1-toolu-1")
+        block = refusal["message"]["content"][0]
+        self.assertEqual((block["tool_use_id"], block["is_error"]), ("toolu-1", True))
+        self.assertTrue(block["content"].startswith("The user doesn't want to proceed"))
+        marker = next(f for f in peer.frames if f.get("uuid") == "fixture-stop-1")
+        self.assertEqual(marker["message"]["content"],
+                         [{"type": "text", "text": "[Request interrupted by user for tool use]"}])
+        self.assertEqual([f["uuid"] for f in self.history()],
+                         ["prompt-1", "replay-start-1", "call-1", "fixture-stop-result-1-toolu-1",
+                          "fixture-stop-1"])
 
     def test_partial_interrupt_survives_a_replay_pause_deadline(self):
         continued = {"type": "assistant", "uuid": "replay-next-@TURN@",
@@ -230,7 +253,7 @@ class Streaming(unittest.TestCase):
         self.assertFalse(any(delta(f) for f in peer.frames[result_at:]))
         self.assertEqual(sum(f.get("type") == "result" for f in peer.frames), 1)
         self.assertFalse(any(f.get("type") == "assistant" for f in peer.frames))
-        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1"])
+        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "fixture-stop-1"])
         # A new reply in the same process must use the state and parent chain
         # owned by the input loop, without persisting the unsent first answer.
         self.reply.write_text("The next turn completed.")
@@ -238,9 +261,10 @@ class Streaming(unittest.TestCase):
         peer.until(lambda f: f.get("type") == "result")
         history = self.history()
         self.assertEqual([f["uuid"] for f in history],
-                         ["prompt-1", "prompt-2", "fixture-message-2"])
+                         ["prompt-1", "fixture-stop-1", "prompt-2", "fixture-message-2"])
         self.assertEqual(history[1]["parentUuid"], "prompt-1")
-        self.assertEqual(history[2]["parentUuid"], "prompt-2")
+        self.assertEqual(history[2]["parentUuid"], "fixture-stop-1")
+        self.assertEqual(history[3]["parentUuid"], "prompt-2")
 
     def test_zero_and_submicrosecond_delays_still_service_ready_controls(self):
         for value in ("0", "0.0000001"):
@@ -277,7 +301,7 @@ class Streaming(unittest.TestCase):
                             for f in peer.frames))
         self.assertTrue(any(f.get("patch", {}).get("status") == "killed" for f in peer.frames))
         peer.interrupt()
-        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1"])
+        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "fixture-stop-1"])
         self.reply.write_text("Done.")
         peer.send(prompt(2))
         init = peer.until(lambda f: f.get("subtype") == "init")
@@ -312,7 +336,7 @@ class Streaming(unittest.TestCase):
         peer.response("barrier")
         results = [f for f in peer.frames if f.get("type") == "result"]
         self.assertEqual(len(results), 1)
-        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1"])
+        self.assertEqual([f["uuid"] for f in self.history()], ["prompt-1", "fixture-stop-1"])
 
     def test_controls_do_not_restart_the_chunk_delay(self):
         (self.config / "fixture-stream-reply").write_text("0.3\n")

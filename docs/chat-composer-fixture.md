@@ -115,7 +115,10 @@ final record. Its first line may hold the delay between deltas in seconds
 several fixture agents give a realistic concurrent load. While streaming,
 control requests still take effect and additional prompts receive the usual
 queued lifecycle. Interrupt stops the stream and settles the turn without
-recording an answer that was never fully sent. Closing stdin finishes the
+recording an answer that was never fully sent. As Claude Code does, it records
+the stop: a rejected result for each call still open, then the user record
+`[Request interrupted by user]` (`… for tool use]` after a call), and ends the
+turn with an `error_during_execution` result. Closing stdin finishes the
 finite reply. The fixture requires Bash for timed input reads; `python3
 tests/chat_composer_streaming.py` checks this duplex protocol without the app
 or a live provider.
@@ -195,8 +198,8 @@ conversation or evidence about the provider's answer prose.
 For subagent tab checks, create `fixture-subagents` before spawning the agent
 (`touch "$fixture_root/home/.claude/fixture-subagents"`). Each turn starts
 five Agent calls before its answer: Scout keeps working in the background,
-Planner waits on a rate limit in the background, Builder fails, and two
-unnamed Explore agents finish. The tabs beside Conversation must read Scout,
+Planner hits a rate limit in the background and says so on its tab, Builder
+fails, and two unnamed Explore agents finish. The tabs beside Conversation must read Scout,
 Planner, Builder, Explore and Explore 2, in that order, each with its state's
 mark; hovering a tab shows its state and task. A selected agent's Stop ends
 just that agent.

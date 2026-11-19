@@ -369,7 +369,7 @@ impl Cagents {
             SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
             SidebarAction::ToggleDirectory { key, path } if self.sidebar_model.source_control.as_ref().is_some_and(|source| source.files.iter().any(|row| row.path == path && row.ignored)) => {
                 if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                    source.ignored_directory_errors.remove(&path);
+                    source.retry_ignored_directory(&path);
                 }
                 self.reload_source_control(&key)
             }
@@ -410,7 +410,7 @@ impl Cagents {
             SidebarAction::RefreshWorktree { key } => {
                 if self.source_control_is_bound(&key)
                     && let Some(source) = self.sidebar_model.source_control.as_mut() {
-                        source.ignored_directory_errors.clear();
+                        source.retry_ignored_directories();
                     }
                 self.reload_source_control(&key)
             },

@@ -891,7 +891,7 @@ fn losing_a_session_update_race_stays_quiet_only_if_its_rename_survives() {
         let warned = app
             .notices
             .recent()
-            .any(|entry| entry.notice.message.contains("session update was refused"));
+            .any(|entry| entry.notice.message.contains("changed elsewhere"));
         assert_eq!(warned, !can_retry);
         if can_retry {
             let ModelEdit::ChangeView { change, .. } = rx.try_recv().unwrap() else {
@@ -1001,7 +1001,7 @@ fn a_source_conflict_refuses_session_intent_and_reissues_only_safe_presentation(
         assert!(
             app.notices
                 .recent()
-                .any(|entry| entry.notice.message.contains("session update was refused"))
+                .any(|entry| entry.notice.message.contains("changed elsewhere"))
         );
         if matches!(
             control,
