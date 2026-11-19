@@ -485,8 +485,9 @@ struct Undelivered {
 enum Connection {
     /// The daemon answered on it, so it can be kept.
     Answered,
-    /// An answer did not arrive in time, and may yet: it can't be read in
-    /// order, so it is not kept.
+    /// A request or its answer ran out of time. A late answer can't be
+    /// read in order, and a write cut short may have left part of a frame
+    /// on the stream, so it is not kept, but nothing shows the daemon gone.
     Unanswered,
     /// It failed as a connection does: the daemon may be gone or replaced.
     Lost,
@@ -497,7 +498,9 @@ impl Undelivered {
         use crate::control::ControlError;
         let connection = match error {
             ControlError::Remote { .. } => Connection::Answered,
-            ControlError::ReplyTimeout { .. } => Connection::Unanswered,
+            // A reply, or a write the daemon is not reading, that ran out
+            // of time.
+            error if crate::control::is_timeout_error(error) => Connection::Unanswered,
             _ => Connection::Lost,
         };
         Self { notice, connection }

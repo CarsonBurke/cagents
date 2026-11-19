@@ -221,9 +221,10 @@ fn a_refusal_on_the_kept_connection_is_reported_and_keeps_it() {
     let refused = TerminalId::new();
     fixture.pending.lock().unwrap().presence = Some(focusing(refused));
     fixture.wake.as_ref().unwrap().send(()).unwrap();
-    // The refused presence, then its retry after the retry delay, both on
-    // the one connection.
-    for _ in 0..2 {
+    // The refused presence, then its retry, both on the one connection. A
+    // wake ends the retry delay early, which otherwise depends on the
+    // process-wide daemon health.
+    for attempt in 0..2 {
         let (connection, request) = fixture
             .requests
             .recv_timeout(Duration::from_secs(10))
@@ -234,6 +235,9 @@ fn a_refusal_on_the_kept_connection_is_reported_and_keeps_it() {
                 if presence.focused == Some(refused)),
             "{request:?}"
         );
+        if attempt == 0 {
+            let _ = fixture.wake.as_ref().unwrap().try_send(());
+        }
     }
     assert_eq!(fixture.connects.load(Ordering::SeqCst), 1);
     // Reported before the retry was sent, and only once.
