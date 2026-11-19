@@ -270,6 +270,7 @@ async fn run_reading(
         let entry = Entry {
             identity: identity.clone(),
             snapshot: UsageSnapshot::clone(snapshot),
+            inventory_observed_at: Some(snapshot.observed_at),
         };
         let catalog = catalog.clone();
         let provider = account.provider;
@@ -1872,6 +1873,7 @@ mod tests {
                 Entry {
                     identity: Some(first.clone()),
                     snapshot: UsageSnapshot::state(UsageStatus::Ok, "fixture", now_ms()),
+                    inventory_observed_at: None,
                 },
             )
             .unwrap();
@@ -2771,6 +2773,7 @@ cat >/dev/null
                     Entry {
                         identity: Some(identity),
                         snapshot: UsageSnapshot::state(UsageStatus::Ok, "", observed_at),
+                        inventory_observed_at: Some(observed_at),
                     },
                 )
                 .unwrap();

@@ -30,6 +30,7 @@ fn entry(label: &str) -> Entry {
     Entry {
         identity: None,
         snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, label, NOW),
+        inventory_observed_at: Some(NOW),
     }
 }
 

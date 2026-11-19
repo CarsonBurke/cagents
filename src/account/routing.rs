@@ -267,6 +267,7 @@ mod tests {
                     cache::Entry {
                         identity: None,
                         snapshot: UsageSnapshot::state(UsageStatus::Limited, "exhausted", now),
+                        inventory_observed_at: Some(now),
                     },
                 )
                 .unwrap();
@@ -325,6 +326,7 @@ mod tests {
                         cache::Entry {
                             identity: Some(identity.clone()),
                             snapshot: snapshot.clone(),
+                            inventory_observed_at: Some(snapshot.observed_at),
                         },
                     )
                     .unwrap();
