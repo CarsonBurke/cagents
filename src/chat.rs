@@ -1376,6 +1376,12 @@ impl PromptSuggestion {
     }
 }
 
+/// The UI reads this status line to name how a turn ended.
+pub const TURN_INTERRUPTED: &str = "Turn interrupted";
+
+/// The UI reads this status line to name how a turn ended.
+pub const TURN_FAILED: &str = "Turn failed";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Resident live-turn excerpt; never transcript serialization or wire state.

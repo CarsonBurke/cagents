@@ -9554,6 +9554,47 @@ fn a_runaway_message_stops_streaming_without_ending_the_conversation() {
 }
 
 #[test]
+fn an_acknowledged_interrupt_reports_the_turn_interrupted() {
+    let mut adapter = Claude {
+        busy: true,
+        ready: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({}),
+        ))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","subtype":"error_during_execution","is_error":false}))
+        .unwrap();
+    let status = settled.events.iter().rev().find_map(|event| match event {
+        Event::Status { busy, detail } => Some((*busy, detail.as_str())),
+        _ => None,
+    });
+    assert_eq!(status, Some((false, chat::TURN_INTERRUPTED)));
+}
+
+#[test]
+fn an_uninterrupted_result_still_reports_turn_complete() {
+    let mut adapter = Claude {
+        busy: true,
+        ready: true,
+        ..Claude::default()
+    };
+    let settled = adapter
+        .receive(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    let status = settled.events.iter().rev().find_map(|event| match event {
+        Event::Status { busy, detail } => Some((*busy, detail.as_str())),
+        _ => None,
+    });
+    assert_eq!(status, Some((false, "Claude turn complete")));
+}
+
+#[test]
 fn interrupted_ack_does_not_claim_turn_or_background_task_finished() {
     let mut adapter = Claude {
         busy: true,

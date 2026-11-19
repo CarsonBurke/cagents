@@ -2416,7 +2416,7 @@ impl Codex {
                     step.events.push(Event::Waiting(false));
                     step.events.push(Event::Status {
                         busy: false,
-                        detail: "Turn failed".into(),
+                        detail: chat::TURN_FAILED.into(),
                     });
                 }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
@@ -3948,8 +3948,8 @@ fn status_detail(status: &Value) -> String {
 /// only spends a row of the status line on a word the reader can see.
 fn turn_detail(status: &Value) -> String {
     match status.as_str() {
-        Some("interrupted") => "Turn interrupted".into(),
-        Some("failed") => "Turn failed".into(),
+        Some("interrupted") => chat::TURN_INTERRUPTED.into(),
+        Some("failed") => chat::TURN_FAILED.into(),
         _ => String::new(),
     }
 }

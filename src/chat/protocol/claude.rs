@@ -4246,6 +4246,8 @@ impl Claude {
                     busy,
                     if busy {
                         "Claude turn ended; decisions remain"
+                    } else if interruption == Some(true) {
+                        chat::TURN_INTERRUPTED
                     } else {
                         "Claude turn complete"
                     },

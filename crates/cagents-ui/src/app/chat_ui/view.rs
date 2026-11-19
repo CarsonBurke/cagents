@@ -889,8 +889,8 @@ fn bounded<'a>(
 /// How a turn that finished with `snapshot` ended, as its provider said.
 pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     match snapshot.detail.as_str() {
-        "Turn interrupted" => "Interrupted",
-        "Turn failed" => "Failed",
+        detail if detail == chat::TURN_INTERRUPTED => "Interrupted",
+        detail if detail == chat::TURN_FAILED => "Failed",
         _ => "Finished",
     }
 }
