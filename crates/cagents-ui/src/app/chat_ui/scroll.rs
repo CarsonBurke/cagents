@@ -98,6 +98,10 @@ impl Memory {
     pub(super) fn land(&self, index: u64, at: f32) {
         self.0.borrow_mut().landing = Some(Landing { index, at });
     }
+    /// Forget where the reader asked to land: they are back in loaded rows.
+    pub(super) fn cancel_landing(&self) {
+        self.0.borrow_mut().landing = None;
+    }
     /// The conversation index the reader is waiting to land on.
     pub(super) fn landing(&self) -> Option<u64> {
         self.0.borrow().landing.map(|landing| landing.index)

@@ -2946,6 +2946,97 @@ fn history_explicit_navigation_survives_wheeling_away_from_the_edge() {
 }
 
 #[test]
+fn history_report_from_loaded_rows_cancels_an_earlier_landing() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.history = chat::HistoryExtent {
+        before: 400,
+        after: 0,
+        unfetched: Some(0),
+    };
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let unloaded = view::Unloaded {
+        before: 40_000.0,
+        after: 0.0,
+    };
+    // A drag reported in the space standing for earlier history, then, in
+    // the same batch of events, back among the loaded rows.
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(20_000.0, 50_000.0, 400.0).with_unloaded(unloaded),
+        None,
+    )));
+    assert!(chat_runtime(&app, card).scroll_memory.landing().is_some());
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(45_000.0, 50_000.0, 400.0).with_unloaded(unloaded),
+        None,
+    )));
+    assert_eq!(chat_runtime(&app, card).scroll_memory.landing(), None);
+}
+
+/// A reader who clicked far into history the provider has not handed over
+/// waits there while the window pages back toward them: each page that
+/// arrives off the window's start sends it back there for the next.
+#[test]
+fn history_paging_to_a_reader_in_unfetched_history_seeks_the_start_after_every_page() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let window = |app: &mut Cagents, before: u64, unfetched: u64| {
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.history = chat::HistoryExtent {
+            before,
+            after: 0,
+            unfetched: Some(unfetched),
+        };
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: format!("item-{before}-{unfetched}"),
+            role: chat::Role::User,
+            content: text("Earlier"),
+            started_at: None,
+            at: None,
+        })];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+    };
+    window(&mut app, 0, 1000);
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(1000.0, 50_000.0, 400.0).with_unloaded(view::Unloaded {
+            before: 40_000.0,
+            after: 0.0,
+        }),
+        None,
+    )));
+    assert_eq!(
+        chat_runtime(&app, card).pending.as_ref().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+    for round in 0..2 {
+        // The page lands, and the window slides off the cached start.
+        window(&mut app, 15, 900 - round * 100);
+        settle(&mut app, card, Ok(()));
+        assert_eq!(chat_runtime(&app, card).sought, Some(0), "round {round}");
+        // The window is back at the start, and asks for the next page.
+        window(&mut app, 0, 900 - round * 100);
+        settle(&mut app, card, Ok(()));
+        assert_eq!(chat_runtime(&app, card).sought, None, "round {round}");
+        assert_eq!(
+            chat_runtime(&app, card).pending.as_ref().unwrap().page,
+            Some(view::Page::Earlier),
+            "round {round}"
+        );
+    }
+}
+
+#[test]
 fn history_failure_can_retry_without_leaving_the_boundary() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let (card, target, _) = history_fixture(&mut app);

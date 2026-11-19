@@ -11594,6 +11594,17 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        // A window that holds the item sought has answered the seek, so a
+        // later one to the same item, after paging moved the window off it,
+        // is sent again.
+        let history = runtime.snapshot.history;
+        if runtime.sought.is_some_and(|index| {
+            index
+                .checked_sub(history.before)
+                .is_some_and(|offset| offset < runtime.snapshot.items.len() as u64)
+        }) {
+            runtime.sought = None;
+        }
         if !runtime.commands.is_idle()
             || runtime.queued.is_some()
             || runtime.disconnected
@@ -11676,7 +11687,7 @@ impl Cagents {
                 if runtime.snapshot.history.before > 0 {
                     return self.seek_history(target, 0);
                 }
-                if runtime.pending.is_some()
+                if !runtime.commands.is_idle()
                     || runtime.disconnected
                     || runtime.snapshot.history_loading
                 {
@@ -11696,7 +11707,7 @@ impl Cagents {
         if runtime.sought == Some(index) {
             return Task::none();
         }
-        if runtime.pending.is_some() || runtime.disconnected {
+        if !runtime.commands.is_idle() || runtime.disconnected {
             if runtime
                 .deferred_page
                 .is_none_or(|page| page != HistoryNavigation::Latest)
@@ -16062,6 +16073,11 @@ impl Cagents {
                 }
                 let sought = runtime.history_index(scroll);
                 if sought.is_none() {
+                    // Reports queue behind the moves that make them, so one
+                    // from a moment ago in unloaded history can have asked
+                    // to land after the reader came back. The rows they see
+                    // now place them when the window arrives.
+                    runtime.scroll_memory.cancel_landing();
                     runtime.sought = None;
                     if runtime.deferred_page == Some(HistoryNavigation::Seek) {
                         runtime.deferred_page = None;

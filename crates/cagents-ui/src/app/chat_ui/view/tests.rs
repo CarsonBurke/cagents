@@ -12362,10 +12362,22 @@ fn unloaded_history_space_places_the_reader_in_the_whole_conversation() {
         before: 10_000.0,
         after: 4_000.0,
     };
-    // 6000 px of loaded window between the spaces, an 800 px viewport.
-    let at = |top: f32| Scroll::new(top, 20_000.0, 800.0).with_unloaded(unloaded);
+    // 6000 px of loaded window between the spaces, an 800 px viewport, its
+    // halves meeting halfway down it.
+    let kept = Kept {
+        older_end: 13_000.0,
+        newer_start: 13_000.0,
+    };
+    let at = |top: f32| {
+        Scroll::new(top, 20_000.0, 800.0)
+            .with_unloaded(unloaded)
+            .with_kept(Some(kept))
+    };
     assert_eq!(at(10_000.0).unseen(), None);
     assert!(at(10_000.0).prefetch_earlier());
+    // Without the halves, as while the thumb is dragged, the window's edge
+    // asks for nothing: the reader moves on into the space instead.
+    assert!(!at(10_000.0).with_kept(None).prefetch_earlier());
     assert!(!at(10_000.0).prefetch_later());
     // Deep in the loaded window, nothing is fetched.
     assert!(!at(12_600.0).prefetch_earlier());
