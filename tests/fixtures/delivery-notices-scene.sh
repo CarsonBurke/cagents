@@ -40,7 +40,7 @@ for attempt in 1 2 3 4 5 6 7 8; do
     fi
 done
 [ -n "$opened" ] || { printf '%s\n' 'Fixture conversation did not open.' >&2; exit 1; }
-"$ne" drive move 1,1 >/dev/null
+"$ne" drive hover 1,1 >/dev/null
 sleep 2
 "$ne" shot "$scene-delivery-notices"
 printf '%s\n' 'Scene ready. Expand the command/report rows and capture details with native-evidence shot.'

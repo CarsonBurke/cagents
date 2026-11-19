@@ -490,6 +490,46 @@ fn a_file_choice_holds_the_draft_until_it_ends_and_then_attaches() {
     assert!(peer.app.chat_ui.retiring.is_empty());
 }
 
+/// A file the conversation another window started cannot take is refused
+/// when the choice ends, though the draft that chose it is gone by then.
+#[test]
+fn a_refused_file_choice_is_told_after_the_draft_attaches_elsewhere() {
+    let mut peer = peer();
+    let ticket = {
+        let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+            panic!("expected a chat runtime");
+        };
+        let ticket = runtime.begin_attachment_insert();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+        ticket
+    };
+    let target = draft_runtime(&peer.app, peer.card).target;
+    let mut accepted = started(&peer.draft);
+    accepted.launch.provider = Provider::Codex;
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    let notes = peer._directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    peer.app.status = None;
+
+    drop(
+        peer.app
+            .handle_chat_ui(Action::Attached(target, ticket, Ok(Some(vec![notes])))),
+    );
+
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    let notice = peer.app.status.as_ref().expect("the refusal is told");
+    assert_eq!(notice.severity, NoticeSeverity::Warning);
+    assert_eq!(
+        notice.message,
+        "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+    );
+}
+
 #[test]
 fn a_paste_holds_the_draft_until_it_ends_and_then_attaches() {
     let mut peer = peer();
@@ -615,7 +655,7 @@ fn warned_of_refused_update(peer: &Peer) -> bool {
     peer.app
         .notices
         .recent()
-        .any(|entry| entry.notice.message.contains("session update was refused"))
+        .any(|entry| entry.notice.message.contains("changed elsewhere"))
 }
 
 /// Two windows attached to one conversation learn its provider session at the
@@ -1115,16 +1155,11 @@ fn escape_on_the_question_lets_the_next_close_ask() {
         drop(app.begin_card_close(next));
         assert!(app.chat_close_asked(asked));
 
-        let task = app.update(Message::KeyEvent {
+        // Escape answers the question within its own update.
+        drop(app.update(Message::KeyEvent {
             event: crate::app::dialog_ui::tests::key_press(iced::keyboard::key::Named::Escape),
             captured,
-        });
-        let cancel = crate::app::tests::task_app_message(task);
-        assert!(
-            matches!(cancel, Message::CancelChatClose),
-            "captured={captured}"
-        );
-        drop(app.update(cancel));
+        }));
 
         assert!(app.chat_close_asked(next), "captured={captured}");
         assert!(!app.chat_close_owned(asked), "captured={captured}");
@@ -1316,6 +1351,7 @@ fn a_copy_of_the_first_message_leaves_the_composer_and_other_writing_stays() {
 /// along to the attached conversation.
 #[test]
 fn a_file_chosen_while_another_window_sends_comes_along() {
+    let _admission = super::attachment_draft::test_admission();
     const FILE: &str = "/repo/notes.txt";
     let mut peer = peer();
     write(&mut peer.app, peer.card, "notes");
@@ -1342,7 +1378,6 @@ fn a_file_chosen_while_another_window_sends_comes_along() {
         "the chooser holds the draft"
     );
 
-    let _admission = super::attachment_draft::test_admission();
     drop(peer.app.handle_chat_ui(Action::Attached(
         target,
         ticket.clone(),
@@ -1488,12 +1523,10 @@ fn a_working_chat_close_answers_enter_and_escape_and_can_stop_asking() {
 
     // Escape keeps the chat, and a tick only counts once the close goes ahead.
     drop(app.update(Message::DontAskAgain(StopWorkingChat, true)));
-    let escape = crate::app::tests::task_app_message(app.update(Message::KeyEvent {
+    drop(app.update(Message::KeyEvent {
         event: key_press(keyboard::key::Named::Escape),
         captured: false,
     }));
-    assert!(matches!(escape, Message::CancelChatClose));
-    drop(app.update(escape));
     assert!(!app.chat_close_dialog_visible());
     assert!(
         app.card_state(card)

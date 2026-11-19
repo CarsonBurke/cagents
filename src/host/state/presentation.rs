@@ -276,12 +276,18 @@ pub(in crate::host) fn snapshot(
         }
         let mut capture = (*capture).clone();
         capture.generation = revision;
-        let capture = Arc::new(capture);
-        let wire = match state.subscriptions.last_sent(client, id) {
+        let (capture, wire) = match state.subscriptions.last_sent(client, id) {
             Some(base) if base.generation == after && after != 0 => {
-                TerminalSnapshot::diff(&capture, base)
+                capture.share_unchanged_rows(base);
+                let capture = Arc::new(capture);
+                let wire = TerminalSnapshot::diff(&capture, base);
+                (capture, wire)
             }
-            _ => TerminalSnapshot::full(&capture),
+            _ => {
+                let capture = Arc::new(capture);
+                let wire = TerminalSnapshot::full(&capture);
+                (capture, wire)
+            }
         };
         state
             .subscriptions
@@ -389,6 +395,55 @@ mod tests {
         assert_eq!(handle.snapshot().scroll.offset, parser.scroll.offset);
         assert_ne!(top, bottom);
         assert_eq!(unchanged, bottom);
+        handle.shutdown().unwrap();
+    }
+    #[test]
+    fn a_scrolled_client_is_sent_only_rows_that_changed() {
+        let (host, handle, id, _dir) = fixture_with(
+            r#"i=1; while [ $i -le 100 ]; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); done; read line; i=101; while [ $i -le 105 ]; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); done; exec sleep 600"#,
+        );
+        host.lock()
+            .unwrap()
+            .scroll_client(1, id, crate::terminal::ipc::TerminalScroll::Top)
+            .unwrap();
+        let first = snapshot(&host, 1, id, 0).unwrap().unwrap();
+        assert!(matches!(
+            &first.content,
+            crate::terminal::ipc::SnapshotContent::Full { .. }
+        ));
+        assert_eq!(first.scroll.offset, 0);
+
+        handle.input(b"more\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if handle.snapshot().lines.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("ROW-105")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the shell never replied");
+            handle.acknowledge_redraw(handle.generation());
+            thread::sleep(Duration::from_millis(10));
+        }
+        let next = snapshot(&host, 1, id, first.generation)
+            .unwrap()
+            .expect("output below the viewport advances the presentation");
+        assert!(next.generation > first.generation);
+        assert!(next.scroll.total > first.scroll.total);
+        assert_eq!(next.scroll.offset, 0);
+        let crate::terminal::ipc::SnapshotContent::Delta {
+            base_generation,
+            rows,
+        } = next.content
+        else {
+            panic!("the scrolled viewport should receive a delta");
+        };
+        assert_eq!(base_generation, first.generation);
+        assert!(rows.is_empty(), "unchanged history rows were sent again");
         handle.shutdown().unwrap();
     }
     #[test]

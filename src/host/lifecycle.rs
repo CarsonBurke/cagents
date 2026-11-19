@@ -26,11 +26,15 @@ pub(super) struct Lifecycle {
 
 impl Lifecycle {
     pub(super) fn new() -> Self {
+        Self::for_identity(crate::instance::IS_DEVELOPMENT)
+    }
+
+    fn for_identity(development: bool) -> Self {
         Self {
             retention: duration_setting("CAGENTS_EXITED_TERMINAL_RETENTION_SECS", EXITED_RETENTION),
             retention_error_reported: false,
             idle: IdleTimer::new(
-                crate::instance::IS_DEVELOPMENT,
+                development,
                 duration_setting(
                     "CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS",
                     Duration::from_secs(30 * 60),
@@ -712,6 +716,102 @@ mod tests {
         assert_eq!(lifecycle.maintain(&host, false), Some(first));
         assert!(child_reaper::has_suspended_custody());
         stdin.write_all(b"release\n").unwrap();
+    }
+
+    #[test]
+    fn production_lifecycle_never_arms_the_idle_timer() {
+        if isolated_lifecycle_case() {
+            return;
+        }
+        // SAFETY: this isolated child has not started any host threads yet.
+        unsafe { std::env::set_var("CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS", "0") };
+        let (host, _lease, _paths, _) = fixture_host();
+        assert!(host.lock().unwrap().development_idle());
+        assert!(holders_empty());
+
+        let mut lifecycle = Lifecycle::for_identity(false);
+        for _ in 0..3 {
+            assert!(lifecycle.maintain(&host, false).is_none());
+        }
+        assert!(lifecycle.idle.deadline.is_none());
+        assert!(!host.lock().unwrap().is_shutting_down());
+
+        let mut lifecycle = Lifecycle::for_identity(true);
+        assert!(lifecycle.maintain(&host, false).is_some());
+        lifecycle.maintain(&host, false);
+        assert!(host.lock().unwrap().is_shutting_down());
+    }
+
+    #[test]
+    fn a_detached_running_terminal_keeps_a_development_daemon_up() {
+        if isolated_lifecycle_case() {
+            return;
+        }
+        let (host, _lease, paths, _) = fixture_host();
+        let proof = host.lock().unwrap().proof().clone();
+        let source = TerminalSession {
+            id: TerminalId::new(),
+            launch: LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), "exec sleep 300".into()],
+                working_directory: paths.directory.clone(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            },
+        };
+        let recovery = crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: Default::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let handle = TerminalHandle::spawn(
+            source.clone(),
+            TerminalConfig {
+                holder_recovery: Some(recovery),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(source.id).unwrap();
+            state
+                .finish_spawn(1, source, handle.clone(), false)
+                .unwrap();
+            drop(state.unregister_client(1));
+        }
+
+        let mut lifecycle = Lifecycle::testing(Duration::ZERO);
+        lifecycle.idle = IdleTimer::new(true, Duration::ZERO);
+        for _ in 0..3 {
+            lifecycle.maintain(&host, false);
+        }
+        {
+            let state = host.lock().unwrap();
+            assert!(!state.development_idle());
+            assert!(!state.is_shutting_down());
+            assert_eq!(state.list(1).len(), 1);
+        }
+        assert!(lifecycle.idle.deadline.is_none());
+        assert!(!handle.is_completed());
+
+        handle.shutdown().unwrap();
+        wait_until(|| handle.is_completed());
     }
 
     #[test]

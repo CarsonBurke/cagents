@@ -843,14 +843,17 @@ impl Row {
     /// name where the row cut it, the outcome's reason, what pressing does
     /// where it opens no agent, and then the message or prompt.
     fn described(&self) -> (String, String) {
-        let reason = self
-            .state
-            .detail
-            .as_deref()
-            .map(|detail| match self.state.tone {
-                Tone::Error => format!("{}: {detail}", self.state.text),
-                _ => detail.to_owned(),
-            });
+        // A warning or a failure names itself, as a narrow row keeps only
+        // its mark; a plain state is either drawn or the working dot.
+        let reason = match (self.state.tone, self.state.detail.as_deref()) {
+            (Tone::Plain, detail) => detail.map(str::to_owned),
+            // A state with no words of its own, such as an agent that
+            // couldn't start, whose verb says so, gives only its reason.
+            (_, Some(detail)) if self.state.text.is_empty() => Some(detail.to_owned()),
+            (_, Some(detail)) => Some(format!("{}: {detail}", self.state.text)),
+            (_, None) => Some(self.state.text.to_string()),
+        }
+        .filter(|reason| !reason.trim().is_empty());
         let pressing = match (&self.open, self.several) {
             (Some(_), _) => "Opens the agent",
             (None, false) => OPENS_DETAIL,
@@ -887,26 +890,6 @@ impl Row {
         .join(" · ");
         (tip.join("\n\n"), name)
     }
-}
-
-/// The still mark beside a live caption: the accent, in a dot the size of
-/// the caption's lowercase letters.
-fn live_dot() -> Element<'static, Message> {
-    const SIZE: f32 = 6.0;
-    widget::container(widget::Space::new())
-        .width(Length::Fixed(SIZE))
-        .height(Length::Fixed(SIZE))
-        .class(cosmic::theme::Container::custom(|theme| {
-            widget::container::Style {
-                background: Some(iced::Background::Color(design::accent_color(theme))),
-                border: iced::Border {
-                    radius: (SIZE / 2.0).into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
 }
 
 /// A row's trailing status: a word or two, with the whole account of it in
@@ -1341,6 +1324,16 @@ impl Runtime {
         }
         let background = self.background_state(coordinated);
         let run = reading.outcome.run.as_ref();
+        // A launch refused before its agent did anything, such as one past
+        // the provider's limit of agents at once: there is no agent to open,
+        // so pressing the row shows why in its tool call. The CLI names the
+        // agent it started; a native agent that started has a transcript.
+        let unstarted = matches!(status, ToolStatus::Failed | ToolStatus::Denied)
+            && if reading.cli {
+                run.is_none()
+            } else {
+                listed.is_some_and(|agent| agent.items.is_empty())
+            };
         let mut glyph = Icon::Agent;
         // Use the observed task state while a native launch tool is still
         // settling, but keep an explicit launch failure visible.
@@ -1359,6 +1352,11 @@ impl Runtime {
                 ToolStatus::Running if spawn.waits => RowStatus::live("Working"),
                 ToolStatus::Running => RowStatus::live("Starting"),
                 ToolStatus::Stopped => RowStatus::plain("Stopped"),
+                // The verb says it: the agent never started.
+                ToolStatus::Failed | ToolStatus::Denied if unstarted => RowStatus {
+                    detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
+                    ..RowStatus::error("")
+                },
                 ToolStatus::Failed | ToolStatus::Denied => RowStatus {
                     detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
                     ..RowStatus::error("Failed")
@@ -1377,16 +1375,23 @@ impl Runtime {
             run.filter(|run| !run.agent.is_empty())
                 .map(|run| Action::OpenAgent(run.agent.clone()))
         } else {
-            listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())))
+            listed
+                .filter(|_| !unstarted)
+                .map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())))
         };
         // What it reported is in the open detail, and in the agent's
         // transcript; where the row cannot open one, the tooltip gives it too.
-        if open.is_none() {
+        // A refused launch's report is only the reason it already gives.
+        if open.is_none() && !unstarted {
             full.extend(coordinated.plain.collected(reading));
         }
         Row {
             glyph,
-            verb: "Started",
+            verb: if unstarted {
+                "Couldn't start"
+            } else {
+                "Started"
+            },
             label,
             shown,
             preview,
@@ -1426,34 +1431,69 @@ impl Runtime {
         // The preview fades out where the pane runs short, as a step row's
         // summary does, on whatever the row is painted with; the agent keeps
         // its tab's words, cut as the tab cuts them.
-        let mut line: Vec<Element<'static, Message>> = vec![
-            lead,
-            design::body(row.verb)
+        let words = widget::row::with_children(vec![
+            design::transcript(row.verb)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            chat_title(label)
-                .size(design::TEXT_BODY)
+            design::transcript_name(label.clone())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            crate::ui_controls::fade_text(row.preview.clone())
+            crate::ui_controls::FadeText::transcript(row.preview.clone())
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
-        ];
+        ])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        // What must not be cut for the state's sake: the verb and the agent.
+        let kept = widget::row::with_children(vec![
+            design::transcript(row.verb)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            design::transcript_name(label)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ])
+        .spacing(step::GAP_S);
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
-        if row.state.live && matches!(row.state.tone, Tone::Plain) {
-            line.push(live_dot());
+        let live = row.state.live && matches!(row.state.tone, Tone::Plain);
+        let mut state = Vec::new();
+        if live {
+            state.push(disclosure::state_dot(design::accent_color));
         }
-        let status = design::body(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+        let status =
+            design::transcript(row.state.text).wrapping(iced::widget::text::Wrapping::None);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
             Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
         };
-        line.push(status.into());
-        let content = widget::row::with_children(line)
+        if !row.state.text.is_empty() {
+            state.push(status.into());
+        }
+        // Where the agent's name and its state no longer both fit, the state
+        // keeps only its mark: the dot of work under way, or one in the
+        // warning colour. A failure is told by the row's leading glyph, and
+        // a settled state by the absence of either. A warning's words stay
+        // in the row's tooltip, and every state's in its accessible name.
+        let compact = match row.state.tone {
+            Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
+            Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
+            Tone::Plain | Tone::Error => None,
+        };
+        let content = crate::ui_controls::yielding(
+            words,
+            kept,
+            widget::row::with_children(state)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            compact,
+            step::GAP_S,
+        );
+        let content = widget::row::with_children(vec![lead, content])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .width(Length::Fill);
@@ -1900,6 +1940,71 @@ mod identity_tests {
             at: None,
         };
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    /// An agent Claude refused to start, past its limit of agents at once,
+    /// says so where it was asked for, and pressing it shows why; one that
+    /// worked before it failed is still an agent to open.
+    #[test]
+    fn a_refused_launch_reads_as_one_that_never_started() {
+        let refusal =
+            "Concurrent subagent limit reached. You can run 20 subagents at once. Do not retry.";
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let step = claude_step(
+            "Agent",
+            serde_json::json!({"description": "Review the change", "prompt": "Review the change on this branch.", "subagent_type": "general-purpose"}),
+            refusal,
+        );
+        let Kind::Spawn(spawn) = &step.reading.kind else {
+            panic!("an Agent call starts an agent");
+        };
+        for worked in [false, true] {
+            let items = if worked {
+                vec![std::sync::Arc::new(chat::Item {
+                    id: "child".into(),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: "Reading the diff.".into(),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })]
+            } else {
+                Vec::new()
+            };
+            std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+                id: "toolu_step".into(),
+                kind: "general-purpose".into(),
+                description: "Review the change".into(),
+                status: ToolStatus::Failed,
+                model: None,
+                waiting: false,
+                detail: refusal.into(),
+                background: false,
+                items,
+            }];
+            let row = runtime.spawn_row(&step, spawn, ToolStatus::Failed, refusal);
+            let (tip, accessible) = row.described();
+            assert!(tip.contains(refusal), "{worked}: {tip}");
+            assert!(accessible.contains(refusal), "{worked}: {accessible}");
+            if worked {
+                assert_eq!(row.verb, "Started");
+                assert_eq!(row.state.text, "Failed");
+                assert!(tip.starts_with(&format!("Failed: {refusal}")), "{tip}");
+                assert!(row.open.is_some(), "its transcript opens");
+            } else {
+                assert_eq!(row.verb, "Couldn't start");
+                assert_eq!(row.state.text, "", "the verb says it failed");
+                assert!(row.open.is_none(), "there is no agent to open");
+                assert!(accessible.starts_with("Couldn't start "), "{accessible}");
+                assert!(tip.contains(OPENS_DETAIL), "{tip}");
+                assert_eq!(tip.matches(refusal).count(), 1, "the reason once: {tip}");
+                // A state with no words gives its bare reason, not ": reason".
+                assert!(tip.starts_with(refusal), "{tip}");
+            }
+        }
     }
 
     /// However long an agent's name or a step's text, its row stays one line

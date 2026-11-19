@@ -42,6 +42,7 @@ const THREAD_RAIL_OFFSET: f32 =
 /// reading any text.
 fn kind_glyph(content: &ItemContent) -> Icon {
     match content {
+        _ if chat::is_stopped_notice(content) => Icon::Stop,
         ItemContent::Text { .. } => Icon::Private,
         ItemContent::Command { action, .. } => match action {
             chat::CommandAction::Read => Icon::TextFile,
@@ -275,10 +276,7 @@ impl Runtime {
     /// cannot know.
     #[cfg(test)]
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
-        match self.strip_headline(turn) {
-            disclosure::Headline::Text(text) => text,
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        }
+        self.strip_headline(turn).plain()
     }
 
     /// A collapsed strip's line as it is drawn. A lone step on one file
@@ -376,10 +374,7 @@ impl Runtime {
             turn.duration_label(0)
         };
         let text = self.strip_headline(turn);
-        let name = match &text {
-            disclosure::Headline::Text(text) => text.clone(),
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        };
+        let name = text.plain();
         let mut kinds = turn.steps.iter().filter_map(|step| {
             self.step_items().get(step.index).map(|item| {
                 self.presentation_cache()
@@ -435,8 +430,10 @@ impl Runtime {
                 .into(),
             );
         }
+        // Each nested row brings the air above it, so the strip has none of
+        // its own: its rows are as far apart as any two rows of the
+        // timeline, and so are its last row and the row after the strip.
         widget::column::with_children(content)
-            .spacing(GAP_XS)
             .width(Length::Fill)
             .into()
     }
@@ -471,6 +468,19 @@ impl Runtime {
         settings: markdown::Settings,
         status: Option<ToolStatus>,
     ) -> Element<'static, Message> {
+        // Where the turn was stopped: a marker with nothing to disclose and
+        // no time of its own.
+        if chat::is_stopped_notice(&item.content) {
+            return disclosure::row(
+                chat::STOPPED.to_string(),
+                chat::STOPPED.to_string(),
+                Icon::Stop,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         let open = self.item_expanded(&item.id);
         let mut rows = vec![self.step_button(item, cached, open, status)];
         if open {
@@ -868,7 +878,7 @@ mod tests {
         };
         let renderer = crate::app::tests::headless_renderer();
         let viewport = iced::Rectangle::with_size(iced::Size::new(275.0, 1_000.0));
-        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+        let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
         for group in [false, true] {
             let (mut runtime, _handle) =
                 super::super::view::prepared_runtime_for_test(std::slice::from_ref(&item));

@@ -149,19 +149,6 @@ pub(super) fn prune_pasted_images() {
     clipboard_image::prune_cache();
 }
 
-/// Names lead the chat hierarchy; prose and operational metadata keep their
-/// existing scale. Keep this local so workbench labels remain unchanged.
-fn chat_title<'a>(
-    text: impl Into<Cow<'a, str>> + 'a,
-) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    design::body(text)
-        .size(design::TEXT_PROSE)
-        .font(iced::Font {
-            weight: iced::font::Weight::Semibold,
-            ..cosmic::font::default()
-        })
-}
-
 fn action(action: Action) -> Message {
     Message::ChatUi(action)
 }
@@ -3139,7 +3126,15 @@ impl RestoredWaiting {
 
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
+struct FileCompletionMemo {
+    files: Arc<Vec<String>>,
+    query: String,
+    indices: Vec<usize>,
+}
+
 pub(super) struct Runtime {
+    /// The permission mode this draft's launch recipe previews.
+    draft_permission: DraftPermissionPreview,
     preparation: preparation::State,
     find: Option<String>,
     /// The groups Find matched, in transcript order. Every turn asks whether
@@ -3155,6 +3150,7 @@ pub(super) struct Runtime {
     pub(super) interrupt_armed: Option<Instant>,
     drop_hover: bool,
     files: Option<Arc<Vec<String>>>,
+    file_completion: std::cell::RefCell<Option<FileCompletionMemo>>,
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
@@ -3529,10 +3525,21 @@ impl Runtime {
             return None;
         }
         let rows = if token.sigil == '@' {
-            completion::files(
-                self.files.as_deref().map_or(&[][..], Vec::as_slice),
-                &token.query,
-            )
+            if let Some(files) = &self.files {
+                let mut memo = self.file_completion.borrow_mut();
+                if !memo.as_ref().is_some_and(|memo| {
+                    Arc::ptr_eq(&memo.files, files) && memo.query == token.query
+                }) {
+                    *memo = Some(FileCompletionMemo {
+                        files: Arc::clone(files),
+                        query: token.query.clone(),
+                        indices: completion::file_matches(files, &token.query),
+                    });
+                }
+                completion::file_candidates(files, &memo.as_ref().unwrap().indices)
+            } else {
+                Vec::new()
+            }
         } else {
             completion::candidates(&self.snapshot, &token)
         };
@@ -4359,10 +4366,11 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let mut draft_permission = DraftPermissionPreview::default();
+        let permission_mode = draft_permission.get(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
             preparation: preparation::State::default(),
+            draft_permission,
             target,
             session,
             snapshot: Arc::new(Snapshot {
@@ -4395,6 +4403,7 @@ impl Runtime {
             fork_requested: false,
             fork_seen: None,
             files: None,
+            file_completion: Default::default(),
             find: None,
             find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
@@ -4630,6 +4639,13 @@ impl Runtime {
         self.merge_attachments(written);
         Some(queued.draft)
     }
+    /// The permission mode this draft's launch recipe previews, read from
+    /// provider config only when the recipe changed since the last read.
+    fn draft_permission_mode(&mut self) -> Option<String> {
+        self.draft_permission
+            .get(&self.session.launch.recipe, self.session.launch.provider)
+    }
+
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
         target: Target,
@@ -5865,7 +5881,8 @@ impl Runtime {
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
-                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
+                    self.draft_permission
+                        .get(&self.session.launch.recipe, self.session.launch.provider)
                 });
         }
         if !self.parent_scroll().at_bottom()
@@ -7113,6 +7130,27 @@ fn draft_snapshot(
     }
 }
 
+/// The permission mode a draft's launch recipe previews. Reading it touches
+/// provider config files, so it is computed once per (provider, recipe).
+#[derive(Default)]
+struct DraftPermissionPreview {
+    resolved: Option<(Provider, LaunchRecipe, Option<String>)>,
+}
+
+impl DraftPermissionPreview {
+    fn get(&mut self, recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+        if let Some((cached_provider, cached_recipe, mode)) = &self.resolved
+            && *cached_provider == provider
+            && cached_recipe == recipe
+        {
+            return mode.clone();
+        }
+        let mode = draft_permission_mode(recipe, provider);
+        self.resolved = Some((provider, recipe.clone(), mode.clone()));
+        mode
+    }
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -7789,7 +7827,7 @@ impl Cagents {
             .map_or(&runtime.session.launch.recipe, |session| {
                 &session.launch.recipe
             });
-        snapshot.permission_mode = draft_permission_mode(recipe, provider);
+        snapshot.permission_mode = runtime.draft_permission.get(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
@@ -7909,8 +7947,9 @@ impl Cagents {
         runtime.session = session.clone();
         runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, account.provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -8474,8 +8513,9 @@ impl Cagents {
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
         }
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, provider);
         if rehomed {
             // A failed start's reason belongs to the account it failed on.
             runtime.error = None;
@@ -9386,8 +9426,6 @@ impl Cagents {
             snapshot.selected_model = saved.model;
             snapshot.reasoning = saved.reasoning;
         }
-        snapshot.permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
@@ -9397,6 +9435,8 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
+        // The runtime already read its recipe's preview; this is that answer.
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
@@ -11551,7 +11591,7 @@ impl Cagents {
             return Task::none();
         };
         (snapshot.selected_model, snapshot.reasoning) = chosen;
-        snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
+        snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
@@ -15400,27 +15440,68 @@ impl Cagents {
                 });
             }
             Action::Attached(target, id, result) => {
+                // The draft takes up what another window chose while its
+                // chooser was open only once the choice has ended, so the
+                // files are judged by the provider it is about to adopt.
+                let provider = self
+                    .card_state(target.card)
+                    .and_then(|state| match &state.kind {
+                        CardKind::Chat(session) => Some(session.launch.provider),
+                        _ => None,
+                    });
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if runtime.attachment_chooser_pending != Some(id.id) {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
+                    // Why the choice attached nothing, told once the draft
+                    // has caught up below.
+                    let mut failure = None;
                     let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
                         Task::none()
                     } else {
                         match result {
-                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(Some(paths)) => {
+                                let rules = chat::AttachmentRules::for_provider(
+                                    provider.unwrap_or(runtime.session.launch.provider),
+                                );
+                                if rules.images_only
+                                    && paths.iter().any(|path| !chat::is_image_path(path))
+                                {
+                                    runtime.cancel_attachment_insert(id.id, None);
+                                    failure = Some(
+                                        "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.".to_owned(),
+                                    );
+                                    Task::none()
+                                } else {
+                                    self.stage_chat_attachments(target, id, paths)
+                                }
+                            }
                             Ok(None) => {
                                 runtime.cancel_attachment_insert(id.id, None);
                                 Task::none()
                             }
                             Err(error) => {
-                                runtime.cancel_attachment_insert(id.id, Some(error));
+                                runtime.cancel_attachment_insert(id.id, None);
+                                failure = Some(error);
                                 Task::none()
                             }
                         }
                     };
-                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
+                    // With the choice settled the draft can catch up, which
+                    // may attach it to a conversation another window started.
+                    let adopted = self.adopt_stored_draft_session(target.card);
+                    // Adopting another account clears its failed start's
+                    // reason, but this one is about the files just chosen.
+                    // A draft that gave way to the conversation another
+                    // window started has no composer here to say it in.
+                    if let Some(failure) = failure {
+                        match self.chat_runtime_mut(target) {
+                            Some(runtime) => runtime.error = Some(failure),
+                            None => self.status = Some(TransientNotice::warning(failure)),
+                        }
+                    }
+                    return Task::batch([staged, adopted]);
                 }
             }
             Action::Dropped(target, payload) => {

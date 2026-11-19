@@ -11250,18 +11250,40 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
             .unwrap_err()
             .contains("read-only")
     );
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 20")
-    ));
-    assert!(snapshot.has_earlier);
-    handle.command(Command::LoadEarlier).unwrap();
-    let snapshot = handle.snapshot(None).unwrap();
-    assert!(snapshot.items.iter().any(
-        |item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Saved prompt 0")
-    ));
-    assert!(!snapshot.has_earlier);
+    // A window shows a run of the conversation: its prompts in order, with
+    // none missing or repeated.
+    let prompts = |snapshot: &crate::chat::Snapshot| -> std::ops::Range<usize> {
+        let indices: Vec<usize> = snapshot
+            .items
+            .iter()
+            .filter_map(|item| match &item.content {
+                ItemContent::Text { text, .. } => text
+                    .strip_prefix("Saved prompt ")
+                    .and_then(|index| index.parse().ok()),
+                _ => None,
+            })
+            .collect();
+        assert!(!indices.is_empty(), "a window shows prompts");
+        let run = indices[0]..indices[0] + indices.len();
+        assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
+        run
+    };
+    assert_eq!(prompts(&snapshot), 120..220, "the newest history first");
+    // Each earlier page slides the window back by half of it, so the
+    // history is read a window at a time until its start, and every prompt
+    // is shown on the way.
+    let mut seen = std::collections::BTreeSet::from_iter(120..220);
+    let mut snapshot = snapshot;
+    let mut pages = 0;
+    while snapshot.has_earlier {
+        pages += 1;
+        assert!(pages <= 20, "paging back never reached the start");
+        handle.command(Command::LoadEarlier).unwrap();
+        snapshot = handle.snapshot(None).unwrap();
+        seen.extend(prompts(&snapshot));
+    }
+    assert_eq!(prompts(&snapshot).start, 0, "the window reaches the start");
+    assert!(seen.into_iter().eq(0..220), "every prompt was shown");
     handle.close().unwrap();
 
     let mut traversal = launch.clone();
@@ -13222,4 +13244,607 @@ fn the_nested_agents_scene_counts_only_the_leads_running_agents() {
         .find(|item| item.id == "toolu_soak")
         .unwrap();
     assert_eq!(soak.content.status(), Some(ToolStatus::Ended));
+}
+
+/// What Claude Code 2.1 records when the person stops a turn whose Bash call
+/// is running: the call's result, worded as though the person declined it,
+/// then a user message saying the request was interrupted, then a result
+/// that reports an error (from `sdk-cli` transcripts of 2.1.296 to 2.1.323).
+const REFUSED_FOR_STOP: &str = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.";
+
+fn stop_call() -> Value {
+    json!({"type":"assistant","uuid":"call-carrier","parent_tool_use_id":null,"message":{"id":"msg-call","role":"assistant","content":[
+        {"type":"tool_use","id":"toolu_stop","name":"Bash","input":{"command":"sleep 600","description":"Wait"}}
+    ]}})
+}
+
+fn stop_refusal() -> Value {
+    json!({"type":"user","uuid":"refusal-carrier","parent_tool_use_id":null,"tool_use_result":"User rejected tool use","message":{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"toolu_stop","content":REFUSED_FOR_STOP,"is_error":true}
+    ]}})
+}
+
+fn stop_record_frame(uuid: &str, text: &str) -> Value {
+    json!({"type":"user","uuid":uuid,"parent_tool_use_id":null,"message":{"role":"user","content":[{"type":"text","text":text}]}})
+}
+
+/// The result Claude Code 2.1.317 ends a stopped turn with, `aborted_tools`
+/// when a call was cut short and `aborted_streaming` when text was.
+fn stopped_result() -> Value {
+    json!({"type":"result","uuid":"stopped-result","subtype":"error_during_execution","is_error":true,
+        "terminal_reason":"aborted_tools","stop_reason":"tool_use",
+        "errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"]})
+}
+
+/// Every item an interrupted turn published, as it last stood.
+fn last_items(events: &[Event]) -> Vec<Item> {
+    let mut order = Vec::new();
+    let mut latest: HashMap<String, Item> = HashMap::new();
+    for event in events {
+        if let Event::Item(item) = event {
+            if !latest.contains_key(&item.id) {
+                order.push(item.id.clone());
+            }
+            latest.insert(item.id.clone(), item.clone());
+        }
+    }
+    order
+        .into_iter()
+        .map(|id| latest.remove(&id).unwrap())
+        .collect()
+}
+
+fn assert_stopped_turn(events: &[Event], stage: &str) {
+    let items = last_items(events);
+    assert_eq!(
+        errors(events),
+        Vec::<&str>::new(),
+        "{stage}: a stop is not a failure"
+    );
+    assert!(
+        !items.iter().any(|item| item.role == Role::User),
+        "{stage}: the record of the stop is not the person's message: {items:?}"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| chat::is_stopped_notice(&item.content))
+            .count(),
+        1,
+        "{stage}: one marker shows where the turn stopped: {items:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )),
+        "{stage}: the turn ends stopped"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::Status { busy: false, detail } if detail == chat::TURN_INTERRUPTED
+        )),
+        "{stage}: the conversation says its turn was interrupted"
+    );
+}
+
+#[test]
+fn stopping_a_running_call_settles_it_stopped_without_a_failure_or_a_user_message() {
+    // With the call's result and the stop's record, as Claude Code writes a
+    // stop during a call; without the result, as a stop can leave it; and
+    // with both before the stop is acknowledged, whose record says it took.
+    for (refused, record, acknowledged) in [
+        (
+            true,
+            Some("[Request interrupted by user for tool use]"),
+            true,
+        ),
+        (false, Some("[Request interrupted by user]"), true),
+        (
+            true,
+            Some("[Request interrupted by user for tool use]"),
+            false,
+        ),
+    ] {
+        let stage = format!("refused {refused}, record {record:?}, acknowledged {acknowledged}");
+        let mut adapter = Claude {
+            ready: true,
+            busy: true,
+            ..Claude::default()
+        };
+        let mut events = adapter.receive(stop_call()).unwrap().events;
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        if acknowledged {
+            events.extend(
+                adapter
+                    .receive(reply(
+                        interrupt.writes[0]["request_id"].as_str().unwrap(),
+                        json!({"still_queued":[]}),
+                    ))
+                    .unwrap()
+                    .events,
+            );
+        }
+        if refused {
+            events.extend(adapter.receive(stop_refusal()).unwrap().events);
+        }
+        if let Some(record) = record {
+            events.extend(
+                adapter
+                    .receive(stop_record_frame("stop-record", record))
+                    .unwrap()
+                    .events,
+            );
+        }
+        events.extend(adapter.receive(stopped_result()).unwrap().events);
+        if !acknowledged {
+            // A late acknowledgement settles the deferred outcome.
+            events.extend(
+                adapter
+                    .receive(reply(
+                        interrupt.writes[0]["request_id"].as_str().unwrap(),
+                        json!({"still_queued":[]}),
+                    ))
+                    .unwrap()
+                    .events,
+            );
+        }
+        assert_stopped_turn(&events, &stage);
+        let call = last_items(&events)
+            .into_iter()
+            .find(|item| item.id == "toolu_stop")
+            .unwrap();
+        assert_eq!(
+            call.content.status(),
+            Some(ToolStatus::Stopped),
+            "{stage}: {call:?}"
+        );
+    }
+}
+
+#[test]
+fn stopping_while_text_streams_shows_one_marker_and_no_failure() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let mut events = Vec::new();
+    for event in [
+        json!({"type":"message_start","message":{"id":"msg-text"}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Halfway through a sen"}}),
+    ] {
+        events.extend(adapter.receive(stream(event)).unwrap().events);
+    }
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    events.extend(
+        adapter
+            .receive(reply(
+                interrupt.writes[0]["request_id"].as_str().unwrap(),
+                json!({"still_queued":[]}),
+            ))
+            .unwrap()
+            .events,
+    );
+    events.extend(
+        adapter
+            .receive(stop_record_frame(
+                "stop-record",
+                "[Request interrupted by user]",
+            ))
+            .unwrap()
+            .events,
+    );
+    events.extend(adapter.receive(stopped_result()).unwrap().events);
+    assert_stopped_turn(&events, "streaming");
+    // The marker follows the text that was shown.
+    let items = last_items(&events);
+    let marker = items
+        .iter()
+        .position(|item| chat::is_stopped_notice(&item.content))
+        .unwrap();
+    let streamed = events
+        .iter()
+        .find_map(|event| match event {
+            Event::TextDelta { id, delta, .. } if delta.starts_with("Halfway") => Some(id),
+            _ => None,
+        })
+        .unwrap();
+    let text = items.iter().position(|item| &item.id == streamed).unwrap();
+    assert!(text < marker, "{items:?}");
+}
+
+#[test]
+fn a_saved_stop_reads_as_the_live_one() {
+    let mut adapter = Claude::default();
+    let mut step = Step::default();
+    for frame in [
+        stop_call(),
+        stop_refusal(),
+        stop_record_frame("stop-record", "[Request interrupted by user for tool use]"),
+        json!({"type":"user","uuid":"next","parent_tool_use_id":null,"message":{"role":"user","content":"Carry on differently"}}),
+    ] {
+        let record = HistoryRecord {
+            frame,
+            tool_calls: HashMap::new(),
+            gap: None,
+        };
+        adapter.history_message(&record, &mut step).unwrap();
+    }
+    let items = last_items(&step.events);
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.id == "toolu_stop")
+            .and_then(|item| item.content.status()),
+        Some(ToolStatus::Stopped)
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| chat::is_stopped_notice(&item.content))
+            .count(),
+        1
+    );
+    let prompts: Vec<_> = items
+        .iter()
+        .filter(|item| item.role == Role::User)
+        .filter_map(|item| match &item.content {
+            ItemContent::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prompts, ["Carry on differently"]);
+}
+
+/// A declined call that no stop follows stays declined, and a person's
+/// own message quoting the marker inside other words is theirs.
+#[test]
+fn a_refusal_without_a_stop_and_a_quoted_marker_keep_their_meaning() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let mut events = adapter.receive(stop_call()).unwrap().events;
+    events.extend(adapter.receive(stop_refusal()).unwrap().events);
+    events.extend(
+        adapter
+            .receive(stop_record_frame(
+                "quoted",
+                "Why did you show [Request interrupted by user] earlier?",
+            ))
+            .unwrap()
+            .events,
+    );
+    events.extend(
+        adapter
+            .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+            .unwrap()
+            .events,
+    );
+    let items = last_items(&events);
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.id == "toolu_stop")
+            .and_then(|item| item.content.status()),
+        Some(ToolStatus::Denied)
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| chat::is_stopped_notice(&item.content))
+    );
+    assert!(items.iter().any(|item| item.role == Role::User));
+}
+
+/// A stop that reaches Claude Code after the turn finished stops nothing:
+/// the answer stands without a marker.
+#[test]
+fn a_stop_after_the_turn_succeeded_marks_nothing() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    adapter.command(Command::Interrupt).unwrap();
+    let events = adapter
+        .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+        .unwrap()
+        .events;
+    assert!(
+        !last_items(&events)
+            .iter()
+            .any(|item| chat::is_stopped_notice(&item.content)),
+        "{events:?}"
+    );
+}
+
+/// Claude Code answers each call of a parallel batch in a message of its
+/// own, so a stop during two calls refuses each in turn before its record.
+#[test]
+fn stopping_parallel_calls_settles_every_one_stopped() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let mut events = adapter
+        .receive(json!({"type":"assistant","uuid":"calls","parent_tool_use_id":null,"message":{"id":"msg-calls","role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_a","name":"Bash","input":{"command":"sleep 600"}},
+            {"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"sleep 601"}}
+        ]}}))
+        .unwrap()
+        .events;
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    events.extend(
+        adapter
+            .receive(reply(
+                interrupt.writes[0]["request_id"].as_str().unwrap(),
+                json!({"still_queued":[]}),
+            ))
+            .unwrap()
+            .events,
+    );
+    for tool in ["toolu_a", "toolu_b"] {
+        events.extend(
+            adapter
+                .receive(json!({"type":"user","uuid":format!("refusal-{tool}"),"parent_tool_use_id":null,"tool_use_result":"User rejected tool use","message":{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":tool,"content":REFUSED_FOR_STOP,"is_error":true}
+                ]}}))
+                .unwrap()
+                .events,
+        );
+    }
+    events.extend(
+        adapter
+            .receive(stop_record_frame(
+                "stop-record",
+                "[Request interrupted by user for tool use]",
+            ))
+            .unwrap()
+            .events,
+    );
+    events.extend(adapter.receive(stopped_result()).unwrap().events);
+    assert_stopped_turn(&events, "parallel");
+    let items = last_items(&events);
+    for tool in ["toolu_a", "toolu_b"] {
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.id == tool)
+                .and_then(|item| item.content.status()),
+            Some(ToolStatus::Stopped),
+            "{tool}"
+        );
+    }
+}
+
+/// A stop during a foreground agent stops the agent and the call it was
+/// running, which is drawn in the agent's transcript, not the person's.
+#[test]
+fn stopping_a_foreground_agent_settles_its_running_call_in_its_transcript() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let mut events = adapter
+        .receive(json!({"type":"assistant","uuid":"agent-call","parent_tool_use_id":null,"message":{"id":"msg-agent","role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Look around","prompt":"Look around","subagent_type":"Explore"}}
+        ]}}))
+        .unwrap()
+        .events;
+    events.extend(
+        adapter
+            .receive(json!({"type":"assistant","uuid":"child-call","parent_tool_use_id":"toolu_agent","message":{"id":"msg-child","role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_child","name":"Bash","input":{"command":"sleep 600"}}
+            ]}}))
+            .unwrap()
+            .events,
+    );
+    adapter.command(Command::Interrupt).unwrap();
+    // A second press asks for what the first did, and is no failure.
+    let again = adapter.command(Command::Interrupt).unwrap();
+    assert!(again.writes.is_empty(), "{:?}", again.writes);
+    events.extend(
+        adapter
+            .receive(json!({"type":"user","uuid":"agent-refusal","parent_tool_use_id":null,"tool_use_result":"User rejected tool use","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_agent","content":REFUSED_FOR_STOP,"is_error":true}
+            ]}}))
+            .unwrap()
+            .events,
+    );
+    events.extend(
+        adapter
+            .receive(stop_record_frame(
+                "stop-record",
+                "[Request interrupted by user for tool use]",
+            ))
+            .unwrap()
+            .events,
+    );
+    events.extend(adapter.receive(stopped_result()).unwrap().events);
+    let main = last_items(&events);
+    assert_eq!(
+        main.iter()
+            .find(|item| item.id == "toolu_agent")
+            .and_then(|item| item.content.status()),
+        Some(ToolStatus::Stopped)
+    );
+    assert!(
+        !main.iter().any(|item| item.id == "toolu_child"),
+        "{main:?}"
+    );
+    let child = events.iter().rev().find_map(|event| match event {
+        Event::SubagentItem { id, item } if id == "toolu_agent" && item.id == "toolu_child" => {
+            item.content.status()
+        }
+        _ => None,
+    });
+    assert_eq!(child, Some(ToolStatus::Stopped));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "toolu_agent"
+    )));
+    assert_eq!(errors(&events), Vec::<&str>::new());
+}
+
+/// A subagent's own record of a stop is drawn in its transcript.
+#[test]
+fn a_subagents_stop_record_is_its_own_marker() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    adapter
+        .receive(json!({"type":"assistant","uuid":"agent-call","parent_tool_use_id":null,"message":{"id":"msg-agent","role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Look around","prompt":"Look around"}}
+        ]}}))
+        .unwrap();
+    let mut record = stop_record_frame("child-stop", "[Request interrupted by user]");
+    record["parent_tool_use_id"] = json!("toolu_agent");
+    let events = adapter.receive(record).unwrap().events;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Item(item) if item.role == Role::User || chat::is_stopped_notice(&item.content))),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::SubagentItem { id, item } if id == "toolu_agent" && chat::is_stopped_notice(&item.content)
+    )));
+}
+
+/// A foreground agent's frames interleave with the lead's, so its own stop
+/// and its own words between the lead's refusals and the lead's record of the
+/// stop leave the lead's refusals to that record.
+#[test]
+fn a_subagents_frames_keep_the_leads_refusals_for_its_stop() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let mut events = adapter
+        .receive(json!({"type":"assistant","uuid":"calls","parent_tool_use_id":null,"message":{"id":"msg-calls","role":"assistant","content":[
+            {"type":"tool_use","id":"toolu_main","name":"Bash","input":{"command":"sleep 600"}},
+            {"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Look around","prompt":"Look around","subagent_type":"Explore"}}
+        ]}}))
+        .unwrap()
+        .events;
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    let mut frames = vec![
+        reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ),
+        json!({"type":"user","uuid":"main-refusal","parent_tool_use_id":null,"tool_use_result":"User rejected tool use","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_main","content":REFUSED_FOR_STOP,"is_error":true}
+        ]}}),
+        json!({"type":"assistant","uuid":"child-words","parent_tool_use_id":"toolu_agent","message":{"id":"msg-child","role":"assistant","content":[
+            {"type":"text","text":"Looking around."}
+        ]}}),
+    ];
+    let mut child_stop = stop_record_frame("child-stop", "[Request interrupted by user]");
+    child_stop["parent_tool_use_id"] = json!("toolu_agent");
+    frames.push(child_stop);
+    frames.push(json!({"type":"user","uuid":"agent-refusal","parent_tool_use_id":null,"tool_use_result":"User rejected tool use","message":{"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"toolu_agent","content":REFUSED_FOR_STOP,"is_error":true}
+    ]}}));
+    frames.push(stop_record_frame(
+        "stop-record",
+        "[Request interrupted by user for tool use]",
+    ));
+    frames.push(stopped_result());
+    for frame in frames {
+        events.extend(adapter.receive(frame).unwrap().events);
+    }
+    let main = last_items(&events);
+    for call in ["toolu_main", "toolu_agent"] {
+        assert_eq!(
+            main.iter()
+                .find(|item| item.id == call)
+                .and_then(|item| item.content.status()),
+            Some(ToolStatus::Stopped),
+            "{call}: {main:?}"
+        );
+    }
+    assert_stopped_turn(&events, "a lead stop around a subagent's");
+}
+
+/// A turn that fails while its stop is still unanswered failed: the stop may
+/// yet be refused, and when it is the failure is what the person sees.
+#[test]
+fn a_failure_before_a_refused_stop_stays_a_failure() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    let mut events = adapter
+        .receive(json!({"type":"result","uuid":"failed","subtype":"success","is_error":true,
+            "result":"API Error: 500 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}"}))
+        .unwrap()
+        .events;
+    let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
+    events.extend(
+        adapter
+            .receive(json!({"type":"control_response","response":{"request_id":request_id,"subtype":"error","error":"already settled"}}))
+            .unwrap()
+            .events,
+    );
+    assert!(!errors(&events).is_empty(), "{events:?}");
+    assert!(
+        !last_items(&events)
+            .iter()
+            .any(|item| chat::is_stopped_notice(&item.content)),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::TurnFinished {
+            outcome: crate::notifications::Kind::Failed,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        Event::Status { detail, .. } if detail == chat::TURN_INTERRUPTED
+    )));
+}
+
+/// A stop Claude Code acknowledged ends its turn stopped even when the turn
+/// reports success, as its outcome already says.
+#[test]
+fn an_acknowledged_stop_ends_its_turn_stopped_though_it_succeeded() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    let mut events = adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ))
+        .unwrap()
+        .events;
+    events.extend(
+        adapter
+            .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+            .unwrap()
+            .events,
+    );
+    assert_stopped_turn(&events, "an acknowledged stop of a turn that succeeded");
 }

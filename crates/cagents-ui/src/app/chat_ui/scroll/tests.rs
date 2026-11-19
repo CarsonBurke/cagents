@@ -2554,7 +2554,7 @@ fn appended_flow_prefix_is_not_exact_find_geometry_before_redraw_requests_curren
         generation: 1,
     };
     let identity = selection::logical_identity("opaque-item", &[0, 0]);
-    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE).style;
+    let style = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT).style;
     let mut content = markdown::Content::parse(&"prefix needle words ".repeat(300));
     let cache = flow_layout::Cache::default();
     let entry = cache.markdown_entry(identity, paragraph(&content), style);
@@ -2901,7 +2901,7 @@ fn logical_find_realizes_a_distant_chunk_and_centers_its_mounted_glyph() {
         cases.push((
             prose::view(
                 &cached,
-                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE),
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
                 target,
                 None,
             ),

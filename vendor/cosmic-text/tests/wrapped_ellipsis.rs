@@ -181,3 +181,129 @@ fn an_overflowing_separator_stays_out_of_the_last_ellipsized_line() {
         }
     }
 }
+
+#[test]
+fn height_limited_ellipsis_keeps_wrapped_boundaries_in_both_text_directions() {
+    let mut fonts = font_system();
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    // Height limits take a separate admission path from line-count limits.
+    // Include overwide words in both congruent and reversed bidi spans, plus
+    // authored indentation that must remain on the first, unelided line.
+    for text in [
+        "   Supercalifragilisticexpialidocious and then more words that wrap across several lines",
+        "   שלוםשלוםשלוםשלוםשלוםשלום עולם ועוד מילים ועוד מילים ועוד מילים ועוד מילים",
+        "שלום Supercalifragilisticexpialidocious and then more words שלום עולם שלום עולם",
+    ] {
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        for wrap in [Wrap::Word, Wrap::WordOrGlyph] {
+            for width in [60.0, 110.0, 180.0] {
+                let ordinary = layout(&shaped, width, wrap, Ellipsize::None);
+                for count in [2, 3] {
+                    if ordinary.len() <= count {
+                        continue;
+                    }
+                    let limited = layout(
+                        &shaped,
+                        width,
+                        wrap,
+                        Ellipsize::End(EllipsizeHeightLimit::Height(18.0 * count as f32)),
+                    );
+                    assert_eq!(limited.len(), count);
+                    // Preceding rows have not been elided or re-ordered. Their
+                    // original source clusters and positions must be identical.
+                    for (actual, expected) in
+                        limited[..count - 1].iter().zip(&ordinary[..count - 1])
+                    {
+                        let geometry = |line: &LayoutLine| {
+                            line.glyphs
+                                .iter()
+                                .map(|glyph| (glyph.start, glyph.end, glyph.x, glyph.w))
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(geometry(actual), geometry(expected));
+                    }
+                    let source_start = |line: &LayoutLine| {
+                        line.glyphs
+                            .iter()
+                            .filter(|glyph| glyph.start != glyph.end)
+                            .map(|glyph| glyph.start)
+                            .min()
+                            .expect("the fixture retains text before its ellipsis")
+                    };
+                    assert_eq!(
+                        source_start(&limited[count - 1]),
+                        source_start(&ordinary[count - 1]),
+                        "height-limited boundary: {wrap:?}, width {width}, count {count}: {text}"
+                    );
+                    assert!(
+                        limited[count - 1]
+                            .glyphs
+                            .iter()
+                            .any(|glyph| glyph.start == glyph.end),
+                        "height-limited fixture must show an ellipsis"
+                    );
+                    assert!(limited.iter().flat_map(|line| &line.glyphs).all(|glyph| {
+                        glyph.x.is_finite() && glyph.y.is_finite() && glyph.w.is_finite()
+                    }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ellipsizing_inside_a_reversed_word_measures_only_its_remaining_glyphs() {
+    let mut fonts = font_system();
+    let attrs = AttrsList::new(&Attrs::new().family(Family::Name("Open Sans")));
+    let ellipsis = ShapeLine::new(&mut fonts, "\u{2026}", &attrs, Shaping::Advanced, 8);
+    let ellipsis_width = layout(&ellipsis, 500.0, Wrap::None, Ellipsize::None)[0]
+        .glyphs
+        .iter()
+        .map(|glyph| glyph.w)
+        .sum::<f32>();
+    // The first strong character sets the paragraph direction; the long
+    // unbroken word is in the opposite direction. The last admitted row starts
+    // inside that word rather than at one of its word boundaries.
+    for text in [
+        "A שלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלוםשלום",
+        "א SupercalifragilisticexpialidociousSupercalifragilisticexpialidociousSupercalifragilisticexpialidocious",
+    ] {
+        let shaped = ShapeLine::new(&mut fonts, text, &attrs, Shaping::Advanced, 8);
+        assert!(shaped.spans.iter().any(|span| span.level.is_rtl() != shaped.rtl));
+        for wrap in [Wrap::Glyph, Wrap::WordOrGlyph] {
+            // The smallest width reserves all but a fraction of a pixel for
+            // the ellipsis, so no remaining text glyph can fit. This also
+            // exercises the empty partial-word range without an inverted slice.
+            for width in [ellipsis_width + 0.01, 60.0, 110.0] {
+                let ordinary = layout(&shaped, width, wrap, Ellipsize::None);
+                for count in [2, 3] {
+                    assert!(ordinary.len() > count);
+                    for limit in [
+                        EllipsizeHeightLimit::Lines(count),
+                        EllipsizeHeightLimit::Height(18.0 * count as f32),
+                    ] {
+                        let limited = layout(&shaped, width, wrap, Ellipsize::End(limit));
+                        assert_eq!(limited.len(), count);
+                        let last = &limited[count - 1];
+                        assert!(last.glyphs.iter().any(|glyph| glyph.start == glyph.end),
+                            "missing ellipsis inside reversed word: {wrap:?}, {width}, {count}: {text}");
+                        let actual_width = last.glyphs.iter().map(|glyph| glyph.w).sum::<f32>();
+                        assert!(actual_width <= width + 0.01,
+                            "remaining word escaped its measured width: {actual_width} > {width}");
+                        for glyph in &last.glyphs {
+                            assert!(glyph.x.is_finite() && glyph.w.is_finite());
+                            assert!(glyph.start <= glyph.end && glyph.end <= text.len());
+                            assert!(text.is_char_boundary(glyph.start));
+                            assert!(text.is_char_boundary(glyph.end));
+                            if glyph.start != glyph.end {
+                                assert!(ordinary[count - 1].glyphs.iter().any(|expected| {
+                                    expected.start == glyph.start && expected.end == glyph.end
+                                }), "a glyph from another wrapped row leaked into the ellipsis row");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

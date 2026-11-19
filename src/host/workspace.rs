@@ -250,6 +250,15 @@ fn apply_delta_guarded<G>(
             .view_operation_seen(*operation)
             .map_err(unavailable)?;
         if !seen {
+            #[cfg(debug_assertions)]
+            if matches!(change, Change::RemoveSource { .. }) && super::fixture_close_refusal::take()
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    Registry::VIEW_REMOVAL_CONFLICT,
+                    false,
+                ));
+            }
             if let Some(reason) = registry
                 .view_change_refusal(scope, change)
                 .map_err(unavailable)?

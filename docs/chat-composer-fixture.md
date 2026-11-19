@@ -51,9 +51,8 @@ fixture_env scripts/run-development --browserless --debug --log-file "$fixture_r
 ```
 
 Keep the existing Cargo target/cache configuration when using a worktree; do
-not start another build while the runner builds its matched executables. If the
-harness help exposes `session start NAME --root ROOT --cmd CMD`, start a nested
-Niri session with `niri-harness session start composer --root "$fixture_root/niri" --no-window-wait --cmd WRAPPER`,
+not start another build while the runner builds its matched executables. Start a nested
+Niri session with `niri-harness start --name composer --root "$fixture_root/niri" --no-window-wait -- sh -c WRAPPER`,
 where `WRAPPER` is a shell command that runs the fixture runner script. Before replacing
 `XDG_RUNTIME_DIR`, convert the inherited relative `WAYLAND_DISPLAY` to an
 absolute path (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`). Keep the inherited
@@ -116,7 +115,10 @@ final record. Its first line may hold the delay between deltas in seconds
 several fixture agents give a realistic concurrent load. While streaming,
 control requests still take effect and additional prompts receive the usual
 queued lifecycle. Interrupt stops the stream and settles the turn without
-recording an answer that was never fully sent. Closing stdin finishes the
+recording an answer that was never fully sent. As Claude Code does, it records
+the stop: a rejected result for each call still open, then the user record
+`[Request interrupted by user]` (`… for tool use]` after a call), and ends the
+turn with an `error_during_execution` result. Closing stdin finishes the
 finite reply. The fixture requires Bash for timed input reads; `python3
 tests/chat_composer_streaming.py` checks this duplex protocol without the app
 or a live provider.
