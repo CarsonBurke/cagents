@@ -211,9 +211,12 @@ struct Drawn {
     tiles: Vec<Rectangle>,
     names: Vec<String>,
     texts: Vec<String>,
+    /// Where the transcript places the row before drawing it.
+    estimate: f32,
 }
 
-/// The row a run of `count` pictures draws, laid out `width` wide.
+/// The row a run of `count` pictures an agent read draws, laid out `width`
+/// wide.
 fn drawn(count: usize, width: f32) -> Drawn {
     let mut items = vec![said("ask", chat::Role::User, "Check the breakpoints.")];
     for index in 0..count {
@@ -226,7 +229,12 @@ fn drawn(count: usize, width: f32) -> Drawn {
             &format!("bp-{index}.png"),
         ));
     }
-    let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+    drawn_row(&items, width)
+}
+
+/// The row of `items`' first turn that is not its prompt or steps.
+fn drawn_row(items: &[chat::Item], width: f32) -> Drawn {
+    let (mut runtime, _handle) = frame_cost::live_runtime(items);
     // Wide, tall and square pictures alike fill the same tiles.
     decoded(&mut runtime, &[(1568, 1045), (720, 1440), (1200, 1200)]);
     let turn = &runtime.turns[0];
@@ -235,6 +243,7 @@ fn drawn(count: usize, width: f32) -> Drawn {
         .copied()
         .find(|part| !matches!(part, TurnPart::Prompt(_) | TurnPart::Steps))
         .unwrap();
+    let estimate = runtime.gallery_estimate(turn, part, width);
     let settings = design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE);
     let mut element = runtime.turn_part_view(turn, part, settings);
     let renderer = crate::app::tests::headless_renderer();
@@ -264,6 +273,7 @@ fn drawn(count: usize, width: f32) -> Drawn {
         tiles: tiles.controls,
         names,
         texts: tiles.texts,
+        estimate,
     }
 }
 
@@ -328,11 +338,82 @@ fn a_gallery_wraps_uniform_tiles_to_its_width_and_one_picture_stays_a_capped_pre
             );
             assert!(gallery.texts.contains(&format!("bp-{}.png", count - 1)));
             assert!(
-                (images::tiles::height(count, width) - gallery.size.height).abs() < 24.0,
+                (gallery.estimate - gallery.size.height).abs() < 24.0,
                 "the estimate places the gallery near where it lands: {} vs {:?}",
-                images::tiles::height(count, width),
+                gallery.estimate,
                 gallery.size
             );
         }
+    }
+}
+
+#[test]
+fn pictures_pasted_together_share_a_gallery_within_their_bubble() {
+    for width in [720.0, 360.0] {
+        let mut items = vec![said("mine", chat::Role::User, "Here are mine:")];
+        for index in 1..=4 {
+            items.push(picture(
+                &format!("pasted-{index}"),
+                chat::Role::User,
+                &format!("Image {index}"),
+            ));
+        }
+        items.push(said("then", chat::Role::Assistant, "Thanks."));
+        let gallery = drawn_row(&items, width);
+        assert_eq!(gallery.tiles.len(), 4, "at {width}");
+        // A pasted picture's name is its place, not a file, so no caption.
+        assert!(
+            !gallery.texts.iter().any(|text| text.starts_with("Image ")),
+            "{:?}",
+            gallery.texts
+        );
+        assert_eq!(gallery.names, ["Image 1", "Image 2", "Image 3", "Image 4"]);
+        let bubble = width.min(PROMPT_MEASURE);
+        assert!(
+            gallery
+                .tiles
+                .iter()
+                .all(|tile| tile.x >= width - bubble - 0.5 && tile.x + tile.width <= width + 0.5),
+            "the tiles are within the bubble at {width}: {:?}",
+            gallery.tiles
+        );
+        assert!(
+            (gallery.estimate - gallery.size.height).abs() < 24.0,
+            "at {width}: {} vs {:?}",
+            gallery.estimate,
+            gallery.size
+        );
+    }
+}
+
+#[test]
+fn loading_one_picture_of_an_older_gallery_loads_the_gallery() {
+    use chat::Role::{Assistant, User};
+    let mut items = vec![said("ask", User, "Compare the layouts.")];
+    for name in ["old-a.png", "old-b.png", "old-c.png"] {
+        items.push(read(&format!("read-{name}"), name));
+    }
+    for name in ["old-a.png", "old-b.png", "old-c.png"] {
+        items.push(picture(&format!("read-{name}:image:0"), Assistant, name));
+    }
+    // Newer pictures than the transcript keeps loaded on its own.
+    for index in 0..images::RECENT_IMAGES {
+        items.push(said(&format!("again-{index}"), User, "And this one?"));
+        items.push(picture(&format!("new-{index}"), User, "Image 1"));
+    }
+    let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+    runtime
+        .visible
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    images::sync(&mut runtime);
+    let reading = |runtime: &Runtime, id: &str| runtime.cache[id].image_source.is_some();
+    assert!(!reading(&runtime, "read-old-b.png:image:0"));
+    images::request(&mut runtime, "read-old-a.png:image:0");
+    for id in [
+        "read-old-a.png:image:0",
+        "read-old-b.png:image:0",
+        "read-old-c.png:image:0",
+    ] {
+        assert!(reading(&runtime, id), "{id} is read with its gallery");
     }
 }

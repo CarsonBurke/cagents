@@ -681,14 +681,17 @@ fn interest(runtime: &Runtime) -> Vec<&Arc<chat::Item>> {
         .preview_request
         .as_deref()
         .and_then(|id| items(runtime).iter().find(|item| item.id == id));
-    requested
+    // The requested picture's gallery comes next, in its own order.
+    let gallery = requested.into_iter().flat_map(|_| {
+        items(runtime)
+            .iter()
+            .filter(|item| runtime.preview_gallery.contains(&item.id))
+    });
+    let explicit: Vec<_> = requested.into_iter().chain(gallery).collect();
+    let recent = recent(runtime)
         .into_iter()
-        .chain(
-            recent(runtime)
-                .into_iter()
-                .filter(|item| requested.is_none_or(|requested| requested.id != item.id)),
-        )
-        .collect()
+        .filter(|item| !explicit.iter().any(|chosen| chosen.id == item.id));
+    explicit.iter().copied().chain(recent).collect()
 }
 fn retire(cached: &mut CachedItem, evicted: bool) {
     cached.image = None;
@@ -708,6 +711,9 @@ pub(super) fn sync(runtime: &mut Runtime) {
             .is_some_and(|id| !items(runtime).iter().any(|item| item.id == id))
     {
         runtime.preview_request = None;
+    }
+    if runtime.preview_request.is_none() {
+        runtime.preview_gallery.clear();
     }
     let interested = interest(runtime);
     let folded = runtime.selected_subagent.is_none();
@@ -785,6 +791,31 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
         return;
     }
     runtime.preview_request = Some(id.to_owned());
+    // At most as many beside it as the newest pictures, nearest first.
+    let gallery: Vec<String> = {
+        let run = runtime.image_run(id);
+        let at = run.iter().position(|item| item.id == id).unwrap_or(0);
+        let mut nearest: Vec<_> = run
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != at)
+            .collect();
+        nearest.sort_by_key(|(index, _)| index.abs_diff(at));
+        nearest
+            .into_iter()
+            .take(RECENT_IMAGES)
+            .map(|(_, item)| item.id.clone())
+            .collect()
+    };
+    for member in &gallery {
+        // Pictures set aside for newer ones are wanted again.
+        if let Some(cached) = runtime.presentation_cache_mut().get_mut(member)
+            && cached.image.is_none()
+        {
+            cached.image_evicted = false;
+        }
+    }
+    runtime.preview_gallery = gallery;
     if let Some(cached) = runtime.presentation_cache_mut().get_mut(id) {
         cached.image_item = Some(item.clone());
         if cached.image.is_none() {
@@ -854,17 +885,16 @@ pub(super) fn complete(
         return None;
     }
     let explicit = runtime.preview_request.as_deref() == Some(item.id.as_str());
-    if let Loaded::Deferred(_) = loaded
-        && cached.image.is_some()
-    {
-        // Reading a shown picture again at another size can wait for a
-        // quieter moment; the pixels it has are still the right picture.
-        let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
-        cached.image_source = None;
-        cached.image_wait = None;
-        return None;
-    }
     if let Loaded::Deferred(pressure) = loaded {
+        if cached.image.is_some() {
+            // Reading a shown picture again at another size waits for the
+            // memory without displacing anything; the pixels it has are
+            // still the right picture meanwhile.
+            let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
+            cached.image_wait = Some(pressure);
+            cached.image_attempt = cached.image_attempt.wrapping_add(1);
+            return None;
+        }
         let mut missing =
             (pressure.permits as usize).saturating_sub(pressure.resource.available_permits());
         let mut evicted = false;
@@ -1107,9 +1137,11 @@ impl Gallery {
         if serial != self.serial {
             return;
         }
-        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+        // A read the viewer has moved on from is not kept.
+        let entry = &mut self.entries[self.selected];
+        if entry.id != id {
             return;
-        };
+        }
         match loaded {
             Loaded::Ready(handle) => entry.full = Some(handle),
             Loaded::Failed(error) => entry.error = Some(error),
@@ -1131,6 +1163,8 @@ impl Gallery {
             (self.selected + self.entries.len() - 1) % self.entries.len()
         };
         self.reset = self.reset.wrapping_add(1);
+        // A picture that could not be read is tried again on return.
+        self.entries[self.selected].error = None;
         self.read()
     }
     pub(super) fn url(&self) -> Option<Url> {
@@ -1247,8 +1281,14 @@ impl Gallery {
             .center(Length::Fill)
             .into(),
         };
-        let label: Element<'_, Message> = match (&entry.error, entry.shown()) {
-            (Some(error), Some(_)) => design::caption(format!("{} · {error}", entry.label)).into(),
+        let label: Element<'_, Message> = match (&entry.error, &entry.full, &entry.preview) {
+            (Some(error), _, Some(_)) => {
+                design::caption(format!("{} · {error}", entry.label)).into()
+            }
+            // The transcript's smaller preview stands in meanwhile.
+            (None, None, Some(_)) if entry.source.is_some() => {
+                design::caption(format!("{} · Loading full size…", entry.label)).into()
+            }
             _ => design::caption(entry.label.as_str()).into(),
         };
         // Escape that an open context menu claims closes only the menu.
@@ -2032,5 +2072,54 @@ mod tests {
             gallery.url().is_none(),
             "a remote path must never open a local file URL"
         );
+    }
+    #[test]
+    fn the_viewer_keeps_only_the_shown_pictures_whole_read() {
+        let pixels = || iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+        let entry = |id: &str| Entry {
+            id: id.into(),
+            managed: false,
+            path: format!("/fixture/{id}.png"),
+            label: id.into(),
+            preview: Some(pixels()),
+            full: None,
+            error: None,
+            source: Some(Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Image {
+                    path: format!("/fixture/{id}.png"),
+                    description: String::new(),
+                    reference: None,
+                },
+                started_at: None,
+                at: None,
+            })),
+        };
+        let mut gallery = Gallery {
+            entries: vec![entry("a"), entry("b")],
+            selected: 0,
+            remote: false,
+            reset: 0,
+            origin: None,
+            serial: 7,
+            reading: None,
+        };
+        // A read the viewer has moved on from, or one for an earlier viewer,
+        // is not kept.
+        gallery.loaded(7, "b", Loaded::Ready(pixels()));
+        gallery.loaded(6, "a", Loaded::Ready(pixels()));
+        assert!(gallery.entries.iter().all(|entry| entry.full.is_none()));
+        gallery.loaded(7, "a", Loaded::Failed("gone".into()));
+        assert_eq!(gallery.entries[0].error.as_deref(), Some("gone"));
+        // Browsing away and back tries a failed picture again.
+        drop(gallery.next(true));
+        drop(gallery.next(false));
+        assert_eq!(gallery.entries[0].error, None);
+        gallery.loaded(7, "a", Loaded::Ready(pixels()));
+        assert!(gallery.entries[0].full.is_some());
+        // Only the shown picture is held whole.
+        drop(gallery.next(true));
+        assert!(gallery.entries[0].full.is_none());
     }
 }

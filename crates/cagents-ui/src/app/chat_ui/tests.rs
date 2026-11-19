@@ -1078,7 +1078,9 @@ fn preview_interest_bounds_manual_requests_and_suppresses_over_budget_recent_can
                 .values()
                 .filter(|cached| cached.image_source.is_some())
                 .count()
-                <= images::RECENT_IMAGES + 1
+                // The newest pictures, and the requested one with the
+                // nearest of its gallery.
+                <= 2 * images::RECENT_IMAGES + 1
         );
     }
     assert!(runtime.cache[&items[0].id].image_source.is_none());
