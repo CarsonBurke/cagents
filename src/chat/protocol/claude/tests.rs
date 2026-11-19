@@ -4487,6 +4487,22 @@ fn a_loaded_skill_is_its_calls_step_live_and_in_history() {
     );
 }
 
+/// A skill that failed to launch keeps its error, even when instructions of
+/// the same name arrive later without a call of their own.
+#[test]
+fn a_failed_skill_call_never_takes_later_instructions() {
+    let live = settled_live(&[
+        json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+        json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_skill","is_error":true,"content":"Unknown skill: release-notes"}]}}),
+        json!({"type":"user","uuid":"instructions","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+    ]);
+    assert!(
+        matches!(&live[..], [Item { content: ItemContent::Tool { name, output, status: ToolStatus::Failed, .. }, .. }]
+        if name == "Skill" && output.contains("Unknown skill")),
+        "{live:?}"
+    );
+}
+
 /// A skill the reader runs as a command is shown by the prompt they typed.
 /// Claude Code saves its instructions but never streams them, so the
 /// reopened chat must not add a step the live one lacked.

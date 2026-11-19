@@ -2211,6 +2211,13 @@ impl Claude {
                         {
                             *output = instructions;
                         }
+                        // A skill that did not launch loads nothing.
+                        if let ItemContent::Tool { status, .. } = &item.content
+                            && !matches!(status, ToolStatus::Running | ToolStatus::Succeeded)
+                        {
+                            let call = ScopedId::new(child, &tool_id);
+                            self.skill_loads.retain(|(known, _)| known != &call);
+                        }
                         if let Some(task) = structured["backgroundTaskId"].as_str() {
                             self.foreground_tasks.retain(|known| known != task);
                             self.background_launch(&tool_id, history, &mut item.content);
