@@ -14,6 +14,7 @@
 //! Both records are read by builds older and newer than the one that wrote
 //! them, so every field defaults and every enum names what it doesn't know.
 use crate::{
+    agent::Provider,
     chat::{ItemContent, Snapshot, ToolStatus},
     model::TerminalId,
 };
@@ -86,10 +87,13 @@ impl InFlight {
     /// with. A provider that has exited has nothing in flight.
     ///
     /// While the turn runs, its own steps and subagents belong to it, so only
-    /// the subagents that outlive it are listed. Once it has ended, any step
-    /// the provider still reports running outlived it too: a background
-    /// command stays running until its task notification arrives.
-    pub fn observe(id: TerminalId, snapshot: &Snapshot) -> Self {
+    /// the subagents that outlive it are listed. Once a Claude turn has
+    /// ended, a step its adapter still reports running outlived it too: a
+    /// command moved to the background, or a monitor, stays running until its
+    /// task notification arrives. No other provider's adapter keeps a step
+    /// running past its turn on purpose, so a step one left running is not
+    /// read as work.
+    pub fn observe(id: TerminalId, provider: Provider, snapshot: &Snapshot) -> Self {
         let mut work = Self {
             id,
             ..Self::default()
@@ -111,7 +115,7 @@ impl InFlight {
                 waiting: agent.status == ToolStatus::Waiting,
             });
         }
-        if !work.turn {
+        if !work.turn && provider == Provider::Claude {
             for item in &snapshot.items {
                 let (kind, name) = match &item.content {
                     ItemContent::Command {
@@ -306,7 +310,7 @@ mod tests {
             subagents: vec![agent("finished", ToolStatus::Succeeded, true)],
             ..Snapshot::default()
         };
-        let work = InFlight::observe(TerminalId::new(), &snapshot);
+        let work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
         assert!(work.is_empty(), "{work:?}");
     }
 
@@ -327,7 +331,7 @@ mod tests {
             queued_messages: vec![queued("q1")],
             ..Snapshot::default()
         };
-        let work = InFlight::observe(id, &snapshot);
+        let work = InFlight::observe(id, Provider::Claude, &snapshot);
         assert_eq!(work.id, id);
         assert!(!work.turn);
         let tasks: Vec<_> = work
@@ -370,7 +374,7 @@ mod tests {
             ],
             ..Snapshot::default()
         };
-        let work = InFlight::observe(TerminalId::new(), &snapshot);
+        let work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
         assert!(work.turn);
         let ids: Vec<_> = work.tasks.iter().map(|task| task.id.as_str()).collect();
         assert_eq!(ids, ["toolu_background_agent"]);
@@ -379,7 +383,19 @@ mod tests {
             waiting: true,
             ..Snapshot::default()
         };
-        assert!(InFlight::observe(TerminalId::new(), &awaiting).turn);
+        assert!(InFlight::observe(TerminalId::new(), Provider::Claude, &awaiting).turn);
+    }
+
+    #[test]
+    fn only_claude_keeps_a_step_running_past_its_turn() {
+        let snapshot = Snapshot {
+            items: vec![command("item_left_running", ToolStatus::Running)],
+            subagents: vec![agent("child-thread", ToolStatus::Running, true)],
+            ..Snapshot::default()
+        };
+        let work = InFlight::observe(TerminalId::new(), Provider::Codex, &snapshot);
+        let ids: Vec<_> = work.tasks.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, ["child-thread"]);
     }
 
     #[test]
@@ -397,7 +413,7 @@ mod tests {
                 ..Snapshot::default()
             },
         ] {
-            assert!(InFlight::observe(TerminalId::new(), &snapshot).is_empty());
+            assert!(InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot).is_empty());
         }
     }
 
@@ -407,7 +423,7 @@ mod tests {
             subagents: vec![agent("toolu_worker", ToolStatus::Stopped, true)],
             ..Snapshot::default()
         };
-        let mut work = InFlight::observe(TerminalId::new(), &snapshot);
+        let mut work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
         assert!(work.is_empty());
         work.interrupted(&["toolu_worker".to_owned()]);
         assert!(work.turn);
@@ -428,7 +444,7 @@ mod tests {
                 .collect(),
             ..Snapshot::default()
         };
-        let work = InFlight::observe(TerminalId::new(), &snapshot);
+        let work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
         assert_eq!(work.tasks.len(), MAX_TASKS);
         assert_eq!(work.queued.len(), MAX_QUEUED);
         assert_eq!(work.unlisted, 3 + 1 + 2);

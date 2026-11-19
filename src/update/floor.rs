@@ -383,7 +383,7 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         for chat in &chats {
             let snapshot = client.capture_chat_snapshot(chat.clone())?;
             // Read before the page keeps only what a reader shows.
-            let work = self.survivors.observe_in_flight(chat.id, &snapshot);
+            let work = self.survivors.observe_in_flight(chat, &snapshot);
             if !work.is_empty() {
                 in_flight.push(work);
             }
@@ -1243,6 +1243,8 @@ pub(super) struct Survivors {
     /// become of each conversation, captured together before preparation.
     in_flight: Vec<super::in_flight::InFlight>,
     capture_dispositions: BTreeMap<TerminalId, impact::Disposition>,
+    /// The confirmed successor serves and has finished its restore.
+    successor_serving: bool,
 }
 
 struct PreparationEvidence {
@@ -1349,6 +1351,7 @@ impl Survivors {
             self.recovery_outcome = Some(outcome.map_err(invalid)?);
         }
         peer.verify(client.proof())?;
+        self.successor_serving = true;
         Ok(())
     }
 
@@ -1568,10 +1571,11 @@ impl Survivors {
     /// interruption says it did, with the background tasks it stopped.
     fn observe_in_flight(
         &self,
-        id: TerminalId,
+        chat: &crate::chat::Session,
         snapshot: &crate::chat::Snapshot,
     ) -> super::in_flight::InFlight {
-        let mut work = super::in_flight::InFlight::observe(id, snapshot);
+        let id = chat.id;
+        let mut work = super::in_flight::InFlight::observe(id, chat.launch.provider, snapshot);
         if let Some(turn) = self.interrupted.get(&(impact::SessionKind::NativeChat, id)) {
             work.interrupted(&turn.background_tasks);
         }
@@ -1590,14 +1594,34 @@ impl Survivors {
         use super::in_flight::{Fate, Outcome};
         use crate::upgrade::handoff::UnattachedDisposition;
         if self.in_flight.is_empty()
-            || !self.source_prepared && !self.service_stopped && self.ended.is_empty()
+            || !self.source_prepared
+                && !self.service_stopped
+                && self.ended.is_empty()
+                && self.interrupted.is_empty()
         {
             return Vec::new();
         }
-        let unattached = if self.source_prepared {
+        let unattached = if self.source_prepared && self.successor_serving {
             unattached()
         } else {
             Vec::new()
+        };
+        // What the prepared source said would become of each conversation;
+        // the census's own review stands in where preparation recorded none.
+        let disposition = |id: TerminalId| {
+            self.prepared_source
+                .as_ref()
+                .and_then(|evidence| {
+                    evidence
+                        .daemon
+                        .sessions
+                        .iter()
+                        .find(|session| {
+                            session.kind == impact::SessionKind::NativeChat && session.id == id
+                        })
+                        .map(|session| session.disposition)
+                })
+                .or_else(|| self.capture_dispositions.get(&id).copied())
         };
         self.in_flight
             .iter()
@@ -1605,12 +1629,18 @@ impl Survivors {
                 let key = (impact::SessionKind::NativeChat, work.id);
                 let fate = if self.ended.contains_key(&key) || self.service_stopped {
                     Fate::Ended
+                } else if self.interrupted.contains_key(&key) {
+                    // Settled before preparation, so it stands even when the
+                    // update went no further.
+                    Fate::Interrupted
                 } else if !self.source_prepared {
                     // The source was never prepared, so it kept running every
-                    // conversation the update did not end.
+                    // conversation the update did not end or interrupt.
                     Fate::Continued
-                } else if self.interrupted.contains_key(&key) {
-                    Fate::Interrupted
+                } else if !self.successor_serving {
+                    // Preparation crossed the point of no return, but no
+                    // successor confirmed what it restored.
+                    Fate::Unknown
                 } else if let Some(conversation) = unattached
                     .iter()
                     .find(|conversation| conversation.id == work.id)
@@ -1626,10 +1656,13 @@ impl Survivors {
                 {
                     Fate::Stopped
                 } else {
-                    match self.capture_dispositions.get(&work.id) {
+                    match disposition(work.id) {
                         Some(impact::Disposition::Continues) => Fate::Continued,
                         Some(impact::Disposition::Resumes) => Fate::Restarted,
                         Some(impact::Disposition::Interrupted) => Fate::Interrupted,
+                        // Its provider stopped, and the conversation does not
+                        // reopen on its own.
+                        Some(impact::Disposition::ResumePicker) => Fate::Stopped,
                         _ => Fate::Unknown,
                     }
                 };
