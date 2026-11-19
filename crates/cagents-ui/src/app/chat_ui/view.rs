@@ -1729,6 +1729,19 @@ impl Runtime {
         }
     }
 
+    /// The provider error a running child reported last, while nothing newer
+    /// from it has arrived. Its run may still recover, so this is the child's
+    /// own state, said on its row, not a question for the person.
+    pub(super) fn child_error<'a>(&self, agent: &'a chat::Subagent) -> Option<&'a str> {
+        let detail = agent.detail.trim();
+        (agent.status == chat::ToolStatus::Running
+            && !detail.is_empty()
+            && agent.items.last().is_some_and(|item| {
+                chat::failure::provider_error_text(self.session.launch.provider, item).is_some()
+            }))
+        .then_some(detail)
+    }
+
     pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
         self.child_description(agent, &self.child_label(agent, 80))
     }
@@ -1761,9 +1774,11 @@ impl Runtime {
         let detail = agent.detail.trim();
         if !detail.is_empty() {
             identity.push_str(" · ");
-            let failure = (agent.waiting || agent.status == chat::ToolStatus::Failed)
-                .then(|| chat::failure::Failure::parse(self.session.launch.provider, detail))
-                .flatten();
+            let failure = (agent.waiting
+                || agent.status == chat::ToolStatus::Failed
+                || self.child_error(agent).is_some())
+            .then(|| chat::failure::Failure::parse(self.session.launch.provider, detail))
+            .flatten();
             match failure {
                 Some(failure) => identity.push_str(&failure.summary),
                 None => identity.push_str(&Self::short_description(detail, 120)),
@@ -2017,6 +2032,11 @@ impl Runtime {
             return (agent.status == chat::ToolStatus::Running).then(|| {
                 if agent.waiting {
                     (Icon::AgentWaiting, "Waiting".to_owned())
+                } else if let Some(error) = self.child_error(agent) {
+                    (
+                        Icon::AgentWorking,
+                        chat::failure::summary(self.session.launch.provider, error).into_owned(),
+                    )
                 } else {
                     let activity = items_activity(&agent.items);
                     let label = if activity == "Working" && !agent.detail.trim().is_empty() {
