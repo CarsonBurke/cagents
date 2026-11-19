@@ -69,7 +69,7 @@ show)
     evidence drive type '# Design review' >/dev/null
     evidence drive key Return >/dev/null
     sleep 8
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     sleep 1
     evidence shot "${2:-agent-card}"
     ;;

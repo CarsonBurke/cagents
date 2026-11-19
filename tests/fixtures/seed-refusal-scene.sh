@@ -25,7 +25,7 @@ scene_state=$fixture/state/seed-refusal-scene
 mkdir -p "$scene_state"
 evidence() { "$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" "$@"; }
 shot() {
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     sleep 1
     evidence shot "$1"
 }
@@ -88,7 +88,7 @@ refuse)
 notice)
     # The application's existing persistent-notice popup holds the recovery.
     # Set the point after observing the native header at this viewport size.
-    evidence drive move "${NOTICE_CONTROL_POINT:?name the native notices icon point}" >/dev/null
+    evidence drive hover "${NOTICE_CONTROL_POINT:?name the native notices icon point}" >/dev/null
     evidence drive wait 'notices' --timeout 10 >/dev/null
     evidence drive click "$NOTICE_CONTROL_POINT" >/dev/null
     evidence drive wait 'Retry' --timeout 15 >/dev/null

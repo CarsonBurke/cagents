@@ -36,7 +36,7 @@ config=$fixture/home/.claude
 
 log() { printf '== %s %s\n' "$(date +%T)" "$*"; }
 shot() {
-    "$ne" drive move 1,1 >/dev/null 2>&1
+    "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
     "$ne" shot "$1" >/dev/null && log "shot $1" || log "shot failed: $1"
 }
@@ -53,7 +53,7 @@ cp "$frames/launch.jsonl" "$config/fixture-frames.jsonl"
 composer=
 for _ in 1 2 3 4 5 6 7 8; do
     sleep 4
-    "$ne" drive move 1,1 >/dev/null 2>&1
+    "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
     row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|Review the release' | head -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |

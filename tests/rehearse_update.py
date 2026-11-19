@@ -2448,7 +2448,7 @@ else:sys.exit(2)
         harness = tools / "niri-harness"
         harness.write_text("#!/usr/bin/python3\nimport json,os,sys,pathlib\n"
                            "value=json.dumps(dict(os.environ))\n"
-                           "if sys.argv[-2:]==['session','env']:\n"
+                           "if sys.argv[-1:]==['env']:\n"
                            " pathlib.Path(os.environ['HOME'],'seen.json').write_text(value)\n"
                            " print(\"export WAYLAND_DISPLAY='fixture-wayland'\")\n"
                            "else: print(value)\n")

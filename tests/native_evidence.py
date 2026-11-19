@@ -73,13 +73,14 @@ STUBS = {
         printf '%s\\n' "$*" >> "$STUB_LOG/harness"
         printf '%s\\n' "$PATH" >> "$STUB_LOG/harness-path"
         ls -l /proc/self/fd >> "$STUB_LOG/harness-fds" 2>&1
-        if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1 $2" = "session stop" ]; then exec sleep 300; fi
+        if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1" = stop ]; then exec sleep 300; fi
         args=("$@")
         for ((i = 0; i < $#; i++)); do
             case ${args[i]} in
                 --root) root=${args[i + 1]} ;;
-                --cmd) cmd=${args[i + 1]} ;;
                 --portal) portal=${args[i + 1]} ;;
+                # Like `start`, everything after `--` is the program and its arguments.
+                --) program=("${args[@]:i + 1}"); break ;;
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
@@ -100,12 +101,12 @@ STUBS = {
                     ;;
             esac
         done
-        if [ -n "${cmd:-}" ]; then
+        if [ "$1" = start ] && [ "${#program[@]}" -gt 0 ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
             # Like the real harness, a portal session runs the app on its own bus.
             [ -z "${portal:-}" ] || export DBUS_SESSION_BUS_ADDRESS=stub-portal-bus XDG_CONFIG_HOME=$root/xdg-config
-            NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
+            NIRI_SOCKET=stub-niri "${program[@]}" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep STUB_HARNESS_WAIT_SECONDS
             # Nor does it report ready until the app is up, unless told not to wait.
@@ -925,7 +926,7 @@ class Evidence(unittest.TestCase):
     def test_a_session_is_ready_only_once_the_harness_saw_a_window(self) -> None:
         self.built()
         self.run_tool("start", "after")
-        start = next(line for line in (self.logs / "harness").read_text().splitlines() if "--cmd" in line)
+        start = next(line for line in (self.logs / "harness").read_text().splitlines() if line.startswith("start "))
         self.assertNotIn("--no-window-wait", start)
         self.run_tool("stop")
 
@@ -949,12 +950,12 @@ class Evidence(unittest.TestCase):
                 self.run_tool("start", "after", "--limit", "1234", *options)
                 self.assertEqual((self.task / "session/startup-timeout").read_text(), f"{seconds}\n")
                 harness = next(line for line in reversed((self.logs / "harness").read_text().splitlines())
-                               if "--cmd" in line)
+                               if line.startswith("start "))
                 args = shlex.split(harness)
                 self.assertEqual(args[args.index("--timeout") + 1], str(seconds))
                 self.assertNotIn("--no-window-wait", args)
                 outer = next(line for line in reversed((self.logs / "timeouts").read_text().splitlines())
-                             if "niri-harness session start" in line)
+                             if "niri-harness start" in line)
                 self.assertEqual(shlex.split(outer)[:4], ["-k", "5", str(seconds + 60), "niri-harness"])
                 self.assertTrue((self.logs / "ui-ran").is_file())
                 self.run_tool("stop")
@@ -1515,7 +1516,7 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after", "--portal", "gtk")
         self.run_tool("stop")
         starts = [line for line in (self.logs / "harness").read_text().splitlines()
-                  if line.startswith("session start")]
+                  if line.startswith("start ")]
         self.assertEqual(len(starts), 2, starts)
         self.assertNotIn("--portal", starts[0])
         self.assertIn("--portal gtk", starts[1])
