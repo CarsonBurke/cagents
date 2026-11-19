@@ -26,6 +26,13 @@ use std::collections::VecDeque;
 /// that never does has not made the change.
 const CHOICE_PATIENCE: Duration = Duration::from_secs(5);
 
+/// How long a message the provider took may go without its turn beginning
+/// before what the conversation shows is taken as final: a conversation
+/// idle with an error refused it, one idle without has nothing more to
+/// show of it. Until then a report of the conversation working may still
+/// be on its way.
+pub(super) const TURN_PATIENCE: Duration = Duration::from_secs(5);
+
 /// One command to the provider, with what this window shows of it until the
 /// provider answers.
 pub(super) struct PendingCommand {
@@ -286,22 +293,38 @@ impl Outgoing {
             || (self.mode == PromptMode::Steer
                 && snapshot.generation > self.generation
                 && !snapshot.busy)
-            || (items && snapshot.has_later)
+            || (items && snapshot.has_later && snapshot.turn_generation > self.turns)
             || snapshot.exited
     }
 
-    /// Whether `snapshot` shows the turn this message was to start failing
-    /// before it began: the provider took the message, then stopped working
-    /// with an error of its own and no turn begun. Nothing of it reached the
-    /// conversation, or it would have settled already.
-    fn failed_in(&self, snapshot: &Snapshot) -> bool {
+    /// Whether `snapshot`, `waited` out [`TURN_PATIENCE`] since the provider
+    /// took this message, shows a conversation that is not starting its
+    /// turn and reports nothing wrong: there is nothing more to wait for.
+    fn quiet_in(&self, snapshot: &Snapshot, waited: bool) -> bool {
+        waited && self.never_began(snapshot) && snapshot.error.is_none()
+    }
+
+    /// Whether `snapshot` shows the conversation idle since this message
+    /// went, with its turn not begun.
+    fn never_began(&self, snapshot: &Snapshot) -> bool {
         self.in_transcript()
             && snapshot.generation > self.generation
             && !snapshot.busy
             && !snapshot.exited
             && snapshot.turn_generation == self.turns
+    }
+
+    /// Whether `snapshot` shows the turn this message was to start failing
+    /// before it began: the provider took the message, then stopped working
+    /// with an error of its own and no turn begun. Nothing of it reached the
+    /// conversation, or it would have settled already. The error tells
+    /// only once it differs from the one shown when this went, or the
+    /// conversation was seen working first, or [`TURN_PATIENCE`] is `waited`
+    /// out: the same error again is this message failing the same way.
+    fn failed_in(&self, snapshot: &Snapshot, waited: bool) -> bool {
+        self.never_began(snapshot)
             && snapshot.error.is_some()
-            && (snapshot.error != self.error || self.busy_seen)
+            && (snapshot.error != self.error || self.busy_seen || waited)
     }
 
     /// Whether `snapshot` shows this very message, where it is going.
@@ -410,6 +433,14 @@ impl Commands {
         self.waiting.len()
     }
 
+    /// Takes `by` off the time since each accepted command was accepted.
+    #[cfg(test)]
+    pub(super) fn age(&mut self, by: Duration) {
+        for settling in &mut self.settling {
+            settling.accepted = settling.accepted.checked_sub(by).unwrap();
+        }
+    }
+
     /// Every command not yet answered, in the order it goes.
     pub(super) fn iter(&self) -> impl Iterator<Item = &PendingCommand> {
         self.in_flight
@@ -485,7 +516,7 @@ impl Commands {
 
     /// Whether a message the provider took has yet to start the turn it
     /// asks for.
-    fn turn_coming(&self, snapshot: &Snapshot) -> bool {
+    pub(super) fn turn_coming(&self, snapshot: &Snapshot) -> bool {
         !snapshot.exited
             && self.settling.iter().any(|settling| {
                 matches!(&settling.effect, Effect::Outgoing(outgoing)
@@ -495,9 +526,9 @@ impl Commands {
 
     /// Puts the next waiting command in flight, if none is, as `snapshot`
     /// allows. One that acts on the turn waits while a message sent ahead
-    /// of it has yet to start that turn. Once the turn has come and gone, or
-    /// never came, a message that waited for it goes as a message of its
-    /// own, and a request to stop it is dropped: there is nothing to stop.
+    /// of it has yet to start that turn. A message for a turn that is over
+    /// by the time it goes, or never came, goes as a message of its own, and
+    /// a request that waited to stop it is dropped: there is nothing to stop.
     pub(super) fn next(&mut self, snapshot: &Snapshot) -> Option<(u64, Command)> {
         if self.in_flight.is_some() {
             return None;
@@ -510,7 +541,7 @@ impl Commands {
                     pending.held = true;
                     return None;
                 }
-                if pending.held && !snapshot.busy {
+                if !snapshot.busy {
                     match command {
                         Command::Prompt { mode, .. } => {
                             *mode = PromptMode::Send;
@@ -518,10 +549,11 @@ impl Commands {
                                 outgoing.mode = PromptMode::Send;
                             }
                         }
-                        _ => {
+                        _ if pending.held => {
                             self.waiting.pop_front();
                             continue;
                         }
+                        _ => {}
                     }
                 }
             }
@@ -605,8 +637,9 @@ impl Commands {
                     }
                 }
                 Effect::Outgoing(mut outgoing) => {
-                    if outgoing.settled_by(snapshot, items) {
-                    } else if outgoing.failed_in(snapshot) {
+                    let waited = settling.accepted.elapsed() >= TURN_PATIENCE;
+                    if outgoing.settled_by(snapshot, items) || outgoing.quiet_in(snapshot, waited) {
+                    } else if outgoing.failed_in(snapshot, waited) {
                         settled.failed.push(outgoing);
                     } else {
                         outgoing.busy_seen |= snapshot.busy;
@@ -726,6 +759,13 @@ impl Runtime {
         self.snapshot.busy
             || self.commands.outgoing().next().is_some()
             || self.commands.carrying_followups()
+    }
+
+    /// Whether the conversation runs a turn that a message could steer or
+    /// Stop could end: working, and not only waiting for the turn a message
+    /// on its way is to start, as a conversation reads once it takes one.
+    pub(super) fn turn_running(&self) -> bool {
+        self.snapshot.busy && !self.commands.turn_coming(&self.snapshot)
     }
 
     /// Lets go of what `snapshot` shows of this chat's commands, as
@@ -1163,6 +1203,60 @@ mod tests {
         );
     }
 
+    /// Sent again after failing, a message can fail the same way, with the
+    /// error it failed with before and no report of the conversation working
+    /// in between. Once its turn has had time to begin, that error is its
+    /// own. A conversation idle with no error and no turn has nothing more
+    /// to show, and what waited for the turn goes on.
+    #[test]
+    fn a_message_whose_turn_never_comes_is_not_waited_for_for_good() {
+        const CLOSED: &str = "Codex RPC error: the thread is closed";
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        publish(&mut app, card, |snapshot| {
+            snapshot.capabilities.steer = true;
+            snapshot.error = Some(CLOSED.into());
+        });
+        let target = sending(&mut app, card, "Fix the build");
+        settle(&mut app, card, Ok(()));
+        publish(&mut app, card, |snapshot| snapshot.busy = false);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.commands.outgoing().count(), 1, "a report may lag");
+        assert!(!runtime.turn_running(), "no turn to steer or stop yet");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .commands
+            .age(TURN_PATIENCE);
+        drop(app.update(Message::ChatUi(Action::CommandsDue(target))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.commands.outgoing().count(), 0);
+        assert_eq!(runtime.composer.text().trim_end(), "Fix the build");
+
+        publish(&mut app, card, |snapshot| snapshot.error = None);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text(""));
+        sending(&mut app, card, "Fix the build");
+        settle(&mut app, card, Ok(()));
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("and the tests"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Steer))));
+        publish(&mut app, card, |snapshot| snapshot.busy = false);
+        assert_eq!(chat_runtime(&app, card).commands.waiting(), 1, "held");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .commands
+            .age(TURN_PATIENCE);
+        drop(app.update(Message::ChatUi(Action::CommandsDue(target))));
+        let runtime = chat_runtime(&app, card);
+        let in_flight = runtime.commands.in_flight().expect("released");
+        let outgoing = in_flight.outgoing.as_ref().unwrap();
+        assert_eq!(outgoing.prompt.text(), "and the tests");
+        assert_eq!(outgoing.mode, PromptMode::Send);
+        assert!(runtime.composer.text().trim().is_empty());
+    }
+
     /// A message written while the one before it is still on its way acts
     /// on the turn that one starts. It waits until the provider shows the
     /// turn has begun, since Codex refuses to steer a turn it has not
@@ -1226,6 +1320,34 @@ mod tests {
             assert_eq!(runtime.commands.outgoing().count(), 0);
             assert!(runtime.commands.is_idle());
         }
+    }
+
+    /// A message written to steer the turn the one before it starts goes as
+    /// a message of its own when that turn is over before it goes, as one
+    /// can be by the time the provider answers for the first.
+    #[test]
+    fn a_message_for_a_turn_already_over_goes_as_its_own() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        publish(&mut app, card, |snapshot| {
+            snapshot.capabilities.steer = true
+        });
+        sending(&mut app, card, "Look at the logs");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Then fix them"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Steer))));
+        publish(&mut app, card, |snapshot| {
+            snapshot.turn_generation += 1;
+            snapshot.items.push(user_text("u-logs", "Look at the logs"));
+        });
+        settle(&mut app, card, Ok(()));
+        let runtime = chat_runtime(&app, card);
+        let in_flight = runtime.commands.in_flight().expect("sent");
+        let outgoing = in_flight.outgoing.as_ref().unwrap();
+        assert_eq!(outgoing.prompt.text(), "Then fix them");
+        assert_eq!(outgoing.mode, PromptMode::Send);
     }
 
     /// Changing one's mind about a model while the first change is on its

@@ -371,6 +371,9 @@ pub enum Action {
     /// Lets a cancel waiting for its second press lapse, if it is that one.
     DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
+    /// Looks again at a message the provider took once its turn has had
+    /// time to begin, as no report may come to show it never will.
+    CommandsDue(Target),
     Toggle(Target, String),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
@@ -794,6 +797,7 @@ impl Action {
             Self::Interrupt(..) => "Interrupt",
             Self::DisarmInterrupt(..) => "DisarmInterrupt",
             Self::CommandFinished(..) => "CommandFinished",
+            Self::CommandsDue(..) => "CommandsDue",
             Self::Toggle(..) => "Toggle",
             Self::ToggleTurn(..) => "ToggleTurn",
             Self::SelectSubagent(..) => "SelectSubagent",
@@ -939,6 +943,7 @@ impl Action {
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
+                | Self::CommandsDue(..)
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
@@ -2766,6 +2771,14 @@ struct FinishedStamp {
 
 /// Sends `command` to the conversation `handle` reaches, off the UI thread,
 /// and answers with its outcome. Without one, it is answered as not sent.
+/// [`Action::CommandsDue`] for `target`, once a turn has had time to begin.
+fn commands_due(target: Target) -> Task<Message> {
+    cosmic::task::future(async move {
+        tokio::time::sleep(commands::TURN_PATIENCE).await;
+        Message::ChatUi(Action::CommandsDue(target))
+    })
+}
+
 fn run_chat_command(
     target: Target,
     id: u64,
@@ -14189,6 +14202,7 @@ impl Cagents {
                     return Task::none();
                 };
                 let mut followups_sent = false;
+                let mut due = Task::none();
                 let first_prompt = match result {
                     Ok(()) => {
                         if !pending.followups.is_empty() {
@@ -14214,6 +14228,9 @@ impl Cagents {
                         let items = runtime.presents();
                         runtime.settle_commands(&snapshot, items);
                         runtime.prepare_local_prompt();
+                        if runtime.commands.turn_coming(&snapshot) {
+                            due = commands_due(target);
+                        }
                         if pending.page == Some(view::Page::Latest)
                             && runtime.deferred_page == Some(HistoryNavigation::Latest)
                         {
@@ -14235,6 +14252,7 @@ impl Cagents {
                             }
                             return Task::batch([
                                 snap,
+                                due,
                                 self.next_chat_command(target),
                                 self.dispatch_queued(target),
                                 self.resume_history_navigation(target),
@@ -14288,10 +14306,24 @@ impl Cagents {
                 // acknowledgement. No later provider event is guaranteed to
                 // wake the follow-up again once the command releases it.
                 return Task::batch([
+                    due,
                     self.next_chat_command(target),
                     self.dispatch_queued(target),
                     self.resume_history_navigation(target),
                 ]);
+            }
+            Action::CommandsDue(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let snapshot = runtime.snapshot.clone();
+                let items = runtime.presents();
+                if runtime.settle_commands(&snapshot, items) {
+                    runtime.prepare_local_prompt();
+                }
+                // A conversation still working reports again when it stops,
+                // and its report settles the message then.
+                return Task::batch([self.next_chat_command(target), self.dispatch_queued(target)]);
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {

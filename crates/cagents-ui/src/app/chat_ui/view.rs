@@ -3424,7 +3424,7 @@ impl Runtime {
         let placeholder = if selected.is_some() {
             "Message main agent"
         } else {
-            composer_placeholder(modes.first().copied(), snapshot.busy)
+            composer_placeholder(modes.first().copied(), self.turn_running())
         };
         // Key bindings must remain available while the editor changes its own
         // contents. The action handler checks the current draft before sending;
@@ -3598,12 +3598,12 @@ impl Runtime {
         // Stop waits for a turn to stop, as the placeholder waits for one to
         // steer.
         let submissions: Vec<Element<'_, Message>> =
-            composer_trailing(modes, snapshot.busy, has_draft)
+            composer_trailing(modes, self.turn_running(), has_draft)
                 .into_iter()
                 .map(|control| match control {
                     Trailing::Submit { mode, slot } => {
                         let shown = match mode {
-                            PromptMode::Steer if !snapshot.busy => PromptMode::Send,
+                            PromptMode::Steer if !self.turn_running() => PromptMode::Send,
                             mode => mode,
                         };
                         let (name, tooltip) = submit_control(shown, slot, enter_sends);
