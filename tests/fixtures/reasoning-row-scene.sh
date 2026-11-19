@@ -45,7 +45,7 @@ coordination_done=$fixture/state/reasoning-row-scene-coordination
 initial_spawn=$fixture/state/reasoning-row-scene-spawn.json
 
 shot() {
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     sleep 1
     evidence shot "$1"
 }
@@ -586,7 +586,7 @@ evidence cli --json agent spawn --provider claude --model haiku --surface chat \
 opened=false
 for _ in 1 2 3 4 5 6 7 8; do
     sleep 3
-    evidence drive move 1,1 >/dev/null
+    evidence drive hover 1,1 >/dev/null
     if evidence drive click 'New channel' >/dev/null 2>&1 ||
         evidence drive click 'Fixture:' >/dev/null 2>&1; then
         sleep 2
