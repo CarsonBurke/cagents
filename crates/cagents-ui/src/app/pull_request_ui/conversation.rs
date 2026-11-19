@@ -1512,11 +1512,12 @@ mod tests {
             conversation,
             4,
             vec![row(41, Relation::Created), row(35, Relation::Updated)],
-            vec![worktree("/cache", Some(41))],
+            vec![worktree("/docs", None), worktree("/cache", Some(41))],
         ));
-        assert_eq!(rows_of(&state), ["#41", "#35"]);
+        assert_eq!(rows_of(&state), ["#41", "docs", "#35"]);
 
-        // Another conversation starts from the daemon's order.
+        // Another conversation starts from the daemon's order, even for a
+        // worktree the last one showed in a later row.
         let other = TerminalId::new();
         state.retarget(Some(other));
         state.update(with_worktrees(
