@@ -284,6 +284,10 @@ impl CodeBlock {
         }
     }
 
+    pub(super) fn is_settled(&self) -> bool {
+        self.tail.is_none()
+    }
+
     /// The font a block's paragraph is set in. Its spans name their own only
     /// where highlighting or [`monospace`] chose one, relative to this.
     pub(super) const FONT: iced::Font = iced::Font::MONOSPACE;
@@ -1381,6 +1385,14 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_block_is_settled_and_an_open_one_is_not() {
+        let theme = crate::settings::EditorSyntaxTheme::Mocha;
+        let code = "let value = 1;";
+        assert!(CodeBlock::new(Some("rust"), code, theme).is_settled());
+        assert!(!CodeBlock::open(Some("rust"), code, theme).is_settled());
+    }
 
     #[test]
     fn ordered_tasks_keep_native_numbers_checked_state_and_copied_markers() {

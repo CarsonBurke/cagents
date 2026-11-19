@@ -818,15 +818,27 @@ impl State {
         self.local_error = None;
     }
 
-    /// `append` is proof from the immutable source publication, not a tail
-    /// digest or a guessed matching item ID. An unproven replacement starts a
-    /// new lineage and cancels both queued and currently parsing old input.
+    #[cfg(test)]
     pub(super) fn stage(
         &mut self,
         item: &Arc<chat::Item>,
         growing: bool,
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
+    ) -> bool {
+        self.stage_reusing(item, growing, theme, append, HashMap::new)
+    }
+
+    /// `append` is proof from the immutable source publication, not a tail
+    /// digest or a guessed matching item ID. An unproven replacement starts a
+    /// new lineage and cancels both queued and currently parsing old input.
+    pub(super) fn stage_reusing(
+        &mut self,
+        item: &Arc<chat::Item>,
+        growing: bool,
+        theme: crate::settings::EditorSyntaxTheme,
+        append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
+        reusable: impl FnOnce() -> HashMap<u64, prose::CodeBlock>,
     ) -> bool {
         self.last_deferred = false;
         let Some(bytes) = source_bytes(&item.content) else {
@@ -927,7 +939,10 @@ impl State {
                     }),
                     priority: AtomicU64::new(UNRANKED),
                     place: Place::default(),
-                    canonical: Mutex::new(None),
+                    canonical: Mutex::new(Some(Canonical {
+                        parsed: Parsed::default(),
+                        blocks: reusable(),
+                    })),
                     cancelled: AtomicBool::new(false),
                     lease,
                 })),

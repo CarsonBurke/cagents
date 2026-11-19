@@ -5398,11 +5398,22 @@ impl Runtime {
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
                 if !metadata_reused && (pending || !exact || report_reveal) {
-                    let replaced = self.preparation.stage(
+                    let replaced = self.preparation.stage_reusing(
                         item,
                         growing && (!reader_only || coordinated),
                         theme,
                         |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
+                        || {
+                            current
+                                .into_iter()
+                                .flat_map(|cached| {
+                                    cached.blocks.iter().filter(|(key, block)| {
+                                        block.is_settled() && Some(**key) != cached.open
+                                    })
+                                })
+                                .map(|(key, block)| (*key, block.settled_clone()))
+                                .collect()
+                        },
                     );
                     // The answer being written, then the rows the reader
                     // returns to, then everything else from the newest back.
