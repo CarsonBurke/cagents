@@ -3516,10 +3516,20 @@ impl Runtime {
         } else {
             design::raised
         };
+        // A saved conversation the update refused takes no message in this
+        // pane until it reopens (#2905): the box would take typing with
+        // nowhere to send it. What it holds stays readable and copyable. A
+        // pane that can start a new conversation in its place, which takes
+        // the message along, and a refused first message stay editable.
+        let read_only = transitioning
+            || (self
+                .start_blocked
+                .is_some_and(|reopen| !reopen.offers_fresh())
+                && !self.is_draft());
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             // Nothing can be typed while the conversation changes hands.
-            .placeholder(if transitioning { "" } else { placeholder })
+            .placeholder(if read_only { "" } else { placeholder })
             .size(design::TEXT_PROSE)
             .height(Length::Shrink)
             .max_height(composer_ceiling)
@@ -3528,7 +3538,7 @@ impl Runtime {
             .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
                 composer_editor_style,
             )));
-        let editor: Element<'_, Message> = if transitioning {
+        let editor: Element<'_, Message> = if read_only {
             // While the conversation changes hands the draft stays in place
             // and can still be scrolled, selected and copied, but not edited.
             // It is the same editor rather than a text copy of the draft,

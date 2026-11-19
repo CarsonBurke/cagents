@@ -78,7 +78,19 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
         _ if error.is_daemon_busy() => super::Recovery::Busy,
         ipc::ProtocolErrorCode::NotAdmitted => super::Recovery::NotAdmitted,
+        // The daemon words this refusal retryable, but repeating the same
+        // attachment only meets it again: only a start reopens it.
+        ipc::ProtocolErrorCode::TerminalUnavailable
+            if error.message.starts_with(super::UPDATE_RESTART_STOPPED) =>
+        {
+            super::Recovery::UpdateStopped
+        }
         _ if error.retryable => super::Recovery::Retry,
+        ipc::ProtocolErrorCode::TerminalUnavailable
+            if error.message.starts_with(super::STARTUP_RECOVERY_REFUSAL) =>
+        {
+            super::Recovery::UpdateRecovery
+        }
         // Only the daemon's own whole sentence, never text that quotes it.
         _ if [
             super::UNPROVEN_OWNER_REFUSAL,

@@ -178,6 +178,11 @@ impl ScriptedDaemon {
                                     resumed: Vec::new(),
                                 },
                             },
+                            ClientRequest::StartupState => ServerMessage::Response {
+                                response: ServerResponse::StartupState(
+                                    crate::terminal_ipc::StartupState::Ready,
+                                ),
+                            },
                             ClientRequest::ResolveUpgradeChat { source } => {
                                 resolved.lock().unwrap().push(source.clone());
                                 if let Some(script) = &upgrade {
@@ -357,7 +362,22 @@ pub(super) fn settle_observing(
                         // Scope selection also schedules lifecycle/focus work.
                         // Drive those actual reducers, not only chat replies.
                         if let Some(message) = observe(app, message) {
-                            pending.push_back(app.update(message));
+                            if let Message::ChatUi(chat_ui::Action::UpdateRecoveryAnswered(
+                                answer,
+                            )) = &message
+                            {
+                                assert!(
+                                    matches!(answer, Ok(crate::terminal_ipc::StartupState::Ready)),
+                                    "the admission fixture's daemon is ready: {answer:?}"
+                                );
+                                // Execute the real answer reducer, but leave its
+                                // recurring ten-second poll outside this finite
+                                // admission drain. This daemon never refuses a
+                                // start for update recovery, so nothing is released.
+                                drop(app.update(message));
+                            } else {
+                                pending.push_back(app.update(message));
+                            }
                         }
                     }
                     cosmic::iced::runtime::Action::Widget(mut operation) => {

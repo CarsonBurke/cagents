@@ -47,8 +47,8 @@ pub(super) struct State {
     budget: Option<Duration>,
     saving: bool,
     reported: bool,
-    /// The daemon kept its original owners, so no pane reconnects until the
-    /// terminal service restarts.
+    /// The daemon kept its original owners, so no pane they hold reconnects
+    /// while that daemon runs.
     retained: bool,
     /// What this window's report said, so a failed update's notice that only
     /// repeats it is not shown twice.
@@ -1365,7 +1365,9 @@ fn inspect_existing_daemon(
 
 /// What the window says when the daemon kept its original owners after a
 /// failed restore; the daemon's own reason goes beneath it as details.
-const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted. Until the terminal service restarts, it cannot start new terminals or chats or accept input in existing ones. To start new work, let these sessions finish or close them, then run `cagents daemon stop` and reopen cagents. The update has not been verified.";
+/// The hold lasts as long as its daemon, which admits fresh work beside it
+/// and stops only once no held original owns work, so its steps end there.
+const RETAINED_NOTICE: &str = "The update couldn't reopen every saved session, so cagents is holding them as they were. Their original processes are still running, and nothing was closed or deleted. New conversations and terminals can start meanwhile. To end the hold, let the held sessions finish or close them, then run `cagents daemon stop` and reopen cagents. The update has not been verified.";
 
 /// How the retained report begins, in every build that has written one.
 const RETAINED_LEAD: &str =
@@ -1388,7 +1390,7 @@ pub(super) fn update_failure(message: &str) -> UpdateFailure {
     if grouped.to_lowercase().contains(RETAINED_LEAD) {
         return UpdateFailure {
             summary: "saved sessions could not be fully restored".to_owned(),
-            notice: TransientNotice::error(RETAINED_NOTICE).with_details(grouped),
+            notice: TransientNotice::warning(RETAINED_NOTICE).with_details(grouped),
             #[cfg(test)]
             retained: true,
         };

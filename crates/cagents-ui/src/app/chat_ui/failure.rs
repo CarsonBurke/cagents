@@ -1529,7 +1529,7 @@ impl Runtime {
                 crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
                 design::body(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
-                        blocked_recovery::DRAFT_HEADLINE
+                        reopen.draft_headline()
                     } else {
                         reopen.headline()
                     }

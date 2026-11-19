@@ -1495,6 +1495,8 @@ fn a_stopped_update_leads_with_its_steps_whichever_build_wrote_it() {
         assert!(failure.retained);
         assert_eq!(failure.notice.message, RETAINED_NOTICE);
         assert!(failure.notice.message.contains("cagents daemon stop"));
+        // The same warning the window's own inspection raises for the hold.
+        assert_eq!(failure.notice.severity, NoticeSeverity::Warning);
         assert!(!failure.summary.contains('/'), "{}", failure.summary);
         let details = failure.notice.details.as_deref().unwrap();
         assert!(details.contains("checkpoint retained at"), "{details}");
