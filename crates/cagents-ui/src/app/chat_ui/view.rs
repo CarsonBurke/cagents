@@ -2471,7 +2471,7 @@ impl Runtime {
         transcript_clearance: f32,
         place: Place,
         accepting_drops: bool,
-        accounts: Option<ChatAccounts>,
+        accounts: Option<ChatAccounts<'a>>,
         offers: Vec<Offer<'a>>,
         fresh_available: bool,
     ) -> Element<'a, Message> {
@@ -2501,7 +2501,7 @@ impl Runtime {
         transcript_clearance: f32,
         place: Place,
         accepting_drops: bool,
-        accounts: Option<ChatAccounts>,
+        accounts: Option<ChatAccounts<'a>>,
         offers: Vec<Offer<'a>>,
         reset_controls: Option<crate::app::account_ui::resets::Controls>,
         fresh_available: bool,
@@ -4377,7 +4377,7 @@ impl Runtime {
     fn session_controls<'a>(
         &'a self,
         transitioning: bool,
-        accounts: Option<ChatAccounts>,
+        accounts: Option<ChatAccounts<'a>>,
         offers: Vec<Offer<'a>>,
         shortcuts: &crate::settings::KeyboardShortcuts,
         fit: FooterFit,
@@ -4466,7 +4466,7 @@ impl Runtime {
     /// their current account; automatic routing may hand off between turns.
     fn account_picker<'a>(
         &'a self,
-        accounts: ChatAccounts,
+        accounts: ChatAccounts<'a>,
         transitioning: bool,
         shortcuts: &crate::settings::KeyboardShortcuts,
         fit: FooterFit,
@@ -4477,7 +4477,7 @@ impl Runtime {
         // and to assistive technology, so the controls beside it keep room.
         let named = fit == FooterFit::Wide;
         let label = || -> Element<'a, Message> {
-            crate::ui_controls::FadeText::caption(accounts.current.clone()).into()
+            crate::ui_controls::FadeText::caption(accounts.current).into()
         };
         let icon = Icon::Avatar.handle();
         if transitioning || !self.choosing() {
@@ -4567,7 +4567,7 @@ impl Runtime {
                             ),
                         }
                         let mut text: Vec<Element<'a, Message>> =
-                            vec![crate::ui_controls::fade_text(choice.label.clone()).into()];
+                            vec![crate::ui_controls::fade_text(choice.label).into()];
                         if !choice.detail.is_empty() {
                             text.push(
                                 design::caption(choice.detail)
@@ -4595,7 +4595,7 @@ impl Runtime {
                         .class(crate::ui_controls::control_style(choice.selected, None))
                         .padding([step::GAP_XS, step::GAP_S])
                         .width(Length::Fill)
-                        .on_press(action(Action::ChooseAccount(target, choice.id)))
+                        .on_press(action(Action::ChooseAccount(target, choice.id.clone())))
                         .into()
                     })
                     .chain(std::iter::once(

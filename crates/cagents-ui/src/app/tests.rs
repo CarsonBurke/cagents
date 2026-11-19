@@ -11352,7 +11352,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         source_control_mutations: HashMap::new(),
         operation_recovery: Default::default(),
         device_ui: device_ui::State::default(),
-        account_ui: account_ui::State::default(),
+        account_ui: account_ui::Accounts::default(),
         automation_ui: crate::automation_ui::State::default(),
         work_ui: crate::work_ui::State::default(),
         automation_approval: automation_approval::State::default(),

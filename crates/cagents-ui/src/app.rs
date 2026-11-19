@@ -5837,7 +5837,7 @@ pub struct Cagents {
     refresh_ui: refresh_ui::State,
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     operation_recovery: crate::operation_recovery::Shared,
-    account_ui: account_ui::State,
+    account_ui: account_ui::Accounts,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
     automation_approval: automation_approval::State,
@@ -16075,7 +16075,7 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: account_ui::State::installation().into(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -19557,6 +19557,13 @@ impl Cagents {
         // mounted visible chats are inspected by this bounded handoff.
         let limit_usage =
             projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
+        // Last, after everything above that may change the accounts, so the
+        // frame this update ends in reads its conversations' account choices.
+        projection_stage!(
+            "chat_account_choices",
+            self.account_ui
+                .settle_choices(self.settings.account_usage_display)
+        );
         Task::batch([
             settled_projection,
             task,

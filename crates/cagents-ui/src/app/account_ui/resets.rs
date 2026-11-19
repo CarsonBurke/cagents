@@ -762,11 +762,8 @@ impl Cagents {
         provider: Provider,
         recipe: &LaunchRecipe,
     ) -> Option<Controls> {
-        self.usage_reset_controls(account_of_recipe(
-            &self.account_ui.accounts,
-            provider,
-            recipe,
-        )?)
+        let running = self.running_account(provider, recipe)?;
+        self.usage_reset_controls(self.account_ui.account(&running.id)?)
     }
 
     pub(super) fn start_usage_reset(
