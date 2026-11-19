@@ -405,6 +405,7 @@ the matched set as usual, then starts the UI in a headless
 `niri-harness` session named
 `cagents-NAME` and returns once its window maps. Drive and capture it with
 `niri-harness --session cagents-NAME ...`.
+It needs a niri-harness with the `start` command; `mise run doctor` warns about an older one.
 
 | Shared by default | Per instance |
 | --- | --- |
