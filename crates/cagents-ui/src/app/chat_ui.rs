@@ -1326,6 +1326,15 @@ pub(super) struct State {
     capacity_offers: HashSet<CardId>,
     /// Starts refused as nonretryable before a runtime exists.
     blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
+    /// A message to resume a conversation's stopped work, held for a card
+    /// reopening without a chat runtime until its conversation attaches.
+    held_for_start: HashMap<CardId, String>,
+    /// Cards given a message to resume stopped work that are on their way
+    /// to taking it, with how many more of their pane's ways back they may
+    /// still take for it. Once attached, one whose provider is still stopped
+    /// takes the way back to send it, as a reconnect that comes back as saved
+    /// history then starts a provider.
+    resuming_on_attach: HashMap<CardId, u8>,
     /// What the daemon last said about its update restore, for the panes
     /// that wait on it.
     update_recovery: update_recovery::Watch,
@@ -1367,6 +1376,8 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
+            held_for_start: HashMap::new(),
+            resuming_on_attach: HashMap::new(),
             update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
@@ -3926,6 +3937,20 @@ impl Runtime {
             count: messages.len(),
             whole,
         });
+    }
+
+    /// Holds `text` for the turn after the running one, as a message written
+    /// in the composer and queued would be.
+    fn hold_followup(&mut self, text: String) {
+        let id = self.next_written;
+        self.next_written += 1;
+        self.followups.push(Followup {
+            id,
+            preview: prompt::queue_preview(&text),
+            text,
+            attachments: Vec::new(),
+        });
+        let _ = self.present();
     }
 
     /// Returns every held follow-up to the composer, in the order written.
@@ -7351,6 +7376,12 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 /// going to the provider's default instead.
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
+/// How many of its pane's ways back a conversation may take, one after
+/// another, to send a message resuming stopped work: a reconnect that comes
+/// back as saved history, and then the provider that history starts.
+/// Bounded, so a way back that keeps failing is not taken without end.
+const RESUME_RECOVERIES: u8 = 2;
+
 /// What a chat's pull request labels were built from: the generations of
 /// the window's pull request and worktree indexes, the conversation, and
 /// whether the inspector held a current list of it.
@@ -8886,6 +8917,19 @@ impl Cagents {
                 }
             }
         }
+        // A message to resume stopped work, held until the conversation
+        // attaches, is kept like a held follow-up: ahead of the draft, and
+        // never sent automatically once restored.
+        for (card, held) in &self.chat_ui.held_for_start {
+            if open_cards.contains(card) {
+                let draft = chat_drafts.entry(*card).or_default();
+                *draft = if draft.is_empty() {
+                    held.clone()
+                } else {
+                    format!("{held}\n{draft}")
+                };
+            }
+        }
         let chat_waiting_messages = self
             .durable
             .cards
@@ -9744,6 +9788,8 @@ impl Cagents {
         }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.held_for_start.remove(&card);
+        self.chat_ui.resuming_on_attach.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
         self.chat_ui.confirmed_losses.remove(&card);
@@ -11263,6 +11309,95 @@ impl Cagents {
         )
     }
 
+    /// Asks the conversation in `card` to pick up the work an update stopped,
+    /// with `text`. The message is held like a queued follow-up, which the
+    /// reader can see, change or take back, and goes out once the provider
+    /// is ready and idle. A conversation whose provider stopped first takes
+    /// the way back its pane offers, as pressing it would. `None` when the
+    /// card cannot take a message.
+    pub(super) fn resume_lost_work(&mut self, card: CardId, text: String) -> Option<Task<Message>> {
+        if !self.chat_takes_resume(card) {
+            return None;
+        }
+        let starting = self.chat_start_pending(card);
+        let fresh = self.chat_offers_fresh_conversation(card);
+        match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) if starting => {
+                // What it attaches to says whether it takes the message.
+                runtime.hold_followup(text);
+                self.chat_ui
+                    .resuming_on_attach
+                    .insert(card, RESUME_RECOVERIES);
+                self.persist();
+                Some(Task::none())
+            }
+            Some(CardRuntime::Chat(runtime)) => {
+                let readiness = runtime.readiness(false, fresh);
+                runtime.hold_followup(text);
+                let target = runtime.target;
+                self.persist();
+                Some(match readiness {
+                    stopped::Readiness::Recovers(press) => {
+                        self.chat_ui
+                            .resuming_on_attach
+                            .insert(card, RESUME_RECOVERIES - 1);
+                        self.take_chat_recovery(target, press)
+                    }
+                    _ => self.dispatch_queued(target),
+                })
+            }
+            _ => {
+                self.chat_ui.held_for_start.insert(card, text);
+                self.chat_ui
+                    .resuming_on_attach
+                    .insert(card, RESUME_RECOVERIES);
+                self.persist();
+                Some(if starting {
+                    Task::none()
+                } else {
+                    self.reopen_stopped(card)
+                })
+            }
+        }
+    }
+
+    /// Whether [`Self::resume_lost_work`] would take a message for `card`.
+    pub(super) fn chat_takes_resume(&self, card: CardId) -> bool {
+        // A pane still reopening a conversation is not saved until it starts
+        // (see `persistent_workspace`), so a message held there would not
+        // outlive the window closing first.
+        if self.chat_closed_elsewhere(card) || self.reopen_pending(card) {
+            return false;
+        }
+        let starting = self.chat_start_pending(card);
+        match self.cards.get(&card) {
+            // A draft has no conversation to resume.
+            Some(CardRuntime::Chat(runtime)) if starting => !runtime.is_draft(),
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.readiness(false, self.chat_offers_fresh_conversation(card))
+                    != stopped::Readiness::Cannot
+            }
+            _ => {
+                starting
+                    || self
+                        .blocked_failure(card)
+                        .is_some_and(|blocked| blocked.reopen.reopens())
+            }
+        }
+    }
+
+    /// Takes a stopped card's way back, as its pane's button would.
+    fn take_chat_recovery(&mut self, target: Target, press: stopped::Press) -> Task<Message> {
+        match press {
+            stopped::Press::Reconnect => self.handle_chat_ui(Action::Reconnect(target)),
+            stopped::Press::ResumeSaved => self.handle_chat_ui(Action::ResumeSaved(target)),
+            stopped::Press::Reopen => self.reopen_stopped(target.card),
+            stopped::Press::StartFresh | stopped::Press::SendAgain | stopped::Press::Close => {
+                Task::none()
+            }
+        }
+    }
+
     /// Takes the next step of sending a started draft's first message: its
     /// model, where one was chosen, and then the message.
     ///
@@ -11273,6 +11408,47 @@ impl Cagents {
     /// waited for past [`MODEL_PATIENCE`]; the message is sent on the default
     /// instead, and the transcript says so.
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
+        let held = self.chat_ui.held_for_start.remove(&target.card);
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            if let Some(text) = held {
+                self.chat_ui.held_for_start.insert(target.card, text);
+            }
+            return Task::none();
+        };
+        if let Some(text) = held {
+            runtime.hold_followup(text);
+        }
+        // A message to resume stopped work, held while its conversation
+        // reopened, may find it reopened stopped: saved history read without
+        // a provider, say. It then takes the pane's way back first. While
+        // nothing can bring one back yet (its history still loading, say),
+        // it waits for the change that can, as the message does.
+        if !self.chat_start_pending(target.card)
+            && self.chat_ui.resuming_on_attach.contains_key(&target.card)
+        {
+            let fresh = self.chat_offers_fresh_conversation(target.card);
+            let readiness = self
+                .chat_card_runtime_mut(target)
+                .filter(|runtime| !runtime.followups.is_empty())
+                .map(|runtime| runtime.readiness(false, fresh));
+            match readiness {
+                Some(stopped::Readiness::Cannot) => {}
+                Some(stopped::Readiness::Recovers(press)) => {
+                    if let Some(left) = self.chat_ui.resuming_on_attach.remove(&target.card)
+                        && left > 1
+                    {
+                        self.chat_ui
+                            .resuming_on_attach
+                            .insert(target.card, left - 1);
+                    }
+                    return self.take_chat_recovery(target, press);
+                }
+                // Taken back, or it takes the message as it is.
+                Some(stopped::Readiness::Takes) | None => {
+                    self.chat_ui.resuming_on_attach.remove(&target.card);
+                }
+            }
+        }
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
@@ -14013,11 +14189,16 @@ impl Cagents {
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
-                    return if runtime.turn_under_way() {
-                        Task::none()
-                    } else {
-                        self.dispatch_queued(target)
-                    };
+                    let busy = runtime.turn_under_way();
+                    let continued = self.update_resume_continued(target.card);
+                    return Task::batch([
+                        continued,
+                        if busy {
+                            Task::none()
+                        } else {
+                            self.dispatch_queued(target)
+                        },
+                    ]);
                 }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
@@ -14034,7 +14215,8 @@ impl Cagents {
                         return Task::none();
                     }
                 };
-                return self.chat_send(target, command, true);
+                let continued = self.update_resume_continued(target.card);
+                return Task::batch([continued, self.chat_send(target, command, true)]);
             }
             Action::TakeBackQueued(target, entry) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
