@@ -217,7 +217,7 @@ impl cosmic::Application for Window {
             }
             Message::Diagnosed(summary) => {
                 self.working = false;
-                self.notice = Some(summary.into());
+                self.notice = Some(summary);
                 cosmic::app::Task::none()
             }
             Message::Close => iced::exit().map(cosmic::Action::App),

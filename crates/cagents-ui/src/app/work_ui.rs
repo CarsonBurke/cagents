@@ -33,7 +33,7 @@ impl Cagents {
             Effect::Refresh => control(
                 transport::Purpose::Read,
                 |client| client.refresh_work_board(),
-                |result| Action::Refreshed(result),
+                Action::Refreshed,
             ),
             Effect::Pin {
                 project,
@@ -42,7 +42,7 @@ impl Cagents {
             } => control(
                 transport::Purpose::Mutation,
                 move |client| client.pin_work_card(project, item, column),
-                |result| Action::Pinned(result),
+                Action::Pinned,
             ),
             Effect::OpenWorktree { project, path } => {
                 let opened = self

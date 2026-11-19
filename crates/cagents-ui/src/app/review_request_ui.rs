@@ -366,10 +366,10 @@ mod tests {
                 window, focused,
             ))));
             assert!(
-                !app.refresh_ui
+                app.refresh_ui
                     .review_requests
                     .in_flight_for_test()
-                    .is_some(),
+                    .is_none(),
                 "only regaining focus starts a read"
             );
         }

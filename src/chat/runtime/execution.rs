@@ -48,7 +48,14 @@ impl Tracker {
         ))
     }
 
-    pub fn ended(&mut self, cancelled: bool, usage: Usage) -> Vec<(RunId, Update)> {
+    /// Cancel unsettled runs when stopped, fail them on a nonzero provider exit,
+    /// and otherwise leave them interrupted when the exit is clean or unknown.
+    pub fn ended(
+        &mut self,
+        cancelled: bool,
+        exit_code: Option<i32>,
+        usage: Usage,
+    ) -> Vec<(RunId, Update)> {
         let runs = self.runs.keys().copied().collect::<Vec<_>>();
         let mut updates = Vec::new();
         for run in runs {
@@ -58,14 +65,15 @@ impl Tracker {
             if let Some(capture) = self.runs.get_mut(&run)
                 && let Some(result) = &mut capture.result
             {
-                result.diagnostic = Some(
-                    if cancelled {
-                        "The agent was closed before its provider reported a final result"
-                    } else {
-                        "The provider exited before reporting this prompt's final result"
-                    }
-                    .into(),
-                );
+                result.diagnostic = Some(if cancelled {
+                    "The agent was closed before its provider reported a final result".into()
+                } else if let Some(code) = exit_code.filter(|code| *code != 0) {
+                    format!(
+                        "The provider exited with status {code} before reporting this prompt's final result"
+                    )
+                } else {
+                    "The provider exited before reporting this prompt's final result".into()
+                });
             }
             if let Some(result) = self.runs.remove(&run).and_then(|capture| capture.result) {
                 updates.push((
@@ -73,6 +81,8 @@ impl Tracker {
                     Update::Finished {
                         state: if cancelled {
                             State::Cancelled
+                        } else if exit_code.is_some_and(|code| code != 0) {
+                            State::Failed
                         } else {
                             State::Interrupted
                         },
@@ -235,6 +245,64 @@ mod tests {
             thinking: false,
             delta: delta.into(),
         }
+    }
+
+    #[test]
+    fn a_provider_exit_with_a_failure_status_fails_its_unsettled_run() {
+        let mut tracker = Tracker::default();
+        let run = RunId::new();
+        tracker.start(run, "provider-request".into()).unwrap();
+        tracker.observe(run, &text("message", "Partial answer"));
+
+        let updates = tracker.ended(false, Some(3), Usage::default());
+        let [(finished_run, Update::Finished { state, result })] = updates.as_slice() else {
+            panic!("expected one finished run")
+        };
+        assert_eq!(*finished_run, run);
+        assert_eq!(*state, State::Failed);
+        assert_eq!(
+            result.diagnostic.as_deref(),
+            Some("The provider exited with status 3 before reporting this prompt's final result")
+        );
+        assert_eq!(result.text, "Partial answer");
+    }
+
+    #[test]
+    fn an_unknown_or_clean_provider_exit_leaves_its_run_interrupted() {
+        for exit_code in [None, Some(0)] {
+            let mut tracker = Tracker::default();
+            let run = RunId::new();
+            tracker.start(run, "provider-request".into()).unwrap();
+
+            let updates = tracker.ended(false, exit_code, Usage::default());
+            let [(finished_run, Update::Finished { state, result })] = updates.as_slice() else {
+                panic!("expected one finished run")
+            };
+            assert_eq!(*finished_run, run);
+            assert_eq!(*state, State::Interrupted);
+            assert_eq!(
+                result.diagnostic.as_deref(),
+                Some("The provider exited before reporting this prompt's final result")
+            );
+        }
+    }
+
+    #[test]
+    fn a_stopped_agent_is_cancelled_whatever_its_exit_status() {
+        let mut tracker = Tracker::default();
+        let run = RunId::new();
+        tracker.start(run, "provider-request".into()).unwrap();
+
+        let updates = tracker.ended(true, Some(3), Usage::default());
+        let [(finished_run, Update::Finished { state, result })] = updates.as_slice() else {
+            panic!("expected one finished run")
+        };
+        assert_eq!(*finished_run, run);
+        assert_eq!(*state, State::Cancelled);
+        assert_eq!(
+            result.diagnostic.as_deref(),
+            Some("The agent was closed before its provider reported a final result")
+        );
     }
 
     #[test]

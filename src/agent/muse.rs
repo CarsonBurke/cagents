@@ -104,6 +104,8 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     resume_picker: true,
     latest_selectors: &["--last"],
     native_chat: false,
+    // Muse serves ACP too; its profile describes it once cagents drives it.
+    acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]

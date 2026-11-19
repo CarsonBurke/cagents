@@ -4,8 +4,8 @@ use crate::control::ControlClient;
 /// How long the observer waits before reconnecting.
 ///
 /// A window can open before any daemon exists, and the daemon can be replaced
-/// under it. Neither is an error, so the observer retries rather than giving up
-/// - and it retries slowly, because the only thing it can miss in the meantime
+/// under it. Neither is an error, so the observer retries rather than giving up -
+/// and it retries slowly, because the only thing it can miss in the meantime
 /// is an inventory it re-reads in full on the next connection.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
@@ -219,8 +219,8 @@ impl Cagents {
     }
     /// Adopts every observed hosted terminal this window has no card for.
     ///
-    /// The daemon owns the terminal inventory, so a terminal spawned by the CLI
-    /// - with or without a window running - belongs on screen exactly like one
+    /// The daemon owns the terminal inventory, so a terminal spawned by the CLI -
+    /// with or without a window running - belongs on screen exactly like one
     /// this window spawned itself. Adoption attaches to the existing session; it
     /// never starts a second process.
     pub(super) fn observe_hosted_terminals(

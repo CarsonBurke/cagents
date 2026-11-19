@@ -468,7 +468,7 @@ impl Runtime {
                     mark,
                 ),
                 crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(tabs)),
-                crate::interaction::tooltip(trigger, "Search and filter subagents").into(),
+                crate::interaction::tooltip(trigger, "Search and filter subagents"),
             ])
             .spacing(space::XS)
             .align_y(Alignment::Center),

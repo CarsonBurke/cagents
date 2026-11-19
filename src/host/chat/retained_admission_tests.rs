@@ -128,12 +128,10 @@ fn cleanup_discoveries(directory: &Path) {
                 .path()
                 .extension()
                 .is_some_and(|extension| extension == "json")
+            && let Ok(bytes) = fs::read(entry.path())
+            && let Ok(owner) = serde_json::from_slice::<holders::Record>(&bytes)
         {
-            if let Ok(bytes) = fs::read(entry.path())
-                && let Ok(owner) = serde_json::from_slice::<holders::Record>(&bytes)
-            {
-                cleanup_owner(&owner);
-            }
+            cleanup_owner(&owner);
         }
     }
 }

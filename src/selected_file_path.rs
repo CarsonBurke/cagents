@@ -32,10 +32,7 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
 #[cfg(feature = "host")]
 pub(crate) mod required {
     use super::*;
-    pub(crate) fn serialize<S: Serializer>(
-        path: &PathBuf,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
         PathRef(path).serialize(serializer)
     }
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(

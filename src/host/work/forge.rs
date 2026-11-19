@@ -854,7 +854,6 @@ mod tests {
         forge.pending.store(false, Ordering::SeqCst);
         assert_eq!(poll(Freshness::Watched), ["probe", "listing"]);
         assert_eq!(poll(Freshness::Watched), ["probe"]);
-        drop(poll);
 
         // An old listing is read again: soon while watched, rarely unwatched.
         let age = |memory: &mut Memory, by: Duration| {

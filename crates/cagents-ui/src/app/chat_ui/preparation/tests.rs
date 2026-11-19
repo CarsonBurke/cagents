@@ -2475,6 +2475,161 @@ fn cold_rich_paragraph_is_parsed_once_and_syntax_is_ready_before_install() {
     assert!(!cached.placeholder);
 }
 #[test]
+fn a_regrown_final_answer_reuses_its_unchanged_fence_highlights() {
+    let mut body = (0..20)
+        .map(|index| format!("```rust\nlet value_{index} = {index};\n```\n\n"))
+        .collect::<String>();
+    body.push_str("A final paragraph.");
+    let first = item(&body);
+    let target = target();
+    let mut state = configured(target, &first);
+    let theme = crate::settings::EditorSyntaxTheme::Mocha;
+    state.stage(&first, false, theme, |_, _| false);
+    let (run, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work.0, 20);
+    let output = state
+        .accept(target, "message", run, ready(Ok(output)))
+        .unwrap();
+    assert!(!state.contains("message"));
+    let mut cached = CachedItem::preparing(&first, theme);
+    output.install(&mut cached, false, false);
+    let key = fence_key("rust", "let value_12 = 12;\n");
+    let highlight = cached.blocks[&key].highlight(true).clone();
+
+    body.push_str("\n\nAnother final paragraph.");
+    let next = item(&body);
+    state.stage_reusing(
+        &next,
+        false,
+        theme,
+        |_, _| true,
+        || {
+            cached
+                .blocks
+                .iter()
+                .filter(|(key, block)| block.is_settled() && Some(**key) != cached.open)
+                .map(|(key, block)| (*key, block.settled_clone()))
+                .collect()
+        },
+    );
+    let (_, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work, (0, 0));
+    assert!(highlight.ptr_eq(output.blocks[&key].highlight(true)));
+}
+
+#[test]
+fn a_regrown_final_answer_highlights_only_its_changed_fence() {
+    let mut body = (0..20)
+        .map(|index| format!("```rust\nlet value_{index} = {index};\n```\n\n"))
+        .collect::<String>();
+    body.push_str("A final paragraph.");
+    let first = item(&body);
+    let target = target();
+    let mut state = configured(target, &first);
+    let theme = crate::settings::EditorSyntaxTheme::Mocha;
+    state.stage(&first, false, theme, |_, _| false);
+    let (run, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work.0, 20);
+    let output = state
+        .accept(target, "message", run, ready(Ok(output)))
+        .unwrap();
+    assert!(!state.contains("message"));
+    let mut cached = CachedItem::preparing(&first, theme);
+    output.install(&mut cached, false, false);
+    let old_key = fence_key("rust", "let value_12 = 12;\n");
+
+    body = body.replace("let value_12 = 12;", "let value_12 = 42;");
+    body.push_str("\n\nAnother final paragraph.");
+    let next = item(&body);
+    state.stage_reusing(
+        &next,
+        false,
+        theme,
+        |_, _| false,
+        || {
+            cached
+                .blocks
+                .iter()
+                .filter(|(key, block)| block.is_settled() && Some(**key) != cached.open)
+                .map(|(key, block)| (*key, block.settled_clone()))
+                .collect()
+        },
+    );
+    let (_, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work.0, 1);
+    assert!(!output.blocks.contains_key(&old_key));
+    assert!(
+        output
+            .blocks
+            .contains_key(&fence_key("rust", "let value_12 = 42;\n"))
+    );
+}
+
+#[test]
+fn open_blocks_are_not_reused() {
+    let source = item("```rust\nlet value = 1;\n```\n\nA final paragraph.");
+    let target = target();
+    let mut state = configured(target, &source);
+    let theme = crate::settings::EditorSyntaxTheme::Mocha;
+    let key = fence_key("rust", "let value = 1;\n");
+    let mut cached = CachedItem::preparing(&source, theme);
+    cached.blocks.insert(
+        key,
+        prose::CodeBlock::open(Some("rust"), "let value = 1;\n", theme),
+    );
+    assert!(!cached.blocks[&key].is_settled());
+    state.stage_reusing(
+        &source,
+        false,
+        theme,
+        |_, _| false,
+        || {
+            cached
+                .blocks
+                .iter()
+                .filter(|(key, block)| block.is_settled() && Some(**key) != cached.open)
+                .map(|(key, block)| (*key, block.settled_clone()))
+                .collect()
+        },
+    );
+    let (_, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work.0, 1);
+    assert!(output.blocks[&key].is_settled());
+}
+
+#[test]
+fn a_streamed_answer_turning_final_reuses_its_fences() {
+    let source = item("```rust\nlet value = 1;\n```\n\nA final paragraph.");
+    let target = target();
+    let mut state = configured(target, &source);
+    let theme = crate::settings::EditorSyntaxTheme::Mocha;
+    state.stage(&source, true, theme, |_, _| false);
+    let (run, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work.0, 1);
+    drop(
+        state
+            .accept(target, "message", run, ready(Ok(output)))
+            .unwrap(),
+    );
+    state.stage_reusing(
+        &source,
+        false,
+        theme,
+        |_, _| true,
+        || panic!("an existing growing entry keeps its own canonical blocks"),
+    );
+    let (_, shared) = job(&state);
+    let output = execute(shared, permit()).unwrap();
+    assert_eq!(output.syntax_work, (0, 0));
+}
+
+#[test]
 fn streaming_tail_reuses_finished_fence_highlights_without_new_syntax_work() {
     let mut body = (0..200)
         .map(|index| format!("```rust\nlet value_{index} = {index};\n```\n\n"))
@@ -2972,7 +3127,7 @@ fn large_coordination_runtime_admits_worker_and_retires_real_graphs() {
         let closed = runtime.selection_document().0;
         assert!(contents.iter().flat_map(|(blocks, _)| blocks).all(|(identity, _)| closed.text(*identity).is_none()), "a closed row's detail is not selectable");
         drop(closed);
-        runtime.expanded.insert("message".into());
+        runtime.expanded.edit().insert("message".into());
         let catalog = runtime.selection_document().0;
         for (blocks, text) in contents {
             for (identity, plain) in blocks {
@@ -2981,7 +3136,7 @@ fn large_coordination_runtime_admits_worker_and_retires_real_graphs() {
             assert!(text.contains("λ") || text.contains("Report"));
         }
         drop(catalog);
-        runtime.expanded.remove("message");
+        runtime.expanded.edit().remove("message");
         let previous = runtime.cache.remove("message").unwrap();
         let rebuilt = CachedItem::updated(&source.content, runtime.syntax_theme, Some(previous), true, false, None);
         assert_eq!(rebuilt.coordination.as_ref().unwrap().address(), address, "disclosure reuses the same prepared canonical graphs/palettes");

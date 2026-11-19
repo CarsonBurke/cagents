@@ -1127,7 +1127,7 @@ mod tests {
 
     fn key(named: keyboard::key::Named) -> keyboard::Event {
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(named.clone()),
+            key: keyboard::Key::Named(named),
             modified_key: keyboard::Key::Named(named),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
             location: keyboard::Location::Standard,

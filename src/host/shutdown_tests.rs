@@ -1056,7 +1056,7 @@ fn shutdown_batch_observes_a_real_worker_panic_without_retaining_its_ticket() {
         "a panicked join cannot be successful"
     );
     assert_eq!(
-        finish_terminal_shutdown(&[worker.clone()]),
+        finish_terminal_shutdown(std::slice::from_ref(&worker)),
         [Err(TerminalSendError::Closed)]
     );
     assert_eq!(worker.shutdown(), Err(TerminalSendError::Closed));

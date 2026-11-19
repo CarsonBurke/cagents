@@ -18,6 +18,7 @@ const MIN_PROJECT_INTERVAL: Duration = Duration::from_secs(30);
 /// after each failure, up to this.
 const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Default)]
 pub(super) struct State {
     pub(super) git: git_ui::State,
     pub(super) review_requests: review_request_ui::State,
@@ -26,20 +27,6 @@ pub(super) struct State {
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     schedule: ProjectSchedule,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            git: git_ui::State::default(),
-            review_requests: review_request_ui::State::default(),
-            focused: false,
-            source_generation: 0,
-            source_cancel: None,
-            projects: HashMap::new(),
-            schedule: ProjectSchedule::default(),
-        }
-    }
 }
 
 /// When each project was last read, which ones something has made worth
@@ -666,7 +653,7 @@ mod tests {
             executable: "cagents".into(),
         })
         .unwrap();
-        crate::device::select(Some("focus-test".into())).unwrap();
+        crate::device::select(Some("focus-test")).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(false);
         let window = window::Id::RESERVED;
         app.core.set_main_window_id(Some(window));

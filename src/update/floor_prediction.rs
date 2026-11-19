@@ -168,7 +168,11 @@ mod tests {
     #[test]
     fn remaining_chat_ownership_and_source_failures_are_predicted_before_closes() {
         let (daemon, chat) = fixture();
-        assert!(!inventory_needs_service_stop(&daemon, &[chat.clone()], &[]));
+        assert!(!inventory_needs_service_stop(
+            &daemon,
+            std::slice::from_ref(&chat),
+            &[]
+        ));
         let mut changed = chat.clone();
         changed.proof = None;
         assert!(inventory_needs_service_stop(&daemon, &[changed], &[]));

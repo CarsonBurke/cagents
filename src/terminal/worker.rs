@@ -88,8 +88,8 @@ const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// cancellation between bounded channel waits.
 const READER_SEND_POLL: Duration = Duration::from_millis(10);
 /// How long a synchronized update (DEC mode 2026) may withhold output from the
-/// published grid. A program brackets a frame it has to emit in several writes
-/// - clearing the screen, then repainting it - so that no half-drawn frame is
+/// published grid. A program brackets a frame it has to emit in several writes -
+/// clearing the screen, then repainting it - so that no half-drawn frame is
 /// shown; reads split that frame arbitrarily, and publishing between them
 /// flashes an empty screen. Ghostty bounds the hold the same way, so a program
 /// that dies or never ends the update cannot freeze its card.
@@ -2519,10 +2519,9 @@ impl TerminalHandle {
         if matches!(
             command,
             Command::Interrupt(_) | Command::CloseChecked { .. }
-        ) {
-            if published.completed.load(Ordering::Acquire) {
-                return Err(TerminalSendError::Closed);
-            }
+        ) && published.completed.load(Ordering::Acquire)
+        {
+            return Err(TerminalSendError::Closed);
         }
         if let Command::Interrupt(key) = command {
             return if published.request_interrupt(key) {
@@ -3358,15 +3357,13 @@ impl Worker {
         #[cfg(not(test))]
         let retained = self.holder.commit_adoption().err();
         let mut retained = retained;
-        if retained.is_none() {
-            if let Some(start) = self.reader_start.take()
-                && start.send(()).is_err()
-            {
-                retained = Some(
-                    "The prepared reader did not accept activation; original replay is retained"
-                        .into(),
-                );
-            }
+        if retained.is_none()
+            && let Some(start) = self.reader_start.take()
+            && start.send(()).is_err()
+        {
+            retained = Some(
+                "The prepared reader did not accept activation; original replay is retained".into(),
+            );
         }
         #[cfg(test)]
         if retained.is_none() {
@@ -3430,40 +3427,38 @@ impl Worker {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
-            if let Some(command) = close {
-                if let Command::CloseChecked {
+            if let Some(command) = close
+                && let Command::CloseChecked {
                     allow_active,
                     deadline,
                     reply,
                 } = command
-                {
-                    // A panicking observer/inspection cannot unwind this
-                    // complete original owner out of its parked frame.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.checked_close(allow_active, deadline)
-                    }))
-                    .unwrap_or_else(|_| {
-                        super::ipc::TerminalCloseResult::Unknown(
-                            "Checked close panicked; original startup custody remains retained"
-                                .into(),
-                        )
-                    });
-                    let closed = outcome == super::ipc::TerminalCloseResult::Closed;
-                    if closed {
-                        // Only an explicit checked destructive close releases
-                        // unresolved replay. Ordinary shutdown/Drop does not.
-                        self.holder.prove_startup_cleanup();
-                        drop(self.reader_start.take());
-                        self.published
-                            .startup_unresolved
-                            .store(false, Ordering::Release);
-                        self.published.request_shutdown();
-                        let _ = reply.send(outcome);
-                        self.run();
-                        return;
-                    }
+            {
+                // A panicking observer/inspection cannot unwind this
+                // complete original owner out of its parked frame.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.checked_close(allow_active, deadline)
+                }))
+                .unwrap_or_else(|_| {
+                    super::ipc::TerminalCloseResult::Unknown(
+                        "Checked close panicked; original startup custody remains retained".into(),
+                    )
+                });
+                let closed = outcome == super::ipc::TerminalCloseResult::Closed;
+                if closed {
+                    // Only an explicit checked destructive close releases
+                    // unresolved replay. Ordinary shutdown/Drop does not.
+                    self.holder.prove_startup_cleanup();
+                    drop(self.reader_start.take());
+                    self.published
+                        .startup_unresolved
+                        .store(false, Ordering::Release);
+                    self.published.request_shutdown();
                     let _ = reply.send(outcome);
+                    self.run();
+                    return;
                 }
+                let _ = reply.send(outcome);
             }
             // The original reader remains unactivated. In particular, no raw
             // query can be parsed or answered before ownership is confirmed.
@@ -4751,7 +4746,7 @@ impl Worker {
                     };
                     let activity = self.agent_provider.and_then(|provider| {
                         provider
-                            .activity_from_title(&title)
+                            .activity_from_title(title)
                             .map(|state| crate::agent::Activity { provider, state })
                     });
                     // A shell's title that only says where it is gives way to
@@ -4766,7 +4761,7 @@ impl Worker {
                     if reported_changed {
                         self.reported_title = title.to_owned();
                     }
-                    let display_changed = match agent_title_label(&title, activity) {
+                    let display_changed = match agent_title_label(title, activity) {
                         Some("") => self.display_title != "π",
                         Some(label) => self.display_title.strip_prefix("π ") != Some(label),
                         None => self.display_title != located.as_deref().unwrap_or(title),
@@ -4796,7 +4791,7 @@ impl Worker {
                     }
                     let observed = self.agent_provider.and_then(|provider| {
                         provider
-                            .activity_from_title(&title)
+                            .activity_from_title(title)
                             .map(|state| crate::agent::Activity { provider, state })
                     });
                     if self.agent_provider == Some(crate::agent::Provider::Omp) {
@@ -4811,12 +4806,12 @@ impl Worker {
                         if let Some(process) = &self.agent_process
                             && let Some(name) = process
                                 .provider
-                                .conversation_title(&title, &process.launch.working_directory)
+                                .conversation_title(title, &process.launch.working_directory)
                         {
                             self.set_conversation_title(name.into());
                         }
                         let display =
-                            located.unwrap_or_else(|| canonical_agent_title(&title, observed));
+                            located.unwrap_or_else(|| canonical_agent_title(title, observed));
                         if display != self.display_title {
                             self.display_title = display.clone();
                             self.emit(TerminalEvent::TitleChanged(display));
@@ -5822,7 +5817,7 @@ fn canonical_agent_title(title: &str, activity: Option<crate::agent::Activity>) 
 }
 
 fn agent_title_label(title: &str, activity: Option<crate::agent::Activity>) -> Option<&str> {
-    if !activity.is_some_and(|activity| activity.provider == crate::agent::Provider::Omp) {
+    if activity.is_none_or(|activity| activity.provider != crate::agent::Provider::Omp) {
         return None;
     }
     // The lifecycle glyph is view state, never a durable title or recovery ID.

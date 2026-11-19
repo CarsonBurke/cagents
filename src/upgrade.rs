@@ -2629,7 +2629,9 @@ pub(crate) mod handoff {
                         .proves(source, current, serving)
                 );
                 assert!(!store.path.with_file_name(RECOVERED_FILE).exists());
-                store.record_recovered(&[entry.clone()]).unwrap();
+                store
+                    .record_recovered(std::slice::from_ref(&entry))
+                    .unwrap();
                 let path = store.path.with_file_name(RECOVERED_FILE);
                 let before = std::fs::read(&path).unwrap();
                 let evidence = store.recovered_chats().unwrap();
@@ -3446,7 +3448,7 @@ mod tests {
         fs::write(process.join("comm"), format!("{name}\n")).unwrap();
         fs::write(process.join("cmdline"), format!("{name}\0")).unwrap();
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
-        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(
             fs::read(process.join("environ")).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied,

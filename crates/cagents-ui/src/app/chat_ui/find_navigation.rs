@@ -1024,9 +1024,9 @@ impl Runtime {
             .map(|(_, plans)| plans.clone())
             .unwrap_or_default();
         for plan in plans.iter() {
-            if !self
+            if self
                 .active_item(&plan.id)
-                .is_some_and(|item| plan.source.as_ptr() == Arc::as_ptr(item))
+                .is_none_or(|item| plan.source.as_ptr() != Arc::as_ptr(item))
             {
                 continue;
             }

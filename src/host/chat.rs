@@ -818,8 +818,8 @@ fn resolve_source(
         Provider::Codex => "This terminal is not associated with a managed thread. Open New thread to use native and CLI views of one conversation.",
         Provider::Claude => "Claude has not published an exact live conversation yet. Retry once its live session is available; the terminal has not been stopped.",
         Provider::Omp => "OMP has not published an exact live conversation or fresh-session boundary for this terminal. The terminal has not been stopped; no recent history will be selected.",
-        // Refused above: they have no native chat to switch to.
-        Provider::Antigravity | Provider::Muse => "This terminal's provider has no native chat yet.",
+        // An ACP agent publishes no live conversation of its own.
+        Provider::Antigravity | Provider::Muse => "This terminal does not name its conversation, so it cannot switch to chat. Resume a conversation by its ID in the terminal, then retry.",
         };
         if provider == Provider::Codex { unavailable(message) } else { retryable_unavailable(message) }
     })?;
@@ -3737,7 +3737,7 @@ fn recover_account(
         source.launch.session_id.as_deref().unwrap(),
         false,
         Instant::now() + Duration::from_secs(15),
-        || crate::daemon::termination_requested(),
+        crate::daemon::termination_requested,
     );
     let response = confirmation.map_err(unavailable).and_then(|()| {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3831,9 +3831,9 @@ pub(super) fn read_presentation(
         }
         return Ok(ServerResponse::ChatSnapshot {
             chat_id,
-            snapshot: (!after_generation
-                .is_some_and(|generation| generation >= receipt.generation))
-            .then(|| receipt.snapshot()),
+            snapshot: after_generation
+                .is_none_or(|generation| generation < receipt.generation)
+                .then(|| receipt.snapshot()),
         }
         .into());
     }
@@ -5530,49 +5530,6 @@ pub(super) fn preflight_for_terminal_close(
     };
     if let Some(source) = source {
         super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
-    }
-    Ok(())
-}
-
-/// A terminal card restored after a GUI restart has no parked UI runtime, but
-/// the daemon still owns its exact native actor. Explicit card close retires both.
-#[cfg(test)]
-pub(super) fn close_for_terminal(
-    host: &SharedHost,
-    terminal_id: TerminalId,
-) -> Result<(), ProtocolError> {
-    let handle = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .chats
-            .get(&terminal_id)
-            .filter(|record| {
-                (record.session.launch.provider == Provider::Codex
-                    || record.owns_execution_console())
-                    && record
-                        .session
-                        .terminal
-                        .as_ref()
-                        .is_some_and(|terminal| terminal.id == terminal_id)
-            })
-            .map(|record| {
-                let owned = record.paired_terminal.as_ref().is_some_and(|expected| {
-                    state
-                        .terminals
-                        .get(&terminal_id)
-                        .is_some_and(|actual| actual.handle.same_worker(expected))
-                });
-                if !owned {
-                    return Err(unavailable(
-                        "The terminal worker no longer belongs to this provider pairing",
-                    ));
-                }
-                Ok(record.handle.clone())
-            })
-            .transpose()?
-    };
-    if let Some(handle) = handle {
-        close_terminal_actor(host, terminal_id, &handle)?;
     }
     Ok(())
 }

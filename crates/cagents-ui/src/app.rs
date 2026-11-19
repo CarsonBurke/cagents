@@ -744,10 +744,7 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 }
 
 fn last_success_label(value: Option<i64>) -> String {
-    value.map_or_else(
-        || "none in this run".to_owned(),
-        |value| unix_time_label(value),
-    )
+    value.map_or_else(|| "none in this run".to_owned(), unix_time_label)
 }
 
 fn notice_surface<'a>(
@@ -4722,7 +4719,7 @@ fn grouped_digits(value: usize) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -5399,7 +5396,7 @@ enum CardRuntime {
     Terminal(TerminalSurface),
     Chat(Box<chat_ui::Runtime>),
     #[cfg(feature = "integrated-browser")]
-    Browser(BrowserRuntime),
+    Browser(Box<BrowserRuntime>),
     Repository(Box<RepositoryRuntime>),
     PullRequests(Box<PullRequestPane>),
     /// The settings pane. Its drafts are the window's, not the card's, so
@@ -5725,6 +5722,9 @@ pub struct Cagents {
     /// numbers against, pinned as `card_indices_source` is.
     terminal_ordinals_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
+    /// Where each folder Projects lists sits, for the inspectors' activity
+    /// blocks to name a pane's place without scanning every project.
+    place_index: inspector_activity::PlaceIndex,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
     /// Where each open pane is on screen and what its runtime holds. Both
@@ -7270,11 +7270,11 @@ impl Cagents {
         durable.focused = Some(id);
         // The descriptor's directory can be a nested editor directory rather
         // than its containing workspace. Keep the filing across projection.
-        if worktree_ui::card_directory(&card).is_some() {
-            if let Some(owner) = owner {
-                durable.card_scopes.insert(id, owner.clone());
-                self.worktree_owners.insert(id, owner);
-            }
+        if worktree_ui::card_directory(&card).is_some()
+            && let Some(owner) = owner
+        {
+            durable.card_scopes.insert(id, owner.clone());
+            self.worktree_owners.insert(id, owner);
         }
         if let Some(title) = user_title {
             self.chrome_ui.user_titles.insert(id, title);
@@ -8257,7 +8257,8 @@ impl Cagents {
                 Some(factory),
             ) {
                 Ok(runtime) => {
-                    self.cards.insert(card_id, CardRuntime::Browser(runtime));
+                    self.cards
+                        .insert(card_id, CardRuntime::Browser(Box::new(runtime)));
                 }
                 Err(error) => {
                     startup_error = Some(error.clone());
@@ -10080,7 +10081,8 @@ impl Cagents {
                     Some(factory),
                 ) {
                     Ok(runtime) => {
-                        self.cards.insert(card, CardRuntime::Browser(runtime));
+                        self.cards
+                            .insert(card, CardRuntime::Browser(Box::new(runtime)));
                     }
                     Err(error) => {
                         self.fail_runtime(card, error.clone());
@@ -10691,13 +10693,13 @@ impl Cagents {
                 key: keyboard::Key::Named(key),
                 ..
             } = &event
+            && *key == keyboard::key::Named::Escape
+            && !captured
         {
-            if *key == keyboard::key::Named::Escape && !captured {
-                return (
-                    self.handle_terminal_find(terminal_ui::Action::Close(card)),
-                    Projection::Full,
-                );
-            }
+            return (
+                self.handle_terminal_find(terminal_ui::Action::Close(card)),
+                Projection::Full,
+            );
         }
         if let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::F3),
@@ -10796,9 +10798,7 @@ impl Cagents {
         {
             return None;
         }
-        let Some(card) = self.workspace.focused() else {
-            return None;
-        };
+        let card = self.workspace.focused()?;
         if !self.chat_input_drawn(card) || !self.card_holds_keyboard(card) {
             return None;
         }
@@ -11368,7 +11368,8 @@ impl Cagents {
                             Some(factory),
                         ) {
                             Ok(runtime) => {
-                                self.cards.insert(card, CardRuntime::Browser(runtime));
+                                self.cards
+                                    .insert(card, CardRuntime::Browser(Box::new(runtime)));
                                 deferred_browser_started = true;
                             }
                             Err(message) => {
@@ -13942,10 +13943,10 @@ impl Cagents {
                 self.request_lsp(card, LspRequestKind::Completion)
             }
             Action::Hover(at) => {
-                if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                    if let Some((request, _)) = state.editor_hover_request.take() {
-                        self.lsp.cancel(request);
-                    }
+                if let Some(state) = self.lsp_contexts.get_mut(&card)
+                    && let Some((request, _)) = state.editor_hover_request.take()
+                {
+                    self.lsp.cancel(request);
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_hover(None, at);
@@ -13985,10 +13986,10 @@ impl Cagents {
             }
             Action::Choose { index, target } => self.apply_lsp_completion(card, index, &target),
             Action::Next(_) | Action::Diagnostic(_) | Action::Dismiss => {
-                if matches!(action, Action::Dismiss) {
-                    if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                        state.invalidate_answers();
-                    }
+                if matches!(action, Action::Dismiss)
+                    && let Some(state) = self.lsp_contexts.get_mut(&card)
+                {
+                    state.invalidate_answers();
                 }
                 match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
@@ -15383,12 +15384,12 @@ impl Cagents {
     fn synchronize_terminal_theme(&mut self) {
         let theme = self.effective_terminal_theme();
         for runtime in self.cards.values() {
-            if let CardRuntime::Terminal(surface) = runtime {
-                if let Err(error) = surface.set_theme(theme) {
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not apply terminal theme: {error}"
-                    )));
-                }
+            if let CardRuntime::Terminal(surface) = runtime
+                && let Err(error) = surface.set_theme(theme)
+            {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not apply terminal theme: {error}"
+                )));
             }
         }
     }
@@ -16061,6 +16062,7 @@ impl Application for Cagents {
             card_indices_source: std::sync::Weak::new(),
             terminal_ordinals_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
+            place_index: inspector_activity::PlaceIndex::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
             presence: HashMap::new(),
@@ -19050,7 +19052,7 @@ impl Cagents {
                         .map(cosmic::Action::App);
                 }
                 let generation = self.pull_request_dialog_generation;
-                let submit = cosmic::task::future(async move {
+                cosmic::task::future(async move {
                     let mut dialog = dialog;
                     let result = tokio::task::spawn_blocking(move || {
                         GitHubService::system("gh")
@@ -19069,8 +19071,7 @@ impl Cagents {
                         generation,
                         result,
                     }
-                });
-                submit
+                })
             }
             Message::PullRequestCreated {
                 mut dialog,
@@ -19883,12 +19884,12 @@ fn load_repository_github(
     let github = GitHubService::system("gh");
     (|| {
         let remotes = service
-            .remotes(&repository.selected_path, &cancellation)
+            .remotes(&repository.selected_path, cancellation)
             .map_err(|error| GitHubAvailability::Failed {
                 detail: error.to_string(),
             })?;
         if !github
-            .has_associated_remote(&remotes, &cancellation)
+            .has_associated_remote(&remotes, cancellation)
             .map_err(GitHubAvailability::from_error)?
         {
             return Err(GitHubAvailability::NotAssociated);
@@ -19898,10 +19899,10 @@ fn load_repository_github(
                 &repository.selected_path,
                 &remotes,
                 revalidate,
-                &cancellation,
+                cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
-        let validator = match github.sidebar_probe(&key, revalidate, &cancellation) {
+        let validator = match github.sidebar_probe(&key, revalidate, cancellation) {
             // The probe was answered as this account, so it is signed in.
             crate::github::SidebarProbe::Unchanged(pull_requests) => {
                 return Ok(github_ready(key, pull_requests));
@@ -19909,7 +19910,7 @@ fn load_repository_github(
             crate::github::SidebarProbe::Read(validator) => validator,
         };
         let auth = github
-            .auth_status(&key, &cancellation)
+            .auth_status(&key, cancellation)
             .map_err(GitHubAvailability::from_error)?;
         if auth.state != crate::github::GhAuthState::Authenticated {
             return Err(GitHubAvailability::Unauthenticated);
@@ -19919,7 +19920,7 @@ fn load_repository_github(
                 &key,
                 validator,
                 sidebar::PULL_REQUEST_LIST_LIMIT,
-                &cancellation,
+                cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
         Ok(github_ready(key, pull_requests))

@@ -408,9 +408,9 @@ impl TextSnapshot {
                 let expanded_left = expand(&mut left, a);
                 let expanded_right = expand(&mut right, b);
                 debug_assert!(expanded_left || expanded_right);
-            } else if a.bytes() > b.bytes() && expand(&mut left, a) {
-                continue;
-            } else if b.bytes() > a.bytes() && expand(&mut right, b) {
+            } else if (a.bytes() > b.bytes() && expand(&mut left, a))
+                || (b.bytes() > a.bytes() && expand(&mut right, b))
+            {
                 continue;
             } else {
                 // Equal bytes can have different native line topology. Keep

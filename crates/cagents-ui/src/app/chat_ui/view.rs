@@ -335,11 +335,6 @@ const COMPOSER_MENU_CEILING: f32 = 10.0 * COMPLETION_ROW;
 /// The completion list's scrollable, named so the keyboard can scroll it.
 const COMPLETION_LIST: &str = "chat-completion";
 
-/// How tall the conversation chooser is allowed to grow.
-///
-/// The panel sits over the card, so it is bounded and scrolls: an account with
-/// twenty open conversations must not cover the whole surface.
-
 /// How tall the pending questions are allowed to grow.
 ///
 /// A question blocks the agent, so it is given room to be read and answered
@@ -1118,7 +1113,7 @@ impl Scroll {
     pub(super) fn content(self) -> f32 {
         self.content
     }
-    pub(super) fn from_top(self) -> f32 {
+    pub(super) fn offset_from_top(self) -> f32 {
         self.from_top
     }
     pub(super) fn window_height(self) -> f32 {
@@ -1352,7 +1347,9 @@ impl Cagents {
                 let offers = if runtime.is_draft() {
                     std::iter::once(current)
                         .chain(MODEL_FAMILIES.into_iter().filter(|provider| {
-                            *provider != current && self.account_ui.offers(*provider)
+                            *provider != current
+                                && provider.has_native_chat()
+                                && self.account_ui.offers(*provider)
                         }))
                         .map(|provider| {
                             let catalog = self.account_ui.catalog(provider);
@@ -1476,7 +1473,14 @@ fn reasoning_elapsed(
 
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
-const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
+/// A provider without native chat is never offered.
+const MODEL_FAMILIES: [Provider; 5] = [
+    Provider::Codex,
+    Provider::Claude,
+    Provider::Antigravity,
+    Provider::Muse,
+    Provider::Omp,
+];
 
 /// One provider's models, as a draft's picker offers them.
 struct Offer<'a> {
@@ -1536,6 +1540,21 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
                 .strip_suffix(outcome)
                 .map(|title| (title, outcome.trim()))
         })
+}
+
+/// The inputs of one scope's selection catalog; see [`Runtime::selection_key`].
+#[derive(PartialEq, Eq)]
+pub(super) struct SelectionKey {
+    scope: Option<String>,
+    presentation: u64,
+    turns: revised::Stamp,
+    busy: bool,
+    /// The selected scope's item disclosures; a child with none has no set.
+    expanded: Option<revised::Stamp>,
+    opened: revised::Stamp,
+    tool_groups_expanded: bool,
+    failures: (u64, revised::Stamp, revised::Stamp),
+    queued: Option<(u64, u64)>,
 }
 
 impl Runtime {
@@ -2156,6 +2175,43 @@ impl Runtime {
         }
     }
 
+    /// What the logical copy/selection catalog is built from, as revisions
+    /// compared by value. Building it costs a lookup of the selected child
+    /// and never reads a transcript, a disclosure set or a diagnostic's text.
+    ///
+    /// Cache preparation advances `presentation_revision` for every presented
+    /// text or ordering edit, including the item list of the selected child,
+    /// and only for those: metadata-only heartbeats and hidden-child streams
+    /// leave it alone. The parent's grouping into turns is stamped on its own,
+    /// because a regroup with unchanged items does not advance that epoch.
+    /// Which failure incidents exist and where they anchor is their content
+    /// revision. Together with the selected scope these cover everything an
+    /// incident's exposure reads.
+    pub(super) fn selection_key(&self) -> SelectionKey {
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        SelectionKey {
+            scope: self.selected_subagent.clone(),
+            presentation: self.presentation_revision,
+            turns: self.turns.stamp(),
+            busy: selected.map_or(self.snapshot.busy, |agent| {
+                agent.status == chat::ToolStatus::Running
+            }),
+            expanded: match &self.selected_subagent {
+                Some(child) => self.child_expanded.get(child).map(Revised::stamp),
+                None => Some(self.expanded.stamp()),
+            },
+            opened: self.opened.stamp(),
+            tool_groups_expanded: self.tool_groups_expanded,
+            failures: self.failure_ui.exposure(),
+            queued: self
+                .local_prompt()
+                .map(|local| (local.source.id, local.presentation.revision)),
+        }
+    }
+
     /// The logical copy/selection catalog is rebuilt only when exposed text
     /// or disclosure changes, never for mouse motion, copying, find or timers.
     pub(super) fn selection_document(
@@ -2164,9 +2220,7 @@ impl Runtime {
         Arc<selection::Catalog>,
         std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
     ) {
-        use std::hash::{Hash, Hasher};
-        let mut fingerprint = std::hash::DefaultHasher::new();
-        self.selected_subagent.hash(&mut fingerprint);
+        let key = self.selection_key();
         let selected = self
             .selected_subagent
             .as_ref()
@@ -2174,64 +2228,8 @@ impl Runtime {
         let items = selected.map_or(self.snapshot.items.as_slice(), |agent| {
             agent.items.as_slice()
         });
-        // Cache preparation advances this epoch only for presented text or
-        // ordering edits. Metadata-only heartbeats and hidden-child streams
-        // must not rebuild the entire logical catalog.
-        self.presentation_revision.hash(&mut fingerprint);
-        selected
-            .map_or(self.snapshot.busy, |agent| {
-                agent.status == chat::ToolStatus::Running
-            })
-            .hash(&mut fingerprint);
-        let expanded = self
-            .selected_subagent
-            .as_ref()
-            .and_then(|id| self.child_expanded.get(id))
-            .unwrap_or(&self.expanded);
-        let mut expanded: Vec<_> = expanded.iter().collect();
-        expanded.sort_unstable();
-        expanded.hash(&mut fingerprint);
-        let mut opened: Vec<_> = self.opened.iter().collect();
-        opened.sort_unstable();
-        opened.hash(&mut fingerprint);
-        self.tool_groups_expanded.hash(&mut fingerprint);
-        // Typed summaries/guidance are ordinary labels. Only an exposed,
-        // bounded diagnostic preview has a matching logical text widget.
-        // Never hash or index the hidden original request dump here; explicit
-        // CopyFailure resolves the complete originals independently.
-        for incident in &self.failure_ui.incidents {
-            let exposed = selected.map_or_else(
-                || {
-                    !incident.active_recovery
-                        && incident.child_scope.is_none()
-                        && (incident.anchor.is_none()
-                            || self
-                                .turns
-                                .iter()
-                                .any(|turn| incident.anchor.as_ref() == Some(&turn.key)))
-                },
-                |agent| {
-                    self.incident_has_child_detail(incident, &agent.id)
-                        || agent.items.iter().any(|item| {
-                            self.failure_ui
-                                .child_item(&agent.id, &item.id)
-                                .is_some_and(|(found, _)| found.key == incident.key)
-                        })
-                },
-            );
-            if exposed && let Some(preview) = self.selection_failure_preview(incident) {
-                (preview, &incident.anchor).hash(&mut fingerprint);
-            }
-        }
-        self.local_prompt()
-            .map(|local| (local.source.id, local.presentation.revision))
-            .hash(&mut fingerprint);
-        let fingerprint = fingerprint.finish();
         let mut document = self.selection_document.borrow_mut();
-        if document
-            .as_ref()
-            .is_none_or(|(revision, _)| *revision != fingerprint)
-        {
+        if document.as_ref().is_none_or(|(built, _)| *built != key) {
             let mut builder = selection::Catalog::builder();
             if let Some(agent) = selected {
                 for incident in self.failure_ui.incidents.iter().filter(|incident| {
@@ -2301,7 +2299,7 @@ impl Runtime {
             }
             let catalog =
                 builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
-            *document = Some((fingerprint, catalog));
+            *document = Some((key, catalog));
             self.find_navigation.changed_document();
         }
         let catalog = document.as_ref().unwrap().1.clone();
@@ -2309,7 +2307,7 @@ impl Runtime {
             .selection_bookmarks
             .borrow_mut()
             .entry(self.selected_subagent.clone())
-            .or_insert_with(Default::default)
+            .or_default()
             .clone();
         (catalog, bookmark)
     }
@@ -2427,15 +2425,15 @@ impl Runtime {
                     input.reader_source.prefixes(),
                 );
             }
-            if let Some(output) = &cached.tool_output {
-                if !output.text.is_empty() {
-                    builder.indexed(
-                        &item.id,
-                        &[5],
-                        output.text.clone(),
-                        output.reader_source.prefixes(),
-                    );
-                }
+            if let Some(output) = &cached.tool_output
+                && !output.text.is_empty()
+            {
+                builder.indexed(
+                    &item.id,
+                    &[5],
+                    output.text.clone(),
+                    output.reader_source.prefixes(),
+                );
             }
             for (index, patch) in cached.patches.iter().enumerate() {
                 if !patch.text.is_empty() {
@@ -2614,19 +2612,16 @@ impl Runtime {
                         .into(),
                 );
             }
-            heading.push(
-                crate::interaction::tooltip(
-                    design::caption(match model {
-                        Some(model) => format!(
-                            "{provider} subagent · {}",
-                            Self::short_description(model, 80)
-                        ),
-                        None => format!("{provider} subagent"),
-                    }),
-                    self.native_child_identity(agent),
-                )
-                .into(),
-            );
+            heading.push(crate::interaction::tooltip(
+                design::caption(match model {
+                    Some(model) => format!(
+                        "{provider} subagent · {}",
+                        Self::short_description(model, 80)
+                    ),
+                    None => format!("{provider} subagent"),
+                }),
+                self.native_child_identity(agent),
+            ));
             let heading: Element<'_, Message> = widget::column::with_children(heading)
                 .spacing(step::GAP_XS)
                 .width(Length::Fill)
@@ -2636,7 +2631,7 @@ impl Runtime {
                 // stopping it is how that work ends.
                 if agent.status.is_live() && snapshot.capabilities.stop_subagent {
                     widget::row::with_children(vec![
-                        heading.into(),
+                        heading,
                         crate::ui_controls::button::quiet("Stop")
                             .icon(Icon::Stop)
                             .name(
@@ -2656,7 +2651,7 @@ impl Runtime {
                     .align_y(Alignment::Center)
                     .into()
                 } else {
-                    heading.into()
+                    heading
                 },
             );
             if agent.items.is_empty()
@@ -3792,23 +3787,23 @@ impl Runtime {
         // the trailing group with usage at every footer width.
         let fit = FooterFit::for_width(content_width);
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        if fit == FooterFit::Wide {
-            if let Some(branch) = &place.branch {
-                status.push(bounded(
-                    widget::row::with_children(vec![
-                        crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                        crate::ui_controls::FadeText::caption(branch.clone())
-                            .limit(FOOTER_LABEL)
-                            .into(),
-                    ])
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center)
-                    .into(),
-                    branch,
-                    "Branch",
-                    FOOTER_LABEL,
-                ));
-            }
+        if fit == FooterFit::Wide
+            && let Some(branch) = &place.branch
+        {
+            status.push(bounded(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
+                    crate::ui_controls::FadeText::caption(branch.clone())
+                        .limit(FOOTER_LABEL)
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
+                branch,
+                "Branch",
+                FOOTER_LABEL,
+            ));
         }
         let mut engine = Vec::new();
         if !self.closed_elsewhere {
@@ -5566,10 +5561,10 @@ impl Runtime {
     /// it is base64 and the provider's description is the only thing that reads
     /// as a label.
     fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
-        if !path.starts_with("data:") {
-            if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
-                return name;
-            }
+        if !path.starts_with("data:")
+            && let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty())
+        {
+            return name;
         }
         if description.is_empty() {
             "Attachment"
@@ -6281,7 +6276,7 @@ impl Runtime {
             disclosure.then_some(expanded),
             disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
         );
-        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone()).into()];
+        let mut rows = vec![crate::interaction::tooltip(heading_row, heading.clone())];
         if (expanded || monitor) && has_body {
             if expanded
                 && *kind != chat::DeliveryKind::Notice
@@ -6643,14 +6638,11 @@ pub(super) fn request_view<'a>(
         rows.push(field_view(target, request, field, answers, available));
     }
     for (label, uri) in artifacts::links(request) {
-        rows.push(
-            crate::interaction::tooltip(
-                widget::button::link(format!("Open artifact: {label}"))
-                    .on_press(action(Action::OpenDocument(target, uri.clone()))),
-                uri,
-            )
-            .into(),
-        );
+        rows.push(crate::interaction::tooltip(
+            widget::button::link(format!("Open artifact: {label}"))
+                .on_press(action(Action::OpenDocument(target, uri.clone()))),
+            uri,
+        ));
     }
     rows.push(answers_view(target, request, available, surface));
     widget::container(

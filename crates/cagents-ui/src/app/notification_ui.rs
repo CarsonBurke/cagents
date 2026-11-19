@@ -437,7 +437,7 @@ fn deliver_control(
                         tracing::debug!("kept notification connection lost; reconnecting");
                         deliver_connected(&mut connect, &requests)
                     }
-                    Err(undelivered) => Err((undelivered, Some(client))),
+                    Err(undelivered) => Err((undelivered, Some(Box::new(client)))),
                 },
                 None => deliver_connected(&mut connect, &requests),
             };
@@ -447,7 +447,9 @@ fn deliver_control(
                     break;
                 }
                 Err((undelivered, client)) => {
-                    kept = client.filter(|_| undelivered.connection == Connection::Answered);
+                    kept = client
+                        .filter(|_| undelivered.connection == Connection::Answered)
+                        .map(|client| *client);
                     undelivered
                 }
             };
@@ -508,11 +510,12 @@ impl Undelivered {
 }
 
 /// [`deliver`] over a new connection, which is returned to be kept. A failed
-/// delivery returns the connection where it can still be kept.
+/// delivery returns the connection where it can still be kept, boxed so the
+/// error stays small.
 fn deliver_connected(
     connect: &mut impl FnMut() -> Result<ControlClient, String>,
     requests: &Pending,
-) -> Result<ControlClient, (Undelivered, Option<ControlClient>)> {
+) -> Result<ControlClient, (Undelivered, Option<Box<ControlClient>>)> {
     let mut client = connect().map_err(|error| {
         let undelivered = Undelivered {
             notice: Some(error),
@@ -522,7 +525,7 @@ fn deliver_connected(
     })?;
     match deliver(&mut client, requests) {
         Ok(()) => Ok(client),
-        Err(undelivered) => Err((undelivered, Some(client))),
+        Err(undelivered) => Err((undelivered, Some(Box::new(client)))),
     }
 }
 

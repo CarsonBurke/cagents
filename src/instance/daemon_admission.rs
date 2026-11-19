@@ -659,7 +659,7 @@ mod tests {
         )
         .unwrap();
         let (result, checks) = fence_wait(runtime.path(), Duration::from_secs(30));
-        let error = result.err().expect("an update refuses the window");
+        let error = result.expect_err("an update refuses the window");
         assert!(is_update_in_progress(&error));
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(checks, 0, "an update is reported without waiting");

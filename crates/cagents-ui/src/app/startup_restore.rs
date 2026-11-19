@@ -19,6 +19,128 @@ struct InitialPane {
     settled: bool,
 }
 
+impl InitialPanes {
+    pub(super) fn capture<'a>(
+        &mut self,
+        policy: instance::WindowRestorePolicy,
+        cards: impl IntoIterator<Item = &'a CardState>,
+    ) {
+        if std::mem::replace(&mut self.captured, true)
+            || policy != instance::WindowRestorePolicy::ExistingOnly
+        {
+            return;
+        }
+        self.recovery = true;
+        for card in cards {
+            self.original_cards.insert(card.id);
+            if !card.existence.is_open() {
+                continue;
+            }
+            let session = match &card.kind {
+                CardKind::Chat(session) if !session.is_unstarted() => session.id,
+                CardKind::Terminal(session) if !terminal_ended(session) => session.id,
+                _ => continue,
+            };
+            self.panes.insert(
+                card.id,
+                InitialPane {
+                    session,
+                    settled: false,
+                },
+            );
+        }
+    }
+
+    pub(super) fn capture_views(&mut self, scopes: Vec<crate::workspace_model::views::Scope>) {
+        if std::mem::replace(&mut self.views_captured, true) || !self.recovery {
+            return;
+        }
+        self.pending_views.extend(scopes);
+    }
+
+    pub(super) fn observe_initial_view<'a>(
+        &mut self,
+        view: &crate::workspace_model::views::View,
+        local: impl IntoIterator<Item = &'a CardState>,
+    ) {
+        if !self.pending_views.remove(&view.scope) {
+            return;
+        }
+        // A local pane created after launch is a user action even if its
+        // first registry echo arrives in this scope's initial snapshot.
+        let new_local: HashSet<_> = local
+            .into_iter()
+            .filter(|card| !self.original_cards.contains(&card.id))
+            .map(|card| card.id)
+            .collect();
+        for pane in &view.panes {
+            if new_local.contains(&pane.id) || self.retired.contains(&pane.id) {
+                continue;
+            }
+            let session = match &pane.kind {
+                CardKind::Chat(session) if !session.is_unstarted() => session.id,
+                CardKind::Terminal(session) if !terminal_ended(session) => session.id,
+                _ => continue,
+            };
+            // The first authoritative view owns the initial descriptor. It
+            // may name an issued successor to the cached session. Any attempt
+            // already issued for the cache keeps its captured intent, and its
+            // result cannot settle this new exact key.
+            self.panes.insert(
+                pane.id,
+                InitialPane {
+                    session,
+                    settled: false,
+                },
+            );
+        }
+    }
+
+    pub(super) fn existing_only(&self, card: CardId, session: TerminalId) -> bool {
+        self.panes.get(&card).is_some_and(|initial| {
+            initial.session == session
+                && (!initial.settled
+                    || instance::window_restore_policy()
+                        == instance::WindowRestorePolicy::ExistingOnly)
+        })
+    }
+
+    pub(super) fn settled(&mut self, card: CardId, session: TerminalId) {
+        if let Some(initial) = self.panes.get_mut(&card)
+            && initial.session == session
+        {
+            initial.settled = true;
+            self.retired.insert(card);
+        }
+    }
+
+    pub(super) fn explicit_action(&mut self, card: CardId) {
+        self.panes.remove(&card);
+        self.retired.insert(card);
+    }
+
+    pub(super) fn chat_intent(
+        &mut self,
+        card: CardId,
+        session: TerminalId,
+        intent: chat::Intent,
+    ) -> chat::Intent {
+        if matches!(
+            intent,
+            chat::Intent::Start | chat::Intent::Resume | chat::Intent::RetryStart
+        ) {
+            self.explicit_action(card);
+            return intent;
+        }
+        let policy = if self.existing_only(card, session) {
+            instance::WindowRestorePolicy::ExistingOnly
+        } else {
+            instance::WindowRestorePolicy::Ordinary
+        };
+        chat::client::restore_intent(intent, policy)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,127 +502,5 @@ mod tests {
         };
         assert_eq!(attach(&mut daemon), Ok(hosted.session.clone()));
         assert!(!daemon.asked_ready);
-    }
-}
-
-impl InitialPanes {
-    pub(super) fn capture<'a>(
-        &mut self,
-        policy: instance::WindowRestorePolicy,
-        cards: impl IntoIterator<Item = &'a CardState>,
-    ) {
-        if std::mem::replace(&mut self.captured, true)
-            || policy != instance::WindowRestorePolicy::ExistingOnly
-        {
-            return;
-        }
-        self.recovery = true;
-        for card in cards {
-            self.original_cards.insert(card.id);
-            if !card.existence.is_open() {
-                continue;
-            }
-            let session = match &card.kind {
-                CardKind::Chat(session) if !session.is_unstarted() => session.id,
-                CardKind::Terminal(session) if !terminal_ended(session) => session.id,
-                _ => continue,
-            };
-            self.panes.insert(
-                card.id,
-                InitialPane {
-                    session,
-                    settled: false,
-                },
-            );
-        }
-    }
-
-    pub(super) fn capture_views(&mut self, scopes: Vec<crate::workspace_model::views::Scope>) {
-        if std::mem::replace(&mut self.views_captured, true) || !self.recovery {
-            return;
-        }
-        self.pending_views.extend(scopes);
-    }
-
-    pub(super) fn observe_initial_view<'a>(
-        &mut self,
-        view: &crate::workspace_model::views::View,
-        local: impl IntoIterator<Item = &'a CardState>,
-    ) {
-        if !self.pending_views.remove(&view.scope) {
-            return;
-        }
-        // A local pane created after launch is a user action even if its
-        // first registry echo arrives in this scope's initial snapshot.
-        let new_local: HashSet<_> = local
-            .into_iter()
-            .filter(|card| !self.original_cards.contains(&card.id))
-            .map(|card| card.id)
-            .collect();
-        for pane in &view.panes {
-            if new_local.contains(&pane.id) || self.retired.contains(&pane.id) {
-                continue;
-            }
-            let session = match &pane.kind {
-                CardKind::Chat(session) if !session.is_unstarted() => session.id,
-                CardKind::Terminal(session) if !terminal_ended(session) => session.id,
-                _ => continue,
-            };
-            // The first authoritative view owns the initial descriptor. It
-            // may name an issued successor to the cached session. Any attempt
-            // already issued for the cache keeps its captured intent, and its
-            // result cannot settle this new exact key.
-            self.panes.insert(
-                pane.id,
-                InitialPane {
-                    session,
-                    settled: false,
-                },
-            );
-        }
-    }
-
-    pub(super) fn existing_only(&self, card: CardId, session: TerminalId) -> bool {
-        self.panes.get(&card).is_some_and(|initial| {
-            initial.session == session
-                && (!initial.settled
-                    || instance::window_restore_policy()
-                        == instance::WindowRestorePolicy::ExistingOnly)
-        })
-    }
-
-    pub(super) fn settled(&mut self, card: CardId, session: TerminalId) {
-        if let Some(initial) = self.panes.get_mut(&card)
-            && initial.session == session
-        {
-            initial.settled = true;
-            self.retired.insert(card);
-        }
-    }
-
-    pub(super) fn explicit_action(&mut self, card: CardId) {
-        self.panes.remove(&card);
-        self.retired.insert(card);
-    }
-
-    pub(super) fn chat_intent(
-        &mut self,
-        card: CardId,
-        session: TerminalId,
-        intent: chat::Intent,
-    ) -> chat::Intent {
-        if matches!(
-            intent,
-            chat::Intent::Start | chat::Intent::Resume | chat::Intent::RetryStart
-        ) {
-            self.explicit_action(card);
-            return intent;
-        }
-        let policy = if self.existing_only(card, session) {
-            instance::WindowRestorePolicy::ExistingOnly
-        } else {
-            instance::WindowRestorePolicy::Ordinary
-        };
-        chat::client::restore_intent(intent, policy)
     }
 }

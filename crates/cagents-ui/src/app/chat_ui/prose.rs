@@ -175,10 +175,10 @@ impl Highlight {
         let mut run = runs.partition_point(|run| (run.end as usize) <= range.start);
         let mut start = range.start;
         for source in text[range].split_inclusive('\n') {
-            let (line, ending) = if source.ends_with("\r\n") {
-                (&source[..source.len() - 2], "\r\n")
-            } else if source.ends_with('\n') {
-                (&source[..source.len() - 1], "\n")
+            let (line, ending) = if let Some(line) = source.strip_suffix("\r\n") {
+                (line, "\r\n")
+            } else if let Some(line) = source.strip_suffix('\n') {
+                (line, "\n")
             } else {
                 (source, "")
             };
@@ -282,6 +282,10 @@ impl CodeBlock {
             palettes: self.palettes.clone(),
             tail: None,
         }
+    }
+
+    pub(super) fn is_settled(&self) -> bool {
+        self.tail.is_none()
     }
 
     /// The font a block's paragraph is set in. Its spans name their own only
@@ -619,7 +623,7 @@ impl Renderer {
             flow_cache: self.flow_cache.clone(),
             item: self.item.clone(),
             path,
-            find: self.find.clone(),
+            find: self.find,
             target: self.target,
             reader_memory: self.reader_memory.clone(),
             reader_context: self.reader_context.clone(),
@@ -1189,7 +1193,6 @@ pub(super) fn code_text(
             let revision = revision.finish();
             let text = text.clone();
             let highlight = highlight.clone();
-            let find = find;
             let flow_cache = flow_cache.clone();
             let reader_source = reader_source.clone();
             let descriptor = logical.as_ref().map(|logical| virtualized::LogicalRange {
@@ -1228,7 +1231,7 @@ pub(super) fn code_text(
                     size,
                     font,
                     target,
-                    find.clone(),
+                    find,
                     logical.clone(),
                     flow_cache.clone(),
                     reader_source.clone(),
@@ -1381,6 +1384,14 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_block_is_settled_and_an_open_one_is_not() {
+        let theme = crate::settings::EditorSyntaxTheme::Mocha;
+        let code = "let value = 1;";
+        assert!(CodeBlock::new(Some("rust"), code, theme).is_settled());
+        assert!(!CodeBlock::open(Some("rust"), code, theme).is_settled());
+    }
 
     #[test]
     fn ordered_tasks_keep_native_numbers_checked_state_and_copied_markers() {

@@ -2096,7 +2096,7 @@ fn fixed_fields(field: &[u8], index: usize, count: usize) -> Result<Vec<&[u8]>, 
 }
 
 /// The path of a `?` or `!` record, which is one space-separated field.
-fn path_record<'a>(field: &'a [u8], index: usize) -> Result<&'a [u8], GitParseError> {
+fn path_record(field: &[u8], index: usize) -> Result<&[u8], GitParseError> {
     if field.len() < 3 || field[1] != b' ' {
         Err(malformed("git status", index, "path is missing"))
     } else {
@@ -3427,16 +3427,18 @@ pub enum RepositoryError {
     Validation(#[from] ValidationError),
     #[error(transparent)]
     Parse(#[from] GitParseError),
+    // The process output is diagnostic and rarely built, so it is boxed to
+    // keep every `Result<_, RepositoryError>` small.
     #[error("invalid Git output: {error}")]
     InvalidGitOutput {
         error: GitParseError,
-        process: ProcessOutput,
+        process: Box<ProcessOutput>,
     },
     #[error("invalid Git command response: {source}")]
     InvalidResponse {
         #[source]
         source: Box<RepositoryError>,
-        process: ProcessOutput,
+        process: Box<ProcessOutput>,
     },
     #[error(transparent)]
     Process(#[from] ProcessFailure),
@@ -3881,7 +3883,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
-                process: output,
+                process: Box::new(output),
             }),
         }
     }
@@ -3910,7 +3912,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
-                process: output,
+                process: Box::new(output),
             }),
         }
     }
@@ -6369,10 +6371,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .into());
         }
         let tag = format!("refs/tags/{name}");
-        if explicit_remote.is_none() && ValidatedRefName::parse(tag.clone()).is_ok() {
-            if let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)? {
-                return Ok(BaseRevision::object_id(oid.to_string())?);
-            }
+        if explicit_remote.is_none()
+            && ValidatedRefName::parse(tag.clone()).is_ok()
+            && let Some(oid) = self.resolve_optional_ref(repository, &tag, cancellation)?
+        {
+            return Ok(BaseRevision::object_id(oid.to_string())?);
         }
         let remote_name = explicit_remote.unwrap_or(name);
         if let Some((remote, branch)) = remotes
@@ -6430,14 +6433,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .remote_heads
                 .iter()
                 .find(|head| head.remote == remote.name)
-            {
-                if refs
+                && refs
                     .remote
                     .iter()
                     .any(|reference| reference.name == head.target)
-                {
-                    return Ok(BaseRevision::remote_ref(head.target.as_str())?);
-                }
+            {
+                return Ok(BaseRevision::remote_ref(head.target.as_str())?);
             }
             for branch in ["main", "master"] {
                 if let Some(reference) = refs.remote.iter().find(|reference| {
@@ -7156,7 +7157,10 @@ fn invalid_output<T>(
     result: Result<T, GitParseError>,
     process: ProcessOutput,
 ) -> Result<T, RepositoryError> {
-    result.map_err(|error| RepositoryError::InvalidGitOutput { error, process })
+    result.map_err(|error| RepositoryError::InvalidGitOutput {
+        error,
+        process: Box::new(process),
+    })
 }
 
 fn validate_destination(root: &Path, destination: &Path) -> Result<(), ValidationError> {
@@ -7258,7 +7262,7 @@ fn attach_repository_process<T>(
 ) -> Result<T, RepositoryError> {
     result.map_err(|source| RepositoryError::InvalidResponse {
         source: Box::new(source),
-        process: process.clone(),
+        process: Box::new(process.clone()),
     })
 }
 
@@ -12773,16 +12777,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
-            if let Some(consent) = &journal.pr_checkout {
-                if journal
+            if let Some(consent) = &journal.pr_checkout
+                && journal
                     .existing_branch_oid
                     .as_deref()
                     .is_some_and(|oid| oid != consent.expected_head().as_str())
-                {
-                    return Err(ValidationError::InvalidBranch(
+            {
+                return Err(ValidationError::InvalidBranch(
                         "The existing local branch is not at the reviewed PR commit. Its history was preserved; choose another branch or explicitly open the local work instead".into(),
                     ).into());
-                }
             }
             // The durable identity lease must win over changed repository state:
             // a replay is still a conflict after an earlier attempt made a branch.

@@ -890,7 +890,7 @@ mod tests {
 
     fn key(key: keyboard::key::Named, shift: bool) -> keyboard::Event {
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key.clone()),
+            key: keyboard::Key::Named(key),
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
             location: keyboard::Location::Standard,

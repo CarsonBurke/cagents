@@ -3,7 +3,8 @@
 
   scripts/land-pr PR [-R OWNER/REPO] [--update] [--dry-run] [--timeout MINUTES]
 
-The merge is pinned to the head CI passed on, and its message is built from the
+The merge is pinned to the head CI passed on, and the merge with the current
+main must also pass scripts/check-older-clients. Its message is built from the
 PR's commit messages with AI attribution removed; the landing is refused if
 attribution remains. The branch is brought up to date with main only when
 GitHub reports a conflict that Git merges cleanly, or with --update when its CI
@@ -19,6 +20,8 @@ head moved, 5 refused, 6 CI failed, 7 CI did not finish in time.
 import argparse
 import contextlib
 import fcntl
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -29,6 +32,11 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+loader = importlib.machinery.SourceFileLoader(
+    "check_older_clients", str(Path(__file__).resolve().parent / "check-older-clients"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+older_clients = importlib.util.module_from_spec(spec)
+loader.exec_module(older_clients)
 BASE = "main"
 REFRESH = 120  # gh-pr-status shares one read per PR in this interval.
 MINIMUM_WAIT = 15
@@ -252,6 +260,20 @@ def merged_tree(root, head):
     return result.stdout.split()[0], []
 
 
+def check_merged_protocol(root, number, target):
+    git(root, "fetch", "--quiet", "--no-tags", "origin",
+        f"+refs/heads/{BASE}:refs/remotes/origin/{BASE}")
+    tree, _ = merged_tree(root, target)
+    if tree is None:
+        return "conflict"
+    problems = older_clients.problems_in_tree(root, tree)
+    if problems:
+        raise Stop(REFUSED, f"#{number} merged with the current {BASE} fails the older-client check: "
+                   f"{'; '.join(problems)}. Merge {BASE} in with --update, "
+                   "re-prove the older clients and push")
+    return None
+
+
 def push(root, branch, commit):
     """A plain push, so another session's push to the branch is never overwritten."""
     result = git(root, "push", "--porcelain", "origin", f"{commit}:refs/heads/{branch}", check=False)
@@ -305,8 +327,9 @@ def assess(report, head, since, superseded=()):
     """('wait'|'green'|'failed'|'moved'|'conflict'|'closed', detail) for one status read.
 
     A read fetched before SINCE, when this head was pushed or confirmed, may
-    only confirm this head's own state; one reporting a SUPERSEDED head is
-    GitHub not yet showing a push this run made.
+    only confirm this head's own state and cannot decide draft, closed or
+    conflict state; one reporting a SUPERSEDED head is GitHub not yet showing
+    a push this run made.
     """
     data = report.get("data") or {}
     snapshot = data.get("snapshot")
@@ -326,9 +349,9 @@ def assess(report, head, since, superseded=()):
             return "wait", "waiting for GitHub to report this head"
         return "moved", pr["headRefOid"]
     if pr["state"] != "OPEN":
-        return "closed", pr["state"].lower()
+        return ("closed", pr["state"].lower()) if current else ("wait", "waiting for GitHub to report it open")
     if pr.get("isDraft"):
-        return "closed", "converted to draft"
+        return ("closed", "converted to draft") if current else ("wait", "waiting for GitHub to report it ready")
     if pr.get("mergeable") == "CONFLICTING":
         # Only a current read decides; an older one may predate main's move.
         return ("conflict", "GitHub reports a conflict with main") if current else ("wait", "mergeability unsettled")
@@ -399,10 +422,11 @@ def merge(repository, number, head, title, body):
     return json.loads(result.stdout).get("sha", "")
 
 
-def merge_after_base_moved(repository, number, head, title, body, error):
+def merge_after_base_moved(root, repository, number, head, title, body, error):
     """Merge once more after main moved during the merge, still pinned to HEAD.
 
     None when the PR now conflicts with main, for the conflict path to handle.
+    The merge with the main that moved must pass the older-client check again.
     A second refusal is final: landings racing for main do not loop.
     """
     say(f"{BASE} moved while merging #{number}; checking it again")
@@ -411,6 +435,9 @@ def merge_after_base_moved(repository, number, head, title, body, error):
     if pr["head"]["sha"] != head:
         raise Stop(HEAD_MOVED, f"#{number} moved to {pr['head']['sha'][:12]}; review it and run again")
     if pr.get("mergeable_state") == "dirty":
+        say(f"#{number} now conflicts with {BASE}")
+        return None
+    if check_merged_protocol(root, number, head) == "conflict":
         say(f"#{number} now conflicts with {BASE}")
         return None
     try:
@@ -447,6 +474,8 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60):
                 if target != head:
                     verdict, detail = "wait", f"would push it, then wait for CI on {target[:12]}"
                 else:
+                    if check_merged_protocol(root, number, target) == "conflict":
+                        continue
                     verdict, detail = assess(read_status(root, repository, number), head, since)
                     detail = f"CI on {head[:12]}: " + (f"moved to {detail[:12]}" if verdict == "moved" else detail)
                 say(f"dry run: {detail}; would merge {target[:12]} as:")
@@ -454,10 +483,12 @@ def land(root, repository, number, update=False, dry_run=False, timeout=60):
                 return DRY_RUN_STATUS.get(verdict, 0)
             verdict, detail = wait_for_ci(root, repository, number, target, since, deadline, superseded)
             if verdict == "green":
+                if check_merged_protocol(root, number, target) == "conflict":
+                    continue
                 try:
                     merged = merge(repository, number, target, title, body)
                 except BaseMoved as error:
-                    merged = merge_after_base_moved(repository, number, target, title, body, error)
+                    merged = merge_after_base_moved(root, repository, number, target, title, body, error)
                 if merged is None:
                     continue  # Conflicts with the new main: bring it in next round.
                 git(root, "fetch", "--quiet", "--no-tags", "origin",

@@ -486,10 +486,10 @@ impl State {
             .cards
             .iter()
             .filter_map(|card| {
-                if card.existence.is_open() {
-                    if let CardKind::Terminal(session) = &card.kind {
-                        return Some((card.id, session.id));
-                    }
+                if card.existence.is_open()
+                    && let CardKind::Terminal(session) = &card.kind
+                {
+                    return Some((card.id, session.id));
                 }
                 None
             })
@@ -599,26 +599,27 @@ impl State {
     }
 
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
-        let mut state = Self::default();
-        state.retained = workspace.local_only_cards.clone();
-        state.attached = workspace
-            .channels
-            .iter()
-            .filter(|scope| scope.shared)
-            .flat_map(|scope| scope.cards.iter().copied())
-            .chain(
-                workspace
-                    .cards
-                    .iter()
-                    .filter(|card| {
-                        workspace.workspace_model_identity.is_some()
-                            && card.existence.is_open()
-                            && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
-                    })
-                    .map(|card| card.id),
-            )
-            .collect();
-        state
+        Self {
+            retained: workspace.local_only_cards.clone(),
+            attached: workspace
+                .channels
+                .iter()
+                .filter(|scope| scope.shared)
+                .flat_map(|scope| scope.cards.iter().copied())
+                .chain(
+                    workspace
+                        .cards
+                        .iter()
+                        .filter(|card| {
+                            workspace.workspace_model_identity.is_some()
+                                && card.existence.is_open()
+                                && matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                        })
+                        .map(|card| card.id),
+                )
+                .collect(),
+            ..Self::default()
+        }
     }
 }
 
@@ -2294,7 +2295,7 @@ impl Cagents {
         // scope. Such a scope is published from its panes as any other.
         if !settled.is_empty() {
             let mut moving = HashSet::new();
-            let desired = panes.iter().map(|(scope, panes)| (scope, panes)).chain(
+            let desired = panes.iter().chain(
                 settled
                     .iter()
                     .map(|scope| (scope, &self.shared_views.baseline[scope])),
@@ -2637,23 +2638,23 @@ impl Cagents {
                 .filter(|id| self.shared_views.defaults.contains_key(id))
                 .collect::<Vec<_>>();
             for id in defaults {
-                if self.shared_views.default_requests.insert(id) {
-                    if let Some(mut pane) = self.card_state(id).and_then(|card| {
+                if self.shared_views.default_requests.insert(id)
+                    && let Some(mut pane) = self.card_state(id).and_then(|card| {
                         Pane::from_card(card, self.durable.card_scopes.get(&id).cloned())
-                    }) {
-                        let operation = uuid::Uuid::new_v4();
-                        pane.pending_terminal_start = true;
-                        let change = Change::InsertIfEmpty { pane };
-                        self.shared_views
-                            .pending
-                            .push((operation, scope.clone(), change.clone()));
-                        self.publish_model_edit(ModelEdit::ChangeView {
-                            scope: scope.clone(),
-                            expected_revision: revision,
-                            operation,
-                            change,
-                        });
-                    }
+                    })
+                {
+                    let operation = uuid::Uuid::new_v4();
+                    pane.pending_terminal_start = true;
+                    let change = Change::InsertIfEmpty { pane };
+                    self.shared_views
+                        .pending
+                        .push((operation, scope.clone(), change.clone()));
+                    self.publish_model_edit(ModelEdit::ChangeView {
+                        scope: scope.clone(),
+                        expected_revision: revision,
+                        operation,
+                        change,
+                    });
                 }
             }
         }
@@ -3863,15 +3864,13 @@ impl Cagents {
                     repository.project = project;
                 }
             }
-            if let CardKind::Browser(browser) = &mut projected.kind {
-                if let Some(CardKind::Browser(local)) =
+            if let CardKind::Browser(browser) = &mut projected.kind
+                && let Some(CardKind::Browser(local)) =
                     self.card_state(projected.id).map(|card| &card.kind)
-                {
-                    if local.current_url == browser.current_url {
-                        browser.scroll_x = local.scroll_x;
-                        browser.scroll_y = local.scroll_y;
-                    }
-                }
+                && local.current_url == browser.current_url
+            {
+                browser.scroll_x = local.scroll_x;
+                browser.scroll_y = local.scroll_y;
             }
             let pane = &projected;
             let accepted_default = self
@@ -3886,11 +3885,11 @@ impl Cagents {
                     && Arc::make_mut(&mut self.durable)
                         .pending_terminal_creations
                         .remove(&pane.id);
-                if automatic.is_some() || explicit {
-                    if let CardKind::Terminal(session) = &pane.kind {
-                        self.shared_views.attached.insert(pane.id);
-                        tasks.push(self.start_terminal(pane.id, session.clone(), true, false));
-                    }
+                if (automatic.is_some() || explicit)
+                    && let CardKind::Terminal(session) = &pane.kind
+                {
+                    self.shared_views.attached.insert(pane.id);
+                    tasks.push(self.start_terminal(pane.id, session.clone(), true, false));
                 }
             }
             // A terminal this window restored as its own saved terminal can be
@@ -4426,14 +4425,12 @@ impl Cagents {
         self.shared_views.default_requests.remove(&id);
         self.shared_chat_detach(id);
         self.retire_lsp_card(id);
-        if let Some(runtime) = self.cards.remove(&id) {
-            #[cfg(feature = "integrated-browser")]
-            if let CardRuntime::Browser(browser) = runtime {
-                self.begin_browser_teardown(browser.handle);
-            }
-            #[cfg(not(feature = "integrated-browser"))]
-            drop(runtime);
+        #[cfg(feature = "integrated-browser")]
+        if let Some(CardRuntime::Browser(browser)) = self.cards.remove(&id) {
+            self.begin_browser_teardown(browser.handle);
         }
+        #[cfg(not(feature = "integrated-browser"))]
+        self.cards.remove(&id);
         self.lifecycle.remove(id);
         if let Some(card) = self.card_state_mut(id) {
             card.existence = super::project_ui::removed_existence("pane closed in another client");

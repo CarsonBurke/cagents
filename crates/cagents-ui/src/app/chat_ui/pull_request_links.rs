@@ -459,7 +459,7 @@ impl Labels {
             return false;
         }
         if self.board.len() != other.board.len() {
-            return self.fact(&id) == other.fact(&id);
+            return self.fact(id) == other.fact(id);
         }
         // Labels after a poll share every source but the polled project's, and
         // a shared source settles a link it holds with one look. The
@@ -470,11 +470,11 @@ impl Labels {
         for (index, (mine, theirs)) in sources.enumerate() {
             let watched_alike = index < self.board.len() || shared_conversation;
             if watched_alike && Arc::ptr_eq(mine, theirs) {
-                if mine.get(&id).is_some() {
+                if mine.get(id).is_some() {
                     return true;
                 }
-            } else if mine.get(&id).is_some() || theirs.get(&id).is_some() {
-                return self.fact(&id) == other.fact(&id);
+            } else if mine.get(id).is_some() || theirs.get(id).is_some() {
+                return self.fact(id) == other.fact(id);
             }
         }
         true

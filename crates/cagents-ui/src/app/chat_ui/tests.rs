@@ -1126,7 +1126,7 @@ fn preview_hide_and_subagent_switch_release_owners_and_fence_late_attempts() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(target).unwrap();
-    preview_items(runtime, &[parent.clone()]);
+    preview_items(runtime, std::slice::from_ref(&parent));
     let parent_attempt = runtime.cache[&parent.id].image_attempt;
     finish_preview(
         runtime,
@@ -1196,13 +1196,16 @@ fn explicit_preview_pressure_can_retire_automatic_owners_in_other_panes() {
     let bytes = preview_png();
     let budget = images::Budget::new(1024, 4);
     let runtime = app.chat_runtime_mut(owner_target).unwrap();
-    preview_items(runtime, &[old.clone()]);
+    preview_items(runtime, std::slice::from_ref(&old));
     finish_preview(
         runtime,
         &old,
         images::bounded_handle(bytes.clone(), &budget),
     );
-    preview_items(app.chat_runtime_mut(target).unwrap(), &[requested.clone()]);
+    preview_items(
+        app.chat_runtime_mut(target).unwrap(),
+        std::slice::from_ref(&requested),
+    );
     drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
     let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
     drop(app.handle_chat_ui(Action::ImageLoaded(
@@ -2183,7 +2186,7 @@ fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
         1,
         "only parent source is prepared before child selection"
     );
-    assert!(runtime.cache["body-2"].markdown.items().len() > 0);
+    assert!(!runtime.cache["body-2"].markdown.items().is_empty());
     for selected in [Some("child-2"), Some("child-3"), None] {
         drop(app.handle_chat_ui(Action::SelectSubagent(target, selected.map(str::to_owned))));
         let runtime = app.chat_runtime_mut(target).unwrap();
@@ -3507,6 +3510,7 @@ fn find_actions_restore_automatic_disclosures_and_keep_explicit_choices() {
     app.chat_runtime_mut(target)
         .unwrap()
         .opened
+        .edit()
         .insert("prompt".into(), false);
     drop(find_navigation::find_for_test(
         &mut app,
@@ -3608,7 +3612,8 @@ fn tool_group_toggles_override_both_default_choices() {
             }],
             &HashSet::new(),
             Presentations(&HashMap::new()),
-        );
+        )
+        .into();
         let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
         assert_eq!(chat_runtime(&app, card).opened.get("u1"), Some(&!default));
         let _ = app.handle_chat_ui(Action::ToggleTurn(target, "u1".into()));
@@ -3682,6 +3687,131 @@ fn paged_tool_groups_keep_reader_choices_when_their_prompt_is_evicted() {
 }
 
 #[test]
+fn selection_catalog_is_rebuilt_only_when_exposed_text_or_disclosure_changes() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some("selection-catalog"));
+    let target = chat_runtime(&app, card).target;
+    let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![
+        Arc::new(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("question"),
+            started_at: None,
+            at: None,
+        }),
+        Arc::new(chat::Item {
+            id: "tool".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Inspect".into(),
+                input: "{}".into(),
+                output: "tool output".into(),
+                status: chat::ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        }),
+    ];
+    show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+    // An open diagnostic whose bounded preview a Find query can move.
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let anchor = runtime.turns[0].key.clone();
+    runtime.failures = vec![failure::Note {
+        message: Some(anchor.clone()),
+        after: Some(anchor),
+        text: format!(
+            "Provider failure\n{}\nDIAGNOSTIC_TAIL",
+            "diagnostic bytes ".repeat(4096)
+        ),
+    }];
+    runtime.refresh_failure_ui();
+    let key = runtime.failure_ui.incidents[0].key.clone();
+    drop(app.handle_chat_ui(Action::ToggleFailure(target, key.clone())));
+    let catalog = |app: &Cagents| chat_runtime(app, card).selection_document().0;
+    let preview = |catalog: &selection::Catalog| {
+        catalog
+            .text(failure::diagnostic_preview_identity(&key))
+            .expect("the open diagnostic preview is selectable")
+    };
+
+    let built = catalog(&app);
+    assert!(!preview(&built).contains("DIAGNOSTIC_TAIL"));
+    assert!(
+        Arc::ptr_eq(&built, &catalog(&app)),
+        "an unchanged view reuses it"
+    );
+
+    snapshot.generation += 1;
+    snapshot.detail = "Still working".into();
+    show_chat_snapshot_for_test(&mut app, card, snapshot.clone());
+    assert!(
+        Arc::ptr_eq(&built, &catalog(&app)),
+        "a metadata-only publication exposes nothing new"
+    );
+
+    for query in ["absent", "absentee"] {
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            query.into(),
+        ));
+        assert!(
+            Arc::ptr_eq(&built, &catalog(&app)),
+            "a Find keystroke that reveals and restores nothing keeps it"
+        );
+    }
+
+    drop(find_navigation::find_for_test(
+        &mut app,
+        target,
+        "DIAGNOSTIC_TAIL".into(),
+    ));
+    let found = catalog(&app);
+    assert!(
+        !Arc::ptr_eq(&built, &found),
+        "a query that moves the preview's window changes exposed text"
+    );
+    assert!(preview(&found).contains("DIAGNOSTIC_TAIL"));
+    assert!(Arc::ptr_eq(&found, &catalog(&app)));
+
+    drop(app.handle_chat_ui(Action::CloseFind(target)));
+    let closed = catalog(&app);
+    assert!(!preview(&closed).contains("DIAGNOSTIC_TAIL"));
+    assert!(Arc::ptr_eq(&closed, &catalog(&app)));
+
+    drop(app.handle_chat_ui(Action::Toggle(target, "tool".into())));
+    let disclosed = catalog(&app);
+    assert!(
+        !Arc::ptr_eq(&closed, &disclosed),
+        "opening a step changes what is exposed"
+    );
+    assert!(Arc::ptr_eq(&disclosed, &catalog(&app)));
+
+    // A question regroups the transcript around its boundary without
+    // touching any item, so no presented text moves; the grouping does.
+    let presented = chat_runtime(&app, card).presentation_revision;
+    snapshot.generation += 1;
+    snapshot.requests = vec![chat::Request {
+        kind: crate::chat::RequestKind::Approval,
+        id: "approval".into(),
+        title: "Allow Bash?".into(),
+        description: String::new(),
+        fields: vec![],
+        actions: vec![],
+    }];
+    show_chat_snapshot_for_test(&mut app, card, snapshot);
+    assert_eq!(chat_runtime(&app, card).presentation_revision, presented);
+    let regrouped = catalog(&app);
+    assert!(
+        !Arc::ptr_eq(&disclosed, &regrouped),
+        "a regroup with unchanged items is still a new catalog"
+    );
+    assert!(Arc::ptr_eq(&regrouped, &catalog(&app)));
+}
+
+#[test]
 fn paging_inherits_reader_choices_without_retaining_temporary_find_disclosure() {
     for explicit in [false, true] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -3739,13 +3869,17 @@ fn paging_inherits_reader_choices_without_retaining_temporary_find_disclosure() 
 
 #[test]
 fn disclosure_choices_survive_history_eviction_and_are_bounded() {
-    let mut opened = HashMap::from([("u1".to_owned(), true)]);
+    let mut opened = Revised::new(HashMap::from([("u1".to_owned(), true)]));
+    let stamp = opened.stamp();
     reconcile_disclosure(&mut opened, &[]);
     assert_eq!(opened.get("u1"), Some(&true));
-    opened.insert("u1".to_owned(), false);
+    assert_eq!(opened.stamp(), stamp, "within budget, nothing is pruned");
+    opened.edit().insert("u1".to_owned(), false);
     reconcile_disclosure(&mut opened, &[]);
     assert_eq!(opened.get("u1"), Some(&false));
-    opened.extend((0..4097).map(|index| (format!("old-{index}"), true)));
+    opened
+        .edit()
+        .extend((0..4097).map(|index| (format!("old-{index}"), true)));
     reconcile_disclosure(&mut opened, &[]);
     assert!(opened.is_empty());
 }
@@ -4134,7 +4268,7 @@ fn a_busy_daemon_refusing_an_automatic_switch_keeps_the_conversation_on_its_acco
             // Details carry only what the notice doesn't already say.
             let key = notice.key.clone();
             let runtime = app.chat_runtime_mut(target).unwrap();
-            runtime.failure_ui.expanded.insert(key.clone());
+            runtime.failure_ui.expanded.edit().insert(key.clone());
             runtime.cache_failure_preview(&key);
             assert_eq!(runtime.failure_preview(&key), Some((REASON, false)));
         }
@@ -4508,7 +4642,7 @@ fn a_pane_inspector_overlay_excludes_covered_widgets_and_keeps_other_panes_reach
     let composer = card_control_id(card, "chat-composer");
     let sibling = widget::Id::new("inspector-test.other-pane");
     let viewport = iced::Rectangle::with_size(iced::Size::new(640.0, 720.0));
-    let mut tree = Tree::new(&view(&app, card));
+    let mut tree = Tree::new(view(&app, card));
     {
         let mut element = view(&app, card);
         let node = element.as_widget_mut().layout(
@@ -5236,6 +5370,7 @@ fn selected_presentation_bounds_child_disclosure_history_without_crossing_transc
         .child_expanded
         .get_mut("long-running-child")
         .unwrap()
+        .edit()
         .extend((0..2048).map(|index| format!("retired-item-{index}")));
     runtime
         .child_unfolded
@@ -6720,9 +6855,8 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                 .composer
                 .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
 
-            let mut moved = 0;
             let mut boundary = None;
-            for _ in 0..256 {
+            for moved in 0..256 {
                 let before = chat_runtime(&app, card).composer.cursor();
                 composer_history_key(&mut app, card, width, Named::ArrowUp, &renderer);
                 let runtime = chat_runtime(&app, card);
@@ -6740,7 +6874,6 @@ fn native_composer_up_crosses_wrapped_rows_before_history_and_restores_the_draft
                     before,
                     "Up must move within the draft"
                 );
-                moved += 1;
             }
             let boundary = boundary.expect("Up eventually reaches native history");
             assert_eq!(
@@ -12616,7 +12749,7 @@ fn stopped_agent_terminal(app: &mut Cagents, arguments: &[&str], exited: bool) -
     terminal.launch = launch.clone();
     terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
         recipe: launch,
-        last_exit: exited.then(|| crate::model::TerminalExit {
+        last_exit: exited.then_some(crate::model::TerminalExit {
             code: Some(0),
             signal: None,
             occurred_at_unix_ms: 1,
@@ -13225,7 +13358,7 @@ fn a_draft_moved_to_another_provider_or_account_is_saved_as_its_new_conversation
     assert_eq!(stored.launch.session_id.as_deref(), Some(fresh_id));
     // A late or repeated press, once nothing offers it, keeps it.
     let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
-    assert!(!app.chat_ui.attempt(card).is_some());
+    assert!(app.chat_ui.attempt(card).is_none());
     assert_eq!(flushed(&app), stored);
 }
 
@@ -17127,7 +17260,7 @@ fn nonretryable_failed_resume_preserves_an_explicit_fresh_start_offer() {
         stopped.secondary,
         Some(("Close", stopped::Press::Close, true))
     );
-    assert_eq!(runtime.stopped(true, false).primary.unwrap().2, false);
+    assert!(!runtime.stopped(true, false).primary.unwrap().2);
     assert!(
         matches!(stopped.primary.unwrap().1.message(runtime.target), Message::ChatUi(Action::StartFresh(fresh)) if fresh == card)
     );
@@ -18222,8 +18355,8 @@ fn hidden_prose_releases_graph_and_scratch_and_rehydrates_reader_state() {
     let client_retired = handle.observe_snapshot_retirement_for_test();
     runtime.replace_draft(text_editor::Content::with_text("unsent reader draft"));
     runtime.find = Some("kept query".into());
-    runtime.expanded.insert("scratch-owner".into());
-    runtime.opened.insert("kept turn".into(), true);
+    runtime.expanded.edit().insert("scratch-owner".into());
+    runtime.opened.edit().insert("kept turn".into(), true);
     runtime.set_visible(false).unwrap();
     runtime.set_visible(false).unwrap();
     runtime.cool();
@@ -22340,7 +22473,11 @@ fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
         anchor_prefix: document.fingerprint(anchor),
         end_prefix: document.fingerprint(end),
     }));
-    runtime.selection_document.get_mut().replace((99, document));
+    let key = runtime.selection_key();
+    runtime
+        .selection_document
+        .get_mut()
+        .replace((key, document));
     runtime
         .selection_bookmarks
         .get_mut()
@@ -22349,7 +22486,7 @@ fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
     runtime
         .subagent_scroll
         .insert("child".into(), view::Scroll::new(75.0, 900.0, 400.0));
-    runtime.expanded.insert("parent".into());
+    runtime.expanded.edit().insert("parent".into());
     let scroll = runtime.scroll;
     let child_scroll = runtime.subagent_scroll.clone();
     let turns = runtime
