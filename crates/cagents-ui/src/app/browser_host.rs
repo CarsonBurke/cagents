@@ -334,9 +334,9 @@ impl Cagents {
         browser: crate::model::BrowserId,
         opened: bool,
     ) {
-        if !self
+        if self
             .browser_system_request(card)
-            .is_some_and(|(current, _)| current == browser)
+            .is_none_or(|(current, _)| current != browser)
         {
             return;
         }
@@ -705,7 +705,7 @@ mod tests {
         element.as_widget_mut().update(
             &mut tree,
             &Event::A11y(
-                id.into(),
+                id,
                 ActionRequest {
                     action: Action::Click,
                     target_tree: iced_accessibility::accesskit::TreeId::ROOT,

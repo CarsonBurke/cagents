@@ -202,9 +202,7 @@ impl NavigationState {
         entries: Vec<Url>,
         current: usize,
     ) -> Option<Url> {
-        let Some(last) = entries.len().checked_sub(1) else {
-            return None;
-        };
+        let last = entries.len().checked_sub(1)?;
         let current = current.min(last);
         // A traversal leaves Servo's list as it was, and a redirect or
         // `history.replaceState` rewrites only the current entry.

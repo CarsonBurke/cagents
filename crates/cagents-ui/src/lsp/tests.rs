@@ -552,10 +552,10 @@ fn queued_status_and_progress_cannot_cross_a_session_restart() {
         assert_eq!(displayed, LspStatus::Starting);
         for event in [old_ready, old_failed, old_progress] {
             assert!(!manager.event_is_current(&event));
-            if manager.event_is_current(&event) {
-                if let LspEvent::Status { status, .. } = event {
-                    displayed = status;
-                }
+            if manager.event_is_current(&event)
+                && let LspEvent::Status { status, .. } = event
+            {
+                displayed = status;
             }
             assert_eq!(displayed, LspStatus::Starting);
         }
@@ -2832,12 +2832,14 @@ fn scalar_and_utf16_positions_round_trip_for_ascii_bmp_and_astral_text() {
 
     assert_eq!(
         snapshot
-            .to_utf16(LspPosition::new(0, 5))
+            .utf16_position(LspPosition::new(0, 5))
             .expect("ascii end"),
         lsp_types::Position::new(0, 5)
     );
     assert_eq!(
-        snapshot.to_utf16(LspPosition::new(1, 2)).expect("bmp"),
+        snapshot
+            .utf16_position(LspPosition::new(1, 2))
+            .expect("bmp"),
         lsp_types::Position::new(1, 2)
     );
     assert_eq!(
@@ -2846,7 +2848,9 @@ fn scalar_and_utf16_positions_round_trip_for_ascii_bmp_and_astral_text() {
         "the two-byte scalar shifts byte offsets but not UTF-16 offsets"
     );
     assert_eq!(
-        snapshot.to_utf16(LspPosition::new(2, 2)).expect("astral"),
+        snapshot
+            .utf16_position(LspPosition::new(2, 2))
+            .expect("astral"),
         lsp_types::Position::new(2, 3)
     );
 
@@ -2861,9 +2865,9 @@ fn scalar_and_utf16_positions_round_trip_for_ascii_bmp_and_astral_text() {
         (2, 3),
     ] {
         let scalar = LspPosition::new(line, character);
-        let utf16 = snapshot.to_utf16(scalar).expect("outbound");
+        let utf16 = snapshot.utf16_position(scalar).expect("outbound");
         assert_eq!(
-            snapshot.from_utf16(utf16).expect("inbound"),
+            snapshot.native_position(utf16).expect("inbound"),
             scalar,
             "{scalar:?} must round-trip"
         );
@@ -2874,22 +2878,22 @@ fn scalar_and_utf16_positions_round_trip_for_ascii_bmp_and_astral_text() {
 fn a_utf16_offset_inside_a_surrogate_pair_is_rejected() {
     let snapshot = Snapshot::new(1, Arc::from("a𝄞b"));
     assert_eq!(
-        snapshot.from_utf16(lsp_types::Position::new(0, 2)),
+        snapshot.native_position(lsp_types::Position::new(0, 2)),
         Err(LspError::SplitSurrogate {
             line: 0,
             character: 2
         })
     );
     assert!(matches!(
-        snapshot.from_utf16(lsp_types::Position::new(0, 99)),
+        snapshot.native_position(lsp_types::Position::new(0, 99)),
         Err(LspError::PositionOutOfRange { .. })
     ));
     assert!(matches!(
-        snapshot.to_utf16(LspPosition::new(9, 0)),
+        snapshot.utf16_position(LspPosition::new(9, 0)),
         Err(LspError::PositionOutOfRange { version: 1, .. })
     ));
     assert_eq!(
-        snapshot.range_from_utf16(lsp_types::Range::new(
+        snapshot.native_range(lsp_types::Range::new(
             lsp_types::Position::new(0, 3),
             lsp_types::Position::new(0, 0),
         )),
@@ -2913,10 +2917,12 @@ fn a_crlf_terminator_is_not_part_of_its_line() {
         Some(std::borrow::Cow::Borrowed(""))
     );
     assert_eq!(
-        snapshot.to_utf16(LspPosition::new(0, 2)).expect("line end"),
+        snapshot
+            .utf16_position(LspPosition::new(0, 2))
+            .expect("line end"),
         lsp_types::Position::new(0, 2)
     );
-    assert!(snapshot.to_utf16(LspPosition::new(0, 3)).is_err());
+    assert!(snapshot.utf16_position(LspPosition::new(0, 3)).is_err());
 }
 
 #[test]
@@ -4068,11 +4074,11 @@ fn the_event_channel_stays_bounded_under_diagnostic_flooding() {
             else {
                 break;
             };
-            if let LspEvent::Diagnostics { items, .. } = event {
-                if items.first().is_some_and(|item| item.message == newest) {
-                    seen_newest = true;
-                    break;
-                }
+            if let LspEvent::Diagnostics { items, .. } = event
+                && items.first().is_some_and(|item| item.message == newest)
+            {
+                seen_newest = true;
+                break;
             }
         }
         assert!(
@@ -4159,7 +4165,7 @@ fn a_crashed_server_reports_a_restartable_status_and_keeps_the_document() {
         );
         let uri = Url::from_file_path(&file).expect("uri");
         assert_eq!(
-            &*manager
+            manager
                 .snapshots
                 .latest(&uri)
                 .expect("the snapshot survives the crash")
@@ -4442,7 +4448,7 @@ fn a_missing_executable_reports_unavailable_and_leaves_editing_working() {
         assert!(status.can_restart());
         manager.change(doc, 2, &[], "abcd\n");
         assert_eq!(
-            &*manager
+            manager
                 .snapshots
                 .latest(&Url::from_file_path(&file).expect("uri"))
                 .expect("snapshot")
@@ -4601,6 +4607,10 @@ fn child_helper_leaves_a_grandchild_behind() {
     };
     let published = PathBuf::from(published);
     let executable = std::env::current_exe().expect("the test executable");
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the grandchild must outlive this helper; the stop under test ends its group"
+    )]
     let grandchild = std::process::Command::new(executable)
         .args(["--exact", CHILD_HELPER_TEST, "--test-threads=1"])
         .env(CHILD_HELPER_ENV, "1")

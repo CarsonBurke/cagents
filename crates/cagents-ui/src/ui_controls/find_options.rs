@@ -38,7 +38,7 @@ pub fn find_options<'a, Message: Clone + 'static>(
             if enabled {
                 control = control.on_toggle(move |value| on_toggle(option, value));
             }
-            crate::interaction::tooltip(control, description).into()
+            crate::interaction::tooltip(control, description)
         }),
     )
     .spacing(space::S)

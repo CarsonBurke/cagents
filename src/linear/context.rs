@@ -183,17 +183,16 @@ fn lock_link(root: &Root) -> Result<crate::instance::OwnedLock, Error> {
 
 fn validate(issue: &LinkedIssue) -> Result<(), Error> {
     super::issue_reference(&issue.issue_id)?;
-    if let Some(workspace) = &issue.workspace {
-        if workspace.is_empty()
+    if let Some(workspace) = &issue.workspace
+        && (workspace.is_empty()
             || !workspace
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        {
-            return Err(Error::new(
-                "linear_invalid_workspace",
-                "Workspace aliases must contain only ASCII letters, digits, or underscores",
-            ));
-        }
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    {
+        return Err(Error::new(
+            "linear_invalid_workspace",
+            "Workspace aliases must contain only ASCII letters, digits, or underscores",
+        ));
     }
     Ok(())
 }

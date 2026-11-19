@@ -1395,7 +1395,7 @@ impl Store {
             &self.directory.join(LOCK_NAME),
             libc::LOCK_EX | libc::LOCK_NB,
         )
-        .map_err(|error| ListHeld::Registry.from_flock(error))
+        .map_err(|error| ListHeld::Registry.flock_error(error))
     }
 
     #[cfg(feature = "host")]
@@ -1832,8 +1832,10 @@ mod tests {
             .unwrap();
         store.load_and_sweep(&homes).unwrap();
         assert!(home.is_dir());
-        let mut newer = Registry::default();
-        newer.version = VERSION + 1;
+        let newer = Registry {
+            version: VERSION + 1,
+            ..Registry::default()
+        };
         write(&store.directory, &store.path(), &newer).unwrap();
         store.load_and_sweep(&homes).unwrap();
         assert!(home.is_dir());

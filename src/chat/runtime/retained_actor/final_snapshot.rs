@@ -614,7 +614,7 @@ pub(crate) mod fixture {
             proof: proof.clone(),
             source: source.clone(),
             previous_sources: Vec::new(),
-            launch_account_scope: scope.map(Clone::clone).map_err(str::to_owned),
+            launch_account_scope: scope.cloned().map_err(str::to_owned),
             confirmed_session: Some(session),
             paired_holder: None,
         })

@@ -322,10 +322,10 @@ fn split(
             for pid in procs(scope)? {
                 // The provider is the caller's unreaped child, and its
                 // early helpers are moved under the same pidfd proof.
-                if let Err(error) = migrate(pid, membership, &provider) {
-                    if pid == root {
-                        return Err(error);
-                    }
+                if let Err(error) = migrate(pid, membership, &provider)
+                    && pid == root
+                {
+                    return Err(error);
                 }
             }
             let request = wanted

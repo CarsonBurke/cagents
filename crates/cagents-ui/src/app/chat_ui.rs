@@ -1665,7 +1665,7 @@ impl ChangeToken {
 pub(super) fn format_duration(millis: u64) -> String {
     match millis {
         0..1_000 => format!("{millis}ms"),
-        0..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
+        1_000..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
         _ => format!("{}m {}s", millis / 60_000, (millis % 60_000) / 1_000),
     }
 }
@@ -1885,10 +1885,10 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
             body,
             ..
         } => {
-            find::contains(&from, query)
-                || find::contains(&sender, query)
-                || find::contains(&summary, query)
-                || find::contains(&body, query)
+            find::contains(from, query)
+                || find::contains(sender, query)
+                || find::contains(summary, query)
+                || find::contains(body, query)
         }
     }
 }
@@ -3733,29 +3733,29 @@ impl Runtime {
                 insertion.push(' ');
             }
         }
-        if !insertion.is_empty() {
-            if let Ok(Some(change)) = attachment_draft::edit(
+        if !insertion.is_empty()
+            && let Ok(Some(change)) = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(insertion)),
-            ) {
-                for (other_id, other) in &mut self.attachment_bookmarks {
-                    // Equal collapsed anchors follow paste initiation order,
-                    // independent of worker completion order. User caret
-                    // mapping retains its normal left affinity.
-                    let later_at_start = !earlier.contains(other_id)
-                        && other.cursor.selection.is_none()
-                        && other.cursor.position == change.start;
-                    other.changed(&change);
-                    if later_at_start && other.valid {
-                        other.cursor.position = change.inserted_end();
-                    }
+            )
+        {
+            for (other_id, other) in &mut self.attachment_bookmarks {
+                // Equal collapsed anchors follow paste initiation order,
+                // independent of worker completion order. User caret
+                // mapping retains its normal left affinity.
+                let later_at_start = !earlier.contains(other_id)
+                    && other.cursor.selection.is_none()
+                    && other.cursor.position == change.start;
+                other.changed(&change);
+                if later_at_start && other.valid {
+                    other.cursor.position = change.inserted_end();
                 }
-                self.cancel_invalid_attachment_jobs();
-                if current != bookmark.cursor {
-                    if let Some(mapped) = attachment_draft::mapped(current, &change) {
-                        attachment_draft::move_to(&mut self.composer, mapped);
-                    }
-                }
+            }
+            self.cancel_invalid_attachment_jobs();
+            if current != bookmark.cursor
+                && let Some(mapped) = attachment_draft::mapped(current, &change)
+            {
+                attachment_draft::move_to(&mut self.composer, mapped);
             }
         }
         self.merge_attachments(attachments);
@@ -5422,11 +5422,22 @@ impl Runtime {
                 // of tiny fences. Every changed prose publication goes to the
                 // worker; the last proven prefix remains visible meanwhile.
                 if !metadata_reused && (pending || !exact || report_reveal) {
-                    let replaced = self.preparation.stage(
+                    let replaced = self.preparation.stage_reusing(
                         item,
                         growing && (!reader_only || coordinated),
                         theme,
                         |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
+                        || {
+                            current
+                                .into_iter()
+                                .flat_map(|cached| {
+                                    cached.blocks.iter().filter(|(key, block)| {
+                                        block.is_settled() && Some(**key) != cached.open
+                                    })
+                                })
+                                .map(|(key, block)| (*key, block.settled_clone()))
+                                .collect()
+                        },
                     );
                     // The answer being written, then the rows the reader
                     // returns to, then everything else from the newest back.
@@ -5462,7 +5473,6 @@ impl Runtime {
                     if !cache.contains_key(&item.id) {
                         presentation_changed = true;
                     }
-                    let theme = theme;
                     let cached = cache
                         .entry(item.id.clone())
                         .or_insert_with(|| CachedItem::preparing(item, theme));
@@ -7067,7 +7077,15 @@ fn draft_snapshot(
                     "bypassPermissions".into(),
                 ],
                 Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
-                Provider::Omp | Provider::Antigravity | Provider::Muse => Vec::new(),
+                // An ACP agent's own modes, by what they mean, until its
+                // session lists the ones it offers.
+                Provider::Antigravity | Provider::Muse => provider
+                    .acp()
+                    .into_iter()
+                    .flat_map(|acp| acp.mode_meanings())
+                    .map(str::to_owned)
+                    .collect(),
+                Provider::Omp => Vec::new(),
             },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
@@ -7125,7 +7143,8 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .or_else(|| Some("manual".into()))
         }
         Provider::Codex => codex_draft_permission_mode(recipe),
-        Provider::Omp | Provider::Antigravity | Provider::Muse => None,
+        Provider::Antigravity | Provider::Muse => chat::acp_permission_mode(recipe, provider),
+        Provider::Omp => None,
     }
 }
 
@@ -7264,6 +7283,9 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
     if provider == Provider::Claude {
         chat::apply_claude_permission_mode(recipe, mode);
+        return;
+    }
+    if chat::apply_acp_permission_mode(recipe, provider, mode) {
         return;
     }
     if provider != Provider::Codex || !matches!(mode, "yolo" | "readOnly" | "workspaceWrite") {
@@ -8250,9 +8272,7 @@ impl Cagents {
         let Some(CardKind::Chat(source)) = self.card_state(card).map(|state| &state.kind) else {
             return None;
         };
-        if source.launch.session_id.is_none() {
-            return None;
-        }
+        source.launch.session_id.as_ref()?;
         let choices = self
             .chat_accounts(source.launch.provider, &source.launch.recipe)
             .into_iter()
@@ -9873,12 +9893,20 @@ impl Cagents {
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
-            // Only an agent cagents can run as native chat switches to it.
+            // Only an agent cagents can run as native chat switches to it,
+            // and an ACP agent's terminal only once it names its
+            // conversation: it publishes no other sign of which one it is in.
             Some(CardKind::Terminal(session)) => session
                 .agent_resume_recipe()
                 .or_else(|| observed_launch(session))
-                .and_then(|recipe| Provider::from_program(&recipe.program))
-                .is_some_and(Provider::has_native_chat),
+                .and_then(|recipe| {
+                    let provider = Provider::from_program(&recipe.program)?;
+                    (provider.has_native_chat()
+                        && (!provider.speaks_acp()
+                            || provider.resume_id(&recipe.arguments).is_some()))
+                    .then_some(())
+                })
+                .is_some(),
             _ => false,
         }
     }
@@ -10293,11 +10321,15 @@ impl Cagents {
                 return Task::none();
             }
         };
-        if session.launch.provider == Provider::Claude
-            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
             && let Some(mode) = runtime.snapshot.permission_mode.as_deref()
         {
-            chat::apply_claude_permission_mode(&mut launch, mode);
+            // The terminal resumes in the mode the conversation is in now.
+            if session.launch.provider == Provider::Claude {
+                chat::apply_claude_permission_mode(&mut launch, mode);
+            } else {
+                chat::apply_acp_permission_mode(&mut launch, session.launch.provider, mode);
+            }
         }
         let resumes = session.launch.session_id.is_some();
         let handle = match self.cards.get(&card) {
@@ -11924,7 +11956,7 @@ impl Cagents {
             );
             return Task::none();
         }
-        return cosmic::task::future(async move {
+        cosmic::task::future(async move {
             let worker_ticket = id.clone();
             let result = images::run_worker(move || {
                 worker_ticket.check()?;
@@ -11942,7 +11974,7 @@ impl Cagents {
             .await
             .and_then(|r| r);
             Message::ChatUi(Action::AttachmentsPrepared(target, id, result))
-        });
+        })
     }
 
     fn handle_chat_ui_inner(&mut self, action: Action) -> Task<Message> {
@@ -13852,20 +13884,20 @@ impl Cagents {
                 }
             }
             Action::AppendProviderDraft(target) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(provided) = &runtime.snapshot.composer {
-                        let mut text = runtime.composer.text();
-                        if !text.trim().is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(provided);
-                        // Appending promotes the recalled prompt to the unsent
-                        // draft, just as typing or completing a word does.
-                        runtime.history_cursor = None;
-                        runtime.history_stash = None;
-                        runtime.history_attachment_stash = None;
-                        runtime.replace_draft(text_editor::Content::with_text(&text));
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(provided) = &runtime.snapshot.composer
+                {
+                    let mut text = runtime.composer.text();
+                    if !text.trim().is_empty() {
+                        text.push('\n');
                     }
+                    text.push_str(provided);
+                    // Appending promotes the recalled prompt to the unsent
+                    // draft, just as typing or completing a word does.
+                    runtime.history_cursor = None;
+                    runtime.history_stash = None;
+                    runtime.history_attachment_stash = None;
+                    runtime.replace_draft(text_editor::Content::with_text(&text));
                 }
             }
             Action::SubmitControl(target, mode) => {
@@ -14313,20 +14345,20 @@ impl Cagents {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                 }
-                if command == Command::LoadEarlier {
-                    if let Some(runtime) = self.chat_runtime_mut(target) {
-                        if runtime.selected_subagent.is_some() {
-                            return Task::none();
-                        }
-                        if runtime
-                            .commands
-                            .iter()
-                            .any(|pending| pending.page.is_none())
-                            && runtime.deferred_page != Some(HistoryNavigation::Latest)
-                        {
-                            runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
-                            return Task::none();
-                        }
+                if command == Command::LoadEarlier
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    if runtime.selected_subagent.is_some() {
+                        return Task::none();
+                    }
+                    if runtime
+                        .commands
+                        .iter()
+                        .any(|pending| pending.page.is_none())
+                        && runtime.deferred_page != Some(HistoryNavigation::Latest)
+                    {
+                        runtime.deferred_page = Some(HistoryNavigation::EarlierExplicit);
+                        return Task::none();
                     }
                 }
                 if matches!(command, Command::Branch { .. })
@@ -15010,23 +15042,21 @@ impl Cagents {
                 };
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
-                let text = match part {
-                    part => runtime.active_item(&id).and_then(|item| {
-                        let card = runtime
-                            .presentation_cache()
-                            .get(&item.id)
-                            .and_then(|cached| cached.coordination.as_deref())
-                            .filter(|coordinated| coordinated.is_card());
-                        match card {
-                            // A message read from a file copies as the
-                            // command that sent it.
-                            Some(card) if matches!(part, CopyPart::Text) => {
-                                card.copy_text().or_else(|| copy_text(part, &item.content))
-                            }
-                            _ => copy_text(part, &item.content),
+                let text = runtime.active_item(&id).and_then(|item| {
+                    let card = runtime
+                        .presentation_cache()
+                        .get(&item.id)
+                        .and_then(|cached| cached.coordination.as_deref())
+                        .filter(|coordinated| coordinated.is_card());
+                    match card {
+                        // A message read from a file copies as the
+                        // command that sent it.
+                        Some(card) if matches!(part, CopyPart::Text) => {
+                            card.copy_text().or_else(|| copy_text(part, &item.content))
                         }
-                    }),
-                };
+                        _ => copy_text(part, &item.content),
+                    }
+                });
                 if let Some(text) = text {
                     let at = Instant::now();
                     runtime.copied = Some((id, at));
@@ -15452,13 +15482,11 @@ impl Cagents {
                             if runtime.pastes_pending >= 2 {
                                 runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
+                            } else if let Some((id, lease)) = attachment_draft::admit() {
+                                staged = Some((id, files, lease));
                             } else {
-                                if let Some((id, lease)) = attachment_draft::admit() {
-                                    staged = Some((id, files, lease));
-                                } else {
-                                    runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
-                                    rest.extend(files.into_iter().map(file_drop::Item::File));
-                                }
+                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                rest.extend(files.into_iter().map(file_drop::Item::File));
                             }
                         }
                         file_drop::Dropped::Items(rest)
@@ -15501,22 +15529,22 @@ impl Cagents {
                 ]);
             }
             Action::RemoveAttachment(target, index) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if index < runtime.attachments.len() {
-                        let token = runtime.attachments[index]
-                            .reference
-                            .as_ref()
-                            .map(chat::ImageReference::token);
-                        if let Some(token) = token
-                            && !runtime.remove_image_token(&token)
-                        {
-                            return Task::none();
-                        }
-                        runtime.attachments.remove(index);
-                        runtime.thumbnails.sync(&runtime.attachments);
-                        runtime.revision = runtime.revision.wrapping_add(1);
-                        runtime.settle_restored_notice();
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && index < runtime.attachments.len()
+                {
+                    let token = runtime.attachments[index]
+                        .reference
+                        .as_ref()
+                        .map(chat::ImageReference::token);
+                    if let Some(token) = token
+                        && !runtime.remove_image_token(&token)
+                    {
+                        return Task::none();
                     }
+                    runtime.attachments.remove(index);
+                    runtime.thumbnails.sync(&runtime.attachments);
+                    runtime.revision = runtime.revision.wrapping_add(1);
+                    runtime.settle_restored_notice();
                 }
             }
             Action::Model(target, id) => {
@@ -15623,8 +15651,8 @@ impl Cagents {
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
             Action::Field(target, request, field, value) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(schema) = runtime
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(schema) = runtime
                         .snapshot
                         .requests
                         .iter()
@@ -15635,24 +15663,23 @@ impl Cagents {
                                 .iter()
                                 .find(|candidate| candidate.id == field)
                         })
-                    {
-                        let values = runtime.answers.entry((request, field)).or_default();
-                        if schema.multiple {
-                            values.retain(|selected| {
-                                schema.choices.iter().any(|choice| &choice.id == selected)
-                            });
-                        } else {
-                            values.clear();
-                        }
-                        if !value.is_empty() {
-                            values.push(value);
-                        }
+                {
+                    let values = runtime.answers.entry((request, field)).or_default();
+                    if schema.multiple {
+                        values.retain(|selected| {
+                            schema.choices.iter().any(|choice| &choice.id == selected)
+                        });
+                    } else {
+                        values.clear();
+                    }
+                    if !value.is_empty() {
+                        values.push(value);
                     }
                 }
             }
             Action::Choice(target, request, field, value) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if let Some(schema) = runtime
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(schema) = runtime
                         .snapshot
                         .requests
                         .iter()
@@ -15663,21 +15690,17 @@ impl Cagents {
                                 .iter()
                                 .find(|candidate| candidate.id == field)
                         })
-                    {
-                        if schema.choices.iter().any(|choice| choice.id == value) {
-                            let values = runtime.answers.entry((request, field)).or_default();
-                            if schema.multiple {
-                                if let Some(index) =
-                                    values.iter().position(|selected| selected == &value)
-                                {
-                                    values.remove(index);
-                                } else {
-                                    values.push(value);
-                                }
-                            } else {
-                                *values = vec![value];
-                            }
+                    && schema.choices.iter().any(|choice| choice.id == value)
+                {
+                    let values = runtime.answers.entry((request, field)).or_default();
+                    if schema.multiple {
+                        if let Some(index) = values.iter().position(|selected| selected == &value) {
+                            values.remove(index);
+                        } else {
+                            values.push(value);
                         }
+                    } else {
+                        *values = vec![value];
                     }
                 }
             }

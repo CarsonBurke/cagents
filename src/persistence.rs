@@ -1806,10 +1806,12 @@ impl StateStore {
         manifest
             .pending_chat_admissions
             .insert(copy.copy.id, copy.source.clone());
-        let mut state = WorkspaceState::default();
-        state.id = copy.workspace;
-        state.channels = manifest.channels;
-        state.card_scopes = manifest.card_scopes;
+        let mut state = WorkspaceState {
+            id: copy.workspace,
+            channels: manifest.channels,
+            card_scopes: manifest.card_scopes,
+            ..WorkspaceState::default()
+        };
         copy.project(&mut state)?;
         for (name, value) in [
             ("chat_drafts", ordered_map_json(&manifest.chat_drafts)?),
@@ -2765,7 +2767,7 @@ fn checkpoint_wal(connection: &Connection) {
         ))
     });
     match outcome {
-        Ok((busy, frames, checkpointed)) if busy == 0 => {
+        Ok((0, frames, checkpointed)) => {
             tracing::debug!(frames, checkpointed, "checkpointed the session WAL");
         }
         Ok((_, frames, checkpointed)) => {
@@ -5190,13 +5192,12 @@ fn validate_chat_identity(
     }
     if let Some(previous) = previous.filter(|previous| previous.kind == PersistedCardKind::Chat)
         && let Some(stored) = stored_chat_session(transaction, card, previous)?
+        && let Some(check) = chat_identity_change(&stored, session)
     {
-        if let Some(check) = chat_identity_change(&stored, session) {
-            return Err(StoreError::InvalidState(Violation::new(
-                check,
-                check.replace("{card}", &card.to_string()),
-            )));
-        }
+        return Err(StoreError::InvalidState(Violation::new(
+            check,
+            check.replace("{card}", &card.to_string()),
+        )));
     }
     Ok(())
 }
@@ -10137,10 +10138,9 @@ mod tests {
     }
     fn descriptor_busy_gate(attempt: i32) -> bool {
         if let Some((entered, proceed)) = DESCRIPTOR_BUSY_GATE.with(|gate| gate.borrow_mut().take())
+            && (entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err())
         {
-            if entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err() {
-                return false;
-            }
+            return false;
         }
         std::thread::sleep(Duration::from_millis(1));
         attempt < 5000

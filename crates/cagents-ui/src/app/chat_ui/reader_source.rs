@@ -74,7 +74,7 @@ impl Source {
             hasher.update(&suffix[..take]);
             seen += take;
             suffix = &suffix[take..];
-            if seen % 4096 == 0 {
+            if seen.is_multiple_of(4096) {
                 Arc::make_mut(&mut self.prefixes).push(*hasher.finalize().as_bytes());
             }
         }

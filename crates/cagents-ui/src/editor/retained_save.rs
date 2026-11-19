@@ -1221,15 +1221,15 @@ mod tests {
             fs::read(directory.path().join("file")).unwrap(),
             b"newer writer"
         );
-        if let Err(error) = &result {
-            if let Some(authority) = error.recovery_authority() {
-                authority.retry().unwrap();
-                assert!(authority.is_resolved());
-                assert_eq!(
-                    fs::read(directory.path().join("file")).unwrap(),
-                    b"newer writer"
-                );
-            }
+        if let Err(error) = &result
+            && let Some(authority) = error.recovery_authority()
+        {
+            authority.retry().unwrap();
+            assert!(authority.is_resolved());
+            assert_eq!(
+                fs::read(directory.path().join("file")).unwrap(),
+                b"newer writer"
+            );
         }
     }
 

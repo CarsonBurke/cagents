@@ -154,7 +154,7 @@ impl Homes {
             &self.root.join(".lifecycle.lock"),
             libc::LOCK_EX | libc::LOCK_NB,
         )
-        .map_err(|error| super::remote::ListHeld::Lifecycle.from_flock(error))
+        .map_err(|error| super::remote::ListHeld::Lifecycle.flock_error(error))
     }
 
     fn provider_directory(&self, provider: Provider) -> PathBuf {

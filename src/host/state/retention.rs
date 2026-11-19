@@ -66,14 +66,13 @@ impl HostState {
         }
         let panes: &[crate::workspace_model::views::Pane] = match edit {
             ModelEdit::SeedView { panes, .. } => panes,
-            ModelEdit::ChangeView { change, .. } => match change {
-                crate::workspace_model::views::Change::Insert { pane, .. }
-                | crate::workspace_model::views::Change::InsertIfEmpty { pane }
-                | crate::workspace_model::views::Change::Update { pane, .. } => {
-                    std::slice::from_ref(pane)
-                }
-                _ => &[],
-            },
+            ModelEdit::ChangeView {
+                change:
+                    crate::workspace_model::views::Change::Insert { pane, .. }
+                    | crate::workspace_model::views::Change::InsertIfEmpty { pane }
+                    | crate::workspace_model::views::Change::Update { pane, .. },
+                ..
+            } => std::slice::from_ref(pane),
             _ => &[],
         };
         for pane in panes {
