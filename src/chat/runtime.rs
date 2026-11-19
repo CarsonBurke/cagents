@@ -1,7 +1,7 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
-    protocol::{Adapter, ProcessSpec, SetupError, Step, TransportSpec},
+    protocol::{Adapter, HeldStop, ProcessSpec, SetupError, Step, TransportSpec},
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
@@ -2598,7 +2598,7 @@ impl Actor {
                             // A provider that names a turn only once it has
                             // started holds the stop until then, and sends it
                             // as it drains.
-                            interrupt_held = self.adapter.stop_held();
+                            interrupt_held = self.adapter.held_stop() == HeldStop::Waiting;
                             self.step(step)?;
                             interrupt_sent = true;
                         }
@@ -2619,14 +2619,19 @@ impl Actor {
                     if settled {
                         return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
                     }
-                    let reason = if interrupt_held && self.adapter.stop_held() {
-                        " (the provider had not yet started the turn to stop)".to_owned()
-                    } else if interrupt_held {
-                        " (the stop was sent once the turn started)".to_owned()
-                    } else if interrupt_error.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({interrupt_error})")
+                    let reason = match (interrupt_held, self.adapter.held_stop()) {
+                        (true, HeldStop::Waiting) => {
+                            " (the provider had not yet started the turn to stop)".to_owned()
+                        }
+                        (true, HeldStop::Sent) => {
+                            " (the stop was sent once the turn started)".to_owned()
+                        }
+                        (true, _) => {
+                            " (no stop was sent: the provider refused or had already finished the turn)"
+                                .to_owned()
+                        }
+                        (false, _) if interrupt_error.is_empty() => String::new(),
+                        (false, _) => format!(" ({interrupt_error})"),
                     };
                     return Err(format!(
                         "Provider interruption was not confirmed within 30 seconds{reason}; backend work may still be active. Inspect exact provider session before recovery"

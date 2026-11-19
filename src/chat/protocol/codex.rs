@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, HeldStop, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -520,7 +520,7 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
-            stop_on_start: false,
+            held_stop: HeldStop::None,
             notification_turn: None,
             notification_revision: 0,
             busy: false,
@@ -689,7 +689,7 @@ struct Codex {
     turn: Option<String>,
     /// A stop asked for while this thread's `turn/start` was unanswered,
     /// sent as `turn/interrupt` once the turn's ID is known.
-    stop_on_start: bool,
+    held_stop: HeldStop,
     /// Exact live notice authority. Scalar status and paged history must not
     /// replace it; they can arrive after a newer turn's start.
     notification_turn: Option<String>,
@@ -2103,7 +2103,7 @@ impl Adapter for Codex {
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
-                        self.stop_on_start = false;
+                        self.held_stop = HeldStop::None;
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
@@ -2128,7 +2128,7 @@ impl Adapter for Codex {
             // while its start is unanswered waits for that name.
             Command::Interrupt => match self.turn.clone() {
                 Some(turn) => self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?,
-                None if self.starting_turn() => self.stop_on_start = true,
+                None if self.starting_turn() => self.held_stop = HeldStop::Waiting,
                 None => return Err("There is no known active Codex turn to interrupt".into()),
             },
             // The client's form of the model's own `interrupt_agent`: a child
@@ -2238,14 +2238,14 @@ impl Adapter for Codex {
         }
         Ok(step)
     }
-    fn stop_held(&self) -> bool {
-        self.stop_on_start
+    fn held_stop(&self) -> HeldStop {
+        self.held_stop
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
-        if self.stop_on_start {
+        if self.held_stop == HeldStop::Waiting {
             if let Some(turn) = self.turn.clone() {
-                self.stop_on_start = false;
+                self.held_stop = HeldStop::Sent;
                 self.call(
                     &mut step,
                     "turn/interrupt",
@@ -2254,7 +2254,7 @@ impl Adapter for Codex {
                 )?;
             } else if !self.starting_turn() {
                 // The start failed: there is nothing left to stop.
-                self.stop_on_start = false;
+                self.held_stop = HeldStop::Dropped;
             }
         }
         Ok(step)
@@ -2847,17 +2847,21 @@ impl Codex {
                     // The answer names the very turn a stop given while it
                     // was unanswered was for, whichever lifecycle it now
                     // belongs to. One that already finished needs none.
-                    if std::mem::take(&mut self.stop_on_start)
-                        && !early_completion
+                    if self.held_stop == HeldStop::Waiting {
+                        if early_completion
                             .as_ref()
                             .is_some_and(|early| early.completed.is_some())
-                    {
-                        self.call(
-                            &mut step,
-                            "turn/interrupt",
-                            json!({"threadId":self.thread,"turnId":id}),
-                            Pending::Other,
-                        )?;
+                        {
+                            self.held_stop = HeldStop::Dropped;
+                        } else {
+                            self.held_stop = HeldStop::Sent;
+                            self.call(
+                                &mut step,
+                                "turn/interrupt",
+                                json!({"threadId":self.thread,"turnId":id}),
+                                Pending::Other,
+                            )?;
+                        }
                     }
                     // An active-status update may announce newer work before
                     // its turn ID arrives. The old request's correlation alone

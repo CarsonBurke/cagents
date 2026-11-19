@@ -404,6 +404,21 @@ pub struct ServerIdentity {
 }
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
+/// What became of a stop an adapter held, unsent, until the provider named
+/// the turn it was for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeldStop {
+    /// No stop is held: none was asked for, or it went out at once.
+    #[default]
+    None,
+    /// Held until the provider names the turn.
+    Waiting,
+    /// Sent once the provider named the turn.
+    Sent,
+    /// Never sent: the provider refused the turn or had already finished it.
+    Dropped,
+}
+
 pub trait Adapter: Send {
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
@@ -421,10 +436,10 @@ pub trait Adapter: Send {
     fn initialization_pending(&self) -> bool {
         false
     }
-    /// Whether a stop this adapter accepted is still held, unsent, until
-    /// the provider names the turn it is for.
-    fn stop_held(&self) -> bool {
-        false
+    /// What became of a stop this adapter held until the provider named
+    /// the turn it is for.
+    fn held_stop(&self) -> HeldStop {
+        HeldStop::None
     }
     /// Whether a settled turn's outcome still waits on a provider reply, such
     /// as the acknowledgement of an interrupt sent before its result arrived.

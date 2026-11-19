@@ -1932,7 +1932,7 @@ fn adapter() -> Codex {
         pricing: Default::default(),
         turn_pricing: Default::default(),
         turn: None,
-        stop_on_start: false,
+        held_stop: HeldStop::None,
         notification_turn: None,
         notification_revision: 0,
         busy: false,
@@ -2950,6 +2950,7 @@ fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
         interrupts(&answered),
         vec![json!({"threadId":"thread-exact","turnId":"turn-a"})]
     );
+    assert_eq!(adapter.held_stop(), HeldStop::Sent);
     adapter.receive(finish("turn-a")).unwrap();
 
     let request = prompt(&mut adapter);
@@ -3008,10 +3009,28 @@ fn a_stop_given_before_a_turn_starts_interrupts_it_once_named() {
         .receive(json!({"id":request,"error":{"code":-32600,"message":"thread is closed"}}))
         .unwrap();
     assert!(interrupts(&refused).is_empty());
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
     assert!(
         adapter.command(Command::Interrupt).is_err(),
         "nothing left to stop"
     );
+
+    // A turn that finished before its start was answered needs no stop.
+    let request = prompt(&mut adapter);
+    adapter.command(Command::Interrupt).unwrap();
+    assert_eq!(adapter.held_stop(), HeldStop::Waiting);
+    let finished = adapter
+        .receive(
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn-d","status":"completed","items":[]}}}),
+        )
+        .unwrap();
+    assert!(interrupts(&finished).is_empty());
+    let answered = adapter
+        .receive(json!({"id":request,"result":{"turn":{"id":"turn-d"}}}))
+        .unwrap();
+    assert!(interrupts(&answered).is_empty(), "nothing left to stop");
+    assert_eq!(adapter.held_stop(), HeldStop::Dropped);
 }
 
 /// A child is a thread of its own: stopping it interrupts its turn alone,
