@@ -4474,6 +4474,12 @@ fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
     let snapshot = until(&handle, |snapshot| snapshot.ready);
     assert_eq!(snapshot.session_id.as_deref(), Some(session.as_str()));
     assert!(says(&snapshot, "Turned on debugging in config.toml."));
+    // The saved conversation left the stopped step running; it shows as
+    // stopped, not as still working.
+    assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+        ItemContent::Command { command, status: super::super::ToolStatus::Stopped, .. }
+            if command == "sleep 60")));
+    assert!(!snapshot.busy);
     assert!(snapshot.items.iter().any(|item| item.role == super::super::Role::User
         && matches!(&item.content, ItemContent::Text { text, .. } if text == "Use some tools")));
     assert!(snapshot.error.is_none(), "{:?}", snapshot.error);

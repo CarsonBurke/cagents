@@ -1090,14 +1090,14 @@ its older `models` and `modes` lists. Run as `muse...` or with
 no thinking level. It ignores its arguments, so a launch recipe written for
 the real agent runs it unchanged. It contacts no model, account or network.
 
-It keeps sessions as JSON lines under `FAKE_ACP_STATE`, or
-`$XDG_DATA_HOME/fake-acp-agent`, so `session/load` replays a conversation
-from an earlier process and `session/list` finds it. Point it at the
-fixture's own directory.
+It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
+replays a conversation from an earlier process and `session/list` finds it.
+Point it at the fixture's own directory; without it, sessions go to a
+directory in the system's temporary directory.
 
-A prompt's words choose what it does:
+The first of these words a prompt contains chooses what it does:
 
-| Prompt contains | The agent |
+| Word | The agent |
 | --- | --- |
 | `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
@@ -1108,7 +1108,7 @@ A prompt's words choose what it does:
 | `title` | names the conversation |
 | `refuse` | ends the turn as a refusal |
 | `auth` | answers that sign-in is required |
-| `/compact` | compacts the conversation |
+| `/compact`, at the start | compacts the conversation |
 
 Anything else gets a thought and `Fake answer to: ...`. These variables add
 failures:

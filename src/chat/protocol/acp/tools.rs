@@ -219,6 +219,8 @@ fn status(status: &str) -> Option<ToolStatus> {
 fn contents(blocks: &[Value]) -> (String, Vec<FileChange>) {
     let mut output = String::new();
     let mut diffs = Vec::new();
+    // Every diff of a call shares the bound on its output.
+    let mut budget = MAX_OUTPUT;
     for block in blocks {
         match block["type"].as_str() {
             Some("content") => {
@@ -230,7 +232,12 @@ fn contents(blocks: &[Value]) -> (String, Vec<FileChange>) {
                 }
             }
             Some("diff") if diffs.len() < MAX_DIFFS => {
-                if let Some(change) = diff(block) {
+                if let Some(mut change) = diff(block) {
+                    let shown = change.diff.len().min(budget);
+                    if shown < change.diff.len() {
+                        change.diff = bounded_to(change.diff, shown);
+                    }
+                    budget -= shown;
                     diffs.push(change);
                 }
             }
@@ -303,9 +310,14 @@ fn exit_code(raw: &Value) -> Option<i32> {
         .and_then(|code| i32::try_from(code).ok())
 }
 
-fn bounded(mut text: String) -> String {
-    if text.len() > MAX_OUTPUT {
-        let mut end = MAX_OUTPUT;
+fn bounded(text: String) -> String {
+    bounded_to(text, MAX_OUTPUT)
+}
+
+/// `text`, cut to its first `limit` bytes with a note when it is longer.
+fn bounded_to(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let mut end = limit;
         while !text.is_char_boundary(end) {
             end -= 1;
         }

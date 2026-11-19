@@ -35,6 +35,12 @@ const PROTOCOL_VERSION: u64 = 1;
 const MAX_COMMANDS: usize = 256;
 const MAX_PLAN_STEPS: usize = 256;
 const MAX_SESSION_ID: usize = 256;
+/// The message identifiers remembered for naming items, about a long
+/// conversation's worth.
+const MAX_SEGMENT_IDS: usize = 4096;
+/// The approvals that may be open at once; an agent asking for more is
+/// refused rather than piling them up in front of the reader.
+const MAX_PERMISSIONS: usize = 64;
 
 /// What one agent needs beyond the protocol itself.
 pub struct Profile {
@@ -208,6 +214,9 @@ struct Acp {
     replay: Option<history::Replay>,
     calls: tools::Calls,
     segment: Option<Segment>,
+    /// How many items each message identifier has opened, so a message the
+    /// agent resumes after a tool call continues below it in a new item.
+    segment_ids: HashMap<String, u32>,
     next_item: u64,
     turn: Option<Turn>,
     permissions: BTreeMap<String, Permission>,
@@ -233,6 +242,7 @@ impl Acp {
             replay: None,
             calls: tools::Calls::default(),
             segment: None,
+            segment_ids: HashMap::new(),
             next_item: 0,
             turn: None,
             permissions: BTreeMap::new(),
@@ -425,6 +435,9 @@ impl Acp {
         self.segment = None;
         let (kind, notice) = match outcome {
             Ok(result) => {
+                // The unstable `PromptResponse.usage` is read as this turn's
+                // own tokens, so turns add up; an agent that reports a
+                // running total instead would be counted again each turn.
                 if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
                     let count = |key: &str| usage[key].as_u64().unwrap_or(0);
                     self.usage.input_tokens += count("inputTokens");
@@ -640,7 +653,12 @@ impl Acp {
             };
             self.session = Some(id.to_owned());
         }
-        if let Some(replay) = self.replay.take() {
+        if let Some(mut replay) = self.replay.take() {
+            // A step the saved conversation left running ended with the
+            // process that ran it; it is not running now.
+            for (id, content) in self.calls.stop_running() {
+                replay.absorb(Event::Item(tool_item(id, content)));
+            }
             step.events.push(Event::History {
                 items: replay.finish(),
                 has_earlier: false,
@@ -679,10 +697,11 @@ impl Acp {
             })
             .take(16)
             .collect::<Vec<_>>();
-        // A request that cannot be answered, or that arrives after the
-        // reader stopped the turn, is cancelled as the protocol requires.
+        // A request that cannot be answered, that arrives after the reader
+        // stopped the turn, or beyond what a reader could work through, is
+        // cancelled as the protocol requires.
         let stopping = self.turn.as_ref().is_some_and(|turn| turn.cancelling);
-        if options.is_empty() || stopping {
+        if options.is_empty() || stopping || self.permissions.len() >= MAX_PERMISSIONS {
             step.writes.push(rpc::result(
                 rpc,
                 json!({"outcome": {"outcome": "cancelled"}}),
@@ -733,6 +752,25 @@ impl Acp {
                     .collect(),
             },
         );
+    }
+
+    /// The agent no longer wants an answer to an approval it asked for.
+    fn withdrawn(&mut self, rpc: &Value, step: &mut Step) {
+        let Some(id) = self
+            .permissions
+            .iter()
+            .find(|(_, permission)| permission.rpc == *rpc)
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        self.permissions.remove(&id);
+        step.writes
+            .push(rpc::error(rpc, rpc::REQUEST_CANCELLED, "Request cancelled"));
+        step.events.push(Event::RequestResolved { id });
+        if self.permissions.is_empty() {
+            step.events.push(Event::Waiting(false));
+        }
     }
 
     fn update(&mut self, params: &Value, step: &mut Step) {
@@ -906,16 +944,30 @@ impl Acp {
                 && (message.is_none() || segment.message == message)
         });
         if !continues {
-            let id = match &message {
-                Some(message) => format!(
+            let base = message.as_ref().map(|message| {
+                format!(
                     "acp-{}:{message}",
                     match (role, thinking) {
                         (Role::User, _) => "user",
                         (_, true) => "thought",
                         _ => "message",
                     }
-                ),
-                None => self.item_id(),
+                )
+            });
+            let id = match base {
+                Some(base)
+                    if self.segment_ids.len() < MAX_SEGMENT_IDS
+                        || self.segment_ids.contains_key(&base) =>
+                {
+                    let opened = self.segment_ids.entry(base.clone()).or_default();
+                    *opened += 1;
+                    match *opened {
+                        1 => base,
+                        n => format!("{base}:{n}"),
+                    }
+                }
+                // Past the bound, a message is told apart by its order alone.
+                _ => self.item_id(),
             };
             self.segment = Some(Segment {
                 role,
@@ -983,12 +1035,17 @@ impl Adapter for Acp {
     }
 
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
+        // The same reading of the action as answering it: an offered option
+        // by its kind, and otherwise the request cancelled.
         self.permissions.get(request_id).is_some_and(|permission| {
-            action == "cancel"
-                || permission
-                    .options
-                    .iter()
-                    .any(|(option, kind)| option == action && kind.starts_with("reject"))
+            match permission
+                .options
+                .iter()
+                .find(|(option, _)| option == action)
+            {
+                Some((_, kind)) => kind.starts_with("reject"),
+                None => action == "cancel",
+            }
         })
     }
 
@@ -1037,7 +1094,7 @@ impl Adapter for Acp {
             } => {
                 if mode != PromptMode::Send {
                     return Err(format!(
-                        "{label} takes a new message only between turns; it is held until this one ends."
+                        "{label} cannot take a message while it is working; send it once this turn ends."
                     ));
                 }
                 self.accepts_turn()?;
@@ -1242,6 +1299,10 @@ impl Adapter for Acp {
                 scoped = true;
                 self.update(params, &mut step);
             }
+            rpc::Frame::Notification {
+                method: "$/cancel_request",
+                params,
+            } => self.withdrawn(&params["requestId"], &mut step),
             rpc::Frame::Notification { .. } | rpc::Frame::Other => {}
             rpc::Frame::Response { id: None, .. } => {}
             rpc::Frame::Response {

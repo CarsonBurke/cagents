@@ -370,6 +370,31 @@ fn streamed_text_and_thought_keep_one_item_each_until_a_tool_intervenes() {
     assert_eq!(ids[2], ids[3]);
     assert_ne!(ids[4].0, ids[3].0);
     assert_ne!(ids[4].0, ids[0].0);
+    // The same message resumed after another tool call continues below
+    // the call, in an item of its own.
+    acp.receive(update(
+        &session,
+        json!({"sessionUpdate": "tool_call", "toolCallId": "t2",
+        "title": "Read", "kind": "read", "status": "pending"}),
+    ))
+    .unwrap();
+    let mut resumed = Vec::new();
+    for _ in 0..2 {
+        for event in acp
+            .receive(update(
+                &session,
+                json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1",
+                "content": {"type": "text", "text": "More"}}),
+            ))
+            .unwrap()
+            .events
+        {
+            if let Event::TextDelta { id, .. } = event {
+                resumed.push(id);
+            }
+        }
+    }
+    assert_eq!(resumed, ["acp-message:m1:2", "acp-message:m1:2"]);
 }
 
 #[test]
@@ -493,6 +518,8 @@ fn a_permission_is_declined_by_its_kind_never_its_label() {
     assert!(acp.answer_declines(&request.id, "allow"));
     assert!(acp.answer_declines(&request.id, "never"));
     assert!(!acp.answer_declines("another-request", "never"));
+    // An action no option has cancels the request, which declines it.
+    assert!(acp.answer_declines(&request.id, "cancel"));
     assert!(
         acp.command(Command::Answer {
             request_id: request.id.clone(),
@@ -1161,4 +1188,100 @@ fn a_launch_needs_an_absolute_directory_and_an_exact_session() {
     assert!(create(&TEST_PROFILE, &launch(&[], Some(""))).is_err());
     assert!(create(&TEST_PROFILE, &launch(&[], Some("a\nb"))).is_err());
     assert!(create(&TEST_PROFILE, &launch(&["--model"], None)).is_err());
+}
+
+#[test]
+fn an_option_named_cancel_is_read_by_its_kind() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    prompt(&mut acp, "permission");
+    let step = acp
+        .receive(
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/request_permission",
+            "params": {"sessionId": session, "toolCall": {"toolCallId": "x"},
+                "options": [{"optionId": "cancel", "name": "Continue", "kind": "allow_once"}]}}),
+        )
+        .unwrap();
+    let Some(Event::Request(request)) = step
+        .events
+        .iter()
+        .find(|event| matches!(event, Event::Request(_)))
+    else {
+        panic!("{:?}", step.events);
+    };
+    assert!(!acp.answer_declines(&request.id, "cancel"));
+    let step = acp
+        .command(Command::Answer {
+            request_id: request.id.clone(),
+            action: "cancel".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        only_write(&step)["result"]["outcome"],
+        json!({"outcome": "selected", "optionId": "cancel"})
+    );
+}
+
+#[test]
+fn an_approval_the_agent_withdraws_leaves_the_reader() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    prompt(&mut acp, "permission");
+    let ask = |acp: &mut Acp, id: Value| {
+        acp.receive(
+            json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+            "params": {"sessionId": session, "toolCall": {"toolCallId": "x"},
+                "options": [{"optionId": "ok", "name": "Allow", "kind": "allow_once"}]}}),
+        )
+        .unwrap()
+    };
+    ask(&mut acp, json!("first"));
+    ask(&mut acp, json!(2));
+    let withdraw = |acp: &mut Acp, id: Value| {
+        acp.receive(
+            json!({"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": id}}),
+        )
+        .unwrap()
+    };
+    let step = withdraw(&mut acp, json!("first"));
+    assert_eq!(only_write(&step)["error"]["code"], -32800);
+    assert_eq!(only_write(&step)["id"], "first");
+    assert!(matches!(
+        step.events.as_slice(),
+        [Event::RequestResolved { .. }]
+    ));
+    // A request that is not open is not answered twice.
+    assert!(withdraw(&mut acp, json!("first")).writes.is_empty());
+    let step = withdraw(&mut acp, json!(2));
+    assert!(step.events.contains(&Event::Waiting(false)));
+    assert!(acp.permissions.is_empty());
+}
+
+#[test]
+fn approvals_beyond_the_bound_are_cancelled_without_being_shown() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    prompt(&mut acp, "permission");
+    for id in 0..MAX_PERMISSIONS + 3 {
+        let step = acp
+            .receive(
+                json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+                "params": {"sessionId": session, "toolCall": {"toolCallId": "x"},
+                    "options": [{"optionId": "ok", "name": "Allow", "kind": "allow_once"}]}}),
+            )
+            .unwrap();
+        let shown = step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Request(_)));
+        assert_eq!(shown, id < MAX_PERMISSIONS, "{id}");
+        if !shown {
+            assert_eq!(
+                only_write(&step)["result"]["outcome"]["outcome"],
+                "cancelled"
+            );
+        }
+    }
+    assert_eq!(acp.permissions.len(), MAX_PERMISSIONS);
 }

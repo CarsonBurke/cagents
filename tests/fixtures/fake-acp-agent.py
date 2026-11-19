@@ -8,11 +8,12 @@ copy the shapes of Antigravity 1.5.12's and Muse 1.4.23's `initialize` and
 `muse` or `muse-upstream` or with FAKE_ACP_SHAPE=muse. Any command-line
 arguments, such as `acp --disable-telemetry`, are accepted and ignored.
 
-Each conversation is saved under FAKE_ACP_STATE (default
-$XDG_DATA_HOME/fake-acp-agent) as the session updates it sent, so
+Each conversation is saved under FAKE_ACP_STATE (default: a directory in
+the system's temporary directory) as the session updates it sent, so
 `session/load` replays it and `session/list` lists it.
 
-The prompt chooses the turn, by the first of these words it contains:
+The prompt chooses the turn, by the first of these words it contains as a
+word:
 
   tools       a plan, a shell command, a file edit with its diff, then an answer
   permission  an edit that asks for approval first; refusing fails the edit,
@@ -43,7 +44,9 @@ Environment switches:
 import json
 import os
 import queue
+import re
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -51,9 +54,10 @@ import uuid
 SHAPE = os.environ.get("FAKE_ACP_SHAPE") or (
     "muse" if os.path.basename(sys.argv[0]).startswith("muse") else "agy"
 )
+# Never a real data directory: without FAKE_ACP_STATE, conversations last
+# only as long as the temporary directory does.
 STATE = os.environ.get("FAKE_ACP_STATE") or os.path.join(
-    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
-    "fake-acp-agent",
+    tempfile.gettempdir(), f"fake-acp-agent-{os.getuid()}"
 )
 AUTH = os.environ.get("FAKE_ACP_AUTH", "")
 LOG = os.environ.get("FAKE_ACP_LOG")
@@ -179,15 +183,23 @@ class Agent:
         self.cancelled = set()
 
     def read(self):
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            if LOG:
-                with open(LOG, "a") as log:
-                    log.write(line + "\n")
-            self.inbox.put(json.loads(line))
-        self.inbox.put(None)
+        # Whatever ends the input, the agent hears that it ended and exits.
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                if LOG:
+                    with open(LOG, "a") as log:
+                        log.write(line + "\n")
+                try:
+                    frame = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(frame, dict):
+                    self.inbox.put(frame)
+        finally:
+            self.inbox.put(None)
 
     def call(self, method, params):
         self.next_request += 1
@@ -350,9 +362,9 @@ class Agent:
         if session.title is None:
             session.title = text.strip().splitlines()[0][:60] if text.strip() else None
         self.remember(session)
-        words = text.lower()
+        words = set(re.findall(r"[a-z]+", text.lower()))
         stop = "end_turn"
-        if "auth" in words.split():
+        if "auth" in words:
             return signed_out(id)
         if text.strip().startswith("/compact"):
             self.say(session, "Compacted the conversation.")
