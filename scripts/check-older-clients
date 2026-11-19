@@ -12,6 +12,7 @@ re-proof still needs the Rust test.
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -20,6 +21,9 @@ from pathlib import Path
 IPC = Path("src/terminal/ipc.rs")
 OLDER_CLIENTS = Path("src/terminal/ipc/older_clients.rs")
 RECORDINGS = Path("tests/fixtures/wire-formats")
+# Variables that would point `git -C ROOT` at another repository.
+GIT_LOCATION = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
 
 
 def problems_from(ipc: str | None, older: str | None, recording_names: list[str]) -> list[str]:
@@ -68,20 +72,17 @@ def problems(root: Path) -> list[str]:
 
 
 def problems_in_tree(git_root: Path, tree: str) -> list[str] | None:
+    env = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION}
+
+    def git(*args: str, check: bool = False) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(git_root), *args], check=check,
+                              capture_output=True, text=True, env=env)
+
     def read(path: Path) -> str | None:
-        result = subprocess.run(
-            ["git", "-C", str(git_root), "cat-file", "-p", f"{tree}:{path}"],
-            capture_output=True,
-            text=True,
-        )
+        result = git("cat-file", "-p", f"{tree}:{path}")
         if result.returncode == 0:
             return result.stdout
-        listed = subprocess.run(
-            ["git", "-C", str(git_root), "ls-tree", "--name-only", tree, "--", str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        listed = git("ls-tree", "--name-only", tree, "--", str(path), check=True)
         if listed.stdout:
             result.check_returncode()
         return None
@@ -89,12 +90,7 @@ def problems_in_tree(git_root: Path, tree: str) -> list[str] | None:
     ipc = read(IPC)
     if ipc is None:
         return None
-    recordings = subprocess.run(
-        ["git", "-C", str(git_root), "ls-tree", "--name-only", tree, f"{RECORDINGS}/"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    recordings = git("ls-tree", "--name-only", tree, f"{RECORDINGS}/", check=True)
     return problems_from(
         ipc,
         read(OLDER_CLIENTS),

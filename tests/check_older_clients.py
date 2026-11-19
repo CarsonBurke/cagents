@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import tempfile
 import unittest
@@ -77,6 +78,23 @@ class OlderClientProof(unittest.TestCase):
                     checker.problems_in_tree(root, "HEAD^{tree}"),
                     checker.problems(root),
                 )
+
+    def test_a_git_tree_ignores_a_git_dir_pointing_elsewhere(self):
+        root = self.tree(151, [129], [128, 129, 151])
+        self.commit(root)
+        expected = checker.problems(root)
+        elsewhere = tempfile.TemporaryDirectory()
+        self.addCleanup(elsewhere.cleanup)
+        subprocess.run(["git", "init", "-q", elsewhere.name], check=True)
+        saved = os.environ.get("GIT_DIR")
+        os.environ["GIT_DIR"] = str(Path(elsewhere.name) / ".git")
+        try:
+            self.assertEqual(checker.problems_in_tree(root, "HEAD^{tree}"), expected)
+        finally:
+            if saved is None:
+                del os.environ["GIT_DIR"]
+            else:
+                os.environ["GIT_DIR"] = saved
 
     def test_a_tree_without_the_protocol_has_nothing_to_check(self):
         root = self.tree(151, [151], [151])
