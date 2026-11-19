@@ -564,7 +564,7 @@ impl Cagents {
         }
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             if !runtime.start_blocked.is_some_and(Reopen::reopens)
-                || runtime.pending.is_some()
+                || !runtime.commands.is_idle()
                 || runtime.attachment_chooser_pending.is_some()
                 || runtime.pastes_pending > 0
             {
