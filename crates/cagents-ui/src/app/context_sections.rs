@@ -319,7 +319,7 @@ impl Cagents {
         let mut children: Vec<Element<'_, Message>> = Vec::with_capacity(panes.len() * 3 + 3);
         if let Some((activity, _)) = activity {
             children.push(activity);
-            children.push(design::horizontal_rule().into());
+            children.push(design::horizontal_rule());
         }
         for (index, pane) in panes.into_iter().enumerate() {
             if index > 0 {
