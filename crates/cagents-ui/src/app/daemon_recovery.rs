@@ -72,7 +72,7 @@ pub(super) fn reconcile(
         session,
         explicit_retry,
         &socket,
-        || Leased::Fresh(client).or_reconnect(&socket),
+        || Leased::Fresh(Box::new(client)).or_reconnect(&socket),
         Path::new("/proc"),
         holder_of_kind,
     )
@@ -136,7 +136,7 @@ pub(super) fn inspect_saved_at(
 enum Leased<'a> {
     /// A connection the caller keeps using after the recovery.
     Held(&'a mut ControlClient),
-    Fresh(ControlClient),
+    Fresh(Box<ControlClient>),
 }
 
 impl Leased<'_> {
@@ -150,7 +150,7 @@ impl Leased<'_> {
             return Ok(self);
         }
         ControlClient::connect(socket)
-            .map(Self::Fresh)
+            .map(|client| Self::Fresh(Box::new(client)))
             .map_err(|error| error.to_string())
     }
 
@@ -385,7 +385,7 @@ fn reconcile_with(
         socket,
         || {
             ControlClient::connect(socket)
-                .map(Leased::Fresh)
+                .map(|client| Leased::Fresh(Box::new(client)))
                 .map_err(|error| error.to_string())
         },
         proc_root,
