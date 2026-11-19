@@ -491,17 +491,15 @@ impl Cagents {
             return Task::none();
         };
         let id = session.id;
-        if !self
-            .update_resume
-            .offers
-            .iter()
-            .any(|outcome| outcome.work.id == id)
-        {
+        // A resume still asking the record is not sent after their message,
+        // even once another answer has taken the row off the offer.
+        let state = &mut self.update_resume;
+        let pending = state.taking.contains(&id);
+        state.taking.retain(|taking| *taking != id);
+        if !pending && !state.offers.iter().any(|outcome| outcome.work.id == id) {
             return Task::none();
         }
-        // A resume still asking the record is not sent after their message.
-        self.update_resume.taking.retain(|taking| *taking != id);
-        self.update_resume.handle(id);
+        state.handle(id);
         self.take_update_offer(vec![id], Vec::new())
     }
 

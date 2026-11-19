@@ -335,6 +335,53 @@ fn writing_while_the_record_is_asked_cancels_the_resume() {
     assert!(offered(&app).is_empty());
 }
 
+/// Another Resume's answer can take a row off the offer while its own
+/// answer is still on the way; writing to it then still cancels its resume.
+#[test]
+fn writing_cancels_a_resume_another_answer_already_took_off_the_offer() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let _record = shared(&mut app);
+    let first = live_chat_for_provider(&mut app, Provider::Claude, Some("first"));
+    let second = live_chat_for_provider(&mut app, Provider::Claude, Some("second"));
+    let (a, b) = (session_id(&app, first), session_id(&app, second));
+    let update = job(
+        UpdatePhase::Complete,
+        vec![
+            outcome(a, Fate::Interrupted, |work| work.turn = true),
+            outcome(b, Fate::Interrupted, |work| work.turn = true),
+        ],
+    );
+    offer(&mut app, &update, &[]);
+    drop(app.update_update_resume(Action::Resume(a)));
+    let resume_a = taken_request(&mut app, a).unwrap();
+    drop(app.update_update_resume(Action::Resume(b)));
+    let resume_b = taken_request(&mut app, b).unwrap();
+    // B's answer comes first and already records A's claim.
+    drop(app.update_update_resume(Action::Taken(
+        update.id.clone(),
+        vec![resume_b],
+        Ok(Taken {
+            first: vec![b],
+            handled: vec![a, b],
+        }),
+    )));
+    assert!(app.update_resume.offers.is_empty());
+    write(&mut app, first, "Where were we?");
+    submit(&mut app, first);
+    drop(app.update_update_resume(Action::Taken(
+        update.id.clone(),
+        vec![resume_a],
+        Ok(Taken {
+            first: vec![a],
+            handled: vec![a, b],
+        }),
+    )));
+    assert_eq!(sent(&app, first).as_deref(), Some("Where were we?"));
+    assert_eq!(held(&app, first), None, "nothing else waits to go");
+    assert!(sent(&app, second).is_some_and(|message| message.contains("carry on")));
+    assert!(app.update_resume.taking.is_empty());
+}
+
 #[test]
 fn the_message_names_tasks_as_their_provider_did_and_counts_the_unnamed() {
     let mut work = InFlight {
@@ -367,7 +414,8 @@ fn the_message_names_tasks_as_their_provider_did_and_counts_the_unnamed() {
 #[test]
 fn resume_all_asks_every_conversation_listed() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let cards: Vec<_> = ["one", "two"]
+    // More than the six rows shown.
+    let cards: Vec<_> = ["one", "two", "three", "four", "five", "six", "seven"]
         .into_iter()
         .map(|name| live_chat_for_provider(&mut app, Provider::Claude, Some(name)))
         .collect();
