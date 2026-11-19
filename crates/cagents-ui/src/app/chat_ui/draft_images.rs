@@ -22,16 +22,37 @@ pub(super) struct Detached {
     attachment: Attachment,
 }
 
-/// Most detached images one draft remembers. Each is a receipt, not pixels,
-/// but a draft that cycles through pastes should not grow without end.
-const MAX_DETACHED: usize = 64;
+/// Most detached images one draft remembers: as many as the undo history
+/// has steps, since each step can take one reference out and undoing it must
+/// find its image. Each is a receipt, not pixels.
+const MAX_DETACHED: usize = crate::editor_history::MAX_TRANSACTIONS;
+
+/// The longest `[Image N]` token [`tokens`] looks for.
+const MAX_TOKEN: usize = 32;
+
+/// Every short bracketed span in `text`, read in one pass, so that asking
+/// whether the draft holds a reference costs a lookup rather than a search
+/// of the whole draft per image. A token has no bracket inside it, so this
+/// finds every one a substring search would.
+fn tokens(text: &str) -> HashSet<&str> {
+    let bytes = text.as_bytes();
+    let mut found = HashSet::new();
+    for (start, _) in text.match_indices('[') {
+        let reach = bytes.len().min(start + MAX_TOKEN);
+        if let Some(end) = bytes[start + 1..reach].iter().position(|&b| b == b']') {
+            found.insert(&text[start..start + end + 2]);
+        }
+    }
+    found
+}
 
 /// The ids of `attachments` whose reference `text` holds.
 pub(super) fn inline(text: &str, attachments: &[Attachment]) -> HashSet<uuid::Uuid> {
+    let present = tokens(text);
     attachments
         .iter()
         .filter_map(|attachment| attachment.reference.as_ref())
-        .filter(|reference| text.contains(&reference.token()))
+        .filter(|reference| present.contains(reference.token().as_str()))
         .map(|reference| reference.id)
         .collect()
 }
@@ -56,18 +77,31 @@ pub(super) fn reconcile(
     attachments: &mut Vec<Attachment>,
     detached: &mut Vec<Detached>,
 ) -> bool {
+    let present = tokens(text);
+    let holds = |attachment: &Attachment| {
+        attachment
+            .reference
+            .as_ref()
+            .is_some_and(|reference| present.contains(reference.token().as_str()))
+    };
     let mut changed = false;
     let mut index = 0;
+    // Where each leaving image stood before this edit, so that images that
+    // leave together return in their order.
+    let mut left = 0;
     while index < attachments.len() {
         let leaves = attachments[index]
             .reference
             .as_ref()
-            .is_some_and(|reference| {
-                before.contains(&reference.id) && !text.contains(&reference.token())
-            });
+            .is_some_and(|reference| before.contains(&reference.id))
+            && !holds(&attachments[index]);
         if leaves {
             let attachment = attachments.remove(index);
-            detached.push(Detached { index, attachment });
+            detached.push(Detached {
+                index: index + left,
+                attachment,
+            });
+            left += 1;
             changed = true;
         } else {
             index += 1;
@@ -77,11 +111,7 @@ pub(super) fn reconcile(
     // puts each back where it was.
     let mut returning = Vec::new();
     detached.retain(|entry| {
-        let back = entry
-            .attachment
-            .reference
-            .as_ref()
-            .is_some_and(|reference| text.contains(&reference.token()));
+        let back = holds(&entry.attachment);
         if back {
             returning.push(entry.clone());
         }
@@ -144,7 +174,7 @@ impl EditBuffer for Buffer<'_> {
         start: Position,
         expected: &str,
         replacement: &str,
-        _replacement_breaks: &[usize],
+        replacement_breaks: &[usize],
     ) -> bool {
         // An upper bound on the lines `expected` spans; the excerpt stops at
         // the buffer's end.
@@ -169,11 +199,32 @@ impl EditBuffer for Buffer<'_> {
                 selection: (!expected.is_empty()).then_some(start),
             },
         );
-        if !(expected.is_empty() && replacement.is_empty()) {
-            self.0
-                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                    Arc::new(replacement.to_owned()),
-                )));
+        let paste = |content: &mut Content<cosmic::Renderer>, text: &str| {
+            content.perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(text.to_owned()),
+            )));
+        };
+        if replacement.is_empty() {
+            if !expected.is_empty() {
+                paste(self.0, "");
+            }
+        } else if crate::editor_history::canonical_breaks(replacement, replacement_breaks) {
+            paste(self.0, replacement);
+        } else {
+            // One paste of these bytes would read their line endings again
+            // and could join a recorded LF and CR into one break; each line's
+            // fragment goes in on its own, as the repository editor does.
+            let mut previous = 0;
+            for end in replacement_breaks
+                .iter()
+                .copied()
+                .chain(std::iter::once(replacement.len()))
+            {
+                if end > previous {
+                    paste(self.0, &replacement[previous..end]);
+                }
+                previous = end;
+            }
         }
         true
     }
@@ -258,6 +309,41 @@ mod tests {
             assert_eq!(detached.len(), 1);
             assert_eq!(detached[0].attachment, removed);
         });
+    }
+
+    #[test]
+    fn images_that_leave_together_return_in_their_order() {
+        attachment_assets::with_test_image(|first| {
+            let second = attachment_assets::test_image("second.png");
+            let third = attachment_assets::test_image("third.png");
+            let all = vec![first.clone(), second.clone(), third.clone()];
+            let token = |a: &Attachment| a.reference.as_ref().unwrap().token();
+            let full = format!("{} {} {}", token(&first), token(&second), token(&third));
+            let mut attachments = all.clone();
+            let mut detached = Vec::new();
+            // One cut takes the first two.
+            let before = inline(&full, &attachments);
+            let cut = token(&third);
+            assert!(reconcile(&cut, &before, &mut attachments, &mut detached));
+            assert_eq!(attachments, [third.clone()]);
+            let before = inline(&cut, &attachments);
+            assert!(reconcile(&full, &before, &mut attachments, &mut detached));
+            assert_eq!(attachments, all);
+        });
+    }
+
+    #[test]
+    fn the_token_scan_finds_what_a_search_would() {
+        let text = "[[Image 1]] [Image 2 [Image 3]] é[Image 4] [Image 5";
+        let found = tokens(text);
+        for n in 1..=5 {
+            let token = format!("[Image {n}]");
+            assert_eq!(
+                found.contains(token.as_str()),
+                text.contains(&token),
+                "{token}"
+            );
+        }
     }
 
     #[test]
