@@ -1488,7 +1488,9 @@ fn locate(
             ),
             None => Location::Missed,
         },
-        Provider::Omp => Location::Found(id, Source::Unsupported),
+        Provider::Omp | Provider::Antigravity | Provider::Muse => {
+            Location::Found(id, Source::Unsupported)
+        }
     }
 }
 

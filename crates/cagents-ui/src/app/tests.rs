@@ -3019,7 +3019,7 @@ fn empty_workspace_exposes_provider_status_on_real_account_controls() {
         element
             .as_widget()
             .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    for provider in crate::agent::Provider::ALL {
+    for provider in crate::account::Account::REPORTED {
         let expected = format!(
             "{} · {} · Manage accounts",
             provider.label(),

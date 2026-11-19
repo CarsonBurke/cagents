@@ -508,6 +508,8 @@ impl<'a> Records<'a> {
                     _ => {}
                 }
             }
+            // The catalog lists no transcript of theirs to read.
+            Provider::Antigravity | Provider::Muse => {}
         }
     }
 

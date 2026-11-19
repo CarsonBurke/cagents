@@ -81,6 +81,9 @@ fn locate(source: &Session, replacement: &Session) -> Result<(PathBuf, PathBuf),
         Provider::Codex => crate::agent::codex_rollout(&original, id)
             .map_err(|error| format!("{error}; the conversation stays on its original account"))?,
         Provider::Omp => return Err("Omp manages its own account rotation".into()),
+        Provider::Antigravity | Provider::Muse => {
+            return Err(format!("{} manages its own logins", provider.label()));
+        }
     };
     let relative = path
         .strip_prefix(&original)

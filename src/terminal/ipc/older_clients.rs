@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 190,
+    proven_at: 191,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -109,6 +109,12 @@ pub(super) const STORE_BUSY_ERROR: u16 = 179;
 /// retryability, for a refusal that came before anything changed.
 pub(super) const NOT_ADMITTED_ERROR: u16 = 188;
 
+/// The first protocol whose `Provider` names Antigravity and Muse. A daemon
+/// before it recognised neither, so its clients were never told of them; a
+/// message naming one is refused or withheld for them (see
+/// [`OlderClient::admits_message`]).
+pub(crate) const ANTIGRAVITY_AND_MUSE: u16 = 191;
+
 /// The first protocol whose account usage readings carry reset inventories and
 /// reported plan details. An earlier client is sent the reading without them.
 pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
@@ -140,6 +146,25 @@ const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
         "not_admitted",
         NOT_ADMITTED_ERROR,
     ),
+];
+
+/// Variants a later protocol appended that a client from before it is never
+/// sent: the enum's type name, the variant, and the protocol that added it.
+/// A reply naming one is refused and a notification naming one withheld,
+/// since nothing the client knows could stand for it. The wire format proof
+/// accepts exactly these.
+///
+/// An update source is never sent one either: the update sends a source back
+/// only the conversations and terminals that source listed, which name
+/// providers it knows.
+#[cfg(test)]
+const WITHHELD_VARIANTS: &[(&str, &str, u16)] = &[
+    (
+        "cagents::agent::Provider",
+        "Antigravity",
+        ANTIGRAVITY_AND_MUSE,
+    ),
+    ("cagents::agent::Provider", "Muse", ANTIGRAVITY_AND_MUSE),
 ];
 
 thread_local! {
@@ -254,6 +279,11 @@ impl OlderClient {
             return false;
         };
         if index >= self.server_messages {
+            return false;
+        }
+        // A value with no encoding for this client, such as a provider it
+        // predates, refuses to encode for it (see `WITHHELD_VARIANTS`).
+        if encoding_for(self.protocol, || postcard::to_io(message, std::io::sink())).is_err() {
             return false;
         }
         match message {
@@ -831,6 +861,48 @@ mod tests {
                 }),
             }))
         );
+    }
+
+    /// A client from before a provider was appended cannot decode a value
+    /// naming it, so it is never sent one, while the messages it already
+    /// knows still reach it and a current client receives everything.
+    #[test]
+    fn older_clients_are_never_sent_a_provider_they_predate() {
+        use crate::agent::Provider;
+        use crate::terminal_ipc::{ChatCapacity, ChatCapacityResident};
+        let capacity = |provider| ServerMessage::Response {
+            response: ServerResponse::ChatCapacity {
+                capacity: ChatCapacity {
+                    used: 1,
+                    resident: 1,
+                    spawning: 0,
+                    limit: 8,
+                    residents: vec![ChatCapacityResident {
+                        chat_id: crate::model::TerminalId::new(),
+                        provider,
+                        status: "idle".into(),
+                        release_blocked: None,
+                    }],
+                    omitted_residents: 0,
+                },
+                persistence_warning: None,
+            },
+        };
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        assert!(client.protocol < ANTIGRAVITY_AND_MUSE);
+        let current = OlderClient {
+            protocol: ANTIGRAVITY_AND_MUSE,
+            ..client
+        };
+        for provider in Provider::ALL {
+            let message = capacity(provider);
+            assert!(current.admits_message(&message), "{provider:?}");
+            assert_eq!(
+                client.admits_message(&message),
+                !matches!(provider, Provider::Antigravity | Provider::Muse),
+                "{provider:?}"
+            );
+        }
     }
 
     #[test]

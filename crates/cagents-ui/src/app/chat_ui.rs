@@ -6648,6 +6648,8 @@ pub(super) fn chat_card_title(provider: Provider) -> &'static str {
         Provider::Omp => "OMP chat",
         Provider::Claude => "Claude chat",
         Provider::Codex => "Codex chat",
+        Provider::Antigravity => "Antigravity chat",
+        Provider::Muse => "Muse chat",
     }
 }
 
@@ -6703,6 +6705,9 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
         })?;
     let provider = Provider::from_program(&recipe.program)
         .ok_or("This terminal is not a supported agent session.")?;
+    if !provider.has_native_chat() {
+        return Err(provider.native_chat_refusal());
+    }
     let identity_flag = provider.resume_flag();
     let session_id = session.agent_resume_recipe().and_then(|recipe| {
         recipe
@@ -6980,11 +6985,14 @@ fn draft_snapshot(
                     "bypassPermissions".into(),
                 ],
                 Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
-                Provider::Omp => Vec::new(),
+                Provider::Omp | Provider::Antigravity | Provider::Muse => Vec::new(),
             },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
-                Provider::Claude => chat::SkillReach::Leading,
+                // ACP agents expand a command the prompt opens with.
+                Provider::Claude | Provider::Antigravity | Provider::Muse => {
+                    chat::SkillReach::Leading
+                }
                 Provider::Omp => chat::SkillReach::First,
             },
             ..chat::Capabilities::default()
@@ -7042,7 +7050,7 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .or_else(|| Some("manual".into()))
         }
         Provider::Codex => codex_draft_permission_mode(recipe),
-        Provider::Omp => None,
+        Provider::Omp | Provider::Antigravity | Provider::Muse => None,
     }
 }
 
@@ -9778,9 +9786,12 @@ impl Cagents {
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
-            Some(CardKind::Terminal(session)) => {
-                session.agent_resume_recipe().is_some() || observed_launch(session).is_some()
-            }
+            // Only an agent cagents can run as native chat switches to it.
+            Some(CardKind::Terminal(session)) => session
+                .agent_resume_recipe()
+                .or_else(|| observed_launch(session))
+                .and_then(|recipe| Provider::from_program(&recipe.program))
+                .is_some_and(Provider::has_native_chat),
             _ => false,
         }
     }

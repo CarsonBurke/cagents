@@ -274,7 +274,12 @@ use crate::{
 /// Version 190 appends `ListPage` and its `ListedPage` reply, which return the
 /// terminal inventory in pages that each fit a frame. `List` answers an older
 /// CLI as before, or refuses when the whole inventory no longer fits one.
-pub const PROTOCOL_VERSION: u16 = 190;
+///
+/// Version 191 appends `Provider::Antigravity` and `Provider::Muse`, which run
+/// as terminals. An older client has no encoding for either: an optional value
+/// naming one reaches it as absent, and any other message naming one is
+/// refused or withheld.
+pub const PROTOCOL_VERSION: u16 = 191;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -302,8 +307,11 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
+#[cfg(test)]
+pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS, encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
+    encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

@@ -216,7 +216,7 @@ pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
         .into_iter()
         .find(|provider| provider.executable().eq_ignore_ascii_case(value))
-        .ok_or_else(|| "Choose omp, claude, or codex".into())
+        .ok_or_else(|| "Choose omp, claude, codex, agy or muse".into())
 }
 
 impl PromptArgs {
@@ -1354,8 +1354,12 @@ pub(super) fn execute_with_context(
                 });
             let (placement, placement_warning) = spawn_placement(explicit, caller.as_ref(), owner);
             let caller_view = caller.as_ref().and_then(|caller| caller.view_scope.clone());
+            // A caller running a provider cagents has no native chat for
+            // cannot lend it to the agent, which runs as one.
             let provider = provider
-                .or(caller.and_then(|caller| caller.provider))
+                .or(caller
+                    .and_then(|caller| caller.provider)
+                    .filter(|provider| provider.has_native_chat()))
                 .ok_or_else(|| {
                     AppError::new("agent_request", "Choose --provider claude, codex, or omp")
                 })?;
@@ -2439,6 +2443,8 @@ mod tests {
             ("CLAUDE", Provider::Claude),
             ("CoDeX", Provider::Codex),
             ("Omp", Provider::Omp),
+            ("agy", Provider::Antigravity),
+            ("Muse", Provider::Muse),
         ] {
             let parsed =
                 Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();

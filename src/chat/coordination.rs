@@ -274,6 +274,8 @@ pub fn may_recognize(item: &Item, provider: Provider) -> bool {
                     | "listAgents"
             ),
             Provider::Omp => name == "task",
+            // Their coordination tools aren't read yet.
+            Provider::Antigravity | Provider::Muse => false,
         },
         _ => false,
     }
@@ -777,6 +779,7 @@ fn native(
         Provider::Claude => claude(id, name, input, output),
         Provider::Codex => codex(name, input, output),
         Provider::Omp => omp(name, input),
+        Provider::Antigravity | Provider::Muse => None,
     }
 }
 

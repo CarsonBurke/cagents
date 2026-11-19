@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     provider: Provider::Claude,
     executable: "claude",
+    aliases: &[],
     label: "Claude Code",
     recognizes_script: |path| match path.file_name().and_then(|name| name.to_str()) {
         Some("claude") => true,
@@ -14,6 +15,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
             .is_some_and(|path| path.contains("@anthropic-ai/claude-code/")),
         _ => false,
     },
+    background_command: super::shared_background_command,
     session_file_id: |stem| Some(stem),
     session_root: |launch, home| {
         Some(
@@ -74,6 +76,9 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     ],
     resume_flag: "--resume",
     resume_precedes_options: false,
+    resume_picker: true,
+    latest_selectors: &["--continue", "-c"],
+    native_chat: true,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]

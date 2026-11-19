@@ -731,7 +731,7 @@ fn scope(provider: Provider, window: &UsageWindow) -> Option<&str> {
     match provider {
         Provider::Claude => crate::account::claude::window_scope(window),
         Provider::Codex => crate::account::codex::window_scope(window),
-        Provider::Omp => None,
+        Provider::Omp | Provider::Antigravity | Provider::Muse => None,
     }
 }
 
