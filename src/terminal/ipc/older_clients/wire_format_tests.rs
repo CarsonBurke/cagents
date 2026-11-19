@@ -572,13 +572,16 @@ fn restated_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
 }
 
 /// The lifecycle contract with a source of `protocol`: the frozen variants,
-/// and the unsolicited chat events it already sends.
+/// those its protocol added, and the unsolicited chat events it already sends.
 fn selected_for(protocol: u16) -> Vec<(&'static str, Vec<&'static str>)> {
     let mut selected = crate::update::source::LIFECYCLE_VARIANTS
         .iter()
         .map(|(container, variants)| (*container, variants.to_vec()))
         .collect::<Vec<_>>();
-    for &(container, variant, since) in crate::update::source::UNSOLICITED_SINCE {
+    for &(container, variant, since) in crate::update::source::LIFECYCLE_SINCE
+        .iter()
+        .chain(crate::update::source::UNSOLICITED_SINCE)
+    {
         if protocol < since {
             continue;
         }

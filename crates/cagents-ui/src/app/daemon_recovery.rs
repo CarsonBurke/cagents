@@ -1,11 +1,14 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[cfg(test)]
 use crate::upgrade::ensure_no_surviving_process;
 use crate::{
     control::ControlClient,
     model::{HostSessionProof, TerminalSession},
-    terminal::{ensure_daemon_ready, ipc::TerminalDescriptor},
+    terminal::{ReadyDaemon, connect_ready_daemon, ipc::TerminalDescriptor},
     upgrade::{ScanError, UnreadableProcess, exact_conversation},
 };
 
@@ -16,6 +19,10 @@ pub(super) struct RecoveredTerminal {
     pub(super) session: TerminalSession,
     pub(super) expected_host: Option<HostSessionProof>,
     pub(super) recovery_lease: Option<crate::daemon::RecoveryLease>,
+    /// The daemon socket this recovery already proved ready, which the
+    /// attachment connects to without proving it again. `None` when the
+    /// recovery didn't need the daemon.
+    pub(super) socket: Option<PathBuf>,
 }
 
 /// Match the work represented by two terminal records within one proven
@@ -55,15 +62,17 @@ pub(super) fn reconcile(
 ) -> Result<RecoveredTerminal, String> {
     if session.continuity.live_proof().is_none() {
         return reconcile_without_proof(session, explicit_retry, || {
-            ensure_daemon_ready().map_err(|error| error.to_string())
+            connect_ready_daemon().map_err(|error| error.to_string())
         });
     }
-    let socket = ensure_daemon_ready().map_err(|error| error.to_string())?;
+    let ReadyDaemon { socket, client } =
+        connect_ready_daemon().map_err(|error| error.to_string())?;
     let id = session.id;
-    reconcile_with(
+    reconcile_on(
         session,
         explicit_retry,
         &socket,
+        || Leased::Fresh(client).or_reconnect(&socket),
         Path::new("/proc"),
         holder_of_kind,
     )
@@ -80,31 +89,84 @@ pub(super) fn reconcile(
 fn reconcile_without_proof(
     session: TerminalSession,
     explicit_retry: bool,
-    daemon: impl FnOnce() -> Result<std::path::PathBuf, String>,
+    daemon: impl FnOnce() -> Result<ReadyDaemon, String>,
 ) -> Result<RecoveredTerminal, String> {
     let agent = session.agent_resume_recipe().is_some();
+    let mut socket = None;
     if explicit_retry || agent {
-        let mut client = ControlClient::connect(&daemon()?).map_err(|error| error.to_string())?;
+        let ReadyDaemon {
+            socket: ready,
+            mut client,
+        } = daemon()?;
         ensure_admitted(&mut client)?;
         if agent {
             refuse_conversation_held_elsewhere(&session, &mut client)?;
         }
+        socket = Some(ready);
     }
     Ok(RecoveredTerminal {
         attach_completed: false,
         session,
         expected_host: None,
         recovery_lease: None,
+        socket,
     })
 }
 
 /// Resolve saved-pane ownership at its captured endpoint without starting a daemon.
 /// The caller may attach the result, but must not execute a returned replay plan.
+/// `client` is already connected to `socket`, and is asked again rather than
+/// connecting a second time, unless its daemon was replaced meanwhile.
 pub(super) fn inspect_saved_at(
     session: TerminalSession,
     socket: &Path,
+    client: &mut ControlClient,
 ) -> Result<RecoveredTerminal, String> {
-    reconcile_with(session, false, socket, Path::new("/proc"), holder_of_kind)
+    reconcile_on(
+        session,
+        false,
+        socket,
+        || Leased::Held(client).or_reconnect(socket),
+        Path::new("/proc"),
+        holder_of_kind,
+    )
+}
+
+/// The connection a recovery reads once it holds the recovery lease.
+enum Leased<'a> {
+    /// A connection the caller keeps using after the recovery.
+    Held(&'a mut ControlClient),
+    Fresh(ControlClient),
+}
+
+impl Leased<'_> {
+    /// Keeps a connection made before the lease, which can wait out another
+    /// recovery for seconds, only while it is quiet: a daemon that shut down
+    /// or crashed meanwhile has said so or closed it. A replacement daemon is
+    /// read through a new connection, under its own proof, as a recovery
+    /// that connected after the lease would read it.
+    fn or_reconnect(self, socket: &Path) -> Result<Self, String> {
+        if self.client().is_quiet() {
+            return Ok(self);
+        }
+        ControlClient::connect(socket)
+            .map(Self::Fresh)
+            .map_err(|error| error.to_string())
+    }
+
+    fn client(&self) -> &ControlClient {
+        match self {
+            Self::Held(client) => client,
+            Self::Fresh(client) => client,
+        }
+    }
+
+    fn client_mut(&mut self) -> &mut ControlClient {
+        match self {
+            Self::Held(client) => client,
+            Self::Fresh(client) => client,
+        }
+    }
 }
 
 const CONVERSATION_HELD: &str = "the saved agent conversation is already hosted by another terminal; preserving the live session";
@@ -305,10 +367,39 @@ fn reached<'a>(
     Ok(adoptable_lineage(session, expected, proof, terminals)?.map(Reached::Lineage))
 }
 
+/// [`reconcile_on`] over a fresh connection to `socket`.
+#[cfg(test)]
 fn reconcile_with(
     session: TerminalSession,
     explicit_retry: bool,
     socket: &Path,
+    proc_root: &Path,
+    holder: impl Fn(
+        crate::model::TerminalId,
+        crate::daemon::holder_registry::Kind,
+    ) -> Result<Option<i32>, String>,
+) -> Result<RecoveredTerminal, String> {
+    reconcile_on(
+        session,
+        explicit_retry,
+        socket,
+        || {
+            ControlClient::connect(socket)
+                .map(Leased::Fresh)
+                .map_err(|error| error.to_string())
+        },
+        proc_root,
+        holder,
+    )
+}
+
+/// Recovers `session` against the daemon at `socket`, read through the
+/// connection `connect` gives once the recovery lease is held.
+fn reconcile_on<'a>(
+    session: TerminalSession,
+    explicit_retry: bool,
+    socket: &Path,
+    connect: impl FnOnce() -> Result<Leased<'a>, String>,
     proc_root: &Path,
     holder: impl Fn(
         crate::model::TerminalId,
@@ -328,7 +419,8 @@ fn reconcile_with(
         crate::daemon::RecoveryLease::acquire(socket, Duration::from_secs(5))
             .map_err(|error| format!("cannot serialize terminal recovery: {error}"))?,
     );
-    let mut client = ControlClient::connect(socket).map_err(|error| error.to_string())?;
+    let mut client = connect()?;
+    let client = client.client_mut();
     let proof = client.proof().clone();
     let mut terminals = client.list().map_err(|error| error.to_string())?;
     // A daemon still restoring lists and attaches, so a terminal it lists is
@@ -337,7 +429,7 @@ fn reconcile_with(
     // until then, so the press says that, and reads the inventory again once
     // the daemon is ready.
     if explicit_retry && reached(&session, &expected, &proof, &terminals)?.is_none() {
-        ensure_admitted(&mut client)?;
+        ensure_admitted(client)?;
         terminals = client.list().map_err(|error| error.to_string())?;
     }
     match reached(&session, &expected, &proof, &terminals)? {
@@ -347,6 +439,7 @@ fn reconcile_with(
                 session: terminal.session.clone(),
                 expected_host: Some(expected),
                 recovery_lease,
+                socket: Some(socket.to_owned()),
             });
         }
         Some(Reached::Lineage(restored)) => {
@@ -357,6 +450,7 @@ fn reconcile_with(
                 session: restored.session.clone(),
                 expected_host: Some(proof),
                 recovery_lease,
+                socket: Some(socket.to_owned()),
             });
         }
         None => {}
@@ -411,6 +505,7 @@ fn reconcile_with(
                 session: candidate.session.clone(),
                 expected_host: Some(proof),
                 recovery_lease,
+                socket: Some(socket.to_owned()),
             });
         }
         if !explicit_retry
@@ -508,6 +603,7 @@ fn reconcile_with(
         session: replacement,
         expected_host: Some(proof),
         recovery_lease,
+        socket: Some(socket.to_owned()),
     })
 }
 
@@ -1165,8 +1261,14 @@ mod tests {
             while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
                 assert_eq!(request.proof, Some(proof.clone()));
                 let response = match request.request {
-                    ClientRequest::List => ServerResponse::Listed {
-                        terminals: terminals.clone(),
+                    // A daemon lists in identity order.
+                    ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
+                        terminals: {
+                            let mut terminals = terminals.clone();
+                            terminals.sort_by_key(|terminal| terminal.session.id);
+                            terminals
+                        },
+                        complete: true,
                     },
                     ClientRequest::StartupState => ServerResponse::StartupState(state.clone()),
                     other => panic!("recovery sent {other:?}"),
@@ -2405,8 +2507,14 @@ mod tests {
                                     StartupState::Ready
                                 })
                             }
-                            ClientRequest::List => ServerResponse::Listed {
-                                terminals: inventory.terminals.clone(),
+                            // A daemon lists in identity order.
+                            ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
+                                terminals: {
+                                    let mut terminals = inventory.terminals.clone();
+                                    terminals.sort_by_key(|terminal| terminal.session.id);
+                                    terminals
+                                },
+                                complete: true,
                             },
                             ClientRequest::ChatList => ServerResponse::ChatListed {
                                 sessions: inventory.chats.clone(),
@@ -2442,6 +2550,14 @@ mod tests {
 
     fn no_holder(_: crate::model::TerminalId) -> Result<Option<i32>, String> {
         Ok(None)
+    }
+
+    /// A fixture daemon at `socket`, connected as readiness connects it.
+    fn ready_at(socket: &Path) -> Result<ReadyDaemon, String> {
+        Ok(ReadyDaemon {
+            socket: socket.to_owned(),
+            client: ControlClient::connect(socket).map_err(|error| error.to_string())?,
+        })
     }
 
     fn reconcile_at(
@@ -2585,7 +2701,7 @@ mod tests {
                 live.launch = saved.launch.clone();
             }
             let server = discovery(&socket, daemon, vec![hosted(&live)], 0);
-            let result = reconcile_without_proof(saved, false, || Ok(socket.clone()));
+            let result = reconcile_without_proof(saved, false, || ready_at(&socket));
             server.join().unwrap();
             assert_eq!(result.is_err(), held);
         }
@@ -2656,7 +2772,7 @@ mod tests {
             let result = if live {
                 reconcile_at(saved, true, &socket, directory.path())
             } else {
-                reconcile_without_proof(saved, true, || Ok(socket.clone()))
+                reconcile_without_proof(saved, true, || ready_at(&socket))
             };
             server.join().unwrap();
             assert_eq!(
@@ -2729,7 +2845,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let saved = saved_shell(directory.path(), false);
         let (server, socket) = served(directory.path(), ready());
-        let result = reconcile_without_proof(saved, true, || Ok(socket.clone()));
+        let result = reconcile_without_proof(saved, true, || ready_at(&socket));
         server.join().unwrap();
         assert!(result.is_ok());
     }

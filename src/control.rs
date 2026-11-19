@@ -41,6 +41,8 @@ pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
 mod daemon_stop_tests;
 mod sessions;
+#[cfg(test)]
+mod startup_route;
 mod terminal_list;
 #[cfg(test)]
 mod terminal_start_authority_tests;
@@ -711,7 +713,7 @@ pub enum ControlError {
     Configure(#[source] io::Error),
     #[error(transparent)]
     Frame(#[from] FrameError),
-    #[error("the daemon did not answer within {} s", timeout.as_secs_f64())]
+    #[error("the daemon did not answer within {}", reply_budget(*timeout))]
     ReplyTimeout {
         timeout: Duration,
         #[source]
@@ -759,6 +761,8 @@ pub enum ControlError {
     },
     #[error("the daemon did not publish a current terminal snapshot before the deadline")]
     SnapshotTimeout,
+    #[error("the daemon returned a terminal list page that does not follow the previous one")]
+    StalledListPage,
     #[error("timed out waiting for terminal {terminal_id} to contain {text:?}")]
     WaitTimeout {
         terminal_id: TerminalId,
@@ -919,6 +923,16 @@ pub struct ControlClient {
     /// are not retained, but queued notifications can outlive a Detach reply,
     /// so remember their IDs for this connection's lifetime.
     terminal_streams: BTreeSet<TerminalId>,
+}
+
+impl std::fmt::Debug for ControlClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlClient")
+            .field("proof", &self.proof)
+            .field("protocol", &self.protocol)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
@@ -1107,6 +1121,30 @@ impl ControlClient {
         &self.proof
     }
 
+    /// Whether nothing has arrived on this connection since its last reply,
+    /// and the daemon still holds it open. Asks nothing of the daemon and
+    /// never blocks.
+    ///
+    /// A daemon that exits tells each connection it is shutting down before
+    /// closing it, and one that crashes just closes it, so neither leaves a
+    /// request-only connection quiet. Unsolicited input of any other kind
+    /// also ends quiet, so a caller that reconnects whenever a kept
+    /// connection isn't quiet never reads a replaced daemon through it.
+    pub fn is_quiet(&self) -> bool {
+        let mut byte = 0_u8;
+        // SAFETY: the descriptor belongs to this live stream, and the one-byte
+        // buffer is valid for the call. MSG_PEEK leaves any byte queued.
+        let read = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock
+    }
+
     pub(crate) fn protocol(&self) -> u16 {
         self.protocol
     }
@@ -1136,10 +1174,36 @@ impl ControlClient {
         }
     }
 
+    /// The terminal inventory, read a page at a time so that no reply has to
+    /// hold all of it. A terminal present throughout appears exactly once. An
+    /// update source from before pages answers it in one reply.
     pub fn list(&mut self) -> Result<Vec<TerminalDescriptor>, ControlError> {
-        match self.request_strict(ClientRequest::List)? {
-            ServerResponse::Listed { terminals } => Ok(terminals),
-            response => Err(unexpected_response("a terminal list", &response)),
+        if self.protocol() < crate::terminal_ipc::LIST_PAGES_PROTOCOL {
+            return match self.request_strict(ClientRequest::List)? {
+                ServerResponse::Listed { terminals } => Ok(terminals),
+                response => Err(unexpected_response("a terminal list", &response)),
+            };
+        }
+        let mut inventory: Vec<TerminalDescriptor> = Vec::new();
+        loop {
+            let after = inventory.last().map(|terminal| terminal.session.id);
+            match self.request_strict(ClientRequest::ListPage { after })? {
+                ServerResponse::ListedPage {
+                    terminals,
+                    complete,
+                } => {
+                    // Each page must move past `after`, or the listing would
+                    // never end.
+                    if !crate::terminal_ipc::page_follows(after, &terminals, complete) {
+                        return Err(ControlError::StalledListPage);
+                    }
+                    inventory.extend(terminals);
+                    if complete {
+                        return Ok(inventory);
+                    }
+                }
+                response => return Err(unexpected_response("a terminal list", &response)),
+            }
         }
     }
 
@@ -2824,6 +2888,18 @@ impl HandshakeClient {
         }
     }
 }
+/// How long a reply was awaited, as a person reads it: whole seconds, or a
+/// tenth of a second under one. The budget is often what remained of a
+/// deadline, such as 4.999918217 s of five, which reads as "5 s".
+pub(crate) fn reply_budget(timeout: Duration) -> String {
+    let seconds = timeout.as_secs_f64();
+    if seconds >= 0.95 {
+        format!("{seconds:.0} s")
+    } else {
+        format!("{seconds:.1} s")
+    }
+}
+
 fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
     if let Some(timeout) = timeout
         && matches!(&error, FrameError::Io(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
@@ -2923,6 +2999,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",
+        ServerResponse::ListedPage { .. } => "listed_page",
         ServerResponse::Spawned { .. } => "spawned",
         ServerResponse::Attached { .. } => "attached",
         ServerResponse::Detached => "detached",
@@ -3124,6 +3201,31 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
         }
         Err(error) => Err(AppError::new("daemon_connection", error)),
     }
+}
+
+/// A connection to the daemon [`control_daemon_socket`] selects. A daemon this
+/// call may start is reached on the connection that proved it ready, rather
+/// than proven ready and then connected to again.
+fn control_daemon_client() -> Result<ControlClient, AppError> {
+    if daemon_autostart_disabled() {
+        let socket = control_daemon_socket()?;
+        return ControlClient::connect(&socket)
+            .map_err(|error| AppError::new("daemon_connection", error));
+    }
+    connect_ready_daemon_client()
+}
+
+/// [`terminal::connect_ready_daemon`], failing as a CLI command reports a
+/// daemon that would not start or could not be reached.
+fn connect_ready_daemon_client() -> Result<ControlClient, AppError> {
+    terminal::connect_ready_daemon()
+        .map(|ready| ready.client)
+        .map_err(|error| match error {
+            terminal::HostedTerminalStartError::Connect(error) => {
+                AppError::new("daemon_connection", error)
+            }
+            error => AppError::new("daemon_start", error),
+        })
 }
 
 fn daemon_missing(error: &io::Error) -> bool {
@@ -4954,10 +5056,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
         return execute_terminal_as(command, &ProjectChannelContext::capture());
     }
     // Keep the four global read verbs on their existing unauthenticated route.
-    let socket = control_daemon_socket()?;
-    let client = ControlClient::connect(&socket)
-        .map_err(|error| AppError::new("daemon_connection", error))?;
-    terminal_output(command, client)
+    terminal_output(command, control_daemon_client()?)
 }
 
 fn execute_terminal_as(
@@ -5133,11 +5232,10 @@ impl ServiceRequestContext {
 
     fn connect(&self) -> Result<ControlClient, AppError> {
         self.admit_remote()?;
-        let socket = if self.scoped() {
-            daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?
-        } else {
-            control_daemon_socket()?
-        };
+        if !self.scoped() {
+            return control_daemon_client();
+        }
+        let socket = daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
         ControlClient::connect(&socket).map_err(|error| AppError::new("daemon_connection", error))
     }
 }
@@ -5170,7 +5268,7 @@ impl ProjectChannelContext {
                     control_daemon_socket()
                 }
             },
-            control_daemon_socket,
+            control_daemon_client,
             ControlClient::connect,
         )
     }
@@ -5185,22 +5283,22 @@ impl ProjectChannelContext {
         Ok(())
     }
 
+    /// `ready` connects to the daemon on the connection that proved it
+    /// ready; `connect` reaches the `existing` one.
     fn connect_with(
         &self,
         mutation: bool,
         existing: impl FnOnce() -> Result<PathBuf, AppError>,
-        ready: impl FnOnce() -> Result<PathBuf, AppError>,
+        ready: impl FnOnce() -> Result<ControlClient, AppError>,
         connect: impl FnOnce(&Path) -> Result<ControlClient, ControlError>,
     ) -> Result<ControlClient, AppError> {
         let scoped = self.authority.token().is_some();
         self.admit_remote()?;
-        let socket = if (scoped && mutation) || self.no_start {
-            existing()?
+        let mut client = if (scoped && mutation) || self.no_start {
+            connect(&existing()?).map_err(|error| AppError::new("daemon_connection", error))?
         } else {
             ready()?
         };
-        let mut client =
-            connect(&socket).map_err(|error| AppError::new("daemon_connection", error))?;
         // Lists are deliberately global reads, including for an invalid or
         // empty inherited capability. Only legacy mutations bind the stream.
         if scoped && mutation {
@@ -5988,6 +6086,28 @@ fn emit_error(json_output: bool, error: &AppError) {
 #[cfg(test)]
 mod tests {
     use super::ControlError;
+
+    #[test]
+    fn a_reply_timeout_reads_as_the_budget_it_was_given() {
+        use std::time::Duration;
+        let timeout = |budget| ControlError::ReplyTimeout {
+            timeout: budget,
+            error: super::FrameError::Io(std::io::ErrorKind::TimedOut.into()),
+        };
+        // What remained of a five second deadline.
+        assert_eq!(
+            timeout(Duration::from_nanos(4_999_918_217)).to_string(),
+            "the daemon did not answer within 5 s"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(30)).to_string(),
+            "the daemon did not answer within 30 s"
+        );
+        assert_eq!(
+            timeout(Duration::from_millis(250)).to_string(),
+            "the daemon did not answer within 0.2 s"
+        );
+    }
 
     #[cfg(feature = "host")]
     #[test]
@@ -8593,6 +8713,55 @@ mod tests {
         }
     }
 
+    /// A connection kept across a wait stops reading as quiet once its daemon
+    /// announces its shutdown or closes it, without asking it anything.
+    #[test]
+    fn a_kept_connection_is_quiet_only_while_its_daemon_serves_it() {
+        fn handshaken() -> (ControlClient, UnixStream) {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let proof = proof("session", "boot", "incarnation");
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(connect.request_id, proof.clone(), proof),
+                )
+                .unwrap();
+                server_stream
+            });
+            let client = ControlClient::from_stream(client_stream).unwrap();
+            (client, server.join().unwrap())
+        }
+
+        // An ordinary exit queues its shutdown notice and closes only once
+        // that is delivered, so the connection is still open meanwhile.
+        let (client, mut server_stream) = handshaken();
+        assert!(client.is_quiet(), "a serving daemon keeps it quiet");
+        write_frame(
+            &mut server_stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: proof("session", "boot", "incarnation"),
+                message: ServerMessage::HostShuttingDown,
+            },
+        )
+        .unwrap();
+        assert!(!client.is_quiet(), "a shutting-down daemon");
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(!client.is_quiet(), "a daemon that exited after its notice");
+
+        // A crash closes the connection with nothing said. Shut the socket
+        // itself down: a test process forking concurrently can briefly hold
+        // a duplicate of the descriptor, which would keep a bare drop from
+        // closing the connection.
+        let (client, server_stream) = handshaken();
+        assert!(client.is_quiet());
+        server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(server_stream);
+        assert!(!client.is_quiet(), "a crashed daemon");
+    }
+
     #[test]
     fn handshake_pins_complete_matching_proof_and_correlates_requests() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
@@ -8619,6 +8788,7 @@ mod tests {
             let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             assert_eq!(list.request_id, 2);
             assert_eq!(list.proof.as_ref(), Some(&server_proof));
+            assert_eq!(list.request, ClientRequest::ListPage { after: None });
             write_frame(
                 &mut server_stream,
                 &ServerEnvelope {
@@ -8626,8 +8796,9 @@ mod tests {
                     request_id: Some(2),
                     proof: server_proof,
                     message: ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: Vec::new(),
+                            complete: true,
                         },
                     },
                 },
@@ -8639,6 +8810,93 @@ mod tests {
         assert_eq!(client.proof(), &expected);
         assert!(client.list().unwrap().is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn listing_reads_each_page_after_the_last_and_refuses_one_that_does_not_advance() {
+        let recipe = || LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let mut terminals = (0..3)
+            .map(|_| TerminalDescriptor::relaunchable(TerminalId::new(), recipe(), None))
+            .collect::<Vec<_>>();
+        terminals.sort_by_key(|terminal| terminal.session.id);
+        let id = |index: usize| terminals[index].session.id;
+        // Each case: the pages the daemon answers with, the `after` it must be
+        // asked for each, and what the listing then returns.
+        let cases = [
+            (
+                vec![
+                    (vec![terminals[0].clone(), terminals[1].clone()], false),
+                    (vec![terminals[2].clone()], true),
+                ],
+                vec![None, Some(id(1))],
+                Some(terminals.clone()),
+            ),
+            // An empty page that claims more follows would never end.
+            (
+                vec![(vec![terminals[0].clone()], false), (Vec::new(), false)],
+                vec![None, Some(id(0))],
+                None,
+            ),
+            // So would a page that goes back to an identity already read.
+            (
+                vec![
+                    (vec![terminals[1].clone()], false),
+                    (vec![terminals[0].clone()], true),
+                ],
+                vec![None, Some(id(1))],
+                None,
+            ),
+        ];
+        for (pages, expected_after, listed) in cases {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let server_proof = pinned.clone();
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, server_proof.clone(), server_proof.clone()),
+                )
+                .unwrap();
+                let mut asked = Vec::new();
+                for (terminals, complete) in pages {
+                    let page: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    let ClientRequest::ListPage { after } = page.request else {
+                        panic!("expected a page request, got {:?}", page.request);
+                    };
+                    asked.push(after);
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(page.request_id),
+                            proof: server_proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals,
+                                    complete,
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+                asked
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            match (client.list(), listed) {
+                (Ok(inventory), Some(expected)) => assert_eq!(inventory, expected),
+                (Err(ControlError::StalledListPage), None) => {}
+                (result, expected) => panic!("listed {result:?}, expected {expected:?}"),
+            }
+            assert_eq!(server.join().unwrap(), expected_after);
+        }
     }
 
     #[test]
@@ -8815,8 +9073,9 @@ mod tests {
                     ))
                 } else {
                     ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: Vec::new(),
+                            complete: true,
                         },
                     }
                 };
@@ -8862,8 +9121,9 @@ mod tests {
                         request_id: Some(2),
                         proof: proof("different", "boot", "incarnation"),
                         message: ServerMessage::Response {
-                            response: ServerResponse::Listed {
+                            response: ServerResponse::ListedPage {
                                 terminals: Vec::new(),
+                                complete: true,
                             },
                         },
                     }
@@ -9030,7 +9290,10 @@ mod tests {
                 )
                 .unwrap();
                 let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
-                assert!(matches!(list.request, ClientRequest::List));
+                assert!(matches!(
+                    list.request,
+                    ClientRequest::ListPage { after: None }
+                ));
                 // Publication succeeded before persistence failed. Its output
                 // still arrives during the fallback's view/inventory reads.
                 write_frame(
@@ -9053,7 +9316,10 @@ mod tests {
                         request_id: Some(list.request_id),
                         proof: pinned,
                         message: ServerMessage::Response {
-                            response: ServerResponse::Listed { terminals: vec![] },
+                            response: ServerResponse::ListedPage {
+                                terminals: vec![],
+                                complete: true,
+                            },
                         },
                     },
                 )
@@ -9149,7 +9415,10 @@ mod tests {
                     .unwrap();
                 }
                 let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(list.request, ClientRequest::List));
+                assert!(matches!(
+                    list.request,
+                    ClientRequest::ListPage { after: None }
+                ));
                 // These genuine terminal-stream message kinds remain legal
                 // after the first attachment replay and during a later RPC.
                 for message in [
@@ -9176,8 +9445,9 @@ mod tests {
                         event_sequence: 1,
                     },
                     ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: vec![terminal],
+                            complete: true,
                         },
                     },
                 ] {
@@ -9195,7 +9465,10 @@ mod tests {
                     .unwrap();
                 }
                 let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-                assert!(matches!(list.request, ClientRequest::List));
+                assert!(matches!(
+                    list.request,
+                    ClientRequest::ListPage { after: None }
+                ));
                 let mut envelope = ServerEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: None,
@@ -9759,13 +10032,19 @@ mod tests {
                         false,
                     )),
                 );
-                assert_eq!(request(&mut server_stream, &pinned, 3), ClientRequest::List);
+                assert_eq!(
+                    request(&mut server_stream, &pinned, 3),
+                    ClientRequest::ListPage { after: None }
+                );
                 reply(
                     &mut server_stream,
                     &pinned,
                     Some(3),
                     ServerMessage::Response {
-                        response: ServerResponse::Listed { terminals: vec![] },
+                        response: ServerResponse::ListedPage {
+                            terminals: vec![],
+                            complete: true,
+                        },
                     },
                 );
                 return;
@@ -9890,7 +10169,7 @@ mod tests {
             }
             assert_eq!(
                 request(&mut server_stream, &pinned, next),
-                ClientRequest::List,
+                ClientRequest::ListPage { after: None },
                 "confirmed retirement must be followed by List, never Detach"
             );
             reply(
@@ -9898,8 +10177,9 @@ mod tests {
                 &pinned,
                 Some(next),
                 ServerMessage::Response {
-                    response: ServerResponse::Listed {
+                    response: ServerResponse::ListedPage {
                         terminals: Vec::new(),
+                        complete: true,
                     },
                 },
             );
@@ -10264,13 +10544,14 @@ mod tests {
             );
             let answer_list = |stream: &mut UnixStream| {
                 let list: ClientEnvelope = read_frame(stream).unwrap().unwrap();
-                assert_eq!(list.request, ClientRequest::List);
+                assert_eq!(list.request, ClientRequest::ListPage { after: None });
                 send(
                     stream,
                     Some(list.request_id),
                     ServerMessage::Response {
-                        response: ServerResponse::Listed {
+                        response: ServerResponse::ListedPage {
                             terminals: Vec::new(),
+                            complete: true,
                         },
                     },
                 );
@@ -10716,7 +10997,7 @@ mod tests {
             let mut client = client;
             client
                 .request_with_deadline(
-                    ClientRequest::List,
+                    ClientRequest::ListPage { after: None },
                     Instant::now() + Duration::from_millis(6100),
                 )
                 .unwrap_err()
@@ -10728,7 +11009,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("the daemon did not answer within 6."),
+                .contains("the daemon did not answer within 6 s"),
             "{error}"
         );
         server.join().unwrap();

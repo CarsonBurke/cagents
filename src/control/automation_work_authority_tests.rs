@@ -114,8 +114,8 @@ impl Peer {
                     assert_eq!(request.proof.as_ref(), Some(&proof()));
                     break (peer, request);
                 }
-                // Accept the old readiness probe so the before regression
-                // fails on routing counts after valid business behavior.
+                // A connection that only handshakes is a separate readiness
+                // probe. Diagnose it only after valid business behavior.
                 probes += 1;
                 assert!(probes <= 1, "no repeated readiness or fallback");
             };
@@ -271,6 +271,15 @@ fn exercise_local(role: &str) {
         let (probes, raw_probes) = peer.finished();
         routing.push((business, staged.get(), probes, raw_probes));
     }
+    // Readiness hands its connection to the request, so each route shows in
+    // how its command reports the daemon once it is gone.
+    for business in [Business::Proposal, Business::Pin, Business::List] {
+        let mut args = arguments(business, uuid::Uuid::new_v4(), &project);
+        if no_start {
+            args.insert(1, "--no-start".into());
+        }
+        startup_route::run_absent(args);
+    }
     // Drive every business envelope before checking routing, so a routing
     // failure is reported only after each request reached its business peer.
     for (business, staged, probes, raw_probes) in routing {
@@ -280,9 +289,8 @@ fn exercise_local(role: &str) {
             "{business:?}: scoped services must bypass staged owner lookup/recovery after reaching business dispatch"
         );
         assert_eq!(
-            probes,
-            usize::from(!scoped && !no_start),
-            "{business:?}: scoped services must use the existing endpoint; ordinary User readiness stays intact"
+            probes, 0,
+            "{business:?}: readiness hands its connection to the request rather than handshaking twice"
         );
         assert_eq!(
             raw_probes,
@@ -423,9 +431,17 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
             assert_eq!(outputs[0]["command"], "work.list");
             assert_eq!(outputs[0]["ok"], true);
         }
+        if !role.starts_with("remote-") {
+            // Scoped services use the existing endpoint; ordinary User
+            // readiness stays intact.
+            let route =
+                startup_route::Route::of(!role.starts_with("user"), role == "user-no-start");
+            startup_route::assert_absent_routes(&stderr, &[route; 3]);
+        }
         let errors = stderr
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|error| !startup_route::reports_absent_daemon(error))
             .collect::<Vec<_>>();
         assert_eq!(
             errors.len(),

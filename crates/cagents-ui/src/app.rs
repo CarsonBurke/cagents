@@ -6503,10 +6503,9 @@ impl Cagents {
                 let mut created = false;
                 let mut save_failure = None;
                 let (recovered, mode) = if shared && (!explicit_retry || reserved) {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    let mut client = crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?;
+                    let crate::terminal::ReadyDaemon { socket, mut client } =
+                        crate::terminal::connect_ready_daemon()
+                            .map_err(|error| error.to_string())?;
                     let hosted = if let Some(reservation) = reservation {
                         let (hosted, failure) = terminal_save::complete(
                             &mut client,
@@ -6526,7 +6525,7 @@ impl Cagents {
                         )?)
                     };
                     let hosted = hosted.ok_or(SHARED_TERMINAL_DISCONNECTED)?;
-                    shared_terminal_attachment(hosted.session, client.proof().clone())
+                    shared_terminal_attachment(hosted.session, client.proof().clone(), socket)
                 } else {
                     recover_terminal(session, explicit_retry)?
                 };
@@ -6571,12 +6570,8 @@ impl Cagents {
                 if existing_only {
                     return attach_initial_terminal(card, session, sender).map(Some);
                 }
-                let connect = || {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())
-                };
+                let connect =
+                    || crate::terminal::connect_ready_daemon().map_err(|error| error.to_string());
                 let Some((recovered, mode)) = restored_attachment(shared, session, connect)? else {
                     return Ok(None);
                 };
@@ -9904,6 +9899,11 @@ impl Cagents {
         {
             return Task::none();
         }
+        // Nothing has started in a pane whose reopen failed: it asks the
+        // service to prepare its conversation again.
+        if self.reopen_failed(card) {
+            return self.retry_reopening(card);
+        }
         #[cfg(feature = "integrated-browser")]
         if matches!(
             self.card_state(card).map(|state| &state.kind),
@@ -10936,6 +10936,15 @@ impl Cagents {
         for transition in update.transitions {
             tracing::debug!(target: "cagents::pane_open", stage = "visibility", card = ?transition.id, to = ?transition.to);
             self.set_exposure(transition.id, transition.to.into());
+            // Whether an unreachable agent still runs can change while its
+            // card is out of sight, so it is asked again whenever it is shown.
+            if transition.to == VisibilityClass::Visible
+                && let Some(source) = self
+                    .unnamed_agent(transition.id)
+                    .map(|blocked| blocked.source.clone())
+            {
+                tasks.push(self.ask_unnamed_agent_running(transition.id, source));
+            }
             let browser_card = self
                 .card_state(transition.id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Browser(_)));
@@ -12339,6 +12348,9 @@ impl Cagents {
                 .center(Length::Fill)
                 .into()
             }
+            Some(CardRuntime::Failed(_)) if self.unnamed_agent(id).is_some() => self
+                .unnamed_agent_view(id)
+                .expect("an unreachable agent's card has its own state"),
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -12348,7 +12360,12 @@ impl Cagents {
                                 .icon()
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
-                            design::title(labels.unavailable).into(),
+                            design::title(if self.reopen_failed(id) {
+                                "Couldn't reopen this conversation"
+                            } else {
+                                labels.unavailable
+                            })
+                            .into(),
                         ])
                         .align_y(Alignment::Center)
                         .spacing(space::S)
@@ -19832,6 +19849,7 @@ fn attach_initial_terminal(
             expected_host: Some(proof.clone()),
             attach_completed: false,
             recovery_lease: None,
+            socket: Some(socket.clone()),
         },
         socket,
         proof,
@@ -19916,9 +19934,11 @@ fn initial_terminal_attachment(
 
 /// Another client may own a shared terminal's recovery, so a shared pane only
 /// attaches the exact session its daemon hosts, under that daemon's proof.
+/// `socket` is that daemon's, already proven ready.
 fn shared_terminal_attachment(
     hosted: TerminalSession,
     proof: HostSessionProof,
+    socket: std::path::PathBuf,
 ) -> (daemon_recovery::RecoveredTerminal, TerminalStartMode) {
     (
         daemon_recovery::RecoveredTerminal {
@@ -19926,6 +19946,7 @@ fn shared_terminal_attachment(
             expected_host: Some(proof.clone()),
             attach_completed: false,
             recovery_lease: None,
+            socket: Some(socket),
         },
         TerminalStartMode::Attach(proof),
     )
@@ -19936,21 +19957,22 @@ fn shared_terminal_attachment(
 fn restored_attachment(
     shared: bool,
     session: TerminalSession,
-    connect: impl FnOnce() -> Result<crate::control::ControlClient, String>,
+    connect: impl FnOnce() -> Result<crate::terminal::ReadyDaemon, String>,
 ) -> Result<Option<(daemon_recovery::RecoveredTerminal, TerminalStartMode)>, String> {
     let (recovered, mode) = if shared {
-        hosted_shared_terminal(&mut connect()?, session.id)?
+        hosted_shared_terminal(connect()?, session.id)?
     } else {
         recover_terminal(session, false)?
     };
     Ok(matches!(mode, TerminalStartMode::Attach(_)).then_some((recovered, mode)))
 }
 
-/// The exact shared terminal `client`'s daemon hosts, ready to attach.
+/// The exact shared terminal the ready `daemon` hosts, ready to attach.
 fn hosted_shared_terminal(
-    client: &mut crate::control::ControlClient,
+    daemon: crate::terminal::ReadyDaemon,
     terminal: TerminalId,
 ) -> Result<(daemon_recovery::RecoveredTerminal, TerminalStartMode), String> {
+    let crate::terminal::ReadyDaemon { socket, mut client } = daemon;
     let hosted = client
         .list()
         .map_err(|error| error.to_string())?
@@ -19960,6 +19982,7 @@ fn hosted_shared_terminal(
     Ok(shared_terminal_attachment(
         hosted.session,
         client.proof().clone(),
+        socket,
     ))
 }
 
@@ -19992,6 +20015,12 @@ fn open_terminal(
 ) -> Result<StartedTerminal, String> {
     let recovery_lease = recovered.recovery_lease;
     let session = recovered.session;
+    // A daemon the recovery already proved ready isn't proven again; the
+    // worker's own connection is the attachment's. One that died since is
+    // therefore not started again here: its attach fails, and only a
+    // launch with no proof to keep would have gone ahead on a new daemon,
+    // which the pane's Retry still does.
+    let socket = recovered.socket;
     let spawned = matches!(&mode, TerminalStartMode::Spawn(_));
     let wake = move |wake: crate::terminal::TerminalWake| {
         // Each terminal source coalesces visual and semantic edges until the
@@ -20003,14 +20032,24 @@ fn open_terminal(
             generation: wake.generation,
         });
     };
+    let socket = match socket {
+        Some(socket) => socket,
+        None => crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?,
+    };
     let handle = match mode {
         TerminalStartMode::Attach(proof) => {
-            HostedTerminalHandle::connect(session.id, Some(proof), wake)
+            HostedTerminalHandle::connect_at(socket, session.id, Some(proof), wake)
         }
         TerminalStartMode::Spawn(recipe) => {
             let mut session = session.clone();
             session.launch = recipe;
-            HostedTerminalHandle::attach_or_spawn(session, config, recovered.expected_host, wake)
+            HostedTerminalHandle::attach_or_spawn_at(
+                socket,
+                session,
+                config,
+                recovered.expected_host,
+                wake,
+            )
         }
     }
     .map_err(|error| error.to_string())?;

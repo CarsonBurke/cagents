@@ -67,7 +67,12 @@ pub(crate) struct CommandMailbox {
     tx: Sender<Command>,
     rx: Receiver<Command>,
     coalesced: Mutex<CoalescedCommands>,
+    /// A [`Command::WakeCoalesced`] is queued or owed for the values in
+    /// `coalesced`, so a producer need not send another.
     wake_pending: AtomicBool,
+    /// The wake `wake_pending` promises could not be queued because the queue
+    /// was full. [`Self::try_recv`] delivers it in place of a queued command.
+    wake_owed: AtomicBool,
     shutdown_requested: AtomicBool,
     /// Set by the engine once this card can never be serviced again: it was
     /// closed, or the engine thread unwound out from under it. Commands then
@@ -83,13 +88,24 @@ impl CommandMailbox {
             rx,
             coalesced: Mutex::new(CoalescedCommands::default()),
             wake_pending: AtomicBool::new(false),
+            wake_owed: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
             engine_gone: AtomicBool::new(false),
         })
     }
 
+    /// What the engine selects on to learn that this card has work.
     pub(crate) fn receiver(&self) -> &Receiver<Command> {
         &self.rx
+    }
+
+    /// The engine's next command for this card: an owed coalesced wake first,
+    /// then the queue.
+    pub(crate) fn try_recv(&self) -> Option<Command> {
+        if self.wake_owed.swap(false, Ordering::AcqRel) {
+            return Some(Command::WakeCoalesced);
+        }
+        self.rx.try_recv().ok()
     }
 
     pub(crate) fn send(&self, command: Command) -> Result<(), BrowserError> {
@@ -104,10 +120,10 @@ impl CommandMailbox {
         self.check_live()?;
         update(&mut self.coalesced());
         if !self.wake_pending.swap(true, Ordering::AcqRel)
-            && let Err(error) = self.tx.try_send(Command::WakeCoalesced)
+            && let Err(error) = self.queue_wake()
         {
             self.wake_pending.store(false, Ordering::Release);
-            return Err(map_send_error(error));
+            return Err(error);
         }
         Ok(())
     }
@@ -115,8 +131,13 @@ impl CommandMailbox {
     pub(crate) fn drain_coalesced(&self) -> CoalescedCommands {
         let drained = std::mem::take(&mut *self.coalesced());
         self.wake_pending.store(false, Ordering::Release);
-        // A producer can race between the take and clearing `wake_pending`. Ensure
-        // any values deposited during that window receive another wake packet.
+        self.wake_for_late_deposits();
+        drained
+    }
+
+    /// A producer can race between the take and clearing `wake_pending`: it saw
+    /// the flag still set and sent nothing. Its values need another wake.
+    fn wake_for_late_deposits(&self) {
         let has_more = {
             let state = self.coalesced();
             state.viewport.is_some()
@@ -130,9 +151,35 @@ impl CommandMailbox {
                 || state.touch_motion.is_some()
         };
         if has_more && !self.wake_pending.swap(true, Ordering::AcqRel) {
-            let _ = self.tx.try_send(Command::WakeCoalesced);
+            // Only disconnection fails, and then nothing is left to wake.
+            let _ = self.queue_wake();
         }
-        drained
+    }
+
+    /// Delivers the wake the caller just claimed through `wake_pending`.
+    ///
+    /// A full queue does not lose it: the wake is owed instead, and the engine
+    /// collects it through [`Self::try_recv`] while it works through the queued
+    /// commands. Dropping it would leave `wake_pending` set with nothing to
+    /// clear it, so every later update would skip its wake and the coalesced
+    /// pointer, focus, viewport and placement state would never be applied.
+    fn queue_wake(&self) -> Result<(), BrowserError> {
+        match self.tx.try_send(Command::WakeCoalesced) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.wake_owed.store(true, Ordering::Release);
+                // The engine may have emptied the queue between the failed send
+                // and that store, leaving no queued command to make it read
+                // the owed wake. Sending again settles it: success queues a
+                // wake (a duplicate drains nothing), and a full queue proves
+                // commands remain after the store for the engine to receive.
+                match self.tx.try_send(Command::WakeCoalesced) {
+                    Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+                    Err(TrySendError::Disconnected(_)) => Err(BrowserError::ThreadStopped),
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => Err(BrowserError::ThreadStopped),
+        }
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -646,6 +693,67 @@ mod tests {
             commands.pointer_motion,
             Some(BrowserInput::MouseMove { point }) if point.x == 1000.0 && point.y == 1001.0
         ));
+    }
+
+    fn fill_queue(mailbox: &CommandMailbox) {
+        while mailbox.send(Command::Reload).is_ok() {}
+        assert!(matches!(
+            mailbox.send(Command::Reload),
+            Err(BrowserError::CommandQueueFull)
+        ));
+    }
+
+    /// Receives as the engine does until the queue is empty, returning the
+    /// coalesced values every wake among those commands drained.
+    fn engine_drain(mailbox: &CommandMailbox) -> Vec<CoalescedCommands> {
+        std::iter::from_fn(|| mailbox.try_recv())
+            .filter(|command| matches!(command, Command::WakeCoalesced))
+            .map(|_| mailbox.drain_coalesced())
+            .collect()
+    }
+
+    #[test]
+    fn a_replacement_wake_refused_by_a_full_queue_is_still_delivered() {
+        let mailbox = CommandMailbox::new();
+        fill_queue(&mailbox);
+        // A producer deposited focus after the engine took the previous batch
+        // but before it cleared `wake_pending`, so the producer sent nothing
+        // and the engine's replacement wake is the only one. The queue is full.
+        mailbox.coalesced().focused = Some(true);
+        mailbox.wake_for_late_deposits();
+
+        let drained = engine_drain(&mailbox);
+        assert!(
+            drained
+                .iter()
+                .any(|commands| commands.focused == Some(true)),
+            "the deposited focus was never applied"
+        );
+
+        // Nothing is left claiming a wake, so the next update queues its own.
+        mailbox
+            .update_coalesced(|commands| commands.focused = Some(false))
+            .unwrap();
+        let drained = engine_drain(&mailbox);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].focused, Some(false));
+    }
+
+    #[test]
+    fn a_coalesced_update_against_a_full_queue_is_applied_without_another_producer() {
+        let mailbox = CommandMailbox::new();
+        fill_queue(&mailbox);
+        mailbox
+            .update_coalesced(|commands| commands.viewport = Some(PhysicalViewport::new(640, 480)))
+            .expect("a full queue owes the wake instead of rejecting the update");
+
+        let drained = engine_drain(&mailbox);
+        assert!(
+            drained
+                .iter()
+                .any(|commands| commands.viewport == Some(PhysicalViewport::new(640, 480))),
+            "the viewport waited for a producer that never came"
+        );
     }
 
     #[test]

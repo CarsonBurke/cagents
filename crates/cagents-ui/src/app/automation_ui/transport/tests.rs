@@ -107,25 +107,62 @@ fn scoped_and_no_start_requests_use_selected_socket_without_startup_fallback() {
     }
     for remote in [false, true] {
         let starts = Cell::new(0);
-        let connects = Cell::new(0);
         let error = context(Authority::default(), remote, false)
             .request_with(
                 request(),
                 || panic!("ordinary User keeps ready/start behavior"),
                 || {
                     starts.set(starts.get() + 1);
-                    Ok("/fixture/user-selected.socket".into())
-                },
-                |socket| {
-                    assert_eq!(socket, Path::new("/fixture/user-selected.socket"));
-                    connects.set(connects.get() + 1);
                     Err("connection refused".into())
                 },
+                |_| panic!("ordinary User must not connect beside its start"),
             )
             .unwrap_err();
         assert_eq!(error, "connection refused");
-        assert_eq!((starts.get(), connects.get()), (1, 1));
+        assert_eq!(starts.get(), 1);
     }
+}
+
+/// The connection that proved the daemon ready carries the request: an
+/// ordinary Automations action makes one handshake, not a readiness
+/// handshake followed by another for the request (#3127).
+#[test]
+fn ordinary_automation_request_rides_the_connection_that_proved_readiness() {
+    let (stream, mut peer) = UnixStream::pair().unwrap();
+    let expected = request();
+    let original = expected.clone();
+    let server = thread::spawn(move || {
+        handshake(&mut peer);
+        let envelope: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+        assert!(
+            matches!(&envelope.request, ClientRequest::Automation { operation, .. }
+            if operation == &expected),
+            "the request after readiness came without another handshake"
+        );
+        reply(
+            &mut peer,
+            &envelope,
+            ServerMessage::Response {
+                response: ServerResponse::Automation(Response::Removed),
+            },
+        );
+        assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none());
+    });
+    let starts = Cell::new(0);
+    let result = context(Authority::default(), false, false)
+        .request_with(
+            original,
+            || panic!("ordinary User starts rather than selecting"),
+            || {
+                starts.set(starts.get() + 1);
+                ControlClient::from_stream(stream).map_err(|error| error.to_string())
+            },
+            |_| panic!("readiness already connected"),
+        )
+        .unwrap();
+    assert_eq!(result, Response::Removed);
+    assert_eq!(starts.get(), 1);
+    server.join().unwrap();
 }
 
 #[test]

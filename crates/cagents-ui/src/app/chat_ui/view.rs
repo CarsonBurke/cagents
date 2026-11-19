@@ -358,6 +358,8 @@ const REQUEST_CONTEXT_CEILING: f32 = 160.0;
 /// arrived at the oldest message they have should not have to nudge the wheel
 /// again to be believed.
 const PAGE_REACH: f32 = 24.0;
+/// How many viewport heights before a loaded edge the next page is fetched.
+const PREFETCH_SCREENS: f32 = 2.0;
 
 /// The composer editor, drawing no surface of its own.
 ///
@@ -1036,6 +1038,22 @@ pub struct Scroll {
     from_top: f32,
     content: f32,
     window: f32,
+    /// What of the window a page keeps, where it was last laid out. Unknown
+    /// until the transcript has laid out its rows.
+    kept: Option<Kept>,
+}
+
+/// Where the halves a page keeps end, in the transcript's laid-out
+/// coordinates. A page slides the window around its middle item: an earlier
+/// page keeps the items through it, a later page the items from it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Kept {
+    /// The top of the highest row holding an item after the middle one:
+    /// everything above it survives an earlier page.
+    pub older_end: f32,
+    /// The bottom of the lowest row holding an item before the middle one:
+    /// everything below it survives a later page.
+    pub newer_start: f32,
 }
 
 impl Scroll {
@@ -1044,7 +1062,11 @@ impl Scroll {
             from_top,
             content,
             window,
+            kept: None,
         }
+    }
+    pub(super) fn with_kept(self, kept: Option<Kept>) -> Self {
+        Self { kept, ..self }
     }
     /// How far the transcript can be scrolled.
     fn travel(self) -> f32 {
@@ -1088,6 +1110,36 @@ impl Scroll {
 
     pub(super) fn page_height(self) -> f32 {
         (self.window * 0.9).max(1.0)
+    }
+
+    /// Whether the next earlier page should be fetched now, ahead of the
+    /// reader. Short of the very top this waits until the whole viewport is
+    /// in the half the page keeps, so what is on screen never leaves the
+    /// window. Items differ in height and are not drawn in item order within
+    /// an exchange, so that half is where its rows were drawn. Until they
+    /// have been, only the edge asks.
+    pub(super) fn prefetch_earlier(self) -> bool {
+        self.at_top()
+            || self.kept.is_some_and(|kept| {
+                self.from_top <= self.prefetch_reach()
+                    && self.from_top + self.window <= kept.older_end
+            })
+    }
+
+    /// Whether the next newer page should be fetched now, the mirror of
+    /// [`Self::prefetch_earlier`].
+    pub(super) fn prefetch_later(self) -> bool {
+        self.at_bottom()
+            || self.kept.is_some_and(|kept| {
+                self.travel() - self.from_top <= self.prefetch_reach()
+                    && self.from_top >= kept.newer_start
+            })
+    }
+
+    /// How far from a loaded edge a page is fetched: far enough that wheel
+    /// and Page Up reading does not reach the edge before the page arrives.
+    fn prefetch_reach(self) -> f32 {
+        self.window * PREFETCH_SCREENS
     }
 }
 
@@ -1260,6 +1312,9 @@ impl Cagents {
         } else {
             0.0
         };
+        if let Some(done) = self.unnamed_agent_view(card) {
+            return done;
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime))
                 if runtime.awaiting_admission()
@@ -3030,6 +3085,22 @@ impl Runtime {
                         Default::default()
                     },
                     Some(self.find_navigation.guard()),
+                    if selected.is_none() {
+                        scroll::History {
+                            pages: scroll::Pages {
+                                earlier: snapshot.has_earlier,
+                                later: snapshot.has_later,
+                            },
+                            // The store's `middle` cursor is the window's
+                            // item at `len / 2` too (`Store::window_reusing`).
+                            pivot: (!snapshot.items.is_empty()).then(|| scroll::Pivot {
+                                index: snapshot.items.len() / 2,
+                                items: snapshot.items.len(),
+                            }),
+                        }
+                    } else {
+                        scroll::History::default()
+                    },
                 ),
                 target,
                 self.selected_subagent.as_deref(),
@@ -5670,6 +5741,8 @@ impl Runtime {
                     .is_some_and(|card| card.is_card())
             {
                 Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
+            } else if let Some(source) = self.excerpted_output_source(item) {
+                Action::CopyStep(self.target, item.id.clone(), CopyPart::Text, source)
             } else {
                 Action::Copy(self.target, item.id.clone(), CopyPart::Text)
             },

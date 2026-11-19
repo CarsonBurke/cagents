@@ -65,8 +65,14 @@ fn serve(mut stream: std::os::unix::net::UnixStream, hosted: Vec<TerminalSession
                     proof: proof.clone(),
                     resumed: Vec::new(),
                 },
-                ClientRequest::List => ServerResponse::Listed {
-                    terminals: hosted.iter().map(descriptor).collect(),
+                // A daemon lists in identity order.
+                ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
+                    terminals: {
+                        let mut terminals = hosted.iter().map(descriptor).collect::<Vec<_>>();
+                        terminals.sort_by_key(|terminal| terminal.session.id);
+                        terminals
+                    },
+                    complete: true,
                 },
                 ClientRequest::Attach { terminal_id, .. } => ServerResponse::Attached {
                     terminal: descriptor(
@@ -598,6 +604,16 @@ fn an_edit_to_a_neighbouring_pane_does_not_restart_the_retry_window() {
     assert!(report.contains(REFUSAL), "{report}");
 }
 
+const FIXTURE_SOCKET: &str = "/fixture/daemon.sock";
+
+/// A fixture daemon connection, as readiness hands it over.
+fn fixture_daemon(client: crate::control::ControlClient) -> crate::terminal::ReadyDaemon {
+    crate::terminal::ReadyDaemon {
+        socket: FIXTURE_SOCKET.into(),
+        client,
+    }
+}
+
 /// The refusals a shared pane's own attach produces, through the choice
 /// `attach_restored_agent` makes for it: a daemon that no longer hosts the
 /// exact terminal, and one that cannot be reached. Each is retried after its
@@ -612,7 +628,9 @@ fn a_shared_attach_refusal_is_retried_and_then_reported() {
     let unhosted = || {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         serve(server, Vec::new());
-        crate::control::ControlClient::from_stream(client).map_err(|error| error.to_string())
+        crate::control::ControlClient::from_stream(client)
+            .map(fixture_daemon)
+            .map_err(|error| error.to_string())
     };
     let disconnected = crate::app::restored_attachment(shared, saved.clone(), unhosted)
         .err()
@@ -692,11 +710,17 @@ fn a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof() {
     other.launch = saved.launch.clone();
     let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
     serve(server, vec![rehosted(&other), rehosted(&saved)]);
-    let mut client = crate::control::ControlClient::from_stream(client).unwrap();
-    let (recovered, mode) = crate::app::hosted_shared_terminal(&mut client, saved.id).unwrap();
+    let client = crate::control::ControlClient::from_stream(client).unwrap();
+    let (recovered, mode) =
+        crate::app::hosted_shared_terminal(fixture_daemon(client), saved.id).unwrap();
     assert_eq!(recovered.session, rehosted(&saved));
     assert_eq!(recovered.expected_host, Some(replacement_proof()));
     assert!(recovered.recovery_lease.is_none());
+    assert_eq!(
+        recovered.socket.as_deref(),
+        Some(std::path::Path::new(FIXTURE_SOCKET)),
+        "the attachment connects to the daemon its readiness proved"
+    );
     assert!(!recovered.attach_completed);
     assert!(
         matches!(mode, crate::app::TerminalStartMode::Attach(proof) if proof == replacement_proof())
@@ -704,9 +728,9 @@ fn a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof() {
 
     let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
     serve(server, vec![rehosted(&other)]);
-    let mut client = crate::control::ControlClient::from_stream(client).unwrap();
+    let client = crate::control::ControlClient::from_stream(client).unwrap();
     assert_eq!(
-        crate::app::hosted_shared_terminal(&mut client, saved.id)
+        crate::app::hosted_shared_terminal(fixture_daemon(client), saved.id)
             .err()
             .as_deref(),
         Some(crate::app::SHARED_TERMINAL_DISCONNECTED),

@@ -1,5 +1,6 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
-//! keep both long conversations and a single enormous tool result pageable.
+//! keep both long conversations and a single enormous message pageable, and
+//! let one enormous tool result be shown as an excerpt and copied whole.
 mod file_changes;
 mod text_copy;
 use super::observed_at;
@@ -104,11 +105,36 @@ const BULK_BYTES: usize = METADATA_LIMIT / 2;
 /// How far before a part's nominal end a patch is searched for the end of a
 /// line to be cut at instead.
 const LINE_BYTES: usize = 4 * 1024;
+/// A command's output, or a tool's input or output, longer than this is shown
+/// as an excerpt rather than in parts: paged like prose, one enormous output
+/// filled the whole window with parts of itself, leaving no room for the
+/// conversation around it.
+const EXCERPT_BYTES: usize = 64 * 1024;
+/// How much of an excerpted field's start is shown. What was printed first
+/// says what ran.
+const EXCERPT_HEAD_BYTES: usize = 16 * 1024;
+/// How much of an excerpted field's end is shown, the larger share: a
+/// command's result and its errors are printed last. Head and tail together
+/// stay well under `EXCERPT_BYTES`, so an excerpt always leaves out more than
+/// the line saying so adds.
+const EXCERPT_TAIL_BYTES: usize = 40 * 1024;
+/// Charged for the line an excerpt adds to say how much it left out.
+const EXCERPT_GAP_BYTES: usize = 64;
 /// Charged per vector element beside its own text to cover what postcard adds:
 /// a variant tag and a length prefix per string. Without it an item of many
 /// tiny paths could satisfy the text budget and still overrun the serialized one.
 const ELEMENT_BYTES: usize = 16;
 type Cursor = (i64, usize);
+/// A page request that slides the window: it keeps the half the reader is in
+/// and fills the other half from further along, so what is on screen stays
+/// loaded. `from` is the old edge in the requested direction; a window that
+/// does not pass it has made no progress and falls back to a page that starts
+/// at that edge.
+#[derive(Clone, Copy)]
+enum Slide {
+    Earlier { from: Cursor },
+    Later { from: Cursor },
+}
 #[derive(Clone, Copy)]
 enum LatestBoundary {
     BeforeAll,
@@ -139,11 +165,16 @@ pub(crate) struct Store {
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
+    /// The part in the middle of the window, where a page slide pivots.
+    middle: Option<Cursor>,
     forward: Option<Cursor>,
+    slide: Option<Slide>,
     paging: bool,
     cached_earlier: bool,
     provider_earlier: bool,
     pending_earlier: Option<Cursor>,
+    /// Where the window will end once the provider's earlier page arrives.
+    pending_pivot: Option<Cursor>,
     latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
@@ -389,11 +420,14 @@ impl Store {
                 end: None,
                 first: None,
                 newest: None,
+                middle: None,
                 forward: None,
+                slide: None,
                 paging: false,
                 cached_earlier: false,
                 provider_earlier: false,
                 pending_earlier: None,
+                pending_pivot: None,
                 latest_boundary: None,
                 messages: None,
                 dirty: true,
@@ -602,10 +636,19 @@ impl Store {
         } else {
             body0.len() as i64
         };
-        let copy_prefix = if item.logical_copy_body().is_some() {
-            self.copy_parent_prefix(&item.id, &body0)?
-        } else {
-            false
+        let copy_body = text_copy::copy_field(&item).map(|field| {
+            (
+                field,
+                if field == 0 {
+                    body0.as_str()
+                } else {
+                    body1.as_str()
+                },
+            )
+        });
+        let copy_prefix = match copy_body {
+            Some((_, body)) => self.copy_parent_prefix(&item.id, body)?,
+            None => false,
         };
         let transaction = self.db.transaction()?;
         let index_spans = spans.clone();
@@ -622,7 +665,7 @@ impl Store {
         let copy_invalidated = Self::copy_parent_put(
             &transaction,
             &item.id,
-            item.logical_copy_body().is_some().then_some(len0 as usize),
+            copy_body.map(|(field, body)| (field, body.len())),
             copy_prefix,
         )?;
         transaction.commit()?;
@@ -784,13 +827,20 @@ impl Store {
                 .transpose()
                 .map(Option::flatten)
         };
-        let (end, first, newest, forward, pending_earlier) = (
+        let (end, first, newest, middle, forward, pending_earlier, pending_pivot) = (
             remap(self.end)?,
             remap(self.first)?,
             remap(self.newest)?,
+            remap(self.middle)?,
             remap(self.forward)?,
             remap(self.pending_earlier)?,
+            remap(self.pending_pivot)?,
         );
+        let slide = match self.slide {
+            Some(Slide::Earlier { from }) => remap(Some(from))?.map(|from| Slide::Earlier { from }),
+            Some(Slide::Later { from }) => remap(Some(from))?.map(|from| Slide::Later { from }),
+            None => None,
+        };
         let latest_boundary = match self.latest_boundary {
             Some(LatestBoundary::After(ordinal)) => {
                 let mapped: Option<i64> = transaction.query_row(
@@ -815,8 +865,11 @@ impl Store {
         self.end = end;
         self.first = first;
         self.newest = newest;
+        self.middle = middle;
         self.forward = forward;
+        self.slide = slide;
         self.pending_earlier = pending_earlier;
+        self.pending_pivot = pending_pivot;
         self.latest_boundary = latest_boundary;
         self.dirty = true;
         Ok(())
@@ -952,6 +1005,8 @@ impl Store {
                     "UPDATE items SET len1=len1+?2,metadata=?3 WHERE id=?1"
                 };
                 transaction.execute(update, params![id, delta.len(), metadata])?;
+                // The output is what Copy reads of a step, and grows in place.
+                Self::copy_parent_append(&transaction, &id, delta.len())?;
                 transaction.commit()?;
                 self.changed(&id);
                 self.dirty = true;
@@ -973,6 +1028,7 @@ impl Store {
                     // A latest reread cannot satisfy an outstanding older
                     // cursor, including a deferred reread after RPC failure.
                     self.pending_earlier = None;
+                    self.pending_pivot = None;
                 }
                 self.provider_earlier = has_earlier;
                 let mut seen = std::collections::BTreeSet::new();
@@ -988,6 +1044,7 @@ impl Store {
                         warning.clone()
                     }));
                 }
+                let pivot = self.pending_pivot.take();
                 if let Some(first) = self.pending_earlier.take()
                     && self.db.query_row(
                         "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal<?1)",
@@ -995,9 +1052,7 @@ impl Store {
                         |row| row.get::<_, bool>(0),
                     )?
                 {
-                    self.end = Some((first.0, first.1 + 1));
-                    self.forward = None;
-                    self.paging = true;
+                    self.slide_earlier(first, pivot);
                 }
                 self.dirty = true;
                 out.push(Event::HistoryRecovered);
@@ -1048,11 +1103,14 @@ impl Store {
                 self.end = None;
                 self.first = None;
                 self.newest = None;
+                self.middle = None;
                 self.forward = None;
+                self.slide = None;
                 self.paging = false;
                 self.provider_earlier = false;
                 self.cached_earlier = false;
                 self.pending_earlier = None;
+                self.pending_pivot = None;
                 self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
@@ -1064,6 +1122,7 @@ impl Store {
                 // for an unrelated later history response. Successful pages
                 // consume the cursor before publishing loading=false.
                 self.pending_earlier = None;
+                self.pending_pivot = None;
                 self.latest_boundary = None;
                 out.push(Event::HistoryLoading(false));
                 return Ok(out);
@@ -1080,6 +1139,7 @@ impl Store {
             event @ (Event::Exited { .. } | Event::Error { fatal: true, .. }) => {
                 self.latest_boundary = None;
                 self.pending_earlier = None;
+                self.pending_pivot = None;
                 out.push(event);
                 return Ok(out);
             }
@@ -1164,25 +1224,37 @@ impl Store {
         self.trim_wal();
         Ok(warning)
     }
-    /// Returns true when earlier history is already cached (no provider command).
+    /// Slide the window toward earlier history. It keeps the older half of
+    /// what is displayed, where a reader paging back is, and fills the rest
+    /// from before it. Returns true when earlier history is already cached
+    /// (no provider command).
     pub fn earlier(&mut self) -> Result<bool, String> {
         if self.cached_earlier {
             if let Some(first) = self.first {
-                self.end = Some((first.0, first.1 + 1));
-                self.forward = None;
+                self.slide_earlier(first, self.middle);
             }
-            self.paging = true;
-            self.dirty = true;
             Ok(true)
         } else if self.provider_earlier {
             self.pending_earlier = self.first;
+            self.pending_pivot = self.middle;
             Ok(false)
         } else {
             Err("No earlier transcript is available".into())
         }
     }
-    /// Continue from the newest displayed chunk, retaining it as an anchor.
-    /// Only two cursors are retained, regardless of conversation length.
+    /// End the next window at `pivot`, or at `first` when the window has no
+    /// distinct middle, so that it starts before `first`.
+    fn slide_earlier(&mut self, first: Cursor, pivot: Option<Cursor>) {
+        let pivot = pivot.filter(|pivot| *pivot > first).unwrap_or(first);
+        self.end = Some((pivot.0, pivot.1 + 1));
+        self.forward = None;
+        self.slide = Some(Slide::Earlier { from: first });
+        self.paging = true;
+        self.dirty = true;
+    }
+    /// Slide the window toward newer history. It keeps the newer half of
+    /// what is displayed and continues after it. Only a few cursors are
+    /// retained, regardless of conversation length.
     pub fn later(&mut self) -> Result<bool, String> {
         if self.end.is_none() {
             return Err("No newer cached transcript is available".into());
@@ -1190,9 +1262,15 @@ impl Store {
         let newest = self
             .newest
             .ok_or("No newer cached transcript is available")?;
-        self.forward = Some(newest);
+        let pivot = self
+            .middle
+            .filter(|pivot| *pivot < newest)
+            .unwrap_or(newest);
+        self.forward = Some(pivot);
+        self.slide = Some(Slide::Later { from: newest });
         self.paging = true;
         self.pending_earlier = None;
+        self.pending_pivot = None;
         self.dirty = true;
         Ok(true)
     }
@@ -1200,7 +1278,9 @@ impl Store {
         self.paging = false;
         self.forward = None;
         self.end = None;
+        self.slide = None;
         self.pending_earlier = None;
+        self.pending_pivot = None;
         self.dirty = true;
     }
     fn field(&self, id: &str, field: i64, start: usize, end: usize) -> Result<Vec<u8>, StoreError> {
@@ -1217,39 +1297,67 @@ impl Store {
         }
         Ok(result)
     }
-    fn body(&self, id: &str, len0: usize, start: usize, end: usize) -> Result<Vec<u8>, StoreError> {
-        let mut result = self.field(id, 0, start.min(len0), end.min(len0))?;
-        if end > len0 {
-            result.extend(self.field(id, 1, start.saturating_sub(len0), end - len0)?);
-        }
-        Ok(result)
-    }
-    fn boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, StoreError> {
+    /// Where the character at or before `target` in one field starts.
+    fn boundary(&self, id: &str, field: i64, target: usize) -> Result<usize, StoreError> {
         if target == 0 {
             return Ok(0);
         }
         let start = target.saturating_sub(3);
-        let bytes = self.body(id, len0, start, target + 1)?;
+        let bytes = self.field(id, field, start, target + 1)?;
         Ok(bytes
             .iter()
             .rposition(|byte| byte & 0xc0 != 0x80)
             .map_or(target, |index| start + index)
             .min(target))
     }
-    /// Where a patch is cut near `target`: after the last line that ends
-    /// within `LINE_BYTES` before it, so that a part starts where a line does
-    /// and the first byte it shows is the one that says what the line is. A
-    /// longer line is cut as any other text is.
-    fn line_boundary(&self, id: &str, len0: usize, target: usize) -> Result<usize, StoreError> {
+    /// Where a field is cut near `target`: after the last line that ends
+    /// within `LINE_BYTES` before it, so that what follows starts where a
+    /// line does and the first byte it shows is the one that says what the
+    /// line is. A longer line is cut as any other text is.
+    fn line_boundary(&self, id: &str, field: i64, target: usize) -> Result<usize, StoreError> {
         let start = target.saturating_sub(LINE_BYTES);
         match self
-            .field(id, 0, start, target)?
+            .field(id, field, start, target)?
             .iter()
             .rposition(|byte| *byte == b'\n')
         {
             Some(index) => Ok(start + index + 1),
-            None => self.boundary(id, len0, target),
+            None => self.boundary(id, field, target),
         }
+    }
+    /// Where the first line that starts within `LINE_BYTES` after `target`
+    /// begins, or the character at `target` when none does.
+    fn next_line(&self, id: &str, field: i64, target: usize) -> Result<usize, StoreError> {
+        match self
+            .field(id, field, target, target + LINE_BYTES)?
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            Some(index) => Ok(target + index + 1),
+            None => self.boundary(id, field, target),
+        }
+    }
+    /// A step's input or output as one transcript row shows it: whole when it
+    /// is at most `EXCERPT_BYTES`, and otherwise its first and last lines with
+    /// a line between them saying how much was left out. Copy still reads the
+    /// whole field through the item's copy source.
+    fn excerpt(&self, id: &str, field: i64, length: usize) -> Result<String, StoreError> {
+        let text = |start, end| -> Result<String, StoreError> {
+            String::from_utf8(self.field(id, field, start, end)?)
+                .map_err(|error| StoreError::Invalid(error.to_string()))
+        };
+        if length <= EXCERPT_BYTES {
+            return text(0, length);
+        }
+        let head = self.line_boundary(id, field, EXCERPT_HEAD_BYTES)?;
+        let tail = self.next_line(id, field, length - EXCERPT_TAIL_BYTES)?;
+        let mut excerpt = text(0, head)?;
+        if !excerpt.ends_with('\n') {
+            excerpt.push('\n');
+        }
+        excerpt.push_str(&crate::chat::excerpt_gap((tail - head) as u64));
+        excerpt.push_str(&text(tail, length)?);
+        Ok(excerpt)
     }
     /// Marks every cached step still running or waiting as stopped, once the provider
     /// that ran it has exited and nothing will report its end. A step's
@@ -1354,23 +1462,37 @@ impl Store {
                 .map_err(|e| e.to_string())?
         };
         let mut items = Vec::new();
+        let mut cursors = Vec::new();
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
+        // How many parts the newest item has, which says whether the window
+        // ends inside it.
+        let mut newest_parts = 0;
         'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
             let patch = matches!(base.content, ItemContent::Changes { .. });
             let cut = |target: usize| {
                 if patch {
-                    self.line_boundary(&id, len0, target)
+                    self.line_boundary(&id, 0, target)
                 } else {
-                    self.boundary(&id, len0, target)
+                    self.boundary(&id, 0, target)
                 }
             };
-            let total = len0 + len1;
+            // A step is one row whatever it printed; a long input or output
+            // is shown as an excerpt. Everything else pages its one body.
+            let excerpted = matches!(
+                base.content,
+                ItemContent::Command { .. } | ItemContent::Tool { .. }
+            );
+            let total = if excerpted { len0 + len1 } else { len0 };
             let kind = layout(&base.content);
-            let parts = total.max(1).div_ceil(PART_BYTES);
+            let parts = if excerpted {
+                1
+            } else {
+                total.max(1).div_ceil(PART_BYTES)
+            };
             let until =
                 if self.forward.is_none() && self.end.is_some_and(|cursor| cursor.0 == ordinal) {
                     self.end.unwrap().1.min(parts)
@@ -1387,14 +1509,26 @@ impl Store {
                 } else {
                     until - index - 1
                 };
-                let start = cut(part * PART_BYTES)?;
-                let end = if (part + 1) * PART_BYTES >= total {
-                    total
+                let (start, end) = if excerpted {
+                    (0, total)
                 } else {
-                    cut((part + 1) * PART_BYTES)?
+                    let start = cut(part * PART_BYTES)?;
+                    let end = if (part + 1) * PART_BYTES >= total {
+                        total
+                    } else {
+                        cut((part + 1) * PART_BYTES)?
+                    };
+                    (start, end)
                 };
                 let (start0, end0) = (start.min(len0), end.min(len0));
                 let (start1, end1) = (start.saturating_sub(len0), end.saturating_sub(len0));
+                // What the row carries of its bodies, which is all of them
+                // unless an excerpt stands in for one.
+                let shown = if excerpted {
+                    excerpt_bytes(len0) + excerpt_bytes(len1)
+                } else {
+                    end - start
+                };
                 // A part's identity carries its field ranges and layout so
                 // disclosure state cannot move to different bytes on rewrite.
                 let item_id = if part > 0 {
@@ -1410,18 +1544,17 @@ impl Store {
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
-                let attached =
-                    if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
-                        len2
-                    } else {
-                        0
-                    };
-                let size = metadata.len() + end - start + 128 + attached;
+                let attached = if len2 > 0 && metadata.len() + shown + len2 + 128 <= WINDOW_BYTES {
+                    len2
+                } else {
+                    0
+                };
+                let size = metadata.len() + shown + 128 + attached;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
                 }
-                let copy_source = if base.logical_copy_body().is_some() {
+                let copy_source = if text_copy::copy_field(&base).is_some() {
                     self.copy_parent_source(&id)?
                 } else {
                     None
@@ -1439,10 +1572,14 @@ impl Store {
                     newest = Some(
                         newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))),
                     );
+                    if newest == Some((ordinal, part)) {
+                        newest_parts = parts;
+                    }
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
                     copy_projection.push(copy_source);
+                    cursors.push((ordinal, part));
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1450,45 +1587,31 @@ impl Store {
                 if part > 0 {
                     item.id = item_id.into_owned();
                 }
-                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
-                    .map_err(|e| e.to_string())?;
-                let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
-                    .map_err(|e| e.to_string())?;
+                let (body0, body1) = if excerpted {
+                    (self.excerpt(&id, 0, len0)?, self.excerpt(&id, 1, len1)?)
+                } else {
+                    (
+                        String::from_utf8(self.field(&id, 0, start0, end0)?)
+                            .map_err(|e| e.to_string())?,
+                        String::new(),
+                    )
+                };
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
-                let attachment =
-                    if len2 > 0 && metadata.len() + (end - start) + len2 + 128 <= WINDOW_BYTES {
-                        Some(
-                            String::from_utf8(self.field(&id, 2, 0, len2)?)
-                                .map_err(|e| e.to_string())?,
-                        )
-                    } else {
-                        None
-                    };
+                let attachment = if len2 > 0 && metadata.len() + shown + len2 + 128 <= WINDOW_BYTES
+                {
+                    Some(
+                        String::from_utf8(self.field(&id, 2, 0, len2)?)
+                            .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
+                };
                 let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
                     ItemContent::Text { text, .. } => *text = body0,
                     ItemContent::Delivery { body, .. } => *body = body0,
-                    ItemContent::Command {
-                        label,
-                        command,
-                        output,
-                        ..
-                    } => {
-                        *output = body0;
-                        if parts > 1 {
-                            // The view shows the command itself when the
-                            // provider supplied no label, so a paged command
-                            // has to name itself in the label that now carries
-                            // which part of the output this is.
-                            let base = if label.is_empty() {
-                                command.clone()
-                            } else {
-                                std::mem::take(label)
-                            };
-                            *label = format!("{base} (part {}/{parts})", part + 1);
-                        }
-                    }
+                    ItemContent::Command { output, .. } => *output = body0,
                     // Each file is given the lines of its patch that fall in
                     // this part, and a part names only the files it has lines
                     // of. A path is what the view counts edited files by, so
@@ -1520,17 +1643,9 @@ impl Store {
                     // Bounded when the item was cached, so there is no chunked
                     // body to restore here.
                     ItemContent::WebSearch { .. } => {}
-                    ItemContent::Tool {
-                        name,
-                        input,
-                        output,
-                        ..
-                    } => {
+                    ItemContent::Tool { input, output, .. } => {
                         *input = body0;
                         *output = body1;
-                        if parts > 1 {
-                            *name = format!("{name} (part {}/{parts})", part + 1);
-                        }
                     }
                     ItemContent::Image {
                         path, description, ..
@@ -1548,7 +1663,7 @@ impl Store {
                         }
                     }
                 }
-                let size = metadata.len() + end - start + 128 + attached;
+                let size = metadata.len() + shown + 128 + attached;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
@@ -1560,9 +1675,13 @@ impl Store {
                 }
                 newest =
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
+                if newest == Some((ordinal, part)) {
+                    newest_parts = parts;
+                }
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                 copy_projection.push(copy_source);
+                cursors.push((ordinal, part));
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1586,10 +1705,39 @@ impl Store {
                 return self.window_reusing(previous);
             }
         }
+        // A slide keeps half of what was displayed. When the history past
+        // its pivot is too large to fit beside that half, the window holds
+        // nothing new; page from the old edge instead, as a page without
+        // that overlap would.
+        if self.paging {
+            match self.slide {
+                Some(Slide::Earlier { from })
+                    if self.forward.is_none()
+                        && first.is_some_and(|first| first >= from)
+                        && self.end != Some((from.0, from.1 + 1)) =>
+                {
+                    self.end = Some((from.0, from.1 + 1));
+                    return self.window_reusing(previous);
+                }
+                Some(Slide::Later { from })
+                    if self.forward.is_some()
+                        && newest.is_some_and(|newest| newest <= from)
+                        && self.forward != Some(from) =>
+                {
+                    self.forward = Some(from);
+                    return self.window_reusing(previous);
+                }
+                _ => {}
+            }
+        }
         if self.forward.is_none() {
             items.reverse();
             copy_projection.reverse();
+            cursors.reverse();
         }
+        // The UI measures the kept halves around the item at the same index
+        // of the window (`scroll::Pivot`), so the two must agree.
+        self.middle = cursors.get(cursors.len() / 2).copied();
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
                 part > 0
@@ -1612,7 +1760,15 @@ impl Store {
         let has_later = if self.end.is_none() {
             false
         } else if let Some((ordinal, part)) = newest {
-            self.db.query_row("SELECT EXISTS(SELECT 1 FROM items WHERE ordinal>?1 OR (ordinal=?1 AND MAX(len0+len1,1)>?2))",params![ordinal,((part+1)*PART_BYTES) as i64],|row|row.get::<_,bool>(0)).map_err(|e|e.to_string())?
+            part + 1 < newest_parts
+                || self
+                    .db
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal>?1)",
+                        [ordinal],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|e| e.to_string())?
         } else {
             self.db
                 .query_row("SELECT EXISTS(SELECT 1 FROM items)", [], |row| {
@@ -1642,6 +1798,7 @@ impl Store {
         previous.clear();
         self.dirty = false;
         self.paging = false;
+        self.slide = None;
         self.changed = Some(Default::default());
         Ok(Window {
             items,
@@ -1755,6 +1912,15 @@ fn brief(id: &str) -> &str {
         end -= 1;
     }
     &id[..end]
+}
+/// The most an excerpted field's presentation carries, charged against the
+/// window before it is read.
+fn excerpt_bytes(length: usize) -> usize {
+    if length <= EXCERPT_BYTES {
+        length
+    } else {
+        EXCERPT_HEAD_BYTES + EXCERPT_TAIL_BYTES + EXCERPT_GAP_BYTES
+    }
 }
 /// Names how a variant's payload is spread across the chunk fields, for the
 /// part IDs of a paged item. Which field a byte offset belongs to is decided by
@@ -2368,8 +2534,10 @@ mod tests {
             .collect()
     }
 
+    /// Paging slides the window by half: the half a reader paging that way
+    /// is in stays loaded, so what is on screen never leaves the window.
     #[test]
-    fn bounded_history_pages_overlap_and_continue_in_both_directions() {
+    fn bounded_history_pages_slide_by_half_and_continue_in_both_directions() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         for n in 0..400 {
             store
@@ -2379,33 +2547,58 @@ mod tests {
         let latest = store.window().unwrap();
         assert_eq!(latest.items.len(), WINDOW_ITEMS);
         assert!(!latest.has_later);
-        store.earlier().unwrap();
-        let older = store.window().unwrap();
-        assert_eq!(
-            older.items.last().unwrap().id,
-            latest.items.first().unwrap().id
-        );
-        assert!(older.has_later);
-        store.earlier().unwrap();
-        let oldest = store.window().unwrap();
-        assert_eq!(
-            oldest.items.last().unwrap().id,
-            older.items.first().unwrap().id
-        );
-        assert!(oldest.items.len() <= WINDOW_ITEMS);
-        let mut boundary = oldest.items.last().unwrap().id.clone();
+        let mut page = latest.items;
+        for _ in 0..2 {
+            store.earlier().unwrap();
+            let older = store.window().unwrap();
+            assert!(older.items.ends_with(&page[..=page.len() / 2]));
+            assert_eq!(older.items.len(), WINDOW_ITEMS);
+            assert!(older.items[0].id < page[0].id);
+            assert!(older.has_later);
+            page = older.items;
+        }
+        assert_eq!(page[0].id, "row-146");
         for _ in 0..4 {
             store.later().unwrap();
             let next = store.window().unwrap();
-            assert_eq!(next.items.first().unwrap().id, boundary);
+            assert!(next.items.starts_with(&page[page.len() / 2..]));
             assert!(next.items.len() <= WINDOW_ITEMS);
-            boundary = next.items.last().unwrap().id.clone();
+            page = next.items;
             if !next.has_later {
-                assert_eq!(boundary, "row-399");
+                assert_eq!(page.last().unwrap().id, "row-399");
                 return;
             }
         }
         panic!("forward paging never reached cached live end");
+    }
+
+    /// A slide whose kept half fills the byte budget would hold nothing new,
+    /// so it pages from the old edge instead and still reaches earlier rows.
+    #[test]
+    fn a_slide_with_no_room_beside_its_kept_half_still_makes_progress() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(history_item("older", &"o".repeat(PART_BYTES))))
+            .unwrap();
+        store
+            .apply(Event::Item(history_item(
+                "big",
+                &"b".repeat(23 * PART_BYTES),
+            )))
+            .unwrap();
+        for n in 0..30 {
+            store
+                .apply(Event::Item(history_item(&format!("small-{n:02}"), "s")))
+                .unwrap();
+        }
+        let latest = store.window().unwrap();
+        assert_eq!(latest.items[0].id, "big");
+        assert!(latest.has_earlier);
+        store.earlier().unwrap();
+        let older = store.window().unwrap();
+        assert_eq!(older.items[0].id, "older");
+        assert_eq!(older.items[1].id, "big");
+        assert!(older.has_later);
     }
 
     #[test]
@@ -2474,9 +2667,10 @@ mod tests {
         assert_eq!((store.first, store.newest), cursors);
         store.earlier().unwrap();
         let previous = store.window().unwrap();
-        assert_eq!(
-            previous.items.last().unwrap().id,
-            page.items.first().unwrap().id
+        assert!(
+            previous
+                .items
+                .ends_with(&page.items[..=page.items.len() / 2])
         );
         assert!(previous.items.first().unwrap().id < page.items.first().unwrap().id);
     }
@@ -2504,10 +2698,12 @@ mod tests {
             })
             .unwrap();
         let older = store.window().unwrap();
-        assert_eq!(
-            older.items.last().unwrap().id,
-            initial.items.first().unwrap().id
+        assert!(
+            older
+                .items
+                .ends_with(&initial.items[..=initial.items.len() / 2])
         );
+        assert_eq!(older.items[0].id, "row-098");
         store
             .apply(Event::Item(history_item(
                 "row-250",
@@ -2518,9 +2714,10 @@ mod tests {
         assert_eq!(held.items, older.items);
         store.later().unwrap();
         let recent = store.window().unwrap();
-        assert_eq!(
-            recent.items.first().unwrap().id,
-            older.items.last().unwrap().id
+        assert!(
+            recent
+                .items
+                .starts_with(&older.items[older.items.len() / 2..])
         );
         assert_eq!(recent.items.last().unwrap().id, "row-250");
         assert!(!recent.has_later);
@@ -2556,10 +2753,12 @@ mod tests {
             if !page.has_later {
                 break;
             }
+            let kept = page.items[page.items.len() / 2..].to_vec();
             let boundary = page.items.last().unwrap().id.clone();
             store.later().unwrap();
             page = store.window().unwrap();
-            assert_eq!(page.items.first().unwrap().id, boundary);
+            assert!(page.items.starts_with(&kept));
+            assert_ne!(page.items.last().unwrap().id, boundary);
         }
         assert_eq!(bytes, text.len());
     }
@@ -3226,68 +3425,394 @@ mod tests {
             assert_eq!((path, diff), (&change.path, &change.diff));
         }
     }
-    /// Command output is the one field of a command that pages, so it must come
-    /// back from the chunk it was written to rather than from an empty one.
+    /// A finished command that printed `output`.
+    fn command(id: &str, output: &str) -> Item {
+        Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Command {
+                label: "Run cargo".into(),
+                command: "cargo test".into(),
+                working_directory: "/repo".into(),
+                action: crate::chat::CommandAction::Run,
+                status: crate::chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(12),
+                output: output.into(),
+            },
+            started_at: None,
+            at: None,
+        }
+    }
+    /// The serialized bytes a window would send, which is what its budget is
+    /// for.
+    fn window_bytes(window: &Window) -> usize {
+        window
+            .items
+            .iter()
+            .map(|item| postcard::to_stdvec(item.as_ref()).unwrap().len())
+            .sum()
+    }
+    /// A numbered build log of `lines` lines, so that where an excerpt cut
+    /// it can be checked line by line.
+    fn build_log(prefix: &str, lines: usize) -> String {
+        (0..lines)
+            .map(|line| format!("{prefix} line {line:07}: compiling crate number {line}\n"))
+            .collect()
+    }
+
+    /// A short output is shown whole, as before.
     #[test]
-    fn command_output_pages_without_losing_bytes() {
+    fn short_command_output_is_one_row_shown_whole() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
-        let original = "cargo output line\n".repeat(20_000);
-        assert!(original.len() > 2 * PART_BYTES);
+        let output = build_log("short", 100);
+        assert!(output.len() < EXCERPT_BYTES);
+        store.apply(Event::Item(command("exec", &output))).unwrap();
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        assert!(matches!(
+            &window.items[0].content,
+            ItemContent::Command { output: shown, label, .. } if *shown == output && label == "Run cargo"
+        ));
+    }
+
+    /// An output of exactly the excerpt size is shown whole; one byte more is
+    /// excerpted.
+    #[test]
+    fn excerpting_starts_just_past_its_size() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let whole = "x".repeat(EXCERPT_BYTES - 1) + "\n";
+        let over = whole.clone() + "y";
+        store.apply(Event::Item(command("whole", &whole))).unwrap();
+        store.apply(Event::Item(command("over", &over))).unwrap();
+        let window = store.window().unwrap();
+        let shown: Vec<&str> = window
+            .items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Command { output, .. } => output.as_str(),
+                _ => panic!("commands stay commands"),
+            })
+            .collect();
+        assert_eq!(shown[0], whole);
+        assert!(!crate::chat::is_excerpt(shown[0]));
+        assert!(crate::chat::is_excerpt(shown[1]));
+        assert!(shown[1].len() < over.len());
+    }
+
+    /// Output with no line breaks is cut between whole characters, so the
+    /// excerpt is still the output's own start and end.
+    #[test]
+    fn an_excerpt_of_one_long_line_cuts_between_characters() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        // Two- and three-byte characters, so no fixed offset is a boundary.
+        let output = "\u{3bb}\u{2026}".repeat(30_000);
+        store.apply(Event::Item(command("exec", &output))).unwrap();
+        let window = store.window().unwrap();
+        let ItemContent::Command { output: shown, .. } = &window.items[0].content else {
+            panic!("the command is still a command");
+        };
+        assert!(crate::chat::is_excerpt(shown));
+        let mut lines = shown.split('\n');
+        let (head, gap, tail) = (
+            lines.next().unwrap(),
+            lines.next().unwrap(),
+            lines.next().unwrap(),
+        );
+        assert_eq!(lines.next(), None);
+        assert!(!head.is_empty() && !tail.is_empty());
+        assert!(output.starts_with(head) && output.ends_with(tail));
+        assert_eq!(
+            format!("{gap}\n"),
+            crate::chat::excerpt_gap((output.len() - head.len() - tail.len()) as u64)
+        );
+    }
+
+    /// One enormous output is one row among the conversation around it,
+    /// showing its first and last lines and how much was left out between
+    /// them, while Copy still reads every byte.
+    #[test]
+    fn enormous_command_output_is_one_excerpted_row_beside_its_neighbours() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let output = build_log("build", 100_000);
+        assert!(output.len() > 4 * 1024 * 1024);
+        store
+            .apply(Event::Item(history_item("before", "Let me run the tests.")))
+            .unwrap();
+        store.apply(Event::Item(command("exec", &output))).unwrap();
+        store
+            .apply(Event::Item(history_item("after", "They all pass.")))
+            .unwrap();
+        let window = store.window().unwrap();
+        let ids: Vec<_> = window.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["before", "exec", "after"]);
+        assert!(!window.has_earlier && !window.has_later);
+        let ItemContent::Command {
+            label,
+            output: shown,
+            ..
+        } = &window.items[1].content
+        else {
+            panic!("the command is still a command");
+        };
+        assert_eq!(label, "Run cargo");
+        assert!(shown.len() < EXCERPT_BYTES, "{}", shown.len());
+        let lines: Vec<&str> = shown.lines().collect();
+        let gap = lines
+            .iter()
+            .position(|line| line.ends_with(" not shown \u{22ef}"))
+            .expect("the excerpt says what it left out");
+        // Head and tail are whole lines of the output, in order.
+        assert_eq!(lines[0], output.lines().next().unwrap());
+        assert_eq!(lines.last(), output.lines().last().as_ref());
+        let head = lines[..gap].join("\n") + "\n";
+        let tail = lines[gap + 1..].join("\n") + "\n";
+        assert!(output.starts_with(&head));
+        assert!(output.ends_with(&tail));
+        assert!(tail.len() > head.len(), "the end is the larger share");
+        let omitted = output.len() - head.len() - tail.len();
+        assert_eq!(
+            format!("{}\n", lines[gap]),
+            crate::chat::excerpt_gap(omitted as u64)
+        );
+        assert!(crate::chat::is_excerpt(shown));
+        let source = store.copy_projection[1]
+            .clone()
+            .expect("output copy source");
+        assert_eq!(source.bytes as usize, output.len());
+        let mut copied = String::new();
+        loop {
+            let page = store.text_copy(&source, copied.len() as u64).unwrap();
+            copied.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(copied, output);
+    }
+
+    /// A tool's input and output are excerpted each on its own, and Copy of
+    /// its output reads the output, not the input.
+    #[test]
+    fn enormous_tool_input_and_output_are_excerpted_separately() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let input = build_log("input", 3_000);
+        let output = build_log("output", 30_000);
+        assert!(input.len() > EXCERPT_BYTES && output.len() > EXCERPT_BYTES);
         store
             .apply(Event::Item(Item {
-                id: "exec".into(),
+                id: "call".into(),
                 role: Role::Assistant,
-                content: ItemContent::Command {
-                    label: "Run cargo".into(),
-                    command: "cargo test".into(),
-                    working_directory: "/repo".into(),
-                    action: crate::chat::CommandAction::Run,
+                content: ItemContent::Tool {
+                    name: "shell".into(),
+                    input: input.clone(),
+                    output: output.clone(),
                     status: crate::chat::ToolStatus::Succeeded,
-                    exit_code: Some(0),
-                    duration_ms: Some(12),
-                    output: original.clone(),
                 },
                 started_at: None,
                 at: None,
             }))
             .unwrap();
         let window = store.window().unwrap();
-        let parts = original.len().div_ceil(PART_BYTES);
-        assert_eq!(window.items.len(), parts);
-        let mut restored = String::new();
-        for (index, item) in window.items.iter().enumerate() {
-            match &item.content {
-                ItemContent::Command {
-                    label,
-                    command,
-                    output,
-                    exit_code,
-                    ..
-                } => {
-                    assert_eq!(command, "cargo test");
-                    assert_eq!(*exit_code, Some(0));
-                    assert_eq!(label, &format!("Run cargo (part {}/{parts})", index + 1));
-                    restored.push_str(output);
-                }
-                other => panic!("unexpected content {other:?}"),
+        assert_eq!(window.items.len(), 1);
+        let ItemContent::Tool {
+            name,
+            input: shown_input,
+            output: shown_output,
+            ..
+        } = &window.items[0].content
+        else {
+            panic!("the tool is still a tool");
+        };
+        assert_eq!(name, "shell");
+        for (shown, whole) in [(shown_input, &input), (shown_output, &output)] {
+            assert!(shown.len() < EXCERPT_BYTES);
+            assert!(whole.starts_with(shown.lines().next().unwrap()));
+            assert!(whole.ends_with(&format!("{}\n", shown.lines().last().unwrap())));
+        }
+        let source = store.copy_projection[0].clone().unwrap();
+        assert_eq!(source.bytes as usize, output.len());
+        assert_eq!(
+            store.text_copy(&source, 0).unwrap().text,
+            output[..crate::chat::TEXT_COPY_PAGE_BYTES]
+        );
+    }
+
+    /// Output streaming past the excerpt size keeps one row with the same ID,
+    /// so a reader who opened it keeps it open, and its copy source grows with
+    /// it rather than being replaced.
+    #[test]
+    fn streamed_output_keeps_one_row_and_its_copy_source_grows() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let mut running = command("exec", "");
+        if let ItemContent::Command { status, .. } = &mut running.content {
+            *status = crate::chat::ToolStatus::Running;
+        }
+        store.apply(Event::Item(running)).unwrap();
+        let first = store.copy_parent_source("exec").unwrap().unwrap();
+        let mut output = String::new();
+        for chunk in 0..60 {
+            let delta = build_log(&format!("chunk {chunk}"), 100);
+            store
+                .apply(Event::OutputDelta {
+                    id: "exec".into(),
+                    offset: output.len(),
+                    delta: delta.clone(),
+                })
+                .unwrap();
+            output.push_str(&delta);
+        }
+        assert!(output.len() > 4 * EXCERPT_BYTES);
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        assert_eq!(window.items[0].id, "exec");
+        let ItemContent::Command { output: shown, .. } = &window.items[0].content else {
+            panic!("the command is still a command");
+        };
+        assert!(shown.ends_with(&output[output.len() - 1000..]));
+        let source = store.copy_projection[0].clone().unwrap();
+        assert_eq!(
+            (source.token, source.revision),
+            (first.token, first.revision),
+            "an append keeps the source"
+        );
+        assert_eq!(source.bytes as usize, output.len());
+    }
+
+    /// A step's copy source follows the field its output is kept in. A
+    /// rewrite that extends what it copied keeps the source, as an append
+    /// does, even when the step changes kind; one that changes those bytes
+    /// replaces it, so a pending copy cannot mix the two.
+    #[test]
+    fn a_step_copy_source_survives_only_a_rewrite_that_extends_it() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let output = build_log("tool", 2_000);
+        store
+            .apply(Event::Item(Item {
+                id: "step".into(),
+                role: Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "shell".into(),
+                    input: "cargo test".into(),
+                    output: output.clone(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+                started_at: None,
+                at: None,
+            }))
+            .unwrap();
+        let tool = store.copy_parent_source("step").unwrap().unwrap();
+        assert_eq!(tool.bytes as usize, output.len());
+        let extended = output.clone() + &build_log("command", 2_000);
+        store
+            .apply(Event::Item(command("step", &extended)))
+            .unwrap();
+        let kept = store.copy_parent_source("step").unwrap().unwrap();
+        assert_eq!((kept.token, kept.revision), (tool.token, tool.revision));
+        assert_eq!(kept.bytes as usize, extended.len());
+        let rewritten = build_log("final", 4_000);
+        store
+            .apply(Event::Item(command("step", &rewritten)))
+            .unwrap();
+        let replaced = store.copy_parent_source("step").unwrap().unwrap();
+        assert_ne!(
+            (replaced.token, replaced.revision),
+            (kept.token, kept.revision)
+        );
+        assert_eq!(replaced.bytes as usize, rewritten.len());
+        let mut copied = String::new();
+        loop {
+            let page = store.text_copy(&replaced, copied.len() as u64).unwrap();
+            copied.push_str(&page.text);
+            if page.done {
+                break;
             }
         }
-        assert_eq!(restored, original);
+        assert_eq!(copied, rewritten);
     }
+
+    /// Paging through history holding several enormous outputs keeps whole
+    /// windows of conversation in both directions: each output costs a row,
+    /// not the window.
+    #[test]
+    fn paging_through_enormous_outputs_keeps_the_conversation_around_them() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        // Each output is larger than a part, which is what used to split it.
+        let output = build_log("build", 6_000);
+        assert!(output.len() > 2 * PART_BYTES);
+        let mut expected = Vec::new();
+        for turn in 0..50 {
+            for (id, item) in [
+                (
+                    format!("{turn:03}-ask"),
+                    history_item(&format!("{turn:03}-ask"), "Run it again."),
+                ),
+                (
+                    format!("{turn:03}-run"),
+                    command(&format!("{turn:03}-run"), &output),
+                ),
+                (
+                    format!("{turn:03}-answer"),
+                    history_item(&format!("{turn:03}-answer"), "Done."),
+                ),
+            ] {
+                store.apply(Event::Item(item)).unwrap();
+                expected.push(id);
+            }
+        }
+        let whole = |page: &Window| {
+            assert!(window_bytes(page) <= WINDOW_BYTES);
+            assert!(page.items.len() > 3, "{}", page.items.len());
+            assert!(
+                page.items
+                    .iter()
+                    .all(|item| crate::chat::TranscriptPart::parse(&item.id).is_none()),
+                "no output is cut into parts"
+            );
+        };
+        let mut page = store.window().unwrap();
+        whole(&page);
+        // The item count bounds the latest window, not one output's bytes.
+        assert_eq!(page.items.len(), WINDOW_ITEMS);
+        let mut seen: std::collections::BTreeSet<String> =
+            page.items.iter().map(|item| item.id.clone()).collect();
+        let mut pages = 0;
+        while page.has_earlier {
+            let oldest = page.items[0].id.clone();
+            store.earlier().unwrap();
+            page = store.window().unwrap();
+            assert!(page.items[0].id < oldest, "paging back made progress");
+            whole(&page);
+            seen.extend(page.items.iter().map(|item| item.id.clone()));
+            pages += 1;
+            assert!(pages < 20, "paging back never reached the start");
+        }
+        assert_eq!(page.items[0].id, expected[0]);
+        assert_eq!(seen.len(), expected.len(), "every row was shown");
+        while page.has_later {
+            let newest = page.items.last().unwrap().id.clone();
+            store.later().unwrap();
+            page = store.window().unwrap();
+            assert!(
+                page.items.last().unwrap().id > newest,
+                "paging on made progress"
+            );
+            whole(&page);
+            pages += 1;
+            assert!(pages < 40, "paging on never reached the end");
+        }
+        assert_eq!(&page.items.last().unwrap().id, expected.last().unwrap());
+    }
+
     /// A part id is the key the view's disclosure state is held under, and a
-    /// provider rewrites a live item: a finished tool call arrives again as a
-    /// command, which drops the input from the body and re-slices what is left.
-    /// A part that kept its old id would open on its first paint because the
-    /// reader had expanded the different bytes that id used to name.
+    /// provider rewrites a live item. A part that kept its old id would open
+    /// on its first paint because the reader had expanded what that id used
+    /// to name, so the id names the item's layout as well as its bytes.
     #[test]
     fn re_sliced_parts_do_not_reuse_the_ids_of_different_bytes() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
-        let output = "shell output line\n".repeat(19_445);
-        let input = "{\"command\":\"ls\"}".repeat(18_750);
-        // Both bodies span more than two parts, so a part lands wholly inside
-        // the call's input and the byte range it names outlives the rewrite
-        // that moves the output to where that input used to be.
-        assert!(output.len() > 2 * PART_BYTES && input.len() > 2 * PART_BYTES);
+        let body = "report line\n".repeat(30_000);
+        assert!(body.len() > 2 * PART_BYTES);
         let parts = |window: Window| {
             window
                 .items
@@ -3297,18 +3822,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         store
-            .apply(Event::Item(Item {
-                id: "call".into(),
-                role: Role::Assistant,
-                content: ItemContent::Tool {
-                    name: "shell".into(),
-                    input,
-                    output: output.clone(),
-                    status: crate::chat::ToolStatus::Running,
-                },
-                started_at: None,
-                at: None,
-            }))
+            .apply(Event::Item(history_item("report", &body)))
             .unwrap();
         let before = parts(store.window().unwrap());
         assert!(before.len() > 1, "{before:?}");
@@ -3317,17 +3831,14 @@ mod tests {
         assert_eq!(parts(store.window().unwrap()), before);
         store
             .apply(Event::Item(Item {
-                id: "call".into(),
+                id: "report".into(),
                 role: Role::Assistant,
-                content: ItemContent::Command {
-                    label: "shell".into(),
-                    command: "ls".into(),
-                    working_directory: "/repo".into(),
-                    action: crate::chat::CommandAction::Run,
-                    status: crate::chat::ToolStatus::Succeeded,
-                    exit_code: Some(0),
-                    duration_ms: Some(3),
-                    output,
+                content: ItemContent::Delivery {
+                    kind: crate::chat::DeliveryKind::Report,
+                    from: "reviewer".into(),
+                    sender: String::new(),
+                    summary: String::new(),
+                    body,
                 },
                 started_at: None,
                 at: None,

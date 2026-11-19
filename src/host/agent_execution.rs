@@ -2672,7 +2672,7 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
                 CommandAction::List => ("Listed", "Listing", Some("List ")),
             };
             let verb = if running { doing } else { verb };
-            let label = chat::without_page_mark(label.trim());
+            let label = label.trim();
             // Transcripts stored before adapters dropped the verb from the
             // label still carry it, as the native view also allows for.
             let label = stored
@@ -2712,14 +2712,10 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
             format!("Searched the web for {}", first_line(query))
         }
         ItemContent::Tool { name, .. } if running => {
-            format!("Calling {}", chat::without_page_mark(name))
+            format!("Calling {name}")
         }
         ItemContent::Tool { name, status, .. } => {
-            format!(
-                "Called {}{}",
-                chat::without_page_mark(name),
-                outcome(status)
-            )
+            format!("Called {name}{}", outcome(status))
         }
         ItemContent::Image { description, .. } if description.trim().is_empty() => {
             "Viewed an image".to_owned()

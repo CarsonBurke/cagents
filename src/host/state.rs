@@ -1245,6 +1245,39 @@ impl HostState {
             .collect()
     }
 
+    /// The descriptors after `after`, in identity order, until their encoding
+    /// would pass `budget` bytes, and whether the page ends the inventory. A
+    /// page always holds at least one descriptor when any follows `after`.
+    pub(crate) fn list_page(
+        &self,
+        client_id: ClientId,
+        after: Option<TerminalId>,
+        budget: usize,
+    ) -> (Vec<TerminalDescriptor>, bool) {
+        let following = match after {
+            Some(after) => self
+                .terminals
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded)),
+            None => self.terminals.range(..),
+        };
+        let mut page = Vec::new();
+        let mut used = 0;
+        for terminal_id in following.map(|(terminal_id, _)| *terminal_id) {
+            let Ok(descriptor) = self.descriptor(client_id, terminal_id) else {
+                continue;
+            };
+            // A descriptor that cannot be measured cannot be encoded either;
+            // charging it the whole budget gives it a page of its own.
+            let size = postcard::experimental::serialized_size(&descriptor).unwrap_or(budget);
+            if !page.is_empty() && used + size > budget {
+                return (page, false);
+            }
+            used += size;
+            page.push(descriptor);
+        }
+        (page, true)
+    }
+
     pub(crate) fn descriptor(
         &self,
         client_id: ClientId,

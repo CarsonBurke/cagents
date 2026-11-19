@@ -1472,6 +1472,8 @@ impl Cagents {
         if self.shared_views.retained.contains(&id)
             || self.chat_is_unused_default(id)
             || self.shared_views.defaults.contains_key(&id)
+            // Published once it starts, under the identity it starts with.
+            || self.reopen_pending(id)
             // What `Pane::from_card` publishes.
             || !card.existence.is_open()
             || card.kind.is_utility()
@@ -1761,6 +1763,7 @@ impl Cagents {
                 && !self.shared_views.attached.contains(&card.id)
                 && !self.shared_views.retained.contains(&card.id)
                 && !self.chat_is_unused_default(card.id)
+                && !self.reopen_pending(card.id)
         }) {
             return Err("an unpublished local conversation needs reconciliation");
         }
@@ -1913,6 +1916,7 @@ impl Cagents {
         self.pane_close_owned(card)
             || self.terminal_start_in_flight(card)
             || self.chat_start_pending(card)
+            || self.reopen_pending(card)
     }
 
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
@@ -2216,6 +2220,7 @@ impl Cagents {
                     || self.shared_views.attached.contains(&card.id)
                     || self.shared_views.retained.contains(&card.id)
                     || self.chat_is_unused_default(card.id)
+                    || self.reopen_pending(card.id)
                 {
                     return None;
                 }
@@ -3739,8 +3744,10 @@ impl Cagents {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
             }
+            // A pane still reopening is not shared yet, so no view lists it.
             if owned.contains(&id)
                 || self.shared_views.quarantined.contains(&id)
+                || self.reopen_pending(id)
                 || self
                     .card_state(id)
                     .is_some_and(|card| card.kind.is_utility())
@@ -4138,6 +4145,7 @@ impl Cagents {
             .filter(|id| {
                 (self.shared_views.quarantined.contains(id) && !shared.contains(id))
                     || self.shared_views.retained.contains(id)
+                    || self.reopen_pending(*id)
                     || (view.panes.is_empty() && self.chat_is_unused_default(*id))
                     || self
                         .card_state(*id)
@@ -4145,14 +4153,18 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         let mut visible = strip.iter().map(|pane| pane.id).collect::<Vec<_>>();
-        let mut fenced = Vec::new();
+        let mut held = Vec::new();
         for id in retained {
-            if !self.shared_views.quarantined.contains(&id) || shared.contains(&id) {
+            // A fenced card the view does not place keeps its local place:
+            // after the nearest card it followed here. So does a pane still
+            // reopening, which is not shared until it starts, rather than
+            // jumping to the end of the strip meanwhile.
+            if shared.contains(&id)
+                || !(self.shared_views.quarantined.contains(&id) || self.reopen_pending(id))
+            {
                 visible.push(id);
                 continue;
             }
-            // A fenced card the view does not place keeps its local place:
-            // after the nearest card it followed here.
             let before = local_order
                 .iter()
                 .position(|prior| *prior == id)
@@ -4163,10 +4175,10 @@ impl Cagents {
                 .find_map(|prior| visible.iter().position(|placed| placed == prior))
                 .map_or(0, |index| index + 1);
             visible.insert(place, id);
-            fenced.extend(local_pane(id));
+            held.extend(local_pane(id));
         }
-        // The strip shows fenced cards too, in their visible order.
-        for pane in fenced {
+        // The strip shows held cards too, in their visible order.
+        for pane in held {
             let place = visible
                 .iter()
                 .take(visible.iter().position(|id| *id == pane.id).unwrap_or(0))

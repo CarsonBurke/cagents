@@ -64,6 +64,9 @@ pub struct Request {
     handle: Arc<ClientHandle>,
     source: chat::TextCopySource,
     conversation_revision: u64,
+    /// What the clipboard holds ahead of the source's text, such as the
+    /// command a step's whole copy starts with.
+    prefix: String,
 }
 
 #[derive(Clone)]
@@ -128,7 +131,12 @@ impl Request {
             handle,
             source,
             conversation_revision,
+            prefix: String::new(),
         }
+    }
+    pub(super) fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = prefix.into();
+        self
     }
 }
 
@@ -159,6 +167,22 @@ impl Runtime {
                 chat::TextCopyScope::Conversation => self.selected_subagent.is_none(),
                 chat::TextCopyScope::Subagent { id } => self.selected_subagent.as_ref() == Some(id),
             })
+    }
+    /// The source of a step's whole output when its row shows only an
+    /// excerpt of it, which the store does for a long output. An output too
+    /// large for the clipboard has none: its Copy, and the note beneath it,
+    /// are about the excerpt it shows.
+    pub(super) fn excerpted_output_source(
+        &self,
+        item: &chat::Item,
+    ) -> Option<chat::TextCopySource> {
+        let output = match &item.content {
+            ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => output,
+            _ => return None,
+        };
+        self.message_copy_source(item).filter(|source| {
+            source.bytes > output.len() as u64 && source.bytes <= chat::TEXT_COPY_LIMIT_BYTES as u64
+        })
     }
     fn contains_copy_source(&self, captured: &chat::TextCopySource) -> bool {
         let sources = match (&captured.scope, self.selected_subagent.as_deref()) {
@@ -277,6 +301,7 @@ impl Cagents {
         target: Target,
         id: String,
         source: Option<chat::TextCopySource>,
+        prefix: String,
     ) -> Task<Message> {
         let context = current_context();
         let intent = context.advance();
@@ -284,12 +309,12 @@ impl Cagents {
             return Task::none();
         };
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
-            runtime.error = Some("This message is unavailable in the local copy cache. Open the provider transcript to recover its text.".into());
+            runtime.error = Some("This text is unavailable in the local copy cache. Open the provider transcript to recover it.".into());
             return Task::none();
         };
         let Some(handle) = runtime.handle().cloned() else {
             runtime.error =
-                Some("Reconnect this conversation before copying its full message.".into());
+                Some("Reconnect this conversation before copying all of this text.".into());
             return Task::none();
         };
         let request = Request {
@@ -298,6 +323,7 @@ impl Cagents {
             handle: handle.clone(),
             source: source.clone(),
             conversation_revision: runtime.snapshot.text_copy_sources.conversation_revision,
+            prefix,
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
@@ -342,6 +368,11 @@ impl Cagents {
             Ok(text) => {
                 let at = Instant::now();
                 runtime.copied = Some((id, at));
+                let text = match request.prefix.as_str() {
+                    "" => text,
+                    prefix if text.is_empty() => prefix.to_owned(),
+                    prefix => format!("{prefix}\n\n{text}"),
+                };
                 let context = request.context.clone();
                 let intent = request.intent;
                 Task::batch([

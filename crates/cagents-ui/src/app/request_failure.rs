@@ -127,6 +127,39 @@ pub(super) fn message(error: ControlError, activity: Activity, scoped: bool) -> 
     Failure::control(error, activity, scoped).message
 }
 
+/// A User connection to the daemon, started if need be, on the connection
+/// whose handshake proved it ready. Only a remote device's daemon, which
+/// readiness doesn't prove, is reached by a connection that fails in the
+/// words of `activity`.
+pub(super) fn connect_ready(activity: Activity) -> Result<crate::control::ControlClient, String> {
+    crate::terminal::connect_ready_daemon()
+        .map(|ready| ready.client)
+        .map_err(|error| match error {
+            crate::terminal::HostedTerminalStartError::Connect(error) => {
+                message(error, activity, false)
+            }
+            error => error.to_string(),
+        })
+}
+
+/// Readiness hands its connection to the request (#3127), so on the wire a
+/// readiness handshake and a direct connection look alike. Authority
+/// fixtures tell them apart with the daemon gone while this fence is held:
+/// only readiness would start a daemon, and the fence refuses that start
+/// with [`update_refusal`] before any daemon binary is looked for.
+#[cfg(test)]
+pub(super) fn hold_launch_fence() -> crate::instance::UiUpdateGuard {
+    crate::instance::UiUpdateGuard::acquire().unwrap()
+}
+
+/// What a task that tried to start an absent daemon under
+/// [`hold_launch_fence`] reports.
+#[cfg(test)]
+pub(super) fn update_refusal() -> String {
+    crate::terminal::HostedTerminalStartError::UpdateInProgress(crate::instance::UpdateInProgress)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

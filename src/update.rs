@@ -4965,7 +4965,10 @@ finally:
                                 StartupState::Ready
                             },
                         ),
-                        ClientRequest::List => ServerResponse::Listed { terminals: vec![] },
+                        ClientRequest::ListPage { after: None } => ServerResponse::ListedPage {
+                            terminals: vec![],
+                            complete: true,
+                        },
                         ClientRequest::ChatList => ServerResponse::ChatListed { sessions: vec![] },
                         _ => panic!("unexpected verification request"),
                     };

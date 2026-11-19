@@ -105,7 +105,10 @@ class ListenerTests(unittest.TestCase):
             runtime = root / "runtime"
             runtime.mkdir(mode=0o700)
             public = runtime / "public"
-            public.mkdir(mode=0o755)
+            public.mkdir()
+            # Set the mode explicitly: mkdir's mode is masked by the umask, and
+            # under 077 the directory would be private, not public.
+            public.chmod(0o755)
             unrelated = root / "other"
             unrelated.mkdir(mode=0o700)
             link = runtime / "link"

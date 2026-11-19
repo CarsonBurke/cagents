@@ -7,7 +7,7 @@
 //! it does the card fall back to saying so.
 
 use super::*;
-use crate::{control::ControlClient, terminal::HostedTerminalHandle};
+use crate::terminal::HostedTerminalHandle;
 
 /// How long a restored card waits for the daemon to hand back a final screen.
 const RETAINED_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,11 +175,11 @@ fn attach_retained(
     session: &TerminalSession,
     sender: async_channel::Sender<TerminalWakeup>,
 ) -> Result<Option<TerminalSurface>, String> {
-    let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-    let (proof, terminals) = {
-        let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let (socket, proof, terminals) = {
+        let crate::terminal::ReadyDaemon { socket, mut client } =
+            crate::terminal::connect_ready_daemon().map_err(|error| error.to_string())?;
         let terminals = client.list().map_err(|error| error.to_string())?;
-        (client.proof().clone(), terminals)
+        (socket, client.proof().clone(), terminals)
     };
     let retained = terminals.iter().any(|terminal| {
         terminal.session.id == session.id

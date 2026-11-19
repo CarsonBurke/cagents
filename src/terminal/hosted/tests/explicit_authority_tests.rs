@@ -77,14 +77,30 @@ fn inventory(
     proof: &HostSessionProof,
     terminals: Vec<TerminalDescriptor>,
 ) {
-    let list = request(stream, proof);
-    assert!(matches!(list.request, ClientRequest::List));
-    reply(
-        stream,
-        proof,
-        list.request_id,
-        ServerResponse::Listed { terminals },
-    );
+    inventory_pages(stream, proof, vec![(terminals, true)]);
+}
+/// Answers one `ListPage` request with each page in turn, checking that each
+/// asks for what follows the previous page.
+fn inventory_pages(
+    stream: &mut UnixStream,
+    proof: &HostSessionProof,
+    pages: Vec<(Vec<TerminalDescriptor>, bool)>,
+) {
+    let mut expected = None;
+    for (terminals, complete) in pages {
+        let list = request(stream, proof);
+        assert_eq!(list.request, ClientRequest::ListPage { after: expected });
+        expected = terminals.last().map(|terminal| terminal.session.id);
+        reply(
+            stream,
+            proof,
+            list.request_id,
+            ServerResponse::ListedPage {
+                terminals,
+                complete,
+            },
+        );
+    }
 }
 fn attach(
     stream: &mut UnixStream,
@@ -378,6 +394,51 @@ fn explicit_authority_precedes_spawn_input_paste_and_close_without_environment_f
     stop(&handle);
 }
 
+#[test]
+fn explicit_authority_reads_inventory_pages_only_until_its_terminal_identity() {
+    let other = |id: uuid::Uuid| {
+        let mut terminal = TerminalDescriptor::relaunchable(
+            TerminalId::from(id),
+            LaunchRecipe::shell("/".into()).unwrap(),
+            None,
+        );
+        terminal.attached = false;
+        terminal
+    };
+    // Its terminal follows a page of an earlier identity: the second page
+    // finds it, and nothing after it is read, though more would follow.
+    let authority = Authority::session(TOKEN.into());
+    let (_directory, listener, handle, proof, session) = begin(authority.clone());
+    let mut stream = connect(&listener, &proof);
+    let auth = authenticate(&mut stream, &proof, &authority);
+    reply(&mut stream, &proof, auth, ServerResponse::Accepted);
+    inventory_pages(
+        &mut stream,
+        &proof,
+        vec![
+            (vec![other(uuid::Uuid::nil())], false),
+            (vec![descriptor(&session)], false),
+        ],
+    );
+    attach(&mut stream, &proof, &session, false, None);
+    handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+    stop(&handle);
+
+    // A page that passes its identity without it ends the search: the
+    // terminal does not exist yet, so it is spawned.
+    let (_directory, listener, handle, proof, session) = begin(authority.clone());
+    let mut stream = connect(&listener, &proof);
+    let auth = authenticate(&mut stream, &proof, &authority);
+    reply(&mut stream, &proof, auth, ServerResponse::Accepted);
+    inventory_pages(
+        &mut stream,
+        &proof,
+        vec![(vec![other(uuid::Uuid::max())], false)],
+    );
+    attach(&mut stream, &proof, &session, true, None);
+    handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+    stop(&handle);
+}
 #[test]
 fn explicit_authority_reauthenticates_on_reconnect_without_replaying_started_input() {
     // A lost Spawn acknowledgement must not bless its provisional broadcasts
@@ -693,14 +754,15 @@ fn explicit_authority_rejects_changed_source_and_uncorrelated_or_stale_proof_bef
         if case.starts_with("list-") {
             reply(&mut stream, &proof, auth, ServerResponse::Accepted);
             let list = request(&mut stream, &proof);
-            assert!(matches!(list.request, ClientRequest::List));
+            assert_eq!(list.request, ClientRequest::ListPage { after: None });
             let mut response = ServerEnvelope {
                 version: PROTOCOL_VERSION,
                 request_id: Some(list.request_id),
                 proof: proof.clone(),
                 message: ServerMessage::Response {
-                    response: ServerResponse::Listed {
+                    response: ServerResponse::ListedPage {
                         terminals: Vec::new(),
+                        complete: true,
                     },
                 },
             };

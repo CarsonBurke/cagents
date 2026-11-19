@@ -158,6 +158,20 @@ fn change_verb(kind: &ChangeKind) -> &'static str {
     }
 }
 
+/// What the note beneath an input or output shown as an excerpt says,
+/// depending on whether its Copy reads the whole of it.
+pub(super) fn excerpt_note(part: &CopyPart, copies_whole: bool) -> &'static str {
+    match (part, copies_whole) {
+        (CopyPart::Input, _) => {
+            "Only the start and end of this input are shown. Copy includes only what is shown."
+        }
+        (_, true) => "Only the start and end of this output are shown. Copy includes all of it.",
+        (_, false) => {
+            "Only the start and end of this output are shown. Copy includes only what is shown."
+        }
+    }
+}
+
 fn change_view(change: &FileChange) -> Element<'static, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
@@ -209,7 +223,14 @@ impl Runtime {
         };
         let target = self.target;
         let id = item.id.clone();
-        let copy = Action::Copy(target, id.clone(), part.clone());
+        // A long output's row holds only its start and end; Copy reads the
+        // whole of it.
+        let copy = match (&part, self.excerpted_output_source(item)) {
+            (CopyPart::Output, Some(source)) => {
+                Action::CopyStep(target, id.clone(), CopyPart::Output, source)
+            }
+            _ => Action::Copy(target, id.clone(), part.clone()),
+        };
         // What a command or a tool printed is followed from its end. A patch,
         // an input, and what a read or a search returned are read from the
         // top, whether or not the step is still running.
@@ -527,6 +548,27 @@ impl Runtime {
             .filter(|status| *status != ToolStatus::Running || newest)
     }
 
+    /// Says, beneath an input or output shown as an excerpt, that only its
+    /// start and end are shown and what Copy takes, so the line marking the
+    /// gap is not mistaken for something the step printed.
+    fn excerpt_note(&self, item: &chat::Item, part: CopyPart) -> Option<Element<'static, Message>> {
+        let shown = match (&part, &item.content) {
+            (CopyPart::Input, ItemContent::Tool { input, .. }) => input,
+            (
+                CopyPart::Output,
+                ItemContent::Command { output, .. } | ItemContent::Tool { output, .. },
+            ) => output,
+            _ => return None,
+        };
+        let copies_whole =
+            matches!(part, CopyPart::Output) && self.excerpted_output_source(item).is_some();
+        (copies_whole || chat::is_excerpt(shown)).then(|| {
+            design::caption(excerpt_note(&part, copies_whole))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into()
+        })
+    }
+
     /// The bounded height a step's raw output is allowed to occupy before it
     /// scrolls inside its own surface, so one long build log cannot bury the
     /// steps that follow it.
@@ -599,6 +641,7 @@ impl Runtime {
                         "Output",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item, CopyPart::Output));
                 }
             }
             ItemContent::Changes { changes, status } => {
@@ -637,6 +680,7 @@ impl Runtime {
                         "Input",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item, CopyPart::Input));
                 }
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
@@ -648,6 +692,7 @@ impl Runtime {
                         "Output",
                         Some(Self::OUTPUT_HEIGHT),
                     ));
+                    rows.extend(self.excerpt_note(item, CopyPart::Output));
                 }
             }
             ItemContent::Image { path, .. } => {

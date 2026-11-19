@@ -16217,6 +16217,253 @@ fn a_never_named_conversation_whose_daemon_is_gone_reopens_as_a_draft() {
     assert!(app.chat_offers_fresh_conversation(card));
 }
 
+/// An agent's chat card whose Codex conversation was never named, after its
+/// restore found the daemon gone. `kept_runtime` keeps the card's chat
+/// runtime, as a window open across the daemon's restart does.
+fn unreachable_unnamed_agent(kept_runtime: bool) -> (Cagents, CardId, chat::Session) {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, None);
+    let session = chat_runtime(&app, card).session.clone();
+    assert!(!session.is_unstarted());
+    assert!(session.launch.session_id.is_none());
+    app.workspace_model.agents = vec![crate::app::channel_ui::close_tests::agent(&session)];
+    if !kept_runtime {
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+    }
+    let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
+    let target = chat_runtime_attempt(&app, card);
+    answer_start(
+        &mut app,
+        target,
+        Err(chat::StartFailure::fresh("fixture: daemon gone")),
+    );
+    (app, card, session)
+}
+
+/// #3095: an agent's Codex conversation whose thread ID was never saved
+/// came back from an abandoned update as a draft, and giving up the old
+/// conversation retired the agent. The card keeps the conversation and says
+/// why it can't reopen; the agent stays open.
+#[test]
+fn an_agents_never_named_conversation_stays_its_card_when_its_daemon_is_gone() {
+    // Whether the card still had its chat runtime when the restore failed, as
+    // a window that stays open across the daemon's restart does.
+    for kept_runtime in [true, false] {
+        let (mut app, card, session) = unreachable_unnamed_agent(kept_runtime);
+        assert!(
+            app.chat_ui
+                .retiring
+                .iter()
+                .all(|retiring| retiring.card != card),
+            "nothing gives up the agent's conversation"
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(session.clone()),
+            "the card still names the conversation the agent ran"
+        );
+        let why = super::unnamed_agent_conversation(&session);
+        // Starting over would retire the agent's pane, and reconnecting finds
+        // nothing, so Close is its only recovery.
+        assert!(!app.chat_offers_fresh_conversation(card));
+        // Nor does it open in a terminal, which would give the card up and
+        // leave the agent without one.
+        assert_eq!(
+            app.chat_switch_blocker(card).as_deref(),
+            Some(blocked_recovery::UNNAMED_AGENT_TERMINAL)
+        );
+        // One centred state replaces the pane, composer included.
+        assert!(app.unnamed_agent(card).is_some());
+        assert!(app.unnamed_agent_view(card).is_some());
+        assert_eq!(app.blocked_details_text(card), Some(why.as_str()));
+        assert!(!why.contains("daemon"));
+        // Its open record doesn't make the agent run: until the daemon proves
+        // its processes still run, the card claims nothing, and Close is only
+        // Close.
+        let stopped_copy = blocked_recovery::UnnamedAgentCopy {
+            body: "cagents lost track of this conversation when its background service stopped. Nothing new was started.",
+            close: "Close",
+            close_name: "Close this tab",
+        };
+        assert_eq!(app.unnamed_agent_copy(card), Some(stopped_copy));
+        // An answer about another conversation changes nothing.
+        let survivor = crate::terminal::ipc::ProcessStart {
+            pid: 4242,
+            start: 7,
+        };
+        let mut other = session.clone();
+        other.id = TerminalId::new();
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            other.clone(),
+            vec![survivor],
+        )));
+        assert_eq!(app.unnamed_agent_copy(card), Some(stopped_copy));
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            vec![survivor],
+        )));
+        assert_eq!(
+            app.unnamed_agent_copy(card),
+            Some(blocked_recovery::UnnamedAgentCopy {
+                body: "cagents lost track of this conversation when its background service stopped. The agent is still running. Nothing new was started.",
+                close: "Close and end agent",
+                close_name: "Close this tab and end its agent",
+            })
+        );
+        assert!(app.unnamed_agent_view(card).is_some());
+        // Close and end agent ends exactly what the card said runs before it
+        // closes anything; an answer arriving meanwhile doesn't change that.
+        let liveness = |app: &Cagents| app.unnamed_agent(card).unwrap().liveness.clone();
+        let _ = app.update(Message::CloseCard(card));
+        assert!(liveness(&app).ending);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            Vec::new(),
+        )));
+        assert_eq!(liveness(&app).running, vec![survivor]);
+        // A failure to end it keeps the card, says why, and lets Close try
+        // again; so does an agent still running afterwards.
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            session.clone(),
+            Err("fixture: cannot end".into()),
+        )));
+        assert!(!liveness(&app).ending);
+        assert_eq!(
+            liveness(&app).end_error.as_deref(),
+            Some("fixture: cannot end")
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(session.clone())
+        );
+        let _ = app.update(Message::CloseCard(card));
+        assert!(liveness(&app).ending);
+        assert_eq!(liveness(&app).end_error, None);
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            session.clone(),
+            Ok(vec![crate::terminal::ipc::LostProcess {
+                process: survivor,
+                name: "codex".into(),
+                command: "codex app-server".into(),
+                proved: true,
+            }]),
+        )));
+        assert_eq!(
+            liveness(&app).end_error.as_deref(),
+            Some(blocked_recovery::UNNAMED_AGENT_STILL_RUNS)
+        );
+        assert_eq!(liveness(&app).running, vec![survivor]);
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            Vec::new(),
+        )));
+        assert_eq!(app.unnamed_agent_copy(card), Some(stopped_copy));
+        if kept_runtime {
+            let runtime = chat_runtime(&app, card);
+            assert!(!runtime.is_draft());
+            assert_eq!(runtime.error.as_ref(), Some(&why));
+            assert_eq!(
+                runtime.start_blocked,
+                Some(blocked_recovery::Reopen::UnnamedAgent)
+            );
+            let stopped = runtime.stopped(false, false);
+            assert_eq!(
+                stopped.primary.map(|(label, press, _)| (label, press)),
+                Some(("Close", stopped::Press::Close))
+            );
+            assert_eq!(stopped.secondary, None);
+        } else {
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+            assert_eq!(attach_failure_details(&app, card), Some(why));
+            assert_eq!(
+                app.blocked_failure(card).map(|blocked| blocked.reopen),
+                Some(blocked_recovery::Reopen::UnnamedAgent)
+            );
+        }
+        // The refusal belongs to the conversation it refused, not the card:
+        // once the card names another one, neither its state nor its
+        // terminal blocker applies, and its Details reveal nothing.
+        let mut replacement = session.clone();
+        replacement.id = TerminalId::new();
+        app.replace_chat_conversation(card, replacement);
+        assert!(app.unnamed_agent(card).is_none());
+        assert!(app.unnamed_agent_view(card).is_none());
+        assert_eq!(app.unnamed_agent_copy(card), None);
+        assert_ne!(
+            app.chat_switch_blocker(card).as_deref(),
+            Some(blocked_recovery::UNNAMED_AGENT_TERMINAL)
+        );
+        assert_eq!(app.blocked_details_text(card), None);
+    }
+}
+
+/// #3095: Close and end agent ends the agent only once the close is settled:
+/// an unsent message is asked about first, and the card closes once nothing
+/// it named still runs.
+#[test]
+fn closing_an_unreachable_unnamed_agent_ends_it_after_asking_then_closes() {
+    for kept_runtime in [true, false] {
+        let (mut app, card, session) = unreachable_unnamed_agent(kept_runtime);
+        let survivor = crate::terminal::ipc::ProcessStart {
+            pid: 4242,
+            start: 7,
+        };
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentRunning(
+            card,
+            session.clone(),
+            vec![survivor],
+        )));
+        let liveness = |app: &Cagents| app.unnamed_agent(card).unwrap().liveness.clone();
+        // A retained conversation closes through the daemon, so its card
+        // goes once that answers; any other card goes at once.
+        let closing = |app: &Cagents| {
+            app.chat_close_owned(card) || !app.card_state(card).unwrap().existence.is_open()
+        };
+        if kept_runtime {
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                unreachable!()
+            };
+            runtime.replace_draft(text_editor::Content::with_text("Keep this unsent note."));
+            let _ = app.update(Message::CloseCard(card));
+            assert!(app.chat_close_dialog_visible());
+            assert!(!liveness(&app).ending, "nothing ends before the answer");
+            let _ = app.update(Message::CancelChatClose);
+            assert!(!liveness(&app).ending);
+            assert!(!closing(&app));
+            let _ = app.update(Message::CloseCard(card));
+            let _ = app.update(Message::ConfirmChatClose);
+        } else {
+            let _ = app.update(Message::CloseCard(card));
+        }
+        assert!(liveness(&app).ending);
+        assert!(!closing(&app));
+        // Another conversation's answer settles nothing.
+        let mut other = session.clone();
+        other.id = TerminalId::new();
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            other,
+            Ok(Vec::new()),
+        )));
+        assert!(liveness(&app).ending);
+        assert!(!closing(&app));
+        let _ = app.update(Message::ChatUi(Action::UnnamedAgentEnded(
+            card,
+            session.clone(),
+            Ok(Vec::new()),
+        )));
+        assert!(closing(&app));
+    }
+}
+
 #[test]
 fn attention_session_click_reveals_the_parent_before_reading_its_notice() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -19205,6 +19452,117 @@ fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() 
             .contains("unavailable")
     );
     assert!(chat_runtime(&app, card).copied.is_none());
+}
+
+/// A long output's row shows only its start and end. Its Copy reads the
+/// whole output from its source, and the step's copy puts the command ahead
+/// of it, while a row showing all of its output copies what it shows.
+#[test]
+fn an_excerpted_output_copies_whole_from_its_source() {
+    let _context = text_copy::isolated_context();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    app.workspace.focus(card).unwrap();
+    let whole = "line\n".repeat(200_000);
+    let step = |id: &str, output: &str| {
+        Arc::new(chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "cargo build".into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: output.into(),
+            },
+            at: None,
+            started_at: None,
+        })
+    };
+    let source = |token, bytes: usize| chat::TextCopySource {
+        cache: uuid::Uuid::new_v4(),
+        scope: chat::TextCopyScope::Conversation,
+        token,
+        revision: 1,
+        bytes: bytes as u64,
+    };
+    let excerpt = &format!("line\n{}line\n", chat::excerpt_gap(1_000_000));
+    let excerpted = source(1, whole.len());
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.items = vec![
+        step("long", excerpt),
+        step("short", "done\n"),
+        step("huge", excerpt),
+    ];
+    snapshot.text_copy_sources.conversation = vec![
+        Some(excerpted.clone()),
+        Some(source(2, 5)),
+        Some(source(3, chat::TEXT_COPY_LIMIT_BYTES + 1)),
+    ];
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime.excerpted_output_source(runtime.active_item("long").unwrap()),
+        Some(excerpted.clone())
+    );
+    assert_eq!(
+        runtime.excerpted_output_source(runtime.active_item("short").unwrap()),
+        None,
+        "a row showing all of its output copies what it shows"
+    );
+    assert_eq!(
+        runtime.excerpted_output_source(runtime.active_item("huge").unwrap()),
+        None,
+        "an output past the clipboard limit copies the excerpt it shows, as its note says"
+    );
+    assert_eq!(
+        step::excerpt_note(&CopyPart::Output, true),
+        "Only the start and end of this output are shown. Copy includes all of it."
+    );
+    assert!(chat::is_excerpt(excerpt) && !chat::is_excerpt("done\n"));
+    // The step's own Copy starts with its command, as a step shown whole
+    // does; its output's Copy is the output alone.
+    let long = runtime.active_item("long").unwrap().content.clone();
+    assert_eq!(
+        super::step_copy_prefix(&CopyPart::Text, &long).as_deref(),
+        Some("cargo build")
+    );
+    assert_eq!(
+        super::step_copy_prefix(&CopyPart::Output, &long).as_deref(),
+        Some("")
+    );
+    let tool = ItemContent::Tool {
+        name: "shell".into(),
+        input: "{\"cmd\":\"ls\"}".into(),
+        output: excerpt.into(),
+        status: chat::ToolStatus::Succeeded,
+    };
+    assert_eq!(
+        super::step_copy_prefix(&CopyPart::Text, &tool).as_deref(),
+        Some("{\"cmd\":\"ls\"}")
+    );
+    assert_eq!(super::step_copy_prefix(&CopyPart::Input, &tool), None);
+    let request = text_copy::Request::for_test(handle.clone(), excerpted.clone());
+    let task = app.handle_chat_ui(Action::MessageCopied(
+        target,
+        "long".into(),
+        request,
+        Ok(whole.clone()),
+    ));
+    assert_chat_copy_task_writes(task, &whole);
+    let request = text_copy::Request::for_test(handle, excerpted).with_prefix("cargo build");
+    let task = app.handle_chat_ui(Action::MessageCopied(
+        target,
+        "long".into(),
+        request,
+        Ok(whole.clone()),
+    ));
+    assert_chat_copy_task_writes(task, &format!("cargo build\n\n{whole}"));
 }
 
 /// Establish every completion guard, and prove this exact authority can

@@ -3672,3 +3672,122 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
         assert_eq!(view.retired, [pane.id]);
     }
 }
+
+#[test]
+fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(crate::host::state::HostLock::new(
+        super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("list-pages-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        }),
+    ));
+    host.lock().unwrap().register_client(1);
+    for _ in 0..3 {
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        let session = crate::model::TerminalSession {
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let (response, _, _) = process_request(
+            &host,
+            1,
+            ClientRequest::Spawn {
+                session,
+                options: crate::terminal_ipc::TerminalSpawnOptions::default(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(response, ServerResponse::Spawned { .. }));
+    }
+    let whole = host.lock().unwrap().list(1);
+    let ids = |terminals: &[TerminalDescriptor]| {
+        terminals
+            .iter()
+            .map(|terminal| terminal.session.id)
+            .collect::<Vec<_>>()
+    };
+    let mut sorted = ids(&whole);
+    sorted.sort();
+    assert_eq!(ids(&whole), sorted, "the inventory lists in identity order");
+
+    // The reply the client sees at the default budget is one complete page.
+    // The shells keep writing, so compare identities: their activity moves
+    // between reads.
+    let (response, _, _) =
+        process_request(&host, 1, ClientRequest::ListPage { after: None }).unwrap();
+    let ServerResponse::ListedPage {
+        terminals,
+        complete,
+    } = response
+    else {
+        panic!("ListPage answers with a page");
+    };
+    assert_eq!((ids(&terminals), complete), (ids(&whole), true));
+
+    // At a budget one descriptor fills, every page holds exactly one, and
+    // following each page's last identity reads the rest.
+    let budget = whole
+        .iter()
+        .map(|terminal| postcard::experimental::serialized_size(terminal).unwrap())
+        .max()
+        .unwrap();
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, complete) = host.lock().unwrap().list_page(1, after, budget);
+        after = page.last().map(|terminal| terminal.session.id);
+        pages.push(page);
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(pages.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 1]);
+    assert_eq!(ids(&pages.concat()), ids(&whole));
+    // A descriptor larger than the budget still has a page of its own.
+    let (page, complete) = host.lock().unwrap().list_page(1, None, 1);
+    assert_eq!((ids(&page), complete), (vec![whole[0].session.id], false));
+    // Nothing follows the last terminal.
+    let last = whole.last().map(|terminal| terminal.session.id);
+    assert_eq!(
+        host.lock().unwrap().list_page(1, last, budget),
+        (Vec::new(), true)
+    );
+
+    // An older CLI still gets the whole inventory in one reply while it fits,
+    // and a refusal it can read once it would not.
+    let size = postcard::experimental::serialized_size(&ServerResponse::Listed {
+        terminals: whole.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        listed_in_one_reply(whole.clone(), size).unwrap(),
+        ServerResponse::Listed {
+            terminals: whole.clone(),
+        }
+    );
+    let refusal = listed_in_one_reply(whole.clone(), size - 1).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert!(refusal.message.contains("too large to list in one reply"));
+
+    for terminal in &whole {
+        let handle = host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle(1, terminal.session.id)
+            .unwrap();
+        handle.shutdown().unwrap();
+    }
+}

@@ -10,12 +10,12 @@ use std::{
 use crate::{
     model::HostSessionProof,
     terminal_ipc::{
-        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_CLIENT_FRAME_BYTES,
-        MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
-        ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
-        ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit,
-        validate_proof,
+        ClientEnvelope, ClientRequest, FrameCodec, FrameError, LIST_PAGE_BYTES,
+        MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS,
+        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION,
+        ServerEnvelope, ServerMessage, ServerResponse, ShutdownOperation, ShutdownOutcome,
+        TerminalDescriptor, TerminalScroll, TerminalSnapshot, TerminalVisibility,
+        WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit, validate_proof,
     },
 };
 
@@ -167,6 +167,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
     !matches!(
         request,
         ClientRequest::List
+            | ClientRequest::ListPage { .. }
             | ClientRequest::Input { .. }
             | ClientRequest::Key { .. }
             | ClientRequest::Mouse { .. }
@@ -529,6 +530,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
         ClientRequest::BuildInfo
             | ClientRequest::StartupState
             | ClientRequest::List
+            | ClientRequest::ListPage { .. }
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
             | ClientRequest::Snapshot { .. }
@@ -596,6 +598,27 @@ fn ensure_startup_recovery_request(
     request: &ClientRequest,
 ) -> Result<(), ProtocolError> {
     super::recovery_admission::admit(host, request)
+}
+
+/// The encoded `Listed` reply a frame still holds with room for its envelope.
+const LIST_REPLY_LIMIT: usize = MAX_FRAME_BYTES - 64 * 1024;
+
+/// The whole inventory as one `Listed` reply, which only an older CLI still
+/// asks for, or a refusal once it passes `limit`: past a frame, the writer
+/// would drop the connection without a word.
+fn listed_in_one_reply(
+    terminals: Vec<TerminalDescriptor>,
+    limit: usize,
+) -> Result<ServerResponse, ProtocolError> {
+    let response = ServerResponse::Listed { terminals };
+    match postcard::experimental::serialized_size(&response) {
+        Ok(size) if size <= limit => Ok(response),
+        _ => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "The terminal inventory is too large to list in one reply; update cagents to list it",
+            false,
+        )),
+    }
 }
 
 fn ensure_terminal_close_open(host: &SharedHost) -> Result<(), ProtocolError> {
@@ -1919,7 +1942,25 @@ fn process_admitted_request(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .list(client_id);
-            Ok((ServerResponse::Listed { terminals }, Vec::new(), false))
+            Ok((
+                listed_in_one_reply(terminals, LIST_REPLY_LIMIT)?,
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ListPage { after } => {
+            let (terminals, complete) = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .list_page(client_id, after, LIST_PAGE_BYTES);
+            Ok((
+                ServerResponse::ListedPage {
+                    terminals,
+                    complete,
+                },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::WatchTerminals => {
             host.lock()

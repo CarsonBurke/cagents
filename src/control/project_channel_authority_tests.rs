@@ -424,7 +424,8 @@ fn public_user_open_and_spawn_preserve_folder_identity_order_and_readiness_polic
                         },
                         || {
                             ready.set(ready.get() + 1);
-                            Ok(peer.socket.clone())
+                            ControlClient::connect(&peer.socket)
+                                .map_err(|error| AppError::new("daemon_connection", error))
                         },
                         ControlClient::connect,
                     )

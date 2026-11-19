@@ -64,6 +64,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::BuildInfo
         | R::StartupState
         | R::List
+        | R::ListPage { .. }
         | R::ChatList
         | R::Attach { .. }
         | R::Detach { .. }

@@ -255,6 +255,21 @@ pub enum CopyPart {
     Change(usize),
 }
 
+/// What a copy of an excerpted step puts ahead of the whole output it reads,
+/// joined as `copy_text` joins a step shown whole: the command or input for
+/// the step's own Copy, nothing for its output's. `None` for a part that has
+/// no whole output to read.
+fn step_copy_prefix(part: &CopyPart, content: &ItemContent) -> Option<String> {
+    match (part, content) {
+        (CopyPart::Text, ItemContent::Command { command, .. }) => Some(command.clone()),
+        (CopyPart::Text, ItemContent::Tool { input, .. }) => Some(input.clone()),
+        (CopyPart::Output, ItemContent::Command { .. } | ItemContent::Tool { .. }) => {
+            Some(String::new())
+        }
+        _ => None,
+    }
+}
+
 /// Why a chat with no daemon handoff did not give its actor up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnRefused {
@@ -403,6 +418,9 @@ pub enum Action {
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
+    /// Copies a step whose row shows only an excerpt of its output, reading
+    /// the whole output from its source.
+    CopyStep(Target, String, CopyPart, chat::TextCopySource),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
     /// A complete message read for a window that shows only part of it.
     LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
@@ -548,6 +566,22 @@ pub enum Action {
     ),
     ToggleBlockedDetails(CardId, chat::Session),
     CopyBlockedDetails(CardId, chat::Session),
+    /// Copies the unsent message an unreachable agent's card would discard.
+    CopyBlockedDraft(CardId, chat::Session),
+    /// The processes of an unreachable agent's conversation the daemon
+    /// proved still running.
+    UnnamedAgentRunning(
+        CardId,
+        chat::Session,
+        Vec<crate::terminal::ipc::ProcessStart>,
+    ),
+    /// What ending an unreachable agent's processes, before its card
+    /// closes, left running.
+    UnnamedAgentEnded(
+        CardId,
+        chat::Session,
+        Result<Vec<crate::terminal::ipc::LostProcess>, String>,
+    ),
     /// Asks the daemon what still runs for a conversation whose Close it
     /// refused.
     AskCloseHolders(Target, chat::Session),
@@ -773,6 +807,9 @@ impl Action {
             Self::FreshCloseFinished(..) => "FreshCloseFinished",
             Self::ToggleBlockedDetails(..) => "ToggleBlockedDetails",
             Self::CopyBlockedDetails(..) => "CopyBlockedDetails",
+            Self::CopyBlockedDraft(..) => "CopyBlockedDraft",
+            Self::UnnamedAgentRunning(..) => "UnnamedAgentRunning",
+            Self::UnnamedAgentEnded(..) => "UnnamedAgentEnded",
             Self::Composer(..) => "Composer",
             Self::ReadComposer(..) => "ReadComposer",
             Self::ComposerUp(..) => "ComposerUp",
@@ -812,6 +849,7 @@ impl Action {
             Self::SessionLinkToken(..) => "SessionLinkToken",
             Self::Copy(..) => "Copy",
             Self::CopyMessage(..) => "CopyMessage",
+            Self::CopyStep(..) => "CopyStep",
             Self::MessageCopied(..) => "MessageCopied",
             Self::LogicalProseRead(..) => "LogicalProseRead",
             Self::MarkdownPrepared(..) => "MarkdownPrepared",
@@ -963,6 +1001,8 @@ impl Action {
                 | Self::FreshCloseFinished(..)
                 | Self::CloseHolders(..)
                 | Self::CloseHoldersEnded(..)
+                | Self::UnnamedAgentRunning(..)
+                | Self::UnnamedAgentEnded(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
@@ -1125,6 +1165,15 @@ fn draft_start_backend() -> Option<(String, String, String)> {
             device.executable.clone(),
         )
     })
+}
+
+/// Why an agent's card that never saved its provider's conversation ID can't
+/// reopen it; [`blocked_recovery::Reopen::UnnamedAgent`] says what to do.
+fn unnamed_agent_conversation(session: &chat::Session) -> String {
+    format!(
+        "{} hadn't reported this agent's conversation ID when cagents' background service stopped, so this tab has no saved conversation to reconnect to.",
+        session.launch.provider.label()
+    )
 }
 
 /// Why sending cannot move a conversation to another account yet: a
@@ -6705,6 +6754,20 @@ fn retire_conversation(
     end_conversation(handle, session, super::channel_ui::close_sessions)
 }
 
+/// Gives up a failed start the card replaced on its own, like
+/// [`retire_conversation`], but never retires an open agent that runs as it:
+/// the card's agent check can predate the agents the daemon reports.
+fn give_up_failed_start(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    end_conversation(
+        handle,
+        session,
+        super::channel_ui::close_sessions_sparing_agents,
+    )
+}
+
 /// Closes a conversation the reader closed, like [`retire_conversation`],
 /// and also retires the agent still bound to it after a daemon stop. Giving
 /// up a failed start must not do that, so only an explicit Close comes here.
@@ -8599,12 +8662,15 @@ impl Cagents {
         for card in used {
             self.chat_ui.default_chats.remove(&card);
         }
+        // A pane still reopening holds a conversation nobody knows the
+        // identity of yet; it is saved once it starts.
         let defaults = self
             .chat_ui
             .default_chats
             .iter()
             .copied()
             .chain(self.shared_views.defaults.keys().copied())
+            .chain(self.resume_ui.reopening.keys().copied())
             .collect::<HashSet<_>>();
         let open_cards = self
             .durable
@@ -8932,15 +8998,17 @@ impl Cagents {
     /// Opens a saved conversation in a new card, restoring its manual pane
     /// name before its first shared publication or provider attachment can
     /// report another title. `draft_from` is the card it was closed in, whose
-    /// kept draft the new card takes.
+    /// kept draft the new card takes. With `reopening`, the card waits for
+    /// that preparation, unsaved and unshared, and starts nothing yet.
     pub(super) fn insert_resumed_chat_card(
         &mut self,
         session: chat::Session,
         beside: Option<CardId>,
         user_title: Option<String>,
         draft_from: Option<CardId>,
-    ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, user_title)
+        reopening: Option<resume_ui::Reopening>,
+    ) -> (CardId, Task<Message>) {
+        self.insert_chat_card_as(session, beside, false, draft_from, user_title, reopening)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -8951,6 +9019,19 @@ impl Cagents {
         draft_from: Option<CardId>,
         user_title: Option<String>,
     ) -> Task<Message> {
+        self.insert_chat_card_as(session, beside, ephemeral, draft_from, user_title, None)
+            .1
+    }
+
+    fn insert_chat_card_as(
+        &mut self,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
+        draft_from: Option<CardId>,
+        user_title: Option<String>,
+        reopening: Option<resume_ui::Reopening>,
+    ) -> (CardId, Task<Message>) {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
             let durable = self
@@ -9024,15 +9105,12 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 ViewportUpdate::unchanged()
             });
-        let skills = if session.is_unstarted() {
-            self.open_chat_draft(card_id, session)
-        } else {
-            let intent = if session.native_continuity.retains_provider() {
-                chat::Intent::Restore
-            } else {
-                chat::Intent::Start
-            };
-            self.open_chat(card_id, session, intent)
+        let skills = match reopening {
+            Some(reopening) => {
+                self.resume_ui.reopening.insert(card_id, reopening);
+                Task::none()
+            }
+            None => self.open_placed_chat(card_id, session),
         };
         // An automatic placeholder is neither saved nor shared until someone
         // uses it (see `persistent_workspace`), so opening one, as entering an
@@ -9050,12 +9128,31 @@ impl Cagents {
         };
         // The new pane's input takes the keyboard through the workspace's
         // focus request, now if it is drawn or once it starts.
-        Task::batch([
+        let task = Task::batch([
             skills,
             self.apply_viewport(update, true, DurableChange::None),
             title,
             save,
-        ])
+        ]);
+        (card_id, task)
+    }
+
+    /// Opens the conversation `session` in the card `card` just placed for
+    /// it: its draft, when nothing has ever run it, or else a connection to it.
+    pub(super) fn open_placed_chat(
+        &mut self,
+        card: CardId,
+        session: chat::Session,
+    ) -> Task<Message> {
+        if session.is_unstarted() {
+            return self.open_chat_draft(card, session);
+        }
+        let intent = if session.native_continuity.retains_provider() {
+            chat::Intent::Restore
+        } else {
+            chat::Intent::Start
+        };
+        self.open_chat(card, session, intent)
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -9467,6 +9564,8 @@ impl Cagents {
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.chat_ui.default_chats.remove(&card);
+        // A late preparation answer for it then finds nothing to start.
+        self.forget_reopening(card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
         match self.chat_ui.phases.remove(&card) {
@@ -9522,7 +9621,19 @@ impl Cagents {
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
+        // A reopened conversation still being prepared starts once that ends.
+        self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
+    }
+    /// Whether `card` has begun starting its conversation, as opposed to
+    /// waiting for that start to be allowed.
+    #[cfg(test)]
+    pub(super) fn chat_start_began(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
+    }
+    /// Unsent text held for a card that has no chat runtime.
+    #[cfg(test)]
+    pub(super) fn held_chat_draft(&self, card: CardId) -> Option<&str> {
+        self.chat_ui.drafts.get(&card).map(String::as_str)
     }
     /// A shared echo may arrive before a starting chat has a runtime. Only
     /// the exact attempted descriptor reserves that attachment; a canonical
@@ -9666,6 +9777,18 @@ impl Cagents {
                 Phase::Closing { .. } => "The conversation is closing. Wait for it to finish.",
             }));
         }
+        // Returning it to a terminal would retire the actor the service is
+        // preparing, or reopen what nobody has confirmed can be reopened.
+        if self.reopen_preparing(card) {
+            return Some(Cow::Borrowed(
+                "This conversation is reopening. Wait for it to connect.",
+            ));
+        }
+        if self.reopen_failed(card) {
+            return Some(Cow::Borrowed(
+                "This conversation couldn't be reopened. Retry or close it first.",
+            ));
+        }
         let Some(state) = self
             .card_state(card)
             .filter(|state| state.existence.is_open())
@@ -9696,6 +9819,11 @@ impl Cagents {
                 } else {
                     None
                 }
+            }
+            // Only while the card still names the conversation that was
+            // refused: a replacement is judged on its own.
+            CardKind::Chat(_) if self.unnamed_agent(card).is_some() => {
+                Some(Cow::Borrowed(blocked_recovery::UNNAMED_AGENT_TERMINAL))
             }
             CardKind::Chat(_) => match self.cards.get(&card) {
                 Some(CardRuntime::Chat(runtime)) => {
@@ -9858,6 +9986,12 @@ impl Cagents {
                 .remove(&card);
             return remove;
         }
+        // A reopened conversation still being prepared has started nothing
+        // from this pane, so closing it leaves the conversation as it was
+        // before the reopen; the preparation's answer is then ignored.
+        if self.reopen_pending(card) {
+            return self.remove_chat_card(card, None).unwrap_or_else(Task::none);
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -9869,6 +10003,11 @@ impl Cagents {
             Some(Phase::Closing { restart: None, .. })
         ) {
             return Task::none();
+        }
+        // Its questions are answered, so "Close and end agent" ends what it
+        // said still runs before the card goes.
+        if let Some(ending) = self.end_unnamed_agent_before_close(card) {
+            return ending;
         }
         if !self.prepare_shared_removal(card) {
             return Task::none();
@@ -11250,7 +11389,7 @@ impl Cagents {
             }
             HistoryNavigation::Latest => Task::none(),
             HistoryNavigation::NewerEdge
-                if runtime.parent_scroll().at_bottom() && runtime.snapshot.has_later =>
+                if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
                 self.chat_send(target, Command::LoadLater, false)
             }
@@ -11258,7 +11397,7 @@ impl Cagents {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
             HistoryNavigation::EarlierEdge
-                if runtime.parent_scroll().at_top() && runtime.snapshot.has_earlier =>
+                if runtime.parent_scroll().prefetch_earlier() && runtime.snapshot.has_earlier =>
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
@@ -12570,7 +12709,10 @@ impl Cagents {
                             && matches!(
                                 self.card_state(target.card).map(|state| &state.kind),
                                 Some(CardKind::Chat(_))
-                            ) =>
+                            )
+                            // An agent ran there, and giving up its card
+                            // would end the agent and its conversation.
+                            && !self.chat_runs_as_open_agent(target.card, &attempt.session) =>
                     {
                         // A conversation its provider never named, and that
                         // no CLI terminal of the reader's holds, has nothing
@@ -12591,19 +12733,45 @@ impl Cagents {
                         let skills = self.open_chat_draft(target.card, draft);
                         return Task::batch([
                             skills,
-                            self.retire_chat(target.card, None, Some(attempt.session)),
+                            self.end_chat(
+                                target.card,
+                                None,
+                                Some(attempt.session),
+                                give_up_failed_start,
+                            ),
                         ]);
                     }
-                    Err(failure) => {
-                        let blocked = blocked_recovery::Reopen::of(failure.recovery);
+                    Err(mut failure) => {
+                        // Starting over would give up the agent's card, so its
+                        // conversation is refused for good, with Close to end it.
+                        let unnamed_agent = failure.recovery == chat::Recovery::Fresh
+                            && attempt.session.launch.session_id.is_none()
+                            && self.chat_runs_as_open_agent(target.card, &attempt.session);
+                        if unnamed_agent {
+                            failure.recovery = chat::Recovery::Blocked;
+                            failure.message = unnamed_agent_conversation(&attempt.session);
+                        }
+                        let blocked = if unnamed_agent {
+                            Some(blocked_recovery::Reopen::UnnamedAgent)
+                        } else {
+                            blocked_recovery::Reopen::of(failure.recovery)
+                        };
+                        let mut running = Task::none();
                         if let Some(reopen) = blocked {
                             self.chat_ui.blocked_starts.insert(
                                 target.card,
                                 blocked_recovery::BlockedStart {
                                     source: attempt.session.clone(),
                                     reopen,
+                                    liveness: Default::default(),
                                 },
                             );
+                            if unnamed_agent {
+                                running = self.ask_unnamed_agent_running(
+                                    target.card,
+                                    attempt.session.clone(),
+                                );
+                            }
                         } else {
                             self.chat_ui.blocked_starts.remove(&target.card);
                         }
@@ -12660,8 +12828,11 @@ impl Cagents {
                                 .unwrap_or_else(|| "a conversation".to_owned());
                             // A launch that names no conversation had none to
                             // reopen: starting it is what failed.
+                            // An agent's conversation that ran is reopened,
+                            // even though it was never named.
                             let verb = if attempt.intent == chat::Intent::Start
                                 && attempt.session.launch.session_id.is_none()
+                                && !unnamed_agent
                             {
                                 "start"
                             } else {
@@ -12695,6 +12866,7 @@ impl Cagents {
                         return Task::batch([
                             self.drain_terminal(target.card, 0),
                             cleanup,
+                            running,
                             if terminal_switch {
                                 cosmic::task::message(Message::ChromeUi(
                                     chrome_ui::Action::ShowNoticesFor(target.card),
@@ -13118,7 +13290,7 @@ impl Cagents {
                 return self.finish_fresh_conversation(target, *source, *requested, result);
             }
             Action::ToggleBlockedDetails(card, source) => {
-                if self.blocked_failure_source(card) == Some(&source) {
+                if self.blocked_details_source(card) == Some(&source) {
                     if self.chat_ui.blocked_details.get(&card) == Some(&source) {
                         self.chat_ui.blocked_details.remove(&card);
                     } else {
@@ -13127,12 +13299,31 @@ impl Cagents {
                 }
             }
             Action::CopyBlockedDetails(card, source) => {
-                if self.blocked_failure_source(card) == Some(&source)
-                    && let Some(CardRuntime::Failed(failure)) = self.cards.get(&card)
+                if self.blocked_details_source(card) == Some(&source)
+                    && let Some(text) = self.blocked_details_text(card)
                 {
                     text_copy::invalidate();
-                    return iced::clipboard::write(failure.message().to_owned())
-                        .map(cosmic::Action::App);
+                    return iced::clipboard::write(text.to_owned()).map(cosmic::Action::App);
+                }
+            }
+            Action::UnnamedAgentRunning(card, source, running) => {
+                self.record_unnamed_agent_running(card, &source, running);
+            }
+            Action::UnnamedAgentEnded(card, source, result) => {
+                return self.unnamed_agent_ended(card, &source, result);
+            }
+            Action::CopyBlockedDraft(card, source) => {
+                if self
+                    .unnamed_agent(card)
+                    .is_some_and(|blocked| blocked.source == source)
+                    && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+                {
+                    let text = runtime.unsent_text();
+                    if !text.trim().is_empty() {
+                        text_copy::invalidate();
+                        self.status = Some(TransientNotice::success("Copied message"));
+                        return iced::clipboard::write(text).map(cosmic::Action::App);
+                    }
                 }
             }
             Action::ComposerCursor(target, cursor) => {
@@ -14457,7 +14648,16 @@ impl Cagents {
                 }
             }
             Action::CopyMessage(target, id, source) => {
-                return self.start_message_copy(target, id, source);
+                return self.start_message_copy(target, id, source, String::new());
+            }
+            Action::CopyStep(target, id, part, source) => {
+                let prefix = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| runtime.active_item(&id))
+                    .and_then(|item| step_copy_prefix(&part, &item.content));
+                if let Some(prefix) = prefix {
+                    return self.start_message_copy(target, id, Some(source), prefix);
+                }
             }
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);
@@ -15412,13 +15612,15 @@ impl Cagents {
                     return Task::none();
                 }
                 runtime.scroll = scroll;
-                let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
-                if at_bottom && !runtime.snapshot.has_later {
+                if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
                 }
-                // Leaving an end is what arms the page at it, so a reader who
-                // scrolls away and comes back asks again, while one who stays
-                // put asks once.
+                // Pages are fetched ahead of the reader, within a couple of
+                // screens of a loaded edge rather than at it.
+                let (at_top, at_bottom) = (scroll.prefetch_earlier(), scroll.prefetch_later());
+                // Leaving that reach is what arms the page at it, so a reader
+                // who scrolls away and comes back asks again, while one who
+                // stays put asks once.
                 if !at_top || direction == Some(view::Page::Newer) {
                     if runtime.deferred_page == Some(HistoryNavigation::EarlierEdge) {
                         runtime.deferred_page = None;

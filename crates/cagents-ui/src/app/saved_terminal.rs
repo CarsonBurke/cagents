@@ -507,6 +507,7 @@ impl Cagents {
                                 session,
                                 expected_host: Some(proof.clone()),
                                 recovery_lease: None,
+                                socket: Some(socket.clone()),
                             },
                             socket,
                             proof,
@@ -515,7 +516,11 @@ impl Cagents {
                         .map(Some);
                     }
                     if source.continuity.live_proof().is_some() {
-                        let recovered = daemon_recovery::inspect_saved_at(source.clone(), &socket)?;
+                        let recovered = daemon_recovery::inspect_saved_at(
+                            source.clone(),
+                            &socket,
+                            &mut client,
+                        )?;
                         if recovered.expected_host.as_ref() != Some(&proof) {
                             return Err("The terminal service changed during recovery".into());
                         }
@@ -568,6 +573,7 @@ impl Cagents {
                             session,
                             expected_host: Some(proof.clone()),
                             recovery_lease: None,
+                            socket: Some(socket.clone()),
                         },
                         socket,
                         proof,
