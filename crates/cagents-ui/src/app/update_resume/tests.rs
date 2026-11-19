@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent::Provider;
-use crate::app::chat_ui::tests::{live_chat_for_provider, outgoing};
+use crate::app::chat_ui::tests::{live_chat_for_provider, outgoing, submit, write};
 use crate::update::UpdatePhase;
 use crate::update::in_flight::{Fate, Task as InFlightTask};
 
@@ -114,7 +114,7 @@ fn resuming_asks_the_conversation_to_carry_on_once_per_update() {
     drop(app.update_update_resume(Action::Resume(id)));
     let sent = outgoing(&app, card).expect("the resumed conversation is asked to carry on");
     assert!(
-        sent.contains("subagent \"Review the diff\" (toolu_agent)"),
+        sent.contains("- subagent \"Review the diff\"\n") && !sent.contains("toolu_agent"),
         "{sent}"
     );
     assert!(sent.contains("carry on from where you left off"), "{sent}");
@@ -163,22 +163,53 @@ fn resume_all_asks_every_conversation_listed() {
 fn a_dismissed_offer_stays_dismissed_for_that_update() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat_for_provider(&mut app, Provider::Claude, Some("dismissed"));
+    let id = session_id(&app, card);
+    let elsewhere = TerminalId::new();
     let update = job(
         UpdatePhase::Failed,
-        vec![outcome(session_id(&app, card), Fate::Stopped, |work| {
-            work.turn = true;
-        })],
+        vec![
+            outcome(id, Fate::Stopped, |work| work.turn = true),
+            outcome(elsewhere, Fate::Stopped, |work| work.turn = true),
+        ],
     );
     offer(&mut app, &update, None);
-    assert_eq!(offered(&app).len(), 1);
+    assert_eq!(offered(&app), vec![id]);
     drop(app.update_update_resume(Action::Dismiss));
     assert!(offered(&app).is_empty());
     assert_eq!(outgoing(&app, card), None, "dismissing sends nothing");
+    // Only what this window showed is dismissed: the window holding the
+    // other conversation still offers it.
     let record = app.update_resume.record.clone().unwrap();
-    assert!(record.dismissed);
+    assert_eq!(record.handled, vec![id]);
     app.update_resume = State::default();
     offer(&mut app, &update, Some(&record));
     assert!(offered(&app).is_empty());
+    assert_eq!(
+        app.update_resume
+            .offers
+            .iter()
+            .map(|outcome| outcome.work.id)
+            .collect::<Vec<_>>(),
+        vec![elsewhere]
+    );
+}
+
+#[test]
+fn writing_to_a_conversation_takes_it_off_the_offer() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some("by-hand"));
+    let id = session_id(&app, card);
+    let update = job(
+        UpdatePhase::Complete,
+        vec![outcome(id, Fate::Interrupted, |work| work.turn = true)],
+    );
+    offer(&mut app, &update, None);
+    assert_eq!(offered(&app), vec![id]);
+    write(&mut app, card, "Where were we?");
+    submit(&mut app, card);
+    assert_eq!(outgoing(&app, card).as_deref(), Some("Where were we?"));
+    assert!(offered(&app).is_empty(), "their own message carries it on");
+    assert_eq!(app.update_resume.record.clone().unwrap().handled, vec![id]);
 }
 
 #[test]
@@ -221,9 +252,15 @@ fn rows_say_what_stopped_in_plain_words() {
                 name: "cargo test".into(),
                 waiting: false,
             });
-            work.unlisted = 1;
         }),
-        "Stopped a reply in progress, 1 subagent and 2 background tasks"
+        "Stopped a reply in progress, 1 subagent and 1 background task"
+    );
+    assert_eq!(
+        work(|work| {
+            work.tasks.push(subagent("a", "A"));
+            work.unlisted = 3;
+        }),
+        "Stopped 1 subagent and 3 other items"
     );
     assert_eq!(
         work(|work| {
@@ -253,20 +290,33 @@ fn windows_keep_what_each_other_recorded_of_the_same_update() {
     let mine = Record {
         job: "update-1".into(),
         handled: vec![one],
-        dismissed: false,
     };
     let theirs = Record {
         job: "update-1".into(),
         handled: vec![two, one],
-        dismissed: true,
     };
-    let merged = mine.clone().merged(Some(theirs));
-    assert_eq!(merged.handled, vec![one, two]);
-    assert!(merged.dismissed);
+    assert_eq!(mine.clone().merged(Some(theirs)).handled, vec![one, two]);
     let earlier = Record {
         job: "update-0".into(),
         handled: vec![two],
-        dismissed: true,
     };
     assert_eq!(mine.clone().merged(Some(earlier)), mine);
+}
+
+#[test]
+fn the_notice_names_every_conversation_that_could_not_be_resumed() {
+    let labels = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        refused_notice(&labels(&["login"])),
+        "login can't take a message right now, so it wasn't resumed."
+    );
+    assert_eq!(
+        refused_notice(&labels(&["login", "ci", "notes"])),
+        "login, ci and notes can't take a message right now, so they weren't resumed."
+    );
 }

@@ -30,11 +30,10 @@ pub(super) struct State {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Record {
     job: String,
-    /// Conversations resumed from the offer.
+    /// Conversations no longer on offer: resumed from it, continued by
+    /// hand, or dismissed by the window that showed them.
     #[serde(default)]
     handled: Vec<TerminalId>,
-    #[serde(default)]
-    dismissed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +49,6 @@ impl Record {
     /// This window's record, with what `stored` says of the same update.
     fn merged(mut self, stored: Option<Record>) -> Self {
         if let Some(stored) = stored.filter(|stored| stored.job == self.job) {
-            self.dismissed |= stored.dismissed;
             for id in stored.handled {
                 if !self.handled.contains(&id) {
                     self.handled.push(id);
@@ -67,18 +65,23 @@ impl State {
             self.offers.clear();
             return;
         };
-        self.offers = if record.job == job.id && record.dismissed {
-            Vec::new()
-        } else {
-            job.in_flight
-                .iter()
-                .filter(|outcome| outcome.lost())
-                .filter(|outcome| {
-                    record.job != job.id || !record.handled.contains(&outcome.work.id)
-                })
-                .cloned()
-                .collect()
-        };
+        self.offers = job
+            .in_flight
+            .iter()
+            .filter(|outcome| outcome.lost())
+            .filter(|outcome| record.job != job.id || !record.handled.contains(&outcome.work.id))
+            .cloned()
+            .collect();
+    }
+
+    /// Takes `id` off the offer, for this window and the others.
+    fn handle(&mut self, id: TerminalId) {
+        self.offers.retain(|offered| offered.work.id != id);
+        if let Some(record) = self.record_for()
+            && !record.handled.contains(&id)
+        {
+            record.handled.push(id);
+        }
     }
 
     fn record_for(&mut self) -> Option<&mut Record> {
@@ -112,9 +115,13 @@ fn summary(work: &InFlight) -> String {
     if subagents > 0 {
         parts.push(counted(subagents, "subagent", "subagents"));
     }
-    let background = work.tasks.len() - subagents + work.unlisted as usize;
+    let background = work.tasks.len() - subagents;
     if background > 0 {
         parts.push(counted(background, "background task", "background tasks"));
+    }
+    // Past the census's limits, tasks and queued messages are only counted.
+    if work.unlisted > 0 {
+        parts.push(counted(work.unlisted as usize, "other item", "other items"));
     }
     let stopped = match parts.split_last() {
         None => None,
@@ -134,7 +141,7 @@ fn summary(work: &InFlight) -> String {
 }
 
 /// The message that asks the agent to pick its work up again. It names what
-/// was stopped, in the provider's own terms, so the agent can check on each.
+/// was stopped so the agent can check on each.
 fn continue_prompt(work: &InFlight) -> String {
     let mut lines = vec![
         "cagents was updated while you were working, and the update stopped work that was still under way here:".to_owned(),
@@ -149,14 +156,19 @@ fn continue_prompt(work: &InFlight) -> String {
             TaskKind::Step => "background step",
             TaskKind::Unknown => "background task",
         };
-        lines.push(if task.name.is_empty() || task.name == task.id {
+        // The reader sees this message too: a name says more to both than
+        // the provider's identifier, which is the fallback.
+        lines.push(if task.name.is_empty() {
             format!("- {kind} {}", task.id)
         } else {
-            format!("- {kind} \"{}\" ({})", task.name, task.id)
+            format!("- {kind} \"{}\"", task.name)
         });
     }
     if work.unlisted > 0 {
-        lines.push(format!("- {} more background tasks", work.unlisted));
+        lines.push(format!(
+            "- {} more background tasks or queued messages",
+            work.unlisted
+        ));
     }
     if !work.queued.is_empty() {
         lines.push(format!(
@@ -169,6 +181,19 @@ fn continue_prompt(work: &InFlight) -> String {
         "Check what finished and what didn't, then carry on from where you left off.".to_owned(),
     );
     lines.join("\n")
+}
+
+/// What the notice says of the conversations that could not take the
+/// message to resume.
+fn refused_notice(labels: &[String]) -> String {
+    match labels {
+        [one] => format!("{one} can't take a message right now, so it wasn't resumed."),
+        [rest @ .., last] => format!(
+            "{} and {last} can't take a message right now, so they weren't resumed.",
+            rest.join(", ")
+        ),
+        [] => String::new(),
+    }
 }
 
 impl Cagents {
@@ -246,55 +271,77 @@ impl Cagents {
                     channel.map_or_else(Task::none, |channel| self.navigate_to_channel(channel));
                 Task::batch([selected, cosmic::task::message(Message::FocusCard(card))])
             }
-            Action::Resume(id) => {
-                let task = self.resume_offered(id);
-                Task::batch([task, self.save_update_resume()])
-            }
+            Action::Resume(id) => self.resume_offered_all([id]),
             Action::ResumeAll => {
                 let ids: Vec<_> = self.offered_here().map(|outcome| outcome.work.id).collect();
-                let tasks: Vec<_> = ids.into_iter().map(|id| self.resume_offered(id)).collect();
-                Task::batch(tasks.into_iter().chain([self.save_update_resume()]))
+                self.resume_offered_all(ids)
             }
             Action::Dismiss => {
-                let state = &mut self.update_resume;
-                if let Some(record) = state.record_for() {
-                    record.dismissed = true;
+                // Only what this window showed: another window's conversations
+                // stay on offer there.
+                let ids: Vec<_> = self.offered_here().map(|outcome| outcome.work.id).collect();
+                for id in ids {
+                    self.update_resume.handle(id);
                 }
-                state.offers.clear();
                 self.save_update_resume()
             }
         }
     }
 
-    /// Resumes one offered conversation and takes it off the offer.
-    fn resume_offered(&mut self, id: TerminalId) -> Task<Message> {
-        let Some(outcome) = self
+    /// Resumes each offered conversation in `ids`, taking it off the offer,
+    /// and says which could not take the message.
+    fn resume_offered_all(&mut self, ids: impl IntoIterator<Item = TerminalId>) -> Task<Message> {
+        let mut tasks = Vec::new();
+        let mut refused = Vec::new();
+        for id in ids {
+            let Some(outcome) = self
+                .update_resume
+                .offers
+                .iter()
+                .find(|outcome| outcome.work.id == id)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some((card, _)) = self.session_card(id) else {
+                continue;
+            };
+            match self.resume_lost_work(card, continue_prompt(&outcome.work)) {
+                Some(task) => {
+                    self.update_resume.handle(id);
+                    tasks.push(task);
+                }
+                // It stays on offer, to resume once it can take a message.
+                None => refused.push(self.offer_label(&outcome)),
+            }
+        }
+        if !refused.is_empty() {
+            self.status = Some(TransientNotice::warning(refused_notice(&refused)));
+        }
+        if tasks.is_empty() {
+            return Task::none();
+        }
+        Task::batch(tasks.into_iter().chain([self.save_update_resume()]))
+    }
+
+    /// Takes the conversation in `card` off the offer once the reader writes
+    /// to it themselves: it is under way again, and a message about stopped
+    /// work would arrive after their own.
+    pub(super) fn update_resume_continued(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind) else {
+            return Task::none();
+        };
+        let id = session.id;
+        if !self
             .update_resume
             .offers
             .iter()
-            .find(|outcome| outcome.work.id == id)
-            .cloned()
-        else {
-            return Task::none();
-        };
-        let Some((card, _)) = self.session_card(id) else {
-            return Task::none();
-        };
-        let Some(task) = self.resume_lost_work(card, continue_prompt(&outcome.work)) else {
-            self.status = Some(TransientNotice::warning(format!(
-                "{} can't take a message right now, so it wasn't resumed.",
-                self.offer_label(&outcome)
-            )));
-            return Task::none();
-        };
-        let state = &mut self.update_resume;
-        state.offers.retain(|offered| offered.work.id != id);
-        if let Some(record) = state.record_for()
-            && !record.handled.contains(&id)
+            .any(|outcome| outcome.work.id == id)
         {
-            record.handled.push(id);
+            return Task::none();
         }
-        task
+        self.update_resume.handle(id);
+        self.save_update_resume()
     }
 
     fn save_update_resume(&self) -> Task<Message> {
@@ -310,18 +357,16 @@ impl Cagents {
         };
         iced::Task::future(async move {
             let saved = tokio::task::spawn_blocking(move || {
-                // Each window resumes the conversations it holds, so what the
-                // others recorded for the same update is kept.
-                let stored = store
-                    .load_update_resume()
-                    .ok()
-                    .flatten()
-                    .and_then(|value| serde_json::from_str::<Record>(&value).ok());
-                let value = serde_json::to_string(&record.merged(stored))
-                    .map_err(|error| error.to_string())?;
-                store
-                    .save_update_resume(&value)
-                    .map_err(|error| error.to_string())
+                // Each window takes the conversations it holds off the offer,
+                // so what the others recorded for the same update is kept.
+                let mut encoded = Ok(());
+                let merged = store.merge_update_resume(|stored| {
+                    let stored = stored.and_then(|value| serde_json::from_str(&value).ok());
+                    serde_json::to_string(&record.merged(stored))
+                        .map_err(|error| encoded = Err(error.to_string()))
+                        .ok()
+                });
+                encoded.and(merged.map_err(|error| error.to_string()))
             })
             .await
             .map_err(|error| error.to_string())

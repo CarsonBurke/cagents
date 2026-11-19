@@ -8844,6 +8844,19 @@ impl Cagents {
                 }
             }
         }
+        // A message to resume stopped work, held until the conversation
+        // attaches, is kept like a held follow-up: ahead of the draft, and
+        // never sent automatically once restored.
+        for (card, held) in &self.chat_ui.held_for_start {
+            if open_cards.contains(card) {
+                let draft = chat_drafts.entry(*card).or_default();
+                *draft = if draft.is_empty() {
+                    held.clone()
+                } else {
+                    format!("{held}\n{draft}")
+                };
+            }
+        }
         let chat_waiting_messages = self
             .durable
             .cards
@@ -9702,6 +9715,7 @@ impl Cagents {
         }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.held_for_start.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
         self.chat_ui.confirmed_losses.remove(&card);
@@ -11209,15 +11223,6 @@ impl Cagents {
         )
     }
 
-    /// Takes the next step of sending a started draft's first message: its
-    /// model, where one was chosen, and then the message.
-    ///
-    /// Nothing is sent before the provider says it takes commands, which the
-    /// next snapshot to say so brings back here. A provider that cannot get
-    /// that far says so by ending the conversation, which sends the card back
-    /// to its draft with the reason. A model the conversation does not list is not
-    /// waited for past [`MODEL_PATIENCE`]; the message is sent on the default
-    /// instead, and the transcript says so.
     /// Asks the conversation in `card` to pick up the work an update stopped,
     /// with `text`. The message is held like a queued follow-up, which the
     /// reader can see, change or take back, and goes out once the provider
@@ -11262,16 +11267,27 @@ impl Cagents {
             }
             _ if starting => {
                 self.chat_ui.held_for_start.insert(card, text);
+                self.persist();
                 Some(Task::none())
             }
             _ if blocked => {
                 self.chat_ui.held_for_start.insert(card, text);
+                self.persist();
                 Some(self.reopen_stopped(card))
             }
             _ => None,
         }
     }
 
+    /// Takes the next step of sending a started draft's first message: its
+    /// model, where one was chosen, and then the message.
+    ///
+    /// Nothing is sent before the provider says it takes commands, which the
+    /// next snapshot to say so brings back here. A provider that cannot get
+    /// that far says so by ending the conversation, which sends the card back
+    /// to its draft with the reason. A model the conversation does not list is not
+    /// waited for past [`MODEL_PATIENCE`]; the message is sent on the default
+    /// instead, and the transcript says so.
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
         let held = self.chat_ui.held_for_start.remove(&target.card);
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
@@ -14020,11 +14036,16 @@ impl Cagents {
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
-                    return if runtime.turn_under_way() {
-                        Task::none()
-                    } else {
-                        self.dispatch_queued(target)
-                    };
+                    let busy = runtime.turn_under_way();
+                    let continued = self.update_resume_continued(target.card);
+                    return Task::batch([
+                        continued,
+                        if busy {
+                            Task::none()
+                        } else {
+                            self.dispatch_queued(target)
+                        },
+                    ]);
                 }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
@@ -14041,7 +14062,8 @@ impl Cagents {
                         return Task::none();
                     }
                 };
-                return self.chat_send(target, command, true);
+                let continued = self.update_resume_continued(target.card);
+                return Task::batch([continued, self.chat_send(target, command, true)]);
             }
             Action::TakeBackQueued(target, entry) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {

@@ -6755,7 +6755,7 @@ fn local_return(app: &Cagents) -> (Target, &LocalReturn) {
 }
 
 /// Types `text` into the composer of `card`.
-pub(super) fn write(app: &mut Cagents, card: CardId, text: &str) {
+pub(in crate::app) fn write(app: &mut Cagents, card: CardId, text: &str) {
     let target = chat_runtime(app, card).target;
     let _ = app.update(Message::ChatUi(Action::Composer(
         target,
@@ -7138,7 +7138,7 @@ fn prompt_history_keeps_multiline_draft_navigation_and_saved_text() {
 }
 
 /// Sends what the composer of `card` holds.
-pub(super) fn submit(app: &mut Cagents, card: CardId) {
+pub(in crate::app) fn submit(app: &mut Cagents, card: CardId) {
     let target = chat_runtime(app, card).target;
     submit_target(app, target);
 }
