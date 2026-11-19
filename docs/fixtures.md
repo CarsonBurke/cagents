@@ -23,6 +23,7 @@ person.
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
 | An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
+| The offer, after an update, to resume conversations whose work it stopped | [`tests/fixtures/update-resume-scene.sh`](#an-update-that-stopped-work-in-progress), which records an ended update over four offline agents |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -1264,6 +1265,22 @@ details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
+
+## An update that stopped work in progress
+
+An ended update job in `home/.config/fixture-update-review.json` can carry
+the census's `in_flight` outcomes, which the window reads at startup to offer
+resuming the conversations whose work didn't survive.
+[`update-resume-scene.sh`](../tests/fixtures/update-resume-scene.sh) builds
+one over real offline conversations. Run it as a steps file: `prepare` in a
+running session opens the fixture project, starts four Claude agents in a
+"Release checks" channel, and records a completed update in which one was
+restarted without its subagent and background command, one had its turn
+interrupted, one was ended with a queued message, and one kept running.
+`stop` and `save-seed`, then `shots` in each side's session captures the
+offer and, where it exists, resumes one conversation and dismisses the rest.
+The offer is made once per update: what was resumed or dismissed is kept with
+the window state, so restore the seed (any `start` does) to see it again.
 
 ## A refused shared-view seed
 
