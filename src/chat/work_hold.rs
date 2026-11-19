@@ -10,8 +10,6 @@ use serde::{Deserialize, Serialize};
 
 /// Subagents named in one list before the rest are only counted.
 const NAMED: usize = 3;
-/// Characters of a subagent's task kept in its name.
-const NAME_CHARS: usize = 60;
 
 /// What a conversation is doing that closing it now would end or abandon.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,17 +35,9 @@ pub struct HeldSubagent {
 
 impl HeldSubagent {
     pub fn of(agent: &Subagent) -> Self {
-        let name = [agent.kind.as_str(), agent.description.as_str()]
-            .into_iter()
-            .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
-            .unwrap_or("Subagent");
-        let mut chars = name.chars();
-        let mut name: String = chars.by_ref().take(NAME_CHARS).collect();
-        if chars.next().is_some() {
-            name.push('…');
-        }
         Self {
-            name,
+            name: super::short_name([agent.kind.as_str(), agent.description.as_str()])
+                .unwrap_or_else(|| "Subagent".into()),
             waiting: agent.status == ToolStatus::Waiting,
         }
     }
@@ -62,10 +52,7 @@ impl Snapshot {
             subagents: self
                 .subagents
                 .iter()
-                .filter(|agent| {
-                    agent.status == ToolStatus::Waiting
-                        || agent.background && agent.status.is_live()
-                })
+                .filter(|agent| agent.outlives_turn())
                 .map(HeldSubagent::of)
                 .collect(),
         }

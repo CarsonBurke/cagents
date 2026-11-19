@@ -1292,6 +1292,7 @@ exit 1"#,
                 log_path: root.join("update.log"),
                 confirmation: None,
                 refusal: None,
+                in_flight: Vec::new(),
             };
             write_job(&state, &job).unwrap();
             if mode == "write-error" {

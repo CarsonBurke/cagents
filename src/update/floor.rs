@@ -379,8 +379,14 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         let mut client = source_client_for(daemon)?;
         let chats = client.list_chats()?;
         let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
+        let mut in_flight = Vec::new();
         for chat in &chats {
             let snapshot = client.capture_chat_snapshot(chat.clone())?;
+            // Read before the page keeps only what a reader shows.
+            let work = self.survivors.observe_in_flight(chat, &snapshot);
+            if !work.is_empty() {
+                in_flight.push(work);
+            }
             snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
         }
         let terminals: Vec<_> = client
@@ -403,10 +409,12 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             snapshots: snapshots.finish(),
             aliases: presentation.aliases,
             presentations: presentation.presentations,
+            in_flight,
         };
         census
             .fit_pages(&self.proof, daemon, self.guard.prepared_window_slots())
             .map_err(invalid)?;
+        self.survivors.record_census(self.reviewed, daemon, &census);
         let census = self.original_census.insert(census);
         crate::upgrade::recovery::capture_before_floor(
             &self.proof,
@@ -1231,6 +1239,12 @@ pub(super) struct Survivors {
     scopes: BTreeMap<String, (TerminalId, String)>,
     ambient_scopes: BTreeSet<String>,
     markers: BTreeMap<Vec<u8>, (TerminalId, String)>,
+    /// The census's work in flight, and what the reviewed source said would
+    /// become of each conversation, captured together before preparation.
+    in_flight: Vec<super::in_flight::InFlight>,
+    capture_dispositions: BTreeMap<TerminalId, impact::Disposition>,
+    /// The confirmed successor serves and has finished its restore.
+    successor_serving: bool,
 }
 
 struct PreparationEvidence {
@@ -1337,6 +1351,7 @@ impl Survivors {
             self.recovery_outcome = Some(outcome.map_err(invalid)?);
         }
         peer.verify(client.proof())?;
+        self.successor_serving = true;
         Ok(())
     }
 
@@ -1520,6 +1535,174 @@ impl Survivors {
             }
         }
         report
+    }
+
+    /// Remember, beside the census, what the reviewed source said would become
+    /// of each conversation, so the update's record can say what became of
+    /// the work the census found in flight.
+    fn record_census(
+        &mut self,
+        reviewed: &impact::Preview,
+        daemon: &impact::DaemonImpact,
+        census: &crate::upgrade::recovery::Census,
+    ) {
+        for item in &daemon.sessions {
+            self.labels.insert(
+                item.id,
+                reviewed
+                    .labels
+                    .names
+                    .get(&item.id)
+                    .unwrap_or(&item.title)
+                    .clone(),
+            );
+        }
+        self.in_flight.clone_from(&census.in_flight);
+        self.capture_dispositions = daemon
+            .sessions
+            .iter()
+            .filter(|session| session.kind == impact::SessionKind::NativeChat)
+            .map(|session| (session.id, session.disposition))
+            .collect();
+    }
+
+    /// What `id` had in flight when the update began. A turn the update has
+    /// already interrupted no longer runs when the census reads it, so the
+    /// interruption says it did, with the background tasks it stopped.
+    fn observe_in_flight(
+        &self,
+        chat: &crate::chat::Session,
+        snapshot: &crate::chat::Snapshot,
+    ) -> super::in_flight::InFlight {
+        let id = chat.id;
+        let mut work = super::in_flight::InFlight::observe(id, chat.launch.provider, snapshot);
+        if let Some(turn) = self.interrupted.get(&(impact::SessionKind::NativeChat, id)) {
+            work.interrupted(&turn.background_tasks);
+        }
+        work
+    }
+
+    /// What became of each conversation's work in flight, once the update
+    /// has finished or failed. `unattached` is what the serving daemon
+    /// recorded of the conversations its restore could not reattach, read
+    /// only when needed. Empty while nothing in flight was recorded, or no
+    /// provider was changed.
+    pub(super) fn in_flight_outcomes(
+        &self,
+        unattached: impl FnOnce() -> Vec<crate::upgrade::handoff::UnattachedSummary>,
+    ) -> Vec<super::in_flight::Outcome> {
+        use super::in_flight::{Fate, Outcome};
+        use crate::upgrade::handoff::UnattachedDisposition;
+        // An update that failed between settling its interruptions and taking
+        // the census still interrupted those turns.
+        let unrecorded = self
+            .interrupted
+            .iter()
+            .filter(|((kind, id), _)| {
+                *kind == impact::SessionKind::NativeChat
+                    && !self.in_flight.iter().any(|work| work.id == *id)
+            })
+            .map(|((_, id), turn)| {
+                let mut work = super::in_flight::InFlight {
+                    id: *id,
+                    ..Default::default()
+                };
+                work.interrupted(&turn.background_tasks);
+                work
+            });
+        let works: Vec<_> = self.in_flight.iter().cloned().chain(unrecorded).collect();
+        if works.is_empty()
+            || !self.source_prepared
+                && !self.service_stopped
+                && self.ended.is_empty()
+                && self.interrupted.is_empty()
+        {
+            return Vec::new();
+        }
+        let unattached = if self.source_prepared && self.successor_serving {
+            unattached()
+        } else {
+            Vec::new()
+        };
+        // What the prepared source said would become of each conversation;
+        // the census's own review stands in where preparation recorded none.
+        let disposition = |id: TerminalId| {
+            self.prepared_source
+                .as_ref()
+                .and_then(|evidence| {
+                    evidence
+                        .daemon
+                        .sessions
+                        .iter()
+                        .find(|session| {
+                            session.kind == impact::SessionKind::NativeChat && session.id == id
+                        })
+                        .map(|session| session.disposition)
+                })
+                .or_else(|| self.capture_dispositions.get(&id).copied())
+        };
+        works
+            .into_iter()
+            .map(|work| {
+                let key = (impact::SessionKind::NativeChat, work.id);
+                let fate = if self.ended.contains_key(&key) || self.service_stopped {
+                    Fate::Ended
+                } else if self.interrupted.contains_key(&key) {
+                    // Settled before preparation, so it stands even when the
+                    // update went no further.
+                    Fate::Interrupted
+                } else if !self.source_prepared {
+                    // The source was never prepared, so it kept running every
+                    // conversation the update did not end or interrupt.
+                    Fate::Continued
+                } else if !self.successor_serving {
+                    // Preparation crossed the point of no return: the source
+                    // exited with every provider it did not retain, and no
+                    // successor confirmed restarting one. Only a retained
+                    // provider may still be running its work.
+                    match disposition(work.id) {
+                        Some(impact::Disposition::Resumes | impact::Disposition::ResumePicker) => {
+                            Fate::Stopped
+                        }
+                        _ => Fate::Unknown,
+                    }
+                } else if let Some(conversation) = unattached
+                    .iter()
+                    .find(|conversation| conversation.id == work.id)
+                {
+                    match conversation.disposition {
+                        UnattachedDisposition::Stopped => Fate::Stopped,
+                        UnattachedDisposition::Retained => Fate::Detached,
+                    }
+                } else if self
+                    .recovery_outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.paused_chats.contains(&work.id))
+                {
+                    Fate::Stopped
+                } else {
+                    match disposition(work.id) {
+                        Some(impact::Disposition::Continues) => Fate::Continued,
+                        Some(impact::Disposition::Resumes) => Fate::Restarted,
+                        Some(impact::Disposition::Interrupted) => Fate::Interrupted,
+                        // Its provider stopped, and the conversation does not
+                        // reopen on its own.
+                        Some(impact::Disposition::ResumePicker) => Fate::Stopped,
+                        _ => Fate::Unknown,
+                    }
+                };
+                Outcome {
+                    label: self
+                        .labels
+                        .get(&work.id)
+                        .or_else(|| self.interrupted.get(&key).map(|turn| &turn.label))
+                        .cloned()
+                        .unwrap_or_default(),
+                    work,
+                    fate,
+                }
+            })
+            .collect()
     }
 
     pub(super) fn needs_daemon_recovery(&self) -> bool {

@@ -53,6 +53,11 @@ pub(crate) struct Census {
     pub aliases: Vec<Session>,
     #[serde(default)]
     pub presentations: Vec<super::floor::Presentation>,
+    /// The conversations with work in flight when the census was taken.
+    /// Absent from censuses taken before it was recorded, and empty when
+    /// nothing was under way, so their bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight: Vec<crate::update::in_flight::InFlight>,
 }
 
 /// Transcript pages captured before preparation. [`Census::fit_pages`] fits
@@ -360,6 +365,14 @@ impl Census {
             );
         }
         self.validate_presentations()?;
+        let mut working = BTreeSet::new();
+        if self
+            .in_flight
+            .iter()
+            .any(|work| work.is_empty() || !chats.contains(&work.id) || !working.insert(work.id))
+        {
+            return Err("Recovery capture records work for a conversation it does not hold".into());
+        }
         encoded_size(self, SNAPSHOT_LIMIT)?;
         encoded_size(&self.record(source), SNAPSHOT_LIMIT)?;
         Ok(())

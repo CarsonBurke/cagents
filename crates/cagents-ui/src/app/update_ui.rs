@@ -1282,6 +1282,7 @@ pub(in crate::app) mod tests {
                 log_path: "/nonexistent/update.log".into(),
                 confirmation: None,
                 refusal: None,
+                in_flight: Vec::new(),
             };
             app.update_ui.job = Some(job.clone());
             app.status = None;
@@ -1312,6 +1313,7 @@ pub(in crate::app) mod tests {
             log_path: "/nonexistent/update.log".into(),
             confirmation: None,
             refusal: Some(refusal.clone()),
+            in_flight: Vec::new(),
         };
         let reason = "Claude: Its provider stopped but may still hold unfinished work. \
                       Close this conversation to release it.";
@@ -1406,6 +1408,7 @@ pub(in crate::app) mod tests {
             log_path: "/nonexistent/update.log".into(),
             confirmation: None,
             refusal: None,
+            in_flight: Vec::new(),
         });
         app.update_ui.error = Some("installed daemon startup failed".into());
         drop(app.update_update_ui(Action::Polled(Some("historical-failure".into()), Ok(None))));
@@ -1529,6 +1532,7 @@ pub(in crate::app) mod tests {
                 expires_at_unix_ms: u64::MAX,
             }),
             refusal: None,
+            in_flight: Vec::new(),
         }
     }
 
@@ -1725,6 +1729,7 @@ pub(in crate::app) mod tests {
                 log_path: "/nonexistent/update.log".into(),
                 confirmation,
                 refusal: None,
+                in_flight: Vec::new(),
             })),
         )));
         assert!(app.update_ui.confirmation.is_none());
@@ -1840,6 +1845,7 @@ pub(in crate::app) mod tests {
             log_path: "/fixture/update.log".into(),
             confirmation: Some(confirmation.clone()),
             refusal: None,
+            in_flight: Vec::new(),
         }
     }
 

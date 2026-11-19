@@ -2130,6 +2130,31 @@ impl Serialize for ToolStatus {
     }
 }
 
+/// Characters of a task kept in its short name.
+const SHORT_NAME_CHARS: usize = 60;
+
+/// The first non-empty line of the first text that has one, cut to the
+/// length a list of names can show.
+pub(crate) fn short_name<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let line = texts
+        .into_iter()
+        .find_map(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))?;
+    let mut chars = line.chars();
+    let mut name: String = chars.by_ref().take(SHORT_NAME_CHARS).collect();
+    if chars.next().is_some() {
+        name.push('…');
+    }
+    Some(name)
+}
+
+impl Subagent {
+    /// Whether it holds its conversation apart from the turn: it runs in the
+    /// background, or waits on background work of its own.
+    pub fn outlives_turn(&self) -> bool {
+        self.status == ToolStatus::Waiting || self.background && self.status.is_live()
+    }
+}
+
 impl ToolStatus {
     /// Whether the agent or tool has yet to end.
     pub fn is_live(self) -> bool {
