@@ -436,6 +436,9 @@ fn change(
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
+                if let Err(error) = homes.mark_released(provider, key) {
+                    tracing::warn!(%error, ?provider, %key, "Could not mark a released sign-in's home");
+                }
                 let (registry, ()) = reservation.commit(|| {
                     store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
                 })?;
@@ -484,6 +487,9 @@ fn change(
                     snapshot: Some(snapshot),
                 },
                 Err(existing) => {
+                    if let Err(error) = homes.mark_released(provider, key) {
+                        tracing::warn!(%error, ?provider, %key, "Could not mark a released sign-in's home");
+                    }
                     let (registry, ()) = reservation.commit(|| {
                         store.try_update_reserved(reservation, |registry| {
                             registry.release(key, &homes)
@@ -505,6 +511,9 @@ fn change(
                 .any(|pending| pending.provider == provider && pending.key == key)
             {
                 return Err("This pending sign-in changed on the device".into());
+            }
+            if let Err(error) = homes.mark_released(provider, key) {
+                tracing::warn!(%error, ?provider, %key, "Could not mark a released sign-in's home");
             }
             let (registry, ()) = reservation.commit(|| {
                 store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
@@ -635,7 +644,7 @@ fn restore_reserved(
     if !homes.is_unregistered(&registry, provider, key) {
         return Err(RestoreFailure::settled(NO_HOME));
     }
-    if registry.is_released(key) {
+    if homes.is_released(provider, key) || registry.is_released(key) {
         return Err(RestoreFailure::settled(RELEASED));
     }
     let cli = probe::cli_name(provider);
