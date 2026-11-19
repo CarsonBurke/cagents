@@ -1296,7 +1296,6 @@ impl OwedProjection {
 /// and the postlude that follow it.
 struct UpdateEntry {
     notice_control: Option<NoticeSeverity>,
-    attention_scope_changed: bool,
     /// The update's workspace pipeline timing is on, so its chrome
     /// projection times its phases too.
     timed: bool,
@@ -3175,6 +3174,18 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::BrowserNavigate(_) => true,
         _ => false,
     }
+}
+
+/// Whether `message` may change which projects and worktrees attention
+/// covers, so a pending notification activation no longer applies.
+fn changes_attention_scope(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RepositoryLoaded { result: Ok(_), .. }
+            | Message::DeviceProjectLoaded { result: Ok(_), .. }
+            | Message::AttachedWorktreePrsResolved { .. }
+            | Message::GitUi(_)
+    )
 }
 
 /// Timers that exist only to repaint elapsed time or a progress animation.
@@ -5979,6 +5990,10 @@ pub struct Cagents {
     /// What the messages dispatched since the last projection owe it; see
     /// [`Cagents::dispatch`].
     owed_projection: Option<OwedProjection>,
+    /// A message dispatched in this update, its own or one a handler
+    /// dispatched within it, may have changed which projects and worktrees
+    /// attention covers.
+    attention_scope_changed: bool,
     /// How many updates are running their message's handler: a dispatch
     /// made while none is has no update to project what it owes.
     dispatching: u32,
@@ -16218,6 +16233,7 @@ impl Application for Cagents {
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             owed_projection: None,
+            attention_scope_changed: false,
             dispatching: 0,
             frame_clock: FrameClock::default(),
             latency: crate::performance::InteractionLatency::default(),
@@ -17200,13 +17216,6 @@ impl Application for Cagents {
         #[cfg(not(any(test, feature = "development")))]
         let settled_projection = Task::none();
         let notice_control = self.notice_control_severity();
-        let attention_scope_changed = matches!(
-            &message,
-            Message::RepositoryLoaded { result: Ok(_), .. }
-                | Message::DeviceProjectLoaded { result: Ok(_), .. }
-                | Message::AttachedWorktreePrsResolved { .. }
-                | Message::GitUi(_)
-        );
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
@@ -17219,7 +17228,6 @@ impl Application for Cagents {
             task,
             UpdateEntry {
                 notice_control,
-                attention_scope_changed,
                 timed: _workspace_timing.is_some(),
                 settled_projection,
                 #[cfg(any(test, feature = "development"))]
@@ -17384,6 +17392,8 @@ impl Cagents {
         if self.dispatching == 0 {
             return self.update(message);
         }
+        // Noted before admission, as a message held back still arrived.
+        self.attention_scope_changed |= changes_attention_scope(&message);
         let (message, settled) = match self.admit(message) {
             ControlFlow::Continue(admitted) => admitted,
             ControlFlow::Break(refused) => return refused,
@@ -19494,7 +19504,6 @@ impl Cagents {
     fn finish_update(&mut self, task: Task<Message>, entry: UpdateEntry) -> Task<Message> {
         let UpdateEntry {
             notice_control,
-            attention_scope_changed,
             timed,
             settled_projection,
             #[cfg(any(test, feature = "development"))]
@@ -19629,7 +19638,7 @@ impl Cagents {
         ]);
         let _postlude_trace = crate::performance::ui_trace::projection("Postlude");
         projection_stage!("chat_failures", self.reconcile_chat_failure_presentations());
-        if attention_scope_changed {
+        if std::mem::take(&mut self.attention_scope_changed) {
             self.notification_ui.scope_changed();
         }
         projection_stage!("pull_request_labels", self.sync_pull_request_labels());
