@@ -65,8 +65,6 @@ impl<'a, Message> Tile<'a, Message> {
 struct State {
     focused: bool,
     hovered: bool,
-    /// The accessible node keeps one identity across frames.
-    a11y: iced_accessibility::Id,
 }
 
 impl operation::Focusable for State {
@@ -106,7 +104,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
         tree::State::new(State {
             focused: false,
             hovered: false,
-            a11y: iced_accessibility::Id::unique(),
         })
     }
 
@@ -185,8 +182,29 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
             state.hovered = hovered;
             shell.request_redraw();
         }
+        // An assistive technology acts on the tile through its accessible
+        // node, which shares the tile's id.
+        if let Event::A11y(id, request) = event {
+            if *id != self.id {
+                return;
+            }
+            match request.action {
+                A11yAction::Focus => state.focused = true,
+                A11yAction::Click => {
+                    if let Some(open) = &self.on_open {
+                        shell.publish(open.clone());
+                    }
+                }
+                _ => return,
+            }
+            shell.request_redraw();
+            return;
+        }
         let revealed = self.revealed(state);
         if revealed {
+            // Only the × taking the event ends it here: a press another tile
+            // already took still has to take focus away from this one.
+            let captured = shell.is_event_captured();
             let close = layout.children().nth(CLOSE).expect("a tile's ×");
             self.children[CLOSE].as_widget_mut().update(
                 &mut tree.children[CLOSE],
@@ -198,7 +216,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
                 shell,
                 viewport,
             );
-            if shell.is_event_captured() {
+            if !captured && shell.is_event_captured() {
                 return;
             }
         }
@@ -362,10 +380,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
     fn a11y_nodes(
         &self,
         layout: Layout<'_>,
-        tree: &Tree,
+        _tree: &Tree,
         _cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds() - layout.virtual_offset();
         let mut node = Node::new(Role::Button);
         node.set_label(self.name.clone());
@@ -384,6 +401,92 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
             f64::from(bounds.x + bounds.width),
             f64::from(bounds.y + bounds.height),
         ));
-        iced_accessibility::A11yTree::leaf(node, state.a11y.clone())
+        iced_accessibility::A11yTree::leaf(node, self.id.clone())
+    }
+
+    fn id(&self) -> Option<widget::Id> {
+        Some(self.id.clone())
+    }
+
+    fn set_id(&mut self, id: widget::Id) {
+        self.id = id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{clipboard, widget::operation::Focusable};
+    use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+    /// The ids of the tiles that hold keyboard focus.
+    #[derive(Default)]
+    struct Focused(Vec<widget::Id>);
+    impl Operation for Focused {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(&mut self, id: Option<&widget::Id>, _: Rectangle, state: &mut dyn Focusable) {
+            if state.is_focused() {
+                self.0.extend(id.cloned());
+            }
+        }
+    }
+
+    fn tray(ids: &[widget::Id]) -> Element<'static, usize> {
+        let tiles = ids.iter().enumerate().map(|(index, id)| {
+            tile(
+                id.clone(),
+                cosmic::widget::Space::new().width(56).height(56),
+                cosmic::widget::Space::new(),
+                cosmic::widget::button::custom(cosmic::widget::Space::new().width(18).height(18))
+                    .on_press(100 + index),
+                format!("Image {}", index + 1),
+                Some(200 + index),
+            )
+            .on_open(Some(index))
+            .into()
+        });
+        cosmic::widget::row::with_children(tiles.collect::<Vec<_>>())
+            .spacing(8)
+            .into()
+    }
+
+    #[test]
+    fn clicking_a_tile_takes_focus_from_the_one_that_had_it() {
+        let ids = [widget::Id::unique(), widget::Id::unique()];
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = UserInterface::build(
+            tray(&ids),
+            Size::new(400.0, 100.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let mut focus = operation::focusable::focus(ids[1].clone());
+        ui.operate(&renderer, &mut focus);
+
+        // Tile 2 shows its × while focused, so the press reaches its × and
+        // is already taken, by tile 1, when it gets there.
+        let position = Point::new(28.0, 40.0);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(position),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, [0], "the press opens tile 1");
+        let mut focused = Focused::default();
+        ui.operate(&renderer, &mut focused);
+        assert_eq!(
+            focused.0,
+            [ids[0].clone()],
+            "only the clicked tile holds focus"
+        );
     }
 }
