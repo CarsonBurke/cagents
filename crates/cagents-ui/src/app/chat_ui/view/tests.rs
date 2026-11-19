@@ -5530,6 +5530,49 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
 }
 
 #[test]
+fn a_stop_marker_is_one_quiet_row_with_nothing_to_open() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    use iced_accessibility::accesskit::Role;
+    let item = chat::Item {
+        at: Some(10),
+        ..chat::stopped_notice("turn:stopped".into())
+    };
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    let mut element = runtime.step_view(
+        &item,
+        &runtime.cache[&item.id],
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+    );
+    let renderer = crate::app::tests::headless_renderer();
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let labels: Vec<_> = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .filter_map(|node| node.node().label().map(|label| (node.node().role(), label)))
+        .collect();
+    assert!(
+        labels.iter().any(|(_, label)| *label == chat::STOPPED),
+        "the marker says the turn stopped: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .all(|(role, label)| *role != Role::Button && !label.contains("0s")),
+        "a stop has nothing to disclose and no time of its own: {labels:?}"
+    );
+}
+
+#[test]
 fn transcript_viewport_reaches_pane_edges_with_inset_inside_content() {
     use iced::advanced::{
         Layout, layout,

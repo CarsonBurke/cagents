@@ -155,7 +155,7 @@ class TaskReceiptContracts(unittest.TestCase):
             self.assertEqual([f["uuid"] for f in results], ["fixture-result-1", "fixture-result-2"])
             interrupt = next(i for i, f in enumerate(frames) if f["type"] == "control_response" and f["response"]["request_id"] == "interrupt")
             self.assertGreater(frames.index(results[0]), interrupt)
-            self.assertEqual([f["uuid"] for f in fixture.history()], ["prompt-1", "fixture-message-1", "prompt-2", "fixture-message-2"])
+            self.assertEqual([f["uuid"] for f in fixture.history()], ["prompt-1", "fixture-message-1", "fixture-stop-1", "prompt-2", "fixture-message-2"])
         for args, expected in [
             (("--version",), "2.1.286 (Claude Code fixture)\n"),
             (("auth",), '{"loggedIn":true,"email":"fixture@example.test","subscriptionType":"pro"}\n'),

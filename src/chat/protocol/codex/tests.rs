@@ -3476,6 +3476,44 @@ fn child_legacy_embedded_history_retains_the_latest_turn_outcome() {
     );
 }
 
+/// A child's history embedded in its resume leaves the command of a turn
+/// still under way running, and shows one its ended turn cut short stopped.
+#[test]
+fn child_embedded_history_settles_only_the_commands_of_ended_turns() {
+    let mut parent = adapter();
+    let mut discovered = Step::default();
+    parent
+        .discover_child("child", &json!({}), &mut discovered)
+        .unwrap();
+    let command = |id: &str| json!({"id":id,"type":"commandExecution","command":"sleep 600","cwd":"/tmp","status":"inProgress","aggregatedOutput":""});
+    let attached = parent.receive(json!({"id":discovered.writes[0]["id"],"result":{"thread":{"id":"child","status":{"type":"active","activeFlags":[]},"turns":[
+        {"id":"ended","status":"interrupted","items":[command("cut")]},
+        {"id":"live","status":"inProgress","items":[command("running")]}
+    ]}}})).unwrap();
+    let status = |turn: &str, id: &str| {
+        attached.events.iter().rev().find_map(|event| match event {
+            Event::SubagentItem { item, .. } | Event::Item(item)
+                if item.id == item_key(turn, id) =>
+            {
+                item.content.status()
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(
+        status("ended", "cut"),
+        Some(ToolStatus::Stopped),
+        "{:?}",
+        attached.events
+    );
+    assert_eq!(
+        status("live", "running"),
+        Some(ToolStatus::Running),
+        "{:?}",
+        attached.events
+    );
+}
+
 #[test]
 fn child_resume_without_embedded_turns_reads_history_and_settles_idle() {
     let mut adapter = adapter();
@@ -6004,4 +6042,81 @@ fn stale_login_verification_rpc_failure_emits_no_new_error() {
     adapter.lifecycle_revision += 1;
     let late = adapter.receive(json!({"id":request.writes[0]["id"],"error":{"code":-32000,"message":"old refresh failed"}})).unwrap();
     assert!(late.events.is_empty());
+}
+
+/// A stopped turn ends with its running command settled and one quiet
+/// marker after its work, live and read back from history alike, and
+/// reports no failure.
+#[test]
+fn a_stopped_turn_settles_its_command_and_marks_the_stop_once() {
+    let mut adapter = adapter();
+    adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"stopped","status":"inProgress","items":[]}}})).unwrap();
+    adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"stopped","item":{"id":"cmd","type":"commandExecution","command":"sleep 600","cwd":"/tmp","status":"inProgress","commandActions":[]}}})).unwrap();
+    let ended = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"stopped","status":"interrupted","items":[]}}})).unwrap();
+    let items: Vec<&Item> = ended
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Item(item) => Some(item),
+            _ => None,
+        })
+        .collect();
+    let command = items
+        .iter()
+        .find(|item| item.id == item_key("stopped", "cmd"))
+        .expect("the running command settles");
+    assert_eq!(command.content.status(), Some(ToolStatus::Stopped));
+    let markers: Vec<_> = items
+        .iter()
+        .filter(|item| crate::chat::is_stopped_notice(&item.content))
+        .collect();
+    assert_eq!(markers.len(), 1, "{items:?}");
+    assert!(
+        !ended
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
+    assert!(ended.events.iter().any(|event| matches!(
+        event,
+        Event::TurnFinished {
+            outcome: crate::notifications::Kind::Cancelled,
+            ..
+        }
+    )));
+
+    let mut page = Step::default();
+    adapter
+        .page(
+            &json!({"data":[{"id":"stopped","status":"interrupted","items":[
+                {"id":"cmd","type":"commandExecution","command":"sleep 600","cwd":"/tmp","status":"inProgress","aggregatedOutput":""}
+            ]}],"nextCursor":null}),
+            &mut page,
+            false,
+        )
+        .unwrap();
+    let history = page
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::LatestHistory { items, .. } => Some(items),
+            _ => None,
+        })
+        .unwrap();
+    // Codex reads an aborted command back as still in progress; its turn
+    // ended it, so it stays stopped after a reload.
+    let saved = history
+        .iter()
+        .find(|item| item.id == item_key("stopped", "cmd"))
+        .expect("the saved command");
+    assert_eq!(
+        saved.content.status(),
+        Some(ToolStatus::Stopped),
+        "{saved:?}"
+    );
+    let last = history.last().unwrap();
+    assert!(crate::chat::is_stopped_notice(&last.content), "{history:?}");
+    // The same marker as the live one, so reading history again does not
+    // add a second.
+    assert_eq!(last.id, markers[0].id);
 }

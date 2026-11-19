@@ -962,7 +962,7 @@ fn bounded<'a>(
 /// How a turn that finished with `snapshot` ended, as its provider said.
 pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     match snapshot.detail.as_str() {
-        "Turn interrupted" => "Interrupted",
+        chat::TURN_INTERRUPTED => "Interrupted",
         "Turn failed" => "Failed",
         _ => "Finished",
     }
@@ -6390,6 +6390,8 @@ impl Runtime {
                 || report_outcome.is_some_and(|(_, outcome)| outcome == "failed");
         let glyph = if failed {
             Icon::Error
+        } else if chat::is_stopped_notice(&item.content) {
+            Icon::Stop
         } else if *kind == chat::DeliveryKind::Notice
             && !monitor
             && delivery_command_outcome(&heading).is_some()

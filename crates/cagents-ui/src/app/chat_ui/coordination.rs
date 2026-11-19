@@ -847,6 +847,9 @@ impl Row {
         // its mark; a plain state is either drawn or the working dot.
         let reason = match (self.state.tone, self.state.detail.as_deref()) {
             (Tone::Plain, detail) => detail.map(str::to_owned),
+            // A state with no words of its own, such as an agent that
+            // couldn't start, whose verb says so, gives only its reason.
+            (_, Some(detail)) if self.state.text.is_empty() => Some(detail.to_owned()),
             (_, Some(detail)) => Some(format!("{}: {detail}", self.state.text)),
             (_, None) => Some(self.state.text.to_string()),
         }
@@ -1321,6 +1324,16 @@ impl Runtime {
         }
         let background = self.background_state(coordinated);
         let run = reading.outcome.run.as_ref();
+        // A launch refused before its agent did anything, such as one past
+        // the provider's limit of agents at once: there is no agent to open,
+        // so pressing the row shows why in its tool call. The CLI names the
+        // agent it started; a native agent that started has a transcript.
+        let unstarted = matches!(status, ToolStatus::Failed | ToolStatus::Denied)
+            && if reading.cli {
+                run.is_none()
+            } else {
+                listed.is_some_and(|agent| agent.items.is_empty())
+            };
         let mut glyph = Icon::Agent;
         // Use the observed task state while a native launch tool is still
         // settling, but keep an explicit launch failure visible.
@@ -1339,6 +1352,11 @@ impl Runtime {
                 ToolStatus::Running if spawn.waits => RowStatus::live("Working"),
                 ToolStatus::Running => RowStatus::live("Starting"),
                 ToolStatus::Stopped => RowStatus::plain("Stopped"),
+                // The verb says it: the agent never started.
+                ToolStatus::Failed | ToolStatus::Denied if unstarted => RowStatus {
+                    detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
+                    ..RowStatus::error("")
+                },
                 ToolStatus::Failed | ToolStatus::Denied => RowStatus {
                     detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
                     ..RowStatus::error("Failed")
@@ -1357,16 +1375,23 @@ impl Runtime {
             run.filter(|run| !run.agent.is_empty())
                 .map(|run| Action::OpenAgent(run.agent.clone()))
         } else {
-            listed.map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())))
+            listed
+                .filter(|_| !unstarted)
+                .map(|agent| Action::SelectSubagent(self.target, Some(agent.id.clone())))
         };
         // What it reported is in the open detail, and in the agent's
         // transcript; where the row cannot open one, the tooltip gives it too.
-        if open.is_none() {
+        // A refused launch's report is only the reason it already gives.
+        if open.is_none() && !unstarted {
             full.extend(coordinated.plain.collected(reading));
         }
         Row {
             glyph,
-            verb: "Started",
+            verb: if unstarted {
+                "Couldn't start"
+            } else {
+                "Started"
+            },
             label,
             shown,
             preview,
@@ -1446,7 +1471,9 @@ impl Runtime {
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
             Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
         };
-        state.push(status.into());
+        if !row.state.text.is_empty() {
+            state.push(status.into());
+        }
         // Where the agent's name and its state no longer both fit, the state
         // keeps only its mark: the dot of work under way, or one in the
         // warning colour. A failure is told by the row's leading glyph, and
@@ -1913,6 +1940,68 @@ mod identity_tests {
             at: None,
         };
         Coordinated::new(chat::coordination::recognize(&item, Provider::Claude).unwrap())
+    }
+
+    /// An agent Claude refused to start, past its limit of agents at once,
+    /// says so where it was asked for, and pressing it shows why; one that
+    /// worked before it failed is still an agent to open.
+    #[test]
+    fn a_refused_launch_reads_as_one_that_never_started() {
+        let refusal =
+            "Concurrent subagent limit reached. You can run 20 subagents at once. Do not retry.";
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let step = claude_step(
+            "Agent",
+            serde_json::json!({"description": "Review the change", "prompt": "Review the change on this branch.", "subagent_type": "general-purpose"}),
+            refusal,
+        );
+        let Kind::Spawn(spawn) = &step.reading.kind else {
+            panic!("an Agent call starts an agent");
+        };
+        for worked in [false, true] {
+            let items = if worked {
+                vec![std::sync::Arc::new(chat::Item {
+                    id: "child".into(),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: "Reading the diff.".into(),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })]
+            } else {
+                Vec::new()
+            };
+            std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+                id: "toolu_step".into(),
+                kind: "general-purpose".into(),
+                description: "Review the change".into(),
+                status: ToolStatus::Failed,
+                model: None,
+                waiting: false,
+                detail: refusal.into(),
+                background: false,
+                items,
+            }];
+            let row = runtime.spawn_row(&step, spawn, ToolStatus::Failed, refusal);
+            let (tip, accessible) = row.described();
+            assert!(tip.contains(refusal), "{worked}: {tip}");
+            assert!(accessible.contains(refusal), "{worked}: {accessible}");
+            if worked {
+                assert_eq!(row.verb, "Started");
+                assert_eq!(row.state.text, "Failed");
+                assert!(row.open.is_some(), "its transcript opens");
+            } else {
+                assert_eq!(row.verb, "Couldn't start");
+                assert_eq!(row.state.text, "", "the verb says it failed");
+                assert!(row.open.is_none(), "there is no agent to open");
+                assert!(accessible.starts_with("Couldn't start "), "{accessible}");
+                assert!(tip.contains(OPENS_DETAIL), "{tip}");
+                assert_eq!(tip.matches(refusal).count(), 1, "the reason once: {tip}");
+            }
+        }
     }
 
     /// However long an agent's name or a step's text, its row stays one line
