@@ -1538,6 +1538,21 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
         })
 }
 
+/// The inputs of one scope's selection catalog; see [`Runtime::selection_key`].
+#[derive(PartialEq, Eq)]
+pub(super) struct SelectionKey {
+    scope: Option<String>,
+    presentation: u64,
+    turns: revised::Stamp,
+    busy: bool,
+    /// The selected scope's item disclosures; a child with none has no set.
+    expanded: Option<revised::Stamp>,
+    opened: revised::Stamp,
+    tool_groups_expanded: bool,
+    failures: (u64, revised::Stamp, revised::Stamp),
+    queued: Option<(u64, u64)>,
+}
+
 impl Runtime {
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
         self.selected_subagent
@@ -2156,6 +2171,43 @@ impl Runtime {
         }
     }
 
+    /// What the logical copy/selection catalog is built from, as revisions
+    /// compared by value. Building it costs a lookup of the selected child
+    /// and never reads a transcript, a disclosure set or a diagnostic's text.
+    ///
+    /// Cache preparation advances `presentation_revision` for every presented
+    /// text or ordering edit, including the item list of the selected child,
+    /// and only for those: metadata-only heartbeats and hidden-child streams
+    /// leave it alone. The parent's grouping into turns is stamped on its own,
+    /// because a regroup with unchanged items does not advance that epoch.
+    /// Which failure incidents exist and where they anchor is their content
+    /// revision. Together with the selected scope these cover everything an
+    /// incident's exposure reads.
+    pub(super) fn selection_key(&self) -> SelectionKey {
+        let selected = self
+            .selected_subagent
+            .as_ref()
+            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+        SelectionKey {
+            scope: self.selected_subagent.clone(),
+            presentation: self.presentation_revision,
+            turns: self.turns.stamp(),
+            busy: selected.map_or(self.snapshot.busy, |agent| {
+                agent.status == chat::ToolStatus::Running
+            }),
+            expanded: match &self.selected_subagent {
+                Some(child) => self.child_expanded.get(child).map(Revised::stamp),
+                None => Some(self.expanded.stamp()),
+            },
+            opened: self.opened.stamp(),
+            tool_groups_expanded: self.tool_groups_expanded,
+            failures: self.failure_ui.exposure(),
+            queued: self
+                .local_prompt()
+                .map(|local| (local.source.id, local.presentation.revision)),
+        }
+    }
+
     /// The logical copy/selection catalog is rebuilt only when exposed text
     /// or disclosure changes, never for mouse motion, copying, find or timers.
     pub(super) fn selection_document(
@@ -2164,9 +2216,7 @@ impl Runtime {
         Arc<selection::Catalog>,
         std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
     ) {
-        use std::hash::{Hash, Hasher};
-        let mut fingerprint = std::hash::DefaultHasher::new();
-        self.selected_subagent.hash(&mut fingerprint);
+        let key = self.selection_key();
         let selected = self
             .selected_subagent
             .as_ref()
@@ -2174,64 +2224,8 @@ impl Runtime {
         let items = selected.map_or(self.snapshot.items.as_slice(), |agent| {
             agent.items.as_slice()
         });
-        // Cache preparation advances this epoch only for presented text or
-        // ordering edits. Metadata-only heartbeats and hidden-child streams
-        // must not rebuild the entire logical catalog.
-        self.presentation_revision.hash(&mut fingerprint);
-        selected
-            .map_or(self.snapshot.busy, |agent| {
-                agent.status == chat::ToolStatus::Running
-            })
-            .hash(&mut fingerprint);
-        let expanded = self
-            .selected_subagent
-            .as_ref()
-            .and_then(|id| self.child_expanded.get(id))
-            .unwrap_or(&self.expanded);
-        let mut expanded: Vec<_> = expanded.iter().collect();
-        expanded.sort_unstable();
-        expanded.hash(&mut fingerprint);
-        let mut opened: Vec<_> = self.opened.iter().collect();
-        opened.sort_unstable();
-        opened.hash(&mut fingerprint);
-        self.tool_groups_expanded.hash(&mut fingerprint);
-        // Typed summaries/guidance are ordinary labels. Only an exposed,
-        // bounded diagnostic preview has a matching logical text widget.
-        // Never hash or index the hidden original request dump here; explicit
-        // CopyFailure resolves the complete originals independently.
-        for incident in &self.failure_ui.incidents {
-            let exposed = selected.map_or_else(
-                || {
-                    !incident.active_recovery
-                        && incident.child_scope.is_none()
-                        && (incident.anchor.is_none()
-                            || self
-                                .turns
-                                .iter()
-                                .any(|turn| incident.anchor.as_ref() == Some(&turn.key)))
-                },
-                |agent| {
-                    self.incident_has_child_detail(incident, &agent.id)
-                        || agent.items.iter().any(|item| {
-                            self.failure_ui
-                                .child_item(&agent.id, &item.id)
-                                .is_some_and(|(found, _)| found.key == incident.key)
-                        })
-                },
-            );
-            if exposed && let Some(preview) = self.selection_failure_preview(incident) {
-                (preview, &incident.anchor).hash(&mut fingerprint);
-            }
-        }
-        self.local_prompt()
-            .map(|local| (local.source.id, local.presentation.revision))
-            .hash(&mut fingerprint);
-        let fingerprint = fingerprint.finish();
         let mut document = self.selection_document.borrow_mut();
-        if document
-            .as_ref()
-            .is_none_or(|(revision, _)| *revision != fingerprint)
-        {
+        if document.as_ref().is_none_or(|(built, _)| *built != key) {
             let mut builder = selection::Catalog::builder();
             if let Some(agent) = selected {
                 for incident in self.failure_ui.incidents.iter().filter(|incident| {
@@ -2301,7 +2295,7 @@ impl Runtime {
             }
             let catalog =
                 builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
-            *document = Some((fingerprint, catalog));
+            *document = Some((key, catalog));
             self.find_navigation.changed_document();
         }
         let catalog = document.as_ref().unwrap().1.clone();

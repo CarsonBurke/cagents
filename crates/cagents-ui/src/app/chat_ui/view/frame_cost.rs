@@ -659,7 +659,7 @@ impl Pane {
     /// Opens `id` the way pressing its header does.
     fn open(&mut self, id: &str) {
         let runtime = &mut self.runtime;
-        runtime.expanded.insert(id.to_owned());
+        runtime.expanded.edit().insert(id.to_owned());
         let (index, item) = runtime
             .snapshot
             .items
@@ -673,7 +673,7 @@ impl Pane {
             .iter()
             .find(|turn| turn.steps.iter().any(|placed| placed.index == index))
         {
-            runtime.opened.insert(turn.key.clone(), true);
+            runtime.opened.edit().insert(turn.key.clone(), true);
         }
         let previous = runtime.cache.remove(id);
         runtime.cache.insert(

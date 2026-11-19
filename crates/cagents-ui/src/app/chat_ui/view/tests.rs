@@ -784,7 +784,7 @@ fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
         },
     };
     let (mut runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
-    runtime.expanded.insert(item.id.clone());
+    runtime.expanded.edit().insert(item.id.clone());
     let stamp = runtime.cache[&item.id]
         .stamp
         .as_ref()
@@ -1444,7 +1444,8 @@ fn contentless_thinking_draws_no_row_and_leaves_the_working_indicator_in_place()
             &runtime.snapshot.items,
             &runtime.asked_after,
             crate::app::chat_ui::Presentations(&runtime.cache),
-        );
+        )
+        .into();
     };
     let (mut runtime, _handle) =
         frame_cost::live_runtime(&[prompt, command("c1", chat::ToolStatus::Succeeded), thought]);
@@ -1543,7 +1544,8 @@ fn a_working_turn_shows_one_activity_indicator_on_its_newest_live_row() {
             &runtime.snapshot.items,
             &runtime.asked_after,
             crate::app::chat_ui::Presentations(&runtime.cache),
-        );
+        )
+        .into();
     };
     let running = command("c1", chat::ToolStatus::Running);
     let (mut runtime, _handle) =
@@ -4701,7 +4703,7 @@ fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebu
     target.card = app.workspace.focused().unwrap();
     live.target = target;
     live.session.launch.provider = Provider::Codex;
-    live.expanded.insert("live-thought".into());
+    live.expanded.edit().insert("live-thought".into());
     let mut child = native_child_fixture();
     child.waiting = true;
     child.model = Some("gpt-fixture-mini".into());
@@ -5197,9 +5199,9 @@ fn drawing_and_regrouping_a_tool_row_do_not_read_its_input_again() {
     let name = "Tried to write docs/large-report.md · Denied";
     for open in [false, true, false] {
         if open {
-            runtime.expanded.insert(item.id.clone());
+            runtime.expanded.edit().insert(item.id.clone());
         } else {
-            runtime.expanded.remove(&item.id);
+            runtime.expanded.edit().remove(&item.id);
         }
         let mut element = runtime.step_header(&item, &runtime.cache[&item.id], open);
         let renderer = crate::app::tests::headless_renderer();
@@ -5372,9 +5374,9 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
         assert_eq!(runtime.turns[0].summary, name);
         for open in [false, true] {
             if open {
-                runtime.expanded.insert(item.id.clone());
+                runtime.expanded.edit().insert(item.id.clone());
             } else {
-                runtime.expanded.remove(&item.id);
+                runtime.expanded.edit().remove(&item.id);
             }
             let mut element = runtime.step_view(
                 &item,
@@ -7002,7 +7004,10 @@ fn reading_column_is_stable_across_transcript_states() {
                     });
             }
             if state == 3 {
-                runtime.opened.insert(runtime.turns[0].key.clone(), true);
+                runtime
+                    .opened
+                    .edit()
+                    .insert(runtime.turns[0].key.clone(), true);
             }
             if state == 4 {
                 Arc::make_mut(&mut runtime.snapshot).ready = false;
@@ -7296,7 +7301,7 @@ fn failure_catalog_keeps_visible_turn_order_and_duplicate_messages_distinct() {
             .any(|(_, text)| text.contains("Repeated failure") || text.contains("Current failure"))
     );
     for key in &keys {
-        runtime.failure_ui.expanded.insert(key.clone());
+        runtime.failure_ui.expanded.edit().insert(key.clone());
         runtime.cache_failure_preview(key);
     }
     let (catalog, _) = runtime.selection_document();
@@ -7401,7 +7406,7 @@ fn copy_web_search_native(select_all: bool) {
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
     let runtime = app.chat_runtime_mut(target).unwrap();
     let key = runtime.turns[0].key.clone();
-    runtime.opened.insert(key, true);
+    runtime.opened.edit().insert(key, true);
     let (catalog, bookmark) = runtime.selection_document();
     let canonical = runtime
         .snapshot
@@ -7688,7 +7693,7 @@ fn cli_spawn_step_stays_one_row_and_discloses_its_launch_at_narrow_width() {
             "compact spawn: {size:?}"
         );
     }
-    runtime.expanded.insert(item.id.clone());
+    runtime.expanded.edit().insert(item.id.clone());
     let mut catalog = selection::Catalog::builder();
     runtime.selection_item(&mut catalog, &item, turn::Slot::Card, true);
     assert!(catalog.finish().retained_plain_bytes() > 0);
@@ -7771,7 +7776,7 @@ fn delivery_details_are_closed_at_narrow_width_and_preserve_literal_output() {
         0,
         "closed details cannot be selected"
     );
-    runtime.expanded.insert(item.id.clone());
+    runtime.expanded.edit().insert(item.id.clone());
     let mut open = runtime.delivery_view(&item, &runtime.cache[&item.id], settings);
     let mut tree = Tree::new(&open);
     let node = open.as_widget_mut().layout(&mut tree, &renderer, &limits);
@@ -7839,7 +7844,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
     sources.push(delivery);
     let (mut runtime, _handle) = frame_cost::live_runtime(&sources);
     let delivery = runtime.snapshot.items.last().unwrap().clone();
-    runtime.expanded.insert(delivery.id.clone());
+    runtime.expanded.edit().insert(delivery.id.clone());
     let queued = Queued {
         prompt: prompt::LocalPrompt::new("Queued message".into(), vec![]),
         resolved_text: "Queued message".into(),
@@ -9594,7 +9599,7 @@ fn refresh_replaces_expanded_tool_text_after_a_tail_colliding_rewrite() {
         at: None,
     }];
     let (mut runtime, handle) = frame_cost::live_runtime(&items);
-    runtime.expanded.insert("tool".into());
+    runtime.expanded.edit().insert("tool".into());
     // First update creates the expanded presentation.
     if let ItemContent::Tool { input, .. } = &mut items[0].content {
         *input = "pwd".into();
@@ -9776,7 +9781,7 @@ fn an_exchange_is_drawn_again_when_its_presentation_changes() {
         .get(&key)
         .copied()
         .unwrap_or(runtime.tool_groups_expanded);
-    runtime.opened.insert(key, !open);
+    runtime.opened.edit().insert(key, !open);
     let toggled = fingerprint(&runtime, false);
     assert_ne!(light, toggled, "the strip opening or closing");
     runtime.set_syntax_theme(crate::settings::EditorSyntaxTheme::SolarizedDark);
@@ -9798,6 +9803,7 @@ fn an_open_steps_retained_key_changes_once_for_its_disclosure() {
     let step = runtime.turns[strip].steps[0].index;
     runtime
         .expanded
+        .edit()
         .insert(runtime.snapshot.items[step].id.clone());
     let opened = runtime.turn_fingerprint(&runtime.turns[strip], true);
     assert_ne!(closed, opened);
