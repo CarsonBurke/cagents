@@ -1263,6 +1263,11 @@ struct OwedProjection {
     /// The shared workspace model changed, so the replica snapshot is
     /// materialized before chrome reads it.
     model_update: bool,
+    /// The window's saved view changed. It is captured once the projection
+    /// has rebound what the view shows, such as the source-control panel's
+    /// worktree and its filter, so the save never holds the binding being
+    /// replaced.
+    save_view: bool,
 }
 
 impl OwedProjection {
@@ -1273,6 +1278,15 @@ impl OwedProjection {
             camera_only: false,
             reconcile_row_selection: false,
             model_update: false,
+            save_view: false,
+        }
+    }
+
+    /// This projection, then a save of the window's view.
+    fn saving_view(self) -> Self {
+        Self {
+            save_view: true,
+            ..self
         }
     }
 
@@ -1285,6 +1299,7 @@ impl OwedProjection {
             projection,
             reconcile_row_selection: self.reconcile_row_selection || other.reconcile_row_selection,
             model_update: self.model_update || other.model_update,
+            save_view: self.save_view || other.save_view,
         }
     }
 
@@ -19393,7 +19408,7 @@ impl Cagents {
                 committed,
             } => handled!(self.source_control_mutated(key, operation, report, committed)),
         };
-        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update });
+        self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
         task
             })();
         Task::batch([settled, task])
@@ -19420,7 +19435,7 @@ impl Cagents {
         } = entry;
         #[rustfmt::skip]
         let task = (|| {
-        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update }) = self.owed_projection.take() else {
+        let Some(OwedProjection { mut projection, camera_only, reconcile_row_selection, model_update, save_view }) = self.owed_projection.take() else {
             return task;
         };
         // Scoped proof was established during dispatch. Settings commit and
@@ -19533,9 +19548,15 @@ impl Cagents {
                 reconcile_row_selection,
             ),
         ]);
+        let saved = if save_view {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
         Task::batch([
             task,
             projected,
+            saved,
             self.release_deferred_navigation_if_unblocked(),
         ])
             })();

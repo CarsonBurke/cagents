@@ -606,28 +606,17 @@ impl Cagents {
         })
     }
 
-    /// Opens or closes the pane's inspector, and saves which inspectors are
-    /// open. A pane without one never opens it.
-    pub(super) fn set_pane_inspector_open(&mut self, card: CardId, open: bool) -> Task<Message> {
-        self.change_pane_inspector(card, open)
-            .map_or_else(Task::none, |focus| {
-                Task::batch([focus, self.save_settings_task(false)])
-            })
-    }
-
-    /// Opens or closes the pane's inspector without saving it, returning what
-    /// moves the keyboard to its toggle, or `None` when nothing changed.
+    /// Opens or closes the pane's inspector. A pane without one never opens
+    /// it.
     ///
     /// The update owes the full projection for it, which syncs the
-    /// inspectors and then rebinds source control to the pane drawing it;
-    /// doing either here would only be done again there.
-    pub(super) fn change_pane_inspector(
-        &mut self,
-        card: CardId,
-        open: bool,
-    ) -> Option<Task<Message>> {
+    /// inspectors and then rebinds source control to the pane drawing it,
+    /// and then saves which inspectors are open; doing any of these here
+    /// would only be done again there, and a save made here would hold the
+    /// binding the projection replaces.
+    pub(super) fn set_pane_inspector_open(&mut self, card: CardId, open: bool) -> Task<Message> {
         if open && !self.pane_has_inspector(card) {
-            return None;
+            return Task::none();
         }
         let closing_overlay =
             !open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay);
@@ -639,22 +628,20 @@ impl Cagents {
             self.frame_clock.frame(),
             Instant::now(),
         ) {
-            return None;
+            return Task::none();
         }
         self.frame_clock.reset();
-        self.owe_projection(OwedProjection::full());
+        self.owe_projection(OwedProjection::full().saving_view());
         // An inspector opened over the pane's content takes the keyboard
         // from it, so typing never lands in content it hides.
-        Some(
-            if closing_overlay
-                || (open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay))
-            {
-                iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
-                    .map(cosmic::Action::App)
-            } else {
-                Task::none()
-            },
-        )
+        if closing_overlay
+            || (open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay))
+        {
+            iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
+                .map(cosmic::Action::App)
+        } else {
+            Task::none()
+        }
     }
 
     pub(super) fn toggle_pane_inspector(&mut self, card: CardId) -> Task<Message> {

@@ -239,16 +239,12 @@ impl Cagents {
         card: CardId,
         section: Section,
     ) -> Task<Message> {
-        let expanded = !self.context_sections.is_open(section);
-        self.context_sections.set_open(section, true);
-        let opened = self.change_pane_inspector(card, true);
-        // One save holds both the expanded section and the open inspector.
-        let save = if expanded || opened.is_some() {
-            self.save_settings_task(false)
-        } else {
-            Task::none()
-        };
-        Task::batch([opened.unwrap_or_else(Task::none), save])
+        if !self.context_sections.is_open(section) {
+            self.context_sections.set_open(section, true);
+            // The same save as the inspector's, if it opens too.
+            self.owe_projection(OwedProjection::full().saving_view());
+        }
+        self.set_pane_inspector_open(card, true)
     }
 
     /// `card`'s inspector's sections, the first of whose headers ends with
@@ -953,14 +949,8 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         app.context_sections.set_open(Section::Problems, false);
-        let captures = crate::app::terminal_output_tests::settings_captures();
         drop(app.reveal_context_section(card, Section::Problems));
         assert!(app.pane_inspectors.is_open(card));
         assert!(app.context_sections.is_open(Section::Problems));
-        // One save holds both.
-        assert_eq!(
-            crate::app::terminal_output_tests::settings_captures() - captures,
-            1
-        );
     }
 }

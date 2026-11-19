@@ -8376,6 +8376,7 @@ fn repository_card(app: &mut Cagents, worktree: &str) -> CardId {
 #[test]
 fn editor_language_results_expand_their_section() {
     use context_sections::Section;
+    use terminal_output_tests::{settings_captures, source_control_rebinds};
     let mut app = lsp_test_app();
     let card = repository_card(&mut app, "/repo");
     for (action, section) in [
@@ -8389,6 +8390,7 @@ fn editor_language_results_expand_their_section() {
         ),
     ] {
         app.context_sections.set_open(section, false);
+        let (captures, rebinds) = (settings_captures(), source_control_rebinds());
         let _ = app.update(Message::Repository(RepositoryAction::Language {
             card,
             action,
@@ -8401,12 +8403,22 @@ fn editor_language_results_expand_their_section() {
             app.context_sections.is_open(section),
             "a collapsed section hides the requested language results"
         );
+        // One save holds the section and the inspector, after one rebind.
+        assert_eq!(settings_captures() - captures, 1);
+        assert_eq!(source_control_rebinds() - rebinds, 1);
     }
     let doc = LspDocumentId(1);
     let request = crate::lsp::LspRequestId(1);
     app.lsp_documents.insert(doc, card);
     lsp_state(&mut app, card).editor_navigation = Some(request);
     app.context_sections.set_open(Section::Locations, false);
+    // A response that cannot jump opens the closed inspector from a handler
+    // that returns before its message's projection; the inspector still
+    // owes one, and the save after it.
+    let _ = app.update(Message::TogglePaneInspector(card));
+    app.settle_pane_inspectors();
+    assert!(!app.pane_inspectors.is_open(card));
+    let (captures, rebinds) = (settings_captures(), source_control_rebinds());
     let _ = app.update(Message::Lsp(LspEvent::Locations {
         doc,
         request,
@@ -8418,6 +8430,8 @@ fn editor_language_results_expand_their_section() {
         app.context_sections.is_open(Section::Locations),
         "a definition response that cannot jump must expose its results"
     );
+    assert_eq!(settings_captures() - captures, 1);
+    assert_eq!(source_control_rebinds() - rebinds, 1);
 }
 
 fn lsp_state(app: &mut Cagents, card: CardId) -> &mut LspInspectorState {
