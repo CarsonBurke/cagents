@@ -1921,12 +1921,24 @@ fn chip_with_window(
         }
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
             let Some(window) = window_of(snapshot) else {
-                return Chip {
-                    text: "No limits".into(),
-                    usage_fraction: None,
-                    tone: ChipTone::Current,
-                    essential: false,
-                    tooltip: format!("{name} reports no usage limits for this account"),
+                return if account::reports_usage_limits(account.account.provider) {
+                    Chip {
+                        text: "No limits".into(),
+                        usage_fraction: None,
+                        tone: ChipTone::Current,
+                        essential: false,
+                        tooltip: format!("{name} reports no usage limits for this account"),
+                    }
+                } else {
+                    Chip {
+                        text: "Limits not reported".into(),
+                        usage_fraction: None,
+                        tone: ChipTone::Current,
+                        essential: false,
+                        tooltip: format!(
+                            "{name} is signed in. It does not report its usage limits, so cagents cannot show them."
+                        ),
+                    }
                 };
             };
             let stale = is_stale(snapshot, now);
@@ -8244,7 +8256,7 @@ mod app_tests {
     /// limits. That system login is listed, with its plan, and its chip says
     /// it reports no limits; signed out, it asks for sign-in again.
     #[test]
-    fn a_signed_in_antigravity_login_is_listed_with_its_plan_and_no_limits() {
+    fn a_signed_in_antigravity_login_is_listed_with_its_plan_and_unreported_limits() {
         let mut app = context_inspector_test_app(false);
         let provider = Provider::Antigravity;
         let id = Account::system(provider).id();
@@ -8281,7 +8293,7 @@ mod app_tests {
             app.account_ui.now_ms,
             Default::default(),
         );
-        assert_eq!(shown.text, "No limits");
+        assert_eq!(shown.text, "Limits not reported");
         answer(&mut app, UsageStatus::NeedsLogin, None);
         assert_eq!(app.account_ui.provider_status(provider), "Sign in again");
     }

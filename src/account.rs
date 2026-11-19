@@ -229,6 +229,12 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
     }
 }
 
+/// Whether a provider reports its accounts' usage limits. One that does not
+/// has limits all the same; cagents just cannot show them.
+pub fn reports_usage_limits(provider: Provider) -> bool {
+    !matches!(provider, Provider::Antigravity)
+}
+
 /// Documented process credentials and provider selectors that outrank a CLI's
 /// stored login. Keep this list explicit: cloud credentials may still be needed
 /// by the agent's tools, and account-local configuration remains user-owned.
