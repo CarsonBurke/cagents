@@ -2233,8 +2233,17 @@ impl Cagents {
             .position(|channel| channel.id == id)?;
         self.forget_view_seed(&crate::workspace_model::views::Scope::Channel(id));
         let was_active = self.durable.active_channel == Some(id);
-        let (project_id, successor) = self.channel_successor(index);
-        let fallback = self.project_primary_worktree(project_id);
+        let project_id = self.durable.channels[index].project_id;
+        // Read while the channel is still listed. Only the active channel has
+        // somewhere to land, and only a peer's deletion keeps panes needing a
+        // worktree, so a project's channels retiring together don't each
+        // search all the others.
+        let successor = was_active
+            .then(|| self.channel_successor(index).1)
+            .flatten();
+        let fallback = passive
+            .then(|| self.project_primary_worktree(project_id))
+            .flatten();
         let focused = self.durable.channels[index].focused;
         let mut retained_scope = None;
         let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
