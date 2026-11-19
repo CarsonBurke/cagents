@@ -1535,10 +1535,15 @@ impl Editor {
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
         );
-        for (path, language) in &self.saved_session.languages {
-            if let Ok(source) = Path::new(path).strip_prefix(&opened.root) {
-                runtime.restore_language_choice(source.to_owned(), *language);
-            }
+        // Only the file this tab opens: an untitled tab shares its root with
+        // every other note, and a note's choice must not reach its siblings.
+        if let Some(file) = &opened.file
+            && let Some(language) = self
+                .saved_session
+                .languages
+                .get(&opened.root.join(file).display().to_string())
+        {
+            runtime.restore_language_choice(file.clone(), *language);
         }
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
@@ -9906,6 +9911,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "keep me\n");
         let session = crate::preferences::load_session(&app.settings_path).unwrap();
         assert_eq!(session.paths, vec![scratch]);
+    }
+
+    #[test]
+    fn an_untitled_note_keeps_its_chosen_language_across_sessions() {
+        use cagents_ui::editor::language::DocumentLanguage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let scratch = app.untitled_scratch_path(id).unwrap();
+        load_selected(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::ChooseLanguage {
+                card: id,
+                language: Some(DocumentLanguage::PlainText),
+            })),
+        );
+        let session = app.session();
+        assert_eq!(
+            session.languages.get(&scratch.display().to_string()),
+            Some(&DocumentLanguage::PlainText)
+        );
+
+        // The next session's tab for the same note starts with the choice,
+        // and a new note beside it does not.
+        let mut restored = configured(&directory);
+        restored.saved_session = session;
+        drop(restored.add(
+            Opened {
+                root: scratch.parent().unwrap().to_owned(),
+                file: Some("Untitled".into()),
+                snapshot: None,
+            },
+            true,
+        ));
+        let tab = restored.tab(restored.active.unwrap()).unwrap();
+        assert_eq!(
+            tab.runtime.language_choices().collect::<Vec<_>>(),
+            vec![(Path::new("Untitled"), DocumentLanguage::PlainText)]
+        );
+        drop(restored.update(Message::NewTab));
+        let tab = restored.tab(restored.active.unwrap()).unwrap();
+        assert_eq!(tab.runtime.language_choices().count(), 0);
+
+        // Handing the note back to its content forgets the choice.
+        drop(
+            app.update(Message::Repository(RepositoryAction::ChooseLanguage {
+                card: id,
+                language: None,
+            })),
+        );
+        assert!(app.session().languages.is_empty());
     }
 
     #[test]
