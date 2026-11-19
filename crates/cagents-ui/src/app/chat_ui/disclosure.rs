@@ -38,10 +38,10 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
     match status {
         Some(chat::ToolStatus::Failed) => Icon::Error,
         Some(chat::ToolStatus::Denied) => Icon::Unavailable,
-        Some(chat::ToolStatus::Stopped) => Icon::Stop,
+        // Work that was stopped, or that ended without saying how it went,
+        // has not failed. Its mark is a still one, unlike the Stop control.
+        Some(chat::ToolStatus::Stopped | chat::ToolStatus::Ended) => Icon::Ended,
         Some(chat::ToolStatus::Waiting) => Icon::AgentBackground,
-        // Work that ended without saying how it went has not failed: it keeps
-        // its own glyph, as finished work does, and its badge says it ended.
         _ => kind,
     }
 }
@@ -240,16 +240,11 @@ mod tests {
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Denied)),
             Icon::Unavailable
         );
-        // Stopping is not failing, and nor is ending unreported, which is
-        // drawn as work that is done.
-        assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Stopped)),
-            Icon::Stop
-        );
-        assert_eq!(
-            status_glyph(Icon::Terminal, Some(chat::ToolStatus::Ended)),
-            Icon::Terminal
-        );
+        // Stopping is not failing, and nor is ending unreported. Neither is
+        // drawn as the Stop control, which reads as something to press.
+        for status in [chat::ToolStatus::Stopped, chat::ToolStatus::Ended] {
+            assert_eq!(status_glyph(Icon::Terminal, Some(status)), Icon::Ended);
+        }
         assert_eq!(
             status_glyph(Icon::Terminal, Some(chat::ToolStatus::Waiting)),
             Icon::AgentBackground

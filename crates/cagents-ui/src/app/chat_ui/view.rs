@@ -1465,14 +1465,22 @@ fn delivery_command_failed(heading: &str) -> bool {
 }
 
 /// `text` as it reads after other words: a badge continues its row's title.
-fn lowercase_initial(text: Cow<'static, str>) -> Cow<'static, str> {
+fn lowercase_initial(text: &str) -> String {
     let mut chars = text.chars();
-    match chars.next() {
-        Some(initial) if initial.is_uppercase() => {
-            Cow::Owned(initial.to_lowercase().chain(chars).collect())
-        }
-        _ => text,
-    }
+    chars
+        .next()
+        .map(|initial| initial.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a delivery may be an agent's report, which says how the agent
+/// its sender names stands now: what [`delivery_report_outcome`] reads.
+fn delivery_names_agent(from: &str, sender: &str, summary: &str) -> bool {
+    from.is_empty()
+        && !sender.is_empty()
+        && ["Agent ", "Workflow "]
+            .iter()
+            .any(|prefix| summary.trim_start().starts_with(prefix))
 }
 
 fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str, &'a str)> {
@@ -1490,6 +1498,47 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
                 .strip_suffix(outcome)
                 .map(|title| (title, outcome.trim()))
         })
+}
+
+/// How `agent` stands, given what it waits on if it waits on work of its
+/// own that its transcript names; see [`Runtime::native_child_status`].
+fn agent_caption<'a>(agent: &chat::Subagent, work: Option<&'a str>) -> &'a str {
+    match agent.status {
+        chat::ToolStatus::Running if agent.waiting => "Waiting",
+        chat::ToolStatus::Waiting => work.unwrap_or("Waiting on background work"),
+        chat::ToolStatus::Running => "Working",
+        chat::ToolStatus::Succeeded => "Finished",
+        chat::ToolStatus::Failed => "Failed",
+        chat::ToolStatus::Denied => "Denied",
+        chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::Ended => "Ended",
+    }
+}
+
+/// What each listed agent waiting on its own background work waits on, as
+/// its caption says it, named once per installed publication so that
+/// drawing and fingerprinting only look it up.
+#[derive(Default)]
+pub(super) struct AgentWork(HashMap<String, Box<str>>);
+
+impl AgentWork {
+    pub(super) fn observe(&mut self, agents: &[chat::Subagent]) {
+        self.0.clear();
+        for agent in agents {
+            if let Some(caption) = Runtime::background_work(agent) {
+                self.0.insert(agent.id.clone(), caption.into_boxed_str());
+            }
+        }
+    }
+
+    pub(super) fn get(&self, id: &str) -> Option<&str> {
+        self.0.get(id).map(|caption| &**caption)
+    }
+
+    /// How `agent` stands, as [`Runtime::native_child_status`] says it.
+    pub(super) fn caption<'a>(&'a self, agent: &chat::Subagent) -> &'a str {
+        agent_caption(agent, self.get(&agent.id))
+    }
 }
 
 /// How a delivery's one line reads; see [`Runtime::delivery_outcome`].
@@ -1539,30 +1588,20 @@ impl Runtime {
     }
 
     /// How `agent` stands now, in the words every row, tab and notice about
-    /// it uses, so that none of them contradicts another.
-    pub(super) fn native_child_status(agent: &chat::Subagent) -> Cow<'static, str> {
-        Cow::Borrowed(match agent.status {
-            chat::ToolStatus::Running if agent.waiting => "Waiting",
-            chat::ToolStatus::Waiting => {
-                return match Self::background_work(agent) {
-                    Some(work) => Cow::Owned(format!("Waiting on {work}")),
-                    None => Cow::Borrowed("Waiting on background work"),
-                };
-            }
-            chat::ToolStatus::Running => "Working",
-            chat::ToolStatus::Succeeded => "Finished",
-            chat::ToolStatus::Failed => "Failed",
-            chat::ToolStatus::Denied => "Denied",
-            chat::ToolStatus::Stopped => "Stopped",
-            chat::ToolStatus::Ended => "Ended",
-        })
+    /// it uses, so that none of them contradicts another. What a waiting
+    /// agent waits on was named when its publication was installed.
+    pub(super) fn native_child_status<'a>(&'a self, agent: &chat::Subagent) -> &'a str {
+        self.agent_work.caption(agent)
     }
 
     /// What an agent left waiting on its own background work is waiting on,
     /// where its transcript shows it: the command still running, as its row
     /// names it, or how many are. Its turn has ended, so any command of its
     /// own still running is one it left in the background.
-    pub(super) fn background_work(agent: &chat::Subagent) -> Option<String> {
+    ///
+    /// This walks the agent's transcript, so it runs once per installed
+    /// publication, through [`AgentWork::observe`], and never while drawing.
+    fn background_work(agent: &chat::Subagent) -> Option<String> {
         if agent.status != chat::ToolStatus::Waiting {
             return None;
         }
@@ -1575,10 +1614,14 @@ impl Runtime {
             _ => None,
         });
         let first = running.next()?;
-        let first = Self::short_description(first.trim(), BACKGROUND_WORK_CHARS);
+        // Several are counted: a list would be cut where the row runs short,
+        // and the count is what the reader needs from it.
         Some(match running.count() {
-            0 => first,
-            more => format!("{first} and {more} more"),
+            0 => format!(
+                "Waiting on {}",
+                Self::short_description(first.trim(), BACKGROUND_WORK_CHARS)
+            ),
+            more => format!("Waiting on {} commands", more + 1),
         })
     }
 
@@ -1603,7 +1646,7 @@ impl Runtime {
         let mut identity = format!(
             "{} · {} · {provider} native subagent · {}",
             Self::short_description(label, 80),
-            Self::native_child_status(agent),
+            self.native_child_status(agent),
             Self::short_description(model, 80),
         );
         // A blocked or failed child's provider error keeps its raw diagnostic
@@ -1836,7 +1879,7 @@ impl Runtime {
             if agent.status == chat::ToolStatus::Waiting {
                 return Some((
                     Icon::AgentBackground,
-                    Self::native_child_status(agent).into_owned(),
+                    self.native_child_status(agent).to_owned(),
                 ));
             }
             return (agent.status == chat::ToolStatus::Running).then(|| {
@@ -2104,7 +2147,7 @@ impl Runtime {
             let label = self.finished_label();
             (
                 Some(match label {
-                    "Interrupted" => Icon::Stop,
+                    "Interrupted" => Icon::Ended,
                     "Finished" => Icon::Check,
                     _ => Icon::Warning,
                 }),
@@ -2562,7 +2605,7 @@ impl Runtime {
                     chat_title(self.child_label(agent, 80))
                         .width(Length::Fill)
                         .into(),
-                    design::heading(Self::native_child_status(agent))
+                    design::heading(self.native_child_status(agent).to_owned())
                         .size(design::TEXT_CAPTION)
                         .into(),
                 ])
@@ -5247,7 +5290,7 @@ impl Runtime {
         if coordinating {
             for agent in &self.snapshot.subagents {
                 (&agent.id, &agent.kind, &agent.description, &agent.model).hash(&mut hasher);
-                Self::hash_agent_state(agent, &mut hasher);
+                self.hash_agent_state(agent, &mut hasher);
             }
             // The client replaces its map whenever it learns an address, and a
             // new handle brings its own.
@@ -5257,9 +5300,9 @@ impl Runtime {
     }
 
     /// What a row saying how `agent` stands draws from it.
-    fn hash_agent_state(agent: &chat::Subagent, hasher: &mut std::hash::DefaultHasher) {
+    fn hash_agent_state(&self, agent: &chat::Subagent, hasher: &mut std::hash::DefaultHasher) {
         use std::hash::Hash;
-        (agent.status, agent.waiting, Self::background_work(agent)).hash(hasher);
+        (agent.status, agent.waiting, self.agent_work.get(&agent.id)).hash(hasher);
     }
 
     /// What one item of an exchange, drawn from `cached`, contributes to its
@@ -5336,12 +5379,19 @@ impl Runtime {
         if cached.is_some_and(CachedItem::shows_figures) {
             self.figures.version().hash(hasher);
         }
-        // An agent's report says how the agent stands now.
-        if let ItemContent::Delivery { sender, .. } = &item.content
-            && !sender.is_empty()
+        // An agent's report says how the agent stands now, so it tracks that
+        // agent, and which agent its sender names. Nothing else a delivery
+        // says depends on either.
+        if let ItemContent::Delivery {
+            from,
+            sender,
+            summary,
+            ..
+        } = &item.content
+            && delivery_names_agent(from, sender, summary)
         {
             if let Some(agent) = self.subagent(sender) {
-                Self::hash_agent_state(agent, hasher);
+                self.hash_agent_state(agent, hasher);
             }
             std::sync::Arc::as_ptr(&self.agent_addresses).hash(hasher);
         }
@@ -6075,14 +6125,25 @@ impl Runtime {
             (Some((title, outcome)), ..) => (title, Some(Cow::Borrowed(outcome))),
             (None, Some((title, _)), Some(agent)) => (
                 title,
-                Some(lowercase_initial(Self::native_child_status(agent))),
+                Some(Cow::Owned(lowercase_initial(
+                    self.native_child_status(agent),
+                ))),
             ),
             (None, Some((title, outcome)), None) => (title, Some(Cow::Borrowed(outcome))),
             (None, None, _) => (first, None),
         };
-        // Its tooltip and accessible name say it in the same words.
-        let heading = match (agent, &outcome) {
-            (Some(_), Some(outcome)) => format!("{title} {outcome}{}", &heading[first.len()..]),
+        // Its tooltip and accessible name say it in the same words, and keep
+        // what the report said where the agent has since moved on.
+        let heading = match (agent, report, &outcome) {
+            (Some(_), Some((_, reported)), Some(now)) => {
+                let rest = &heading[first.len()..];
+                let reported = reported.strip_prefix("was ").unwrap_or(reported);
+                if reported == now {
+                    format!("{title} {now}{rest}")
+                } else {
+                    format!("{title} reported {reported} · now {now}{rest}")
+                }
+            }
             _ => heading.to_owned(),
         };
         DeliveryOutcome {

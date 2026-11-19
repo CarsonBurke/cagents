@@ -631,8 +631,16 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
 /// How many characters of a name that is not a listed agent's a row shows:
 /// few enough that, in the narrowest chat pane, the status after it keeps
 /// its place, and enough for "the conversation that started it". A listed
-/// agent goes by its tab's shorter words.
+/// agent's name is bounded by [`ROW_NAME_CHARS`] instead.
 const LABEL_CHARS: usize = 32;
+
+/// How much of a listed agent's name its row may show. The row fades it
+/// where it runs short; this bounds only the text shaped for it.
+const ROW_NAME_CHARS: usize = 80;
+
+/// How much of its status a row shows, a caption naming what an agent waits
+/// on included, so that the status leaves room for the agent's name.
+const STATUS_CHARS: usize = 32;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
 /// and the gap before it, as a step row keeps for its chevron, so statuses
 /// end in line with step durations.
@@ -1013,25 +1021,50 @@ enum Tone {
     Error,
 }
 
+/// A row's name and, after it, its preview: the name takes its room before
+/// the preview has any, and a preview that is one term, an agent's type, is
+/// left out whole rather than cut, so the name fades only once nothing
+/// follows it.
+fn row_name(name: String, preview: String, term: bool) -> Element<'static, Message> {
+    let title = crate::ui_controls::fade_text(name)
+        .size(design::TEXT_BODY)
+        .font(iced::Font {
+            weight: iced::font::Weight::Semibold,
+            ..cosmic::font::default()
+        });
+    let preview = crate::ui_controls::fade_text(preview)
+        .class(cosmic::theme::Text::Custom(design::muted_text))
+        .width(Length::Fill);
+    widget::row::with_children(vec![
+        title.into(),
+        if term { preview.whole() } else { preview }.into(),
+    ])
+    .spacing(step::GAP_S)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
 /// A tracked task's state is independent of the tool that launched it.
-enum BackgroundState {
+#[derive(Debug, PartialEq)]
+enum BackgroundState<'a> {
     Working,
     Waiting,
     /// Alive, with its result so far delivered: nothing is asked of anyone.
-    /// It names what it waits on where that is known.
-    OnBackgroundWork(Option<String>),
+    /// It holds its agent's caption where that names what it waits on.
+    OnBackgroundWork(Option<&'a str>),
     Failed,
     Stopped,
     Ended,
     Finished,
 }
 
-impl BackgroundState {
+impl BackgroundState<'_> {
     fn caption(self) -> Cow<'static, str> {
         Cow::Borrowed(match self {
             Self::Working => "Working",
             Self::Waiting => "Waiting",
-            Self::OnBackgroundWork(Some(work)) => return Cow::Owned(format!("Waiting on {work}")),
+            Self::OnBackgroundWork(Some(caption)) => return Cow::Owned(caption.to_owned()),
             Self::OnBackgroundWork(None) => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
@@ -1073,10 +1106,11 @@ impl Runtime {
             .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
-    /// How a row names a listed agent: in its tab's words, number and all.
+    /// How a row names a listed agent: as its tab does, number and all, but
+    /// with as much of its name as the row has room for, which comes before
+    /// the agent's type or the start of what was said.
     fn row_agent_name(&self, agent: &chat::Subagent) -> String {
-        self.child_label(agent, super::child_navigation::TAB_CHARS)
-            .into_owned()
+        self.child_label(agent, ROW_NAME_CHARS).into_owned()
     }
 
     /// The agents a step names that this conversation lists, each once.
@@ -1431,34 +1465,27 @@ impl Runtime {
             muted_glyph(row.glyph)
         };
         let (tip, name) = row.described();
-        let label = row.shown.clone();
-        // The preview fades out where the pane runs short, as a step row's
-        // summary does, on whatever the row is painted with; the agent keeps
-        // its tab's words, cut as the tab cuts them.
+        // The verb and the status take their room first. The name has what
+        // is left before the preview does: the preview fades out where the
+        // pane runs short, as a step row's summary does, and an agent's type
+        // is left out whole, so the name fades only once nothing follows it.
+        let named = row_name(row.shown.clone(), row.preview.clone(), row.term);
         let mut line: Vec<Element<'static, Message>> = vec![
             lead,
             design::body(row.verb)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            chat_title(label)
-                .size(design::TEXT_BODY)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            {
-                let preview = crate::ui_controls::fade_text(row.preview.clone())
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .width(Length::Fill);
-                if row.term { preview.whole() } else { preview }.into()
-            },
+            named.into(),
         ];
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
         if row.state.live && matches!(row.state.tone, Tone::Plain) {
             line.push(live_dot());
         }
-        let status =
-            design::body(row.state.text.clone()).wrapping(iced::widget::text::Wrapping::None);
+        // A caption naming what an agent waits on is held to a budget, and
+        // fades where it, or the pane, runs short rather than clipping.
+        let status = crate::ui_controls::fade_text(row.state.text.clone()).limit(STATUS_CHARS);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
@@ -1551,7 +1578,7 @@ impl Runtime {
 
     /// How the agents a step left running in the background are doing now,
     /// for as long as this conversation tracks them.
-    fn background_state(&self, coordinated: &Coordinated) -> Option<BackgroundState> {
+    fn background_state(&self, coordinated: &Coordinated) -> Option<BackgroundState<'_>> {
         let Kind::Spawn(spawn) = &coordinated.reading.kind else {
             return None;
         };
@@ -1575,7 +1602,7 @@ impl Runtime {
                 .iter()
                 .filter(|agent| agent.status == ToolStatus::Waiting);
             let work = match (waiting.next(), waiting.next()) {
-                (Some(agent), None) => Runtime::background_work(agent),
+                (Some(agent), None) => self.agent_work.get(&agent.id),
                 _ => None,
             };
             Some(BackgroundState::OnBackgroundWork(work))
@@ -1954,6 +1981,12 @@ mod identity_tests {
             background: true,
             items: vec![running_command("check", "scripts/restart-check\n--verbose").into()],
         }];
+        // As a publication is installed: what each agent waits on is named
+        // once, then only looked up.
+        let observe = |runtime: &mut Runtime| {
+            runtime.agent_work.observe(&runtime.snapshot.subagents);
+        };
+        observe(&mut runtime);
         let row =
             |runtime: &Runtime| runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
         let started = row(&runtime);
@@ -1963,26 +1996,76 @@ mod identity_tests {
         assert_eq!(started.state.text, "Waiting on scripts/restart-check");
         let agent = &runtime.snapshot.subagents[0];
         assert_eq!(
-            Runtime::native_child_status(agent),
+            runtime.native_child_status(agent),
             started.state.text,
             "the row and the agent's tab say the same"
         );
-        // A second command is counted, and work it never showed is unnamed.
-        let snapshot = std::sync::Arc::make_mut(&mut runtime.snapshot);
-        snapshot.subagents[0]
+        // Several commands are counted, and work it never showed is unnamed.
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
             .items
             .push(running_command("soak", "scripts/soak").into());
-        assert_eq!(
-            row(&runtime).state.text,
-            "Waiting on scripts/restart-check and 1 more"
-        );
+        observe(&mut runtime);
+        assert_eq!(row(&runtime).state.text, "Waiting on 2 commands");
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
             .items
             .clear();
+        observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Waiting on background work");
         // Settled, it names no work.
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].status = ToolStatus::Succeeded;
+        observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Finished");
+    }
+
+    /// A row for several agents names what one waits on only when it is the
+    /// one waiting; the work of several is theirs to say on their own tabs.
+    #[test]
+    fn a_row_for_several_agents_names_work_only_when_one_waits() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let agent = |id: &str, status: ToolStatus, command: &str| chat::Subagent {
+            id: id.into(),
+            kind: id.into(),
+            description: String::new(),
+            status,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: vec![running_command(&format!("{id}-check"), command).into()],
+        };
+        let delegate = |name: &str| crate::chat::coordination::Delegate {
+            name: name.into(),
+            kind: String::new(),
+            description: String::new(),
+            prompt: Text::Inline(String::new()),
+        };
+        let reading = Coordinated::new(Coordination {
+            kind: Kind::Spawn(Spawn {
+                agents: vec![delegate("docs"), delegate("tests")],
+                ..Default::default()
+            }),
+            outcome: Default::default(),
+            subagents: vec!["docs".into(), "tests".into()],
+            cli: false,
+        });
+        let mut state = |docs: ToolStatus, tests: ToolStatus| {
+            std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
+                agent("docs", docs, "scripts/build-docs"),
+                agent("tests", tests, "scripts/test"),
+            ];
+            runtime.agent_work.observe(&runtime.snapshot.subagents);
+            runtime
+                .background_state(&reading)
+                .map(|state| state.caption().into_owned())
+        };
+        assert_eq!(
+            state(ToolStatus::Waiting, ToolStatus::Succeeded).as_deref(),
+            Some("Waiting on scripts/build-docs")
+        );
+        assert_eq!(
+            state(ToolStatus::Waiting, ToolStatus::Waiting).as_deref(),
+            Some("Waiting on background work")
+        );
     }
 
     fn claude_step(name: &str, input: serde_json::Value, output: &str) -> Coordinated {
@@ -2103,6 +2186,52 @@ mod identity_tests {
                 "the row is one control named with its agent whole: {named:?}"
             );
         }
+    }
+
+    /// Where a row runs short, its agent's name keeps its room and its type
+    /// goes first; the name fades only once the type is gone.
+    #[test]
+    fn a_rows_name_has_room_before_its_agents_type() {
+        use iced::advanced::{layout, widget::Tree};
+
+        let renderer = crate::app::tests::headless_renderer();
+        let laid = |width: f32| {
+            let mut element = row_name(
+                "Confirm every supported platform".into(),
+                "general-purpose".into(),
+                true,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 100.0)),
+            );
+            node.children()
+                .iter()
+                .map(|child| child.size().width)
+                .collect::<Vec<_>>()
+        };
+        // With room to spare, the name is laid out at its own width.
+        let name = laid(2000.0)[0];
+        assert!(name > 0.0 && name < 1000.0, "{name}");
+        // Room for the name but not its type: the name is laid out whole.
+        let short = name + 20.0;
+        let widths = laid(short);
+        assert_eq!(widths[0], name, "the name keeps its room: {widths:?}");
+        assert!(
+            widths[1] <= 20.0,
+            "the type has only what is left: {widths:?}"
+        );
+        // Less than the name: the name has all of it but the gap the row
+        // keeps between its parts, and nothing follows.
+        let widths = laid(name / 2.0);
+        assert_eq!(
+            widths[0],
+            name / 2.0 - step::GAP_S,
+            "the name fades at the edge: {widths:?}"
+        );
+        assert!(widths[1] <= 0.0, "the type is gone: {widths:?}");
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the
@@ -2369,8 +2498,8 @@ mod identity_tests {
         assert!(several.described().0.contains(OPENS_DETAIL_OF_SEVERAL));
     }
 
-    /// A row names an agent in its tab's words, so two whose tasks a tab
-    /// cuts to one text keep the number that tells them apart; a session it
+    /// A row names an agent as its tab does, so two whose tasks a tab cuts
+    /// to one text keep the number that tells them apart; a session it
     /// messaged keeps the ID that tells it apart, however long its title.
     #[test]
     fn a_rows_name_keeps_what_tells_its_agent_apart() {
@@ -2392,7 +2521,9 @@ mod identity_tests {
         let second = &runtime.snapshot.subagents[1];
         let tab = runtime.child_label(second, super::super::child_navigation::TAB_CHARS);
         assert!(tab.ends_with(" 2"), "{tab}");
-        assert_eq!(runtime.row_agent_name(second), tab);
+        // The row has room for more of the name than the tab, and keeps the
+        // number.
+        assert_eq!(runtime.row_agent_name(second), format!("{task} 2"));
 
         let titled = Recipient {
             name: "A session whose title runs on well past a row".into(),

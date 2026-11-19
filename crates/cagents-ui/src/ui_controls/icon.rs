@@ -92,6 +92,7 @@ icons! {
         DraftPullRequest => "draft-pull-request",
         Duplicate => "duplicate",
         Edit => "edit",
+        Ended => "ended",
         ExpandAll => "expand-all",
         ExpandDown => "expand-down",
         ExpandUp => "expand-up",

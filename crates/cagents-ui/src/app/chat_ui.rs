@@ -3071,6 +3071,8 @@ pub(super) struct Runtime {
     /// the next frame keeps that tab mounted wherever its state sorts it.
     child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     child_ordinals: child_navigation::Ordinals,
+    /// What each waiting agent waits on, named once per publication.
+    agent_work: view::AgentWork,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -4210,6 +4212,7 @@ impl Runtime {
             child_picker: None,
             child_tab_focus: Default::default(),
             child_ordinals: Default::default(),
+            agent_work: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -5540,6 +5543,7 @@ impl Runtime {
         // Hidden publications number new children too, so a child keeps the
         // number it first appeared with for as long as it stays listed.
         self.child_ordinals.observe(&snapshot.subagents);
+        self.agent_work.observe(&snapshot.subagents);
         if !self.presents() {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
@@ -14327,7 +14331,11 @@ impl Cagents {
                     && let Some(picker) = runtime.child_picker.as_mut()
                 {
                     let last = picker
-                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
+                        .rows(
+                            &runtime.snapshot.subagents,
+                            &runtime.child_ordinals,
+                            &runtime.agent_work,
+                        )
                         .len()
                         .saturating_sub(1)
                         / 24;
