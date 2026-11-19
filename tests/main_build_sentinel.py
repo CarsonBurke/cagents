@@ -129,7 +129,7 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.assertEqual([(entry[0], entry[1]) for entry in records],
                          [(sha, lane) for sha in (self.first, second, third) for lane in sentinel.LANES])
         for entry in records:
-            self.assertEqual(entry[2][:4], ['check', '--locked', '--no-default-features', '--all-targets'])
+            self.assertEqual(entry[2][:4], ['clippy', '--locked', '--no-default-features', '--all-targets'])
             self.assertEqual(entry[2][-1], '--message-format=json')
             self.assertEqual(entry[3], 'fw16')
 

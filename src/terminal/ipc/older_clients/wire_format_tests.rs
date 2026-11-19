@@ -328,12 +328,10 @@ impl Comparison<'_> {
                         _ => self.differ(&path, "variant was not traced".into()),
                     }
                 }
-                let appended = new.iter().skip(old.len()).any(|(name, _)| {
-                    !self
-                        .restated
-                        .iter()
-                        .any(|restated| *restated == (current, name.as_str()))
-                });
+                let appended = new
+                    .iter()
+                    .skip(old.len())
+                    .any(|(name, _)| !self.restated.contains(&(current, name.as_str())));
                 if appended && direction == Direction::Reply && gate.is_none() && selected.is_none()
                 {
                     self.differ(

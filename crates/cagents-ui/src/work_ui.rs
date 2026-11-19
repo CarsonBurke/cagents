@@ -1888,7 +1888,7 @@ mod tests {
                     );
                     let clock = Instant::now();
                     let _ = ui.update(
-                        &[wheel.clone()],
+                        std::slice::from_ref(&wheel),
                         cursor,
                         &mut renderer,
                         &mut iced::advanced::clipboard::Null,

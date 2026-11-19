@@ -2099,7 +2099,8 @@ pub(crate) mod tests {
         let account = Account::linked(Provider::Codex, key, directory);
         let host = host();
         let reservation =
-            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
+            Reservation::test_install(&host, std::slice::from_ref(&account), store.clone(), &homes)
+                .unwrap();
         store
             .update(|registry| registry.set_label(&account, Some("external edit".into())))
             .unwrap();
@@ -2447,17 +2448,22 @@ pub(crate) mod tests {
             drop(brief);
         });
         let reservation =
-            Reservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
+            Reservation::test_install(&host, std::slice::from_ref(&account), store.clone(), &homes)
+                .unwrap();
         releaser.join().unwrap();
         drop(reservation);
 
         // One that outlasts the wait refuses the reservation, as retryable.
         let stuck = probes.admit(probe(&home));
-        let error =
-            match Reservation::test_install(&host, &[account.clone()], store.clone(), &homes) {
-                Ok(_) => panic!("a listing reading the home must refuse its reservation"),
-                Err(error) => error,
-            };
+        let error = match Reservation::test_install(
+            &host,
+            std::slice::from_ref(&account),
+            store.clone(),
+            &homes,
+        ) {
+            Ok(_) => panic!("a listing reading the home must refuse its reservation"),
+            Err(error) => error,
+        };
         assert!(error.retryable, "{}", error.message);
         assert!(
             error.message.contains("still checking"),

@@ -162,6 +162,14 @@ fn style() -> cosmic::theme::TextInput {
     }
 }
 
+/// A named multiline form field with the native editor's ordinary behavior.
+pub fn editor<'a, Message: Clone + 'static>(
+    name: impl Into<Cow<'a, str>>,
+    content: &'a cosmic::iced::widget::text_editor::Content<cosmic::Renderer>,
+) -> TextEditor<'a, Message> {
+    TextEditor::new(name, content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,12 +195,4 @@ mod tests {
             assert_eq!(node.size().height, design::DENSE_ROW_HEIGHT, "{query:?}");
         }
     }
-}
-
-/// A named multiline form field with the native editor's ordinary behavior.
-pub fn editor<'a, Message: Clone + 'static>(
-    name: impl Into<Cow<'a, str>>,
-    content: &'a cosmic::iced::widget::text_editor::Content<cosmic::Renderer>,
-) -> TextEditor<'a, Message> {
-    TextEditor::new(name, content)
 }

@@ -666,12 +666,12 @@ impl View {
                 }
             }
             Change::Move { id, before } => {
-                if before != &Some(*id) {
-                    if let Some(index) = self.panes.iter().position(|pane| pane.id == *id) {
-                        let pane = self.panes.remove(index);
-                        let index = self.position(*before);
-                        self.panes.insert(index, pane);
-                    }
+                if before != &Some(*id)
+                    && let Some(index) = self.panes.iter().position(|pane| pane.id == *id)
+                {
+                    let pane = self.panes.remove(index);
+                    let index = self.position(*before);
+                    self.panes.insert(index, pane);
                 }
             }
         }

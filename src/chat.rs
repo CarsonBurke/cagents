@@ -905,11 +905,11 @@ pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> 
         || source.launch.recipe != replacement.launch.recipe
         || !source.has_valid_native_continuity()
         || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
-        || !source
+        || source
             .proof
             .as_ref()
             .zip(replacement.proof.as_ref())
-            .is_some_and(|(old, new)| old.boot_id == new.boot_id)
+            .is_none_or(|(old, new)| old.boot_id != new.boot_id)
         || source.terminal.as_ref().is_some_and(|terminal| {
             terminal.continuity.live_proof().as_ref() != source.proof.as_ref()
         })

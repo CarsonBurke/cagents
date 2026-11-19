@@ -41,7 +41,9 @@ const BACKGROUND_SLOWDOWN: u32 =
 
 // A whole multiple keeps each background step exactly one focused step.
 const _: () = assert!(
-    SPINNER_BACKGROUND_FRAME.as_millis() % SPINNER_FRAME.as_millis() == 0
+    SPINNER_BACKGROUND_FRAME
+        .as_millis()
+        .is_multiple_of(SPINNER_FRAME.as_millis())
         && BACKGROUND_SLOWDOWN > 1
 );
 

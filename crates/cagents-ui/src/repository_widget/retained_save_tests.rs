@@ -1004,9 +1004,10 @@ async fn resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline
         .update(crate::operation_recovery::Action::Retry(authority.clone()));
     let mut stream = iced::runtime::task::into_stream(retry).expect("actual Retry worker");
     let finished = loop {
-        match stream.next().await.expect("actual Finished output") {
-            iced::runtime::Action::Output(action) => break action,
-            _ => {}
+        if let iced::runtime::Action::Output(action) =
+            stream.next().await.expect("actual Finished output")
+        {
+            break action;
         }
     };
     assert!(matches!(

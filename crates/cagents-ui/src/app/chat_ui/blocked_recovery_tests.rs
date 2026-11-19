@@ -397,7 +397,7 @@ fn blocked_runtime_primary_hides_temporal_and_internal_reasons() {
         runtime.error = Some(raw.into());
         runtime.refresh_failure_ui();
         let incident = runtime.failure_ui.incidents.last().unwrap();
-        let (tree, _) = frame(runtime.failure_view(&incident), 900.0, None);
+        let (tree, _) = frame(runtime.failure_view(incident), 900.0, None);
         assert!(labels(&tree).contains(&blocked_recovery::HEADLINE));
         assert!(!labels(&tree).contains(&raw));
         assert!(!runtime.stopped(false, false).guidance.contains("actor"));
@@ -615,7 +615,7 @@ fn typed_remediable_first_message_keeps_send_enabled() {
                 recovery,
             }),
         );
-        assert!(!chat_runtime(&app, card).start_blocked.is_some());
+        assert!(chat_runtime(&app, card).start_blocked.is_none());
         let (tree, _) = frame(app.card_view(card, true, false), 900.0, None);
         assert!(tree.root().iter().chain(tree.children()).any(|node| {
             node.node().role() == Role::Button
@@ -1231,7 +1231,7 @@ fn a_pending_paste_disables_fresh_in_place() {
     ));
     drop(app.handle_chat_ui(Action::StartFresh(card)));
     assert!(
-        app.chat_ui.phases.get(&card).is_none(),
+        !app.chat_ui.phases.contains_key(&card),
         "nothing closes mid-paste"
     );
 }

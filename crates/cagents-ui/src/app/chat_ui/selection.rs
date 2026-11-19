@@ -108,7 +108,7 @@ impl Unit {
                 .map(|(start, word)| start..start + word.len())
                 .or_else(|| {
                     (byte == text.len())
-                        .then(|| text.split_word_bound_indices().last())
+                        .then(|| text.split_word_bound_indices().next_back())
                         .flatten()
                         .map(|(start, word)| start..start + word.len())
                 })
@@ -769,8 +769,8 @@ impl Operation for Read {
                     },
                 );
             }
-            if let Kind::Cell { row, column } = &enter.kind {
-                if let Some(table) = self
+            if let Kind::Cell { row, column } = &enter.kind
+                && let Some(table) = self
                     .frames
                     .iter()
                     .rev()
@@ -778,9 +778,8 @@ impl Operation for Read {
                         matches!(frame.kind, Kind::Table { .. }).then_some(frame.identity)
                     })
                     .and_then(|identity| self.tables.get_mut(&identity))
-                {
-                    table.cells.insert((*row, *column), self.blocks.len());
-                }
+            {
+                table.cells.insert((*row, *column), self.blocks.len());
             }
             self.frames.push(Frame {
                 identity: enter.identity,
@@ -790,10 +789,10 @@ impl Operation for Read {
             return;
         }
         if state.is::<boundary::Exit>() {
-            if let Some(frame) = self.frames.pop() {
-                if let Some(table) = self.tables.get_mut(&frame.identity) {
-                    table.last_block = self.blocks.len();
-                }
+            if let Some(frame) = self.frames.pop()
+                && let Some(table) = self.tables.get_mut(&frame.identity)
+            {
+                table.last_block = self.blocks.len();
             }
             return;
         }
@@ -1252,32 +1251,31 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         if let Event::Window(iced::window::Event::RedrawRequested(now)) = event
             && state.dragging
             && state.next_scroll.is_none_or(|next| *now >= next)
+            && let Some(pointer) = state.pointer
         {
-            if let Some(pointer) = state.pointer {
-                let elapsed = state.next_scroll.map_or(0.016, |next| {
-                    now.saturating_duration_since(next - std::time::Duration::from_millis(16))
-                        .as_secs_f32()
-                        .min(0.05)
-                });
-                let delta = edge_delta(pointer, visible) * (elapsed / 0.016);
-                if delta != 0.0 {
-                    let mut scroll = DragScroll {
-                        delta,
-                        visited: false,
-                        changed: false,
-                        bottom_id: self
-                            .context
-                            .map(|(target, _)| card_control_id(target.card, "chat-transcript")),
-                    };
-                    self.content.as_widget_mut().operate(
-                        &mut tree.children[0],
-                        layout,
-                        renderer,
-                        &mut scroll,
-                    );
-                    autoscrolled = scroll.changed;
-                    state.next_scroll = Some(*now + std::time::Duration::from_millis(16));
-                }
+            let elapsed = state.next_scroll.map_or(0.016, |next| {
+                now.saturating_duration_since(next - std::time::Duration::from_millis(16))
+                    .as_secs_f32()
+                    .min(0.05)
+            });
+            let delta = edge_delta(pointer, visible) * (elapsed / 0.016);
+            if delta != 0.0 {
+                let mut scroll = DragScroll {
+                    delta,
+                    visited: false,
+                    changed: false,
+                    bottom_id: self
+                        .context
+                        .map(|(target, _)| card_control_id(target.card, "chat-transcript")),
+                };
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut scroll,
+                );
+                autoscrolled = scroll.changed;
+                state.next_scroll = Some(*now + std::time::Duration::from_millis(16));
             }
         }
         if press || (state.dragging && (motion || release)) || command.is_some() {
@@ -1419,14 +1417,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 state.dragging = false;
                 state.link = None;
             }
-            if command.is_some_and(|key| key.eq_ignore_ascii_case("c")) {
-                if let Some(ranges) = &ranges {
-                    let text = read.copy(ranges);
-                    if !text.is_empty() {
-                        super::text_copy::invalidate();
-                        clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
-                        captured = true;
-                    }
+            if command.is_some_and(|key| key.eq_ignore_ascii_case("c"))
+                && let Some(ranges) = &ranges
+            {
+                let text = read.copy(ranges);
+                if !text.is_empty() {
+                    super::text_copy::invalidate();
+                    clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
+                    captured = true;
                 }
             }
             let mut apply = Apply {
@@ -1588,10 +1586,7 @@ mod tests {
     #[test]
     fn terminal_caret_enclosure_allows_one_float_step_and_refuses_clipped_or_invalid_rows() {
         let clip = Rectangle::new(Point::ORIGIN, Size::new(600.0, 10920.0));
-        let actual = Rectangle::new(
-            Point::new(0.0, 10901.80078125),
-            Size::new(0.0, 18.19999885559082),
-        );
+        let actual = Rectangle::new(Point::new(0.0, 10_901.801), Size::new(0.0, 18.199_999));
         assert_eq!(
             (actual.y + actual.height).to_bits(),
             clip.height.to_bits() + 1
@@ -3164,7 +3159,7 @@ mod tests {
         let mut element = Element::new(Selection {
             catalog: None,
             bookmark: None,
-            content: content.into(),
+            content,
             context: None,
             click_clock: next_click_time,
         });
@@ -3274,7 +3269,6 @@ mod tests {
             "Shift-click keeps the original selection anchor"
         );
         assert!(state.end.unwrap().byte > 0 && state.end.unwrap().byte < "one two three".len());
-        drop(send);
         assert!(
             messages.is_empty(),
             "a moved drag returning to the link never activates it"

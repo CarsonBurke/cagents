@@ -5141,19 +5141,19 @@ fn start_terminal_view_owned_reserved(
     let redraw_handle = handle.clone();
     {
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        if !adopting {
-            if let Err(error) = state.install_startup_parent(
+        if !adopting
+            && let Err(error) = state.install_startup_parent(
                 client_id,
                 registered_session,
                 handle.clone(),
                 false,
                 execution_recipe.clone(),
                 retained_environment,
-            ) {
-                drop(state);
-                let _ = handle.shutdown();
-                return Err(error);
-            }
+            )
+        {
+            drop(state);
+            let _ = handle.shutdown();
+            return Err(error);
         }
         let record = state
             .terminals

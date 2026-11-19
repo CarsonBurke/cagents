@@ -510,20 +510,20 @@ impl Service {
             }
         }
         // As with retain, the worker cannot see a rearm that failed its wake.
-        if !rearmed.is_empty() {
-            if let Err(error) = self.wake() {
-                for slot in rearmed {
-                    state.entries[slot]
-                        .as_mut()
-                        .expect("retained under the state lock")
-                        .suspended = true;
-                }
-                state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
-                self.progress(&mut state);
-                drop(state);
-                crate::daemon::wake();
-                return Err(error);
+        if !rearmed.is_empty()
+            && let Err(error) = self.wake()
+        {
+            for slot in rearmed {
+                state.entries[slot]
+                    .as_mut()
+                    .expect("retained under the state lock")
+                    .suspended = true;
             }
+            state.failure = Some(format!("Exact-child recovery wake failed: {error}"));
+            self.progress(&mut state);
+            drop(state);
+            crate::daemon::wake();
+            return Err(error);
         }
         let retained = state
             .entries
@@ -663,11 +663,11 @@ impl Service {
                 self.fail(error);
                 return;
             }
-            if poll[0].revents != 0 {
-                if let Err(error) = self.drain_wake() {
-                    self.fail(error);
-                    return;
-                }
+            if poll[0].revents != 0
+                && let Err(error) = self.drain_wake()
+            {
+                self.fail(error);
+                return;
             }
             for ((slot, ticket, _), ready) in snapshot.iter().zip(&poll[1..]) {
                 if ready.revents == 0 {

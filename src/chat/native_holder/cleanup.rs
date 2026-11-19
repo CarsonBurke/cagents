@@ -101,7 +101,7 @@ fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
         serde_json::to_writer(&mut file, &receipt).map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())?;
         file.sync_all().map_err(|error| error.to_string())?;
-        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+        fs::rename(&temporary, path).map_err(|error| error.to_string())?;
         fs::File::open(parent)
             .and_then(|file| file.sync_all())
             .map_err(|error| error.to_string())

@@ -4582,7 +4582,7 @@ mod tests {
         }))
         .unwrap();
         assert!(
-            select_branch_pull_request(&[pr.clone()], &own, "master", Some("abc"))
+            select_branch_pull_request(std::slice::from_ref(&pr), &own, "master", Some("abc"))
                 .unwrap()
                 .is_none()
         );

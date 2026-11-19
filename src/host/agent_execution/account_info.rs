@@ -470,7 +470,11 @@ mod tests {
             None
         );
         assert_eq!(
-            select(&[system.clone()], Provider::Codex, &Default::default()),
+            select(
+                std::slice::from_ref(&system),
+                Provider::Codex,
+                &Default::default()
+            ),
             None
         );
         assert_eq!(select(&[], Provider::Codex, &environment), None);
@@ -554,7 +558,11 @@ mod tests {
         )]
         .into();
         assert_eq!(
-            select(&[linked.clone()], Provider::Claude, &environment),
+            select(
+                std::slice::from_ref(&linked),
+                Provider::Claude,
+                &environment
+            ),
             Some(linked.clone())
         );
         let duplicate = Account::linked(Provider::Claude, uuid::Uuid::new_v4(), alias);
@@ -593,9 +601,13 @@ mod tests {
             .unwrap();
         let account = Account::linked(Provider::Codex, key, selected);
         let host = crate::host::AccountReservation::test_host();
-        let reservation =
-            crate::host::AccountReservation::test_install(&host, &[account.clone()], store, &homes)
-                .unwrap();
+        let reservation = crate::host::AccountReservation::test_install(
+            &host,
+            std::slice::from_ref(&account),
+            store,
+            &homes,
+        )
+        .unwrap();
         let invoked = Cell::new(0);
         let aliased = Account::linked(Provider::Codex, key, alias);
         let refused =

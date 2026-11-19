@@ -13,7 +13,6 @@ pub(crate) fn surface<'a, M: 'a>(
             .width(Length::Fill)
             .max_width(max_width),
     )
-    .into()
 }
 
 /// A dialog's scrolled content, held off the scrollbar's rail by `padding`.
@@ -98,7 +97,6 @@ pub(crate) fn scrolling_surface<'a, M: 'a>(
         .max_width(max_width)
         .max_height(max_height),
     )
-    .into()
 }
 
 /// A [`scrolling_surface`] whose closing `actions` stay below the body,
@@ -701,7 +699,7 @@ pub(super) fn overlay<'a>(
     if let Some(message) = dismiss {
         backdrop = backdrop.on_press(message);
     }
-    let backdrop = crate::interaction::opaque(backdrop).into();
+    let backdrop = crate::interaction::opaque(backdrop);
     let centered = widget::container(crate::interaction::fade(
         crate::interaction::opaque(surface),
         progress,
@@ -729,7 +727,7 @@ pub(super) mod tests {
     }
     pub(in crate::app) fn key_press(key: keyboard::key::Named) -> keyboard::Event {
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key.clone()),
+            key: keyboard::Key::Named(key),
             modified_key: keyboard::Key::Named(key),
             physical_key: keyboard::key::Physical::Unidentified(
                 keyboard::key::NativeCode::Unidentified,
@@ -1226,7 +1224,7 @@ pub(super) mod tests {
     /// asks about is.
     #[test]
     fn a_confirmation_keeps_its_answers_in_reach_whatever_it_says() {
-        let [dismiss, confirm] = ["dismiss", "confirm"].map(|role| widget::Id::new(role));
+        let [dismiss, confirm] = ["dismiss", "confirm"].map(widget::Id::new);
         assert_actions_stay_in_reach(
             || {
                 overlay(

@@ -89,8 +89,8 @@ pub(super) struct Turn {
     /// the transcript does.
     ///
     /// The key is the id of the item that started the group, taken when the
-    /// group is created and never revised. A group has no identity of its own
-    /// - it is derived from item order on every snapshot - and the reader's
+    /// group is created and never revised. A group has no identity of its own -
+    /// it is derived from item order on every snapshot - and the reader's
     /// choice to open its steps survives ordinary appended items and status
     /// updates. A tool after narration opens its own group, keyed by that tool,
     /// so adding more prose never moves an existing tool strip's identity.

@@ -42,7 +42,7 @@ pub fn navigation_url_with_search(input: &str, search_url: &str) -> Result<Url, 
         .append_pair("q", input)
         .finish();
     let encoded = &encoded[2..];
-    Url::parse(&search_url.replace("{query}", &encoded))
+    Url::parse(&search_url.replace("{query}", encoded))
 }
 
 /// A browser location that is safe to present outside navigation and restore

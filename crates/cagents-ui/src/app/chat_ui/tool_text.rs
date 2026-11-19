@@ -619,7 +619,7 @@ impl ToolText {
         // Find reveals the matching source in the outer transcript. A nested
         // viewport would otherwise keep a deep match hidden at its old offset.
         let limit = limit.filter(|_| {
-            !find.is_some()
+            find.is_none()
                 || !find_navigation::tool_uncapped(target, self.reader_identity, &self.text)
         });
         let Some((height, follows)) = limit else {
@@ -894,7 +894,7 @@ mod tests {
                     None,
                 ))
             };
-            let mut tree = Tree::new(&make());
+            let mut tree = Tree::new(make());
             let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 20000.0));
             let (mut element, mut node) = laid_out(&block, &make, &mut tree, &renderer, &limits);
             for _ in 0..3 {

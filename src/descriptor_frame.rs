@@ -217,7 +217,7 @@ fn take_rights(bytes: &[u8], descriptors: &mut Vec<OwnedFd>) -> Result<(), Strin
                 .cast::<libc::cmsghdr>()
                 .read_unaligned()
         };
-        let length = header.cmsg_len as usize;
+        let length = header.cmsg_len;
         if length < base_length || length > bytes.len() - offset {
             return Err("malformed descriptor frame ancillary header".into());
         }
@@ -225,7 +225,7 @@ fn take_rights(bytes: &[u8], descriptors: &mut Vec<OwnedFd>) -> Result<(), Strin
         let rights = header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS;
         let pidfd = header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == SCM_PIDFD;
         if rights || pidfd {
-            invalid |= payload.len() % size_of::<RawFd>() != 0 || pidfd;
+            invalid |= !payload.len().is_multiple_of(size_of::<RawFd>()) || pidfd;
             for chunk in payload.chunks_exact(size_of::<RawFd>()) {
                 let descriptor = unsafe { chunk.as_ptr().cast::<RawFd>().read_unaligned() };
                 if descriptor < 0 {

@@ -760,7 +760,7 @@ impl LocalHandle {
                     });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
-                        String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
+                        String::from_utf8_lossy(actor.stderr.make_contiguous()).into_owned();
                     let message = if stderr.is_empty() {
                         error
                     } else {
@@ -2861,35 +2861,35 @@ impl Actor {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
             self.report_command_stops();
-            if fds[3].revents != 0 {
-                if let Some(line) = self.pending.front() {
-                    match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
-                        Ok(n) => {
-                            // Input can start a command before any output,
-                            // such as a hook run on a submitted prompt.
-                            self.poke_scope();
-                            self.offset += n;
-                            self.queued -= n;
-                            if self.offset == line.len() {
-                                self.pending.pop_front();
-                                self.offset = 0;
-                                self.write_started = if self.pending.is_empty() {
-                                    None
-                                } else {
-                                    Some(Instant::now())
-                                };
-                            }
+            if fds[3].revents != 0
+                && let Some(line) = self.pending.front()
+            {
+                match stdin.write(&line[self.offset..]) {
+                    Ok(0) => return Err("Provider closed stdin".into()),
+                    Ok(n) => {
+                        // Input can start a command before any output,
+                        // such as a hook run on a submitted prompt.
+                        self.poke_scope();
+                        self.offset += n;
+                        self.queued -= n;
+                        if self.offset == line.len() {
+                            self.pending.pop_front();
+                            self.offset = 0;
+                            self.write_started = if self.pending.is_empty() {
+                                None
+                            } else {
+                                Some(Instant::now())
+                            };
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        // The provider closed its input, ordinarily by exiting.
-                        // Drain its output to EOF so its exit status, and any
-                        // final frames, explain the failure instead of EPIPE.
-                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                            stdin_closed = Some(format!("Provider stdin: {e}"));
-                        }
-                        Err(e) => return Err(format!("Provider stdin: {e}")),
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    // The provider closed its input, ordinarily by exiting.
+                    // Drain its output to EOF so its exit status, and any
+                    // final frames, explain the failure instead of EPIPE.
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        stdin_closed = Some(format!("Provider stdin: {e}"));
+                    }
+                    Err(e) => return Err(format!("Provider stdin: {e}")),
                 }
             }
             if fds[1].revents != 0 {
@@ -3338,13 +3338,11 @@ impl Actor {
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
         let suppress_current_notification = step.suppress_current_notification;
-        if !suppress_current_notification {
-            if let Some(preview) = &step.notification_preview {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .notification_preview = Arc::new(preview.clone());
-            }
+        if !suppress_current_notification && let Some(preview) = &step.notification_preview {
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notification_preview = Arc::new(preview.clone());
         }
         // A new Codex thread is created asynchronously after initialize; check
         // its RPC boundary too. Interrupts, denials and cleanup remain usable

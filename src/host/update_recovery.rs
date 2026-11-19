@@ -565,7 +565,7 @@ mod tests {
             kind: crate::model::CardKind::Chat(alias.clone()),
             scope: Some(directory.to_owned()),
         };
-        let mut registry = super::super::model::Registry::at(&registry_path).unwrap();
+        let mut registry = super::super::model::Registry::at(registry_path).unwrap();
         registry
             .apply(&crate::workspace_model::ModelEdit::OpenProject {
                 repository: directory.to_owned(),
@@ -584,7 +584,7 @@ mod tests {
                 title_source: Default::default(),
             })
             .unwrap();
-        let db = rusqlite::Connection::open(&registry_path).unwrap();
+        let db = rusqlite::Connection::open(registry_path).unwrap();
         db.execute(
             "INSERT INTO agents(id,origin,record,session_id,closed) VALUES(?1,'user',?2,?3,0)",
             rusqlite::params![

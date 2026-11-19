@@ -3960,10 +3960,10 @@ impl Cagents {
                 widget::text_input::focus(table::link_id())
             }
             Action::LinkInput(path) => {
-                if !self.account_ui.table.linking {
-                    if let Some((_, draft)) = &mut self.account_ui.table.link {
-                        *draft = path;
-                    }
+                if !self.account_ui.table.linking
+                    && let Some((_, draft)) = &mut self.account_ui.table.link
+                {
+                    *draft = path;
                 }
                 Task::none()
             }
@@ -5767,10 +5767,10 @@ impl Cagents {
         + 'static,
     ) -> Task<Message> {
         self.account_ui.table.close_popups();
-        if !self
+        if self
             .account_ui
             .account(&id)
-            .is_some_and(|state| state.account.registry_key().is_some())
+            .is_none_or(|state| state.account.registry_key().is_none())
             || !self.account_ui.removing.insert(id.clone())
         {
             return Task::none();
@@ -6069,8 +6069,7 @@ impl Cagents {
             .filter(|recipe| {
                 recipe
                     .environment
-                    .get(account::home_variable(provider).unwrap_or_default())
-                    .is_some()
+                    .contains_key(account::home_variable(provider).unwrap_or_default())
                     && self
                         .running_account(provider, recipe)
                         .is_some_and(|account| &account.id == id)
@@ -6596,7 +6595,6 @@ impl Cagents {
                 }),
             format!("Show {label} in the status bar"),
         )
-        .into()
     }
 
     fn account_header<'a>(

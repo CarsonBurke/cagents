@@ -3737,7 +3737,7 @@ fn recover_account(
         source.launch.session_id.as_deref().unwrap(),
         false,
         Instant::now() + Duration::from_secs(15),
-        || crate::daemon::termination_requested(),
+        crate::daemon::termination_requested,
     );
     let response = confirmation.map_err(unavailable).and_then(|()| {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3831,9 +3831,9 @@ pub(super) fn read_presentation(
         }
         return Ok(ServerResponse::ChatSnapshot {
             chat_id,
-            snapshot: (!after_generation
-                .is_some_and(|generation| generation >= receipt.generation))
-            .then(|| receipt.snapshot()),
+            snapshot: after_generation
+                .is_none_or(|generation| generation < receipt.generation)
+                .then(|| receipt.snapshot()),
         }
         .into());
     }

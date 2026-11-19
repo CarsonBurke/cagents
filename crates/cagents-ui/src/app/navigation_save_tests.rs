@@ -24,7 +24,7 @@ fn assert_saved_with_the_burst(app: &mut Cagents, saved: usize, what: &str) {
 fn toggling_the_projects_sidebar_saves_the_window_view_not_the_workspace() {
     let directory = tempfile::tempdir().unwrap();
     let (session, _) = SessionRuntime::open(
-        &directory.path().join("window.sqlite3"),
+        directory.path().join("window.sqlite3"),
         crate::model::BootId::new("projects-sidebar-toggle"),
     )
     .unwrap();

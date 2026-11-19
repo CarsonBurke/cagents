@@ -489,17 +489,19 @@ impl DirectoryCreation {
 #[must_use = "creation failures may retain live staging authority"]
 pub struct DirectoryCreateError {
     cause: ResolveError,
-    recovery: Option<DirectoryPreparation>,
+    /// Boxed: a failure is rare and the preparation is large, while every
+    /// `Result` that may carry this error pays for its size.
+    recovery: Option<Box<DirectoryPreparation>>,
 }
 impl DirectoryCreateError {
     pub fn cause(&self) -> &ResolveError {
         &self.cause
     }
     pub fn recovery(&self) -> Option<&DirectoryPreparation> {
-        self.recovery.as_ref()
+        self.recovery.as_deref()
     }
     pub fn take_recovery(&mut self) -> Option<DirectoryPreparation> {
-        self.recovery.take()
+        self.recovery.take().map(|recovery| *recovery)
     }
 }
 impl std::fmt::Display for DirectoryCreateError {
@@ -604,18 +606,17 @@ impl DirectoryPreparation {
         let outer = match resolve_directory(&self.namespace.directory, Path::new(&self.name)) {
             Ok(outer) => outer,
             Err(error) if error.is_not_found() => {
-                if let Some(held) = &self.outer {
-                    if held
+                if let Some(held) = &self.outer
+                    && held
                         .metadata()
                         .map_err(|e| ResolveError::io(&held.path, &e))?
                         .nlink()
                         != 0
-                    {
-                        return Err(ResolveError::message(
-                            &held.path,
-                            "retained staging is no longer at its internal name; authority preserved for resolution",
-                        ));
-                    }
+                {
+                    return Err(ResolveError::message(
+                        &held.path,
+                        "retained staging is no longer at its internal name; authority preserved for resolution",
+                    ));
                 }
                 self.created = false;
                 self.cleanup_error = None;
@@ -678,18 +679,17 @@ impl DirectoryPreparation {
                     remove_directory_within(outer, OsStr::new("directory"))?;
                 }
                 Err(error) if error.is_not_found() => {
-                    if let Some(held) = &self.payload {
-                        if held
+                    if let Some(held) = &self.payload
+                        && held
                             .metadata()
                             .map_err(|e| ResolveError::io(&held.path, &e))?
                             .nlink()
                             != 0
-                        {
-                            return Err(ResolveError::message(
-                                &held.path,
-                                "retained payload is no longer at its internal name; authority preserved for resolution",
-                            ));
-                        }
+                    {
+                        return Err(ResolveError::message(
+                            &held.path,
+                            "retained payload is no longer at its internal name; authority preserved for resolution",
+                        ));
                     }
                 }
                 Err(error) => return Err(error),
@@ -708,7 +708,7 @@ impl DirectoryPreparation {
                 self.cleanup_error = Some(error.to_string());
                 DirectoryCreateError {
                     cause,
-                    recovery: Some(self),
+                    recovery: Some(Box::new(self)),
                 }
             }
         }

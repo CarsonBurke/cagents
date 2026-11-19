@@ -290,13 +290,12 @@ pub(super) mod legacy {
         let plain = text.strip_suffix(&suffix)?;
         let mut ids = std::collections::HashSet::new();
         for (reference, source) in references.iter().zip(sources) {
-            if let Some(reference) = reference {
-                if !ids.insert(reference.id)
+            if let Some(reference) = reference
+                && (!ids.insert(reference.id)
                     || crate::chat::attachment_assets::restore_reference(reference, source)
-                        .is_none()
-                {
-                    return None;
-                }
+                        .is_none())
+            {
+                return None;
             }
         }
         Some((plain, references))
@@ -409,7 +408,7 @@ mod tests {
         assert_eq!(attachments[0].reference.as_ref().unwrap().number, 13);
         assert!(ordered("[Image 13]", &[first.clone(), first.clone()]).is_err());
         assert!(
-            ordered("missing reference", &[first.clone()])
+            ordered("missing reference", std::slice::from_ref(&first))
                 .unwrap_err()
                 .contains("inline reference is missing")
         );
@@ -424,7 +423,13 @@ mod tests {
             [&second],
             "a history label never adds a current attachment"
         );
-        assert!(ordered("[Image 13] then literal [Image 999]", &[first.clone()]).is_ok());
+        assert!(
+            ordered(
+                "[Image 13] then literal [Image 999]",
+                std::slice::from_ref(&first)
+            )
+            .is_ok()
+        );
         assert!(ordered("", &[first]).is_ok());
         assert!(ordered("literal [Image 999]", &[Attachment::file("/legacy.png")]).is_ok());
     }

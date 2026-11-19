@@ -443,7 +443,7 @@ mod tests {
         let mut target = super::super::CheckoutTarget::read_only(
             "/repo".into(),
             7,
-            Oid::parse(&"a".repeat(40)).unwrap(),
+            Oid::parse("a".repeat(40)).unwrap(),
         );
         target.pull_request = Some(PullRequestKey::new(repo.clone(), 7).unwrap());
         target.head_ref_name = "feature/x".into();
@@ -587,7 +587,7 @@ mod tests {
             let (target, head, mut git) = fixture();
             git.refs.push(LocalRefRecord {
                 name: ValidatedRefName::parse("refs/heads/feature/x").unwrap(),
-                oid: Oid::parse(&"b".repeat(40)).unwrap(),
+                oid: Oid::parse("b".repeat(40)).unwrap(),
                 upstream: upstream.map(|value| ValidatedRefName::parse(value).unwrap()),
                 head: false,
             });

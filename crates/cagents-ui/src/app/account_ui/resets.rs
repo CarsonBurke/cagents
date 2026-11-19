@@ -171,10 +171,10 @@ impl State {
     }
 
     fn finish(&mut self, key: &str, status: ConsumeStatus, message: String) -> bool {
-        if !self
+        if self
             .pending
             .as_ref()
-            .is_some_and(|attempt| attempt.key == key)
+            .is_none_or(|attempt| attempt.key != key)
         {
             return false;
         }
@@ -2356,10 +2356,12 @@ pub(in crate::app) mod tests {
             "weekly_scoped:Fable",
             0.0,
         )];
-        let mut state = State::default();
-        state.feedback = Some("Reset used. Usage refreshed.".into());
-        state.feedback_reset = Some(grant.clone());
-        state.feedback_status = Some(ConsumeStatus::Reset);
+        let mut state = State {
+            feedback: Some("Reset used. Usage refreshed.".into()),
+            feedback_reset: Some(grant.clone()),
+            feedback_status: Some(ConsumeStatus::Reset),
+            ..State::default()
+        };
         state.confirmed.insert(
             grant.id.clone(),
             ConfirmedReset {

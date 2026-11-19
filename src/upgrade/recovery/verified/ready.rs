@@ -510,7 +510,7 @@ mod tests {
                 &proof("successor"),
                 &target,
                 &[],
-                &[original.clone()],
+                std::slice::from_ref(&original),
                 &ledger
             )
             .is_err()
