@@ -89,10 +89,9 @@ fn private_listener() -> UnixListener {
     listener
 }
 
-fn accept_request(listener: &UnixListener) -> (UnixStream, ClientEnvelope, usize) {
+fn accept_request(listener: &UnixListener) -> (UnixStream, ClientEnvelope) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut probes = 0;
-    let (peer, request) = loop {
+    loop {
         let (mut peer, _) = loop {
             match listener.accept() {
                 Ok(accepted) => break accepted,
@@ -119,16 +118,13 @@ fn accept_request(listener: &UnixListener) -> (UnixStream, ClientEnvelope, usize
                 },
             },
         );
-        if let Some(request) = read_frame::<ClientEnvelope>(&mut peer).unwrap() {
-            break (peer, request);
-        }
-        // Baseline ensure_daemon_ready verifies the protocol on a
-        // separate Connect/EOF stream. Accept it so a before failure
-        // exposes discarded authority, rather than missing setup.
-        probes += 1;
-        assert!(probes <= 1, "no repeated readiness or User fallback");
-    };
-    (peer, request, probes)
+        // A connection that only handshakes would be a separate readiness
+        // probe; readiness hands its connection to the request instead.
+        let request = read_frame::<ClientEnvelope>(&mut peer)
+            .unwrap()
+            .expect("no separate readiness handshake or User fallback");
+        return (peer, request);
+    }
 }
 
 struct Peer {
@@ -138,13 +134,8 @@ struct Peer {
 impl Peer {
     fn new(proposal: Proposal, approved: Option<bool>, authority: Authority) -> Self {
         let listener = private_listener();
-        // Derive the oracle from the synthetic role, independently of the
-        // production environment parser. Ordinary User still probes readiness.
-        let expected_probes = usize::from(
-            authority.token().is_none() && std::env::var(ROLE).as_deref() != Ok("user-no-start"),
-        );
         let worker = thread::spawn(move || {
-            let (mut peer, request, probes) = accept_request(&listener);
+            let (mut peer, request) = accept_request(&listener);
             let expected = match approved {
                 None => Request::PendingProposals {
                     repository: proposal.definition.agent.target.repository.clone(),
@@ -212,10 +203,6 @@ impl Peer {
                 read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
                 "no request or User retry after the expected completion"
             );
-            assert_eq!(
-                probes, expected_probes,
-                "scoped or no-start effects must not run readiness or autostart"
-            );
             listener
         });
         Self {
@@ -228,7 +215,6 @@ impl Peer {
     fn cached_reads(
         proposal: Proposal,
         authority: Authority,
-        expected_probes: usize,
     ) -> (Self, std::sync::mpsc::Receiver<()>) {
         let listener = private_listener();
         let (closed, closure) = std::sync::mpsc::channel();
@@ -270,8 +256,7 @@ impl Peer {
                     );
                 }
             };
-            let (mut peer, first, probes) = accept_request(&listener);
-            assert_eq!(probes, expected_probes);
+            let (mut peer, first) = accept_request(&listener);
             read(&mut peer, first);
             // The next owed read must reach this stream, including after
             // the first detail read was refused. A reconnect cannot satisfy it.
@@ -279,8 +264,7 @@ impl Peer {
             read(&mut peer, second);
             drop(peer);
             closed.send(()).unwrap();
-            let (mut replacement, third, probes) = accept_request(&listener);
-            assert_eq!(probes, expected_probes);
+            let (mut replacement, third) = accept_request(&listener);
             read(&mut replacement, third);
             assert!(
                 read_frame::<ClientEnvelope>(&mut replacement)
@@ -350,19 +334,7 @@ fn exercise_app() {
     for approved in [None, Some(false), Some(true)] {
         let (mut app, proposal) = reviewing();
         let peer = Peer::new(proposal.clone(), approved, authority.clone());
-        let task = if let Some(approved) = approved {
-            app.update_automation_approval(Action::Decide {
-                id: proposal.id,
-                revision: proposal.revision,
-                generation: app.automation_approval.generation,
-                approved,
-            })
-        } else {
-            drop(app.cancel_automation_approval());
-            app.automation_approval.available = None;
-            assert!(app.automation_approval_read_owed());
-            app.read_owed_automation_requests()
-        };
+        let task = effect(&mut app, &proposal, approved);
         let completion = complete(&runtime, task);
         match &completion {
             Action::Read { result, .. } => {
@@ -417,6 +389,56 @@ fn exercise_app() {
         drop(app); // Release the retained approval reader before checking EOF.
         peer.finished();
     }
+    // Derive the oracle from the synthetic role, independently of the
+    // production environment parser: only an ordinary User's effects prove
+    // the daemon ready, starting it when it is gone.
+    let readiness = !scoped && std::env::var(ROLE).as_deref() != Ok("user-no-start");
+    for approved in [None, Some(false), Some(true)] {
+        let error = absent_daemon_error(&runtime, approved);
+        assert_eq!(
+            error.contains(&request_failure::update_refusal()),
+            readiness,
+            "{approved:?}: scoped or no-start effects must not run readiness or autostart: {error}"
+        );
+    }
+}
+
+/// The App task that reads owed requests, or decides `proposal` when
+/// `approved` is given.
+fn effect(app: &mut Cagents, proposal: &Proposal, approved: Option<bool>) -> Task<Message> {
+    if let Some(approved) = approved {
+        app.update_automation_approval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: app.automation_approval.generation,
+            approved,
+        })
+    } else {
+        drop(app.cancel_automation_approval());
+        app.automation_approval.available = None;
+        assert!(app.automation_approval_read_owed());
+        app.read_owed_automation_requests()
+    }
+}
+
+/// What the `approved` effect reports with the daemon gone from its stale
+/// socket while the update launch fence is held. Starts no daemon.
+fn absent_daemon_error(runtime: &tokio::runtime::Runtime, approved: Option<bool>) -> String {
+    let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
+    assert!(UnixStream::connect(&socket).is_err(), "the daemon is gone");
+    let _fence = request_failure::hold_launch_fence();
+    let (mut app, proposal) = reviewing();
+    let task = effect(&mut app, &proposal, approved);
+    let error = match complete(runtime, task) {
+        Action::Read { result, .. } => result.as_ref().as_ref().unwrap_err().clone(),
+        Action::Finished { result, .. } => result.as_ref().as_ref().unwrap_err().clone(),
+        _ => panic!("unexpected App completion"),
+    };
+    assert!(
+        UnixStream::connect(&socket).is_err(),
+        "no daemon was started"
+    );
+    error
 }
 
 /// Drive event-owed App reads across refusal, reuse, and daemon disconnect.
@@ -436,8 +458,7 @@ fn exercise_cache(role: &str) {
     let (mut app, proposal) = reviewing();
     drop(app.cancel_automation_approval());
     app.automation_approval.available = None;
-    let (peer, closure) =
-        Peer::cached_reads(proposal.clone(), authority, usize::from(role == "user"));
+    let (peer, closure) = Peer::cached_reads(proposal.clone(), authority);
     for read in 0..3 {
         if read == 2 {
             // The second reply can reach the App before the server closes.
@@ -484,6 +505,14 @@ fn exercise_cache(role: &str) {
     }
     drop(app);
     peer.finished();
+    // The replacement connection is made as the first one is, through the
+    // read's own connect, so its route shows the same way.
+    let error = absent_daemon_error(&runtime, None);
+    assert_eq!(
+        error.contains(&request_failure::update_refusal()),
+        role == "user",
+        "a reconnecting read keeps the caller's startup policy: {error}"
+    );
 }
 
 #[test]

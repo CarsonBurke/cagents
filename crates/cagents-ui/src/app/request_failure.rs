@@ -142,6 +142,24 @@ pub(super) fn connect_ready(activity: Activity) -> Result<crate::control::Contro
         })
 }
 
+/// Readiness hands its connection to the request (#3127), so on the wire a
+/// readiness handshake and a direct connection look alike. Authority
+/// fixtures tell them apart with the daemon gone while this fence is held:
+/// only readiness would start a daemon, and the fence refuses that start
+/// with [`update_refusal`] before any daemon binary is looked for.
+#[cfg(test)]
+pub(super) fn hold_launch_fence() -> crate::instance::UiUpdateGuard {
+    crate::instance::UiUpdateGuard::acquire().unwrap()
+}
+
+/// What a task that tried to start an absent daemon under
+/// [`hold_launch_fence`] reports.
+#[cfg(test)]
+pub(super) fn update_refusal() -> String {
+    crate::terminal::HostedTerminalStartError::UpdateInProgress(crate::instance::UpdateInProgress)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
