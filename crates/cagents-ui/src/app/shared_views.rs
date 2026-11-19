@@ -3588,6 +3588,7 @@ impl Cagents {
                 }
             }
         }
+        let mut detached = HashSet::new();
         for (scope, alias, shared) in adoptions {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
@@ -3617,8 +3618,10 @@ impl Cagents {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
             self.detach_shared_pane(alias);
+            detached.insert(alias);
             self.remove_shared_channel_member(alias);
         }
+        self.remove_detached_from_strip(&detached);
     }
 
     /// Removing an alias or moving a pane to a worktree must leave a valid
@@ -3739,6 +3742,7 @@ impl Cagents {
         let mut retained_upgrades = Vec::new();
         let local_order = current.clone();
         let local_members = current.iter().copied().collect::<HashSet<_>>();
+        let mut detached = HashSet::new();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
@@ -3798,6 +3802,7 @@ impl Cagents {
             }
             if self.absence_closes_pane(id, view) {
                 self.detach_shared_pane(id);
+                detached.insert(id);
                 continue;
             }
             // Nobody closed this pane: a snapshot only says what the registry
@@ -4200,8 +4205,14 @@ impl Cagents {
             }
         }
         self.normalize_projected_card_order(&visible);
+        // The active strip's one edit also takes out the detached panes.
         if active {
-            self.project_shared_strip(&strip, &visible);
+            self.project_shared_strip(&strip, &visible, &detached);
+            if !detached.is_empty() {
+                self.settle_focus();
+            }
+        } else {
+            self.remove_detached_from_strip(&detached);
         }
         if !self.shared_views.applying {
             self.persist();
@@ -4402,6 +4413,8 @@ impl Cagents {
     }
 
     /// Passive removal detaches surfaces; it never calls a host close request.
+    /// The caller then takes the pane out of the strip, in one edit for every
+    /// pane it detaches: see [`Self::remove_detached_from_strip`].
     fn detach_shared_pane(&mut self, id: CardId) {
         self.shared_views.defaults.remove(&id);
         Arc::make_mut(&mut self.durable)
@@ -4419,18 +4432,22 @@ impl Cagents {
             drop(runtime);
         }
         self.lifecycle.remove(id);
-        if self.workspace.card(id).is_some() {
-            if self.workspace.request_close(id).is_ok() {
-                let _ = self.workspace.commit_close(id);
-            }
-        }
         if let Some(card) = self.card_state_mut(id) {
             card.existence = super::project_ui::removed_existence("pane closed in another client");
         }
-        // The strip handed this pane's focus to a neighbour above, with no
+        self.sidebar_state.forget_card_attention(id);
+    }
+
+    /// Takes the panes [`Self::detach_shared_pane`] detached out of the strip
+    /// in one edit, however many there are.
+    fn remove_detached_from_strip(&mut self, detached: &HashSet<CardId>) {
+        if detached.is_empty() {
+            return;
+        }
+        let _ = self.workspace.remove_cards(detached);
+        // The strip handed a removed pane's focus to a neighbour, with no
         // viewport update to tell the saved state.
         self.settle_focus();
-        self.sidebar_state.forget_card_attention(id);
     }
 
     /// Refresh presentation after an exact managed owner changes on first model
@@ -4448,7 +4465,7 @@ impl Cagents {
         let panes = self.local_view_panes(&scope);
         let visible = self.local_view_cards(&scope);
         let viewport = self.workspace.capture_viewport_anchor();
-        self.project_shared_strip(&panes, &visible);
+        self.project_shared_strip(&panes, &visible, &HashSet::new());
         self.finish_shared_viewport_projection(viewport)
     }
 
@@ -4474,13 +4491,22 @@ impl Cagents {
     /// Mirrors `panes` into the strip without moving the view: the caller
     /// captured a [`crate::workspace::ViewportAnchor`] first and restores it
     /// with [`Self::finish_shared_viewport_projection`] once the batch ends.
-    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) {
-        let focus = self.workspace.focused();
+    ///
+    /// The strip keeps the cards in `visible` and closes the rest, along with
+    /// any in `detached`, whose surfaces are already gone. The panes come
+    /// first, in their order, followed by the other cards it keeps, in theirs.
+    /// The whole edit is one [`crate::workspace::Workspace::arrange`].
+    fn project_shared_strip(
+        &mut self,
+        panes: &[Pane],
+        visible: &[CardId],
+        detached: &HashSet<CardId>,
+    ) {
         let visible = visible.iter().copied().collect::<HashSet<_>>();
         let removed = self
             .workspace
             .order()
-            .filter(|id| !visible.contains(id))
+            .filter(|id| !visible.contains(id) && !detached.contains(id))
             .collect::<Vec<_>>();
         for id in removed {
             // A transfer removes only this surface, leaving the actor and its
@@ -4500,62 +4526,62 @@ impl Cagents {
                 _ => {}
             }
             self.set_exposure(id, Exposure::Offscreen);
-            if self.workspace.request_close(id).is_ok() {
-                let _ = self.workspace.commit_close(id);
-            }
         }
-        for (index, pane) in panes.iter().enumerate() {
-            if self.workspace.card(pane.id).is_none() {
-                // A held reported title is newer than the shared one.
-                let held = self
-                    .reported_title_save
-                    .cards
-                    .contains(&pane.id)
-                    .then(|| self.card_state(pane.id).map(|card| card.title.as_str()))
-                    .flatten();
-                if let Ok(card) = WorkspaceCard::new(
-                    pane.id,
-                    pane.user_title.as_deref().or(held).unwrap_or_else(|| {
-                        browser_host::presentation_title(&pane.kind, &pane.title)
-                    }),
-                    CardWidth::Fraction(pane.width_fraction),
-                ) {
-                    let _ = self.workspace.add_card(
-                        card,
-                        index.min(self.workspace.cards().len()),
-                        false,
-                    );
+        let mut placed = HashSet::with_capacity(panes.len());
+        let mut cards = Vec::with_capacity(panes.len());
+        for pane in panes {
+            if detached.contains(&pane.id) || !placed.insert(pane.id) {
+                continue;
+            }
+            // A held reported title is newer than the shared one.
+            let held = self.reported_title_save.cards.contains(&pane.id);
+            let card = match self.workspace.card(pane.id) {
+                Some(current) => {
+                    // A name or width the strip refuses leaves the one it has.
+                    let accessible_name = (pane.user_title.is_some() || !held)
+                        .then(|| {
+                            crate::workspace::normalize_card_name(
+                                pane.user_title.as_deref().unwrap_or_else(|| {
+                                    browser_host::presentation_title(&pane.kind, &pane.title)
+                                }),
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| current.accessible_name.clone());
+                    Some(WorkspaceCard {
+                        id: pane.id,
+                        accessible_name,
+                        width: CardWidth::fraction(pane.width_fraction).unwrap_or(current.width),
+                    })
                 }
-            } else {
-                // A held reported title is newer than the shared one.
-                if pane.user_title.is_some() || !self.reported_title_save.cards.contains(&pane.id) {
-                    let _ = self.workspace.rename_card(
+                None => {
+                    let held = held
+                        .then(|| self.card_state(pane.id).map(|card| card.title.as_str()))
+                        .flatten();
+                    WorkspaceCard::new(
                         pane.id,
-                        pane.user_title
-                            .as_deref()
-                            .unwrap_or_else(|| {
-                                browser_host::presentation_title(&pane.kind, &pane.title)
-                            })
-                            .to_owned(),
-                    );
+                        pane.user_title.as_deref().or(held).unwrap_or_else(|| {
+                            browser_host::presentation_title(&pane.kind, &pane.title)
+                        }),
+                        CardWidth::Fraction(pane.width_fraction),
+                    )
+                    .ok()
                 }
-                if self
-                    .workspace
-                    .card(pane.id)
-                    .is_some_and(|card| card.width != CardWidth::Fraction(pane.width_fraction))
-                {
-                    let _ = self
-                        .workspace
-                        .set_card_width(pane.id, CardWidth::Fraction(pane.width_fraction));
-                }
-                if self.workspace.order().nth(index) != Some(pane.id) {
-                    let _ = self.workspace.reorder(pane.id, index);
-                }
-            }
+            };
+            cards.extend(card);
         }
-        if let Some(focus) = focus.filter(|id| self.workspace.card(*id).is_some()) {
-            let _ = self.workspace.focus_without_scrolling(focus);
-        }
+        cards.extend(
+            self.workspace
+                .cards()
+                .iter()
+                .filter(|card| {
+                    visible.contains(&card.id)
+                        && !detached.contains(&card.id)
+                        && !placed.contains(&card.id)
+                })
+                .cloned(),
+        );
+        let _ = self.workspace.arrange(cards);
     }
 }
 
