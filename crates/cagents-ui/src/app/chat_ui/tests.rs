@@ -20383,11 +20383,9 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             assert_chat_copy_task_writes(task, "replacement");
         } else {
             assert_chat_copy_task_has_no_effects(task, change);
-            assert!(
-                runtime
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("unavailable")),
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
                 "{change}"
             );
         }

@@ -1,7 +1,7 @@
 //! Logical message Copy reads canonical source pages off the UI thread.
 use super::*;
 
-const UNAVAILABLE: &str =
+pub(super) const UNAVAILABLE: &str =
     "This text is unavailable in the local copy cache. Open the provider transcript to recover it.";
 
 /// All production UI surfaces share one clipboard intent context. A request
@@ -436,14 +436,18 @@ impl Cagents {
         }
         // The text changed under the read, whether this client saw it first or
         // the store did. Read the item once more as it is now, rather than
-        // dropping the copy without a word.
-        if !request.snapshot_is_current(&current_snapshot)
-            || result
-                .as_ref()
-                .is_err_and(|error| error == chat::TEXT_COPY_CHANGED)
-        {
+        // dropping the copy without a word. A source the store refused, and
+        // this client has nothing newer for, would only be refused again.
+        let refused = result
+            .as_ref()
+            .is_err_and(|error| error == chat::TEXT_COPY_CHANGED);
+        if refused || !request.snapshot_is_current(&current_snapshot) {
             return match request.reread(&current_snapshot, &id) {
-                Some(reread) if !request.retried => reread.read(target, id),
+                Some(reread)
+                    if !request.retried && !(refused && reread.source == request.source) =>
+                {
+                    reread.read(target, id)
+                }
                 Some(_) => {
                     runtime.error = Some(chat::TEXT_COPY_CHANGED.into());
                     Task::none()
@@ -764,25 +768,36 @@ mod tests {
         }
     }
 
-    /// The store can see the change before this client's snapshot does.
+    /// The store can see the change before this client's snapshot does. Its
+    /// refusal reads the step again once this client has the change, and
+    /// says so at once while it has nothing newer to read.
     #[test]
-    fn a_copy_the_store_refuses_as_changed_reads_once_more_before_saying_so() {
+    fn a_copy_the_store_refuses_as_changed_reads_again_only_from_a_newer_source() {
         let _context = isolated_context();
-        let scope = chat::TextCopyScope::Conversation;
-        let (mut app, target, _, request) = copy_fixture(scope);
-        let source = request.source.clone();
-        let changed = || Err(chat::TEXT_COPY_CHANGED.to_owned());
-        let task = app.finish_message_copy(target, "step".into(), request, changed());
-        let reread = read_by(task, target);
-        assert_eq!(reread.source, source);
-        assert!(app.chat_runtime_mut(target).unwrap().error.is_none());
+        for scope in scopes() {
+            let changed = || Err(chat::TEXT_COPY_CHANGED.to_owned());
+            let (mut app, target, _, request) = copy_fixture(scope.clone());
+            let task = app.finish_message_copy(target, "step".into(), request, changed());
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                Some(chat::TEXT_COPY_CHANGED)
+            );
 
-        let task = app.finish_message_copy(target, "step".into(), reread, changed());
-        assert!(iced::runtime::task::into_stream(task).is_none());
-        assert_eq!(
-            app.chat_runtime_mut(target).unwrap().error.as_deref(),
-            Some(chat::TEXT_COPY_CHANGED)
-        );
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            let rewritten = source(&scope, 2);
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build"), rewritten.clone())),
+            );
+            let task = app.finish_message_copy(target, "step".into(), request, changed());
+            assert_eq!(read_by(task, target).source, rewritten, "{scope:?}");
+            assert!(app.chat_runtime_mut(target).unwrap().error.is_none());
+        }
     }
 
     #[test]
