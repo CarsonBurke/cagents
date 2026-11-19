@@ -5543,15 +5543,21 @@ impl Runtime {
         // Hidden publications number new children too, so a child keeps the
         // number it first appeared with for as long as it stays listed.
         self.child_ordinals.observe(&snapshot.subagents);
-        self.agent_work.observe(&snapshot.subagents);
         if !self.presents() {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
+            // Evicted, its agents have no transcripts to scan.
+            self.agent_work.observe(&snapshot.subagents);
             self.snapshot = snapshot;
             self.source_clock = source_clock;
             return;
         }
         let snapshot = self.logical_prose.project(snapshot);
+        // A publication installed again projects to the one already shown,
+        // whose work is already named.
+        if !Arc::ptr_eq(&self.snapshot, &snapshot) {
+            self.agent_work.observe(&snapshot.subagents);
+        }
         self.install_presented_snapshot(snapshot, source_clock);
     }
 

@@ -99,12 +99,21 @@ impl<Message> Trailing<'_, Message> {
         };
         // What each end would take with all the room it wants; unwrapped
         // text only re-flows for that, it is not shaped again.
-        let wanted = |node: layout::Node| node.size().width;
-        let lead_wants = wanted(lay(0, f32::INFINITY));
-        let trail_wants = wanted(lay(2, f32::INFINITY));
+        // An end that has all it wants keeps that layout.
+        let lead = lay(0, f32::INFINITY);
+        let trail = lay(2, f32::INFINITY);
+        let (lead_wants, trail_wants) = (lead.size().width, trail.size().width);
         let (lead_room, trail_room) = split(max.width, lead_wants, trail_wants, self.spacing);
-        let lead = lay(0, lead_room);
-        let trail = lay(2, trail_room);
+        let lead = if lead_room < lead_wants {
+            lay(0, lead_room)
+        } else {
+            lead
+        };
+        let trail = if trail_room < trail_wants {
+            lay(2, trail_room)
+        } else {
+            trail
+        };
         // However wide an end reports itself, it ends where its room does.
         let lead_width = lead.size().width.min(lead_room);
         let trail_width = trail.size().width.min(trail_room);

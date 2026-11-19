@@ -871,16 +871,13 @@ impl Row {
             (None, false) => OPENS_DETAIL,
             (None, true) => OPENS_DETAIL_OF_SEVERAL,
         };
-        let mut tip = Vec::new();
-        if matches!(&self.open, Some(Action::OpenAgent(_))) {
-            tip.push(format!("Open {}", self.label));
-        }
-        if self.shown.len() + self.tag.len() != self.label.len()
-            || !self.label.starts_with(&self.shown)
-            || !self.label.ends_with(&self.tag)
-        {
-            tip.push(format!("{} {}", self.verb, self.label));
-        }
+        // The row fades its name where the pane runs short, so the tooltip
+        // names it whole.
+        let mut tip = vec![if matches!(&self.open, Some(Action::OpenAgent(_))) {
+            format!("Open {}", self.label)
+        } else {
+            format!("{} {}", self.verb, self.label)
+        }];
         tip.extend(reason);
         if self.open.is_none() {
             tip.push(pressing.to_owned());
@@ -2032,10 +2029,12 @@ mod identity_tests {
             background: true,
             items: vec![running_command("check", "scripts/restart-check\n--verbose").into()],
         }];
-        // As a publication is installed: what each agent waits on is named
-        // once, then only looked up.
+        // Each change arrives as a publication, which names what each agent
+        // waits on once; drawing only looks it up.
         let observe = |runtime: &mut Runtime| {
-            runtime.agent_work.observe(&runtime.snapshot.subagents);
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.generation += 1;
+            runtime.install_snapshot(std::sync::Arc::new(snapshot), None);
         };
         observe(&mut runtime);
         let row =
@@ -2051,6 +2050,14 @@ mod identity_tests {
             started.state.text,
             "the row and the agent's tab say the same"
         );
+        // The same publication installed again is not scanned again.
+        let mut again = (*runtime.snapshot).clone();
+        again.generation += 1;
+        let again = std::sync::Arc::new(again);
+        runtime.install_snapshot(again.clone(), None);
+        runtime.agent_work = Default::default();
+        runtime.install_snapshot(again, None);
+        assert_eq!(runtime.agent_work.get("toolu_step"), None);
         // Several commands are counted, and work it never showed is unnamed.
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
             .items
@@ -2529,7 +2536,8 @@ mod identity_tests {
             name,
             format!("Message to {long} · Queued · Opens the agent · The repo is now at /srv")
         );
-        // A name the row draws whole is not repeated.
+        // A short name is named whole too: the row may still fade it where
+        // the pane runs short.
         let (tip, _) = row(
             "reviewer",
             "reviewer",
@@ -2537,7 +2545,10 @@ mod identity_tests {
             RowStatus::plain("Queued"),
         )
         .described();
-        assert_eq!(tip, "The repo is now at /srv/repos/t3code.");
+        assert_eq!(
+            tip,
+            "Message to reviewer\n\nThe repo is now at /srv/repos/t3code."
+        );
 
         // A row with no agent to open says so, after the outcome's reason.
         let refused = || RowStatus {
@@ -2548,7 +2559,8 @@ mod identity_tests {
         assert_eq!(
             tip,
             format!(
-                "Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_DETAIL}\n\n\
+                "Message to release-notes\n\n\
+                 Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_DETAIL}\n\n\
                  The repo is now at /srv/repos/t3code."
             )
         );
