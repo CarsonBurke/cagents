@@ -889,16 +889,17 @@ impl Row {
     }
 }
 
-/// The still mark beside a live caption: the accent, in a dot the size of
-/// the caption's lowercase letters.
-fn live_dot() -> Element<'static, Message> {
+/// The still mark of a state, in a dot the size of a caption's lowercase
+/// letters: the accent beside a live caption, or in its place, the state's
+/// colour, where a narrow row has no room for its words.
+fn state_dot(color: fn(&cosmic::Theme) -> iced::Color) -> Element<'static, Message> {
     const SIZE: f32 = 6.0;
     widget::container(widget::Space::new())
         .width(Length::Fixed(SIZE))
         .height(Length::Fixed(SIZE))
-        .class(cosmic::theme::Container::custom(|theme| {
+        .class(cosmic::theme::Container::custom(move |theme| {
             widget::container::Style {
-                background: Some(iced::Background::Color(design::accent_color(theme))),
+                background: Some(iced::Background::Color(color(theme))),
                 border: iced::Border {
                     radius: (SIZE / 2.0).into(),
                     ..Default::default()
@@ -1426,24 +1427,38 @@ impl Runtime {
         // The preview fades out where the pane runs short, as a step row's
         // summary does, on whatever the row is painted with; the agent keeps
         // its tab's words, cut as the tab cuts them.
-        let mut line: Vec<Element<'static, Message>> = vec![
-            lead,
+        let words = widget::row::with_children(vec![
             design::transcript(row.verb)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            design::transcript_name(label)
+            design::transcript_name(label.clone())
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             crate::ui_controls::FadeText::transcript(row.preview.clone())
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
-        ];
+        ])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        // What must not be cut for the state's sake: the verb and the agent.
+        let kept = widget::row::with_children(vec![
+            design::transcript(row.verb)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            design::transcript_name(label)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ])
+        .spacing(step::GAP_S);
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
-        if row.state.live && matches!(row.state.tone, Tone::Plain) {
-            line.push(live_dot());
+        let live = row.state.live && matches!(row.state.tone, Tone::Plain);
+        let mut state = Vec::new();
+        if live {
+            state.push(state_dot(design::accent_color));
         }
         let status =
             design::transcript(row.state.text).wrapping(iced::widget::text::Wrapping::None);
@@ -1452,8 +1467,27 @@ impl Runtime {
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
             Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
         };
-        line.push(status.into());
-        let content = widget::row::with_children(line)
+        state.push(status.into());
+        // Where the agent's name and its state no longer both fit, the state
+        // keeps only its mark: the dot of work under way, or one in the
+        // warning colour. A failure is told by the row's leading glyph, and
+        // a settled state by the absence of either; the words stay in the
+        // row's tooltip and accessible name.
+        let compact = match row.state.tone {
+            Tone::Plain if live => Some(state_dot(design::accent_color)),
+            Tone::Warning => Some(state_dot(design::warning_color)),
+            Tone::Plain | Tone::Error => None,
+        };
+        let content = crate::ui_controls::yielding(
+            words,
+            kept,
+            widget::row::with_children(state)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            compact,
+            step::GAP_S,
+        );
+        let content = widget::row::with_children(vec![lead, content])
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .width(Length::Fill);

@@ -49,7 +49,13 @@ fn status_glyph(kind: Icon, status: Option<chat::ToolStatus>) -> Icon {
 /// start of the path give way instead, behind a verb that always shows.
 pub(super) enum Headline {
     Text(String),
-    Path { verb: String, path: String },
+    /// Who a row is about, such as the agent that reported: emphasised by
+    /// weight, as an agent's name is wherever a row names one.
+    Name(String),
+    Path {
+        verb: String,
+        path: String,
+    },
 }
 
 impl From<String> for Headline {
@@ -68,6 +74,10 @@ impl Headline {
             // The fade is in the glyphs themselves, so it is right on the
             // row's resting, hovered, pressed and focused paint alike.
             Self::Text(text) => line(text).width(Length::Fill).into(),
+            Self::Name(name) => crate::ui_controls::FadeText::transcript(name)
+                .font(design::transcript_name_font())
+                .width(Length::Fill)
+                .into(),
             Self::Path { verb, path } => {
                 let (anchor, rest) = path.split_at(anchor(&path));
                 let mut path = vec![];
@@ -89,6 +99,33 @@ impl Headline {
                 widget::row::with_children(vec![line(verb).into(), path.into()])
                     .spacing(space::XS)
                     .width(Length::Fill)
+                    .into()
+            }
+        }
+    }
+}
+
+impl Headline {
+    /// What the headline says, as one line of plain text.
+    pub(super) fn plain(&self) -> String {
+        match self {
+            Self::Text(text) | Self::Name(text) => text.clone(),
+            Self::Path { verb, path } => format!("{verb} {path}"),
+        }
+    }
+
+    /// The headline's words at their natural width, never drawn: what a
+    /// row's trailing state gives way to.
+    fn measure(&self) -> Element<'static, Message> {
+        let line = |text: &str| {
+            design::transcript(text.to_owned()).wrapping(iced::widget::text::Wrapping::None)
+        };
+        match self {
+            Self::Text(text) => line(text).into(),
+            Self::Name(name) => line(name).font(design::transcript_name_font()).into(),
+            Self::Path { verb, path } => {
+                widget::row::with_children(vec![line(verb).into(), line(path).into()])
+                    .spacing(space::XS)
                     .into()
             }
         }
@@ -157,7 +194,7 @@ pub(super) fn row_named(
     expanded: Option<bool>,
     toggle: Option<Action>,
 ) -> Element<'static, Message> {
-    let text = label.into().view();
+    let label = label.into();
     let indicator = match status {
         Some(chat::ToolStatus::Running) => crate::ui_controls::activity_spinner(
             f32::from(design::LEADING_ICON_SIZE),
@@ -175,18 +212,32 @@ pub(super) fn row_named(
             crate::ui_controls::passive_icon(status_glyph(icon, status), design::LEADING_ICON_SIZE)
         }
     };
-    let mut cells = vec![indicator, text];
-    if let Some(trailing) = trailing {
-        let trailing = match trailing {
-            Trailing::Elapsed(elapsed) => design::caption(elapsed),
-            Trailing::Outcome(outcome) => design::transcript(outcome),
-        };
-        cells.push(
-            trailing
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        );
+    let mut cells = vec![indicator];
+    let trailing_text = |text: iced::widget::Text<'static, cosmic::Theme, cosmic::Renderer>| {
+        text.class(cosmic::theme::Text::Custom(design::muted_text))
+            .wrapping(iced::widget::text::Wrapping::None)
+    };
+    match trailing {
+        // A duration is a caption, short enough to keep its place.
+        Some(Trailing::Elapsed(elapsed)) => {
+            cells.push(label.view());
+            cells.push(trailing_text(design::caption(elapsed)).into());
+        }
+        // An outcome gives way to the headline where both no longer fit:
+        // the row's name is what a reader needs, and a failure is still
+        // told by the leading glyph. The outcome stays in the row's
+        // accessible name.
+        Some(Trailing::Outcome(outcome)) => {
+            let measure = label.measure();
+            cells.push(crate::ui_controls::yielding(
+                label.view(),
+                measure,
+                trailing_text(design::transcript(outcome)),
+                None,
+                step::GAP_S,
+            ));
+        }
+        None => cells.push(label.view()),
     }
     if let Some(expanded) = expanded {
         cells.push(crate::ui_controls::passive_icon(

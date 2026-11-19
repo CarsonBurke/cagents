@@ -130,6 +130,30 @@ const NARROW_FOOTER_LABEL: usize = 20;
 /// its place while the session switches.
 const TIGHT_FOOTER_LABEL: usize = 14;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
+/// What one row of the timeline draws: its line box and the padding above
+/// and below it. Rows are [`step::GAP_XS`] apart, so this plus that gap is
+/// the timeline's pitch.
+const TIMELINE_ROW: f32 = design::LINE_TRANSCRIPT + 2.0 * step::GAP_XS;
+
+/// How tall a row is taken to be until it is first measured, so a long
+/// transcript scrolls without the rows below a mounted one jumping: one
+/// timeline row for a line of the timeline, and otherwise its prose, as
+/// many lines as its length would fill at `width`, set as answers are.
+/// Either way with the room its actions reserve beneath it.
+fn row_estimate(item: &chat::Item, rhythm: Rhythm, footer: f32, width: f32) -> f32 {
+    let drawn = match (rhythm, CachedItem::prose(&item.content)) {
+        (Rhythm::Line, _) | (_, None) => TIMELINE_ROW,
+        (_, Some(body)) => {
+            // About half an em a character, on average, at the prose size.
+            let per_line = (width / (design::TEXT_TRANSCRIPT / 2.0)).max(20.0);
+            let line = iced::widget::text::LineHeight::default()
+                .to_absolute(design::TEXT_TRANSCRIPT.into())
+                .0;
+            (body.len() as f32 / per_line).ceil().max(1.0) * line
+        }
+    };
+    drawn + footer
+}
 
 /// What a transcript row is to the rows around it, which alone decides the
 /// space above it.
@@ -1561,6 +1585,20 @@ struct Place {
     branch: Option<String>,
 }
 
+/// Whether a delivery draws its message actions: while its detail shows,
+/// or always when it cannot be opened, so a message that is only its row
+/// still offers its copy and its time on hover.
+fn delivery_actions(has_body: bool, monitor: bool, long: bool, expanded: bool) -> bool {
+    let shown = (expanded || monitor) && has_body;
+    shown || !delivery_opens(has_body, monitor, long)
+}
+
+/// Whether a delivery's row opens its detail: it has one, and it is not a
+/// monitor event short enough to be shown whole.
+fn delivery_opens(has_body: bool, monitor: bool, long: bool) -> bool {
+    has_body && (!monitor || long)
+}
+
 /// A monitor's event, whose body is shown without being opened.
 fn delivery_monitor(kind: chat::DeliveryKind, summary: &str) -> bool {
     kind == chat::DeliveryKind::Notice && summary.starts_with("Monitor event: ")
@@ -1579,6 +1617,17 @@ fn delivery_has_body(
         || !body.is_empty() || !remainder.is_empty() || !sender.is_empty(),
         |notice| notice.body.full.len() != 0,
     )
+}
+
+/// The agent a report's title names, as `Agent "NAME"` or `Agent NAME`
+/// say it.
+fn delivery_agent_name(title: &str) -> Option<&str> {
+    let name = title.strip_prefix("Agent ")?;
+    let name = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+        .unwrap_or(name);
+    (!name.trim().is_empty()).then_some(name)
 }
 
 fn delivery_command_outcome(heading: &str) -> Option<(&str, &str)> {
@@ -2781,7 +2830,7 @@ impl Runtime {
                 let delivery = item.role == chat::Role::User
                     && matches!(item.content, ItemContent::Delivery { .. });
                 let footer = if delivery {
-                    if self.delivery_detail_shown(item) {
+                    if self.delivery_carries_actions(item) {
                         MESSAGE_ACTION_FOOTER
                     } else {
                         0.0
@@ -2804,13 +2853,6 @@ impl Runtime {
                     dark,
                     self.source_now_ms(),
                 );
-                let estimate = CachedItem::prose(&item.content).map_or(80.0, |body| {
-                    (body.len() as f32 / (content_width / 8.0).max(20.0))
-                        .ceil()
-                        .max(1.0)
-                        * 22.0
-                        + footer
-                });
                 // The subagent's own messages to it open its exchanges; the
                 // rest of its work keeps the main transcript's rhythm.
                 let rhythm = if delivery {
@@ -2824,6 +2866,7 @@ impl Runtime {
                         .is_some_and(|coordinated| coordinated.is_card());
                     Rhythm::of(item, turn::slot_of(item), card)
                 };
+                let estimate = row_estimate(item, rhythm, footer, content_width);
                 let row_index = transcript.lazy(
                     key.finish(),
                     revision,
@@ -5022,15 +5065,6 @@ impl Runtime {
         let items = &self.snapshot.items;
         let now = self.source_now_ms();
         let common = self.turn_common_hasher(turn, dark);
-        let estimate = |item: &chat::Item| {
-            CachedItem::prose(&item.content).map_or(60.0, |body| {
-                ((body.len() as f32 / (content_width / 8.0).max(20.0))
-                    .ceil()
-                    .max(1.0)
-                    * 22.0)
-                    + 40.0
-            })
-        };
         // Find reaches an exchange through its first row, whether or not
         // that row is mounted, and so does anything drawn before it.
         // Room for the row's own item too, which is usually all it holds.
@@ -5056,7 +5090,7 @@ impl Runtime {
                 0 => std::mem::take(&mut leading),
                 _ => Vec::with_capacity(1),
             };
-            let (estimate, footer) = match part {
+            let (item, footer) = match part {
                 TurnPart::Steps => {
                     aliases.reserve(turn.steps.len());
                     aliases.extend(
@@ -5065,16 +5099,16 @@ impl Runtime {
                             .filter_map(|placed| items.get(placed.index))
                             .map(|item| scroll::item_id(&item.id)),
                     );
-                    (48.0, 0.0)
+                    (None, 0.0)
                 }
                 TurnPart::Prompt(index) => {
                     let item = &items[index];
                     aliases.push(scroll::item_id(&item.id));
                     let footer = match item.content {
-                        ItemContent::Delivery { .. } if !self.delivery_detail_shown(item) => 0.0,
+                        ItemContent::Delivery { .. } if !self.delivery_carries_actions(item) => 0.0,
                         _ => MESSAGE_ACTION_FOOTER,
                     };
-                    (estimate(item), footer)
+                    (Some(item), footer)
                 }
                 TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                     let placed = &turn.prose[prose];
@@ -5086,7 +5120,7 @@ impl Runtime {
                         }
                         _ => 0.0,
                     };
-                    (estimate(item), footer)
+                    (Some(item), footer)
                 }
             };
             // An exchange the reader or another agent opened is set apart
@@ -5109,6 +5143,9 @@ impl Runtime {
                     Rhythm::of(&items[placed.index], placed.slot, false)
                 }
             };
+            let estimate = item.map_or(TIMELINE_ROW, |item| {
+                row_estimate(item, rhythm, footer, content_width)
+            });
             rows += 1;
             let fingerprint = self.turn_part_fingerprint(turn, part, key, cached, &common, now);
             transcript.lazy(
@@ -5612,7 +5649,7 @@ impl Runtime {
                             let mut row = virtualized::Row::once(
                                 key,
                                 revision,
-                                56.0 + step::GAP_XS,
+                                step::GAP_XS + TIMELINE_ROW,
                                 Some(scroll::item_id(&id)),
                                 // The air above each row, so the strip's
                                 // rows keep the pitch of the rows around
@@ -6366,9 +6403,21 @@ impl Runtime {
         // Bound synchronous text shaping. The original remains in the tooltip,
         // copy action and expanded detail; fades never introduce an ellipsis.
         let short: String = title.chars().take(1024).collect();
-        let disclosure = has_body && (!monitor || notice.is_some_and(|notice| notice.body.long));
+        // An agent's report is told by its glyph and outcome, so its row
+        // names the agent as every row of the timeline does, by weight,
+        // without the "Agent" and quotes the provider's heading wraps it in.
+        // Its tooltip and accessible name keep the heading whole.
+        let headline = match report_outcome.and_then(|_| delivery_agent_name(&short)) {
+            Some(name) => disclosure::Headline::Name(name.to_owned()),
+            None => disclosure::Headline::Text(short),
+        };
+        let disclosure = delivery_opens(
+            has_body,
+            monitor,
+            notice.is_some_and(|notice| notice.body.long),
+        );
         let heading_row = disclosure::row_named(
-            short,
+            headline,
             if disclosure {
                 format!(
                     "{} delivery details: {heading}",
@@ -6452,11 +6501,21 @@ impl Runtime {
                 );
             }
         }
-        // Like a step or a thought, a delivery is a line of the timeline
-        // until its detail is open. Open, the whole message, its row
-        // included, carries the message's actions beneath it, so hovering
-        // the row that opened it shows them.
-        let body: Element<'static, Message> = if rows.is_empty() {
+        // Like a step or a thought, a delivery that opens is a line of the
+        // timeline until its detail is open. Open, or when it has nothing to
+        // open, the whole message, its row included, carries the message's
+        // actions beneath it, so hovering the row shows them.
+        debug_assert_eq!(
+            !rows.is_empty(),
+            (expanded || monitor) && has_body,
+            "delivery_actions mirrors the detail drawn here"
+        );
+        let body: Element<'static, Message> = if !delivery_actions(
+            has_body,
+            monitor,
+            notice.is_some_and(|notice| notice.body.long),
+            expanded,
+        ) {
             heading_row
         } else {
             rows.insert(0, heading_row);
@@ -6474,9 +6533,10 @@ impl Runtime {
             .into()
     }
 
-    /// Whether a delivered message shows its detail under its row, which
-    /// then reserves the room for the actions an open detail carries.
-    fn delivery_detail_shown(&self, item: &chat::Item) -> bool {
+    /// Whether a delivered message draws its actions, and so reserves the
+    /// room for them beneath it: while its detail is shown, or always when
+    /// it has no detail to open, as a message does.
+    fn delivery_carries_actions(&self, item: &chat::Item) -> bool {
         let ItemContent::Delivery {
             kind,
             from,
@@ -6487,29 +6547,36 @@ impl Runtime {
         else {
             return false;
         };
-        if !(delivery_monitor(*kind, summary) || self.item_expanded(&item.id)) {
-            return false;
-        }
-        if *kind == chat::DeliveryKind::Notice {
-            return self
+        let monitor = delivery_monitor(*kind, summary);
+        let (has_body, long) = if *kind == chat::DeliveryKind::Notice {
+            // Drawn as loading, without actions, until it is prepared.
+            let Some(notice) = self
                 .prepared_literal(item)
                 .and_then(literal_content::Content::notice)
-                .is_some_and(|notice| delivery_has_body(Some(notice), body, "", sender));
-        }
-        let heading = chat::delivery_heading(
-            *kind,
-            from,
-            sender,
-            if !body.is_empty() && body.trim() == summary.trim() {
-                ""
-            } else {
-                summary
-            },
-        );
-        let remainder = heading
-            .split_once(['\r', '\n'])
-            .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
-        delivery_has_body(None, body, remainder, sender)
+            else {
+                return false;
+            };
+            (
+                delivery_has_body(Some(notice), body, "", sender),
+                notice.body.long,
+            )
+        } else {
+            let heading = chat::delivery_heading(
+                *kind,
+                from,
+                sender,
+                if !body.is_empty() && body.trim() == summary.trim() {
+                    ""
+                } else {
+                    summary
+                },
+            );
+            let remainder = heading
+                .split_once(['\r', '\n'])
+                .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
+            (delivery_has_body(None, body, remainder, sender), false)
+        };
+        delivery_actions(has_body, monitor, long, self.item_expanded(&item.id))
     }
 
     /// An assistant answer, its reasoning, its narration, or a system notice.

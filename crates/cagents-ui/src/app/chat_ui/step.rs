@@ -275,10 +275,7 @@ impl Runtime {
     /// cannot know.
     #[cfg(test)]
     pub(super) fn strip_summary(&self, turn: &turn::Turn) -> String {
-        match self.strip_headline(turn) {
-            disclosure::Headline::Text(text) => text,
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        }
+        self.strip_headline(turn).plain()
     }
 
     /// A collapsed strip's line as it is drawn. A lone step on one file
@@ -376,10 +373,7 @@ impl Runtime {
             turn.duration_label(0)
         };
         let text = self.strip_headline(turn);
-        let name = match &text {
-            disclosure::Headline::Text(text) => text.clone(),
-            disclosure::Headline::Path { verb, path } => format!("{verb} {path}"),
-        };
+        let name = text.plain();
         let mut kinds = turn.steps.iter().filter_map(|step| {
             self.step_items().get(step.index).map(|item| {
                 self.presentation_cache()

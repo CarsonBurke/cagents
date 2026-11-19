@@ -11712,6 +11712,65 @@ fn composer_is_one_row_and_offers_stop_while_busy_with_an_empty_draft() {
     }
 }
 
+/// An agent started, a step, a thought and a report are each a line of the
+/// timeline by the one rule, so the space between any two of them is the
+/// one gap between lines, the same gap a group of steps puts between its
+/// rows; only prose and an exchange's opening set themselves apart.
+#[test]
+fn every_timeline_row_is_a_line_by_the_one_rhythm_rule() {
+    let item = |content| chat::Item {
+        id: "item".into(),
+        role: chat::Role::Assistant,
+        content,
+        started_at: None,
+        at: None,
+    };
+    let started = item(ItemContent::Tool {
+        name: "Agent".into(),
+        input: serde_json::json!({
+            "subagent_type": "general-purpose",
+            "description": "Design",
+            "prompt": "Draft a design",
+        })
+        .to_string(),
+        output: String::new(),
+        status: chat::ToolStatus::Succeeded,
+    });
+    let thought = item(ItemContent::Text {
+        text: "**Weighing the drafts**".into(),
+        thinking: true,
+        phase: chat::Phase::Commentary,
+    });
+    let answer = item(ItemContent::Text {
+        text: "Done.".into(),
+        thinking: false,
+        phase: chat::Phase::Final,
+    });
+    // A started agent is drawn as a card among the prose.
+    assert_eq!(
+        Rhythm::of(&started, turn::slot_of(&started), true),
+        Rhythm::Line
+    );
+    assert_eq!(Rhythm::of(&started, turn::Slot::Step, false), Rhythm::Line);
+    assert_eq!(
+        Rhythm::of(&thought, turn::Slot::Thinking, false),
+        Rhythm::Line
+    );
+    assert_eq!(Rhythm::of(&answer, turn::Slot::Prose, false), Rhythm::Block);
+    assert_eq!(Rhythm::Line.gap(Rhythm::Line), step::GAP_XS);
+    for above in [Rhythm::Line, Rhythm::Block, Rhythm::Opening] {
+        assert_eq!(above.gap(Rhythm::Opening), step::GAP_L);
+    }
+    assert_eq!(Rhythm::Line.gap(Rhythm::Block), step::GAP_M);
+    assert_eq!(Rhythm::Block.gap(Rhythm::Line), step::GAP_M);
+    // Before it is measured, a line is taken to be one timeline row, and
+    // the gap after it completes the pitch the layout test measures.
+    assert_eq!(
+        super::row_estimate(&started, Rhythm::Line, 0.0, 780.0) + step::GAP_XS,
+        design::LINE_TRANSCRIPT + 3.0 * step::GAP_XS
+    );
+}
+
 /// The sequence from #3119: four agents started, a thought with nothing to
 /// read, a fifth agent, then the reply. Every row of the timeline sits the
 /// same distance below the one before it, whether a hidden thought, a shown
@@ -11821,7 +11880,7 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
                 kind: chat::DeliveryKind::Report,
                 from: String::new(),
                 sender: String::new(),
-                summary: format!("Agent \"Design agent-{n}\" finished"),
+                summary: format!("Agent \"Sidebar direction {n}\" finished"),
                 body: "The design is drafted.".into(),
             },
         )
@@ -11875,7 +11934,18 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             false,
             780.0,
         ),
-        ("a narrow pane", sequence(Some(thought), 0), false, 220.0),
+        (
+            "a narrow pane",
+            sequence(Some(thought.clone()), 0),
+            false,
+            220.0,
+        ),
+        (
+            "agents reporting in a narrow pane",
+            sequence(Some(thought), 2),
+            false,
+            220.0,
+        ),
     ];
     let renderer = crate::app::tests::headless_renderer();
     let shortcuts = crate::settings::KeyboardShortcuts::default();
@@ -11936,7 +12006,7 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
             .iter()
             .filter(|(text, _)| {
                 text == "Started"
-                    || text.starts_with("Agent \"")
+                    || text.starts_with("Sidebar direction ")
                     || text.starts_with("Thought")
                     || text.starts_with("Thinking")
                     || text.contains("the fixture")
@@ -11949,8 +12019,42 @@ fn a_timeline_keeps_one_pitch_and_one_size_down_to_the_reply() {
                 scenario,
                 "a thought between" | "a group boundary" | "an open group"
             )) + usize::from(open)
-                + 2 * usize::from(scenario == "agents reporting");
+                + 2 * usize::from(scenario.starts_with("agents reporting"));
         assert_eq!(rows.len(), expected, "{scenario}: {rows:?}");
+        // A report names its agent as a row names any agent, without the
+        // provider's "Agent" and quotes, and the name keeps its room: where
+        // the pane is too narrow for it and the outcome both, the outcome
+        // gives way, and so does a started agent's state.
+        let narrow = width < 300.0;
+        for (text, bounds) in &probe.texts {
+            // Wide, every agent's name is whole; narrow, a report's still
+            // is, its outcome having given way.
+            if text.starts_with("Sidebar direction ")
+                || !narrow && text.starts_with("Design agent-")
+            {
+                let natural = width_at(design::transcript_name(text.clone()).into());
+                assert!(
+                    bounds.width + 0.5 >= natural,
+                    "{scenario}: {text:?} is cut to {} of {natural}",
+                    bounds.width
+                );
+            }
+        }
+        let outcomes = |word: &str| probe.texts.iter().filter(|(text, _)| text == word).count();
+        if scenario.starts_with("agents reporting") {
+            assert_eq!(
+                outcomes("finished"),
+                if narrow { 0 } else { 2 },
+                "{scenario}: the reports' outcome"
+            );
+        }
+        if narrow {
+            assert_eq!(
+                outcomes("Finished"),
+                0,
+                "{scenario}: the started agents' state"
+            );
+        }
         let tops: Vec<f32> = rows.iter().map(|(_, bounds)| bounds.y).collect();
         for pair in tops.windows(2) {
             pitches.push((scenario, pair[1] - pair[0]));

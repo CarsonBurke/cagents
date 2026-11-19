@@ -1676,15 +1676,16 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
             !surface.accessible.contains(&"Copy this message".to_owned()),
             "a closed report reserves no action footer"
         );
-        let title = heading.strip_suffix(outcome).unwrap();
+        // The row names the agent, without the heading's "Agent" and
+        // quotes, which its tooltip and accessible name keep.
         assert_eq!(
             surface
                 .text
                 .iter()
-                .filter(|text| text.as_str() == title)
+                .filter(|text| text.as_str() == long_name)
                 .count(),
             1,
-            "the single-line title keeps its source for overflow fading"
+            "the single-line name keeps its source for overflow fading"
         );
         assert_eq!(
             surface
@@ -1692,8 +1693,9 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
                 .iter()
                 .filter(|text| text.as_str() == outcome.trim())
                 .count(),
-            1,
-            "the outcome stays in its own trailing cell at narrow widths"
+            0,
+            "a name too long for the pane keeps the room its outcome would take, \
+             and the outcome is still read in the row's accessible name"
         );
         assert!(
             !surface.text.iter().any(|text| text == "Copy report"),
@@ -1742,6 +1744,37 @@ fn task_reports_hide_short_and_huge_bodies_without_losing_outcome_or_exact_copy(
             "Copy must not parse hidden Markdown"
         );
     }
+}
+
+/// A delivery with nothing to open is only its row, so the row itself
+/// offers the message's copy and time on hover, as any message does, and
+/// reserves the room for them in the transcript and in an agent's.
+#[test]
+fn a_delivery_that_cannot_open_keeps_its_copy_and_time() {
+    let mut quiet = task_report(
+        "quiet-report",
+        "Agent \"Quiet\" finished".into(),
+        String::new(),
+    );
+    if let ItemContent::Delivery { sender, .. } = &mut quiet.content {
+        sender.clear();
+    }
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&quiet));
+    let surface = report_surface(&runtime, "quiet-report");
+    assert!(
+        !surface
+            .accessible
+            .iter()
+            .any(|text| text.starts_with("Show delivery details")),
+        "nothing to open: {:?}",
+        surface.accessible
+    );
+    assert!(
+        surface.accessible.contains(&"Copy this message".to_owned()),
+        "{:?}",
+        surface.accessible
+    );
+    assert!(runtime.delivery_carries_actions(runtime.active_item("quiet-report").unwrap()));
 }
 
 #[test]
@@ -1812,7 +1845,7 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                 surface
                     .text
                     .iter()
-                    .filter(|text| text.as_str() == "Agent \"Detailed review\"")
+                    .filter(|text| text.as_str() == "Detailed review")
                     .count(),
                 1,
                 "expansion retains one title rather than repeating the full heading"
