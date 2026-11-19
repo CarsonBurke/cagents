@@ -59,8 +59,9 @@ fn chat_stream(intent: Intent) -> Result<ChatStream, StartFailure> {
 /// A connection a native chat goes on over: either one whose control
 /// handshake already proved the daemon, which the chat continues on instead
 /// of connecting and handshaking again, or a bare one it handshakes itself.
-/// Both handshakes are the same `Connect`, so the daemon can't tell them
-/// apart.
+/// The daemon treats a connection after its `Connect` alike whoever sent it.
+/// Only the chat's own `Connect` can name the daemon it must reach, so a
+/// proven connection checks that proof as the daemon would.
 enum ChatStream {
     Proven {
         stream: UnixStream,
@@ -94,17 +95,29 @@ impl From<crate::terminal::ReadyDaemon> for ChatStream {
 /// the connection but did not finish the handshake in time may be held by a
 /// long operation or hung, which the client cannot tell apart.
 fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartFailure {
-    use crate::terminal::HostedTerminalStartError;
+    use crate::{control::ControlError, terminal::HostedTerminalStartError};
     let recovery = match &error {
         HostedTerminalStartError::UpdateInProgress(_) => super::Recovery::Busy,
-        // A selected device's daemon is reached without a readiness proof,
-        // so its handshake fails as a connection does.
-        HostedTerminalStartError::HostProtocol(crate::control::ControlError::ReplyTimeout {
-            ..
-        })
-        | HostedTerminalStartError::Connect(crate::control::ControlError::ReplyTimeout {
-            ..
-        }) => super::Recovery::Unresponsive,
+        HostedTerminalStartError::HostProtocol(ControlError::ReplyTimeout { .. }) => {
+            super::Recovery::Unresponsive
+        }
+        // Nothing proves a selected device's daemon ready, so the connection
+        // handed to the switch is its first, and its handshake fails as the
+        // switch's own did: as `switch_unasked` tells its causes apart.
+        HostedTerminalStartError::Connect(ControlError::ReplyTimeout { .. }) => {
+            return switch_unasked(HandshakeError::Unanswered(error.to_string()));
+        }
+        HostedTerminalStartError::Connect(ControlError::Remote {
+            code,
+            message,
+            retryable,
+        }) => {
+            return switch_unasked(HandshakeError::Protocol(ipc::ProtocolError::new(
+                *code,
+                message.clone(),
+                *retryable,
+            )));
+        }
         _ => super::Recovery::Unreached,
     };
     StartFailure {
@@ -1451,9 +1464,6 @@ fn chat_handshake(
         }
         ChatStream::Proven { stream, proof } => {
             set_chat_timeouts(&stream)?;
-            if !proof.is_complete() {
-                return Err("Daemon returned an incomplete native chat ownership proof".into());
-            }
             if let Some(expected) = expected {
                 ipc::validate_proof(Some(expected), &proof)
                     .map_err(|error| HandshakeError::ProofChanged(Some(error)))?;

@@ -266,8 +266,39 @@ fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
     assert_eq!(timed_out.recovery, Recovery::Unresponsive);
     assert!(!Recovery::Unresponsive.is_blocked());
     assert!(timed_out.message.contains("did not answer within 30 s"));
+    // A selected device's daemon, first reached by the connection handed to
+    // the switch, fails its handshake as the switch's own handshake did.
+    let device_timed_out = switch_unadmitted(HostedTerminalStartError::Connect(
+        crate::control::ControlError::ReplyTimeout {
+            timeout: Duration::from_secs(30),
+            error: ipc::FrameError::Io(io::ErrorKind::WouldBlock.into()),
+        },
+    ));
+    assert_eq!(device_timed_out.recovery, Recovery::Unresponsive);
+    assert!(
+        device_timed_out
+            .message
+            .contains("did not answer within 30 s")
+    );
+    let refused = |message: &str, retryable| {
+        switch_unadmitted(HostedTerminalStartError::Connect(
+            crate::control::ControlError::Remote {
+                code: ipc::ProtocolErrorCode::Internal,
+                message: message.into(),
+                retryable,
+            },
+        ))
+    };
+    let busy = refused(ipc::DAEMON_BUSY, true);
+    assert_eq!(busy.recovery, Recovery::Busy);
+    assert_eq!(busy.message, ipc::DAEMON_BUSY);
+    assert_eq!(
+        refused("refused before any effect", false).recovery,
+        Recovery::NotAdmitted
+    );
     for unreachable in [
         HostedTerminalStartError::HostProtocol(crate::control::ControlError::ConnectionClosed),
+        HostedTerminalStartError::Connect(crate::control::ControlError::ConnectionClosed),
         HostedTerminalStartError::HostSocket {
             path: "/run/cagents.sock".into(),
             source: io::ErrorKind::ConnectionRefused.into(),
@@ -6627,10 +6658,10 @@ fn starting_a_chat_connects_to_the_daemon_once() {
         command.env(crate::agent_execution::AUTHORITY_ENV, authority);
     }
     let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "{stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
