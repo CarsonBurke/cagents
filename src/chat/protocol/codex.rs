@@ -520,6 +520,7 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            stop_on_start: false,
             notification_turn: None,
             notification_revision: 0,
             busy: false,
@@ -686,6 +687,9 @@ struct Codex {
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
+    /// A stop asked for while this thread's `turn/start` was unanswered,
+    /// sent as `turn/interrupt` once the turn's ID is known.
+    stop_on_start: bool,
     /// Exact live notice authority. Scalar status and paged history must not
     /// replace it; they can arrive after a newer turn's start.
     notification_turn: Option<String>,
@@ -2099,6 +2103,7 @@ impl Adapter for Codex {
                 match mode {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
+                        self.stop_on_start = false;
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
@@ -2119,10 +2124,13 @@ impl Adapter for Codex {
                     }
                 }
             }
-            Command::Interrupt => {
-                let turn = self.turn.as_ref().ok_or("There is no known active Codex turn to interrupt")?;
-                self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?;
-            }
+            // Codex names a turn only once it has started, so a stop given
+            // while its start is unanswered waits for that name.
+            Command::Interrupt => match self.turn.clone() {
+                Some(turn) => self.call(&mut step, "turn/interrupt", json!({"threadId":self.thread,"turnId":turn}), Pending::Other)?,
+                None if self.starting_turn() => self.stop_on_start = true,
+                None => return Err("There is no known active Codex turn to interrupt".into()),
+            },
             // The client's form of the model's own `interrupt_agent`: a child
             // is a thread of its own, so interrupting its turn reaches neither
             // the parent nor its siblings. Unlike input, this is not refused
@@ -2231,6 +2239,35 @@ impl Adapter for Codex {
         Ok(step)
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
+        let mut step = self.receive_frame(frame)?;
+        if self.stop_on_start {
+            if let Some(turn) = self.turn.clone() {
+                self.stop_on_start = false;
+                self.call(
+                    &mut step,
+                    "turn/interrupt",
+                    json!({"threadId":self.thread,"turnId":turn}),
+                    Pending::Other,
+                )?;
+            } else if !self.starting_turn() {
+                // The start failed, or its turn came and went unnamed:
+                // there is nothing left to stop.
+                self.stop_on_start = false;
+            }
+        }
+        Ok(step)
+    }
+}
+
+impl Codex {
+    /// Whether a `turn/start` this thread sent is still unanswered.
+    fn starting_turn(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Turn { .. }))
+    }
+
+    fn receive_frame(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
         if !frame.is_object() {
             return Err("Codex sent a non-object JSON-RPC frame".into());
