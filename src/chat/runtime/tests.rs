@@ -4332,6 +4332,155 @@ fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
     assert!(handle.failure().is_none());
 }
 
+#[test]
+fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let agent = directory.path().join("fake-acp-agent");
+    std::fs::write(
+        &agent,
+        include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = |session_id: Option<String>| super::super::Launch {
+        // No provider runs ACP yet; the profile, not the provider, chooses it.
+        provider: crate::agent::Provider::Omp,
+        recipe: crate::model::LaunchRecipe {
+            program: agent.to_string_lossy().into_owned(),
+            arguments: vec!["--model".into(), "gemini-3.8-flash".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([
+                (
+                    "FAKE_ACP_STATE".into(),
+                    directory
+                        .path()
+                        .join("state")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                // A wrapper's banner before the first reply.
+                ("FAKE_ACP_NOISE".into(), "1".into()),
+            ]),
+            unset_environment: Default::default(),
+        },
+        session_id,
+    };
+    let start = |session_id| {
+        let (spec, mut adapter) = super::super::protocol::acp::create(
+            &super::super::protocol::acp::TEST_PROFILE,
+            &launch(session_id),
+        )
+        .unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap()
+    };
+    let prompt = |handle: &LocalHandle, text: &str| {
+        handle
+            .command(Command::Prompt {
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap()
+    };
+    let says = |snapshot: &Snapshot, wanted: &str| {
+        snapshot.items.iter().any(|item| {
+            item.role == super::super::Role::Assistant
+                && matches!(&item.content, ItemContent::Text { text, thinking: false, .. } if text == wanted)
+        })
+    };
+    let handle = start(None);
+    let snapshot = until(&handle, |snapshot| snapshot.ready);
+    assert_eq!(snapshot.selected_model.as_deref(), Some("gemini-3.8-flash"));
+    assert!(snapshot.capabilities.compact);
+    let session = snapshot.session_id.clone().unwrap();
+
+    prompt(&handle, "Use some tools");
+    let snapshot = until(&handle, |snapshot| {
+        !snapshot.busy && says(snapshot, "Listed the files and updated notes.md.")
+    });
+    assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+        ItemContent::Command { command, output, exit_code: Some(0), .. }
+            if command == "ls -1" && output == "README\nnotes.md")));
+    assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+        ItemContent::Changes { changes, .. } if changes[0].diff.contains("+new line"))));
+    assert!(snapshot.usage.context_tokens > 0);
+
+    prompt(&handle, "Ask permission");
+    let snapshot = until(&handle, |snapshot| !snapshot.requests.is_empty());
+    assert!(snapshot.waiting);
+    let request = snapshot.requests[0].clone();
+    assert_eq!(request.title, "Edit config.toml");
+    handle
+        .command(Command::Answer {
+            request_id: request.id,
+            action: "proceed_once".into(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+    until(&handle, |snapshot| {
+        !snapshot.busy
+            && snapshot.requests.is_empty()
+            && says(snapshot, "Turned on debugging in config.toml.")
+    });
+
+    prompt(&handle, "Ask permission again");
+    until(&handle, |snapshot| !snapshot.requests.is_empty());
+    handle.command(Command::Interrupt).unwrap();
+    let snapshot = until(&handle, |snapshot| {
+        !snapshot.busy && snapshot.requests.is_empty()
+    });
+    assert!(!snapshot.waiting);
+
+    prompt(&handle, "hold on");
+    until(&handle, |snapshot| {
+        snapshot.items.iter().any(|item| {
+            matches!(&item.content,
+            ItemContent::Command { command, .. } if command == "sleep 60")
+        })
+    });
+    handle.command(Command::Interrupt).unwrap();
+    let snapshot = until(&handle, |snapshot| !snapshot.busy);
+    assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+        ItemContent::Command { command, status: super::super::ToolStatus::Stopped, .. }
+            if command == "sleep 60")));
+
+    prompt(&handle, "garbage please");
+    let snapshot = until(&handle, |snapshot| {
+        !snapshot.busy
+            && says(snapshot, "Before the stray line. ")
+            && says(snapshot, "After the stray line.")
+    });
+    prompt(&handle, "Read some files");
+    let snapshot_files = until(&handle, |snapshot| {
+        !snapshot.busy
+            && says(
+                snapshot,
+                "The client answered fs/read_text_file with error -32601.",
+            )
+    });
+    assert!(
+        snapshot.error.is_none() && snapshot_files.error.is_none(),
+        "{:?}",
+        snapshot_files.error
+    );
+    assert!(!snapshot_files.exited);
+    handle.close().unwrap();
+    assert!(handle.failure().is_none());
+
+    let handle = start(Some(session.clone()));
+    let snapshot = until(&handle, |snapshot| snapshot.ready);
+    assert_eq!(snapshot.session_id.as_deref(), Some(session.as_str()));
+    assert!(says(&snapshot, "Turned on debugging in config.toml."));
+    assert!(snapshot.items.iter().any(|item| item.role == super::super::Role::User
+        && matches!(&item.content, ItemContent::Text { text, .. } if text == "Use some tools")));
+    assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+    handle.close().unwrap();
+    assert!(handle.failure().is_none());
+}
+
 fn json_lines_spec(arguments: Vec<String>, program: &str) -> ProcessSpec {
     ProcessSpec {
         stdout_noise: None,
@@ -4377,7 +4526,7 @@ fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
 }
 
 #[test]
-fn claude_is_the_only_provider_whose_spec_tolerates_stdout_noise() {
+fn only_providers_that_opt_in_tolerate_stdout_noise() {
     let recipe = crate::model::LaunchRecipe {
         program: "/bin/false".into(),
         arguments: Vec::new(),
