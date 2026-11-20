@@ -2239,6 +2239,16 @@ harness, it provides:
   up to 900 seconds to show its app window. The default is 180 seconds; use a
   whole number from 1 to 3600. Readiness still requires the mapped window.
   This deadline counts toward, and does not extend, the `--limit` session lifetime.
+- **Drags.** `drive drag FROM TO` presses, travels and releases in one
+  injector run, moving by relative steps, so the app sees the path between
+  the two points. A hand-written gesture through the injector (`vptr`) must
+  hold its button within one run and travel with `r` steps, or with `a` once
+  that run has placed the pointer. `a` in a run that has not placed it
+  reaches its point by pinning the pointer to the screen's origin. Before
+  niri-harness#5, it did so with a button held, dragging through the corner
+  on every move: a dragged scrollbar thumb snapped to the top between steps.
+  The injector now refuses that. Check a drag's frames, not only where it
+  ended.
 - **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
   the GTK backend on the session's private bus, so the app's Attach dialog
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
