@@ -2544,6 +2544,7 @@ fn retained_copy_keeps_its_typed_payload_for_io_retry_but_not_content_refusal() 
             copy: state.cards[0].clone(),
             draft: "Keep exact retry bytes".into(),
             attachments: Vec::new(),
+            draft_model: None,
             scope: None,
             channel: None,
         };
@@ -2720,6 +2721,7 @@ fn retained_copy_explicit_retry_commits_real_bytes_after_its_initial_error() {
         copy: card,
         draft: "Retry exact bytes  \nUnicode 🦀".into(),
         attachments: Vec::new(),
+        draft_model: None,
         scope: Some(scope.clone()),
         channel: None,
     };
@@ -2904,6 +2906,7 @@ fn retained_copy_writer_survives_refused_canonical_snapshots_and_explicit_close(
             copy: card,
             draft: "Saved draft  \nUnicode 🦀".into(),
             attachments: Vec::new(),
+            draft_model: None,
             scope: None,
             channel: None,
         };

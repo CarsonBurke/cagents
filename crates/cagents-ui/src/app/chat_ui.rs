@@ -3511,6 +3511,12 @@ fn known_append(
         || prose.proves(previous, current)
 }
 
+/// Text, attachments and an explicit or restored model/effort choice are
+/// local draft work. Lifecycle and transition guards stay with their callers.
+fn draft_has_local_work(has_text: bool, attachments: &[Attachment], model_chosen: bool) -> bool {
+    has_text || !attachments.is_empty() || model_chosen
+}
+
 impl Runtime {
     /// The word the caret is naming something with and the rows offered for
     /// it, or `None` while there is nothing to offer.
@@ -4193,6 +4199,17 @@ impl Runtime {
             .as_deref()
             .filter(|_| self.history_cursor.is_some())
             .unwrap_or(&self.attachments)
+    }
+
+    fn has_local_draft_work(&self, saved_model: Option<&ChatDraftModel>) -> bool {
+        draft_has_local_work(
+            self.has_unsent_text(),
+            self.unsent_attachments(),
+            self.session.is_unstarted()
+                && (self.draft_model_chosen
+                    || saved_model
+                        .is_some_and(|model| model.provider == self.session.launch.provider)),
+        )
     }
 
     /// Checks carried-over unsent text against the message `echo` names,
@@ -8861,9 +8878,11 @@ impl Cagents {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
             if runtime.session.is_unstarted()
                 && runtime.choosing()
-                && !runtime.draft_model_chosen
-                && runtime.composer.is_empty()
-                && runtime.attachments.is_empty()
+                && !draft_has_local_work(
+                    !runtime.composer.is_empty(),
+                    &runtime.attachments,
+                    runtime.draft_model_chosen,
+                )
                 && runtime.commands.is_idle())
             && !self.chat_start_pending(card)
     }
@@ -9682,19 +9701,25 @@ impl Cagents {
         };
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
-                || runtime.has_unsent_text()
-                || !runtime.unsent_attachments().is_empty()
+                || runtime.has_local_draft_work(self.chat_ui.draft_models.get(&card))
                 || runtime.transition_blocker().is_some()
-        }) || self
-            .chat_ui
-            .drafts
-            .get(&card)
-            .is_some_and(|draft| !draft.is_empty())
-            || self
-                .chat_ui
+        }) || draft_has_local_work(
+            self.chat_ui
+                .drafts
+                .get(&card)
+                .is_some_and(|draft| !draft.is_empty()),
+            self.chat_ui
                 .draft_attachments
                 .get(&card)
-                .is_some_and(|images| !images.is_empty())
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            self.chat_ui.draft_models.get(&card).is_some_and(|model| {
+                self.card_state(card).is_some_and(|state| {
+                    matches!(&state.kind, CardKind::Chat(session)
+                        if session.is_unstarted() && session.launch.provider == model.provider)
+                })
+            }),
+        )
     }
 
     /// A live or starting conversation no authoritative view has ever listed.

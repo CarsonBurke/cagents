@@ -15269,7 +15269,7 @@ fn saved_draft_model_is_restored_through_shared_startup() {
     }
 }
 
-fn reload_draft_model_workspace(saved: &WorkspaceState) -> Cagents {
+pub(in crate::app) fn reload_draft_model_workspace(saved: &WorkspaceState) -> Cagents {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("window.sqlite3");
     let boot = crate::model::BootId::new("draft-model-reload");
@@ -15286,6 +15286,10 @@ fn reload_draft_model_workspace(saved: &WorkspaceState) -> Cagents {
     drop(store);
     let store = crate::persistence::StateStore::open(&path, boot).unwrap();
     let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    draft_model_app_from_loaded_workspace(loaded)
+}
+
+fn draft_model_app_from_loaded_workspace(loaded: WorkspaceState) -> Cagents {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.chat_ui = State::for_workspace(&loaded);
     app.shared_views = super::super::shared_views::State::for_workspace(&loaded);
@@ -15425,6 +15429,153 @@ fn saved_draft_model_follows_retained_content_through_shared_startup() {
         restored.persistent_workspace().chat_draft_models[&retained],
         chosen
     );
+}
+
+#[test]
+fn saved_draft_model_only_work_is_retained_through_shared_startup() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    Arc::make_mut(&mut app.durable).workspace_model_identity = Some(uuid::Uuid::new_v4());
+    let saved = app.persistent_workspace();
+    let chosen = saved.chat_draft_models[&card].clone();
+    let mut restored = reload_draft_model_workspace(&saved);
+    let mut pane = crate::workspace_model::views::Pane::from_card(
+        restored.card_state(card).unwrap(),
+        restored.durable.card_scopes.get(&card).cloned(),
+    )
+    .unwrap();
+    let CardKind::Chat(replacement) = &mut pane.kind else {
+        unreachable!()
+    };
+    replacement.id = TerminalId::new();
+    let (task, retained) = restored.admit_shared_chat(&pane);
+    drop(task);
+    let retained = retained.expect("a model choice alone is local draft work");
+    assert_eq!(restored.chat_ui.draft_models.get(&retained), Some(&chosen));
+    let replacement = chat_runtime(&restored, card);
+    assert_eq!(replacement.snapshot.selected_model, None);
+    assert_eq!(replacement.snapshot.reasoning, None);
+    let retained_pane = crate::workspace_model::views::Pane::from_card(
+        restored.card_state(retained).unwrap(),
+        restored.durable.card_scopes.get(&retained).cloned(),
+    )
+    .unwrap();
+    drop(restored.admit_shared_chat(&retained_pane));
+    let runtime = chat_runtime(&restored, retained);
+    assert!(runtime.composer.is_empty());
+    assert_eq!(runtime.snapshot.selected_model, chosen.model);
+    assert_eq!(runtime.snapshot.reasoning, chosen.reasoning);
+}
+
+#[test]
+fn saved_draft_model_checkpoint_reopens_after_the_workspace_save_is_refused() {
+    use iced::futures::StreamExt;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    write(&mut app, card, "checkpoint keeps the text and choice");
+    Arc::make_mut(&mut app.durable).workspace_model_identity = Some(uuid::Uuid::new_v4());
+    let saved = app.persistent_workspace();
+    let chosen = saved.chat_draft_models[&card].clone();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("checkpoint.sqlite3");
+    let boot = crate::model::BootId::new("draft-model-checkpoint");
+    let store = crate::persistence::StateStore::open(&path, boot.clone()).unwrap();
+    store
+        .save_workspace(
+            &saved,
+            crate::persistence::SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    drop(store);
+    let (writer, loaded) = crate::session::SessionRuntime::open(&path, boot.clone()).unwrap();
+    let loaded = loaded.unwrap();
+    let mut restored = draft_model_app_from_loaded_workspace(loaded);
+    restored.session = Some(writer);
+    let mut pane = crate::workspace_model::views::Pane::from_card(
+        restored.card_state(card).unwrap(),
+        restored.durable.card_scopes.get(&card).cloned(),
+    )
+    .unwrap();
+    let CardKind::Chat(replacement) = &mut pane.kind else {
+        unreachable!()
+    };
+    replacement.id = TerminalId::new();
+    let (task, retained) = restored.admit_shared_chat(&pane);
+    let retained = retained.expect("the text needs a retained copy");
+    // Execute the actual checkpoint task and its receipt, without running any
+    // provider or native-window task.
+    let message = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::ChatUi(Action::RetainedCopyCommitted(..)),
+                    )) = effect
+                    {
+                        return message;
+                    }
+                }
+                panic!("retained checkpoint did not report its receipt");
+            })
+            .await
+            .unwrap()
+        });
+    assert!(
+        matches!(&message, Message::ChatUi(Action::RetainedCopyCommitted(id, Ok(()))) if *id == retained)
+    );
+    drop(restored.update(message));
+    let mut refused = (*restored.persistent_workspace()).clone();
+    let state = refused
+        .cards
+        .iter_mut()
+        .find(|state| state.id == card)
+        .unwrap();
+    let CardKind::Chat(session) = &mut state.kind else {
+        unreachable!()
+    };
+    session
+        .launch
+        .recipe
+        .arguments
+        .push("--unproved-replacement".into());
+    // Refuse the whole snapshot before any navigation metadata can commit;
+    // a descriptor-only refusal can still save that metadata separately.
+    refused.cards.push(refused.cards[0].clone());
+    let mut writer = restored.session.take().unwrap();
+    writer.snapshot_conversion(Arc::new(refused));
+    assert!(
+        writer.flush(Duration::from_secs(10)).is_err(),
+        "the full snapshot must be refused"
+    );
+    writer.shutdown();
+    drop(writer);
+    let store = crate::persistence::StateStore::open(&path, boot).unwrap();
+    let loaded = store.load_workspace(saved.id, None).unwrap().unwrap();
+    assert_eq!(
+        loaded.chat_drafts[&retained],
+        "checkpoint keeps the text and choice"
+    );
+    let mut reopened = draft_model_app_from_loaded_workspace(loaded);
+    let pane = crate::workspace_model::views::Pane::from_card(
+        reopened.card_state(retained).unwrap(),
+        reopened.durable.card_scopes.get(&retained).cloned(),
+    )
+    .unwrap();
+    drop(reopened.admit_shared_chat(&pane));
+    let runtime = chat_runtime(&reopened, retained);
+    assert_eq!(
+        runtime.composer.text(),
+        "checkpoint keeps the text and choice"
+    );
+    assert_eq!(runtime.snapshot.selected_model, chosen.model);
+    assert_eq!(runtime.snapshot.reasoning, chosen.reasoning);
 }
 
 #[test]

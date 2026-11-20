@@ -157,6 +157,16 @@ impl Cagents {
             copy: self.card_state(copy).expect("retained card exists").clone(),
             draft,
             attachments,
+            draft_model: runtime.draft_model().or_else(|| {
+                self.chat_ui
+                    .draft_models
+                    .get(&copy)
+                    .filter(|model| {
+                        runtime.session.is_unstarted()
+                            && model.provider == runtime.session.launch.provider
+                    })
+                    .cloned()
+            }),
             scope: self.durable.card_scopes.get(&copy).cloned(),
             channel: self
                 .durable
@@ -323,9 +333,7 @@ impl Cagents {
         // the current pane, with its original descriptor and content intact.
         let same_source =
             matches!(&pane.kind, CardKind::Chat(session) if session == &runtime.session);
-        if !same_source
-            && (!runtime.unsent_text().is_empty() || !runtime.unsent_attachments().is_empty())
-        {
+        if !same_source && runtime.has_local_draft_work(self.chat_ui.draft_models.get(&pane.id)) {
             let retained = CardId::new();
             let mut state = self
                 .card_state(pane.id)

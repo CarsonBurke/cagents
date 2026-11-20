@@ -370,6 +370,9 @@ pub struct RetainedChatCopy {
     /// Empty omission preserves the digest of pre-image retained-copy receipts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::chat::Attachment>,
+    /// The unstarted draft's model and effort, committed with its content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model: Option<crate::model::ChatDraftModel>,
     pub scope: Option<PathBuf>,
     pub channel: Option<crate::model::ChannelId>,
 }
@@ -383,6 +386,9 @@ impl RetainedChatCopy {
             || !matches!(&self.copy.kind, CardKind::Chat(session) if session == &self.source)
             || !self.source.has_valid_native_continuity()
             || (self.source.owned_codex_listener.is_some() && !self.source.owns_codex_listener())
+            || self.draft_model.as_ref().is_some_and(|model| {
+                !self.source.is_unstarted() || model.provider != self.source.launch.provider
+            })
         {
             return Err(invalid_state!(
                 "Retained chat copy changed its captured source"
@@ -408,6 +414,12 @@ impl RetainedChatCopy {
             }
         }
         Ok(())
+    }
+
+    fn project_draft_model(&self, models: &mut HashMap<CardId, crate::model::ChatDraftModel>) {
+        if let Some(model) = &self.draft_model {
+            models.insert(self.copy.id, model.clone());
+        }
     }
 
     /// Keep a committed copy reachable in snapshots captured before its receipt.
@@ -449,6 +461,16 @@ impl RetainedChatCopy {
                 "Retained chat copy attachments changed before saving"
             ));
         }
+        if state
+            .chat_draft_models
+            .get(&self.copy.id)
+            .is_some_and(|model| Some(model) != self.draft_model.as_ref())
+        {
+            return Err(invalid_state!(
+                "Retained chat copy model changed before saving"
+            ));
+        }
+        self.project_draft_model(&mut state.chat_draft_models);
         state.chat_drafts.insert(self.copy.id, self.draft.clone());
         if !self.attachments.is_empty() {
             state
@@ -1719,6 +1741,7 @@ impl StateStore {
                     .map(Vec::as_slice)
                     .unwrap_or_default()
                     != copy.attachments.as_slice()
+                || manifest.chat_draft_models.get(&copy.copy.id) != copy.draft_model.as_ref()
                 || !manifest.local_only_cards.contains(&copy.copy.id)
                 || manifest.pending_chat_admissions.get(&copy.copy.id) != Some(&copy.source)
                 || !(manifest.card_scopes.contains_key(&copy.copy.id)
@@ -1776,6 +1799,7 @@ impl StateStore {
                 .chat_draft_attachments
                 .insert(copy.copy.id, copy.attachments.clone());
         }
+        copy.project_draft_model(&mut manifest.chat_draft_models);
         manifest.local_only_cards.insert(copy.copy.id);
         manifest
             .pending_chat_admissions
@@ -1792,6 +1816,10 @@ impl StateStore {
             (
                 "chat_draft_attachments",
                 ordered_map_json(&manifest.chat_draft_attachments)?,
+            ),
+            (
+                "chat_draft_models",
+                ordered_map_json(&manifest.chat_draft_models)?,
             ),
             (
                 "local_only_cards",
@@ -8818,6 +8846,7 @@ mod tests {
                     retained_image_fixture(29),
                     crate::chat::Attachment::file("/project/notes.txt"),
                 ],
+                draft_model: None,
                 scope: None,
                 channel: None,
             };
@@ -8941,6 +8970,64 @@ mod tests {
     }
 
     #[test]
+    fn retained_chat_copy_checkpoint_keeps_model_without_workspace_snapshot() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = directory.path().join("model-copy.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        source.launch.session_id = None;
+        source.terminal = None;
+        let original = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        let model = crate::model::ChatDraftModel {
+            provider: crate::agent::Provider::Claude,
+            model: Some("haiku".into()),
+            reasoning: Some("low".into()),
+        };
+        workspace.chat_draft_models.insert(original, model.clone());
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        store
+            .replace_chat_identity(original, source.id, &replacement)
+            .unwrap();
+        let mut card = workspace.cards[0].clone();
+        card.id = CardId::new();
+        let copy = RetainedChatCopy {
+            workspace: workspace.id,
+            source_card: original,
+            source,
+            copy: card,
+            draft: "Keep this draft's text and choice".into(),
+            attachments: Vec::new(),
+            draft_model: None,
+            scope: None,
+            channel: None,
+        };
+        // A serialized request exercises the standalone checkpoint payload.
+        let mut request = serde_json::to_value(copy).unwrap();
+        request["draft_model"] = serde_json::to_value(&model).unwrap();
+        let copy: RetainedChatCopy = serde_json::from_value(request).unwrap();
+        let committed = store.preserve_chat_copy(&copy).unwrap();
+        drop(store);
+        // No full workspace snapshot follows the independent checkpoint.
+        let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let replayed = reopened.preserve_chat_copy(&copy).unwrap();
+        assert_eq!(replayed.generation, committed.generation);
+        let saved = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
+        assert_eq!(saved.chat_draft_models.get(&copy.copy.id), Some(&model));
+        assert_eq!(saved.chat_draft_models.get(&original), Some(&model));
+        assert_eq!(
+            reopened.load_card(original, None).unwrap().unwrap().kind,
+            CardKind::Chat(replacement)
+        );
+    }
+
+    #[test]
     fn retained_image_copy_rolls_back_all_fields_when_image_metadata_cannot_commit() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("copy-failure.sqlite3");
@@ -8960,6 +9047,7 @@ mod tests {
             copy: card,
             draft: String::new(),
             attachments: vec![retained_image_fixture(29)],
+            draft_model: None,
             scope: None,
             channel: None,
         };
@@ -9022,6 +9110,7 @@ mod tests {
             copy: card,
             draft: "Legacy exact bytes \n🦀".into(),
             attachments: Vec::new(),
+            draft_model: None,
             scope: None,
             channel: None,
         };
@@ -9042,6 +9131,7 @@ mod tests {
         );
         let old_request = serde_json::from_str::<RetainedChatCopy>(&old_bytes).unwrap();
         assert_eq!(old_request, copy);
+        assert!(old_request.draft_model.is_none());
         let directory = tempdir().unwrap();
         let path = directory.path().join("legacy-copy.sqlite3");
         let store = StateStore::open(&path, boot("chat-boot")).unwrap();
