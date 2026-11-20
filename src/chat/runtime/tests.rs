@@ -2987,6 +2987,94 @@ fn a_window_fills_itself_from_short_provider_pages_once_it_is_read() {
     assert_eq!(asked.load(Ordering::SeqCst), pages + 7);
     handle.close().unwrap();
 }
+/// A provider that answers history later, as Codex does, refuses a second
+/// request while one is loading. A reader who pages back while a page asked
+/// for to fill the window is on its way is answered by that page, rather than
+/// shown the provider's refusal.
+#[test]
+fn a_reader_paging_back_during_a_fill_waits_for_the_page_on_its_way() {
+    struct Later {
+        loading: bool,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Adapter for Later {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Ready(true),
+                    Event::History {
+                        items: vec![text("newest", "newest")],
+                        has_earlier: true,
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::LoadEarlier if self.loading => Err("history is already loading".into()),
+                Command::LoadEarlier => {
+                    self.loading = true;
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step {
+                        events: vec![Event::HistoryLoading(true)],
+                        ..Step::default()
+                    })
+                }
+                // Answers the outstanding request.
+                Command::Compact => Ok(Step {
+                    writes: vec![json!({"page": true})],
+                    ..Step::default()
+                }),
+                _ => Err("unexpected fixture command".into()),
+            }
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            self.loading = false;
+            Ok(Step {
+                events: vec![
+                    Event::HistoryLoading(false),
+                    Event::History {
+                        items: vec![text("older", "older")],
+                        has_earlier: false,
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut adapter: Box<dyn Adapter> = Box::new(Later {
+        loading: false,
+        asked: Arc::clone(&asked),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    // Reading the one-row window starts a fill.
+    until(&handle, |snapshot| snapshot.history_loading);
+    handle.command(Command::LoadEarlier).unwrap();
+    assert!(handle.snapshot(None).unwrap().error.is_none());
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    handle.command(Command::Compact).unwrap();
+    let window = until(&handle, |snapshot| snapshot.items.len() == 2);
+    assert_eq!(window.items[0].id, "older");
+    assert!(!window.history_loading);
+    assert!(window.error.is_none());
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    handle.close().unwrap();
+}
 impl Adapter for Echo {
     fn initialize(&mut self) -> Result<Step, String> {
         Ok(Step {

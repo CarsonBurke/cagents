@@ -3178,6 +3178,24 @@ impl Actor {
                             let _ = reply.send(Ok(()));
                             continue;
                         }
+                        // An earlier page asked for to fill the window is
+                        // still on its way, and it answers the reader too:
+                        // a second request would be refused as a second load.
+                        if command == Command::LoadEarlier
+                            && self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .filling()
+                            && self
+                                .state
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .history_loading
+                        {
+                            let _ = reply.send(Ok(()));
+                            continue;
+                        }
                     }
                     Err(error) => {
                         let _ = refuse(error);
@@ -3283,6 +3301,7 @@ impl Actor {
     /// for, which no reader asked for; see [`Store::fill`].
     fn fill_history(&mut self) -> Result<(), String> {
         if self.stop.load(Ordering::Acquire)
+            || self.queued > QUEUE_BACKPRESSURE
             || self
                 .state
                 .lock()
