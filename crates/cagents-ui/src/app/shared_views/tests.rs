@@ -1,3 +1,4 @@
+mod channel_name_reset;
 mod history_start;
 mod published_card_edits;
 mod removal_tests;

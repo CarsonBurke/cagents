@@ -1081,6 +1081,15 @@ impl Cagents {
             }
             update => update,
         };
+        // A receipt completes this local publication even if the window
+        // joined a different registry while it was in flight.
+        if let ModelUpdate::Committed {
+            edit: ModelEdit::RetitleChannel { id, .. },
+            ..
+        } = &update
+        {
+            self.acknowledge_channel_name(*id);
+        }
         let foreign = match &update {
             ModelUpdate::Committed { receipt, .. } => {
                 receipt.identity != self.workspace_model.identity
@@ -2766,10 +2775,9 @@ impl Cagents {
             return false;
         }
         // A name cleared in another window asks for the automatic one, which
-        // this window offers if it runs the channel's conversation. A model
-        // older than this window's own rename looks the same, so it does not
-        // forget that rename (see `channel_is_named`): the registry refuses
-        // the offer once it holds the new name, whose echo then restores it.
+        // this window offers if it runs the channel's conversation. An older
+        // model can look the same while a local rename is pending; its local
+        // retirement guard lasts until the publisher answers.
         let cleared = retitle && !local.title.is_empty() && shared.title.is_empty();
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {
@@ -3203,6 +3211,10 @@ impl Cagents {
             ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
         );
         let request = ModelRequest::from(edit);
+        let retitle = match &request.edit {
+            ModelEdit::RetitleChannel { id, .. } => Some(*id),
+            _ => None,
+        };
         let seed = match &request.edit {
             ModelEdit::SeedView { scope, .. } => {
                 Some((scope.clone(), request.seed_attempt.unwrap()))
@@ -3228,6 +3240,8 @@ impl Cagents {
                     "Could not save the sidebar order; try again once the selected device is connected",
                 ));
             }
+        } else if let Some(id) = retitle {
+            self.note_channel_name_queued(id);
         }
     }
 }

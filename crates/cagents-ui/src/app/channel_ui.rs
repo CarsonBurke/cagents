@@ -458,9 +458,12 @@ pub struct State {
     /// reclaim it until it reports a name of its own, which one that fails
     /// to reconnect never does.
     names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
-    /// Channels the person renamed in this window. A name is never taken back
-    /// automatically, so this stays true once the registry has the rename.
+    /// Local names whose publications have not yet been acknowledged. The
+    /// canonical title protects a confirmed manual name after that.
     named: HashSet<ChannelId>,
+    /// All queued retitles, including resets, so an older receipt cannot
+    /// release the protection for a newer local name.
+    pending_names: HashMap<ChannelId, usize>,
     reopening: HashMap<ChannelId, PendingReopen>,
     /// Emptied channels waiting for their view publication to settle, by the
     /// incarnation the close saw, with what made each a candidate. The
@@ -1495,6 +1498,24 @@ impl Cagents {
     /// Records that channel `id` went back to its automatic name.
     pub(super) fn note_channel_unnamed(&mut self, id: ChannelId) {
         self.channel_ui.named.remove(&id);
+    }
+
+    pub(super) fn note_channel_name_queued(&mut self, id: ChannelId) {
+        *self.channel_ui.pending_names.entry(id).or_default() += 1;
+    }
+
+    /// Publisher receipts settle in queue order, including a reset followed
+    /// by another rename. Only the last outstanding receipt releases the
+    /// local guard; the canonical title then decides whether it is named.
+    pub(super) fn acknowledge_channel_name(&mut self, id: ChannelId) {
+        let Some(pending) = self.channel_ui.pending_names.get_mut(&id) else {
+            return;
+        };
+        *pending -= 1;
+        if *pending == 0 {
+            self.channel_ui.pending_names.remove(&id);
+            self.channel_ui.named.remove(&id);
+        }
     }
 
     /// Whether `id` holds nothing a person could lose with it, as this window
