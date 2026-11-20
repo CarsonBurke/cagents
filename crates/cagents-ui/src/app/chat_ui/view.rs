@@ -7409,7 +7409,6 @@ fn footer_model_label<'a>(
         active
             .reasoning
             .as_deref()
-            .filter(offered)
             .filter(|effort| Some(*effort) != active.default_reasoning.as_deref())
     });
     match effort.filter(|effort| !effort.is_empty()) {
