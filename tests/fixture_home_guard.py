@@ -117,6 +117,19 @@ def snapshot(root):
     return found
 
 
+def fixture_scripts(root):
+    """Discover source scripts, including provider stand-ins without suffixes."""
+    found = set()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        with path.open("rb") as source:
+            shebang = source.read(2) == b"#!"
+        if path.suffix in (".sh", ".py", ".js", ".c") or shebang:
+            found.add(str(path.relative_to(root)))
+    return found
+
+
 class Home(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="fixture-home-contract-", dir="/var/tmp")
@@ -401,8 +414,7 @@ for _scene in SCENES:
 
 class Inventory(unittest.TestCase):
     def test_every_script_is_enumerated_and_provider_like_scripts_call_shared_guard(self):
-        paths = {str(path.relative_to(FIXTURES)) for path in FIXTURES.rglob("*")
-                 if path.is_file() and path.suffix in (".sh", ".py", ".js", ".c")}
+        paths = fixture_scripts(FIXTURES)
         guarded = {case.filename for case in CASES} | set(SCENES) | set(EXTERNAL_GUARDED)
         self.assertEqual(paths, guarded | set(NOT_APPLICABLE),
                          "classify each new fixture and add its dynamic guard contracts")
@@ -421,6 +433,20 @@ class Inventory(unittest.TestCase):
             with self.subTest(unprotected=filename):
                 if provider_reference.search((FIXTURES / filename).read_text()):
                     self.assertTrue(NOT_APPLICABLE[filename])
+
+    def test_extensionless_and_new_language_provider_scripts_require_inventory_entries(self):
+        with tempfile.TemporaryDirectory(prefix="fixture-inventory-contract-", dir="/var/tmp") as directory:
+            root = Path(directory)
+            (root / "nested").mkdir()
+            (root / "claude").write_text('#!/bin/sh\nprintf "%s" "$CLAUDE_CONFIG_DIR"\n')
+            (root / "nested/provider.rb").write_text('#!/usr/bin/env ruby\nputs ENV["CODEX_HOME"]\n')
+            (root / "known.py").write_text("pass\n")
+            (root / "transcript.jsonl").write_text('{"message":"invented data"}\n')
+            discovered = fixture_scripts(root)
+            self.assertEqual(discovered, {"claude", "nested/provider.rb", "known.py"})
+            declared = {"known.py"}
+            self.assertEqual(discovered - declared, {"claude", "nested/provider.rb"},
+                             "shebang providers must reach the explicit inventory check")
 
     def test_workspace_state_boundaries_call_the_python_helper(self):
         guarded = ("apply.py", "claude.py", "codex.py", "codex_check.py", "repositories.py", "generate.py")
