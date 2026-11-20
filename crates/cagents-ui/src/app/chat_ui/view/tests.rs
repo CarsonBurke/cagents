@@ -6106,19 +6106,26 @@ fn narrow_footer_model_picker_contains_model_and_reasoning_choices() {
 
 /// Where the controls named `roles`, the footer, and the footer's text
 /// land when `runtime` is drawn `width` wide.
-struct Laid {
+pub(super) struct Laid {
     footer: iced::Rectangle,
-    controls: HashMap<String, iced::Rectangle>,
+    pub(super) controls: HashMap<String, iced::Rectangle>,
     footer_text: Vec<String>,
     /// Every text the view draws.
-    text: Vec<String>,
+    pub(super) text: Vec<String>,
+    /// Every text the view draws, with where it lands.
+    pub(super) placed_text: Vec<(iced::Rectangle, String)>,
     /// What assistive technology is told inside the footer.
     footer_names: Vec<String>,
     /// The far edge of whatever the footer draws, text or named glyph.
     footer_drawn_right: f32,
 }
 
-fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles: &[&str]) -> Laid {
+pub(super) fn lay_out(
+    runtime: &Runtime,
+    width: f32,
+    accounts: Option<ChatAccounts>,
+    roles: &[&str],
+) -> Laid {
     use iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree, operation::Focusable},
@@ -6217,6 +6224,7 @@ fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles:
         .filter(|(bounds, _)| footer.contains(bounds.center()))
         .collect();
     let all_text = probe.text.iter().map(|(_, text)| text.clone()).collect();
+    let placed_text = probe.text.clone();
     let text: Vec<(iced::Rectangle, String)> = probe
         .text
         .into_iter()
@@ -6225,6 +6233,7 @@ fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles:
     Laid {
         footer,
         text: all_text,
+        placed_text,
         controls: probe.controls,
         footer_drawn_right: text
             .iter()
@@ -6237,7 +6246,7 @@ fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles:
 }
 
 /// A settled conversation with every footer control a provider offers.
-fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
+pub(super) fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
     let (mut runtime, handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
     snapshot.capabilities.model_selection = true;
