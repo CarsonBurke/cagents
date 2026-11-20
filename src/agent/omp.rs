@@ -76,6 +76,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     resume_picker: true,
     latest_selectors: &["--continue", "-c"],
     native_chat: true,
+    permission_modes: &["always-ask", "write", "yolo"],
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,

@@ -310,6 +310,15 @@ impl Handle {
             match service::validate_target(host, &claim.definition, &claim.target_identity)
                 .and_then(|directory| {
                     agent_execution::selected_account(&claim.definition.agent).map(|_| directory)
+                })
+                .and_then(|directory| {
+                    // Saved before modes were checked per provider: say so
+                    // on the run instead of starting it under another policy.
+                    claim
+                        .definition
+                        .agent
+                        .check_permission_mode()
+                        .map(|()| directory)
                 }) {
                 Ok(directory) => directory,
                 Err(error) => {

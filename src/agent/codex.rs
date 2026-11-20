@@ -70,6 +70,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     resume_picker: true,
     latest_selectors: &["--last"],
     native_chat: true,
+    permission_modes: &["untrusted", "on-failure", "on-request", "never"],
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: true,

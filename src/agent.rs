@@ -161,6 +161,11 @@ struct ProviderAdapter {
     /// Whether cagents can run this provider's conversations as native chat.
     /// Without it the provider runs only in a terminal.
     native_chat: bool,
+    /// The permission modes an agent cagents starts may be given, by the
+    /// names `agent spawn --permission-mode` and automations take: the
+    /// provider's own for Claude, Codex and OMP, and for an ACP agent the
+    /// cagents name of each of its session modes.
+    permission_modes: &'static [&'static str],
     /// What cagents knows of a provider whose native chat is the Agent
     /// Client Protocol, for one that serves it.
     acp: Option<Acp>,
@@ -352,6 +357,29 @@ impl Provider {
     /// converted or started as a native conversation.
     pub fn has_native_chat(self) -> bool {
         self.adapter().native_chat
+    }
+
+    /// The permission modes an agent of this provider may be started with.
+    pub fn permission_modes(self) -> &'static [&'static str] {
+        self.adapter().permission_modes
+    }
+
+    /// Refuses a permission mode this provider has no such mode for, such as
+    /// another provider's, naming the ones it has.
+    pub fn check_permission_mode(self, mode: &str) -> Result<(), String> {
+        let modes = self.permission_modes();
+        if modes.contains(&mode) {
+            return Ok(());
+        }
+        let choices = match modes {
+            [] => return Err(format!("{} takes no permission mode", self.label())),
+            [only] => (*only).to_owned(),
+            [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+        };
+        Err(format!(
+            "{} has no permission mode {mode:?}; choose {choices}",
+            self.label()
+        ))
     }
 
     /// How this provider serves the Agent Client Protocol, for one whose

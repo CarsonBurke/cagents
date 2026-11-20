@@ -104,6 +104,9 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     resume_picker: true,
     latest_selectors: &["--last"],
     native_chat: true,
+    // "Deny unmatched actions" has no terminal option, but a native
+    // conversation sets it as its session mode.
+    permission_modes: &["manual", "auto", "dontAsk", "bypassPermissions"],
     acp: Some(super::Acp {
         mode_option: "--approval-mode",
         effort_option: "--reasoning-effort",

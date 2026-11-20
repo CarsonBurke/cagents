@@ -472,6 +472,9 @@ pub(super) fn enabled(
         // Resolving an explicit saved account fails if that account was removed;
         // enabling never silently substitutes a project's new default account.
         agent_execution::selected_account(&automation.definition.agent)?;
+        // A definition saved before its provider's modes were checked may
+        // name another provider's; it is refused here rather than started.
+        automation.definition.agent.check_permission_mode()?;
         Some(Compiled::new(&automation.definition.schedule)?.next_after(now)?)
     } else {
         None

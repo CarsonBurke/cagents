@@ -263,6 +263,18 @@ pub struct Spec {
     pub reasoning_effort: Option<String>,
 }
 
+impl Spec {
+    /// Refuses a permission mode the provider has no such mode for, as
+    /// another provider's name for one would be: started anyway, the agent
+    /// would ignore it or refuse to start, and run under a policy nobody
+    /// chose.
+    pub fn check_permission_mode(&self) -> Result<(), String> {
+        self.permission_mode
+            .as_deref()
+            .map_or(Ok(()), |mode| self.provider.check_permission_mode(mode))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Destination {
     New(Spec),
@@ -368,6 +380,7 @@ impl Submit {
             {
                 return Err(format!("Invalid reasoning effort {effort:?}"));
             }
+            spec.check_permission_mode()?;
         }
         Ok(())
     }
@@ -911,6 +924,62 @@ mod tests {
         assert!(request.validate().unwrap_err().contains("Only a new agent"));
         request.name = None;
         request.validate().unwrap();
+    }
+
+    #[test]
+    fn each_provider_takes_only_its_own_permission_modes() {
+        let request = |provider, mode: &str| Submit {
+            name: None,
+            destination: Destination::New(Spec {
+                provider,
+                permission_mode: Some(mode.into()),
+                ..spec()
+            }),
+            prompt: "work".into(),
+            idempotency_key: "key".into(),
+        };
+        for provider in Provider::ALL {
+            for mode in provider.permission_modes() {
+                assert_eq!(
+                    request(provider, mode).validate(),
+                    Ok(()),
+                    "{provider:?} {mode}"
+                );
+            }
+            // An ACP agent's modes are named by what they mean, which is
+            // also how the interface offers and the launch reads them.
+            for meaning in provider
+                .acp()
+                .into_iter()
+                .flat_map(|acp| acp.mode_meanings())
+            {
+                assert!(
+                    provider.permission_modes().contains(&meaning),
+                    "{provider:?} {meaning}"
+                );
+            }
+        }
+        for (provider, foreign) in [
+            (Provider::Antigravity, "bypassPermissions"),
+            (Provider::Antigravity, "never"),
+            (Provider::Muse, "plan"),
+            (Provider::Muse, "on-request"),
+            (Provider::Claude, "never"),
+            (Provider::Codex, "plan"),
+            (Provider::Omp, "acceptEdits"),
+        ] {
+            assert!(
+                request(provider, foreign).validate().is_err(),
+                "{provider:?} accepted {foreign}"
+            );
+        }
+        assert_eq!(
+            request(Provider::Antigravity, "never").validate(),
+            Err("Antigravity has no permission mode \"never\"; choose default, acceptEdits, auto or plan".into())
+        );
+        // Muse's "Deny unmatched actions" has no terminal option, but is a
+        // mode of its native conversation.
+        assert_eq!(request(Provider::Muse, "dontAsk").validate(), Ok(()));
     }
 
     #[test]
