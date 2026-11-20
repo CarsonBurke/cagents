@@ -40,23 +40,38 @@
       <feDropShadow dx="0" dy="2.0" stdDeviation="1.6" flood-color="#1E1C1A" flood-opacity="0.28"/>
     </filter>
 
-    <linearGradient id="dark-side" x1="64" y1="88" x2="64" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#141923"/>
-      <stop offset="100%" stop-color="#090C12"/>
+    <!-- Machined gunmetal 2.5D bottom extrusion with horizontal brushed metallic sheen -->
+    <linearGradient id="dark-side" x1="10" y1="104" x2="118" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#222B3B"/>
+      <stop offset="18%" stop-color="#3C485E"/>
+      <stop offset="50%" stop-color="#4B5870"/>
+      <stop offset="82%" stop-color="#3C485E"/>
+      <stop offset="100%" stop-color="#222B3B"/>
     </linearGradient>
-    <linearGradient id="dark-face" x1="64" y1="10" x2="64" y2="112" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#272F3F"/>
-      <stop offset="35%" stop-color="#191F2C"/>
-      <stop offset="100%" stop-color="#11151F"/>
+    <linearGradient id="dark-side-shade" x1="64" y1="98" x2="64" y2="119" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#000000" stop-opacity="0.36"/>
+      <stop offset="38%" stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="82%" stop-color="#000000" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.42"/>
     </linearGradient>
-    <linearGradient id="dark-rim" x1="64" y1="10" x2="64" y2="112" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.34"/>
-      <stop offset="28%" stop-color="#FFFFFF" stop-opacity="0.08"/>
-      <stop offset="100%" stop-color="#000000" stop-opacity="0.25"/>
+    <linearGradient id="dark-face" x1="64" y1="10" x2="64" y2="111" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#343F54"/>
+      <stop offset="32%" stop-color="#232B3C"/>
+      <stop offset="100%" stop-color="#181E2B"/>
+    </linearGradient>
+    <linearGradient id="dark-rim" x1="64" y1="10" x2="64" y2="111" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.44"/>
+      <stop offset="26%" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="82%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.22"/>
     </linearGradient>
 </defs>
   
+  <!-- 2.5D Orthographic machined gunmetal extrusion lip -->
   <rect x="10" y="18" width="108" height="101" rx="18" fill="url(#dark-side)"/>
+  <rect x="10" y="18" width="108" height="101" rx="18" fill="url(#dark-side-shade)"/>
+  <rect x="10.75" y="18.75" width="106.5" height="99.5" rx="17.25" fill="none" stroke="#94A3B8" stroke-opacity="0.22" stroke-width="1.2"/>
+  <!-- Main satin obsidian top face with crisp front-edge chamfer highlight -->
   <rect x="10" y="10" width="108" height="101" rx="18" fill="url(#dark-face)"/>
   <rect x="11" y="11" width="106" height="99" rx="17" fill="none" stroke="url(#dark-rim)" stroke-width="2"/>
 
