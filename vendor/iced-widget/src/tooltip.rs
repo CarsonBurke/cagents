@@ -386,6 +386,19 @@ where
             );
         });
     }
+
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        state: &widget::Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        // Local change: the content stays in the accessibility tree.
+        self.content
+            .as_widget()
+            .a11y_nodes(layout, &state.children[0], cursor)
+    }
 }
 
 impl<'a, Message, Theme, Renderer> From<Tooltip<'a, Message, Theme, Renderer>>

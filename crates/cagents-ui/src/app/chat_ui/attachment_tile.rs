@@ -433,23 +433,48 @@ mod tests {
         }
     }
 
+    /// Tiles as the composer's tray lays them out: each under the tooltip
+    /// naming its file, in a row that wraps.
     fn tray(ids: &[widget::Id]) -> Element<'static, usize> {
         let tiles = ids.iter().enumerate().map(|(index, id)| {
-            tile(
-                id.clone(),
-                cosmic::widget::Space::new().width(56).height(56),
-                cosmic::widget::Space::new(),
-                cosmic::widget::button::custom(cosmic::widget::Space::new().width(18).height(18))
+            cosmic::widget::tooltip(
+                tile(
+                    id.clone(),
+                    cosmic::widget::Space::new().width(56).height(56),
+                    cosmic::widget::Space::new(),
+                    cosmic::widget::button::custom(
+                        cosmic::widget::Space::new().width(18).height(18),
+                    )
                     .on_press(100 + index),
-                format!("Image {}", index + 1),
-                Some(200 + index),
+                    format!("Image {}", index + 1),
+                    Some(200 + index),
+                )
+                .on_open(Some(index)),
+                cosmic::widget::text("screenshot.png"),
+                cosmic::widget::tooltip::Position::Top,
             )
-            .on_open(Some(index))
             .into()
         });
         cosmic::widget::row::with_children(tiles.collect::<Vec<_>>())
             .spacing(8)
+            .wrap()
             .into()
+    }
+
+    #[test]
+    fn assistive_tools_find_every_tile_in_the_tray() {
+        let ids = [widget::Id::unique(), widget::Id::unique()];
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let ui = UserInterface::build(
+            tray(&ids),
+            Size::new(400.0, 100.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        for id in ids {
+            assert!(nodes.contains(&iced_accessibility::A11yId::from(id)));
+        }
     }
 
     #[test]
