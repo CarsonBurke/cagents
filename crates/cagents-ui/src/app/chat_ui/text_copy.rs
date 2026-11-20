@@ -1,8 +1,7 @@
 //! Logical message Copy reads canonical source pages off the UI thread.
 use super::*;
 
-pub(super) const UNAVAILABLE: &str =
-    "This text is unavailable in the local copy cache. Open the provider transcript to recover it.";
+pub(super) const UNAVAILABLE: &str = chat::TEXT_COPY_UNAVAILABLE;
 
 /// A details copy whose diagnostic changed between the click and the read.
 const DETAILS_CHANGED: &str = "These details changed while copying. Copy them again.";

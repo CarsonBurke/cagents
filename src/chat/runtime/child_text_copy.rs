@@ -150,12 +150,12 @@ pub(super) fn read(
         .subagents
         .iter()
         .find(|agent| agent.id == *id)
-        .ok_or("Child text copy is no longer available")?;
+        .ok_or(crate::chat::TEXT_COPY_UNAVAILABLE)?;
     let sources = state
         .text_copy_sources
         .children
         .get(id)
-        .ok_or("Child text copy is unavailable")?;
+        .ok_or(crate::chat::TEXT_COPY_UNAVAILABLE)?;
     let (index, current) = sources
         .iter()
         .enumerate()
@@ -177,9 +177,9 @@ pub(super) fn read(
         .items
         .get(index)
         .and_then(|item| text(item))
-        .ok_or("Child text copy item is unavailable")?;
+        .ok_or(crate::chat::TEXT_COPY_UNAVAILABLE)?;
     if !valid(current, id, body) || source.bytes > current.bytes || offset > source.bytes {
-        return Err("Child text copy prefix is unavailable".into());
+        return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
     }
     let start = usize::try_from(offset).map_err(|_| "Invalid child text copy offset")?;
     let length = usize::try_from(source.bytes).map_err(|_| "Invalid child text copy length")?;
