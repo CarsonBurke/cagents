@@ -4242,6 +4242,361 @@ fn pull_request_remote_failure_restores_hidden_draft_for_retry() {
 }
 
 #[test]
+fn pull_request_failure_leaves_focus_with_a_dialog_opened_meanwhile() {
+    for result in [
+        Ok(PullRequestCreationOutcome::NotCreated {
+            failure: pull_request_test_failure(4),
+        }),
+        Err("pull request creator failed".into()),
+    ] {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog.clone());
+
+        let _ = app.update(Message::SubmitPullRequest);
+        assert!(app.pull_request_dialog.is_none());
+        app.resume_ui.open = true;
+        let mut frames = PullRequestFrames::new();
+        frames.settle(
+            &mut app,
+            iced::widget::operation::focus(resume_ui::focus_id()).map(cosmic::Action::App),
+        );
+        let failed = app.update(Message::PullRequestCreated {
+            dialog: dialog.clone(),
+            generation: app.pull_request_dialog_generation,
+            result,
+        });
+        frames.settle(&mut app, failed);
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+        assert!(app.resume_ui.open);
+        assert!(frames.contains("conversation-resume.search"));
+        assert!(!frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(resume_ui::focus_id()));
+        let close = app.update(Message::ResumeConversation(resume_ui::Action::Close));
+        frames.settle(&mut app, close);
+        assert!(!frames.contains("conversation-resume.search"));
+        assert!(frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(pull_request_dialog_focus_id()));
+        assert_eq!(app.pull_request_dialog, Some(dialog));
+    }
+}
+
+#[test]
+fn pull_request_failure_leaves_focus_with_the_command_palette() {
+    for result in [
+        Ok(PullRequestCreationOutcome::NotCreated {
+            failure: pull_request_test_failure(4),
+        }),
+        Err("pull request creator failed".into()),
+    ] {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog.clone());
+
+        let _ = app.update(Message::SubmitPullRequest);
+        assert!(app.pull_request_dialog.is_none());
+        let mut frames = PullRequestFrames::new();
+        let open = app.update(Message::Palette(palette_ui::Action::Open));
+        frames.settle(&mut app, open);
+        let query = app.update(Message::Palette(palette_ui::Action::Query("res".into())));
+        frames.settle(&mut app, query);
+        assert_eq!(frames.focused, Some(widget::Id::new("palette.query")));
+        let failed = app.update(Message::PullRequestCreated {
+            dialog: dialog.clone(),
+            generation: app.pull_request_dialog_generation,
+            result,
+        });
+        frames.settle(&mut app, failed);
+        assert!(frames.contains("palette.query"));
+        assert!(!frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(widget::Id::new("palette.query")));
+
+        frames.press(&mut app, keyboard::key::Named::Escape);
+        assert!(!frames.contains("palette.query"));
+        assert!(frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(pull_request_dialog_focus_id()));
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+    }
+}
+
+#[test]
+fn pull_request_failure_closes_chrome_popup_and_focuses_the_visible_form() {
+    for (action, popup_control) in [
+        (chrome_ui::Action::ToggleNewTab, "chrome.new-tab.thread"),
+        (chrome_ui::Action::ToggleNotices, "chrome.notices.close"),
+        (chrome_ui::Action::ToggleAttention, "attention.close"),
+    ] {
+        for result in [
+            Ok(PullRequestCreationOutcome::NotCreated {
+                failure: pull_request_test_failure(4),
+            }),
+            Err("pull request creator failed".into()),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let dialog = pull_request_test_dialog();
+            authorize_pull_request_test(&mut app, &dialog);
+            app.pull_request_dialog = Some(dialog.clone());
+
+            let _ = app.update(Message::SubmitPullRequest);
+            assert!(app.pull_request_dialog.is_none());
+            app.status = Some(TransientNotice::error("another failure"));
+            let mut frames = PullRequestFrames::new();
+            let open = app.update(Message::ChromeUi(action.clone()));
+            frames.settle(&mut app, open);
+            assert!(app.chrome_ui.is_open(), "{action:?}");
+            assert!(frames.contains(popup_control), "{action:?}");
+            let failed = app.update(Message::PullRequestCreated {
+                dialog: dialog.clone(),
+                generation: app.pull_request_dialog_generation,
+                result,
+            });
+            frames.settle(&mut app, failed);
+            assert!(!app.chrome_ui.is_open(), "{action:?}");
+            assert!(!frames.contains(popup_control), "{action:?}");
+            assert!(frames.contains("dialog.pull-request.title"), "{action:?}");
+            assert_eq!(
+                frames.focused,
+                Some(pull_request_dialog_focus_id()),
+                "{action:?}"
+            );
+            assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+        }
+    }
+}
+
+#[test]
+fn pull_request_failure_waits_for_the_modal_opened_by_a_palette_command() {
+    for result in [
+        Ok(PullRequestCreationOutcome::NotCreated {
+            failure: pull_request_test_failure(4),
+        }),
+        Err("pull request creator failed".into()),
+    ] {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog.clone());
+        let _ = app.update(Message::SubmitPullRequest);
+
+        let mut frames = PullRequestFrames::new();
+        let open = app.update(Message::Palette(palette_ui::Action::Open));
+        frames.settle(&mut app, open);
+        let query = app.update(Message::Palette(palette_ui::Action::Query(
+            "close focused pane".into(),
+        )));
+        frames.settle(&mut app, query);
+        let failed = app.update(Message::PullRequestCreated {
+            dialog: dialog.clone(),
+            generation: app.pull_request_dialog_generation,
+            result,
+        });
+        frames.settle(&mut app, failed);
+        assert!(frames.contains("palette.query"));
+        assert!(!frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(widget::Id::new("palette.query")));
+
+        frames.press(&mut app, keyboard::key::Named::Enter);
+        assert!(!frames.contains("palette.query"));
+        assert!(app.dirty_repository_close.is_some());
+        let cancel = dirty_close_control_id(card, DirtyCloseControl::Cancel);
+        assert!(frames.contains(&cancel.to_string()));
+        assert_eq!(frames.focused, Some(cancel));
+        assert!(!frames.contains("dialog.pull-request.title"));
+
+        let cancel = app.update(Message::CancelRepositoryClose);
+        frames.settle(&mut app, cancel);
+        assert!(app.dirty_repository_close.is_none());
+        assert!(frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(pull_request_dialog_focus_id()));
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+    }
+}
+
+/// Drives the runtime's complete composed frame, including its popover, with
+/// retained native widget state. Only ready application and widget effects are
+/// delivered; fixture background timers and platform window requests are dropped.
+struct PullRequestFrames {
+    renderer: cosmic::Renderer,
+    cache: iced::runtime::user_interface::Cache,
+    focused: Option<widget::Id>,
+    controls: std::collections::HashSet<String>,
+}
+
+impl PullRequestFrames {
+    fn new() -> Self {
+        Self {
+            renderer: headless_renderer(),
+            cache: iced::runtime::user_interface::Cache::new(),
+            focused: None,
+            controls: Default::default(),
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.controls.contains(id)
+    }
+
+    fn settle(&mut self, app: &mut Cagents, task: Task<Message>) {
+        use cosmic::iced::advanced::widget::operation;
+        use cosmic::iced::futures::FutureExt;
+        use cosmic::iced::runtime::{Action, UserInterface, user_interface::Cache};
+        use cosmic::iced::{Size, mouse};
+
+        struct Controls {
+            focused: Option<widget::Id>,
+            ids: std::collections::HashSet<String>,
+        }
+        impl iced::advanced::widget::Operation for Controls {
+            fn traverse(
+                &mut self,
+                visit: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+            ) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.ids.insert(id.to_string());
+                    if state.is_focused() {
+                        self.focused = Some(id.clone());
+                    }
+                }
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("headless task executor");
+        let mut tasks = std::collections::VecDeque::from([task]);
+        let mut delivered = 0;
+        while let Some(task) = tasks.pop_front() {
+            delivered += 1;
+            assert!(delivered < 64, "fixture effects must settle");
+            let mut ui = UserInterface::build(
+                frame(app),
+                Size::new(1600.0, 1200.0),
+                std::mem::replace(&mut self.cache, Cache::new()),
+                &mut self.renderer,
+            );
+            let mut messages = Vec::new();
+            runtime.block_on(async {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(Some(action)) = stream.next().now_or_never() {
+                        match action {
+                            Action::Widget(mut operation) => loop {
+                                ui.operate(&self.renderer, operation.as_mut());
+                                match operation.finish() {
+                                    operation::Outcome::Chain(next) => operation = next,
+                                    _ => break,
+                                }
+                            },
+                            Action::Output(cosmic::Action::App(message)) => messages.push(message),
+                            _ => {}
+                        }
+                    }
+                }
+            });
+            let mut controls = Controls {
+                focused: None,
+                ids: Default::default(),
+            };
+            ui.operate(&self.renderer, &mut controls);
+            ui.draw(
+                &mut self.renderer,
+                &cosmic::theme::active(),
+                &iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            self.focused = controls.focused;
+            self.controls = controls.ids;
+            self.cache = ui.into_cache();
+            for message in messages {
+                tasks.push_back(app.update(message));
+            }
+        }
+    }
+
+    fn press(&mut self, app: &mut Cagents, key: keyboard::key::Named) {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Size, mouse};
+
+        let event = dialog_ui::tests::key_press(key);
+        let mut ui = UserInterface::build(
+            frame(app),
+            Size::new(1600.0, 1200.0),
+            std::mem::replace(&mut self.cache, Cache::new()),
+            &mut self.renderer,
+        );
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(
+            &[Event::Keyboard(event.clone())],
+            mouse::Cursor::Unavailable,
+            &mut self.renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        self.cache = ui.into_cache();
+        for message in messages {
+            if let cosmic::Action::App(message) = message {
+                let task = app.update(message);
+                self.settle(app, task);
+            }
+        }
+        let task = app.update(Message::KeyEvent {
+            event,
+            captured: statuses.first() == Some(&iced::event::Status::Captured),
+        });
+        self.settle(app, task);
+    }
+}
+
+#[test]
+fn pull_request_failure_refocuses_the_form_when_nothing_covers_it() {
+    for result in [
+        Ok(PullRequestCreationOutcome::NotCreated {
+            failure: pull_request_test_failure(4),
+        }),
+        Err("pull request creator failed".into()),
+    ] {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog.clone());
+
+        let _ = app.update(Message::SubmitPullRequest);
+        assert!(app.pull_request_dialog.is_none());
+        let failed = app.update(Message::PullRequestCreated {
+            dialog: dialog.clone(),
+            generation: app.pull_request_dialog_generation,
+            result,
+        });
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+        let mut frames = PullRequestFrames::new();
+        frames.settle(&mut app, failed);
+        assert!(frames.contains("dialog.pull-request.title"));
+        assert_eq!(frames.focused, Some(pull_request_dialog_focus_id()));
+        assert_eq!(app.pull_request_dialog, Some(dialog));
+    }
+}
+
+#[test]
 fn pull_request_unknown_outcome_keeps_edits_but_requires_reconciliation() {
     let mut app = context_inspector_test_app(false);
     let dialog = pull_request_test_dialog();

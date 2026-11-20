@@ -5160,6 +5160,10 @@ pub enum Message {
         generation: u64,
         result: Result<PullRequestCreationOutcome, String>,
     },
+    RestorePullRequestDialog {
+        dialog: PullRequestDialog,
+        generation: u64,
+    },
     CancelDialog,
     KeyEvent {
         event: keyboard::Event,
@@ -14641,6 +14645,12 @@ impl Cagents {
         self.modal_is_open() || self.chrome_ui.is_open() || self.palette.is_open()
     }
 
+    /// Chrome popups close when the form returns; these layers keep their
+    /// place above it instead.
+    fn pull_request_restore_covered(&self) -> bool {
+        self.modal_is_open() || self.palette.is_open()
+    }
+
     /// A pane's overlay takes input from its covered content, while the other
     /// panes and the inspector's own controls remain usable.
     fn pane_content_inputs_blocked(&self, card: CardId) -> bool {
@@ -14684,14 +14694,26 @@ impl Cagents {
         let repository_blocks = self.workspace.focused().is_some_and(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         });
-        if self.modal_is_open() || repository_blocks {
+        let navigation_blocked = self.modal_is_open() || repository_blocks;
+        let covered = self.pull_request_restore_covered();
+        // This runs after every update: leave a queue nothing can leave alone.
+        if self.deferred_navigation.is_empty() || (navigation_blocked && covered) {
             return Task::none();
         }
-        Task::batch(
-            self.deferred_navigation
-                .drain(..)
-                .map(cosmic::task::message),
-        )
+        let mut ready = Vec::new();
+        for message in std::mem::take(&mut self.deferred_navigation) {
+            let blocked = if matches!(&message, Message::RestorePullRequestDialog { .. }) {
+                covered
+            } else {
+                navigation_blocked
+            };
+            if blocked {
+                self.deferred_navigation.push_back(message);
+            } else {
+                ready.push(cosmic::task::message(message));
+            }
+        }
+        Task::batch(ready)
     }
 
     /// Leaves the application: the window first, the process once the window
@@ -15099,14 +15121,22 @@ impl Cagents {
         if generation != self.pull_request_dialog_generation || self.pull_request_dialog.is_some() {
             return Task::none();
         }
-        self.pull_request_dialog = Some(dialog);
-        if self.dirty_repository_close.is_some()
-            || self.sidebar_state.pending_discard().is_some()
-            || self.worktree_dialog.is_some()
-        {
+        if self.palette.is_open() {
+            // Use the existing deferred completion queue: the palette stays
+            // visible, and a command that opens a modal keeps the draft waiting.
+            self.deferred_navigation
+                .push_back(Message::RestorePullRequestDialog { dialog, generation });
             return Task::none();
         }
-        iced::widget::operation::focus(pull_request_dialog_focus_id()).map(cosmic::Action::App)
+        let covered = self.pull_request_restore_covered();
+        let close_chrome = self.update_chrome(chrome_ui::Action::Close);
+        self.pull_request_dialog = Some(dialog);
+        if covered {
+            return close_chrome;
+        }
+        close_chrome.chain(
+            iced::widget::operation::focus(pull_request_dialog_focus_id()).map(cosmic::Action::App),
+        )
     }
 
     fn cycle_dirty_close_focus(&mut self, backwards: bool) -> Task<Message> {
@@ -19146,6 +19176,9 @@ impl Cagents {
                     self.restore_pull_request_dialog(dialog, generation)
                 }
             },
+            Message::RestorePullRequestDialog { dialog, generation } => {
+                self.restore_pull_request_dialog(dialog, generation)
+            }
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
                 let (task, key_projection) = self.key_event(event, captured);
