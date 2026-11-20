@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cagents" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="slate-side" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#222C3E"/><stop offset="1" stop-color="#171F2E"/></linearGradient>
+    <linearGradient id="slate-top" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4A5B79"/><stop offset="1" stop-color="#2E3A51"/></linearGradient>
+    <linearGradient id="teal-side" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#347A70"/><stop offset="1" stop-color="#255E56"/></linearGradient>
+    <linearGradient id="teal-top" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6CC2B3"/><stop offset="1" stop-color="#459689"/></linearGradient>
+    <linearGradient id="coral-side" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#C84418"/><stop offset="1" stop-color="#A4320D"/></linearGradient>
+    <linearGradient id="coral-top" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF7F4D"/><stop offset=".45" stop-color="#F85F2A"/><stop offset="1" stop-color="#E34C1A"/></linearGradient>
+    <filter id="key-sh" x="-15%" y="-10%" width="130%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="1.6" flood-color="#05080F" flood-opacity="0.45"/></filter>
+    <filter id="key-sh-soft" x="-15%" y="-10%" width="130%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="1.6" flood-color="#3A3226" flood-opacity="0.30"/></filter>
+  </defs>
+  <defs>
+    <linearGradient id="ivory-side" x1="10" y1="0" x2="118" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#8F8778"/><stop offset=".22" stop-color="#ABA394"/><stop offset=".5" stop-color="#BDB5A6"/><stop offset=".78" stop-color="#ABA394"/><stop offset="1" stop-color="#8F8778"/></linearGradient>
+    <linearGradient id="ivory-shade" x1="0" y1="102" x2="0" y2="119" gradientUnits="userSpaceOnUse"><stop offset="0" stop-opacity=".22"/><stop offset=".55" stop-opacity=".06"/><stop offset="1" stop-opacity=".34"/></linearGradient>
+    <linearGradient id="ivory-face" x1="0" y1="10" x2="0" y2="111" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FFFDF9"/><stop offset=".5" stop-color="#F3EFE7"/><stop offset="1" stop-color="#E4DED3"/></linearGradient>
+    <linearGradient id="ivory-rim" x1="0" y1="10" x2="0" y2="111" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fff" stop-opacity="0.9"/><stop offset=".24" stop-color="#fff" stop-opacity=".08"/><stop offset=".84" stop-color="#fff" stop-opacity=".04"/><stop offset="1" stop-color="#fff" stop-opacity=".15"/></linearGradient>
+  </defs>
+  <rect x="10" y="18" width="108" height="101" rx="18" fill="url(#ivory-side)"/>
+  <rect x="10" y="18" width="108" height="101" rx="18" fill="url(#ivory-shade)"/>
+  <rect x="10.75" y="18.75" width="106.5" height="99.5" rx="17.25" fill="none" stroke="#3A3226" stroke-opacity="0.18" stroke-width="1.2"/>
+  <rect x="10" y="10" width="108" height="101" rx="18" fill="url(#ivory-face)"/>
+  <rect x="11" y="11" width="106" height="99" rx="17" fill="none" stroke="url(#ivory-rim)" stroke-width="2"/>
+  <g filter="url(#key-sh-soft)">
+    <rect x="18" y="24" width="28" height="80" rx="8" fill="url(#slate-side)"/>
+    <rect x="18" y="18" width="28" height="78" rx="8" fill="url(#slate-top)"/>
+    <rect x="18.7" y="18.7" width="26.6" height="76.6" rx="7.3" fill="none" stroke="#fff" stroke-opacity="0.18" stroke-width="1.3"/>
+    <rect x="24.5" y="25.5" width="15" height="3.8" rx="1.9" fill="#8EA4C8" opacity="0.88"/>
+  </g>
+  <g filter="url(#key-sh-soft)">
+    <rect x="50" y="24" width="28" height="80" rx="8" fill="url(#teal-side)"/>
+    <rect x="50" y="18" width="28" height="78" rx="8" fill="url(#teal-top)"/>
+    <rect x="50.7" y="18.7" width="26.6" height="76.6" rx="7.3" fill="none" stroke="#fff" stroke-opacity="0.28" stroke-width="1.3"/>
+    <rect x="56.5" y="25.5" width="15" height="3.8" rx="1.9" fill="#C4F5EC" opacity="0.96"/>
+  </g>
+  <g filter="url(#key-sh-soft)">
+    <rect x="82" y="24" width="28" height="80" rx="8" fill="url(#coral-side)"/>
+    <rect x="82" y="18" width="28" height="78" rx="8" fill="url(#coral-top)"/>
+    <rect x="82.7" y="18.7" width="26.6" height="76.6" rx="7.3" fill="none" stroke="#fff" stroke-opacity="0.34" stroke-width="1.3"/>
+    <path d="M 92.2 49 L 100.2 57 L 92.2 65" fill="none" stroke="#FFF7ED" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

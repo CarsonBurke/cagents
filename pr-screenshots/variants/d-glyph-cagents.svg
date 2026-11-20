@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cagents" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="slate-side" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#222C3E"/><stop offset="1" stop-color="#171F2E"/></linearGradient>
+    <linearGradient id="slate-top" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4A5B79"/><stop offset="1" stop-color="#2E3A51"/></linearGradient>
+    <linearGradient id="teal-side" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#347A70"/><stop offset="1" stop-color="#255E56"/></linearGradient>
+    <linearGradient id="teal-top" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6CC2B3"/><stop offset="1" stop-color="#459689"/></linearGradient>
+    <linearGradient id="coral-side" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#C84418"/><stop offset="1" stop-color="#A4320D"/></linearGradient>
+    <linearGradient id="coral-top" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF7F4D"/><stop offset=".45" stop-color="#F85F2A"/><stop offset="1" stop-color="#E34C1A"/></linearGradient>
+    <filter id="key-sh" x="-15%" y="-10%" width="130%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="1.6" flood-color="#05080F" flood-opacity="0.45"/></filter>
+    <filter id="key-sh-soft" x="-15%" y="-10%" width="130%" height="125%"><feDropShadow dx="0" dy="2" stdDeviation="1.6" flood-color="#3A3226" flood-opacity="0.30"/></filter>
+    <linearGradient id="t-side" x1="10" y1="0" x2="118" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#A4320D"/><stop offset=".5" stop-color="#C2421A"/><stop offset="1" stop-color="#A4320D"/></linearGradient>
+    <linearGradient id="t-face" x1="0" y1="10" x2="0" y2="111" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#FF8452"/><stop offset="1" stop-color="#E9501D"/></linearGradient>
+    <linearGradient id="t-rim" x1="0" y1="10" x2="0" y2="111" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fff" stop-opacity=".5"/><stop offset=".25" stop-color="#fff" stop-opacity=".1"/><stop offset="1" stop-color="#fff" stop-opacity=".12"/></linearGradient>
+    <filter id="glyph-sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="2.5" stdDeviation="1.8" flood-color="#7A2008" flood-opacity=".55"/></filter>
+  </defs>
+  <rect x="10" y="18" width="108" height="101" rx="22" fill="url(#t-side)"/>
+  <rect x="10" y="10" width="108" height="101" rx="22" fill="url(#t-face)"/>
+  <rect x="11" y="11" width="106" height="99" rx="21" fill="none" stroke="url(#t-rim)" stroke-width="2"/>
+  <g filter="url(#glyph-sh)">
+    <path d="M 30 38 L 54 61 L 30 84" fill="none" stroke="#FFF7ED" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="64" y="38" width="34" height="9" rx="4.5" fill="#FFF7ED" opacity=".55"/>
+    <rect x="64" y="56.5" width="34" height="9" rx="4.5" fill="#FFF7ED" opacity=".78"/>
+    <rect x="64" y="75" width="34" height="9" rx="4.5" fill="#1B2230"/>
+  </g>
+</svg>
