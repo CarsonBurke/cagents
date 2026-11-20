@@ -2176,18 +2176,21 @@ fn terminal_continuity(state: Option<&CardState>) -> Option<&TerminalContinuity>
     }
 }
 
-fn terminal_relaunch_recipe(
-    session: &TerminalSession,
-    fallback: &LaunchRecipe,
-) -> Result<LaunchRecipe, String> {
-    if session
+/// Current observation supersedes the original selector, so a relaunch of an
+/// observed agent follows recovery's plan rather than the saved recipe.
+fn relaunch_follows_recovery_plan(session: &TerminalSession) -> bool {
+    session
         .resume_hint
         .as_deref()
         .and_then(crate::model::agent_recovery::observed_launch_from_hint)
         .is_some()
-    {
-        // Current observation supersedes the original selector. Reuse the
-        // recovery policy that opens a picker when exact identity is withheld.
+}
+
+fn terminal_relaunch_recipe(
+    session: &TerminalSession,
+    fallback: &LaunchRecipe,
+) -> Result<LaunchRecipe, String> {
+    if relaunch_follows_recovery_plan(session) {
         return crate::upgrade::recovery_plan(session).map(|(recipe, _)| recipe);
     }
     Ok(session
