@@ -3576,3 +3576,100 @@ fn restored_camera_initializes_native_scroll_once_before_the_first_frame() {
     moved.offset = moved_offset;
     assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
 }
+
+#[test]
+fn a_chat_panes_editor_takes_undo_and_redo_before_the_workspace_reopens_a_pane() {
+    use cosmic::iced::advanced::{clipboard, renderer::Headless};
+    use keyboard::key::{Code, Physical};
+
+    let shortcuts = KeyboardShortcuts::default();
+    let chord = |character: &str, code, modifiers| keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character(character.into()),
+        modified_key: keyboard::Key::Character(character.to_uppercase().into()),
+        physical_key: Physical::Code(code),
+        location: keyboard::Location::Standard,
+        modifiers,
+        text: None,
+        repeat: false,
+    };
+    let control = keyboard::Modifiers::CTRL;
+    let redo = chord("z", Code::KeyZ, control | keyboard::Modifiers::SHIFT);
+    // The default reopen chord is the editor's redo.
+    assert_eq!(
+        global_shortcut(&redo, &shortcuts, FocusedPane::Chat),
+        Some(GlobalShortcut::ReopenPane)
+    );
+    let renderer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Renderer::new(
+            cosmic::iced::Font::default(),
+            cosmic::iced::Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+    let card = CardId::new();
+    for (focused, delivered) in [
+        // A chat pane's content sees the chord first; its focused message
+        // editor takes it as redo.
+        (FocusedPane::Chat, true),
+        // Anywhere else the workspace keeps it.
+        (FocusedPane::Other, false),
+        (FocusedPane::Terminal, false),
+    ] {
+        let mut element: Element<'_, Option<CardId>> = WorkspaceSurface::new(
+            Element::new(KeyProbe(card)),
+            &shortcuts,
+            focused,
+            400.0,
+            |_| None,
+        )
+        .into();
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()),
+        );
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(redo.clone()),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        assert_eq!(messages.contains(&Some(card)), delivered, "{focused:?}");
+    }
+    // The workspace's action runs only when nothing in the pane took it: in
+    // a chat pane whose message editor does not hold the keyboard, Ctrl+Shift+Z
+    // still reopens the last closed pane.
+    assert!(deferred_shortcut_taken(&redo, true, FocusedPane::Chat));
+    assert!(!deferred_shortcut_taken(&redo, false, FocusedPane::Chat));
+    assert!(!deferred_shortcut_taken(&redo, true, FocusedPane::Other));
+    for (event, defers) in [
+        (chord("z", Code::KeyZ, control), true),
+        (chord("y", Code::KeyY, control), true),
+        (
+            chord("y", Code::KeyY, control | keyboard::Modifiers::SHIFT),
+            false,
+        ),
+        (
+            chord("z", Code::KeyZ, control | keyboard::Modifiers::ALT),
+            false,
+        ),
+        (chord("x", Code::KeyX, control), false),
+    ] {
+        assert_eq!(
+            deferred_shortcut_taken(&event, true, FocusedPane::Chat),
+            defers,
+            "{event:?}"
+        );
+    }
+}
