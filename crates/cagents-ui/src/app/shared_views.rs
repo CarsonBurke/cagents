@@ -3570,6 +3570,9 @@ impl Cagents {
         // A closed pane a view brought back after its conversation stopped
         // goes again, now that the views it is removed from are settled.
         tasks.push(self.remove_stopped_returns());
+        // A closed pane's conversation stops once the registry has answered
+        // its removal; a pane the registry kept is back, and goes on with it.
+        tasks.push(self.settle_stops_after_removal());
         // Presentation-only projection preserves every notification attribution
         // input: source, membership, ownership, placement and project identity.
         // Journal snapshots attribute their own new evidence independently.

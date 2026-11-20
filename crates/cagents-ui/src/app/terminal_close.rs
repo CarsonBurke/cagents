@@ -1218,29 +1218,6 @@ impl Cagents {
         {
             return Task::none();
         }
-        // A hidden pane that has to come back with a question or a report
-        // waits for another pane's open dialog, rather than open beneath it.
-        // Its own close's dialog, still open after the person confirmed
-        // closing beside an active process, is where that report goes.
-        if self.hidden_closes.contains(&card)
-            && self.modal_beside_terminal_close_is_open()
-            && !matches!(
-                outcome,
-                CloseOutcome::Closed
-                    | CloseOutcome::ClosedWithBasis(_)
-                    | CloseOutcome::NotHosted
-                    | CloseOutcome::NotHostedWithBasis(_)
-            )
-        {
-            self.held_close_answer = Some(HeldCloseAnswer {
-                card,
-                terminal,
-                proof,
-                generation,
-                outcome,
-            });
-            return Task::none();
-        }
         let outcome = match outcome {
             CloseOutcome::ClosedWithBasis(basis) => {
                 if self.shared_removal_terminal_receipt(card, basis) {
@@ -1258,15 +1235,46 @@ impl Cagents {
             }
             outcome => outcome,
         };
-        let intent = self.terminal_close.as_ref().unwrap();
-        let identity_matches = target_matches(intent, self.card_state(card))
-            || exited_target_matches(intent, self.card_state(card));
-        let still_saved = intent
-            .saved_source
-            .as_ref()
-            .or(intent.completed_source.as_ref())
-            .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
+        let (identity_matches, still_saved) = {
+            let intent = self.terminal_close.as_ref().unwrap();
+            let identity_matches = target_matches(intent, self.card_state(card))
+                || exited_target_matches(intent, self.card_state(card));
+            let still_saved = intent
+                .saved_source
+                .as_ref()
+                .or(intent.completed_source.as_ref())
+                .is_some_and(|saved| terminal_session(self.card_state(card)) == Some(saved));
+            (identity_matches, still_saved)
+        };
         let starting = self.terminal_start_in_flight(card);
+        // A close that ends with nothing to say: every other outcome brings
+        // the pane back with a question or a report.
+        let settles_quietly = match outcome {
+            CloseOutcome::NotHosted => identity_matches && still_saved && !starting,
+            CloseOutcome::Closed => identity_matches,
+            _ => false,
+        };
+        // A hidden pane that has to come back with a question or a report
+        // waits for another pane's open dialog, rather than open beneath it.
+        // Its own close's dialog, still open after the person confirmed
+        // closing beside an active process, is where that report goes. What
+        // decides is the outcome once its basis and identity are checked: a
+        // close of a terminal another window has replaced since comes back as
+        // a report.
+        if self.hidden_closes.contains(&card)
+            && self.modal_beside_terminal_close_is_open()
+            && !settles_quietly
+        {
+            self.held_close_answer = Some(HeldCloseAnswer {
+                card,
+                terminal,
+                proof,
+                generation,
+                outcome,
+            });
+            return Task::none();
+        }
+        let intent = self.terminal_close.as_ref().unwrap();
         match outcome {
             CloseOutcome::NotHosted if identity_matches && still_saved && !starting => {
                 if intent.shows_dialog() {
@@ -2522,32 +2530,80 @@ pub(in crate::app) mod tests {
 
     /// A hidden pane whose close comes back with something to say waits for
     /// a dialog another pane opened meanwhile, so the two never open
-    /// together; it comes back with its own once that one closes.
+    /// together; it comes back with its own once that one closes. That
+    /// includes a close the daemon carried out on a terminal another window
+    /// has since put in the pane, which keeps the pane and says so.
     #[test]
     fn a_hidden_pane_brings_its_report_back_after_another_dialog() {
+        for replaced in [false, true] {
+            let (mut app, card) = closing_unasked();
+            let _other = queued_terminal(&mut app, card);
+            drop(app.update(Message::FocusCard(card)));
+            drop(app.update(Message::CloseCard(card)));
+            let intent = app.terminal_close.clone().expect("the close is running");
+            app.resume_ui.open = true;
+            assert!(app.modal_is_open());
+            let outcome = if replaced {
+                if let Some(CardKind::Terminal(session)) =
+                    app.card_state_mut(card).map(|state| &mut state.kind)
+                {
+                    session.id = TerminalId::new();
+                }
+                CloseOutcome::Closed
+            } else {
+                CloseOutcome::Unreachable("reply lost".into())
+            };
+
+            drop(app.update(Message::TerminalCloseFinished {
+                card,
+                terminal: intent.terminal,
+                proof: intent.proof,
+                generation: intent.generation,
+                outcome,
+            }));
+            assert!(
+                app.workspace.is_hidden(card),
+                "replaced={replaced}: it waits out of sight"
+            );
+            assert!(!app.terminal_close_dialog_visible(), "replaced={replaced}");
+
+            app.resume_ui.open = false;
+            drop(app.settle_close_queue());
+            assert!(
+                !app.workspace.is_hidden(card),
+                "replaced={replaced}: it is back"
+            );
+            assert!(
+                app.terminal_close_dialog_visible(),
+                "replaced={replaced}: with what happened"
+            );
+            assert!(app.held_close_answer.is_none(), "replaced={replaced}");
+        }
+    }
+
+    /// A hidden pane whose close ended as asked has nothing to bring back, so
+    /// it goes while another dialog is open rather than wait behind it.
+    #[test]
+    fn a_hidden_pane_closed_as_asked_goes_beside_another_dialog() {
         let (mut app, card) = closing_unasked();
         let _other = queued_terminal(&mut app, card);
         drop(app.update(Message::FocusCard(card)));
         drop(app.update(Message::CloseCard(card)));
         let intent = app.terminal_close.clone().expect("the close is running");
         app.resume_ui.open = true;
-        assert!(app.modal_is_open());
-
         drop(app.update(Message::TerminalCloseFinished {
             card,
             terminal: intent.terminal,
             proof: intent.proof,
             generation: intent.generation,
-            outcome: CloseOutcome::Unreachable("reply lost".into()),
+            outcome: CloseOutcome::Closed,
         }));
-        assert!(app.workspace.is_hidden(card), "it waits out of sight");
-        assert!(!app.terminal_close_dialog_visible());
-
-        app.resume_ui.open = false;
-        drop(app.settle_close_queue());
-        assert!(!app.workspace.is_hidden(card), "it is back");
-        assert!(app.terminal_close_dialog_visible(), "with what happened");
-        assert!(app.held_close_answer.is_none());
+        assert!(app.held_close_answer.is_none(), "nothing waits");
+        assert!(app.terminal_close.is_none(), "the close is over");
+        assert!(
+            app.closed_terminal_cards.contains(&card),
+            "and the pane goes"
+        );
     }
 
     /// A pane closed beside an active process, once the person confirmed it,

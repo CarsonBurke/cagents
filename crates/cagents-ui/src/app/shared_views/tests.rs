@@ -8035,87 +8035,64 @@ fn retained_chat_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
     (app, source, destination, pane)
 }
 
+/// A closed chat whose removal its shared view refuses, as naming a pane the
+/// view no longer holds, closed nothing: it comes back where it was, as the
+/// view keeps it, and goes on with its conversation, which nothing asked to
+/// stop and nothing will on the next launch.
+#[test]
+fn a_closed_chat_its_view_keeps_goes_on_with_its_conversation() {
+    let (mut app, _source, _destination, pane) = retained_chat_move_fixture();
+    let (tx, rx) = test_model_channel();
+    app.workspace_model_tx = tx;
+    drop(app.begin_chat_close(pane.id));
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(
+        app.background_close_for_test(pane.id).is_some(),
+        "the conversation is to stop in the background"
+    );
+    let (operation, scope, change) = app
+        .shared_views
+        .pending
+        .iter()
+        .find(|(_, _, change)| {
+            matches!(change, Change::RemoveSource { before, .. } if before.id == pane.id)
+        })
+        .cloned()
+        .expect("its removal is published");
+    while rx.try_recv().is_ok() {}
+
+    drop(app.refuse_conflicting_view_change(
+        scope,
+        operation,
+        change,
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT.into(),
+    ));
+    assert!(
+        app.card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "the view keeps it"
+    );
+    assert!(
+        app.background_close_for_test(pane.id).is_none(),
+        "nothing stops"
+    );
+    assert!(
+        app.durable.stopping_chats.is_empty(),
+        "nor on the next launch"
+    );
+    assert!(!app.holds_reopen(pane.id));
+    assert!(
+        app.chat_start_pending(pane.id),
+        "it goes back to its conversation"
+    );
+}
+
 /// Closing a retained native chat never opens a modal, and its cleanup is
 /// never overtaken by a channel move (#2327, #2593). The first close takes
 /// the pane away at once, so there is nothing left to move while the daemon
 /// stops the conversation. Once the daemon has refused that stop, the
 /// conversation reopens on the provider still running it, and closing it
 /// again waits on its pane for the daemon, refusing every move meanwhile.
-/// A closed chat whose removal its shared view refuses comes back where it
-/// was, as the view keeps it, but nothing attaches to its conversation while
-/// that stops. A refused stop puts it back on what still runs, saying why on
-/// the pane rather than in a notice; once its conversation has stopped it
-/// goes, as it was asked to.
-#[test]
-fn a_closed_chat_its_view_keeps_waits_for_its_conversation_to_stop() {
-    for refused in [false, true] {
-        let (mut app, _source, _destination, pane) = retained_chat_move_fixture();
-        let (tx, rx) = test_model_channel();
-        app.workspace_model_tx = tx;
-        drop(app.begin_chat_close(pane.id));
-        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
-        let stopping = app
-            .background_close_for_test(pane.id)
-            .expect("the conversation stops in the background");
-        let (operation, scope, change) = app
-            .shared_views
-            .pending
-            .iter()
-            .find(|(_, _, change)| {
-                matches!(change, Change::RemoveSource { before, .. } if before.id == pane.id)
-            })
-            .cloned()
-            .expect("its removal is published");
-        while rx.try_recv().is_ok() {}
-
-        drop(app.refuse_conflicting_view_change(
-            scope,
-            operation,
-            change,
-            crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT.into(),
-        ));
-        assert!(
-            app.card_state(pane.id)
-                .is_some_and(|state| state.existence.is_open()),
-            "refused={refused}: the view keeps it"
-        );
-        assert!(app.holds_reopen(pane.id), "refused={refused}");
-        assert!(
-            !app.cards.contains_key(&pane.id) && !app.chat_start_pending(pane.id),
-            "refused={refused}: nothing attaches to the conversation being stopped"
-        );
-
-        let result = if refused {
-            Err("the retained provider is still running".to_owned())
-        } else {
-            Ok(())
-        };
-        drop(
-            app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
-                stopping, result,
-            ))),
-        );
-        assert!(!app.holds_reopen(pane.id));
-        if refused {
-            assert!(
-                app.chat_start_pending(pane.id),
-                "it goes back to what still runs"
-            );
-            assert!(
-                !app.has_close_failure_notices(),
-                "its pane says why, so no notice does"
-            );
-        } else {
-            assert!(
-                !app.card_state(pane.id)
-                    .is_some_and(|state| state.existence.is_open()),
-                "with nothing running, it goes"
-            );
-            assert!(!app.chat_start_pending(pane.id));
-        }
-    }
-}
-
 #[test]
 fn channel_move_waits_for_retained_native_chat_cleanup_without_a_modal() {
     let (mut app, source, destination, pane) = retained_chat_move_fixture();
