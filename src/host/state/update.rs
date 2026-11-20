@@ -51,9 +51,18 @@ pub(in crate::host) fn inspect(
         )
     };
     let mut blockers = cleanup_failures;
+    // Agents whose only outstanding work is queued for their own conversation.
+    let mut queued = BTreeMap::new();
     if let Some(registry) = registry {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        blockers.extend(registry.agent_update_blockers().map_err(upgrade_error)?);
+        for hold in registry.agent_update_holds().map_err(upgrade_error)? {
+            match hold.session {
+                Some(session) => {
+                    queued.insert(session, hold.blocker);
+                }
+                None => blockers.push(hold.blocker),
+            }
+        }
         blockers.extend(
             registry
                 .automation_update_blockers()
@@ -92,7 +101,17 @@ pub(in crate::host) fn inspect(
     let mut impact = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .upgrade_impact(policy)?;
+        .upgrade_impact_with_queued(policy, &queued.keys().copied().collect())?;
+    // Queued work no listed conversation will deliver still fences the update.
+    for (session, blocker) in queued {
+        if !impact.sessions.iter().any(|item| {
+            item.id == session
+                && item.kind == SessionKind::NativeChat
+                && item.disposition == Disposition::WaitsForIdle
+        }) {
+            blockers.push(blocker);
+        }
+    }
     impact.blockers.extend(blockers);
     Ok(impact)
 }
@@ -135,7 +154,20 @@ impl HostState {
             )
     }
 
+    #[cfg(test)]
     pub(crate) fn upgrade_impact(&mut self, policy: Policy) -> Result<DaemonImpact, ProtocolError> {
+        self.upgrade_impact_with_queued(policy, &BTreeSet::new())
+    }
+
+    /// `queued` names conversations that have messages accepted for them but
+    /// not yet delivered. An accepted run is never redispatched after a
+    /// restart, so the update waits for each one to receive them, under
+    /// either policy; interrupting its turn would not deliver them.
+    pub(in crate::host) fn upgrade_impact_with_queued(
+        &mut self,
+        policy: Policy,
+        queued: &BTreeSet<TerminalId>,
+    ) -> Result<DaemonImpact, ProtocolError> {
         let capability = self
             .shutdown_preflight(Instant::now())
             .map_err(|outcome| upgrade_error(format!("Cannot inspect update impact: {outcome:?}")))?
@@ -201,7 +233,10 @@ impl HostState {
                         .unwrap_or(&source.launch.program),
                     &source.launch.working_directory,
                 ),
-                identity: identity(&(self.inventory_generation, &source))?,
+                // Bind consent to this terminal's own owner, never the
+                // daemon-wide generation: another session opening or closing
+                // must not revoke a review of this one.
+                identity: identity(&(record.handle.execution_instance(), &source))?,
                 disposition,
                 reason: reason.into(),
                 interrupted_subagents: Vec::new(),
@@ -283,6 +318,8 @@ impl HostState {
                     "The paired console cannot preserve its live process through this update."
                         .into(),
                 )
+            } else if queued.contains(&id) {
+                (Disposition::WaitsForIdle, QUEUED_MESSAGES.into())
             } else if durable {
                 (
                     Disposition::Continues,
@@ -313,7 +350,7 @@ impl HostState {
                     &record.session.launch.recipe.working_directory,
                 ),
                 identity: identity(&(
-                    self.inventory_generation,
+                    record.execution_instance,
                     &record.session,
                     confirmed,
                     record.handle.native_continuity(),
@@ -337,6 +374,8 @@ impl HostState {
 /// Waiting for idle can last as long as a subagent's own background work,
 /// which may never end while the conversation looks finished, so the reason
 /// names any such subagent and how to update sooner.
+const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
+
 fn waits_for_idle_reason(hold: &crate::chat::WorkHold) -> String {
     let wait = "The update will wait for this conversation to become idle, then resume it.";
     let held = hold.beyond_turn();

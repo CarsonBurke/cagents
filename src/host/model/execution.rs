@@ -305,35 +305,59 @@ impl Registry {
     /// it owns a hosted actor. Do not lose it from impact merely because there
     /// is no terminal/chat to project yet. Call outside HostState; final update
     /// admission also holds the control write gate to exclude new acceptance.
-    pub(crate) fn agent_update_blockers(&self) -> Result<Vec<String>, String> {
+    ///
+    /// An accepted run is never redispatched after a restart, so each hold
+    /// fences the update until its work is delivered. A hold whose agent is
+    /// bound to a session and owes nothing but queued messages names that
+    /// session: the update waits for that conversation rather than for an
+    /// anonymous agent, and the hold's identity does not depend on how many
+    /// messages are queued.
+    pub(crate) fn agent_update_holds(&self) -> Result<Vec<AgentUpdateHold>, String> {
         let mut query = self.db.prepare(
-            "SELECT a.record FROM agents a WHERE a.closed = 0 AND (
+            "SELECT a.record, a.session_id,
+                 EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
+             FROM agents a WHERE a.closed = 0 AND (
                  EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
                  OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id AND
                      (r.state = 'accepted' OR (a.session_id IS NULL AND r.state IN ('running', 'waiting'))))
              ) ORDER BY a.id LIMIT ?1",
         ).map_err(|error| error.to_string())?;
         let records = query
-            .query_map([MAX_RUNNING as u64 + 1], |row| row.get::<_, String>(0))
+            .query_map([MAX_RUNNING as u64 + 1], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
-        let mut blockers = records
+        let mut holds = records
             .iter()
             .take(MAX_RUNNING)
-            .map(|record| {
+            .map(|(record, session, launching)| {
                 let agent: Agent = decode(record)?;
-                Ok(format!(
-                    "{} agent {} has accepted work or launch ownership awaiting confirmation",
-                    agent.spec.provider.label(),
-                    agent.id
-                ))
+                Ok(AgentUpdateHold {
+                    session: session
+                        .as_deref()
+                        .filter(|_| !launching)
+                        .and_then(|session| session.parse().ok()),
+                    blocker: format!(
+                        "{} agent {} has accepted work or launch ownership awaiting confirmation",
+                        agent.spec.provider.label(),
+                        agent.id
+                    ),
+                })
             })
             .collect::<Result<Vec<_>, String>>()?;
         if records.len() > MAX_RUNNING {
-            blockers.push("Additional agent launches must settle before updating".into());
+            holds.push(AgentUpdateHold {
+                session: None,
+                blocker: "Additional agent launches must settle before updating".into(),
+            });
         }
-        Ok(blockers)
+        Ok(holds)
     }
 
     /// Caller has authenticated every retained descriptor with the actual
@@ -2949,6 +2973,16 @@ pub(super) fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, S
         .map_err(|error| format!("Stored agent execution is unreadable: {error}"))
 }
 
+/// Agent work an update must let finish before it can install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentUpdateHold {
+    /// The hosted session that will deliver this agent's queued messages,
+    /// when that is all it owes.
+    pub(crate) session: Option<crate::model::TerminalId>,
+    /// The fence when no such session is in the update's impact.
+    pub(crate) blocker: String,
+}
+
 #[cfg(test)]
 impl Registry {
     /// Refuse binding a console to any agent on this connection only. A
@@ -5487,26 +5521,29 @@ mod tests {
     }
 
     #[test]
-    fn update_blockers_include_accepted_dispatch_and_unbound_provider_work() {
+    fn update_holds_include_accepted_dispatch_and_unbound_provider_work() {
         let (mut registry, _directory, mut request) = fixture();
         let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
-        let assert_blocked = |registry: &Registry| {
-            let blockers = registry.agent_update_blockers().unwrap();
-            assert_eq!(blockers.len(), 1);
-            assert!(blockers[0].contains(&accepted.agent.id.to_string()));
-        };
-        assert_blocked(&registry);
-        registry.claim_agent_dispatch(&accepted, 2).unwrap();
-        assert_blocked(&registry);
         let session = source();
+        let assert_held = |registry: &Registry, by: Option<crate::model::TerminalId>| {
+            let holds = registry.agent_update_holds().unwrap();
+            assert_eq!(holds.len(), 1);
+            assert!(holds[0].blocker.contains(&accepted.agent.id.to_string()));
+            assert_eq!(holds[0].session, by);
+        };
+        assert_held(&registry, None);
+        registry.claim_agent_dispatch(&accepted, 2).unwrap();
+        assert_held(&registry, None);
         registry
             .reserve_agent_launch(accepted.agent.id, &session)
             .unwrap();
-        assert_blocked(&registry);
+        // A launch still being confirmed is not yet any session's work.
+        assert_held(&registry, None);
         registry
-            .bind_agent(accepted.agent.id, None, session)
+            .bind_agent(accepted.agent.id, None, session.clone())
             .unwrap();
-        assert_blocked(&registry);
+        // Bound, its accepted run is the work its own session delivers next.
+        assert_held(&registry, Some(session.id()));
         registry
             .update_agent_run(
                 accepted.run.id,
@@ -5517,10 +5554,21 @@ mod tests {
                 3,
             )
             .unwrap();
-        assert!(registry.agent_update_blockers().unwrap().is_empty());
+        assert!(registry.agent_update_holds().unwrap().is_empty());
+
+        // A message queued behind the running turn waits on that session.
+        let follow_up = Submit {
+            name: None,
+            destination: Destination::Existing(accepted.agent.id),
+            prompt: "and then this".into(),
+            idempotency_key: "queued-follow-up".into(),
+        };
+        let queued = registry.submit_agent(&Origin::User, &follow_up, 4).unwrap();
+        assert_eq!(queued.run.state, State::Accepted);
+        assert_held(&registry, Some(session.id()));
 
         request.idempotency_key = "unbound-provider".into();
-        let unbound = registry.submit_agent(&Origin::User, &request, 4).unwrap();
+        let unbound = registry.submit_agent(&Origin::User, &request, 5).unwrap();
         registry
             .update_agent_run(
                 unbound.run.id,
@@ -5528,12 +5576,16 @@ mod tests {
                 Update::Started {
                     provider_key: "unbound".into(),
                 },
-                5,
+                6,
             )
             .unwrap();
-        let blockers = registry.agent_update_blockers().unwrap();
-        assert_eq!(blockers.len(), 1);
-        assert!(blockers[0].contains(&unbound.agent.id.to_string()));
+        let holds = registry.agent_update_holds().unwrap();
+        let unbound_hold = holds
+            .iter()
+            .find(|hold| hold.blocker.contains(&unbound.agent.id.to_string()))
+            .unwrap();
+        assert_eq!(holds.len(), 2);
+        assert_eq!(unbound_hold.session, None);
     }
 
     #[test]

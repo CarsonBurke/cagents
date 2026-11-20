@@ -222,9 +222,14 @@ impl DaemonImpact {
                             .iter()
                             .all(|id| permitted.contains(id.as_str()))
                         && (previous.disposition == current.disposition
-                            || (self.policy == Policy::WhenIdle
-                                && previous.disposition == Disposition::WaitsForIdle
-                                && current.disposition == Disposition::Resumes)
+                            // Waiting authorizes the wait's own end: resuming
+                            // or, for a provider that outlives the update,
+                            // continuing. Never an interruption.
+                            || (previous.disposition == Disposition::WaitsForIdle
+                                && matches!(
+                                    current.disposition,
+                                    Disposition::Resumes | Disposition::Continues
+                                ))
                             || (self.policy == Policy::Interrupt
                                 && previous.disposition == Disposition::Interrupted
                                 && current.disposition == Disposition::Resumes))
@@ -368,6 +373,29 @@ pub(super) mod tests {
         current = confirmed.clone();
         current.capability.proof.host_incarnation = HostIncarnation::new("replacement");
         assert!(!confirmed.preserves_consent(&current));
+    }
+
+    #[test]
+    fn a_reviewed_wait_may_end_by_continuing_under_either_policy_but_never_by_interrupting() {
+        for policy in [Policy::WhenIdle, Policy::Interrupt] {
+            let mut confirmed = waiting();
+            confirmed.policy = policy;
+            for settled in [Disposition::Resumes, Disposition::Continues] {
+                let mut current = confirmed.clone();
+                current.sessions[0].disposition = settled;
+                assert!(
+                    confirmed.preserves_consent(&current),
+                    "{policy:?} {settled:?}"
+                );
+                assert!(
+                    !current.preserves_consent(&confirmed),
+                    "new queued work needs another review"
+                );
+            }
+            let mut current = confirmed.clone();
+            current.sessions[0].disposition = Disposition::Interrupted;
+            assert!(!confirmed.preserves_consent(&current));
+        }
     }
 
     #[test]
