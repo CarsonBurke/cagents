@@ -61,3 +61,9 @@ crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.
 Why: a scrolled composer draft was sliced at the padding's inner edge (#2824). Remove this when upstream editors can draw into their padding.
 
 Dragging a selection into a band selects the line drawn there, and cursor reveal then scrolls it into view. The drag therefore scrolls one line for each pointer move inside the band, and stops while the pointer is still. iced still reports drags only within the widget's bounds.
+
+## Accessibility through tooltips and wrapping rows (cagents #3259)
+
+`Tooltip` and `row::Wrapping` report their content's accessibility nodes (`a11y_nodes`). Upstream they kept the trait's empty default, so a control under a tooltip, or in a row that wraps, was missing from the accessibility tree. Screen readers couldn't find it, and focus or click requests addressed to it never arrived. A tooltip reports its content and leaves the tooltip text out, as upstream does when it draws the tooltip. Wrapping reports what its row would.
+
+Why: the composer's attachment tiles each sit under a tooltip in a wrapping row, and none of them reached assistive tools. The same applies to every other tooltip-wrapped control in the app. The regression test is `assistive_tools_find_every_tile_in_the_tray` in crates/cagents-ui/src/app/chat_ui/attachment_tile.rs. Remove this change when upstream forwards these nodes.

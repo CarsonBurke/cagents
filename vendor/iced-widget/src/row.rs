@@ -656,6 +656,17 @@ where
             .draw(tree, renderer, theme, style, layout, cursor, viewport);
     }
 
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        state: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        // Local change: the wrapped row's children are laid out as its own.
+        self.row.a11y_nodes(layout, state, cursor)
+    }
+
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
