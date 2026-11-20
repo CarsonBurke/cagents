@@ -155,15 +155,7 @@ fn project_items(
             // work only while something happens there. An idle shell open in
             // it is not something happening.
             let agent = attached.iter().any(|session| session.provider.is_some());
-            if worktree.primary
-                && !ahead
-                && !dirty
-                && !agent
-                && worktree
-                    .branch
-                    .as_deref()
-                    .is_none_or(|identity| crate::work::branch_name(identity).to_str().is_some())
-            {
+            if worktree.primary && !ahead && !dirty && !agent {
                 continue;
             }
             // `git worktree add --force` can check one branch out twice.
@@ -249,7 +241,7 @@ fn project_items(
                 pull_request.state == PullRequestState::Open
                     || (pull_request.state == PullRequestState::Closed && pull_request.draft)
             });
-            if !keep && crate::work::branch_name(name).to_str().is_some() {
+            if !keep {
                 continue;
             }
             carded.insert(name.clone());
@@ -879,27 +871,113 @@ mod tests {
         assert_eq!(converted.review, Some(Review::ChangesRequested));
     }
     #[test]
-    fn invalid_byte_branches_keep_plain_cards_and_distinct_duplicate_checkouts() {
+    fn branch_card_rules_are_independent_of_name_encoding() {
+        let states = [
+            ("linked checkout", Some(false), 0, 0, false, [true, true]),
+            (
+                "unchecked-out with open PR",
+                None,
+                0,
+                0,
+                true,
+                [true, false],
+            ),
+            (
+                "unchecked-out without PR",
+                None,
+                0,
+                0,
+                false,
+                [false, false],
+            ),
+            ("idle primary", Some(true), 0, 0, false, [false, false]),
+            ("ahead primary", Some(true), 1, 0, false, [true, true]),
+            ("dirty primary", Some(true), 0, 1, false, [true, true]),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (state, primary, ahead, dirty, open_pr, cards) in states {
+            let mut present = [false; 2];
+            for (index, identity) in ["legacy-ordinary", ":6c65676163792dff"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut fixture = fixture();
+                fixture.local = scan::Local::default();
+                fixture.local.branch_names.insert(identity.into());
+                let mut checkout =
+                    worktree("/repo/checkout", Some(identity), primary == Some(true));
+                checkout.comparison.as_mut().unwrap().ahead = ahead;
+                checkout.dirty.as_mut().unwrap().paths = dirty;
+                let head = checkout.head.as_ref().unwrap().clone();
+                fixture.local.branches.insert(
+                    identity.into(),
+                    scan::Branch {
+                        oid: head.oid.clone(),
+                        committed_at_unix_ms: head.committed_at_unix_ms,
+                        worktree: primary.map(|_| checkout.path.clone()),
+                        comparison: checkout.comparison.clone(),
+                    },
+                );
+                if primary.is_some() {
+                    fixture.local.worktrees.push(checkout);
+                }
+                let display = crate::work::branch_name(identity)
+                    .to_string_lossy()
+                    .into_owned();
+                // GitHub cannot have an invalid-UTF-8 head branch. A PR under
+                // its lossy display name belongs to a different, valid branch.
+                fixture.snapshot = snapshot(if open_pr {
+                    vec![pull_request(&display, &head.oid, "OPEN", false)]
+                } else {
+                    Vec::new()
+                });
+                let forge = Forge::Synced {
+                    at_unix_ms: NOW,
+                    error: None,
+                };
+                let project = ProjectView {
+                    repository: Path::new("/repo/.git"),
+                    name: "repo",
+                    local: Some(&fixture.local),
+                    scan_error: None,
+                    forge: &forge,
+                    snapshot: Some(&fixture.snapshot),
+                };
+                assert_eq!(
+                    pull_request_for(&project, &fixture.local, identity, Some(&head)).is_some(),
+                    open_pr && index == 0,
+                    "{state}: PR association for {identity}"
+                );
+                let board = fixture.board();
+                let card = board
+                    .items
+                    .iter()
+                    .find(|item| item.key == ItemKey::Branch(identity.into()));
+                present[index] = card.is_some();
+                if let Some(card) = card {
+                    assert_eq!(card.branch.as_deref(), Some(display.as_str()));
+                    assert_eq!(card.pull_request.is_some(), open_pr && index == 0);
+                }
+            }
+            actual.push((state, present));
+            expected.push((state, cards));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn invalid_byte_branches_keep_distinct_linked_checkout_cards() {
         let mut fixture = fixture();
         let identity = ":6c65676163792dff";
         let mut branch = fixture.local.branches["draft"].clone();
         branch.oid = "raw-oid".into();
         fixture.local.branches.insert(identity.into(), branch);
-        let board = fixture.board();
-        let plain = board
-            .items
-            .iter()
-            .find(|item| item.key == ItemKey::Branch(identity.into()))
-            .unwrap();
-        assert_eq!(plain.branch.as_deref(), Some("legacy-\u{fffd}"));
-        assert_eq!(plain.label(), "legacy-\u{fffd}");
-        assert_eq!(plain.head.as_ref().unwrap().oid, "raw-oid");
-        assert!(plain.pull_request.is_none());
-        for path in ["/repo/legacy", "/repo/legacy-again"] {
-            fixture
-                .local
-                .worktrees
-                .push(worktree(path, Some(identity), false));
+        fixture.local.branch_names.insert(identity.into());
+        for path in ["/repo/.worktrees/legacy", "/repo/.worktrees/legacy-again"] {
+            let mut checkout = worktree(path, Some(identity), false);
+            checkout.head.as_mut().unwrap().oid = "raw-oid".into();
+            fixture.local.worktrees.push(checkout);
         }
         let board = fixture.board();
         let raw = board
@@ -910,6 +988,10 @@ mod tests {
         assert_eq!(raw.len(), 2);
         assert_ne!(raw[0].key, raw[1].key);
         for card in raw {
+            assert_eq!(card.label(), "legacy-\u{fffd}");
+            assert_eq!(card.head.as_ref().unwrap().oid, "raw-oid");
+            assert!(card.pull_request.is_none());
+            assert!(!card.worktree.as_ref().unwrap().primary);
             let ItemKey::Branch(key) = &card.key else {
                 panic!("missing raw branch identity")
             };
@@ -917,9 +999,10 @@ mod tests {
         }
     }
     #[test]
-    fn idle_primary_invalid_branch_keeps_its_checkout_facts() {
+    fn active_primary_invalid_branch_keeps_its_checkout_facts() {
         let mut fixture = fixture();
         fixture.local.worktrees[0].branch = Some(":6c65676163792dff".into());
+        fixture.local.worktrees[0].dirty.as_mut().unwrap().paths = 1;
         let board = fixture.board();
         let raw = board
             .items
@@ -928,7 +1011,7 @@ mod tests {
             .unwrap();
         assert!(raw.worktree.as_ref().unwrap().primary);
         assert_eq!(raw.worktree.as_ref().unwrap().path, Path::new("/repo"));
-        assert!(raw.dirty.is_some());
+        assert_eq!(raw.dirty.as_ref().unwrap().paths, 1);
         assert!(raw.head.is_some());
         assert!(raw.comparison.is_some());
     }
