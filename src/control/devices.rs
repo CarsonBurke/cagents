@@ -56,18 +56,19 @@ pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError>
         DeviceCommand::List => list(&trust(Request::Links)?),
         DeviceCommand::Link { name, allow_agents } => {
             let device = saved(&name)?;
-            let replaces = links(trust(Request::Links)?)
+            // Linking again replaces only the key. This computer keeps its
+            // identity on the device, so the agents its sessions started
+            // there stay theirs.
+            let peer = links(trust(Request::Links)?)
                 .into_iter()
                 .find(|link| link.device == name)
-                .map(|link| link.peer);
-            let peer = uuid::Uuid::new_v4();
+                .map_or_else(uuid::Uuid::new_v4, |link| link.peer);
             let key = LinkKey::generate().map_err(|error| AppError::new("device", error))?;
             on_device(&name, |remote| {
                 remote.device_trust(Request::RegisterPeer {
                     peer,
                     label: label(),
                     key: key.clone(),
-                    replaces,
                 })
             })?;
             trust(Request::SaveLink {

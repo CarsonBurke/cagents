@@ -19,7 +19,6 @@ fn register(path: &Path, peer: uuid::Uuid, key: LinkKey) {
                 peer,
                 label: "laptop".into(),
                 key,
-                replaces: None,
             },
         )
         .unwrap(),
@@ -75,33 +74,28 @@ fn links_persist_privately_without_listing_their_keys() {
 }
 
 #[test]
-fn relinking_replaces_the_earlier_peer() {
+fn relinking_replaces_the_key_and_keeps_the_peer() {
     let (_directory, path) = store();
-    let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-    save_link(&path, "fw16", first, key(1), true);
+    let peer = uuid::Uuid::new_v4();
+    save_link(&path, "fw16", peer, key(1), true);
     assert_eq!(
-        save_link(&path, "fw16", second, key(2), true),
+        save_link(&path, "fw16", peer, key(2), true),
         Reply::Saved {
-            replaced: Some(first)
+            replaced: Some(peer)
         }
     );
-    register(&path, first, key(1));
-    process_at(
-        &path,
-        Request::RegisterPeer {
-            peer: second,
-            label: "laptop".into(),
-            key: key(2),
-            replaces: Some(first),
-        },
-    )
-    .unwrap();
     assert_eq!(
-        process_at(&path, Request::ForgetPeer { peer: first }).unwrap(),
-        Reply::Forgotten { existed: false }
+        Store::load(&path).unwrap().link("fw16").unwrap().key.0,
+        key(2)
     );
+
+    register(&path, peer, key(1));
+    register(&path, peer, key(2));
+    let device = Store::load(&path).unwrap();
+    assert_eq!(device.peers.len(), 1);
+    assert_eq!(device.peer(peer).unwrap().key.0, key(2));
     assert_eq!(
-        process_at(&path, Request::ForgetPeer { peer: second }).unwrap(),
+        process_at(&path, Request::ForgetPeer { peer }).unwrap(),
         Reply::Forgotten { existed: true }
     );
 }
@@ -148,7 +142,6 @@ fn a_peer_label_drops_control_characters() {
             peer: uuid::Uuid::new_v4(),
             label: format!("lap\u{1b}[31mtop{}", "x".repeat(200)),
             key: key(1),
-            replaces: None,
         })
         .unwrap();
     assert!(store.peers[0].label.starts_with("lap[31mtop"));

@@ -4708,6 +4708,98 @@ fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
 }
 
 #[test]
+fn a_linked_computers_session_owns_the_agents_it_starts_on_the_device() {
+    use crate::device_trust::{LinkKey, Request};
+    use crate::host::device_trust;
+
+    if isolated("a_linked_computers_session_owns_the_agents_it_starts_on_the_device").is_some() {
+        return;
+    }
+    let (host, request, registry_path) = fixture();
+    // A live session here: an agent the person started.
+    let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let registry = registry(&host).unwrap();
+    let session = registry
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let local = registry
+        .lock()
+        .unwrap()
+        .retained_agent_authority(session)
+        .unwrap();
+
+    // This daemon stands for both computers: its store holds the link to
+    // the device and the device's record of this computer.
+    let trust = registry_path.with_file_name("device-trust.json");
+    let (peer, key) = (uuid::Uuid::new_v4(), LinkKey::generate().unwrap());
+    device_trust::process_at(
+        &trust,
+        Request::SaveLink {
+            device: "devx".into(),
+            peer,
+            key: key.clone(),
+            agents_allowed: true,
+        },
+    )
+    .unwrap();
+    device_trust::process_at(
+        &trust,
+        Request::RegisterPeer {
+            peer,
+            label: "laptop".into(),
+            key,
+        },
+    )
+    .unwrap();
+    let client = 41;
+    let nonce = device_trust::challenge(&host, client).unwrap();
+    let (signed, lineage, proof) =
+        device_trust::sign_at(&trust, &host, &local, "devx", &nonce).unwrap();
+    assert_eq!(signed, peer);
+    let remote =
+        device_trust::authenticate_at(&trust, &host, client, peer, lineage, &proof).unwrap();
+
+    let mut linked = request;
+    linked.idempotency_key = "linked".into();
+    let child = submit(&host, &remote, linked).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .agent(child.agent.id)
+            .unwrap()
+            .origin,
+        Origin::Child {
+            parent: crate::device_trust::peer_lineage(peer, lineage)
+        }
+    );
+    let requests = |authority: &Authority| {
+        process(
+            &host,
+            authority.clone(),
+            Operation::Requests(child.agent.id),
+        )
+    };
+    assert!(requests(&remote).is_ok());
+    // Neither the session's own capability nor the device's person owns it.
+    for other in [&local, &Authority::default()] {
+        let error = requests(other).unwrap_err();
+        assert!(error.contains("does not own"), "{error}");
+    }
+
+    host.lock().unwrap().peers.disconnect(client);
+    let error = requests(&remote).unwrap_err();
+    assert!(error.contains("ended with its connection"), "{error}");
+}
+
+#[test]
 fn a_linked_computers_session_reads_only_its_own_mail() {
     use crate::{
         agent_execution::{

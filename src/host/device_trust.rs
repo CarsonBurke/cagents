@@ -300,19 +300,13 @@ impl Store {
                     .map(|index| self.links.remove(index).peer);
                 (Reply::Removed { peer }, peer.is_some())
             }
-            Request::RegisterPeer {
-                peer,
-                label,
-                key,
-                replaces,
-            } => {
+            Request::RegisterPeer { peer, label, key } => {
                 let label: String = label
                     .chars()
                     .filter(|character| !character.is_control())
                     .take(MAX_LABEL_CHARS)
                     .collect();
-                self.peers
-                    .retain(|stored| stored.peer != peer && Some(stored.peer) != replaces);
+                self.peers.retain(|stored| stored.peer != peer);
                 if self.peers.len() >= MAX_PEERS {
                     return Err(format!(
                         "This device keeps at most {MAX_PEERS} linked computers; unlink one first"
@@ -350,7 +344,7 @@ pub(crate) fn process(request: Request) -> Result<Reply, ProtocolError> {
     process_at(&store_path().map_err(unavailable)?, request)
 }
 
-fn process_at(path: &Path, request: Request) -> Result<Reply, ProtocolError> {
+pub(in crate::host) fn process_at(path: &Path, request: Request) -> Result<Reply, ProtocolError> {
     let _store = STORE.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = Store::load(path).map_err(unavailable)?;
     let (reply, changed) = store.apply(request).map_err(unavailable)?;
@@ -397,7 +391,7 @@ pub(crate) fn authenticate(
     )
 }
 
-fn authenticate_at(
+pub(in crate::host) fn authenticate_at(
     path: &Path,
     host: &SharedHost,
     client: ClientId,
@@ -450,7 +444,7 @@ pub(crate) fn sign(
     )
 }
 
-fn sign_at(
+pub(in crate::host) fn sign_at(
     path: &Path,
     host: &SharedHost,
     authority: &Authority,

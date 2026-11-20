@@ -67,13 +67,12 @@ pub enum Request {
     SetAgentsAllowed { device: String, allowed: bool },
     /// Forgets the link to `device`. Sessions here can no longer use it.
     RemoveLink { device: String },
-    /// On the device: accepts `peer` as a linked computer, replacing the
-    /// peer it was linked as before.
+    /// On the device: accepts `peer` as a linked computer, replacing its
+    /// key if it was linked before.
     RegisterPeer {
         peer: uuid::Uuid,
         label: String,
         key: LinkKey,
-        replaces: Option<uuid::Uuid>,
     },
     /// On the device: forgets a linked computer.
     ForgetPeer { peer: uuid::Uuid },

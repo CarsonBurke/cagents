@@ -153,7 +153,7 @@ started them, not to the device's own sessions.
 | Command | What it does |
 | --- | --- |
 | `cagents device list` | Saved devices, whether each is linked, and whether agents here may use it. |
-| `cagents device link NAME [--allow-agents]` | Links a saved device. Linking again replaces the earlier link. |
+| `cagents device link NAME [--allow-agents]` | Links a saved device. Linking again replaces its key; the agents sessions here started on the device stay theirs. |
 | `cagents device allow-agents NAME` | Lets sessions on this computer use a linked device. |
 | `cagents device deny-agents NAME` | Stops them. Agents they already started there keep running. |
 | `cagents device unlink NAME` | Forgets the link here and on the device. |
