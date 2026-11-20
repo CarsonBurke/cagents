@@ -6112,16 +6112,16 @@ impl Runtime {
         )
     }
 
-    /// Whether item `id`'s own Copy is saying why it didn't copy.
+    /// Whether item `id`'s own Copy is saying what its copy did.
     pub(super) fn copy_note_shown(&self, id: &str) -> bool {
-        self.copy_state(id, None).refusal().is_some()
+        self.copy_state(id, None).is_telling()
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
         let state = self.copy_state(&item.id, None);
         let mut controls = vec![small_icon(
             state.icon(),
-            "Copy this message",
+            state.label("Copy this message"),
             if item.logical_copy_body().is_some()
                 && !self
                     .presentation_cache()
@@ -6136,14 +6136,10 @@ impl Runtime {
                 Action::Copy(self.target, item.id.clone(), CopyPart::Text)
             },
         )];
-        // Why the copy didn't go through, beside the Copy that tries again.
-        // It stands in for the timestamp until it lapses.
-        if let Some(refusal) = state.refusal() {
-            controls.push(
-                design::caption(refusal.to_string())
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .into(),
-            );
+        // What the copy did, beside the Copy that made it. It stands in for
+        // the timestamp until it lapses.
+        if let Some(said) = state.said() {
+            controls.push(said);
         } else if let Some((at, stamp, full)) = self
             .presentation_cache()
             .get(&item.id)
