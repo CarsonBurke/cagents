@@ -83,6 +83,41 @@ impl CopyState {
             _ => None,
         }
     }
+
+    /// Whether the control has something to say, and so stays in view while
+    /// it says it.
+    pub(super) fn is_telling(&self) -> bool {
+        !matches!(self, Self::Ready)
+    }
+
+    /// The control's accessible name: `ready` until a copy is made from it,
+    /// then what that copy did. Why one didn't is in [`Self::said`].
+    pub(super) fn label(&self, ready: &'static str) -> &'static str {
+        match self {
+            Self::Ready => ready,
+            Self::Copied => "Copied",
+            Self::Refused(_) => "Copy again",
+        }
+    }
+
+    /// What the control says beside itself: that it copied, or why it
+    /// didn't. Text is announced as it appears, so a reader who can't see the
+    /// icon change hears it too.
+    pub(super) fn said(&self) -> Option<Element<'static, Message>> {
+        match self {
+            Self::Ready => None,
+            Self::Copied => Some(
+                design::caption("Copied")
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            ),
+            Self::Refused(refusal) => Some(
+                design::caption(refusal.to_string())
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .into(),
+            ),
+        }
+    }
 }
 
 /// What the last copy said at the control it was made from: that it copied,
@@ -1012,6 +1047,11 @@ mod tests {
         let _context = isolated_context();
         for scope in scopes() {
             let (mut app, target, _, request) = copy_fixture(scope.clone());
+            let outcome = |app: &mut Cagents| {
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                (runtime.finished_label(), runtime.conversation_status(false))
+            };
+            let before = outcome(&mut app);
             let task = app.finish_message_copy(
                 target,
                 "step".into(),
@@ -1019,6 +1059,8 @@ mod tests {
                 Err(chat::TEXT_COPY_CHANGED.to_owned()),
             );
             assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
+            // The turn keeps its own outcome, and the status its icon.
+            assert_eq!(outcome(&mut app), before, "{scope:?}");
             let runtime = app.chat_runtime_mut(target).unwrap();
             // The step's own Copy says it, not its blocks'.
             assert!(matches!(
@@ -1026,6 +1068,10 @@ mod tests {
                 CopyState::Refused(refusal) if &*refusal == chat::TEXT_COPY_CHANGED
             ));
             assert!(runtime.copy_note_shown("step"));
+            let state = runtime.copy_state("step", None);
+            // The control names what happened, and says why beside itself.
+            assert_eq!(state.label("Copy this message"), "Copy again");
+            assert!(state.said().is_some());
             assert!(matches!(
                 runtime.copy_state("step", Some(&CopyPart::Output)),
                 CopyState::Ready
@@ -1033,6 +1079,19 @@ mod tests {
             assert!(runtime.error.is_none(), "{scope:?}");
             assert_eq!(runtime.reported_errors().count(), 0, "{scope:?}");
         }
+    }
+
+    /// Each state names itself to a reader who can't see its icon.
+    #[test]
+    fn a_copy_control_names_what_its_copy_did() {
+        assert_eq!(CopyState::Ready.label("Copy this block"), "Copy this block");
+        assert!(CopyState::Ready.said().is_none() && !CopyState::Ready.is_telling());
+        assert_eq!(CopyState::Copied.label("Copy this block"), "Copied");
+        assert!(CopyState::Copied.said().is_some() && CopyState::Copied.is_telling());
+        let refused = CopyState::Refused(chat::TEXT_COPY_UNAVAILABLE.into());
+        assert_eq!(refused.label("Copy this block"), "Copy again");
+        assert_eq!(refused.icon(), Icon::Warning);
+        assert!(refused.said().is_some() && refused.is_telling());
     }
 
     /// A block's Copy answers at that block: copying a step's output does not

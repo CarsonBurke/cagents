@@ -147,17 +147,14 @@ pub(super) fn code_frame<'a>(
     .width(Length::Fill);
     match copy {
         Some(copy) => {
-            let refusal = state.refusal().cloned();
             let mut controls = Vec::with_capacity(2);
-            // Why the copy didn't go through, beside the Copy that tries again.
-            if let Some(refusal) = &refusal {
-                controls.push(
-                    design::caption(refusal.to_string())
-                        .class(cosmic::theme::Text::Custom(design::warning_text))
-                        .into(),
-                );
-            }
-            controls.push(small_icon(state.icon(), "Copy this block", copy));
+            // What the copy did, beside the Copy that made it.
+            controls.extend(state.said());
+            controls.push(small_icon(
+                state.icon(),
+                state.label("Copy this block"),
+                copy,
+            ));
             super::hover::over_pinned(
                 block,
                 widget::container(
@@ -169,7 +166,7 @@ pub(super) fn code_frame<'a>(
                 .height(Length::Fill)
                 .align_x(Alignment::End)
                 .align_y(Alignment::Start),
-                refusal.is_some(),
+                state.is_telling(),
             )
         }
         None => block.into(),

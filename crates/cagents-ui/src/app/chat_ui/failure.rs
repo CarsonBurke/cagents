@@ -1652,18 +1652,8 @@ impl Runtime {
             .on_press(action(Action::CopyFailure(target, incident.key.clone())));
         // What its last copy said, beside it: a copy is the reader's own
         // action, not part of the failure it copies.
-        let said = match self.details_copy_state(&incident.key) {
-            super::text_copy::CopyState::Ready => None,
-            super::text_copy::CopyState::Copied => Some(
-                design::caption("Copied").class(cosmic::theme::Text::Custom(design::muted_text)),
-            ),
-            super::text_copy::CopyState::Refused(refusal) => Some(
-                design::caption(refusal.to_string())
-                    .class(cosmic::theme::Text::Custom(design::warning_text)),
-            ),
-        };
-        rows.push(match said {
-            Some(said) => widget::row::with_children(vec![copy.into(), said.into()])
+        rows.push(match self.details_copy_state(&incident.key).said() {
+            Some(said) => widget::row::with_children(vec![copy.into(), said])
                 .spacing(space::S)
                 .align_y(Alignment::Center)
                 .into(),
