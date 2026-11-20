@@ -3061,6 +3061,74 @@ mod tests {
     }
 
     #[test]
+    fn correlated_terminal_error_snapshot_contains_provider_reason_once() {
+        let mut adapter = Omp {
+            ready: true,
+            started: true,
+            ..Omp::default()
+        };
+        let prompt = adapter
+            .command_for_run(
+                crate::model::RunId::new(),
+                Command::Prompt {
+                    text: "Hello".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = &prompt.writes[0]["id"];
+        let message = json!({
+            "role":"assistant","timestamp":1,"content":[],
+            "stopReason":"error","errorMessage":"API quota exhausted"
+        });
+        let mut events = prompt.events;
+        for frame in [
+            json!({"type":"response","command":"prompt","id":request,"success":true}),
+            json!({"type":"agent_start"}),
+            json!({"type":"message_end","message":message}),
+            json!({"type":"agent_end","isTerminal":true,"messages":[message]}),
+            json!({
+                "type":"prompt_result","id":request,"status":"error",
+                "error":{"message":"Different prompt result reason"}
+            }),
+        ] {
+            events.extend(adapter.receive(frame).unwrap().events);
+        }
+        let mut snapshot = chat::Snapshot {
+            ready: true,
+            ..Default::default()
+        };
+        chat::runtime::project_events_for_test(&mut snapshot, events);
+
+        let occurrences = snapshot
+            .items
+            .iter()
+            .map(|item| {
+                serde_json::to_string(&item.content)
+                    .unwrap()
+                    .matches("API quota exhausted")
+                    .count()
+            })
+            .sum::<usize>()
+            + snapshot
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .matches("API quota exhausted")
+                .count();
+        assert_eq!(
+            occurrences, 1,
+            "the provider reason must occur once across transcript items and snapshot.error: items={:?}, error={:?}",
+            snapshot.items, snapshot.error
+        );
+        assert_eq!(snapshot.error.as_deref(), Some("API quota exhausted"));
+        assert!(snapshot.items.is_empty());
+        assert!(snapshot.ready);
+        assert!(!snapshot.busy);
+    }
+
+    #[test]
     fn correlated_terminal_error_preserves_the_assistant_reason_once() {
         for result_before_end in [false, true] {
             let mut adapter = Omp {
