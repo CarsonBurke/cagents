@@ -13112,6 +13112,7 @@ fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) ->
         || channel.selected
         || channel.unread
         || channel.activity.is_some()
+        || channel.attention.needs_attention()
         || channel.deletion.is_some()
         || state.retained_in_attention(SelectionRow::Channel(channel.id))
 }
