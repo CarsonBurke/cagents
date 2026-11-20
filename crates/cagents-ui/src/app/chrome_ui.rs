@@ -2922,6 +2922,7 @@ impl Cagents {
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
             || self.has_terminal_save_notices()
+            || self.has_close_failure_notices()
             || self.has_refused_view_seeds()
             || self
                 .save_health
@@ -3061,7 +3062,7 @@ impl Cagents {
             .max(health_severity)
             .max(seed_severity)
             .max(
-                self.has_terminal_save_notices()
+                (self.has_terminal_save_notices() || self.has_close_failure_notices())
                     .then_some(NoticeSeverity::Error),
             );
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
@@ -3259,6 +3260,7 @@ impl Cagents {
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
                 let mut notices = Vec::with_capacity(self.notices.len() + 1);
                 notices.extend(self.terminal_save_notice_views());
+                notices.extend(self.close_failure_notice_views());
                 for entry in self.notices.recent() {
                     if matches!(entry.notice.key, Some(NoticeKey::TerminalSave(_, _))) {
                         continue;
@@ -3481,18 +3483,18 @@ impl Cagents {
         // instead of giving every agent the same eight-character title budget.
         let desired = self
             .workspace
-            .order()
+            .shown()
             .filter_map(|id| self.card_chrome.get(&id))
             .map(|chrome| chrome.title_width + 144.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
-        let count = self.workspace.order().count();
+        let count = self.workspace.shown().count();
         let comfortable = count as f32 * (desired + crate::tab_strip::SPACING)
             + 2.0 * crate::tab_strip::EDGE_INSET;
         let width = if comfortable > available {
             // Compact whenever the comfortable row would scroll, regardless
             // of the workspace width. Full names remain in the tooltips.
-            let visible = self.workspace.order().count().clamp(1, 4) as f32;
+            let visible = self.workspace.shown().count().clamp(1, 4) as f32;
             let fitting = (available / visible
                 - crate::tab_strip::SPACING
                 - 2.0 * crate::tab_strip::EDGE_INSET / visible)
@@ -3514,7 +3516,7 @@ impl Cagents {
         let Some(index) = self
             .workspace
             .focused()
-            .and_then(|focused| self.workspace.order().position(|id| id == focused))
+            .and_then(|focused| self.workspace.shown().position(|id| id == focused))
         else {
             return Task::none();
         };
@@ -3525,7 +3527,7 @@ impl Cagents {
         // The trailing "new tab" control shares the scrollable row, so a tab
         // revealed flush against the viewport edge would sit underneath it.
         let pitch = width + crate::tab_strip::SPACING;
-        let content = self.workspace.order().count() as f32 * pitch
+        let content = self.workspace.shown().count() as f32 * pitch
             + design::PRIMARY_CONTROL_SIZE
             + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
@@ -3563,7 +3565,7 @@ impl Cagents {
         let (_, tab_width) = self.tab_strip_geometry();
         let tabs = self
             .workspace
-            .order()
+            .shown()
             .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
             .chain(std::iter::once(self.new_tab_control()))
             .collect();
@@ -3577,7 +3579,7 @@ impl Cagents {
                 Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x))
             })),
             crate::tab_strip::Reordering {
-                order: self.workspace.order().collect(),
+                order: self.workspace.shown().collect(),
                 tab_width,
                 enabled: !self.workspace_inputs_blocked(),
                 select: Box::new(Message::FocusCard),

@@ -588,6 +588,7 @@ impl Cagents {
                 .is_some_and(|source| source.busy())
             || !self.settings_pending.is_empty()
             || self.chat_ui.transition_pending()
+            || self.chat_ui.closing_in_background()
         {
             return Some("Finish pending operations and dialogs before updating.");
         }

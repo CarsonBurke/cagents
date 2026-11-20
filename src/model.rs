@@ -412,6 +412,29 @@ pub struct TerminalExit {
     pub occurred_at_unix_ms: i64,
 }
 
+/// A chat whose pane closed before the daemon said its conversation stopped,
+/// or whose stop the daemon refused. It is saved so that what happened is
+/// still reported when the window closed first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoppingChat {
+    /// The conversation as its pane closed.
+    pub session: crate::chat::Session,
+    /// The card it closed from, which keeps its unsent text.
+    pub card: CardId,
+    /// What its pane was called, to name it if it can't be stopped.
+    #[serde(default)]
+    pub title: String,
+    /// Why the daemon refused to stop it. `None` while its answer is still
+    /// to come.
+    #[serde(default)]
+    pub refused: Option<String>,
+    /// Whether the reader dismissed the notice of its refusal. The
+    /// conversation still runs, so reopening it by any route still attaches
+    /// to what runs it rather than starting it again.
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
 /// What a chat had not sent when its card closed: the composer's text and
 /// attachments, with any first message or follow-ups it was holding folded
 /// in, and the messages its provider was still holding, which stopped with
@@ -1652,6 +1675,10 @@ pub struct WorkspaceState {
     /// card, so reopening the conversation brings it back to the composer.
     #[serde(default)]
     pub kept_chat_drafts: HashMap<CardId, KeptChatDraft>,
+    /// Chats closed in this window that the daemon has not yet said were
+    /// stopped, or refused to stop, oldest first.
+    #[serde(default)]
+    pub stopping_chats: Vec<StoppingChat>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1701,6 +1728,7 @@ impl Default for WorkspaceState {
             chat_draft_attachments: HashMap::new(),
             chat_waiting_messages: HashMap::new(),
             kept_chat_drafts: HashMap::new(),
+            stopping_chats: Vec::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),

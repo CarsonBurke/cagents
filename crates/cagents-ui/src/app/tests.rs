@@ -1146,6 +1146,7 @@ fn popup_close_callbacks_and_requests_preserve_the_main_window() {
         Some(ApplicationExit {
             closing: Some(main),
             servers_reaped: false,
+            chats_closed: true,
         })
     );
     assert_eq!(app.core.main_window_id(), None);
@@ -1207,6 +1208,7 @@ fn committed_exit_closes_the_window_before_the_process_exits() {
     let closing = Some(ApplicationExit {
         closing: Some(window),
         servers_reaped: false,
+        chats_closed: true,
     });
     assert_eq!(app.exit, closing);
     // Released, so libcosmic's report of the closed window cannot end the
@@ -11775,6 +11777,9 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         close_commit_delivered: None,
         terminal_close_attempts: HashSet::new(),
         completed_release: None,
+        hidden_closes: HashSet::new(),
+        held_close_answer: None,
+        kept_panes: Vec::new(),
         terminal_close_generation: 0,
         closed_terminal_cards: HashSet::new(),
         proven_gone_cards: HashSet::new(),

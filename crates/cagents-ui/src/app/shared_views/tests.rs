@@ -8035,6 +8035,64 @@ fn retained_chat_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
     (app, source, destination, pane)
 }
 
+/// A closed chat whose removal its shared view refuses, as naming a pane the
+/// view no longer holds, closed nothing: it comes back where it was, as the
+/// view keeps it, and goes on with its conversation, which nothing asked to
+/// stop and nothing will on the next launch.
+#[test]
+fn a_closed_chat_its_view_keeps_goes_on_with_its_conversation() {
+    let (mut app, _source, _destination, pane) = retained_chat_move_fixture();
+    let (tx, rx) = test_model_channel();
+    app.workspace_model_tx = tx;
+    drop(app.begin_chat_close(pane.id));
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    assert!(
+        app.background_close_for_test(pane.id).is_some(),
+        "the conversation is to stop in the background"
+    );
+    let (operation, scope, change) = app
+        .shared_views
+        .pending
+        .iter()
+        .find(|(_, _, change)| {
+            matches!(change, Change::RemoveSource { before, .. } if before.id == pane.id)
+        })
+        .cloned()
+        .expect("its removal is published");
+    while rx.try_recv().is_ok() {}
+
+    drop(app.refuse_conflicting_view_change(
+        scope,
+        operation,
+        change,
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT.into(),
+    ));
+    assert!(
+        app.card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "the view keeps it"
+    );
+    assert!(
+        app.background_close_for_test(pane.id).is_none(),
+        "nothing stops"
+    );
+    assert!(
+        app.durable.stopping_chats.is_empty(),
+        "nor on the next launch"
+    );
+    assert!(!app.holds_reopen(pane.id));
+    assert!(
+        app.chat_start_pending(pane.id),
+        "it goes back to its conversation"
+    );
+}
+
+/// Closing a retained native chat never opens a modal, and its cleanup is
+/// never overtaken by a channel move (#2327, #2593). The first close takes
+/// the pane away at once, so there is nothing left to move while the daemon
+/// stops the conversation. Once the daemon has refused that stop, the
+/// conversation reopens on the provider still running it, and closing it
+/// again waits on its pane for the daemon, refusing every move meanwhile.
 #[test]
 fn channel_move_waits_for_retained_native_chat_cleanup_without_a_modal() {
     let (mut app, source, destination, pane) = retained_chat_move_fixture();
@@ -8042,9 +8100,58 @@ fn channel_move_waits_for_retained_native_chat_cleanup_without_a_modal() {
     app.workspace_model_tx = tx;
     assert!(app.can_move_pane_to_channel(pane.id, destination));
     let close = app.begin_chat_close(pane.id);
-    assert!(app.chat_start_pending(pane.id));
     assert!(!app.modal_is_open());
-    assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, pane.id);
+    assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+    let stopping = app
+        .background_close_for_test(pane.id)
+        .expect("the conversation stops in the background");
+    // The close itself is published; nothing after it may be.
+    while rx.try_recv().is_ok() {}
+    let before = app.workspace_model.clone();
+    assert!(!app.can_move_pane_to_channel(pane.id, destination));
+    drop(app.move_pane_to_channel(pane.id, destination));
+    drop(app.update(Message::MovePaneToChannel {
+        card: pane.id,
+        channel: destination,
+    }));
+    drop(app.update(Message::PaneDropToChannel {
+        generation: app.workspace_view_generation,
+        card: pane.id,
+        channel: destination,
+    }));
+    assert!(rx.try_recv().is_err(), "a closed pane cannot be moved");
+    assert!(!app.pane_transfer_pending(pane.id));
+    assert_eq!(app.workspace_model, before);
+    assert_eq!(app.durable.active_channel, Some(source));
+    drop(close);
+
+    // The daemon refuses to stop it; it reopens on what still runs.
+    let CardKind::Chat(session) = &pane.kind else {
+        unreachable!()
+    };
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Err("the retained provider is still running".into()),
+        ))),
+    );
+    drop(app.update(Message::ChatUi(
+        super::super::chat_ui::Action::ReopenRefusedClose(session.id),
+    )));
+    let reopened = app.workspace.focused().expect("the conversation reopened");
+    assert_ne!(reopened, pane.id);
+    crate::app::chat_ui::tests::attach_start(
+        &mut app,
+        reopened,
+        session.launch.session_id.as_deref(),
+    );
+    while rx.try_recv().is_ok() {}
+    // Its next close is the reader dealing with what held it: it waits on
+    // its pane, and nothing moves the pane meanwhile.
+    let close = app.begin_chat_close(reopened);
+    assert!(app.chat_start_pending(reopened));
+    assert!(!app.modal_is_open());
+    assert_lifecycle_refuses_moves(&mut app, &rx, source, destination, reopened);
     drop(close);
 }
 
@@ -8079,7 +8186,10 @@ fn pending_channel_move_refuses_native_close_and_switch_until_refused() {
     assert!(!app.pane_transfer_pending(pane.id));
     assert!(app.chat_switch_blocker(pane.id).is_none());
     let close = app.begin_chat_close(pane.id);
-    assert!(app.chat_start_pending(pane.id));
+    assert!(
+        !app.card_state(pane.id).unwrap().existence.is_open(),
+        "once the move is refused the close goes ahead"
+    );
     drop(close);
 }
 
