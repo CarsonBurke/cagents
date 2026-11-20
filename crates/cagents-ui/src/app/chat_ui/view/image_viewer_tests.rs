@@ -212,7 +212,11 @@ fn escape_in_the_composer_closes_the_image_before_interrupting() {
             "busy {busy}: {messages:?}"
         );
         for message in messages {
-            drop(app.update(message));
+            let task = app.update(message);
+            assert!(
+                task_focuses(task, &composer).0,
+                "busy {busy}: the keyboard stays in the composer"
+            );
         }
         assert!(shown(&app, target).is_none(), "busy {busy}");
 
