@@ -422,14 +422,26 @@ pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
 /// The session `found` resumes as: `seed`'s account and launch, with the
 /// conversation's own identity and directory.
 pub fn session(seed: &chat::Session, found: &Found) -> Option<chat::Session> {
+    resumed(seed, found.id(), found.directory(), Some(&found.path))
+}
+
+/// The session the conversation `id`, which ran in `directory`, resumes as
+/// on `seed`'s account and launch. `transcript` is where it was found, for
+/// a provider that is told where its conversations are kept.
+pub fn resumed(
+    seed: &chat::Session,
+    id: &str,
+    directory: &Path,
+    transcript: Option<&Path>,
+) -> Option<chat::Session> {
     let provider = seed.launch.provider;
     let mut session = seed.clone();
     session.reset_owned_codex_listener();
     session.id = TerminalId::new();
     session.proof = None;
     session.terminal = None;
-    session.launch.recipe.working_directory = found.directory().to_path_buf();
-    session.launch.session_id = Some(found.id().to_owned());
+    session.launch.recipe.working_directory = directory.to_path_buf();
+    session.launch.session_id = Some(id.to_owned());
     if provider == Provider::Omp {
         let args = &mut session.launch.recipe.arguments;
         let mut index = 0;
@@ -444,7 +456,7 @@ pub fn session(seed: &chat::Session, found: &Found) -> Option<chat::Session> {
         }
         args.extend([
             "--session-dir".into(),
-            found.path.parent()?.to_string_lossy().into_owned(),
+            transcript?.parent()?.to_string_lossy().into_owned(),
         ]);
     }
     // Rebuild resume arguments from the exact discovered identity rather than

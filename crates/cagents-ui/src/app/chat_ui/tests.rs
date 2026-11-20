@@ -8785,6 +8785,76 @@ pub(in crate::app) fn working_chat(app: &mut Cagents, session_id: &str) -> CardI
     card
 }
 
+/// A new chat's inspector asks the daemon for its work only once the daemon
+/// hosts the chat. Asked sooner, the daemon refuses a conversation it does
+/// not know, and the Work section read "Couldn't load this chat's work" for
+/// the half minute before it asked again (#3498).
+#[test]
+fn a_new_chat_reads_its_work_once_the_daemon_hosts_it() {
+    use crate::app::pull_request_ui::{Action as Work, ConversationWatch, WorkPhase};
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1600.0);
+    let card = draft_chat(&mut app);
+    app.open_pane_inspector_now(card);
+    let conversation = |app: &Cagents| match &app.card_state(card).unwrap().kind {
+        CardKind::Chat(session) => session.id,
+        _ => unreachable!("a chat card"),
+    };
+    drop(app.update(Message::ChatUi(Action::Tick)));
+
+    // A draft has done nothing, and nothing asks the daemon about it.
+    let draft = conversation(&app);
+    assert!(!app.inspector_watches(draft));
+    assert_eq!(app.work_phase(card), WorkPhase::Unstarted);
+
+    // Sending its first message starts it: still unknown to the daemon,
+    // so it reads as on its way rather than failed.
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+    let target = app.chat_ui.attempt(card).unwrap().target;
+    let started = conversation(&app);
+    assert_ne!(
+        started, draft,
+        "the first message gives it its own identity"
+    );
+    assert!(!app.inspector_watches(started));
+    assert_eq!(app.work_phase(card), WorkPhase::Reading);
+
+    // The daemon answers the start with the chat, and from then it is
+    // watched, its list showing as soon as it arrives.
+    let handle = fixture_handle(&app, card, Some("session"));
+    answer_start(&mut app, target, Ok(handle));
+    assert_eq!(chat_runtime(&app, card).session.id, started);
+    assert!(app.inspector_watches(started));
+    assert_eq!(app.work_phase(card), WorkPhase::Reading);
+    let mut list = pull_request_links::fixture::fixture_list();
+    list.transcript = crate::work::TranscriptCoverage::Complete;
+    drop(app.update(Message::PullRequestUi(Work::Conversation(
+        ConversationWatch::Listed {
+            conversation: started,
+            revision: 1,
+            list: Arc::new(list),
+            first: true,
+        },
+    ))));
+    assert_eq!(app.work_phase(card), WorkPhase::Listed);
+}
+
+/// A pane awaiting admission can wait there until the reader acts, and the
+/// daemon often hosts its conversation meanwhile, so it is still watched
+/// rather than reading forever.
+#[test]
+fn a_chat_awaiting_admission_still_reads_its_work() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1600.0);
+    let card = live_chat(&mut app, Some("session"));
+    app.open_pane_inspector_now(card);
+    let conversation = chat_runtime(&app, card).session.id;
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().connection = Connection::AwaitingAdmission;
+    assert!(app.inspector_watches(conversation));
+}
+
 #[test]
 fn a_chat_labels_its_links_from_the_projects_and_the_inspector() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
