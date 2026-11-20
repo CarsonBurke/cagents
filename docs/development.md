@@ -2293,8 +2293,18 @@ terminal. A session detached by an explicit `start` keeps running until
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
-stops the session even when a step fails, and brings back the shots. The
-individual commands work too, for a session you drive step by step:
+stops the session even when a step fails, and brings back the shots.
+
+`drive` passes its arguments to the host's `niri-harness`, so a steps file
+uses that harness's commands: `drive hover X,Y` moves the pointer (there is no
+`move`). `drive wait TEXT` and `drive click TEXT` match one target that
+`drive observe` reads off the screen, and a title of several words can read as
+one target per word. So wait for and click one distinctive word of it, such as
+`Long` for a chat titled "Long chat", or click the coordinates `drive --json
+observe` gives. When a wait might fail, save `drive observe` and a `shot`
+before the step exits, so the failed run shows what was on screen.
+
+The individual commands work too, for a session you drive step by step:
 
 ```sh
 export CAGENTS_EVIDENCE_REMOTE=fw16 CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
