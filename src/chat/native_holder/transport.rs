@@ -1322,9 +1322,9 @@ impl Drop for Residence {
         {
             std::thread::sleep(Duration::from_millis(100));
         }
-        // Nothing else may: once the provider is gone, an unrecordable release
-        // (its runtime directory removed, say) would otherwise keep retrying
-        // forever. Without the receipt, a daemon still settles the close from
+        // Only that wait is unbounded. Once the provider is gone, a release
+        // that cannot be recorded (its runtime directory removed, say) would
+        // otherwise retry forever. Without the receipt, a daemon still settles the close from
         // the ended holder and provider, as for a holder that was killed.
         let deadline = Instant::now() + TIMEOUT;
         while let Err(error) = self.release() {
@@ -2909,8 +2909,12 @@ exec /bin/sleep 60
         let deadline = Instant::now() + Duration::from_secs(15);
         while record.holder.is_current() {
             if Instant::now() >= deadline {
+                // Only processes that are still these exact ones: a reaped
+                // root's pid may already belong to something else.
                 for process in [&record.holder, &record.root] {
-                    unsafe { libc::kill(process.pid, libc::SIGKILL) };
+                    if process.is_current() {
+                        unsafe { libc::kill(process.pid, libc::SIGKILL) };
+                    }
                 }
                 panic!("the holder kept retrying a release it cannot record");
             }
