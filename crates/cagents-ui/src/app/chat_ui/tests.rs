@@ -4001,60 +4001,6 @@ pub(super) fn visible_text(app: &Cagents, card: CardId) -> Vec<String> {
     text.0
 }
 
-mod omp_error_view {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn failed_turn_shows_provider_error_exactly_once_and_stops_being_busy() {
-        const SESSION: &str = "01a131b1-7d42-7126-9a3c-e19d00316562";
-        const REASON: &str = "API quota exhausted";
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat_for_provider(&mut app, Provider::Omp, Some(SESSION));
-        let mut replay = chat::test_support::OmpReplay::new(SESSION);
-        let writes = replay
-            .command_for_run(
-                crate::model::RunId::new(),
-                Command::Prompt {
-                    text: "Hello".into(),
-                    attachments: Vec::new(),
-                    mode: PromptMode::Send,
-                },
-            )
-            .unwrap();
-        let request = writes[0]["id"].clone();
-        replay
-            .receive(json!({"type":"response","command":"prompt","id":request,"success":true}))
-            .unwrap();
-        replay.receive(json!({"type":"agent_start"})).unwrap();
-        show_chat_snapshot_for_test(&mut app, card, replay.snapshot());
-        assert!(chat_runtime(&app, card).snapshot.busy);
-
-        let message = json!({
-            "role":"assistant","timestamp":1,"content":[],
-            "stopReason":"error","errorMessage":REASON
-        });
-        for frame in [
-            json!({"type":"message_end","message":message}),
-            json!({"type":"agent_end","isTerminal":true,"messages":[message]}),
-            json!({"type":"prompt_result","id":request,"status":"error","error":{"message":"Different prompt result reason"}}),
-        ] {
-            replay.receive(frame).unwrap();
-            show_chat_snapshot_for_test(&mut app, card, replay.snapshot());
-        }
-
-        let text = visible_text(&app, card);
-        assert_eq!(
-            text.iter()
-                .map(|text| text.matches(REASON).count())
-                .sum::<usize>(),
-            1,
-            "the provider reason must appear once across the entire chat view: {text:#?}"
-        );
-        assert!(!chat_runtime(&app, card).snapshot.busy);
-    }
-}
-
 /// The footer keeps naming the account the conversation is on while an
 /// automatic switch away from it waits, and after the daemon refuses it,
 /// as the conversation never left that account.

@@ -27,9 +27,6 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
-#[cfg(all(feature = "test-support", not(feature = "host")))]
-#[doc(hidden)]
-pub mod test_support;
 #[cfg(any(feature = "ui", feature = "host"))]
 mod work_hold;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -37,7 +34,7 @@ pub use work_hold::{Held, HeldSubagent, WorkHold};
 
 /// Whether answering a request with `action` turns its work down rather than
 /// authorizing it.
-#[cfg(any(feature = "host", feature = "test-support"))]
+#[cfg(feature = "host")]
 pub(crate) fn declines(action: &str) -> bool {
     matches!(action, "deny" | "decline" | "reject" | "cancel" | "abort")
 }
@@ -1795,7 +1792,7 @@ impl Subagent {
 
 /// Route transcript content without letting child status, identity or usage
 /// overwrite the parent conversation. Adapters keep independent child state.
-#[cfg(any(feature = "host", feature = "test-support"))]
+#[cfg(feature = "host")]
 pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
     events
         .into_iter()

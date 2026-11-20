@@ -1,11 +1,7 @@
-#[cfg(feature = "host")]
-use super::ProcessSpec;
-use super::{Adapter, Step};
-#[cfg(feature = "host")]
-use crate::chat::Launch;
+use super::{Adapter, ProcessSpec, Step};
 use crate::chat::{
     self, Answer, ChangeKind, Choice, Command, CommandAction, Event, Field, FileChange, Item,
-    ItemContent, Model, Phase, PromptMode, Request, Role, ToolStatus,
+    ItemContent, Launch, Model, Phase, PromptMode, Request, Role, ToolStatus,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -22,7 +18,6 @@ const MAX_IMAGE: u64 =
 /// adapters retain a comparable amount of a session's tool history.
 const MAX_CALLS: usize = 128;
 
-#[cfg(feature = "host")]
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
     let mut args = launch.recipe.arguments.iter();
@@ -104,16 +99,6 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             ..Omp::default()
         }),
     ))
-}
-
-#[cfg(all(feature = "test-support", not(feature = "host")))]
-pub(crate) fn fixture(session_id: &str) -> Box<dyn Adapter> {
-    Box::new(Omp {
-        ready: true,
-        started: true,
-        session_id: Some(session_id.into()),
-        ..Omp::default()
-    })
 }
 
 #[derive(Default)]
@@ -1971,7 +1956,7 @@ fn answer_value(answers: &[Answer]) -> String {
         .unwrap_or_default()
 }
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

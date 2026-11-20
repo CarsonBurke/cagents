@@ -199,7 +199,7 @@ pub(super) fn read(
     })
 }
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::{DeliveryKind, Item, ItemContent, Phase, Role, ToolStatus};
