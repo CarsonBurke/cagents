@@ -402,14 +402,18 @@ fn bucket_windows(id: &str, bucket: &Value) -> Vec<UsageWindow> {
                 .as_u64()
                 .filter(|minutes| *minutes > 0)
                 .and_then(|minutes| minutes.checked_mul(60));
-            let kind = match span_secs {
-                Some(span) if span <= 86_400 => WindowKind::Session,
-                Some(span) if span == 7 * 86_400 && name.is_none() => WindowKind::Weekly,
-                Some(_) if name.is_some() => WindowKind::Scoped,
-                Some(_) => WindowKind::Other,
-                None if name.is_some() => WindowKind::Scoped,
-                None if slot == "primary" => WindowKind::Session,
-                None => WindowKind::Weekly,
+            // Scope belongs to the bucket, independently of its duration
+            // or whether the server supplies a display name.
+            let kind = if id != DEFAULT_LIMIT_ID {
+                WindowKind::Scoped
+            } else {
+                match span_secs {
+                    Some(span) if span <= 86_400 => WindowKind::Session,
+                    Some(span) if span == 7 * 86_400 => WindowKind::Weekly,
+                    Some(_) => WindowKind::Other,
+                    None if slot == "primary" => WindowKind::Session,
+                    None => WindowKind::Weekly,
+                }
             };
             let span = match span_secs {
                 Some(span) if span <= 86_400 => format!("{} window", span_label(span)),
@@ -566,6 +570,107 @@ mod tests {
         assert_eq!(usage.windows[0].used, 1.0);
         assert!(super::super::routing::available(&usage, 1_000));
         assert!(!super::super::routing::needs_alternate(&usage, 1_000));
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    mod spark_quota {
+        use super::*;
+        use crate::account::{LiveReport, routing};
+
+        const NOW: u64 = 1_795_132_800_000;
+
+        fn report() -> Value {
+            json!({"rateLimitsByLimitId": {
+                "codex": {"limitId": "codex", "limitName": null, "primary": {
+                    "usedPercent": 20, "windowDurationMins": 300, "resetsAt": 2_000_000_000
+                }},
+                "codex_bengalfox": {
+                    "limitId": "codex_bengalfox", "limitName": "GPT-5.3-Codex-Spark",
+                    "primary": {
+                        "usedPercent": 100, "windowDurationMins": 300, "resetsAt": 2_000_000_000
+                    }
+                }
+            }})
+        }
+
+        #[test]
+        fn exhausted_spark_probe_keeps_ordinary_account_available() {
+            let usage = probe_rate_limits(&report(), NOW).unwrap();
+            assert_eq!(usage.ordinary_usage_allowed, None);
+            assert_eq!(usage.status, UsageStatus::Warning);
+            assert!(!routing::needs_alternate(&usage, NOW));
+            assert!(routing::available(&usage, NOW));
+            assert_eq!(usage.windows[1].kind, WindowKind::Scoped);
+        }
+
+        #[test]
+        fn spark_only_probe_cannot_establish_ordinary_eligibility() {
+            for name in [json!("GPT-5.3-Codex-Spark"), Value::Null] {
+                for duration in [json!(300), json!(10080), Value::Null] {
+                    for used in [20, 100] {
+                        let mut result = report();
+                        result["rateLimitsByLimitId"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("codex");
+                        let bucket = &mut result["rateLimitsByLimitId"]["codex_bengalfox"];
+                        bucket["limitName"] = name.clone();
+                        bucket["primary"]["windowDurationMins"] = duration.clone();
+                        bucket["primary"]["usedPercent"] = json!(used);
+                        assert_eq!(
+                            probe_rate_limits(&result, NOW),
+                            Err("Codex could not read usage just now"),
+                            "{result}"
+                        );
+                        let usage = parse_rate_limits(&result, NOW);
+                        assert!(!routing::available(&usage, NOW), "{result}");
+                        assert!(!routing::needs_alternate(&usage, NOW), "{result}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn sparse_spark_updates_preserve_ordinary_eligibility() {
+            for name in [json!("GPT-5.3-Codex-Spark"), Value::Null] {
+                let mut result = report();
+                let spark = result["rateLimitsByLimitId"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("codex_bengalfox")
+                    .unwrap();
+                let mut usage = probe_rate_limits(&result, NOW).unwrap();
+                let mut params = json!({"rateLimits": spark});
+                params["rateLimits"]["limitName"] = name;
+                let update = parse_update(&params).unwrap();
+                assert!(LiveReport::CodexLimits(update).apply(&mut usage, NOW + 1, NOW + 1));
+                assert_eq!(usage.observed_at, NOW);
+                assert_eq!(usage.status, UsageStatus::Warning);
+                assert_eq!(usage.windows[1].kind, WindowKind::Scoped);
+                assert!(!routing::needs_alternate(&usage, NOW + 1));
+                assert!(routing::available(&usage, NOW + 1));
+
+                // Recomputing status after an ordinary update must still
+                // ignore the exhausted model allowance for account routing.
+                for (used, status, available) in [
+                    (30, UsageStatus::Warning, true),
+                    (100, UsageStatus::Limited, false),
+                ] {
+                    let update = parse_update(&json!({"rateLimits": {
+                        "limitId": "codex", "primary": {
+                            "usedPercent": used, "windowDurationMins": 300,
+                            "resetsAt": 2_000_000_000
+                        }
+                    }}))
+                    .unwrap();
+                    assert!(LiveReport::CodexLimits(update).apply(&mut usage, NOW + 2, NOW + 2));
+                    assert_eq!(usage.observed_at, NOW + 2);
+                    assert_eq!(usage.status, status);
+                    assert_eq!(routing::available(&usage, NOW + 2), available);
+                    assert_eq!(routing::needs_alternate(&usage, NOW + 2), !available);
+                }
+            }
+        }
     }
 
     /// A sparse update moves only what it names: the weekly window and the
