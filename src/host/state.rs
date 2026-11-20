@@ -393,7 +393,7 @@ pub(crate) struct HostState {
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     /// Subset of transition reservations that retire an exact original source.
-    pub(super) chat_close_reservations: BTreeMap<TerminalId, crate::chat::Session>,
+    pub(super) chat_close_reservations: BTreeMap<TerminalId, super::chat::capacity::CloseRemoval>,
     pub(super) pane_chat_starts: BTreeMap<CardId, super::chat::pane_start::Claim>,
     /// Private inventory exclusions for exact historical cleanup reservations.
     pub(super) historical_chat_retirements: BTreeMap<TerminalId, crate::chat::Session>,
