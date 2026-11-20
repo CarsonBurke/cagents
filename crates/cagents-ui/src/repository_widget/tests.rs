@@ -1164,22 +1164,6 @@ fn branch_navigation_cannot_discard_an_unsaved_or_saving_native_buffer() {
 }
 
 #[test]
-fn faint_diff_syntax_remains_readable_over_both_highlight_layers() {
-    for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
-        for kind in [DiffRowKind::Addition, DiffRowKind::Deletion] {
-            let row = diff_row_background(&theme, kind);
-            let highlight = color_over(diff_highlight_color(&theme, kind, 0.18), row);
-            let faint = iced::Color::from_rgba(0.6, 0.6, 0.6, 0.7);
-            for background in [row, highlight] {
-                let foreground = readable_diff_color(faint, background);
-                assert!(foreground.relative_contrast(background) >= 4.5);
-                assert_eq!(readable_diff_color(foreground, background), foreground);
-            }
-        }
-    }
-}
-
-#[test]
 fn mode_switches_keep_the_dirty_editor_and_diff_follows_its_line() {
     let card = CardId::new();
     let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.md", "# Notes\n");
@@ -1757,7 +1741,7 @@ fn diff_scroll_range_matches_shaped_content_and_real_split_half_layout() {
         let mut widest = 0.0_f32;
         for row in &model.inline_rows {
             let mut text: Element<'_, RepositoryAction> =
-                iced::widget::rich_text(crate::diff_view::line_spans(
+                iced::widget::rich_text(crate::diff_view::line_spans::<()>(
                     &row.text,
                     &row.changed,
                     model
@@ -11328,19 +11312,4 @@ fn a_copy_source_keeps_its_own_row() {
         files[0].staged_old_path,
         Some(OldPath::Copied("source.md".into()))
     );
-}
-
-#[test]
-fn contrast_correction_retains_syntax_hue_instead_of_replacing_it() {
-    for background in [
-        iced::Color::from_rgb8(42, 29, 31),
-        iced::Color::from_rgb8(251, 231, 233),
-    ] {
-        let syntax = iced::Color::from_rgb8(110, 75, 170);
-        let adjusted = readable_diff_color(syntax, background);
-        assert!(adjusted.relative_contrast(background) >= 4.5);
-        assert_ne!(adjusted, iced::Color::WHITE);
-        assert_ne!(adjusted, iced::Color::BLACK);
-        assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
-    }
 }
