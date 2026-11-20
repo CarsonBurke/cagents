@@ -650,7 +650,7 @@ pub fn tooltip<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     label: impl Into<Cow<'a, str>>,
 ) -> Element<'a, Message> {
-    tooltip_positioned(content, label, false)
+    tooltip_positioned(content, label, TipPlacement::Below)
 }
 
 /// Keep a tooltip above chrome whose native child surface covers the area below.
@@ -658,20 +658,41 @@ pub fn tooltip_above<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     label: impl Into<Cow<'a, str>>,
 ) -> Element<'a, Message> {
-    tooltip_positioned(content, label, true)
+    tooltip_positioned(content, label, TipPlacement::Above)
+}
+
+/// A tooltip for a control as tall as its pane, such as a rail along its
+/// edge, where one above or below would open far from the pointer. It opens
+/// at the control's leading side, level with where the pointer rested, or
+/// beside its middle when no pointer opened it.
+pub fn tooltip_beside<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    tooltip_positioned(content, label, TipPlacement::Beside)
+}
+
+/// Where a tooltip opens around its control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TipPlacement {
+    /// Beneath it, or above it where there is no room beneath.
+    Below,
+    Above,
+    /// At its leading side, level with the pointer.
+    Beside,
 }
 
 fn tooltip_positioned<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     label: impl Into<Cow<'a, str>>,
-    prefer_above: bool,
+    placement: TipPlacement,
 ) -> Element<'a, Message> {
     Effect {
         content: content.into(),
         kind: Kind::Tooltip,
         tip: Some(Tip {
             label: label.into(),
-            prefer_above,
+            placement,
             content: None,
         }),
         on_focused_key: None,
@@ -851,6 +872,23 @@ fn is_typed_text(event: &Event) -> bool {
             && !modifiers.control()
             && !modifiers.alt()
             && !modifiers.logo()
+    )
+}
+
+/// A fresh, unmodified Space press: the key that, with Enter, presses a
+/// focused button. The pinned COSMIC button answers only Enter, so a control
+/// outside a [`focus_scope`] that should answer Space too routes it with
+/// [`focused_key`].
+pub fn is_space_press(event: &cosmic::iced::keyboard::Event) -> bool {
+    use cosmic::iced::keyboard;
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(character),
+            modifiers,
+            repeat: false,
+            ..
+        } if character.as_str() == " " && modifiers.is_empty()
     )
 }
 
@@ -2286,7 +2324,7 @@ struct Effect<'a, Message> {
 
 struct Tip<'a, Message> {
     label: Cow<'a, str>,
-    prefer_above: bool,
+    placement: TipPlacement,
     /// The tip's surface, built when it first opens. A view names a tooltip
     /// for nearly every control and shows at most one of them, so the text,
     /// its container and their widget state are not built until then.
@@ -2361,7 +2399,8 @@ impl<Message: 'static> PartTip<Message> {
             tree: &mut self.tree,
             anchor,
             progress,
-            prefer_above: false,
+            placement: TipPlacement::Below,
+            pointer: None,
         })))
     }
 }
@@ -2434,6 +2473,9 @@ struct State {
     tooltip: Animation<bool>,
     entered: Option<Instant>,
     tip_open: bool,
+    /// Where the pointer rested on the control when its tooltip opened,
+    /// from the control's top-left corner.
+    tip_pointer: Option<Vector>,
     /// Set by a press on the control; its tooltip stays hidden until the
     /// pointer really leaves.
     tip_suppressed: Option<PressSuppression>,
@@ -2451,6 +2493,7 @@ impl Default for State {
             tooltip: Animation::new(false).duration(HOVER_DURATION),
             entered: None,
             tip_open: false,
+            tip_pointer: None,
             tip_suppressed: None,
             inspect_control: true,
             disabled: false,
@@ -2968,6 +3011,9 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
                     state.tooltip.go_mut(visible, now);
                     if visible && !state.tip_open {
                         state.tip_open = true;
+                        state.tip_pointer = cursor
+                            .position_in(layout.bounds())
+                            .map(|point| Vector::new(point.x, point.y));
                         shell.invalidate_layout();
                     }
                     shell.request_redraw();
@@ -3136,13 +3182,14 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
         if state.tip_open
             && let Some(tip) = &mut self.tip
         {
-            let prefer_above = tip.prefer_above;
+            let placement = tip.placement;
             let tip = overlay::Element::new(Box::new(TipOverlay {
                 content: tip.content(),
                 tree: &mut tip_state[0],
                 anchor: layout.bounds() + translation,
                 progress: state.tooltip.interpolate(0.0, 1.0, state.now),
-                prefer_above,
+                placement,
+                pointer: state.tip_pointer,
             }));
             return Some(if let Some(child) = child {
                 overlay::Group::with_children(vec![child, tip]).overlay()
@@ -3220,7 +3267,9 @@ struct TipOverlay<'a, 'b, Message> {
     tree: &'a mut Tree,
     anchor: Rectangle,
     progress: f32,
-    prefer_above: bool,
+    placement: TipPlacement,
+    /// Where the pointer rested on the anchor, from its top-left corner.
+    pointer: Option<Vector>,
 }
 
 impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, Message> {
@@ -3231,16 +3280,33 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, 
             &layout::Limits::new(Size::ZERO, bounds),
         );
         let size = node.size();
-        let x = (self.anchor.center_x() - size.width / 2.0)
-            .clamp(0.0, (bounds.width - size.width).max(0.0));
-        let below = self.anchor.y + self.anchor.height + TIP_GAP;
-        let y = if !self.prefer_above && below + size.height <= bounds.height {
-            below
-        } else {
-            self.anchor.y - size.height - TIP_GAP
+        let (x, y) = match self.placement {
+            TipPlacement::Beside => {
+                let leading = self.anchor.x - size.width - TIP_GAP;
+                let x = if leading >= 0.0 {
+                    leading
+                } else {
+                    self.anchor.x + self.anchor.width + TIP_GAP
+                };
+                let level = self
+                    .pointer
+                    .map_or(self.anchor.center_y(), |pointer| self.anchor.y + pointer.y);
+                (x, level - size.height / 2.0)
+            }
+            placement => {
+                let x = self.anchor.center_x() - size.width / 2.0;
+                let below = self.anchor.y + self.anchor.height + TIP_GAP;
+                let y = if placement == TipPlacement::Below && below + size.height <= bounds.height
+                {
+                    below
+                } else {
+                    self.anchor.y - size.height - TIP_GAP
+                };
+                (x, y)
+            }
         };
         node.move_to(Point::new(
-            x,
+            x.clamp(0.0, (bounds.width - size.width).max(0.0)),
             y.clamp(0.0, (bounds.height - size.height).max(0.0)),
         ))
     }
@@ -3769,6 +3835,70 @@ mod tests {
                 (tip.center_x() - anchor.center_x()).abs() < 0.5
                     && (tip.y - (anchor.y + anchor.height + TIP_GAP)).abs() < 0.5,
                 "tooltip {tip:?} is not beneath its control {anchor:?}"
+            );
+        }
+    }
+
+    /// A rail the height of its pane: its tooltip opens at its leading side,
+    /// level with the pointer, not above it at the top of the window.
+    #[test]
+    fn a_tooltip_beside_a_tall_control_opens_level_with_the_pointer() {
+        use cosmic::iced::advanced::clipboard;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let screen = Size::new(600.0, 800.0);
+        let rail = Rectangle::new(Point::new(540.0, 40.0), Size::new(40.0, 740.0));
+        let mut element: Element<'_, u8> = widget::container(tooltip_beside(
+            cosmic::iced::widget::Space::new()
+                .width(rail.width)
+                .height(rail.height),
+            "Finished · 4 in Work\nShow inspector",
+        ))
+        .padding(cosmic::iced::Padding {
+            left: rail.x,
+            top: rail.y,
+            ..cosmic::iced::Padding::ZERO
+        })
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, screen),
+        );
+        let pointer = Point::new(rail.center_x(), 420.0);
+        let start = Instant::now();
+        let viewport = Rectangle::with_size(screen);
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
+            Event::Window(window::Event::RedrawRequested(start + TOOLTIP_DELAY * 2)),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(pointer),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut Vec::new()),
+                &viewport,
+            );
+        }
+        for camera in [Vector::ZERO, Vector::new(-60.0, 35.0)] {
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(&mut tree, Layout::new(&node), &renderer, &viewport, camera)
+                .expect("hovering past the delay opens the tooltip");
+            // With no overlay of its control's to group with, the tooltip
+            // is the overlay.
+            let tip = overlay.as_overlay_mut().layout(&renderer, screen).bounds();
+            let rail = rail + camera;
+            assert!(
+                (tip.x + tip.width - (rail.x - TIP_GAP)).abs() < 0.5,
+                "tooltip {tip:?} is not at the leading side of {rail:?}"
+            );
+            assert!(
+                (tip.center_y() - (pointer.y + camera.y)).abs() < 0.5,
+                "tooltip {tip:?} is not level with the pointer at {pointer:?}"
             );
         }
     }

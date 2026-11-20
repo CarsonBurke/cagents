@@ -15,10 +15,11 @@ const CHAT_HEIGHT: f32 = design::list::TWO_LINE_HEIGHT + design::DENSE_ROW_HEIGH
 /// A terminal's block: its status and place.
 const TERMINAL_HEIGHT: f32 = design::list::TWO_LINE_HEIGHT + 2.0 * ROW_GAP;
 
-/// What the block says the pane's agent is doing.
-struct Status {
-    glyph: Icon,
-    label: String,
+/// What the block, and the rail an inspector collapses to, say the pane's
+/// agent is doing.
+pub(super) struct Status {
+    pub(super) glyph: Icon,
+    pub(super) label: String,
 }
 
 impl Cagents {
@@ -36,46 +37,21 @@ impl Cagents {
         let Some(state) = self.card_state(card) else {
             return Err(toggle);
         };
-        let (status, subagents) = match (&state.kind, self.cards.get(&card)) {
-            (CardKind::Chat(_), Some(CardRuntime::Chat(runtime))) => {
-                let (glyph, label) = runtime.inspector_status();
-                let status = Status {
-                    glyph: glyph.unwrap_or(Icon::Chat),
-                    label: if label.trim().is_empty() {
-                        "Ready".to_owned()
-                    } else {
-                        label
-                    },
-                };
-                (
-                    status,
-                    Some(self.subagents_row(
-                        runtime.subagent_tally(),
-                        Some(runtime.open_subagent_picker()),
-                    )),
-                )
-            }
+        let Some(status) = self.activity_status(card, state) else {
+            return Err(toggle);
+        };
+        let subagents = match (&state.kind, self.cards.get(&card)) {
+            (CardKind::Chat(_), Some(CardRuntime::Chat(runtime))) => Some(self.subagents_row(
+                runtime.subagent_tally(),
+                Some(runtime.open_subagent_picker()),
+            )),
             // The row stays while the conversation connects, so it is not
             // added under the reader once it has.
-            (CardKind::Chat(_), _) => (
-                Status {
-                    glyph: Icon::Chat,
-                    label: "Connecting…".to_owned(),
-                },
-                Some(self.subagents_row(Default::default(), None)),
-            ),
-            (CardKind::Terminal(_), _) => (self.terminal_status(card), None),
-            _ => return Err(toggle),
+            (CardKind::Chat(_), _) => Some(self.subagents_row(Default::default(), None)),
+            _ => None,
         };
         let place = self.pane_place(state);
-        let mark: Element<'a, Message> = if status.glyph == Icon::AgentWorking {
-            crate::ui_controls::activity_spinner(
-                f32::from(design::ROW_ICON_SIZE),
-                design::accent_color,
-            )
-        } else {
-            crate::ui_controls::passive_icon(status.glyph, design::ROW_ICON_SIZE)
-        };
+        let mark = status_mark(status.glyph);
         let caption = crate::ui_controls::FadeText::caption(place.label)
             .class(cosmic::theme::Text::Custom(design::muted_text));
         let caption: Element<'a, Message> = if place.path.is_empty() {
@@ -181,6 +157,31 @@ impl Cagents {
                 .width(Length::Fill)
                 .on_press_maybe(open.filter(|_| !self.modal_is_open())),
         )
+    }
+
+    /// What `card`'s agent is doing, as its chat or terminal reports it;
+    /// none for a pane with no agent to describe. It reads only what the
+    /// pane already holds, so drawing it on every frame costs nothing more.
+    pub(super) fn activity_status(&self, card: CardId, state: &CardState) -> Option<Status> {
+        match (&state.kind, self.cards.get(&card)) {
+            (CardKind::Chat(_), Some(CardRuntime::Chat(runtime))) => {
+                let (glyph, label) = runtime.inspector_status();
+                Some(Status {
+                    glyph: glyph.unwrap_or(Icon::Chat),
+                    label: if label.trim().is_empty() {
+                        "Ready".to_owned()
+                    } else {
+                        label
+                    },
+                })
+            }
+            (CardKind::Chat(_), _) => Some(Status {
+                glyph: Icon::Chat,
+                label: "Connecting…".to_owned(),
+            }),
+            (CardKind::Terminal(_), _) => Some(self.terminal_status(card)),
+            _ => None,
+        }
     }
 
     /// What a terminal's agent is doing, as its pane reports it, or that it
@@ -330,6 +331,15 @@ fn folders(projects: &[sidebar::SidebarProject]) -> HashMap<PathBuf, Listed> {
 
 /// A row on the list grid: `mark` in the icon column, `text` on the label
 /// column, then `trailing`.
+/// A status's glyph: a spinner while the agent works.
+pub(super) fn status_mark<'a>(glyph: Icon) -> Element<'a, Message> {
+    if glyph == Icon::AgentWorking {
+        crate::ui_controls::activity_spinner(f32::from(design::ROW_ICON_SIZE), design::accent_color)
+    } else {
+        crate::ui_controls::passive_icon(glyph, design::ROW_ICON_SIZE)
+    }
+}
+
 fn grid_row<'a>(
     mark: Element<'a, Message>,
     text: Element<'a, Message>,

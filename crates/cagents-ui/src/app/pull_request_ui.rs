@@ -211,11 +211,11 @@ impl Cagents {
         }
     }
 
-    /// The panes on screen whose inspectors are drawn. An inspector the
-    /// strip has scrolled away keeps its state but watches nothing, so many
+    /// The panes on screen whose inspectors are drawn, docked, over the
+    /// pane or collapsed to its rail. An inspector the strip has scrolled away keeps its state but watches nothing, so many
     /// panes cost only what is in view.
     fn mounted_inspectors(&self) -> impl Iterator<Item = CardId> + '_ {
-        self.pane_inspectors.visible().filter(|card| {
+        self.pane_inspectors.watching().filter(|card| {
             self.workspace
                 .visibility(*card)
                 .is_some_and(crate::workspace::VisibilityClass::is_mounted)
@@ -317,6 +317,14 @@ impl Cagents {
             .map_or(conversation::Phase::Reading, conversation::State::phase)
     }
 
+    /// How many rows `card`'s Work section lists, as counted when its
+    /// conversation's list arrived.
+    pub(super) fn work_count(&self, card: CardId) -> usize {
+        self.pull_request_inspector
+            .conversation(card)
+            .map_or(0, conversation::State::work_count)
+    }
+
     /// How much of `card`'s conversation's transcript its list was read
     /// from, once one has arrived.
     pub(super) fn work_transcript(&self, card: CardId) -> Option<&crate::work::TranscriptCoverage> {
@@ -369,10 +377,7 @@ impl Cagents {
             },
         };
         WorkSummary {
-            count: work
-                .iter()
-                .filter(|work| !matches!(work, conversation::Work::Here(_)))
-                .count(),
+            count: conversation.work_count(),
             lists_work: listed,
             height,
             mentioned: mentioned.len(),
@@ -886,6 +891,67 @@ mod tests {
             "the panels let go of the closed inspector's work"
         );
         crate::app::projection_oracle::assert_projected(&mut app);
+    }
+
+    #[test]
+    fn a_rail_counts_the_work_from_its_list_without_building_it_each_frame() {
+        let (
+            mut app,
+            Panes {
+                conversation, chat, ..
+            },
+        ) = conversation_app();
+        app.sync_pull_request_inspector();
+        // Two pull requests worked on, one only mentioned, a worktree that
+        // heads one of them and another that heads none.
+        drop(app.handle_pull_request_ui(listed_with(
+            conversation,
+            1,
+            &[
+                (4, Relation::Created),
+                (5, Relation::Pushed),
+                (6, Relation::Mentioned),
+            ],
+            vec![
+                edited("/repo/retry-budget", Some(4)),
+                edited("/repo/fix-sidebar", None),
+            ],
+            true,
+        )));
+        assert_eq!(app.work_summary(chat).count, 3, "as the Work header counts");
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(500.0),
+        }));
+        assert!(app.pane_inspectors.is_railed(chat));
+        assert!(
+            app.inspector_watches(conversation),
+            "the rail keeps the list arriving"
+        );
+        assert_eq!(app.inspector_rail_summary(chat).work, Some(3));
+
+        let builds = || conversation::WORK_BUILDS.with(std::cell::Cell::get);
+        let before = builds();
+        for _ in 0..3 {
+            drop(app.card_view(chat, true, false));
+        }
+        assert_eq!(builds(), before, "drawing the rail never builds the list");
+        // The docked inspector does, so the count above means something.
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1600.0),
+        }));
+        assert!(app.pane_inspectors.is_open(chat));
+        drop(app.card_view(chat, true, false));
+        assert!(builds() > before);
+
+        // Back to the rail, a new list's count replaces the old one.
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(500.0),
+        }));
+        drop(app.handle_pull_request_ui(listed(conversation, 2, &[(4, Relation::Created)], false)));
+        assert_eq!(app.inspector_rail_summary(chat).work, Some(1));
     }
 
     fn edited(path: &str, pull_request: Option<u64>) -> crate::work::ConversationWorktree {

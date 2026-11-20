@@ -5547,7 +5547,7 @@ fn dirty_close_restores_the_actual_underlying_modal_focus_target() {
 }
 
 #[test]
-fn a_narrow_pane_closes_its_inspector_and_one_reopened_there_covers_it_until_escape() {
+fn a_narrow_pane_collapses_its_inspector_to_a_rail_that_expands_over_it_until_escape() {
     let mut app = context_inspector_test_app(true);
     let card = app.workspace.focused().unwrap();
     let escape = || Message::KeyEvent {
@@ -5580,14 +5580,15 @@ fn a_narrow_pane_closes_its_inspector_and_one_reopened_there_covers_it_until_esc
     let _ = app.update(escape());
     assert!(app.pane_inspectors.is_open(card));
 
-    // Too narrow for both, the pane closes it by itself.
+    // Too narrow for both, the pane collapses it to its rail by itself.
     resize(&mut app, 500.0);
     assert!(app.pane_too_narrow(card));
     assert!(!app.pane_inspectors.is_open(card));
+    assert!(app.pane_inspectors.is_railed(card));
     assert_eq!(app.pane_inspector_layout(card), None);
     assert!(!app.workspace_inputs_blocked());
 
-    // Reopened there, it covers the pane's content and Escape closes it.
+    // Expanded there, it covers the pane's content and Escape collapses it.
     let _ = app.update(Message::TogglePaneInspector(card));
     app.settle_pane_inspectors();
     assert_eq!(
@@ -5625,6 +5626,9 @@ fn a_narrow_pane_closes_its_inspector_and_one_reopened_there_covers_it_until_esc
     app.settle_pane_inspectors();
     assert_eq!(app.pane_inspector_layout(card), None);
     assert!(!app.pane_content_inputs_blocked(card));
+    assert!(app.pane_inspectors.is_railed(card), "back on its rail");
+    resize(&mut app, 1600.0);
+    assert!(app.pane_inspectors.is_open(card), "and docked once wide");
 }
 
 #[test]
