@@ -70,13 +70,11 @@ pub(crate) fn install(
     if matches!(provider, None | Some(Provider::Antigravity)) {
         // Antigravity reads `.agents/skills` only from the workspace up to
         // its repository root; a user's own are in its global configuration,
-        // `~/.gemini/config/skills`. A shell that may run it later is given
-        // the bundle only where Antigravity has been set up. Its data
-        // directory, `~/.gemini`, exists once it has run.
-        let gemini = home.join(".gemini");
-        if gemini.is_dir() {
-            roots.push((gemini.join("config"), provider.is_some()));
-        }
+        // `~/.gemini/config/skills` (its own data is beside it, in
+        // `~/.gemini/antigravity-cli`). An Antigravity agent gets the bundle
+        // there before its first run; a shell that may run it later, only
+        // once that configuration exists.
+        roots.push((home.join(".gemini").join("config"), provider.is_some()));
     }
     if provider.is_none() || provider == Some(Provider::Claude) {
         let selected = environment
@@ -259,6 +257,11 @@ fn install_bundle(
     previous: &[&str],
 ) -> io::Result<()> {
     if create_root {
+        // A root inside a provider's own directory, as Antigravity's
+        // `~/.gemini/config` is, may come before the provider's first run.
+        if let Some(parent) = root.parent() {
+            directory(parent)?;
+        }
         directory(root)?;
     }
     // Never create a selected account root. Account removal cannot be undone
@@ -610,13 +613,8 @@ mod tests {
         let agents = home.join(".agents/skills/cagents/SKILL.md");
         let antigravity = home.join(".gemini/config/skills/cagents/SKILL.md");
 
-        // Before Antigravity has run there is nowhere of its own to put it,
-        // and `~/.agents`, which it never reads, is left alone.
-        install(Some(Provider::Antigravity), &environment, directory.path());
-        assert!(!home.join(".gemini").exists());
-        assert!(!home.join(".agents").exists());
-
-        std::fs::create_dir(home.join(".gemini")).unwrap();
+        // Even before Antigravity has first run, and never in `~/.agents`,
+        // which it does not read.
         install(Some(Provider::Antigravity), &environment, directory.path());
         assert_eq!(std::fs::read_to_string(&antigravity).unwrap(), CONTENT);
         assert!(!home.join(".agents").exists());
