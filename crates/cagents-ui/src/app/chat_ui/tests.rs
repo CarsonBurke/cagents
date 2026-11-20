@@ -4306,7 +4306,7 @@ fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
     drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
     let runtime = chat_runtime(&app, card);
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.composer_note.as_deref(),
         Some(
             "Sending would move this conversation to another account, but it can't move while background work is still going. Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Stop it from its tab in the conversation, then send again."
         )
@@ -21932,10 +21932,7 @@ fn logical_message_copy_completion_refuses_scope_handle_focus_and_failed_canonic
         assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
         if change == "canonical read" {
             assert!(
-                app.chat_runtime_mut(target)
-                    .unwrap()
-                    .error
-                    .as_deref()
+                copy_refusal(app.chat_runtime_mut(target).unwrap())
                     .unwrap()
                     .contains("Message changed")
             );

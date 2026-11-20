@@ -236,10 +236,7 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
                 None,
             );
             assert!(
-                app.chat_runtime_mut(target)
-                    .unwrap()
-                    .error
-                    .as_deref()
+                super::super::tests::copy_refusal(app.chat_runtime_mut(target).unwrap())
                     .unwrap()
                     .contains("unavailable")
             );
