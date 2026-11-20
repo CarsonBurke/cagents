@@ -5,7 +5,7 @@ use crate::chat::{
     FileChangeSummary, FileChangesCoverage, FileChangesSummary, FilePatchCursor, Item, ItemContent,
     Snapshot, ToolStatus,
 };
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 
 const FILES: usize = 128;
 const PATCHES: usize = 32;
@@ -93,6 +93,31 @@ fn kind_bytes(kind: &crate::chat::ChangeKind) -> usize {
         crate::chat::ChangeKind::Renamed { from } => from.len(),
         _ => 0,
     }
+}
+
+/// Stop the file projection in the transcript cleanup transaction. Waiting
+/// edits already count as unsuccessful; only Running edits move out of pending.
+pub(super) fn stop_running_edits(
+    transaction: &Transaction<'_>,
+    revision: u64,
+) -> Result<bool, StoreError> {
+    let running = postcard::to_stdvec(&ToolStatus::Running)?;
+    let waiting = postcard::to_stdvec(&ToolStatus::Waiting)?;
+    transaction.execute(
+        "UPDATE file_totals SET
+         pending=pending-(SELECT COUNT(*) FROM file_edits e
+             WHERE e.source=file_totals.source AND e.path=file_totals.path AND e.status=?1),
+         failed=failed+(SELECT COUNT(*) FROM file_edits e
+             WHERE e.source=file_totals.source AND e.path=file_totals.path AND e.status=?1),
+         revision=?3
+         WHERE EXISTS(SELECT 1 FROM file_edits e
+             WHERE e.source=file_totals.source AND e.path=file_totals.path AND e.status IN (?1,?2))",
+        params![running, waiting, revision],
+    )?;
+    Ok(transaction.execute(
+        "UPDATE file_edits SET status=?3 WHERE status IN (?1,?2)",
+        params![running, waiting, postcard::to_stdvec(&ToolStatus::Stopped)?],
+    )? > 0)
 }
 
 impl Store {
@@ -728,6 +753,152 @@ mod tests {
         }
     }
     const DIFF: &str = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n-old\n+new\n+another\n";
+    #[test]
+    fn stopping_delegated_edits_preserves_settled_contributions_and_is_idempotent() {
+        let mut store = Store::new().unwrap();
+        store
+            .apply(Event::Item(item(
+                "running",
+                "a.rs",
+                DIFF,
+                ToolStatus::Succeeded,
+                ChangeKind::Updated,
+            )))
+            .unwrap();
+        store
+            .apply(Event::History {
+                items: vec![item(
+                    "imported",
+                    "b.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Updated,
+                )],
+                has_earlier: false,
+            })
+            .unwrap();
+        for (id, status) in [
+            ("running", ToolStatus::Running),
+            ("waiting", ToolStatus::Waiting),
+            ("done", ToolStatus::Succeeded),
+            ("failed", ToolStatus::Failed),
+        ] {
+            store
+                .apply(Event::SubagentItem {
+                    id: "child".into(),
+                    item: item(id, "a.rs", DIFF, status, ChangeKind::Updated),
+                })
+                .unwrap();
+        }
+        let before = summary(&mut store);
+        let file = before.files.last().unwrap();
+        assert_eq!((file.pending, file.failed, file.succeeded), (1, 2, 1));
+        assert!(
+            store
+                .window()
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| { item.content.status() == Some(ToolStatus::Succeeded) })
+        );
+        store.stop_running_steps().unwrap();
+        let after = summary(&mut store);
+        assert_eq!(&after.files[..2], &before.files[..2]);
+        let stopped = after.files.last().unwrap();
+        assert_eq!(
+            (stopped.pending, stopped.failed, stopped.succeeded),
+            (0, 3, 1)
+        );
+        let mut expected = file.clone();
+        expected.pending = 0;
+        expected.failed = 3;
+        expected.revision = stopped.revision;
+        assert_eq!(stopped, &expected);
+        assert_eq!(after.applied_files, before.applied_files);
+        assert_eq!(after.total_files, before.total_files);
+        assert!(after.revision > before.revision);
+        assert!(stopped.revision > file.revision);
+        let patches = page(&mut store, file.key.clone(), None, file.revision);
+        assert!(patches.error.is_none());
+        assert_eq!(patches.patches.len(), 4);
+        let statuses: Vec<_> = patches
+            .patches
+            .iter()
+            .map(|patch| {
+                assert_eq!(patch.diff, DIFF);
+                patch.status
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ToolStatus::Stopped,
+                ToolStatus::Stopped,
+                ToolStatus::Succeeded,
+                ToolStatus::Failed
+            ]
+        );
+        let stale = page(
+            &mut store,
+            file.key.clone(),
+            Some(FilePatchCursor {
+                ordinal: 1,
+                file_index: 0,
+                offset: 0,
+            }),
+            file.revision,
+        );
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Reported edits changed")
+        );
+        store.dirty = false;
+        store.stop_running_steps().unwrap();
+        assert!(!store.dirty);
+        assert_eq!(summary(&mut store), after);
+    }
+
+    #[test]
+    fn stopping_edits_rolls_back_transcript_totals_and_revision_on_failure() {
+        let mut store = Store::new().unwrap();
+        store
+            .apply(Event::Item(item(
+                "running",
+                "a.rs",
+                DIFF,
+                ToolStatus::Running,
+                ChangeKind::Updated,
+            )))
+            .unwrap();
+        let before = summary(&mut store);
+        let transcript = store.window().unwrap().items;
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_stop BEFORE UPDATE OF status ON file_edits
+                 BEGIN SELECT RAISE(ABORT,'injected stopped file failure'); END;",
+            )
+            .unwrap();
+        let error = store.stop_running_steps().unwrap_err();
+        assert!(error.contains("injected stopped file failure"), "{error}");
+        assert_eq!(summary(&mut store), before);
+        assert_eq!(store.window().unwrap().items, transcript);
+        let patches = page(
+            &mut store,
+            before.files[0].key.clone(),
+            None,
+            before.revision,
+        );
+        assert_eq!(patches.patches[0].status, ToolStatus::Running);
+        assert_eq!(patches.patches[0].diff, DIFF);
+        store.db.execute_batch("DROP TRIGGER reject_stop").unwrap();
+        store.stop_running_steps().unwrap();
+        assert_eq!(summary(&mut store).files[0].pending, 0);
+    }
+
     #[test]
     fn file_changes_replace_remove_and_replay_stable_contributions() {
         let mut store = Store::new().unwrap();
