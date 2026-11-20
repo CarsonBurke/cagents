@@ -16,6 +16,16 @@ use std::{
 const MAX_CENSUS_PASSES: usize = 16;
 const MAX_PROCESSES: usize = 65_536;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_census_for_test() {
+    FAIL_NEXT_CENSUS.set(true);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CloseProcess {
     pub pid: libc::pid_t,
@@ -281,49 +291,66 @@ impl FrozenFamily {
     }
 
     pub(super) fn kill(&mut self, deadline: Instant) -> Result<(), String> {
-        self.kill_from(0, deadline)
+        check_deadline(deadline)?;
+        self.kill_survivors()
     }
 
-    /// Stop jobs before allowing the shell to handle HUP. Retaining their
-    /// frozen pidfds prevents shell exit from erasing the cleanup obligation,
-    /// and ending a foreground job lets a deferred shell HUP trap run.
-    pub(super) fn hangup(
-        &mut self,
-        child: &super::holder::HeldChild,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        self.kill_from(1, deadline)?;
-        for target in self.targets.iter().skip(1) {
+    /// Retain every exact handle while restoring the captured family's ability
+    /// to handle HUP. Notify jobs explicitly even when the shell traps HUP.
+    pub(super) fn hangup(&mut self, child: &super::holder::HeldChild) -> Result<(), String> {
+        let mut failure = None;
+        for target in self.targets.iter_mut().rev() {
+            if target.resume {
+                match signal(&target.pidfd, libc::SIGCONT) {
+                    Ok(()) => target.resume = false,
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                        target.resume = false;
+                    }
+                    Err(error) => {
+                        failure.get_or_insert_with(|| error.to_string());
+                    }
+                }
+            }
+        }
+        for target in self.targets.iter().skip(1).rev() {
+            match signal(&target.pidfd, libc::SIGHUP) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if let Err(error) = child.kill() {
+            failure.get_or_insert_with(|| format!("hang up child: {error}"));
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn wait_until(&self, deadline: Instant) -> Result<bool, String> {
+        for target in &self.targets {
             if !super::holder::exits_within(
                 &target.pidfd,
                 deadline.saturating_duration_since(Instant::now()),
             )
             .map_err(|error| error.to_string())?
             {
-                return Err("Terminal process cleanup remains unconfirmed".into());
+                return Ok(false);
             }
         }
-        check_deadline(deadline)?;
-        child
-            .kill()
-            .map_err(|error| format!("hang up child: {error}"))?;
-        let root = &mut self.targets[0];
-        if root.resume {
-            match signal(&root.pidfd, libc::SIGCONT) {
-                Ok(()) => {}
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        root.resume = false;
-        Ok(())
+        Ok(true)
     }
 
-    fn kill_from(&mut self, first: usize, deadline: Instant) -> Result<(), String> {
-        check_deadline(deadline)?;
-        // All targets remain stopped until every signal has been issued. No
-        // numeric PID is ever signaled, even after a job exits or is reparented.
-        for (index, target) in self.targets.iter_mut().enumerate().skip(first) {
+    pub(super) fn kill_survivors(&mut self) -> Result<(), String> {
+        let mut failure = None;
+        // Checked close holds stopped targets; ordinary shutdown retains the
+        // same handles across its graceful wait. Only survivors receive KILL.
+        // Numeric PID reuse and reparenting cannot change that authority.
+        for (index, target) in self.targets.iter_mut().enumerate() {
+            if super::holder::exits_within(&target.pidfd, Duration::ZERO).unwrap_or(false) {
+                target.resume = false;
+                continue;
+            }
             // The root is always first. Serialize receipt publication with
             // exit observation, including upgrades which kill off-worker.
             let mut receipt = (index == 0).then(|| {
@@ -334,7 +361,7 @@ impl FrozenFamily {
             let live_root = receipt.is_some()
                 && read_process(target.identity.pid).is_ok_and(|process| {
                     same_identity(&process, &target.identity)
-                        && matches!(process.state, b'T' | b't')
+                        && !matches!(process.state, b'Z' | b'X')
                 });
             match signal(&target.pidfd, libc::SIGKILL) {
                 Ok(()) => {
@@ -344,10 +371,14 @@ impl FrozenFamily {
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => target.resume = false,
-                Err(error) => return Err(format!("Could not close terminal process: {error}")),
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        format!("Could not close terminal process: {error}")
+                    });
+                }
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -445,6 +476,10 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
     })
 }
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
+    #[cfg(test)]
+    if FAIL_NEXT_CENSUS.replace(false) {
+        return Err("injected terminal process census failure".into());
+    }
     census_with(deadline, read_process)
 }
 

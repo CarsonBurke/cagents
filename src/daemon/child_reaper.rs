@@ -89,11 +89,7 @@ impl ExitDrain {
             return true;
         };
         let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.admission_closed
-            && state.free.len() == state.entries.len()
-            && state.entries.iter().all(Option::is_none)
-            && state.quarantined.iter().all(Option::is_none)
-        {
+        if state.can_seal_exit() {
             state.exit_sealed = true;
         }
         state.exit_sealed
@@ -243,7 +239,23 @@ impl Reservation {
 
     /// Failure returns every ownership object intact. Insertion and wakeup are
     /// atomic to the worker: it cannot observe a transfer that is rolled back.
-    pub(crate) fn retain(mut self, child: Child, pidfd: File) -> Result<(), RetainError> {
+    pub(crate) fn retain(self, child: Child, pidfd: File) -> Result<(), RetainError> {
+        self.retain_with_recovery(child, pidfd, false)
+    }
+
+    /// Only a registered terminal holder retained after unconfirmed ordinary
+    /// shutdown may outlive this daemon without blocking its exit. Its recovery
+    /// record remains authoritative; the reaper still owns the exact child.
+    pub(crate) fn retain_recoverable(self, child: Child, pidfd: File) -> Result<(), RetainError> {
+        self.retain_with_recovery(child, pidfd, true)
+    }
+
+    fn retain_with_recovery(
+        mut self,
+        child: Child,
+        pidfd: File,
+        recoverable: bool,
+    ) -> Result<(), RetainError> {
         if let Err(error) = validate_pidfd(&child, &pidfd) {
             return Err((error, child, pidfd, self));
         }
@@ -270,6 +282,7 @@ impl Reservation {
             pidfd: Some(pidfd),
             ticket: self.ticket,
             suspended: false,
+            recoverable,
         });
         if let Err(error) = service.wake() {
             let entry = state.entries[slot]
@@ -283,8 +296,17 @@ impl Reservation {
                 self,
             ));
         }
+        if recoverable && state.quarantined[slot] == Some(self.ticket) {
+            // Only successful transfer into recoverable custody clears this
+            // handoff quarantine. Every failed transfer returns it unchanged.
+            state.quarantined[slot] = None;
+        }
         self.slot = None;
         service.progress(&mut state);
+        drop(state);
+        if recoverable {
+            crate::daemon::wake();
+        }
         Ok(())
     }
 
@@ -307,6 +329,7 @@ impl Reservation {
             pidfd,
             ticket: self.ticket,
             suspended: true,
+            recoverable: false,
         });
         if state.failure.is_none() {
             state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
@@ -320,18 +343,18 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            let empty = {
+            let exit_ready = {
                 let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.quarantined[slot] == Some(self.ticket) {
                     state.quarantined[slot] = None;
                 }
                 state.free.push(slot);
                 self.service.progress(&mut state);
-                state.free.len() == state.entries.len()
+                state.free.len() == state.entries.len() || state.can_seal_exit()
             };
             // No timer retries the idle census. Publish eligibility before
             // waking its owner, without borrowing the reaper's mutex.
-            if empty {
+            if exit_ready {
                 crate::daemon::wake();
             }
         }
@@ -343,6 +366,7 @@ struct Entry {
     pidfd: Option<File>,
     ticket: u64,
     suspended: bool,
+    recoverable: bool,
 }
 struct State {
     entries: Vec<Option<Entry>>,
@@ -356,6 +380,31 @@ struct State {
     admission_closed: bool,
     exit_sealed: bool,
     progress_epoch: u64,
+}
+impl State {
+    fn can_seal_exit(&self) -> bool {
+        let absent =
+            self.free.len() == self.entries.len() && self.entries.iter().all(Option::is_none);
+        // A registered terminal holder whose cleanup could not be confirmed
+        // remains the recoverable owner after daemon exit. Keep its original
+        // Child and pidfd here until then, but do not wait indefinitely for a
+        // successor to release it. Every outstanding credit must already have
+        // transferred into this explicit category; unpublished, suspended or
+        // otherwise faulted ownership cannot authorize exit.
+        let recoverable = self.failure.is_none()
+            && !self.fatal
+            && self.worker_alive
+            && !self.stopping
+            && self.free.len() + self.entries.iter().flatten().count() == self.entries.len()
+            && self
+                .entries
+                .iter()
+                .flatten()
+                .all(|entry| entry.recoverable && !entry.suspended && entry.pidfd.is_some());
+        self.admission_closed
+            && (absent || recoverable)
+            && self.quarantined.iter().all(Option::is_none)
+    }
 }
 struct Service {
     event: File,
@@ -707,9 +756,10 @@ impl Service {
                     }
                 };
                 let empty = reaped && state.free.len() == state.entries.len();
+                let exit_ready = reaped && state.can_seal_exit();
                 self.progress(&mut state);
                 drop(state);
-                if empty || !reaped {
+                if empty || exit_ready || !reaped {
                     crate::daemon::wake();
                 }
             }

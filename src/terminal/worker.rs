@@ -507,6 +507,8 @@ struct PublishedState {
     #[cfg(test)]
     test_startup_probe: Mutex<Option<Sender<(Vec<u8>, bool, bool)>>>,
     shutdown_requested: AtomicBool,
+    #[cfg(test)]
+    shutdown_census_failure: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
     command_budget: OnceLock<Arc<admission::Budget>>,
@@ -613,6 +615,8 @@ impl PublishedState {
             #[cfg(test)]
             test_startup_probe: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
+            #[cfg(test)]
+            shutdown_census_failure: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
             command_budget: OnceLock::new(),
@@ -3715,6 +3719,14 @@ impl Worker {
                     }
                 }
             } else {
+                #[cfg(test)]
+                if self
+                    .published
+                    .shutdown_census_failure
+                    .load(Ordering::Acquire)
+                {
+                    close_processes::fail_next_census_for_test();
+                }
                 let result = shutdown_child_exit(
                     &self.child,
                     &self.master,
@@ -3823,7 +3835,11 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
-            self.holder.leave_for_successor();
+            if shutting_down {
+                self.holder.leave_after_unconfirmed_shutdown();
+            } else {
+                self.holder.leave_for_successor();
+            }
             drop(self.holder);
         } else if !shutting_down && completion.is_some() && self.holder.registered() {
             self.holder.prove_cleanup();
@@ -5990,55 +6006,83 @@ fn shutdown_child_exit(
     exits: &Receiver<ChildExit>,
     checked: bool,
 ) -> ChildExit {
-    let deadline = std::time::Instant::now() + CHILD_SHUTDOWN_DEADLINE;
-    let mut report = exits.try_recv().ok();
+    let deadline = Instant::now() + CHILD_SHUTDOWN_DEADLINE;
+    let report = exits.try_recv().ok();
     if !checked {
         let captured = identity
             .ok_or_else(|| "Child identity unavailable".to_owned())
             .and_then(|root| FrozenFamily::capture(root, deadline));
         match captured {
             Ok(mut family) => {
-                family.hangup(child, deadline)?;
-                if report.is_none() {
-                    report = match exits.recv_timeout(
-                        CHILD_HANGUP_GRACE.min(deadline.saturating_duration_since(Instant::now())),
-                    ) {
-                        Ok(result) => Some(result),
-                        Err(RecvTimeoutError::Disconnected) => {
-                            return Err("child reaper closed".into());
-                        }
-                        Err(RecvTimeoutError::Timeout) => None,
-                    };
+                if let Err(error) = family.hangup(child) {
+                    tracing::warn!(%error, "could not hang up the complete terminal family");
                 }
-                if child
-                    .exited_within(Duration::ZERO)
-                    .map_err(|error| format!("observe child exit: {error}"))?
-                {
-                    confirm_exited_family(child, master, deadline)?;
-                } else {
-                    // Only the root ran during its grace period. Re-freeze
-                    // its current family, including any jobs its HUP handler
-                    // started, before escalating through exact pidfds.
-                    FrozenFamily::capture(identity.expect("captured root identity"), deadline)?
-                        .kill(deadline)?;
+                let grace = (Instant::now() + CHILD_HANGUP_GRACE).min(deadline);
+                if !family.wait_until(grace).unwrap_or(false) {
+                    if !child.exited_within(Duration::ZERO).unwrap_or(false) {
+                        // Re-census while the exact root still lives, retaining
+                        // the first set even if the shell exits during capture.
+                        let stopped = FrozenFamily::capture(
+                            identity.expect("captured root identity"),
+                            deadline,
+                        )
+                        .and_then(|mut current| current.kill_survivors());
+                        if let Err(error) = stopped {
+                            tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                            if let Err(error) = child.force_kill() {
+                                tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                            }
+                        }
+                    }
+                    // Retained pidfd authority does not expire with census
+                    // time. Issue the finite survivor signals even if the
+                    // re-census consumed the remaining wait budget.
+                    if let Err(error) = family.kill_survivors() {
+                        tracing::warn!(%error, "could not stop the complete terminal family");
+                    }
+                    if !family.wait_until(deadline)? {
+                        return Err("Terminal process cleanup remains unconfirmed".into());
+                    }
                 }
             }
             Err(error) => {
+                // Failed capture resumes its stops on drop. Never let a
+                // process-scan failure discard the independently pinned root.
                 if !child
                     .exited_within(Duration::ZERO)
                     .map_err(|error| format!("observe child exit: {error}"))?
                 {
-                    return Err(error);
+                    tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                    if let Err(error) = child.kill() {
+                        tracing::warn!(%error, "could not hang up the complete terminal family");
+                    }
+                    if !child
+                        .exited_within(
+                            CHILD_HANGUP_GRACE
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        )
+                        .map_err(|error| format!("observe child exit: {error}"))?
+                    {
+                        child
+                            .force_kill()
+                            .map_err(|error| format!("terminate child: {error}"))?;
+                    }
                 }
-                confirm_exited_family(child, master, deadline)?;
+                if !child
+                    .exited_within(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|error| format!("observe child exit: {error}"))?
+                {
+                    return Err("Terminal process cleanup remains unconfirmed".into());
+                }
             }
         }
+        confirm_exited_family(child, master, deadline)?;
     }
     if let Some(report) = report {
         return report;
     }
     exits
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|error| match error {
             RecvTimeoutError::Disconnected => "child reaper closed".to_owned(),
             RecvTimeoutError::Timeout => {
@@ -6062,9 +6106,25 @@ fn confirm_exited_family(
         events: 0,
         revents: 0,
     };
-    // SAFETY: one live, owned descriptor; this only observes readiness.
-    if unsafe { libc::poll(&mut target, 1, 0) } < 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A job can fork between thaw and HUP. Give its final PTY descriptors
+        // the same bounded cleanup budget even after the tracked jobs exit.
+        // SAFETY: one live, owned descriptor; this only observes readiness.
+        match unsafe {
+            libc::poll(
+                &mut target,
+                1,
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as libc::c_int,
+            )
+        } {
+            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            -1 => return Err(std::io::Error::last_os_error().to_string()),
+            _ => break,
+        }
     }
     if child
         .exited_within(Duration::ZERO)
