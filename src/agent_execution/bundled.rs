@@ -531,8 +531,12 @@ mod tests {
         let directory = crate::test_fixture::tempdir().unwrap();
         let environment =
             BTreeMap::from([("HOME".into(), directory.path().to_str().unwrap().into())]);
-        // Agents run only as native chat.
-        for provider in Provider::ALL.into_iter().filter(|p| p.has_native_chat()) {
+        // Agents run only as native chat. An ACP agent lists its own
+        // commands to the conversation, and is not given the bundle yet.
+        for provider in Provider::ALL
+            .into_iter()
+            .filter(|p| p.has_native_chat() && !p.speaks_acp())
+        {
             install(Some(provider), &environment, directory.path());
             let launch = crate::chat::Launch {
                 provider,

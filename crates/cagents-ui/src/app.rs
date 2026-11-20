@@ -69,6 +69,7 @@ mod terminal_failure;
 mod terminal_output_tests;
 mod terminal_save;
 mod terminal_ui;
+mod update_resume;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
@@ -5204,6 +5205,7 @@ pub enum Message {
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
     UpdateUi(update_ui::Action),
+    UpdateResume(update_resume::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
     SidebarSelection(sidebar_selection_ui::Action),
@@ -5912,6 +5914,7 @@ pub struct Cagents {
     chat_ui: chat_ui::State,
     resume_ui: resume_ui::State,
     update_ui: update_ui::State,
+    update_resume: update_resume::State,
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
@@ -16084,6 +16087,12 @@ impl Application for Cagents {
                 .copied()
                 .take(WORKSPACE_HISTORY_LIMIT),
         );
+        // A window that keeps no state records nothing for the others.
+        let update_resume = if session.is_some() {
+            update_resume::State::shared()
+        } else {
+            update_resume::State::default()
+        };
         let mut app = Self {
             startup_gate: startup_gate::State::default(),
             core,
@@ -16184,6 +16193,7 @@ impl Application for Cagents {
                 .with_waiting_messages(chat_waiting_messages),
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
+            update_resume,
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
@@ -17158,6 +17168,7 @@ impl Application for Cagents {
                 .view()
                 .map(Message::OperationRecovery),
             self.daemon_health_banner(),
+            self.update_resume_banner(),
             self.automation_approval_banner(),
             bar,
         ])
@@ -18021,6 +18032,7 @@ impl Cagents {
                 self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
+            Message::UpdateResume(action) => self.update_update_resume(action),
             Message::StartupWindowOpened(window) => {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();

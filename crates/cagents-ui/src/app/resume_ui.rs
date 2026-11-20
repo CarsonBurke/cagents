@@ -2365,6 +2365,47 @@ mod tests {
         assert_eq!(app.durable.cards.len(), 1);
     }
 
+    /// The offer to resume work an update stopped can be taken while the
+    /// conversation is still reopening. Its message waits for the
+    /// conversation, and until then is saved like any held message, so
+    /// closing the app first keeps it as the draft.
+    #[test]
+    fn a_resume_message_held_while_reopening_is_kept_as_its_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        drop(app.resume_saved_conversation(entry.clone()));
+        let (card, attempt) = reopening(&app);
+        drop(app.update_resume(Action::Prepared(
+            card,
+            attempt,
+            Ok(Some(Box::new(successor(&entry.session)))),
+        )));
+        assert!(app.chat_start_began(card));
+        assert!(!app.cards.contains_key(&card), "nothing has attached yet");
+
+        assert!(
+            app.resume_lost_work(card, "Carry on".into()).is_some(),
+            "a reopening conversation takes the message"
+        );
+        assert_eq!(app.persistent_workspace().chat_drafts[&card], "Carry on");
+    }
+
+    /// Until it is prepared, a reopening pane is not saved, so a message
+    /// held there would not outlive the window. It refuses the resume, which
+    /// stays on offer.
+    #[test]
+    fn a_pane_still_being_prepared_refuses_a_resume_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let entry = retained(directory.path());
+        drop(app.resume_saved_conversation(entry));
+        let (card, _) = reopening(&app);
+        assert!(app.reopen_preparing(card));
+        assert!(!app.chat_takes_resume(card));
+        assert!(app.resume_lost_work(card, "Carry on".into()).is_none());
+    }
+
     #[test]
     fn reopening_a_closed_chat_puts_its_pane_back_before_any_answer() {
         let directory = tempfile::tempdir().unwrap();

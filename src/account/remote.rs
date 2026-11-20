@@ -739,7 +739,10 @@ fn login_recipe_with_path(
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
             Provider::Codex => vec!["login".into(), "--device-auth".into()],
-            Provider::Omp | Provider::Antigravity | Provider::Muse => {
+            Provider::Antigravity => ["acp", "--login", "--disable-telemetry"]
+                .map(str::to_owned)
+                .into(),
+            Provider::Omp | Provider::Muse => {
                 return Err(format!(
                     "{} manages its own sign-in",
                     account.provider.label()

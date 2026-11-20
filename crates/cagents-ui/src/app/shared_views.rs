@@ -259,11 +259,6 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
 pub(in crate::app) const PANE_KEPT: &str =
     "This pane couldn't be removed right now, so it was kept. Close it again.";
 
-/// [`PANE_KEPT`] for a terminal whose shell the refused Close already ended.
-/// Closing that pane again doesn't work yet (#3266), so it isn't suggested.
-pub(in crate::app) const ENDED_TERMINAL_KEPT: &str =
-    "This pane couldn't be removed right now, so it was kept.";
-
 /// A Close the registry kept the pane through, where this window has nothing
 /// to show it in now, such as a worktree with no other open pane.
 pub(super) const PANE_KEPT_ELSEWHERE: &str =
@@ -729,9 +724,8 @@ impl Cagents {
             self.shared_views.pending.remove(index);
             self.shared_views.source_bases.remove(&operation);
             let card = before.id;
-            let kept = self.pane_kept_notice(card);
             let projected = self.reconcile_workspace_model();
-            self.report_refused_close(&scope, operation, card, &error, kept);
+            self.report_refused_close(&scope, operation, card, &error);
             return projected;
         }
         // Another window can publish the same session update first, as when two
@@ -879,16 +873,12 @@ impl Cagents {
     /// registry still holds is kept, and said to be. A pane it no longer
     /// holds is closed, as the person asked: its agent or another window may
     /// have closed it first, or its project or channel may be gone.
-    ///
-    /// `kept_notice` is [`Self::pane_kept_notice`] as it stood before the refusal
-    /// was settled, which can end the close that decides it.
     pub(super) fn report_refused_close(
         &mut self,
         scope: &Scope,
         operation: uuid::Uuid,
         card: CardId,
         error: &str,
-        kept_notice: &'static str,
     ) {
         let kept = self
             .workspace_model
@@ -899,23 +889,12 @@ impl Cagents {
             tracing::warn!(?scope, %operation, %error, %card, "the registry refused a close and kept its pane");
             let shown = self.workspace.order().any(|id| id == card);
             self.notices.record(TransientNotice::warning(if shown {
-                kept_notice
+                PANE_KEPT
             } else {
                 PANE_KEPT_ELSEWHERE
             }));
         } else {
             tracing::debug!(?scope, %operation, %error, %card, "a refused close's pane is already gone");
-        }
-    }
-
-    /// What the person is told when `card` is kept after they closed it. A
-    /// terminal whose shell this close has already ended can't be closed
-    /// again yet (#3266), so its notice doesn't ask them to.
-    pub(in crate::app) fn pane_kept_notice(&self, card: CardId) -> &'static str {
-        if self.closed_terminal_cards.contains(&card) {
-            ENDED_TERMINAL_KEPT
-        } else {
-            PANE_KEPT
         }
     }
 
