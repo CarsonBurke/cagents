@@ -1282,17 +1282,24 @@ impl Store {
     /// rows: a run of tool calls, or attachments and bookkeeping records the
     /// transcript does not show. The window is filled to its budget from such
     /// pages before a reader has to ask, one page at a time, and only once the
-    /// last window built is current, so that a hidden conversation, whose
-    /// window nobody reads, fetches nothing.
+    /// last window built is current. A conversation whose window nobody reads
+    /// after it changes fetches nothing more; one that is read, by the app or
+    /// by the host's own snapshots, fetches at most the pages that fill its
+    /// budget.
     ///
-    /// A request that fails leaves this set: nothing retries it until a page
-    /// arrives, as one the reader asks for does.
+    /// A request that fails, or that the provider answers without a page,
+    /// leaves this set: nothing retries it until a page arrives, as one the
+    /// reader asks for does.
     pub(super) fn fill(&mut self) -> bool {
         if !self.wants_fill() {
             return false;
         }
         self.filling = true;
         true
+    }
+    /// Whether a page asked for by [`Store::fill`] has not yet arrived.
+    pub(super) fn filling(&self) -> bool {
+        self.filling
     }
     /// Whether [`Store::fill`] would ask for a page now.
     pub(super) fn wants_fill(&self) -> bool {
