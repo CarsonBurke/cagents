@@ -606,6 +606,14 @@ handle_control() {
     esac
 }
 
+# With home/.claude/fixture-session-idle, a main turn's result is followed by
+# the session_state_changed idle frame Claude Code 2.1 sends once it is idle.
+session_idle() {
+    [ -e "$config/fixture-session-idle" ] || return 0
+    jq -cn --arg session "$session" \
+        '{type:"system",subtype:"session_state_changed",state:"idle",session_id:$session}'
+}
+
 # Claude Code 2.1's record of a stop, as its sdk-cli transcripts and its
 # 2.1.317 stream hold it: a replayed call still running gets a result worded
 # as the person declining it, then a user message says the request was
@@ -629,6 +637,7 @@ record_stop() {
         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,
           terminal_reason:$reason,stop_reason:(if $stop == "null" then null else $stop end),
           errors:["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason="+$stop],session_id:$session}'
+    session_idle
 }
 
 queue_user() {
@@ -702,6 +711,7 @@ settle_first_turn() {
         busy=false
         jq -cn --arg session "$session" --arg turn "$turn" \
             '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+        session_idle
     fi
 }
 
@@ -819,6 +829,7 @@ while next_frame; do
                     busy=false
                     jq -cn --arg session "$session" --arg turn "$turn" \
                         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+                    session_idle
                 fi
             fi
             ;;
