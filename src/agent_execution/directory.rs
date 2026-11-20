@@ -200,6 +200,10 @@ pub enum TtlBasis {
     Observed,
 }
 
+/// Context smaller than this costs little to read again, so nothing points
+/// out that its cache went cold.
+pub const COLD_CONTEXT_TOKENS: u64 = 10_000;
+
 /// Whether a conversation's prompt cache likely still holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Warmth {
@@ -231,6 +235,20 @@ impl Member {
                 ActivityState::Waiting => "waiting",
             }
         }
+    }
+
+    /// The context, in tokens, that a message would make the provider read
+    /// again at full price at `now`, in Unix milliseconds: the session is
+    /// idle past its cache's likely expiry, with enough context for that to
+    /// matter. A session never wakes itself, and an exited one can't be
+    /// woken.
+    pub fn cold_context(&self, now: u64) -> Option<u64> {
+        let cache = self.cache.as_ref()?;
+        (!self.exited
+            && self.session.relation != Relation::Myself
+            && cache.context_tokens >= COLD_CONTEXT_TOKENS
+            && self.warmth(now) == Warmth::Cold)
+            .then_some(cache.context_tokens)
     }
 
     /// Whether the conversation's prompt cache likely still holds at `now`,
