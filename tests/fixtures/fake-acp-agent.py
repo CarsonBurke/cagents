@@ -102,11 +102,14 @@ AGY_MODES = [
     ("auto", "Auto", "Approve edits and safe commands; ask before irreversible actions."),
     ("plan", "Plan", "Plan carefully before executing a task."),
 ]
-AGY_MODELS = [
-    ("gemini-3.8-flash", "Gemini 3.8 Flash"),
-    ("gemini-4-neon", "Gemini 4 Neon"),
-]
 AGY_LEVELS = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "Extra")]
+# As Antigravity 1.5.12 offers them: each model with the levels it has, and
+# one, whose identifier ends like a level, with none.
+AGY_MODELS = [
+    ("gemini-3.8-flash", "Gemini 3.8 Flash", AGY_LEVELS[:3]),
+    ("gemini-4-neon", "Gemini 4 Neon", AGY_LEVELS),
+    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", []),
+]
 MUSE_MODES = [
     ("allowAll", "Allow all", "Run every action without asking for approval"),
     ("promptUnmatched", "Ask before unmatched actions",
@@ -211,7 +214,7 @@ class Session:
         mode = {"id": "mode", "name": "Mode", "category": "mode", "type": "select",
                 "currentValue": self.mode,
                 "options": [{"value": v, "name": n, "description": d} for v, n, d in self.modes()]}
-        models = AGY_MODELS if SHAPE == "agy" else MUSE_MODELS
+        models = [(v, n) for v, n, _ in AGY_MODELS] if SHAPE == "agy" else MUSE_MODELS
         model = {"id": "model", "name": "Model", "category": "model", "type": "select",
                  "currentValue": self.model,
                  "options": [{"value": v, "name": n} for v, n in models]}
@@ -225,10 +228,17 @@ class Session:
                     {"id": "thought_level", "name": "Reasoning effort",
                      "category": "thought_level", "type": "select", "currentValue": self.level,
                      "options": [{"value": v, "name": n} for v, n in levels]}]
+        # Like agy, the level option lists the current model's levels only.
+        levels = self.agy_levels()
+        if not levels:
+            return [model, mode]
         level = {"id": "thought_level", "name": "Thinking Level", "category": "thought_level",
                  "type": "select", "currentValue": self.level,
-                 "options": [{"value": v, "name": n} for v, n in AGY_LEVELS]}
+                 "options": [{"value": v, "name": n} for v, n in levels]}
         return [model, level, mode]
+
+    def agy_levels(self):
+        return next((levels for v, _, levels in AGY_MODELS if v == self.model), [])
 
     def setup(self, session_id=True):
         result = {
@@ -239,9 +249,13 @@ class Session:
         }
         if SHAPE == "agy":
             result["models"] = {
-                "availableModels": [{"modelId": f"{v}-{level}", "name": f"{n} ({ln})"}
-                                    for v, n in AGY_MODELS for level, ln in AGY_LEVELS],
-                "currentModelId": f"{self.model}-{self.level}",
+                # One identifier per model and level, or the model's own.
+                "availableModels": [
+                    model
+                    for v, n, levels in AGY_MODELS
+                    for model in ([{"modelId": f"{v}-{level}", "name": f"{n} ({ln})"}
+                                   for level, ln in levels] or [{"modelId": v, "name": n}])],
+                "currentModelId": f"{self.model}-{self.level}" if self.level else self.model,
             }
             result["_meta"] = {"antigravity": {"tier": {"name": "Fixture tier", "id": "fixture"}}}
         if session_id:
@@ -433,6 +447,12 @@ class Agent:
         if SHAPE == "muse" and option == "model":
             # The options a model offers change with it.
             session.level = None
+        elif option == "model":
+            # A level the new model lacks becomes one it has.
+            levels = [v for v, _ in session.agy_levels()]
+            if session.level not in levels:
+                session.level = ("medium" if "medium" in levels else
+                                 levels[0] if levels else None)
         reply(id, {"configOptions": session.config_options()})
 
     def on_session_set_mode(self, id, params):

@@ -1127,7 +1127,10 @@ PR merges to remove the task's checkouts from the host.
 [`tests/fixtures/fake-acp-agent.py`](../tests/fixtures/fake-acp-agent.py)
 speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
 does, with its configuration options for model, thinking level and mode and
-its older `models` and `modes` lists. Run as `muse...` or with
+its older `models` and `modes` lists. Like agy, its models differ in their
+levels: Gemini 3.8 Flash has Low to High, Gemini 4 Neon adds Extra, and
+`gpt-oss-120b-medium` has none, so the thinking level option lists only the
+current model's. Run as `muse...` or with
 `FAKE_ACP_SHAPE=muse`, it copies Muse 1.4.24 instead: its four modes, a
 `-contributor` model beside each ordinary one, a reasoning option only on
 `muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
