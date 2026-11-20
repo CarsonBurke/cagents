@@ -6,6 +6,9 @@ Run through scripts/native-evidence env so HOME belongs to the fixture:
 The generated conversation exceeds the retained 128-item paging window.
 --varied gives exchanges the mixed heights of real work: tool calls, code
 blocks, lists and attached screenshots.
+--working N gives each exchange N commands, each with the hook records Claude
+Code writes around a tool call, and a one-line answer, so a saved page of 100
+records holds only a few rows, as in an agent's long working session.
 """
 import argparse
 import base64
@@ -31,6 +34,8 @@ parser.add_argument("--untitled", action="store_true",
                     help="leave out the conversation's name, so only its first prompt names it")
 parser.add_argument("--varied", action="store_true",
                     help="mix tool calls, code blocks, lists and images into the exchanges")
+parser.add_argument("--working", type=int, default=0, metavar="N",
+                    help="run N commands per exchange, each with its hook records")
 args = parser.parse_args()
 if args.turns < 129:
     parser.error("use at least 129 turns to exercise history eviction")
@@ -38,6 +43,8 @@ if args.scale < 1:
     parser.error("scale must be positive")
 if args.tool_bytes < 0:
     parser.error("tool bytes must not be negative")
+if args.working < 0:
+    parser.error("working commands must not be negative")
 
 
 
@@ -105,12 +112,32 @@ def varied(turn, call):
     return blocks, prose
 
 
+def working(turn, count):
+    """Commands with the hook records written before and after each call."""
+    records = []
+    for step in range(count):
+        call = f"toolu_working_{turn}_{step}"
+        hook = {"type": "hook_success", "hookName": "", "toolUseID": call,
+                "command": "true", "content": "", "stdout": "", "stderr": "",
+                "exitCode": 0, "durationMs": 4}
+        records.extend([
+            ("assistant", [{"type": "tool_use", "id": call, "name": "Bash",
+                            "input": {"command": f"make check STEP={step}",
+                                      "description": f"Check step {step + 1} of checkpoint {turn:03d}"}}]),
+            ("attachment", dict(hook, hookEvent="PreToolUse", hookName="PreToolUse:Bash")),
+            ("user", [{"type": "tool_result", "tool_use_id": call,
+                       "content": f"step {step + 1}: ok"}]),
+            ("attachment", dict(hook, hookEvent="PostToolUse", hookName="PostToolUse:Bash")),
+        ])
+    return records
+
+
 project = os.path.realpath(args.project)
 session = str(uuid.uuid5(uuid.NAMESPACE_URL, f"claude-long-history:{project}"))
 directory = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", project)
 directory.mkdir(parents=True, exist_ok=True)
 parent = None
-clock = time.time() - (args.turns * (3 if args.varied else 1)
+clock = time.time() - (args.turns * (3 if args.varied else 1) * (1 + 2 * args.working)
                        + (args.turns // 32 if args.tool_bytes else 0)) * 90
 with (directory / f"{session}.jsonl").open("w") as transcript:
     for turn in range(1, args.turns + 1):
@@ -119,7 +146,8 @@ with (directory / f"{session}.jsonl").open("w") as transcript:
         details = "\n\n".join(
             f"Check {check + 1}: the fixture keeps each exchange numbered so the reader "
             "can check that paging preserves their position and restores every newer turn."
-            for check in range(args.scale * (1 + (turn - 1) // 64))
+            # A working session's answers are short; its commands take the room.
+            for check in range(0 if args.working else args.scale * (1 + (turn - 1) // 64))
         )
         prompt = f"Review checkpoint {turn:03d}"
         if turn == 1 and args.first_prompt:
@@ -136,6 +164,7 @@ with (directory / f"{session}.jsonl").open("w") as transcript:
             tools, prose = varied(turn, f"toolu_varied_{turn}")
             for pair in tools:
                 messages.extend(pair)
+        messages.extend(working(turn, args.working))
         if args.tool_bytes and turn % 32 == 0:
             call = f"toolu_checkpoint_{turn}"
             messages.extend([
@@ -153,16 +182,21 @@ with (directory / f"{session}.jsonl").open("w") as transcript:
                          f"Verification marker: checkpoint-{turn:03d}."}]))
         for index, (role, content) in enumerate(messages):
             uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{session}:{turn}:{index}:{role}"))
-            message = {"role": role, "content": content}
-            if role == "assistant":
-                message.update(model="claude-haiku-4-5", id=f"msg_{uid}", type="message",
-                               usage={"input_tokens": 3, "output_tokens": 60})
-            transcript.write(json.dumps({
+            record = {
                 "parentUuid": parent, "isSidechain": False, "userType": "external",
                 "cwd": project, "sessionId": session, "version": "2.1.90",
-                "gitBranch": "main", "type": role, "message": message, "uuid": uid,
+                "gitBranch": "main", "type": role, "uuid": uid,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(clock)),
-            }) + "\n")
+            }
+            if role == "attachment":
+                record["attachment"] = content
+            else:
+                message = {"role": role, "content": content}
+                if role == "assistant":
+                    message.update(model="claude-haiku-4-5", id=f"msg_{uid}", type="message",
+                                   usage={"input_tokens": 3, "output_tokens": 60})
+                record["message"] = message
+            transcript.write(json.dumps(record) + "\n")
             clock += 45
             parent = uid
     if not args.untitled:
