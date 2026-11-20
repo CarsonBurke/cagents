@@ -21,7 +21,7 @@ const REFUSED_FOR: Duration = if cfg!(test) {
 };
 
 /// The copy control a copy answers at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum CopyKey {
     /// An item's own Copy, in the row under it.
     Item(String),
