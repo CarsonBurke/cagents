@@ -19,15 +19,17 @@ ui = "--locked --no-default-features --package cagents --package cagents-ui --fe
 # browser tests use, as main's build check selects it.
 browser = "--locked --no-default-features --package cagents-ui --features browser-protocol-fixture"
 editor = "--locked --package ceditor"
-# Cargo arguments a lane task forwards. Naming any replaces the default target
-# selection, so `-- --lib terminal::` narrows a lane instead of adding to it.
-# mise passes the arguments shell-quoted in $usage_cargo_args; each lane task
-# restores them with `eval "set -- $usage_cargo_args"`.
-# An aggregate refuses arguments rather than silently running every lane whole:
-# narrow one lane instead, such as `mise run test:host -- --lib terminal::`.
-# Each aggregate's first step checks; mise would expand its $ here in [vars].
-no_arguments = 'arg "[unexpected]..." var=#true hide=#true'
-all_targets = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+
+# Usage specs. A lane task forwards Cargo arguments; naming any replaces the
+# default target selection, so `-- --lib terminal::` narrows a lane instead of
+# adding to it. mise passes them shell-quoted in $usage_cargo_args, and each
+# lane task restores them with `eval "set -- $usage_cargo_args"`. An aggregate
+# refuses arguments rather than silently running every lane whole: narrow one
+# lane instead, such as `mise run test:host -- --lib terminal::`. Its first step
+# checks, since mise would expand a $ in a spec kept here in [vars].
+# Each task spells its spec out rather than naming a var: mise 2025.9.9
+# renders {{vars.*}} in `run` but passes a `usage` value verbatim, which then
+# fails to parse as KDL once the task is given arguments or --help.
 
 # Setup ----------------------------------------------------------------------
 
@@ -71,22 +73,22 @@ run = "scripts/run-development"
 
 [tasks."check:cli"]
 description = "Type-check and lint the control CLI lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.cli}} "$@"'
 
 [tasks."check:host"]
 description = "Type-check and lint the terminal daemon lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.host}} "$@"'
 
 [tasks."check:ui"]
 description = "Type-check and lint the browserless UI lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.ui}} "$@"'
 
 [tasks."check:browser"]
 description = "Type-check and lint the integrated-browser UI lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.browser}} "$@"'
 
 [tasks."check:editor"]
@@ -96,7 +98,7 @@ run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.ed
 
 [tasks.check]
 description = "Type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
-usage = "{{vars.no_arguments}}"
+usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["check:cli", "check:host", "check:ui"] }]
 
 [tasks."check:protocol"]
@@ -123,7 +125,7 @@ run = [
 
 [tasks."test:cli"]
 description = "Test the control CLI lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.cli}} "$@"',
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.cli}} --lib --bins --examples ;; esac',
@@ -131,7 +133,7 @@ run = [
 
 [tasks."test:host"]
 description = "Test the terminal daemon lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.host}} "$@"',
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.host}} --lib --bins --examples ;; esac',
@@ -139,7 +141,7 @@ run = [
 
 [tasks."test:ui"]
 description = "Test the browserless UI lane"
-usage = "{{vars.all_targets}}"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.ui}} "$@"',
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.ui}} --lib --bins --examples ;; esac',
@@ -154,7 +156,7 @@ run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-gate test --locked -p
 description = "Test every target of the CLI, host and UI lanes, one lane after another"
 # In sequence: each lane's tests run outside the build slot, and three suites
 # at once would compete for memory and interleave thousands of result lines.
-usage = "{{vars.no_arguments}}"
+usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { task = "test:cli" }, { task = "test:host" }, { task = "test:ui" }]
 
 [tasks."test:lib"]
@@ -186,7 +188,7 @@ run = "scripts/check-format"
 # What GitHub CI runs; none of it compiles Rust.
 [tasks.ci]
 description = "Run the checks GitHub CI runs: formatting, protocol contracts and script suites"
-usage = "{{vars.no_arguments}}"
+usage = 'arg "[unexpected]..." var=#true hide=#true'
 run = ['if [ -n "${usage_unexpected-}" ]; then echo "this task takes no arguments; pass them to one of the tasks it runs" >&2; exit 2; fi', { tasks = ["fmt:check", "check:protocol", "test:scripts"] }]
 
 # Packaging and release ------------------------------------------------------
