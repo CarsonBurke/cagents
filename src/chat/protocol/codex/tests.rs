@@ -2080,6 +2080,7 @@ fn adapter() -> Codex {
         is_child: false,
         child_failure: None,
         child_buffer: BTreeMap::new(),
+        waiting_child_resumes: BTreeMap::new(),
         turn_diffs: BTreeMap::new(),
         repo_root: None,
     }
@@ -3188,13 +3189,17 @@ fn stopping_a_child_interrupts_only_its_own_turn() {
         event,
         Event::Error { message, fatal: false } if message.starts_with("Codex could not stop the subagent")
     )));
-    assert!(
-        parent
-            .command(Command::StopSubagent {
-                id: "idle-child".into()
-            })
-            .is_err()
-    );
+    // A child with nothing running only settles whatever showed it working.
+    let settled = parent
+        .command(Command::StopSubagent {
+            id: "idle-child".into(),
+        })
+        .unwrap();
+    assert!(settled.writes.is_empty());
+    assert!(settled.events.iter().any(|event| matches!(
+        event,
+        Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "idle-child"
+    )));
     assert!(
         parent
             .command(Command::StopSubagent {
@@ -3424,6 +3429,213 @@ fn child_listing_recovers_newest_first_descendants_without_trusting_foreign_thre
     assert!(adapter.children.contains_key("child"));
     assert!(adapter.children.contains_key("grandchild"));
     assert!(!adapter.children.contains_key("foreign"));
+}
+
+/// After a restart Codex has loaded none of a conversation's children, and it
+/// resumes a nested child only once its parent is loaded. A grandchild read
+/// sent beside its parent's was refused, and the child it left behind, never
+/// read and never live, showed as running with no turn to stop.
+#[test]
+fn listed_descendants_are_read_after_their_parents_and_not_loaded_is_not_running() {
+    for parent_read_fails in [false, true] {
+        let mut adapter = adapter();
+        let mut request = Step::default();
+        adapter
+            .call(&mut request, "thread/list", json!({}), Pending::ChildList)
+            .unwrap();
+        let listed = adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{"data":[
+                {"id":"grandchild","parentThreadId":"child","status":{"type":"notLoaded"}},
+                {"id":"great-grandchild","parentThreadId":"grandchild","status":{"type":"notLoaded"}},
+                {"id":"child","parentThreadId":"thread-exact","status":{"type":"notLoaded"}}
+            ]}}))
+            .unwrap();
+        let reads = |step: &Step| {
+            step.writes
+                .iter()
+                .filter(|write| write["method"] == "thread/resume")
+                .map(|write| write["params"]["threadId"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(reads(&listed), ["child"]);
+        for id in ["child", "grandchild", "great-grandchild"] {
+            assert!(
+                listed.events.iter().any(|event| matches!(event,
+                    Event::Subagent { id: agent, status: Some(ToolStatus::Succeeded), .. } if agent == id)),
+                "{id} must not be published without a status, which reads as running"
+            );
+        }
+        let child_read = listed.writes[0]["id"].clone();
+        let answer = if parent_read_fails {
+            json!({"id":child_read,"error":{"code":-32600,"message":"unavailable"}})
+        } else {
+            json!({"id":child_read,"result":{"thread":{"id":"child","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})
+        };
+        let child_answered = adapter.receive(answer).unwrap();
+        assert_eq!(reads(&child_answered), ["grandchild"]);
+        let grandchild_answered = adapter
+            .receive(json!({"id":child_answered.writes.iter().find(|write| write["method"] == "thread/resume").unwrap()["id"],"error":{"code":-32600,"message":"unavailable"}}))
+            .unwrap();
+        assert_eq!(reads(&grandchild_answered), ["great-grandchild"]);
+        assert!(adapter.waiting_child_resumes.is_empty());
+        assert_eq!(
+            adapter.children["grandchild"].subagent_status,
+            Some(ToolStatus::Succeeded)
+        );
+        assert!(adapter.children["grandchild"].turn.is_none());
+    }
+}
+
+/// An old call's record can say a child is running. If the child's own read
+/// then fails and nothing live arrives, no stop could reach it: it settles
+/// instead of keeping its conversation working with no turn to stop.
+#[test]
+fn a_failed_child_read_settles_a_recorded_child_but_not_a_live_one() {
+    for live in [false, true] {
+        let mut parent = adapter();
+        let mut discovered = Step::default();
+        parent
+            .discover_child("child", &json!({"status":"running"}), &mut discovered)
+            .unwrap();
+        if live {
+            parent
+                .receive(json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn","status":"inProgress","items":[]}}}))
+                .unwrap();
+        }
+        let failed = parent
+            .receive(json!({"id":discovered.writes[0]["id"],"error":{"code":-32600,"message":"unavailable"}}))
+            .unwrap();
+        let settled = failed.events.iter().any(|event| {
+            matches!(event,
+            Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "child")
+        });
+        assert_eq!(settled, !live);
+        let child = &parent.children["child"];
+        assert_eq!(child.busy, live);
+        assert_eq!(
+            child.subagent_status,
+            Some(if live {
+                ToolStatus::Running
+            } else {
+                ToolStatus::Stopped
+            })
+        );
+    }
+}
+
+/// The same restart against the offline peer, which models Codex's nested
+/// resume rule. Codex answers concurrent reads in any order, so each batch
+/// of requests is answered last first: the order that refused a grandchild
+/// read sent beside its parent's.
+#[test]
+fn restored_nested_children_settle_against_the_peer_in_any_answer_order() {
+    use std::io::{BufRead, BufReader, Write};
+    let mut peer = std::process::Command::new("/usr/bin/python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+import json, runpy, sys, tempfile
+from pathlib import Path
+peer = runpy.run_path(sys.argv[1])
+home = tempfile.mkdtemp(prefix="codex-nested-")
+(Path(home) / "fixture-nested-child").touch()
+scenario = peer['Scenario']()
+scenario.thread, scenario.child, scenario.grandchild = 'thread-exact', 'child-exact', 'grandchild-exact'
+scenario.loaded = {scenario.thread}
+for line in sys.stdin:
+    replies = []
+    for request in reversed(json.loads(line)):
+        replies += [reply for reply in scenario.request(request, home) if '_sleep' not in reply]
+    print(json.dumps(replies), flush=True)
+"#,
+        ])
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codex-tool-rows.py"),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    struct Peer {
+        parser: Codex,
+        input: std::process::ChildStdin,
+        output: BufReader<std::process::ChildStdout>,
+        refused: usize,
+    }
+    impl Peer {
+        fn answer(&mut self, requests: &[Value]) -> Vec<Value> {
+            writeln!(self.input, "{}", Value::from(requests.to_vec())).unwrap();
+            let mut line = String::new();
+            self.output.read_line(&mut line).unwrap();
+            let replies: Vec<Value> = serde_json::from_str(&line).unwrap();
+            self.refused += replies
+                .iter()
+                .filter(|reply| {
+                    reply["error"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("resume the parent first"))
+                })
+                .count();
+            replies
+        }
+    }
+    impl Adapter for Peer {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Err("the peer test accepts provider frames only".into())
+        }
+        fn receive(&mut self, frame: Value) -> Result<Step, String> {
+            let mut pending = std::collections::VecDeque::from([frame]);
+            let mut result = Step::default();
+            while let Some(frame) = pending.pop_front() {
+                let step = self.parser.receive(frame)?;
+                result.events.extend(step.events);
+                if !step.writes.is_empty() {
+                    pending.extend(self.answer(&step.writes));
+                }
+            }
+            assert_eq!(self.refused, 0, "a child was read before its parent");
+            Ok(result)
+        }
+    }
+    let mut adapter = Peer {
+        parser: adapter(),
+        input: peer.stdin.take().unwrap(),
+        output: BufReader::new(peer.stdout.take().unwrap()),
+        refused: 0,
+    };
+    let mut list = Step::default();
+    adapter
+        .parser
+        .call(&mut list, "thread/list", json!({}), Pending::ChildList)
+        .unwrap();
+    let mut snapshot = crate::chat::Snapshot::default();
+    for frame in adapter.answer(&list.writes) {
+        let events = adapter.receive(frame).unwrap().events;
+        crate::chat::runtime::project_events_for_test(&mut snapshot, events);
+    }
+    drop(adapter);
+    peer.wait().unwrap();
+    let statuses: BTreeMap<_, _> = snapshot
+        .subagents
+        .iter()
+        .map(|agent| (agent.id.as_str(), agent.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        BTreeMap::from([
+            ("child-exact", ToolStatus::Succeeded),
+            ("grandchild-exact", ToolStatus::Succeeded),
+        ])
+    );
+    assert!(
+        !snapshot.is_working(),
+        "settled children must not keep the chat working"
+    );
 }
 
 #[test]
@@ -3702,7 +3914,7 @@ fn active_child_history_fallback_with_completed_newest_turn_has_no_turn_to_stop(
             })
             .err()
             .as_deref(),
-        Some("This Codex subagent has no active turn to stop")
+        Some("This Codex subagent's current turn isn't known yet; stop it again in a moment")
     );
 }
 

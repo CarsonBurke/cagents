@@ -188,6 +188,13 @@ def write_rollout(codex_home, thread, cwd):
 class Scenario:
     def __init__(self):
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
+        # With fixture-nested-child, a subagent the child spawned in an
+        # earlier session: listed, never live, and read only through its parent.
+        self.grandchild = str(uuid.uuid4())
+        # Threads this server process has loaded. Like Codex, it lists any
+        # other as notLoaded and resumes a nested child only through a loaded
+        # parent.
+        self.loaded = set()
         self.latest = None
         self.child_latest = None
         self.model = "fixture-mini"
@@ -212,6 +219,7 @@ class Scenario:
     def state(self):
         with self._changed:
             return copy.deepcopy({"thread": self.thread, "child": self.child,
+                                  "grandchild": self.grandchild,
                                   "latest": self.latest, "child_latest": self.child_latest,
                                   "model": self.model, "reasoning": self.reasoning,
                                   "interrupting": sorted(self.interrupting)})
@@ -223,6 +231,7 @@ class Scenario:
 
     def _restore(self, state):
         self.thread, self.child = state["thread"], state["child"]
+        self.grandchild = state.get("grandchild", self.grandchild)
         self.latest = copy.deepcopy(state["latest"])
         self.child_latest = copy.deepcopy(state.get("child_latest"))
         self.model = state.get("model", "fixture-mini")
@@ -262,13 +271,20 @@ class Scenario:
             return self._metadata(thread)
 
     def _metadata(self, thread):
+        if thread == self.grandchild:
+            return {"id": thread, "name": "Nested review", "parentThreadId": self.child,
+                    "agentNickname": "Ada",
+                    "status": {"type": "idle" if thread in self.loaded else "notLoaded"},
+                    "canAcceptDirectInput": False}
         child = thread == self.child
         latest = self.child_latest if child else self.latest
+        active = latest and latest["status"] == "inProgress"
         return {"id": thread, "name": "Child review" if child else "Offline tool rows",
                 "parentThreadId": self.thread if child else None,
                 "agentNickname": "Quinn" if child else None,
-                "status": {"type": "active" if latest and latest["status"] == "inProgress"
-                           else "idle"}, "canAcceptDirectInput": not child}
+                "status": {"type": "active" if active
+                           else "idle" if not child or thread in self.loaded
+                           else "notLoaded"}, "canAcceptDirectInput": not child}
 
     def observe(self, notification, generations=None):
         """Accept a current frame, updating the history served on reconnection."""
@@ -445,9 +461,16 @@ class Scenario:
                 # An account switch copied this thread's rollout into this
                 # account's home before resuming it here.
                 self.thread, self.latest = thread, None
-            if thread not in (self.thread, self.child):
+            nested = thread == self.grandchild and (Path(codex_home) / "fixture-nested-child").is_file()
+            if thread not in (self.thread, self.child) and not nested:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
-            latest = self.latest if thread == self.thread else self.child_latest
+            parent = self._metadata(thread)["parentThreadId"]
+            if parent == self.child and parent not in self.loaded:
+                return [{"id": identifier, "error": {"code": -32600, "message":
+                         f"cannot resume multi-agent v2 child {thread}: parent {parent} "
+                         "is not loaded; resume the parent first"}}]
+            self.loaded.add(thread)
+            latest = self._latest(thread)
             if method == "thread/start":
                 catalog = self.models(codex_home)["data"]
                 default = next((model for model in catalog if model.get("isDefault")), catalog[0])
@@ -468,7 +491,10 @@ class Scenario:
         elif method == "thread/list":
             result = {"data": [] if any((Path(codex_home) / marker).is_file()
                                        for marker in ("fixture-web-rows", "fixture-row-diagnostics"))
-                      else [self.metadata(self.child)], "nextCursor": None}
+                      else [self._metadata(self.child)], "nextCursor": None}
+            if result["data"] and (Path(codex_home) / "fixture-nested-child").is_file():
+                # Newest first, as Codex lists them.
+                result["data"].insert(0, self._metadata(self.grandchild))
             if (Path(codex_home) / "fixture-unnamed-child").is_file():
                 for thread in result["data"]:
                     thread["agentNickname"] = None
@@ -504,6 +530,8 @@ class Scenario:
                     or self.child_latest and self.child_latest["status"] == "inProgress"
                     and (self.child, self.child_latest["id"]) in self.interrupting):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Fixture turn is still active"}}]
+            # The turn runs its thread and spawns (or continues) the child.
+            self.loaded.update((self.thread, self.child))
             pause = PAUSE
             pause_file = Path(codex_home) / "fixture-turn-pause"
             if pause_file.is_file():
