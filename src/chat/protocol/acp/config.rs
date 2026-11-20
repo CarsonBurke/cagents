@@ -277,11 +277,16 @@ impl Config {
             .reasoning
             .as_ref()
             .is_some_and(|select| select.name_of(level).is_some());
+        // A model whose levels nothing has said yet is taken at the
+        // option's word.
+        let combined = self.combined_models();
         listed
             && self.models().is_none_or(|models| {
-                self.levels_of(&models.current, self.combined_models())
-                    .iter()
-                    .any(|offered| offered == level)
+                (combined.is_none() && !self.levels_seen.contains_key(&models.current))
+                    || self
+                        .levels_of(&models.current, combined)
+                        .iter()
+                        .any(|offered| offered == level)
             })
     }
 
