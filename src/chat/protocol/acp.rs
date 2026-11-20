@@ -91,6 +91,23 @@ pub fn auth_required(error: &Value) -> bool {
 /// recognises for an ACP provider.
 pub const SIGN_IN_PREFIX: &str = chat::ACP_SIGN_IN_PREFIX;
 
+/// Whether an error reply refuses the request because the login has no
+/// usage allowance. ACP has no code for it, so this reads the agent's words
+/// for the HTTP status and Muse's own reason; an allowance Muse merely has
+/// no figures for is not this.
+pub fn no_allowance(error: &Value) -> bool {
+    // Bounded: an error's data can carry a whole request.
+    let text: String = error.to_string().chars().take(8192).collect();
+    let text = text.to_ascii_lowercase();
+    [
+        "payment required",
+        "no_allowance",
+        "no subscription allowance",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
+}
+
 pub fn create(
     profile: &'static Profile,
     launch: &Launch,
@@ -277,16 +294,23 @@ impl Acp {
     }
 
     /// The message a reader is shown for an error reply: its own words, or
-    /// for a sign-in failure, what to do about it.
+    /// for a sign-in failure, what to do about it, or for a login with no
+    /// allowance, the agent's reason, marked as one.
     fn failure(&self, error: &Value) -> String {
-        let message = rpc::error_message(error);
         if (self.profile.sign_in_required)(error) {
             format!(
-                "{SIGN_IN_PREFIX}: sign in to {}, then try again. ({message})",
-                self.profile.label
+                "{SIGN_IN_PREFIX}: sign in to {}, then try again. ({})",
+                self.profile.label,
+                rpc::error_message(error)
+            )
+        } else if no_allowance(error) {
+            format!(
+                "{}{}",
+                chat::ACP_NO_ALLOWANCE_PREFIX,
+                rpc::error_reason(error)
             )
         } else {
-            message
+            rpc::error_message(error)
         }
     }
 

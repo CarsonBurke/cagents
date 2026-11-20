@@ -38,6 +38,7 @@ use super::{
 use crate::{agent::Provider, chat::Model};
 
 mod acp;
+mod inputs;
 mod muse;
 mod reset_consume;
 #[cfg(test)]
@@ -142,7 +143,9 @@ pub enum Outcome {
 /// Probes `account`, sharing the answer with other windows through `cache`.
 ///
 /// Unless `force`d, a cached answer another window observed within
-/// [`STALE_AFTER`] is returned instead of probing again. Explicit refreshes
+/// [`STALE_AFTER`] is returned instead of probing again, as is one whose
+/// inputs have not changed, for a provider that reports no usage figures
+/// (see [`inputs`]). Explicit refreshes
 /// wait for an in-flight reader within [`TIMEOUT`], then take a fresh reading:
 /// a read that started before a reset cannot establish its resulting state.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
@@ -201,9 +204,14 @@ async fn run_reading(
         })
         .await
     };
-    let (program, key, lock) = match setup {
+    let (program, key, lock, fingerprint) = match setup {
         Ok(Prepared::Done(outcome)) => return outcome,
-        Ok(Prepared::Probe { program, key, lock }) => (program, key, lock),
+        Ok(Prepared::Probe {
+            program,
+            key,
+            lock,
+            fingerprint,
+        }) => (program, key, lock, fingerprint),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
     let probed = tokio::time::timeout(
@@ -277,7 +285,7 @@ async fn run_reading(
         // post-consume refresh collide with this probe's unfinished write.
         // A cache write failure still leaves the observed answer usable.
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = cache.store(&key, entry);
+            let _ = cache.store_observed(&key, entry, fingerprint);
             if let Some(catalog) = catalog {
                 let _ = cache.store_catalog(provider, catalog);
             }
@@ -294,6 +302,9 @@ enum Prepared {
         program: PathBuf,
         key: Option<String>,
         lock: Option<crate::instance::OwnedLock>,
+        /// What the answer depends on, taken before the probe starts, so a
+        /// change during it makes the next one ask again.
+        fingerprint: Option<String>,
     },
 }
 
@@ -313,7 +324,8 @@ fn prepare(
     // An account whose home was never created was never set up. It is not a
     // login to prompt for - most people have one of the two CLIs, not both -
     // so it reports nothing rather than a "Sign in" chip.
-    if !account.resolved_home().is_some_and(|home| home.is_dir()) {
+    let set_up = account.resolved_home().is_some_and(|home| home.is_dir());
+    if !set_up && !account.provider.speaks_acp() {
         return unavailable(format!(
             "{} has not been set up",
             cli_name(account.provider)
@@ -322,12 +334,25 @@ fn prepare(
     let Some(program) = find_executable(account.provider.executable(), search_path) else {
         return unavailable(format!("{} is not installed", cli_name(account.provider)));
     };
+    // An ACP agent keeps its sign-in in that home, so one installed without
+    // it has never been signed in, which is what the reader needs to do.
+    if !set_up {
+        return Prepared::Done(answered(
+            None,
+            UsageSnapshot::state(
+                UsageStatus::NeedsLogin,
+                format!("Signed out of {}", cli_name(account.provider)),
+                now,
+            ),
+        ));
+    }
     let key = account.cache_key();
     let Some(cache) = cache else {
         return Prepared::Probe {
             program,
             key,
             lock: None,
+            fingerprint: None,
         };
     };
     let lock = match cache.try_probe_lock(&account.lock_name()) {
@@ -345,7 +370,25 @@ fn prepare(
         snapshot.source = UsageSource::Cache;
         return Prepared::Done(answered(entry.identity, snapshot));
     }
-    Prepared::Probe { program, key, lock }
+    let fingerprint = inputs::fingerprint(account, &program, &|name| std::env::var(name).ok());
+    if !force
+        && let (Some(key), Some(fingerprint)) = (&key, &fingerprint)
+        && let Some(entry) = cache.unchanged(key, fingerprint, now, inputs::UNCHANGED_FOR)
+        && inputs::vouches_for(account.provider, entry.snapshot.status)
+    {
+        // Nothing the answer depends on has changed, which is as good as
+        // asking again now, without starting the CLI.
+        let mut snapshot = entry.snapshot;
+        snapshot.source = UsageSource::Cache;
+        snapshot.observed_at = now;
+        return Prepared::Done(answered(entry.identity, snapshot));
+    }
+    Prepared::Probe {
+        program,
+        key,
+        lock,
+        fingerprint,
+    }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {

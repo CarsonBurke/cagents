@@ -85,6 +85,9 @@ pub fn provider_error_carrier(provider: Provider, item: &super::Item) -> Option<
 pub enum FailureKind {
     AccountLimit,
     Authentication,
+    /// The provider refused the turn because the login has no usage
+    /// allowance at all, such as a Muse login without a subscription.
+    NoAllowance,
     Capacity,
     Connection,
     Interrupted,
@@ -194,6 +197,9 @@ pub struct Failure<'a> {
     /// Guidance, never an instruction to the provider or an automatic retry.
     pub action: &'static str,
     pub reset: Option<String>,
+    /// The provider's own reason, where the summary stands in for words the
+    /// reader needs to see as well: why a login has no allowance.
+    pub reason: Option<&'a str>,
     pub details: &'a str,
 }
 
@@ -217,6 +223,9 @@ impl<'a> Failure<'a> {
             FailureKind::OutOfMemory
         } else if runtime_report.starts_with(COMMAND_OUT_OF_MEMORY) {
             FailureKind::CommandOutOfMemory
+        } else if super::no_allowance_reason(provider, runtime_report).is_some() {
+            // Before limits: the provider's reason may mention its quota.
+            FailureKind::NoAllowance
         } else if reached.is_some()
             || contains(&[
                 "usage limit is reached",
@@ -295,6 +304,10 @@ impl<'a> Failure<'a> {
                 format!("{name} sign-in needs attention"),
                 "Check the selected account and sign in again.",
             ),
+            FailureKind::NoAllowance => (
+                format!("{name} has no usage allowance on this login"),
+                "Check the login's subscription in Accounts, then send your message again.",
+            ),
             FailureKind::Capacity => (
                 format!("{name} is temporarily at capacity"),
                 "Try again when the provider is available.",
@@ -337,12 +350,16 @@ impl<'a> Failure<'a> {
             )),
             None => Cow::Borrowed(message),
         };
+        let reason = (kind == FailureKind::NoAllowance)
+            .then(|| super::no_allowance_reason(provider, message.trim_start()))
+            .flatten();
         Some(Self {
             kind,
             key,
             summary,
             action,
             reset,
+            reason,
             details: message,
         })
     }
@@ -728,6 +745,30 @@ mod tests {
         assert_eq!(
             DeliveryOutcome::parse(&format!("Claude said: {}", delivery::UNCONFIRMED_INPUT)),
             None
+        );
+    }
+
+    /// A turn an ACP provider refused for a login with no allowance says so,
+    /// keeps the provider's reason in view, and is not a usage limit even
+    /// when the reason mentions a quota.
+    #[test]
+    fn a_login_with_no_allowance_keeps_the_provider_s_reason() {
+        let reason = "model request failed: 402 Payment Required: quota exceeded for this login";
+        let message = format!("{}{reason}", crate::chat::ACP_NO_ALLOWANCE_PREFIX);
+        let failure = Failure::parse(Provider::Muse, &message).unwrap();
+        assert_eq!(failure.kind, FailureKind::NoAllowance);
+        assert_eq!(failure.summary, "Muse has no usage allowance on this login");
+        assert_eq!(failure.reason, Some(reason));
+        assert_eq!(failure.reset, None);
+        // Only an ACP adapter's own words are one; a quotation is not.
+        assert_ne!(
+            Failure::parse(Provider::Claude, &message).map(|failure| failure.kind),
+            Some(FailureKind::NoAllowance)
+        );
+        assert_ne!(
+            Failure::parse(Provider::Muse, &format!("It said: {message}"))
+                .map(|failure| failure.kind),
+            Some(FailureKind::NoAllowance)
         );
     }
 

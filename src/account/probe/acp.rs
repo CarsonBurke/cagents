@@ -7,9 +7,13 @@
 //! the agent like any other, so a provider's probe has to keep it out of the
 //! reader's conversations; Antigravity's keeps it in a data directory of its
 //! own (see [`probe_antigravity`]).
-use std::{ffi::OsStr, path::Path};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use serde_json::{Value, json};
+use tokio::process::Command;
 
 use super::{Catalog, Identity, Observed, Probed, Session, UsageSnapshot, UsageStatus};
 use crate::{account::Account, chat::Model};
@@ -43,25 +47,40 @@ pub(super) async fn probe_antigravity(
         .filter(|home| home.is_absolute())
         .ok_or("Antigravity's data directory could not be found")?
         .join(ANTIGRAVITY_PROBE_DATA);
-    let workspace = data.join("workspace");
-    std::fs::create_dir_all(&workspace)
-        .map_err(|_| "Antigravity's probe directory could not be created".to_owned())?;
     let mut command = super::command_with_path(account, program, search_path);
     command
         .args(["acp", "--disable-telemetry", "--app-data-dir"])
-        .arg(ANTIGRAVITY_PROBE_DATA)
-        .current_dir(&workspace);
+        .arg(ANTIGRAVITY_PROBE_DATA);
+    probe_antigravity_in(data, command).await
+}
+
+/// Probes with `command`, an `agy acp` keeping its data in `data`.
+///
+/// Whatever the agent saved of a probe's session is removed afterwards,
+/// whether the probe finished, failed or was abandoned by its timeout, and
+/// again before the next probe, for anything a probe cut short at a moment
+/// no cleanup could follow: nothing in `data` is anyone's conversation.
+async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Probed, String> {
+    let workspace = data.join("workspace");
+    {
+        let (data, workspace) = (data.clone(), workspace.clone());
+        tokio::task::spawn_blocking(move || {
+            forget(&data);
+            std::fs::create_dir_all(&workspace)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|_| "Antigravity's probe directory could not be created".to_owned())?;
+    }
+    command.current_dir(&workspace);
+    // Declared before the session, so it is dropped after the session's
+    // process group is killed.
+    let mut abandoned = Forgetting(Some(data));
     let mut session = Session::spawn(command).await?;
     let result = open(&mut session, &workspace).await;
     let result = super::after_close(result, session.close()).await;
-    if let Ok(Observed {
-        value: Opened {
-            session: Some(id), ..
-        },
-        ..
-    }) = &result
-    {
-        forget(&data, id);
+    if let Some(data) = abandoned.0.take() {
+        let _ = tokio::task::spawn_blocking(move || forget(&data)).await;
     }
     let Observed {
         value: opened,
@@ -70,17 +89,53 @@ pub(super) async fn probe_antigravity(
     Ok(probed("Antigravity", opened, observed_at))
 }
 
-/// Removes what the agent saved of the probe's session from the probe's own
-/// data directory: nothing anyone will open again.
-fn forget(data: &Path, id: &str) {
-    if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
-        return;
+/// The session stores of a probe's data directory, in which Antigravity
+/// names every entry after its session: `conversations/<id>.db`,
+/// `brain/<id>/`, `annotations/<id>.pbtxt` and `implicit/<id>.pb`.
+const SESSION_STORES: [&str; 4] = ["conversations", "brain", "annotations", "implicit"];
+
+/// Removes what the agent saved of any probe's session from the probe's own
+/// data directory: nothing anyone will open again. Only entries named after
+/// a session are touched, and a link is removed rather than followed.
+fn forget(data: &Path) {
+    for store in SESSION_STORES {
+        let Ok(entries) = std::fs::read_dir(data.join(store)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(stem) = name
+                .to_str()
+                .map(|name| name.split('.').next().unwrap_or(name))
+            else {
+                continue;
+            };
+            if stem.len() != 36 || uuid::Uuid::parse_str(stem).is_err() {
+                continue;
+            }
+            let path = entry.path();
+            let _ = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(_) => continue,
+            };
+        }
     }
-    let conversations = data.join("conversations");
-    for suffix in ["db", "db-wal", "db-shm"] {
-        let _ = std::fs::remove_file(conversations.join(format!("{id}.{suffix}")));
+}
+
+/// Forgets a probe's sessions when the probe is dropped before it could:
+/// abandoned by its timeout. The removal runs on a blocking thread, since a
+/// drop cannot wait for it.
+struct Forgetting(Option<PathBuf>);
+
+impl Drop for Forgetting {
+    fn drop(&mut self) {
+        if let Some(data) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn_blocking(move || forget(&data));
+        }
     }
-    let _ = std::fs::remove_dir_all(data.join("brain").join(id));
 }
 
 /// The account as a probe's opened session describes it.
@@ -203,7 +258,7 @@ async fn response(
 }
 
 /// What a `session/new` reply offers: its config options' models, each with
-/// the reasoning levels, and the defaults it opened with.
+/// its own reasoning levels, and the defaults it opened with.
 fn opened(result: &Value) -> Opened {
     let options = result["configOptions"].as_array();
     let select = |category: &str| {
@@ -235,13 +290,23 @@ fn opened(result: &Value) -> Opened {
     let levels: Vec<String> = reasoning
         .map(|option| values(option).into_iter().map(|(value, _)| value).collect())
         .unwrap_or_default();
+    // Antigravity's combined identifiers, which name the other models'
+    // levels (see `crate::chat::acp_levels`).
+    let combined: Vec<String> = result["models"]["availableModels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model["modelId"].as_str().map(str::to_owned))
+        .take(256)
+        .collect();
     let catalog = select("model").and_then(|option| {
+        let current = option["currentValue"].as_str().unwrap_or_default();
         let models = values(option)
             .into_iter()
             .map(|(id, label)| Model {
+                reasoning: crate::chat::acp_levels::model_levels(&id, current, &levels, &combined),
                 id,
                 label,
-                reasoning: levels.clone(),
             })
             .collect::<Vec<_>>();
         let mut catalog = super::observed_catalog(models, super::now_ms())?;
@@ -282,6 +347,9 @@ mod tests {
                  "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]},
                 {"id": "mode", "category": "mode", "type": "select", "currentValue": "default",
                  "options": [{"value": "default", "name": "Default"}]}],
+            "models": {"currentModelId": "gemini-4-neon-high", "availableModels": [
+                {"modelId": "gemini-4-neon-low"}, {"modelId": "gemini-4-neon-high"},
+                {"modelId": "gemini-3.8-flash-low"}, {"modelId": "gpt-oss-120b-medium"}]},
             "_meta": {"antigravity": {"tier": {"name": "Google AI Pro", "id": "g1-pro-tier"}}},
         }));
         assert!(opened.signed_in);
@@ -302,7 +370,9 @@ mod tests {
                 ("gemini-3.8-flash", "Gemini 3.8 Flash")
             ]
         );
-        assert_eq!(catalog.models[1].reasoning, ["low", "high"]);
+        // Each model has its own levels, not the current model's.
+        assert_eq!(catalog.models[0].reasoning, ["low", "high"]);
+        assert_eq!(catalog.models[1].reasoning, ["low"]);
         assert_eq!(catalog.default_model.as_deref(), Some("gemini-4-neon"));
         assert_eq!(catalog.default_effort(None), Some("high"));
     }
@@ -334,25 +404,167 @@ mod tests {
     }
 
     #[test]
-    fn only_the_probe_s_own_session_files_are_forgotten() {
+    fn only_the_probe_s_session_files_are_forgotten() {
         let data = tempfile::tempdir().unwrap();
         let id = "5eb802bd-a4cd-45e4-95df-8a58b97d9c8c";
-        std::fs::create_dir_all(data.path().join("conversations")).unwrap();
-        std::fs::create_dir_all(data.path().join("brain").join(id)).unwrap();
-        for name in [
-            format!("{id}.db"),
-            format!("{id}.db-wal"),
-            "other.db".into(),
-        ] {
-            std::fs::write(data.path().join("conversations").join(name), b"").unwrap();
+        let at = |path: &str| data.path().join(path);
+        for directory in ["conversations", "annotations", "implicit", "workspace"] {
+            std::fs::create_dir_all(at(directory)).unwrap();
         }
-        forget(data.path(), "../../escape");
-        forget(data.path(), id);
-        let left = std::fs::read_dir(data.path().join("conversations"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(left, ["other.db"]);
-        assert!(!data.path().join("brain").join(id).exists());
+        std::fs::create_dir_all(at(&format!("brain/{id}/nested"))).unwrap();
+        for file in [
+            format!("conversations/{id}.db"),
+            format!("conversations/{id}.db-wal"),
+            format!("annotations/{id}.pbtxt"),
+            format!("implicit/{id}.pb"),
+            "conversations/other.db".into(),
+            "workspace/note".into(),
+            "settings.json".into(),
+        ] {
+            std::fs::write(at(&file), b"").unwrap();
+        }
+        // A link named like a session is removed, not followed.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("kept"), b"").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            at("brain/0ab4e7b5-91eb-4a02-981a-0190827ccaa1"),
+        )
+        .unwrap();
+        forget(data.path());
+        let left = |directory: &str| {
+            let mut names = std::fs::read_dir(at(directory))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(left("conversations"), ["other.db"]);
+        assert!(left("brain").is_empty());
+        assert!(left("annotations").is_empty());
+        assert!(left("implicit").is_empty());
+        assert_eq!(left("workspace"), ["note"]);
+        assert!(at("settings.json").exists());
+        assert!(outside.path().join("kept").exists());
+    }
+
+    /// The fake ACP agent, as `agy`, with its own home and state.
+    struct Agent {
+        directory: tempfile::TempDir,
+        program: PathBuf,
+    }
+
+    impl Agent {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let program = directory.path().join("agy");
+            std::fs::write(
+                &program,
+                include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::create_dir_all(directory.path().join("state")).unwrap();
+            Self { directory, program }
+        }
+
+        fn data(&self) -> PathBuf {
+            self.directory
+                .path()
+                .join(".gemini")
+                .join(ANTIGRAVITY_PROBE_DATA)
+        }
+
+        fn mark(&self, name: &str) {
+            std::fs::write(self.directory.path().join("state").join(name), b"").unwrap();
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new(&self.program);
+            command
+                .args(["acp", "--disable-telemetry", "--app-data-dir"])
+                .arg(ANTIGRAVITY_PROBE_DATA)
+                .env("HOME", self.directory.path())
+                .env("FAKE_ACP_SHAPE", "agy")
+                .env("FAKE_ACP_STATE", self.directory.path().join("state"))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0);
+            command
+        }
+
+        /// The session files left in the probe's data directory.
+        fn sessions(&self) -> Vec<PathBuf> {
+            SESSION_STORES
+                .iter()
+                .filter_map(|store| std::fs::read_dir(self.data().join(store)).ok())
+                .flatten()
+                .map(|entry| entry.unwrap().path())
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_reads_each_model_s_levels_and_leaves_no_session_behind() {
+        let agent = Agent::new();
+        // What an earlier probe, cut short, left.
+        let stale = agent
+            .data()
+            .join("conversations/16a9c3a8-8d41-4d2e-9a1c-8b8e2b0f7c11.db");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"").unwrap();
+        let probed = probe_antigravity_in(agent.data(), agent.command())
+            .await
+            .unwrap();
+        assert_eq!(probed.snapshot.status, UsageStatus::Ok);
+        assert_eq!(
+            probed.snapshot.plan_display_name.as_deref(),
+            Some("Fixture tier")
+        );
+        let catalog = probed.catalog.unwrap();
+        assert!(
+            catalog
+                .models
+                .iter()
+                .all(|model| model.reasoning == ["low", "medium", "high", "xhigh"])
+        );
+        assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
+
+        agent.mark("signed-out");
+        let signed_out = probe_antigravity_in(agent.data(), agent.command())
+            .await
+            .unwrap();
+        assert_eq!(signed_out.snapshot.status, UsageStatus::NeedsLogin);
+    }
+
+    #[tokio::test]
+    async fn a_probe_abandoned_by_its_timeout_leaves_no_session_behind() {
+        let agent = Agent::new();
+        agent.mark("hang-probe");
+        let mut probe = Box::pin(probe_antigravity_in(agent.data(), agent.command()));
+        // Abandon it once the agent has saved all four entries of the
+        // session it will not answer for.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while agent.sessions().len() < SESSION_STORES.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent saved no session"
+            );
+            tokio::select! {
+                result = &mut probe => panic!("the hung probe answered: {:?}", result.err()),
+                () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+        drop(probe);
+        // The removal runs on a blocking thread once the probe is dropped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !agent.sessions().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
     }
 }

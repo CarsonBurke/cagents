@@ -188,7 +188,8 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
     assert!(step.events.iter().any(|event| matches!(event,
         Event::Session { id, .. } if id == "98608bab-5eb6-4cf5-8f9b-46019bf29df7")));
     // Config options win over the unstable `models` list: two base models,
-    // each with the thinking levels, not eight combined identifiers.
+    // not their combined identifiers. The current model has the select's
+    // levels; the other, the levels its combined identifiers name.
     let models = step
         .events
         .iter()
@@ -203,7 +204,8 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
         .unwrap();
     assert_eq!(models.0.len(), 2);
     assert_eq!(models.0[1].id, "gemini-3.8-flash");
-    assert_eq!(models.0[1].reasoning, ["low", "medium", "high", "xhigh"]);
+    assert_eq!(models.0[0].reasoning, ["low", "medium", "high", "xhigh"]);
+    assert_eq!(models.0[1].reasoning, ["low"]);
     assert_eq!(models.1.as_deref(), Some("gemini-4-neon"));
     assert_eq!(models.2.as_deref(), Some("high"));
     assert!(
@@ -1007,6 +1009,67 @@ fn being_signed_out_is_a_recognisable_sign_in_failure() {
 }
 
 #[test]
+fn a_turn_refused_for_no_allowance_keeps_the_provider_s_reason() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let refused = |acp: &mut Acp, error: Value| {
+        let request = prompt(acp, "allowance");
+        let step = acp
+            .receive(json!({"jsonrpc": "2.0", "id": request["id"], "error": error}))
+            .unwrap();
+        assert_eq!(finished(&step), Some(Kind::Failed));
+        step.events
+            .iter()
+            .find_map(|event| match event {
+                Event::Error {
+                    message,
+                    fatal: false,
+                } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    // The reason is the most specific words the reply has.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error", "data": {"message":
+            "model request failed: 402 Payment Required: this login has no subscription allowance"}}),
+    );
+    assert_eq!(
+        message,
+        format!(
+            "{}model request failed: 402 Payment Required: this login has no subscription allowance",
+            chat::ACP_NO_ALLOWANCE_PREFIX
+        )
+    );
+    let provider = crate::agent::Provider::Muse;
+    assert_eq!(
+        chat::no_allowance_reason(provider, &message),
+        Some(
+            "model request failed: 402 Payment Required: this login has no subscription allowance"
+        )
+    );
+    assert!(!chat::requires_sign_in(provider, &message));
+    // Muse's reason code, wherever the reply puts it.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "No subscription allowance (no_allowance)",
+            "data": {"reason": "no_allowance"}}),
+    );
+    assert_eq!(
+        chat::no_allowance_reason(provider, &message),
+        Some("No subscription allowance (no_allowance)")
+    );
+    // An allowance Muse has no figures for is not a refusal for one.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error", "data": {"message":
+            "subscription allowance unavailable: the server sent no usage data"}}),
+    );
+    assert_eq!(chat::no_allowance_reason(provider, &message), None);
+}
+
+#[test]
 fn file_terminal_and_unknown_requests_are_refused_and_unknown_frames_ignored() {
     let mut acp = adapter(&[], None);
     let session = ready(&mut acp);
@@ -1114,7 +1177,8 @@ fn plans_commands_modes_titles_and_usage_are_published() {
         .unwrap();
     assert!(step.events.iter().any(|event| matches!(event,
         Event::Models { models, selected: Some(selected), .. }
-            if selected == "gemini-3.8-flash" && models[0].reasoning == ["low"])));
+            if selected == "gemini-3.8-flash" && models.iter().any(|model|
+                model.id == "gemini-3.8-flash" && model.reasoning == ["low"]))));
     let step = acp
         .receive(update(
             &session,

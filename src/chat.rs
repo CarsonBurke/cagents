@@ -3,6 +3,7 @@
 use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
+pub mod acp_levels;
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod failure;
@@ -73,6 +74,23 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
 
 /// How an ACP conversation's sign-in failure begins.
 pub const ACP_SIGN_IN_PREFIX: &str = "Authentication required";
+
+/// How an ACP conversation's failure begins when the provider refused a
+/// turn because the login has no usage allowance, such as Muse's 402 for a
+/// login without a subscription. The provider's own reason follows.
+pub const ACP_NO_ALLOWANCE_PREFIX: &str = "No usage allowance: ";
+
+/// The provider's reason, when `message` is an ACP conversation's report of
+/// a login with no usage allowance: only the adapter's own words begin one.
+pub fn no_allowance_reason(provider: Provider, message: &str) -> Option<&str> {
+    if !provider.speaks_acp() {
+        return None;
+    }
+    message
+        .strip_prefix(ACP_NO_ALLOWANCE_PREFIX)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+}
 
 const SIGN_IN_VERIFICATION_MARKER: &str = "\nSign-in verification: ";
 

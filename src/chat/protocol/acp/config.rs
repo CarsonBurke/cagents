@@ -249,6 +249,12 @@ impl Config {
         let reasoning = self.reasoning.as_ref();
         let levels = reasoning.map(Select::values).unwrap_or_default();
         let current_reasoning = reasoning.map(|select| select.current.clone());
+        // Combined identifiers name the other models' levels only beside a
+        // model option; as the model list itself, each is a model.
+        let combined = match (&self.model, &self.legacy_models) {
+            (Some(_), Some(legacy)) => legacy.values(),
+            _ => Vec::new(),
+        };
         let mut events = Vec::with_capacity(3);
         if let Some(models) = self.models() {
             events.push(Event::Models {
@@ -258,7 +264,12 @@ impl Config {
                     .map(|choice| Model {
                         id: choice.value.clone(),
                         label: choice.name.clone(),
-                        reasoning: levels.clone(),
+                        reasoning: crate::chat::acp_levels::model_levels(
+                            &choice.value,
+                            &models.current,
+                            &levels,
+                            &combined,
+                        ),
                     })
                     .collect(),
                 selected: Some(models.current.clone()),

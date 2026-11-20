@@ -83,21 +83,37 @@ pub(super) fn error(id: &Value, code: i64, message: &str) -> Value {
 
 /// The agent's own words for an error reply, which is what a reader is shown.
 pub(super) fn error_message(error: &Value) -> String {
-    let message = error["message"]
+    let message = error_summary(error);
+    match error_detail(error) {
+        Some(detail) => format!("{message}: {detail}"),
+        None => message.to_owned(),
+    }
+}
+
+/// An error reply's `message`, which for an agent's internal error is often
+/// only the JSON-RPC code's name.
+fn error_summary(error: &Value) -> &str {
+    error["message"]
         .as_str()
         .map(str::trim)
         .filter(|message| !message.is_empty())
-        .unwrap_or("The agent reported an error without a message");
-    let detail = error["data"]["message"]
+        .unwrap_or("The agent reported an error without a message")
+}
+
+/// What an error reply's `data` says beyond its `message`, if anything.
+fn error_detail(error: &Value) -> Option<&str> {
+    let message = error_summary(error);
+    error["data"]["message"]
         .as_str()
         .or_else(|| error["data"]["details"].as_str())
         .or_else(|| error["data"].as_str())
         .map(str::trim)
-        .filter(|detail| !detail.is_empty() && *detail != message);
-    match detail {
-        Some(detail) => format!("{message}: {detail}"),
-        None => message.to_owned(),
-    }
+        .filter(|detail| !detail.is_empty() && *detail != message)
+}
+
+/// An error reply's most specific words: its detail, or its message.
+pub(super) fn error_reason(error: &Value) -> &str {
+    error_detail(error).unwrap_or_else(|| error_summary(error))
 }
 
 /// Whether a non-JSON stdout line contains what looks like a JSON-RPC frame,

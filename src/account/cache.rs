@@ -123,6 +123,39 @@ struct Document {
         deserialize_with = "readable_plan_epochs"
     )]
     plan_epochs: BTreeMap<String, u64>,
+    /// Added after the first version, like `catalogs`: what each account's
+    /// entry depended on when it was observed, by account key, for a
+    /// provider whose answer only a change to these can change (see
+    /// [`Cache::unchanged`]). A build that predates it drops it when it
+    /// writes, which costs one probe.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "readable_inputs"
+    )]
+    inputs: BTreeMap<String, Inputs>,
+}
+
+/// A fingerprint of what an entry's answer depended on, and the observation
+/// it belongs to: an entry since replaced by another observation is not the
+/// one it describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Inputs {
+    fingerprint: String,
+    observed_at: u64,
+}
+
+fn readable_inputs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Inputs>, D::Error> {
+    let serde_json::Value::Object(inputs) = serde_json::Value::deserialize(deserializer)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(inputs
+        .into_iter()
+        .filter_map(|(key, value)| Some((key, Inputs::deserialize(value).ok()?)))
+        .filter(|(_, inputs)| inputs.fingerprint.len() <= 128)
+        .collect())
 }
 
 /// Only allowlisted, bounded display metadata survives a verified profile.
@@ -294,6 +327,18 @@ impl Cache {
     /// only a stamp ahead of the current clock by more than [`CLOCK_SLACK`]
     /// indicates a clock that has since been set back and is replaced.
     pub fn store(&self, key: &str, entry: Entry) -> io::Result<()> {
+        self.store_observed(key, entry, None)
+    }
+
+    /// [`Cache::store`], remembering the `fingerprint` of what the entry's
+    /// answer depended on, for [`Cache::unchanged`]. An entry stored without
+    /// one forgets any earlier one.
+    pub(crate) fn store_observed(
+        &self,
+        key: &str,
+        entry: Entry,
+        fingerprint: Option<String>,
+    ) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
@@ -312,8 +357,45 @@ impl Cache {
         }) {
             return Ok(());
         }
+        match fingerprint {
+            Some(fingerprint) => {
+                document.inputs.insert(
+                    key.to_owned(),
+                    Inputs {
+                        fingerprint,
+                        observed_at: entry.snapshot.observed_at,
+                    },
+                );
+            }
+            None => {
+                document.inputs.remove(key);
+            }
+        }
         document.entries.insert(key.to_owned(), entry);
         self.write(&document)
+    }
+
+    /// The entry for `key`, if it was observed less than `within` before
+    /// `now` with these same inputs: `fingerprint` describes everything its
+    /// answer depends on that can change on this machine, so it still
+    /// stands. It is read whatever its age otherwise, since nothing that
+    /// could change it has.
+    pub(crate) fn unchanged(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        now: u64,
+        within: u64,
+    ) -> Option<Entry> {
+        let mut document = read_document(&self.path())?;
+        let inputs = document.inputs.remove(key)?;
+        let entry = document.entries.remove(key)?;
+        let observed = entry.snapshot.observed_at;
+        (inputs.fingerprint == fingerprint
+            && inputs.observed_at == observed
+            && observed <= now.saturating_add(CLOCK_SLACK)
+            && now.saturating_sub(observed) < within)
+            .then_some(entry)
     }
 
     /// The models each provider last listed, as of `now`. Like
@@ -504,6 +586,7 @@ impl Cache {
         document
             .settled
             .retain(|key, _| keep.contains(key) || entries.contains_key(key));
+        document.inputs.retain(|key, _| entries.contains_key(key));
         document.plan_profiles.retain(|key, profile| {
             keep.contains(key)
                 || profile.observed_at <= now.saturating_add(CLOCK_SLACK)
@@ -764,6 +847,41 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(directory_mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn an_entry_stands_while_its_inputs_are_unchanged_and_young_enough() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "agy:/h/.gemini";
+        cache
+            .store_observed(key, entry(100_000, "signed in"), Some("abc".into()))
+            .unwrap();
+        let unchanged = |fingerprint, now| {
+            cache
+                .unchanged(key, fingerprint, now, 500)
+                .map(|entry| entry.snapshot.detail.unwrap())
+        };
+        assert_eq!(unchanged("abc", 100_400).as_deref(), Some("signed in"));
+        // Other inputs, or an answer too old to take on trust, are probed.
+        assert_eq!(unchanged("abd", 100_400), None);
+        assert_eq!(unchanged("abc", 100_500), None);
+        // A stamp from a clock since set back says nothing of its age.
+        assert_eq!(unchanged("abc", 100_000 - CLOCK_SLACK - 1), None);
+        // An entry observed another way is not the one the inputs describe.
+        cache
+            .store(key, entry(100_200, "from a conversation"))
+            .unwrap();
+        assert_eq!(unchanged("abc", 100_300), None);
+        cache
+            .store_observed(key, entry(100_300, "probed"), Some("abc".into()))
+            .unwrap();
+        assert_eq!(unchanged("abc", 100_350).as_deref(), Some("probed"));
+        // Only the entries' own inputs are kept once they are forgotten.
+        cache
+            .prune(&BTreeSet::new(), 100_300 + ORPHAN_AFTER)
+            .unwrap();
+        assert!(read_document(&cache.path()).unwrap().inputs.is_empty());
     }
 
     #[test]
