@@ -2059,6 +2059,53 @@ pub(crate) mod tests {
         assert!(state.discussion.composer.is_some());
     }
 
+    #[test]
+    fn offline_cached_review_keeps_a_restored_draft_without_writing_it() {
+        use crate::pull_request_review::Action as ReviewAction;
+
+        let mut drafted = ready();
+        drop(drafted.update_discussion(Action::Begin(anchor())));
+        drafted.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Draft written before going offline");
+        let drafts =
+            serde_json::from_str(&serde_json::to_string(&drafted.local_drafts()).unwrap()).unwrap();
+
+        let (mut state, _) = crate::pull_request_review::tests::state();
+        drop(state.update(ReviewAction::Open(target(1))));
+        state.cache_loading = true;
+        drop(state.update(ReviewAction::Cached {
+            generation: state.generation,
+            result: Ok(Some(Arc::new(cache::fixture()))),
+        }));
+        drop(state.update(ReviewAction::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Err("Offline".into()),
+        }));
+        state.restore_drafts(drafts, None);
+        assert!(state.context.is_none());
+        assert!(!state.can_mutate_discussion());
+        let dirty = state.cache_dirty;
+
+        for action in [Action::Save, Action::SaveNow, Action::Reanchor] {
+            let action = state.review_action(action);
+            drop(state.update(action));
+            let composer = state
+                .discussion
+                .composer
+                .as_ref()
+                .expect("the restored draft stays");
+            assert_eq!(
+                composer.content.text(),
+                "Draft written before going offline"
+            );
+            assert_eq!(composer.destination, Destination::Line(anchor()));
+            assert!(!state.discussion.busy, "no review write may start");
+            assert!(!state.discussion.saving_composer);
+            assert_eq!(state.cache_dirty, dirty, "no draft rewrite is scheduled");
+        }
+    }
+
     mod reanchor_receipt_tests {
         use super::*;
         use crate::pull_request_review::Action as ReviewAction;
