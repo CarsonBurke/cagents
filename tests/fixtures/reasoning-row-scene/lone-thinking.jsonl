@@ -1,9 +1,9 @@
 {"type":"assistant","uuid":"lone-check-@TURN@-call","message":{"id":"lone-check-@TURN@-call","role":"assistant","content":[{"type":"tool_use","id":"lone-check-@TURN@","name":"Bash","input":{"command":"printf fixture-verified","description":"Verify the fixture"}}]}}
 {"type":"user","uuid":"lone-check-@TURN@-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"lone-check-@TURN@","is_error":false,"content":"The fixture is verified."}]}}
-{"_sleep":5}
+{"_sleep":10}
 {"type":"stream_event","event":{"type":"message_start","message":{"id":"lone-thought-@TURN@"}}}
 {"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}
-{"_sleep":12}
+{"_sleep":20}
 {"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQBCkgIBhABGAIiQFixtureSignatureOnly"}}}
 {"type":"assistant","uuid":"lone-thought-@TURN@-carrier","message":{"id":"lone-thought-@TURN@","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"EqQBCkgIBhABGAIiQFixtureSignatureOnly"}]}}
 {"type":"stream_event","event":{"type":"content_block_stop","index":0}}

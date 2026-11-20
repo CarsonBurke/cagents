@@ -386,16 +386,25 @@ if [ "$scene" = lone-thinking ]; then
     spawn_scene claude haiku 'Fixture: verify the fixture.' \
         "$fixture/state/reasoning-lone-thinking-spawn.json" 'Lone step thinking'
     seen() { rg -q "\"uuid\":\"$1\"" "$config/projects"; }
-    for _ in $(seq 30); do seen lone-check-1-result && break; sleep 1; done
-    seen lone-check-1-result || { printf '%s\n' 'reasoning-row-scene: the command did not run' >&2; exit 1; }
-    sleep 1
+    late() { printf 'reasoning-row-scene: %s\n' "$1" >&2; exit 1; }
+    # Pace by what is on screen, so a slow host shoots each state rather than
+    # the one after it. The thought starts ten seconds after the command's
+    # row appears and runs twenty; the baseline never draws a strip, so its
+    # thinking shot falls back to the middle of that window.
+    evidence drive wait 'Ran printf fixture-verified' --timeout 60 >/dev/null || late 'the command did not run'
+    start=$(date +%s)
     shot lone-row
-    # The thought starts five seconds after the command and runs twelve.
-    sleep 9
+    [ $(($(date +%s) - start)) -lt 9 ] || late 'the lone row was shot after the thinking began'
+    remaining=$((start + 20 - $(date +%s)))
+    evidence drive wait 'fixture-verified · working' --timeout "$((remaining > 1 ? remaining : 1))" >/dev/null || true
     shot lone-thinking-strip
-    for _ in $(seq 30); do seen lone-answer-1 && break; sleep 1; done
-    seen lone-answer-1 || { printf '%s\n' 'reasoning-row-scene: the answer did not land' >&2; exit 1; }
-    sleep 2
+    elapsed=$(($(date +%s) - start))
+    [ "$elapsed" -gt 7 ] && [ "$elapsed" -lt 29 ] && ! seen lone-answer-1 \
+        || late "the thinking was shot outside it, ${elapsed}s after the command"
+    for _ in $(seq 40); do seen lone-answer-1 && break; sleep 1; done
+    seen lone-answer-1 || late 'the answer did not land'
+    evidence drive wait 'fixture-verified · working' --gone --timeout 15 >/dev/null || late 'the group kept counting after the answer'
+    sleep 1
     shot lone-answered
     printf '%s\n' 'Captured a lone step before, during and after the thinking that follows it.'
     exit 0
