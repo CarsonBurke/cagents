@@ -10,7 +10,7 @@ arguments, such as `acp --disable-telemetry`, are accepted and ignored.
 
 Each conversation is saved under FAKE_ACP_STATE (default: a directory in
 the system's temporary directory) as the session updates it sent, so
-`session/load` replays it and `session/list` lists it.
+`session/load` replays it and `session/list` lists it, newest first.
 
 The prompt chooses the turn, by the first of these words it contains as a
 word:
@@ -32,7 +32,7 @@ Anything else is answered with a short thought and a streamed reply.
 Environment switches:
   FAKE_ACP_SHAPE=agy|muse   which agent's replies to copy
   FAKE_ACP_STATE=DIR        where conversations are saved
-  FAKE_ACP_AUTH=initialize|new|load|prompt
+  FAKE_ACP_AUTH=initialize|new|load|list|prompt
                             refuse that request as signed out (-32000)
   FAKE_ACP_NO_LOAD=1        do not offer session/load
   FAKE_ACP_NOISE=1          print a line that is not JSON before answering
@@ -41,11 +41,21 @@ Environment switches:
                             exchanges, for long histories
   FAKE_ACP_LOG=FILE         append every frame received, one per line
   FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
+  FAKE_ACP_LIST_PAGE=N      list N conversations a page, each page after
+                            the first by the `nextCursor` of the one before
+  FAKE_ACP_PRESENCE=1       hold the lock the agent holds on a conversation
+                            while it has it open, under $HOME as the real
+                            agent does: Antigravity's
+                            ~/.gemini/antigravity-cli/presence/ID.lock, which
+                            it leaves behind, and Muse's
+                            $XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/ID/.session.lock.
+                            Only for a $HOME that is the fixture's own.
 
 In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
 account commands. Signing out lasts, as a file under FAKE_ACP_STATE, until
 `login`.
 """
+import fcntl
 import json
 import os
 import queue
@@ -146,6 +156,28 @@ class Session:
         else:
             self.mode, self.model, self.level = "default", "gemini-3.8-flash", "low"
         self.title = None
+        self.lock = None
+
+    def hold_presence(self):
+        """Locks the conversation as the agent does while it has it open."""
+        if not os.environ.get("FAKE_ACP_PRESENCE") or self.lock is not None:
+            return
+        home = os.environ["HOME"]
+        if SHAPE == "muse":
+            data = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+            path = os.path.join(data, "muse", "sessions", time.strftime("%Y/%m/%d"),
+                                self.id, ".session.lock")
+        else:
+            path = os.path.join(home, ".gemini", "antigravity-cli", "presence",
+                                self.id + ".lock")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.lock = open(path, "a")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+
+    def release_presence(self):
+        if self.lock is not None:
+            self.lock.close()
+            self.lock = None
 
     def path(self):
         return os.path.join(STATE, "sessions", self.id + ".jsonl")
@@ -315,6 +347,7 @@ class Agent:
             return signed_out(id)
         session = Session(str(uuid.uuid4()), params.get("cwd", ""))
         self.sessions[session.id] = session
+        session.hold_presence()
         self.remember(session)
         reply(id, session.setup())
         session.update({"sessionUpdate": "available_commands_update",
@@ -332,6 +365,7 @@ class Agent:
         if not os.path.exists(session.path()):
             return fail(id, -32002, f"Session {session.id} not found")
         self.sessions[session.id] = session
+        session.hold_presence()
         for index in range(int(os.environ.get("FAKE_ACP_REPLAY") or 0)):
             session.update({"sessionUpdate": "user_message_chunk",
                             "content": {"type": "text", "text": f"Earlier question {index}"}},
@@ -347,16 +381,28 @@ class Agent:
                         "availableCommands": COMMANDS}, record=False)
 
     def on_session_list(self, id, params):
+        if AUTH == "list":
+            return signed_out(id)
         index = self.index()
-        reply(id, {"sessions": [
+        sessions = [
             {"sessionId": sid, "cwd": entry["cwd"], "title": entry.get("title"),
              "updatedAt": entry["updatedAt"]}
             for sid, entry in sorted(index.items(), key=lambda kv: kv[1]["updatedAt"],
                                      reverse=True)
-            if not params.get("cwd") or entry["cwd"] == params["cwd"]]})
+            if not params.get("cwd") or entry["cwd"] == params["cwd"]]
+        page = int(os.environ.get("FAKE_ACP_LIST_PAGE") or 0)
+        if page <= 0:
+            return reply(id, {"sessions": sessions})
+        start = int(params.get("cursor") or 0)
+        result = {"sessions": sessions[start:start + page]}
+        if start + page < len(sessions):
+            result["nextCursor"] = str(start + page)
+        reply(id, result)
 
     def on_session_close(self, id, params):
-        self.sessions.pop(params.get("sessionId"), None)
+        session = self.sessions.pop(params.get("sessionId"), None)
+        if session is not None:
+            session.release_presence()
         reply(id, {})
 
     def on_session_set_config_option(self, id, params):

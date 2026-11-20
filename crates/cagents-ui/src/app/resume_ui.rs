@@ -1,4 +1,5 @@
 use super::*;
+use crate::account::{Account, AccountId, probe::conversations::Listed};
 use crate::agent::Provider;
 use crate::chat;
 use crate::persistence::SavedConversation;
@@ -26,7 +27,14 @@ const PREVIEW_FITS: f32 = 820.0;
 /// Rows Page Up and Page Down move the selection by.
 const PAGE_STEP: usize = 8;
 /// A conversation written to this recently may still be running elsewhere.
+/// Not said of a conversation an agent lists: whether something holds it is
+/// known instead.
 const RECENT_MS: i64 = 2 * 60 * 1000;
+/// How long what an agent listed is shown without asking it again, so that
+/// opening the picker again at once starts no agent. Older, it is still
+/// shown at once while the agent is asked again, so a conversation started
+/// since appears without waiting on the next opening.
+const LISTING_FRESH: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Default)]
 pub(super) struct State {
@@ -54,6 +62,14 @@ pub(super) struct State {
     pub(super) asked_from: Option<CardId>,
     /// Transcripts read so far and transcripts to read, while indexing.
     indexing: Option<(usize, usize)>,
+    /// Each seed's account, and the home its provider keeps history in.
+    seed_homes: Vec<(Account, Option<PathBuf>)>,
+    /// The seeds whose agents are being asked for their conversations.
+    asking: Vec<usize>,
+    /// What each agent last listed, kept from one opening to the next.
+    listings: HashMap<AccountId, Listing>,
+    /// The conversation `/resume` was typed in, which is not listed.
+    hidden: Option<Identity>,
     /// Whether a chosen conversation waits for its retiring channel to
     /// settle before it can reopen there.
     pub(super) loading: bool,
@@ -73,6 +89,29 @@ pub(super) struct State {
     /// The reader's Tab traversal setting while the picker owns Tab, which
     /// chooses where to look and must leave the keyboard in the search.
     restore_keyboard_nav: Option<bool>,
+}
+
+/// The conversations an agent listed, and which of them something holds.
+#[derive(Debug, Clone, Default)]
+struct Listing {
+    at: Option<std::time::Instant>,
+    conversations: Arc<[Listed]>,
+    held: Arc<HashSet<String>>,
+    /// The directories its conversations ran in that no longer exist.
+    missing: Arc<[PathBuf]>,
+    /// Why the agent could not be asked last time.
+    error: Option<String>,
+}
+
+/// What asking an agent for its conversations answered.
+#[derive(Debug, Clone)]
+pub struct Listened {
+    seed: usize,
+    account: AccountId,
+    /// `None` when the listing was fresh enough not to ask again.
+    listed: Option<Result<Option<Vec<Listed>>, String>>,
+    held: HashSet<String>,
+    missing: Vec<PathBuf>,
 }
 
 /// A pane put in place for a saved conversation before the service has
@@ -107,6 +146,9 @@ struct Row {
     account: String,
     updated_at_unix_ms: i64,
     open: bool,
+    /// Whether a process outside this window holds the conversation now, by
+    /// its agent's lock on it.
+    held: bool,
     /// Where it ran, as the reader knows it: its project, then its branch
     /// or worktree.
     place: String,
@@ -120,6 +162,9 @@ struct Row {
     title_key: String,
     place_key: String,
     content_key: String,
+    /// What makes it the conversation it is, for one cagents saved, so a
+    /// listing of the same conversation is matched to it.
+    identity: Option<Identity>,
     source: Source,
 }
 
@@ -128,6 +173,8 @@ enum Source {
     Saved(Box<SavedConversation>),
     /// A conversation found in a provider's history.
     Found(catalog::Found),
+    /// A conversation an agent listed, by the seed it resumes with.
+    Listed { seed: usize, id: String },
 }
 
 impl Row {
@@ -141,12 +188,14 @@ impl Row {
             account,
             updated_at_unix_ms: entry.updated_at_unix_ms,
             open: entry.open,
+            held: false,
             place,
             summary: None,
             bytes: None,
             title_key: String::new(),
             place_key: String::new(),
             content_key: String::new(),
+            identity: None,
             source: Source::Saved(Box::new(entry)),
         };
         row.index();
@@ -162,13 +211,51 @@ impl Row {
             account,
             updated_at_unix_ms: found.updated_at_unix_ms,
             open: false,
+            held: false,
             place,
             summary: Some(found.summary.clone()),
             bytes: Some(found.bytes),
             title_key: String::new(),
             place_key: String::new(),
             content_key: String::new(),
+            identity: None,
             source: Source::Found(found),
+        };
+        row.index();
+        row
+    }
+
+    fn listed(
+        card: CardId,
+        seed: usize,
+        listed: &Listed,
+        provider: Provider,
+        account: String,
+        place: String,
+    ) -> Self {
+        let mut row = Self {
+            card,
+            title: listed
+                .title
+                .clone()
+                .unwrap_or_else(|| chat_ui::chat_card_title(provider).into()),
+            provider,
+            directory: listed.directory.clone(),
+            account,
+            updated_at_unix_ms: listed.updated_at_unix_ms.unwrap_or(0),
+            open: false,
+            held: false,
+            place,
+            summary: None,
+            bytes: None,
+            title_key: String::new(),
+            place_key: String::new(),
+            content_key: String::new(),
+            identity: None,
+            source: Source::Listed {
+                seed,
+                id: listed.id.clone(),
+            },
         };
         row.index();
         row
@@ -305,6 +392,9 @@ pub enum Action {
     /// Lists conversations from this far beyond where the picker was opened.
     Reach(Reach),
     Indexed(u64, Progress),
+    /// What an agent answered when the opening numbered so was asked for
+    /// its conversations.
+    Listed(u64, Box<Listened>),
     Resume(CardId),
     More,
     Submit,
@@ -323,8 +413,11 @@ pub enum Action {
 pub enum Progress {
     /// Conversations cagents saved, and the sessions found ones resume with.
     Saved {
-        entries: Vec<SavedConversation>,
+        /// Each with what makes it the conversation it is.
+        entries: Vec<(SavedConversation, Identity)>,
         seeds: Arc<[chat::Session]>,
+        /// Each seed's account, and the home its provider keeps history in.
+        homes: Vec<(Account, Option<PathBuf>)>,
         error: Option<String>,
     },
     /// How many transcripts the providers' histories hold.
@@ -342,6 +435,42 @@ pub enum Progress {
         matched: Vec<(CardId, catalog::Found)>,
         read: usize,
     },
+}
+
+#[cfg(test)]
+impl Progress {
+    /// What indexing first says of `entries` and `seeds`, on the system
+    /// accounts of the seeds' providers.
+    pub(super) fn saved(entries: Vec<SavedConversation>, seeds: Vec<chat::Session>) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|entry| {
+                let launch = &entry.session.launch;
+                let key = identity(
+                    launch.provider,
+                    launch.session_id.as_deref(),
+                    &launch.recipe,
+                );
+                (entry, key)
+            })
+            .collect();
+        let homes = seeds
+            .iter()
+            .map(|seed| {
+                let provider = seed.launch.provider;
+                (
+                    Account::system(provider),
+                    identity(provider, None, &seed.launch.recipe).2,
+                )
+            })
+            .collect();
+        Self::Saved {
+            entries,
+            seeds: seeds.into(),
+            homes,
+            error: None,
+        }
+    }
 }
 
 pub(super) fn focus_id() -> widget::Id {
@@ -411,7 +540,7 @@ fn missing_directories<'a>(
 /// `cancel` is set. What was read is saved to `store` for the next run.
 fn index(
     saved: Result<Vec<SavedConversation>, String>,
-    seeds: Vec<chat::Session>,
+    seeds: Vec<(chat::Session, Account)>,
     cache: &catalog::Cache,
     store: Option<&Path>,
     cancel: &AtomicBool,
@@ -439,7 +568,7 @@ fn index(
 /// [`index`]'s listing, which answers whether it read every transcript.
 fn list(
     saved: Result<Vec<SavedConversation>, String>,
-    seeds: Vec<chat::Session>,
+    seeds: Vec<(chat::Session, Account)>,
     cache: &catalog::Cache,
     cancel: &AtomicBool,
     candidates: &mut Vec<catalog::Candidate>,
@@ -458,27 +587,45 @@ fn list(
     // Persisted descriptors retain their launch configuration and ownership
     // evidence even when a log file is newer, so they win over a found copy.
     let mut seen = HashMap::new();
-    entries.retain(|entry| {
-        let launch = &entry.session.launch;
-        let key = identity(
-            launch.provider,
-            launch.session_id.as_deref(),
-            &launch.recipe,
-        );
-        let untitled = entry.title == chat_ui::chat_card_title(launch.provider);
-        seen.insert(key, Some((entry.card, untitled))).is_none()
-    });
+    let entries = entries
+        .into_iter()
+        .filter_map(|entry| {
+            let launch = &entry.session.launch;
+            let key = identity(
+                launch.provider,
+                launch.session_id.as_deref(),
+                &launch.recipe,
+            );
+            let untitled = entry.title == chat_ui::chat_card_title(launch.provider);
+            seen.insert(key.clone(), Some((entry.card, untitled)))
+                .is_none()
+                .then_some((entry, key))
+        })
+        .collect::<Vec<_>>();
     let mut checked = HashSet::new();
     let missing = missing_directories(
         entries
             .iter()
-            .map(|entry| entry.session.launch.recipe.working_directory.as_path()),
+            .map(|(entry, _)| entry.session.launch.recipe.working_directory.as_path()),
         &mut checked,
     );
+    // Each seed's account home, resolved once rather than per conversation.
+    let (seeds, homes): (Vec<_>, Vec<_>) = seeds
+        .into_iter()
+        .map(|(seed, account)| {
+            let home = identity(seed.launch.provider, None, &seed.launch.recipe).2;
+            (seed, (account, home))
+        })
+        .unzip();
     let seeds: Arc<[chat::Session]> = seeds.into();
+    let homes_only = homes
+        .iter()
+        .map(|(_, home)| home.clone())
+        .collect::<Vec<_>>();
     if !send(Progress::Saved {
         entries,
         seeds: seeds.clone(),
+        homes,
         error,
     }) || !missing.is_empty() && !send(Progress::Missing(missing))
     {
@@ -489,11 +636,7 @@ fn list(
         return false;
     }
     let names = catalog::names(&seeds);
-    // Each seed's account home, resolved once rather than per conversation.
-    let homes = seeds
-        .iter()
-        .map(|seed| identity(seed.launch.provider, None, &seed.launch.recipe).2)
-        .collect::<Vec<_>>();
+    let homes = homes_only;
     // Transcripts are many small reads, which a cold disk answers faster
     // side by side.
     let workers = std::thread::available_parallelism()
@@ -864,6 +1007,9 @@ impl Cagents {
         state.visible.clear();
         state.seeds = Arc::from([]);
         state.seed_accounts.clear();
+        state.seed_homes.clear();
+        state.asking.clear();
+        state.hidden = None;
         state.scope = scope;
         state.missing.clear();
         state.counts = [0; 3];
@@ -920,13 +1066,14 @@ impl Cagents {
                 let seeds = accounts
                     .into_iter()
                     .filter_map(|account| {
-                        chat::fresh_session(
+                        let seed = chat::fresh_session(
                             account.provider,
                             TerminalId::new(),
                             directory.clone(),
                             &account,
                         )
-                        .ok()
+                        .ok()?;
+                        Some((seed, account))
                     })
                     .collect();
                 index(
@@ -1014,9 +1161,9 @@ impl Cagents {
                 if !self.resume_ui.open || generation != self.resume_ui.generation {
                     return Task::none();
                 }
-                self.resume_indexed(progress);
-                Task::none()
+                self.resume_indexed(progress)
             }
+            Action::Listed(generation, listened) => self.resume_listed(generation, *listened),
             Action::Resume(card) => {
                 if !self.resume_ui.open || self.resume_ui.loading {
                     return Task::none();
@@ -1035,6 +1182,18 @@ impl Cagents {
                         .seeds
                         .get(found.seed)
                         .and_then(|seed| catalog::session(seed, found))
+                        .map(|session| SavedConversation {
+                            card,
+                            title: row.title.clone(),
+                            session,
+                            open: false,
+                            updated_at_unix_ms: row.updated_at_unix_ms,
+                        }),
+                    Source::Listed { seed, id } => self
+                        .resume_ui
+                        .seeds
+                        .get(*seed)
+                        .and_then(|seed| catalog::resumed(seed, id, &row.directory, None))
                         .map(|session| SavedConversation {
                             card,
                             title: row.title.clone(),
@@ -1063,11 +1222,13 @@ impl Cagents {
         }
     }
 
-    fn resume_indexed(&mut self, progress: Progress) {
+    fn resume_indexed(&mut self, progress: Progress) -> Task<Message> {
+        let mut asking = Task::none();
         match progress {
             Progress::Saved {
                 entries,
                 seeds,
+                homes,
                 error,
             } => {
                 let accounts = seeds
@@ -1075,21 +1236,26 @@ impl Cagents {
                     .map(|seed| self.resume_account_label(seed))
                     .collect();
                 let asked_from = self.resume_ui.asked_from;
-                let rows = entries
-                    .into_iter()
-                    .filter(|entry| Some(entry.card) != asked_from)
-                    .map(|entry| {
-                        let account = self.resume_account_label(&entry.session);
-                        let place =
-                            self.resume_place(&entry.session.launch.recipe.working_directory, None);
-                        Row::saved(entry, account, place)
-                    })
-                    .collect::<Vec<_>>();
+                let mut rows = Vec::with_capacity(entries.len());
+                for (entry, identity) in entries {
+                    if Some(entry.card) == asked_from {
+                        self.resume_ui.hidden = Some(identity);
+                        continue;
+                    }
+                    let account = self.resume_account_label(&entry.session);
+                    let place =
+                        self.resume_place(&entry.session.launch.recipe.working_directory, None);
+                    let mut row = Row::saved(entry, account, place);
+                    row.identity = Some(identity);
+                    rows.push(row);
+                }
                 let state = &mut self.resume_ui;
                 state.seeds = seeds;
                 state.seed_accounts = accounts;
+                state.seed_homes = homes;
                 state.error = error;
                 state.rows.extend(rows);
+                asking = self.ask_agents();
             }
             Progress::Finished => self.resume_ui.indexing = None,
             Progress::Counted(total) => {
@@ -1098,7 +1264,7 @@ impl Cagents {
             }
             Progress::Missing(directories) => {
                 self.resume_ui.missing.extend(directories);
-                return;
+                return Task::none();
             }
             Progress::Found {
                 conversations,
@@ -1151,6 +1317,199 @@ impl Cagents {
                     .filter(|(read, total)| read < total);
             }
         }
+        self.resume_rows_changed();
+        asking
+    }
+
+    /// Asks each agent among the seeds for the conversations it keeps,
+    /// listing at once what it listed before. One asked recently is not
+    /// asked again; only whether something holds its conversations is.
+    fn ask_agents(&mut self) -> Task<Message> {
+        // A remote device's agents keep their conversations there.
+        if crate::device::is_remote() {
+            return Task::none();
+        }
+        let generation = self.resume_ui.generation;
+        let mut tasks = Vec::new();
+        for seed in 0..self.resume_ui.seed_homes.len() {
+            let (account, home) = self.resume_ui.seed_homes[seed].clone();
+            let provider = account.provider;
+            if !provider.speaks_acp() {
+                continue;
+            }
+            let id = account.id();
+            let cached = self
+                .resume_ui
+                .listings
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            if cached.at.is_some() {
+                self.apply_listing(seed, &cached);
+            }
+            let fresh = cached.at.is_some_and(|at| at.elapsed() < LISTING_FRESH);
+            if !fresh {
+                self.resume_ui.asking.push(seed);
+            }
+            let known = cached.conversations;
+            tasks.push(cosmic::task::future(async move {
+                let listed = if fresh {
+                    None
+                } else {
+                    let search_path = crate::account::probe::current_search_path();
+                    Some(
+                        crate::account::probe::conversations::list(
+                            &account,
+                            search_path.as_deref(),
+                        )
+                        .await,
+                    )
+                };
+                let listing = match &listed {
+                    Some(Ok(Some(listed))) => listed
+                        .iter()
+                        .map(|it| (it.id.clone(), it.directory.clone()))
+                        .collect(),
+                    Some(Ok(None)) => Vec::new(),
+                    _ => known
+                        .iter()
+                        .map(|it| (it.id.clone(), it.directory.clone()))
+                        .collect::<Vec<_>>(),
+                };
+                let (held, missing) = tokio::task::spawn_blocking(move || {
+                    let held = home.map_or_else(HashSet::new, |root| {
+                        crate::account::probe::conversations::held(
+                            provider,
+                            &root,
+                            listing.iter().map(|(id, _)| id.as_str()),
+                        )
+                    });
+                    let missing = missing_directories(
+                        listing.iter().map(|(_, directory)| directory.as_path()),
+                        &mut HashSet::new(),
+                    );
+                    (held, missing)
+                })
+                .await
+                .unwrap_or_default();
+                Message::ResumeConversation(Action::Listed(
+                    generation,
+                    Box::new(Listened {
+                        seed,
+                        account: id,
+                        listed,
+                        held,
+                        missing,
+                    }),
+                ))
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Keeps what an agent answered, and lists it if the opening that asked
+    /// is still the one shown.
+    fn resume_listed(&mut self, generation: u64, listened: Listened) -> Task<Message> {
+        let Listened {
+            seed,
+            account,
+            listed,
+            held,
+            missing,
+        } = listened;
+        let state = &mut self.resume_ui;
+        let listing = state.listings.entry(account).or_default();
+        match listed {
+            Some(Ok(listed)) => {
+                listing.at = Some(std::time::Instant::now());
+                listing.conversations = listed.unwrap_or_default().into();
+                listing.error = None;
+            }
+            // What it listed before stays listed, said to be out of date.
+            Some(Err(error)) => {
+                listing.at = Some(std::time::Instant::now());
+                listing.error = Some(error);
+            }
+            None => {}
+        }
+        listing.held = Arc::new(held);
+        listing.missing = missing.into();
+        let listing = listing.clone();
+        if !state.open || generation != state.generation {
+            return Task::none();
+        }
+        state.asking.retain(|asking| *asking != seed);
+        self.apply_listing(seed, &listing);
+        self.resume_rows_changed();
+        Task::none()
+    }
+
+    /// Lists what the agent of seed `seed` listed in place of what it
+    /// listed before: a conversation cagents saved learns its name, last
+    /// activity and whether something holds it, and every other becomes a
+    /// row of its own, keeping its place in the list when it was one.
+    fn apply_listing(&mut self, seed: usize, listing: &Listing) {
+        let Some(provider) = self
+            .resume_ui
+            .seeds
+            .get(seed)
+            .map(|seed| seed.launch.provider)
+        else {
+            return;
+        };
+        let home = self.resume_ui.seed_homes[seed].1.clone();
+        let account = self.resume_ui.seed_accounts[seed].clone();
+        let mut cards = HashMap::new();
+        self.resume_ui.rows.retain(|row| match &row.source {
+            Source::Listed { seed: listed, id } if *listed == seed => {
+                cards.insert(id.clone(), row.card);
+                false
+            }
+            _ => true,
+        });
+        let saved = self
+            .resume_ui
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| Some((row.identity.clone()?, index)))
+            .collect::<HashMap<_, _>>();
+        let mut rows = Vec::new();
+        for listed in listing.conversations.iter() {
+            let key = (provider, Some(listed.id.clone()), home.clone());
+            let held = listing.held.contains(&listed.id);
+            if let Some(&index) = saved.get(&key) {
+                let renamed = self
+                    .chrome_ui
+                    .user_titles
+                    .contains_key(&self.resume_ui.rows[index].card);
+                let row = &mut self.resume_ui.rows[index];
+                if let Some(title) = listed.title.as_ref().filter(|_| !renamed) {
+                    row.title.clone_from(title);
+                }
+                row.updated_at_unix_ms = row
+                    .updated_at_unix_ms
+                    .max(listed.updated_at_unix_ms.unwrap_or(0));
+                row.held = held;
+                row.index();
+                continue;
+            }
+            if self.resume_ui.hidden.as_ref() == Some(&key) {
+                continue;
+            }
+            let card = cards.get(&listed.id).copied().unwrap_or_else(CardId::new);
+            let place = self.resume_place(&listed.directory, None);
+            let mut row = Row::listed(card, seed, listed, provider, account.clone(), place);
+            row.held = held;
+            rows.push(row);
+        }
+        let state = &mut self.resume_ui;
+        state.missing.extend(listing.missing.iter().cloned());
+        state.rows.extend(rows);
+    }
+
+    /// Orders and filters the rows again once some have changed.
+    fn resume_rows_changed(&mut self) {
         let state = &mut self.resume_ui;
         // A row the reader moved to stays selected wherever more rows land;
         // otherwise the best match stays first.
@@ -1177,6 +1536,37 @@ impl Cagents {
             .unwrap_or(0);
         // Newer rows landing above it never page the selection out of view.
         state.limit = state.limit.max((state.selected + 1).next_multiple_of(PAGE));
+    }
+
+    /// The agents being asked for their conversations, named for the header.
+    fn resume_asking(&self) -> Option<String> {
+        let state = &self.resume_ui;
+        let mut names = Vec::new();
+        for &seed in &state.asking {
+            let name = state.seeds.get(seed)?.launch.provider.label();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        (!names.is_empty()).then(|| names.join(" and "))
+    }
+
+    /// Why an agent's conversations are not listed, or not up to date.
+    fn resume_unlisted(&self) -> Vec<String> {
+        let state = &self.resume_ui;
+        state
+            .seed_homes
+            .iter()
+            .filter_map(|(account, _)| {
+                let listing = state.listings.get(&account.id())?;
+                let error = listing.error.as_ref()?;
+                Some(if listing.conversations.is_empty() {
+                    format!("{error}.")
+                } else {
+                    format!("{error}, so its list may be out of date.")
+                })
+            })
+            .collect()
     }
 
     /// Lists the rows the query and scope admit, from the first.
@@ -1694,10 +2084,11 @@ impl Cagents {
     fn resume_body(&self, wide: bool) -> Element<'_, Message> {
         let state = &self.resume_ui;
         let now = chat::now_ms().map_or(0, |now| now as i64);
-        let progress = match state.indexing {
-            Some((_, 0)) => "Looking for conversations…".to_owned(),
-            Some((read, total)) => format!("Reading {read} of {total} transcripts…"),
-            None => match state.visible.len() {
+        let progress = match (state.indexing, self.resume_asking()) {
+            (Some((_, 0)), _) => "Looking for conversations…".to_owned(),
+            (Some((read, total)), _) => format!("Reading {read} of {total} transcripts…"),
+            (None, Some(agents)) => format!("Asking {agents}…"),
+            (None, None) => match state.visible.len() {
                 1 => "1 conversation".to_owned(),
                 count => format!("{count} conversations"),
             },
@@ -1722,6 +2113,11 @@ impl Cagents {
             .height(Length::Fill);
         if let Some(scope) = &state.scope {
             content = content.push(resume_reaches(scope, &state.counts));
+        }
+        for unlisted in self.resume_unlisted() {
+            content = content.push(
+                design::caption(unlisted).class(cosmic::theme::Text::Custom(design::warning_text)),
+            );
         }
         let list = self.resume_list(now);
         let chosen = state
@@ -1886,10 +2282,12 @@ impl Cagents {
             })
         });
         let here = state.scope.as_ref().map(|scope| scope.label(scope.reach));
-        let mut lines = vec![if state.rows.is_empty() && state.indexing.is_some() {
+        let mut lines = vec![if state.rows.is_empty()
+            && (state.indexing.is_some() || !state.asking.is_empty())
+        {
             "Looking for conversations…".to_owned()
         } else if state.rows.is_empty() {
-            "No conversations yet. Conversations with Claude Code and Codex appear here once they have started.".to_owned()
+            "No conversations yet. Conversations with your agents appear here once they have started.".to_owned()
         } else if !state.query.trim().is_empty() {
             format!("No conversations match “{}”.", state.query.trim())
         } else if let Some(here) = here {
@@ -1962,6 +2360,15 @@ impl Cagents {
             } else {
                 "Its folder no longer exists. Restore the folder to resume it.".to_owned()
             }));
+        } else if row.provider.speaks_acp() {
+            // Its agent's lock says whether it runs elsewhere, so recent
+            // activity alone does not.
+            if row.held {
+                column = column.push(warning(format!(
+                    "{} has it open in another window or terminal now.",
+                    row.provider.label()
+                )));
+            }
         } else if now - row.updated_at_unix_ms < RECENT_MS {
             column = column.push(warning(
                 "Active moments ago. It may still be running in another window or terminal."
@@ -1992,6 +2399,12 @@ impl Cagents {
                 if let Some(reply) = summary.last_reply.as_deref() {
                     column = column.push(section("Last reply", reply, 8));
                 }
+            }
+            None if row.provider.speaks_acp() => {
+                column = column.push(design::caption(format!(
+                    "{} keeps this conversation's messages. Resuming loads them.",
+                    row.provider.label()
+                )));
             }
             None if state.indexing.is_some() => {
                 column = column.push(design::caption("Reading its transcript…"));
@@ -2280,11 +2693,7 @@ mod tests {
     fn list(app: &mut Cagents, generation: u64, entries: Vec<SavedConversation>) {
         let _ = app.update_resume(Action::Indexed(
             generation,
-            Progress::Saved {
-                entries,
-                seeds: Arc::from([]),
-                error: None,
-            },
+            Progress::saved(entries, Vec::new()),
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
     }
@@ -3040,11 +3449,7 @@ mod tests {
         let older = saved(directory.path());
         let _ = app.update_resume(Action::Indexed(
             generation,
-            Progress::Saved {
-                entries: vec![older.clone()],
-                seeds: Arc::from([older.session.clone()]),
-                error: None,
-            },
+            Progress::saved(vec![older.clone()], vec![older.session.clone()]),
         ));
         let found = |updated_at_unix_ms| found(directory.path(), "Newer", updated_at_unix_ms);
         let arrive = |app: &mut Cagents, updated_at_unix_ms| {
@@ -3402,7 +3807,7 @@ mod tests {
         let mut progress = Vec::new();
         index(
             Ok(vec![entry.clone(), named]),
-            vec![seed],
+            vec![(seed, account)],
             &catalog::Cache::default(),
             None,
             &AtomicBool::new(false),
@@ -3450,6 +3855,200 @@ mod tests {
             },
         );
         assert_eq!(steps, 1);
+    }
+
+    const OUTSIDE: &str = "61d4342c-6107-4eeb-9f69-bd7ce741ea0d";
+    const KNOWN: &str = "0b5f3c1e-2d4a-4f6b-8c7d-9e0f1a2b3c4d";
+    const ANOTHER: &str = "1c6a4d2f-3e5b-4a7c-9d8e-0f1a2b3c4d5e";
+    const LATER: &str = "2d7b5e3a-4f6c-4b8d-8e9f-1a2b3c4d5e6f";
+    const KEPT: &str = "3e8c6f4b-5a7d-4c9e-9f0a-2b3c4d5e6f7a";
+
+    /// What Antigravity lists, as answered to the opening numbered
+    /// `generation`.
+    fn listened(app: &mut Cagents, generation: u64, listed: Option<Vec<Listed>>, held: &[&str]) {
+        let account = app.resume_ui.seed_homes[0].0.id();
+        let _ = app.update_resume(Action::Listed(
+            generation,
+            Box::new(Listened {
+                seed: 0,
+                account,
+                listed: listed.map(|listed| Ok(Some(listed))),
+                held: held.iter().map(|id| (*id).to_owned()).collect(),
+                missing: Vec::new(),
+            }),
+        ));
+    }
+
+    fn conversation(id: &str, directory: &Path, title: &str, updated_at_unix_ms: i64) -> Listed {
+        Listed {
+            id: id.into(),
+            directory: directory.into(),
+            title: Some(title.into()),
+            updated_at_unix_ms: Some(updated_at_unix_ms),
+        }
+    }
+
+    /// Antigravity's conversations are listed as it lists them, those
+    /// started outside cagents too; one cagents saved goes by the name the
+    /// agent gives it; and only one something holds is said to run.
+    #[test]
+    fn an_agent_lists_its_conversations_and_says_which_are_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        let seed = chat::fresh_session(
+            Provider::Antigravity,
+            TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Antigravity),
+        )
+        .unwrap();
+        let mut known = SavedConversation {
+            card: CardId::new(),
+            title: chat_ui::chat_card_title(Provider::Antigravity).into(),
+            session: seed.clone(),
+            open: false,
+            updated_at_unix_ms: 1_000,
+        };
+        known.session.launch.session_id = Some(KNOWN.into());
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::saved(vec![known.clone()], vec![seed.clone()]),
+        ));
+        assert_eq!(app.resume_ui.asking, [0]);
+        assert_eq!(app.resume_asking().as_deref(), Some("Antigravity"));
+
+        listened(
+            &mut app,
+            generation,
+            Some(vec![
+                conversation(OUTSIDE, directory.path(), "From the terminal", 3_000),
+                conversation(
+                    KNOWN,
+                    directory.path(),
+                    "Filter environment variables",
+                    2_000,
+                ),
+            ]),
+            &[OUTSIDE],
+        );
+        let state = &app.resume_ui;
+        assert!(state.asking.is_empty());
+        let titles = state
+            .visible
+            .iter()
+            .map(|&index| {
+                let row = &state.rows[index];
+                (row.title.as_str(), row.held, row.updated_at_unix_ms)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            [
+                ("From the terminal", true, 3_000),
+                ("Filter environment variables", false, 2_000),
+            ]
+        );
+        assert!(matches!(state.rows[1].source, Source::Saved(_)));
+        let outside = state.rows[0].card;
+
+        // Asked again, the agent no longer lists one; the one it still
+        // lists keeps its row, and whatever was resumed from it.
+        listened(
+            &mut app,
+            generation,
+            Some(vec![
+                conversation(OUTSIDE, directory.path(), "From the terminal", 4_000),
+                conversation(ANOTHER, directory.path(), "Another", 500),
+            ]),
+            &[],
+        );
+        let state = &app.resume_ui;
+        assert_eq!(state.rows.len(), 3);
+        assert_eq!(state.rows[0].card, outside);
+        assert!(!state.rows[0].held);
+        let row = &state.rows[0];
+        let Source::Listed { seed: 0, id } = &row.source else {
+            panic!("a listed conversation resumes by its seed")
+        };
+        let session = catalog::resumed(&state.seeds[0], id, &row.directory, None).unwrap();
+        assert_eq!(session.launch.session_id.as_deref(), Some(OUTSIDE));
+        assert_eq!(session.launch.provider, Provider::Antigravity);
+
+        // An answer to an earlier opening is kept for the next one, but
+        // changes nothing shown now.
+        app.resume_ui.generation = generation + 1;
+        app.resume_ui.rows.clear();
+        listened(
+            &mut app,
+            generation,
+            Some(vec![conversation(LATER, directory.path(), "Later", 5_000)]),
+            &[],
+        );
+        assert!(app.resume_ui.rows.is_empty());
+        // The next opening lists at once what was listed last, and, asked
+        // so recently, asks the agent only whether something holds them.
+        let _ = app.update_resume(Action::Indexed(
+            generation + 1,
+            Progress::saved(Vec::new(), vec![seed]),
+        ));
+        assert!(app.resume_ui.asking.is_empty());
+        let titles = app
+            .resume_ui
+            .rows
+            .iter()
+            .map(|row| row.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["Later"]);
+    }
+
+    /// Asking an agent that cannot answer says so beside the list, and
+    /// keeps what it listed before.
+    #[test]
+    fn an_agent_that_cannot_list_says_why() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        let generation = app.resume_ui.generation;
+        let seed = chat::fresh_session(
+            Provider::Antigravity,
+            TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Antigravity),
+        )
+        .unwrap();
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::saved(Vec::new(), vec![seed]),
+        ));
+        listened(
+            &mut app,
+            generation,
+            Some(vec![conversation(KEPT, directory.path(), "Kept", 1)]),
+            &[],
+        );
+        let account = app.resume_ui.seed_homes[0].0.id();
+        let _ = app.update_resume(Action::Listed(
+            generation,
+            Box::new(Listened {
+                seed: 0,
+                account,
+                listed: Some(Err(
+                    "Antigravity could not list its conversations: sign in first".into(),
+                )),
+                held: HashSet::new(),
+                missing: Vec::new(),
+            }),
+        ));
+        assert_eq!(app.resume_ui.rows.len(), 1);
+        assert_eq!(
+            app.resume_unlisted(),
+            [
+                "Antigravity could not list its conversations: sign in first, so its list may be out of date."
+            ]
+        );
     }
 
     fn found(directory: &Path, title: &str, updated_at_unix_ms: i64) -> catalog::Found {

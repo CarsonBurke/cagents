@@ -17,6 +17,11 @@ case ${0##*/} in
 esac
 export FAKE_ACP_SHAPE=$shape
 export FAKE_ACP_STATE="${FAKE_ACP_STATE:-$fixture/acp/$shape}"
+# An open conversation is locked as the real agent locks it, in the
+# fixture's own home only.
+case ${HOME:-} in
+    "$fixture"/*) export FAKE_ACP_PRESENCE=1 ;;
+esac
 mkdir -p -- "$FAKE_ACP_STATE"
 if [ "$shape" = agy ]; then
     for argument in "$@"; do

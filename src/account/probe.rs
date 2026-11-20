@@ -38,6 +38,7 @@ use super::{
 use crate::{agent::Provider, chat::Model};
 
 mod acp;
+pub mod conversations;
 mod muse;
 mod reset_consume;
 #[cfg(test)]
