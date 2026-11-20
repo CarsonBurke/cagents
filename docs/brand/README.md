@@ -17,8 +17,9 @@ glyphs on a tile.
   a gutter, syntax-coloured lines and a highlighted active line ending in a
   coral I-beam caret; coral- and slate-edged pages sit behind it.
 
-At task bar and tray sizes (16-24 px) the marks stay distinct: a coral robot in
-an upright pane against a fanned stack of lined pages.
+From 24 px up the marks stay distinct: a coral robot in an upright pane against
+a fanned stack of lined pages. At 16 px they reduce to their colours, an orange
+mark on a dark pane against a dark page with a teal top.
 
 ## Construction
 
@@ -64,4 +65,4 @@ Kept for reference; not shipped.
 | Cascade | Orbit | Stack |
 | :-: | :-: | :-: |
 | <img src="concept-cascade.svg" width="96" alt=""> | <img src="concept-orbit.svg" width="96" alt=""> | <img src="concept-stack.svg" width="96" alt=""> |
-| A prompt running ahead of its own trail. The boldest silhouette in a dock, but reads as "fast forward". | Agents orbiting a core. Polished, but says "space app". | Layered sessions. Reads as storage or a design tool. |
+| A prompt running ahead of its own trail. The boldest silhouette in a dock, but reads as "fast forward". | Agents orbiting a core. Polished, but says "space app". | Sessions as flat stacked slabs. Without a figure on the front one, reads as storage or a design tool. |

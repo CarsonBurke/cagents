@@ -43,6 +43,7 @@
       <rect x="40" y="19" width="72" height="86" rx="10" fill="#11151F"/>
       <rect x="40" y="14" width="72" height="86" rx="10" fill="url(#obs-back)"/>
       <rect x="40" y="14" width="72" height="8" fill="#6CC2B3" clip-path="url(#clip-back)"/>
+      <rect x="40" y="14" width="72" height="8" fill="url(#gloss)" clip-path="url(#clip-back)"/>
       <rect x="40.8" y="14.8" width="70.4" height="84.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
       <rect x="86" y="32" width="18" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
       <rect x="86" y="41" width="12" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
@@ -56,6 +57,7 @@
       <rect x="16" y="33" width="72" height="86" rx="10" fill="#11151F"/>
       <rect x="16" y="28" width="72" height="86" rx="10" fill="url(#obs)"/>
       <rect x="16" y="28" width="72" height="8" fill="#FF7A48" clip-path="url(#clip-front)"/>
+      <rect x="16" y="28" width="72" height="8" fill="url(#gloss)" clip-path="url(#clip-front)"/>
       <rect x="16.8" y="28.8" width="70.4" height="84.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
       <g transform="translate(52.0 79.0) scale(1.2)" opacity="1.0">
         <rect x="-1.5" y="-27" width="3" height="10" rx="1.5" fill="#8EA4C8"/>
