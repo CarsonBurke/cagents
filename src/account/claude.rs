@@ -869,6 +869,7 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
         return;
     }
     snapshot.observed_at = observed_at;
+    snapshot.scoped_observed_at = None;
     snapshot.source = UsageSource::Live;
     snapshot.detail = None;
     match update.status {

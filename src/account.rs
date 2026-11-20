@@ -1127,6 +1127,11 @@ pub struct UsageSnapshot {
 pub const RESET_TOLERANCE: u64 = 3_600;
 
 impl UsageSnapshot {
+    /// The stamp that orders readings, never account-wide freshness.
+    pub fn ordering_stamp(&self) -> u64 {
+        self.observed_at.max(self.scoped_observed_at.unwrap_or(0))
+    }
+
     /// A snapshot that reports a state rather than figures.
     pub fn state(status: UsageStatus, detail: impl Into<String>, observed_at: u64) -> Self {
         Self {
@@ -1231,15 +1236,11 @@ impl LiveReport {
     /// stamp from before the clock was set back. A login report carries no
     /// figures and is never taken.
     pub fn apply(self, current: &mut UsageSnapshot, observed_at: u64, now: u64) -> bool {
-        let latest_observed_at = match &self {
-            Self::Claude(_) => current
-                .observed_at
-                .max(current.scoped_observed_at.unwrap_or(0)),
+        let latest_stamp = match &self {
+            Self::Claude(_) => current.ordering_stamp(),
             _ => current.observed_at,
         };
-        if latest_observed_at > observed_at
-            && latest_observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
-        {
+        if latest_stamp > observed_at && latest_stamp <= now.saturating_add(schedule::CLOCK_SLACK) {
             return false;
         }
         match self {

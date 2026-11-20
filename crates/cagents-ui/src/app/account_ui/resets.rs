@@ -979,7 +979,7 @@ impl Cagents {
             }) {
                 state.inventory_observed_at = Some(snapshot.observed_at);
                 if let Some(current) = state.snapshot.as_mut()
-                    && current.observed_at > snapshot.observed_at
+                    && current.ordering_stamp() > snapshot.ordering_stamp()
                 {
                     merge_complete_inventory(current, &snapshot);
                     merged_inventory = true;
@@ -988,7 +988,7 @@ impl Cagents {
             if state
                 .snapshot
                 .as_ref()
-                .is_none_or(|current| current.observed_at <= snapshot.observed_at)
+                .is_none_or(|current| current.ordering_stamp() <= snapshot.ordering_stamp())
             {
                 state.snapshot = Some(snapshot);
             }

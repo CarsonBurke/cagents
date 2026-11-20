@@ -305,8 +305,8 @@ impl Cache {
             .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
         if document.entries.get(key).is_some_and(|existing| {
             supersedes(
-                existing.snapshot.observed_at,
-                entry.snapshot.observed_at,
+                existing.snapshot.ordering_stamp(),
+                entry.snapshot.ordering_stamp(),
                 now,
             )
         }) {
@@ -598,6 +598,7 @@ fn read_document(path: &Path) -> Option<Document> {
 mod tests {
     use super::*;
     use crate::account::{UsageSource, UsageStatus};
+    use serde_json::json;
     use std::{fs, os::unix::fs::PermissionsExt};
 
     fn entry(observed_at: u64, detail: &str) -> Entry {
@@ -612,6 +613,117 @@ mod tests {
             }),
             snapshot,
         }
+    }
+
+    #[test]
+    fn an_account_rejection_after_clock_rollback_blocks_delayed_allowance() {
+        use crate::account::{
+            LiveReport,
+            claude::{parse_rate_limit_event, parse_usage},
+            routing, schedule,
+        };
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let future = now + schedule::CLOCK_SLACK + 10_000;
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.1, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut usage, future, future));
+        assert_eq!(usage.observed_at, now);
+        assert_eq!(usage.scoped_observed_at, Some(future));
+
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(rejection).apply(&mut usage, now + 3_000, now + 3_000));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert!(!routing::available(&usage, now + 3_000));
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/clock-rollback";
+        cache
+            .store(
+                key,
+                Entry {
+                    identity: None,
+                    snapshot: usage.clone(),
+                },
+            )
+            .unwrap();
+        let mut usage = cache.load(now + 4_000).remove(key).unwrap().snapshot;
+        let latest = usage.clone();
+        let delayed = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.3,
+        }))
+        .unwrap();
+        assert!(!LiveReport::Claude(delayed).apply(&mut usage, now + 2_000, now + 4_000));
+        assert_eq!(usage, latest);
+        assert_eq!(usage.observed_at, now + 3_000);
+        assert_eq!(usage.scoped_observed_at, None);
+        assert_eq!(usage.ordering_stamp(), now + 3_000);
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert!(!routing::available(&usage, now + 4_000));
+    }
+
+    #[test]
+    fn cache_keeps_the_newest_scoped_reading_when_writes_arrive_out_of_order() {
+        use crate::account::{
+            LiveReport,
+            claude::{parse_rate_limit_event, parse_usage},
+        };
+
+        let now = crate::chat::now_ms().unwrap() - 10_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let mut reading = |at, utilization| {
+            let scoped = parse_rate_limit_event(&json!({
+                "status": "allowed", "rateLimitType": "seven_day_overage_included",
+                "utilization": utilization, "resetsAt": 1_893_456_000_i64,
+            }))
+            .unwrap();
+            assert!(LiveReport::Claude(scoped).apply(&mut usage, at, at));
+            Entry {
+                identity: None,
+                snapshot: usage.clone(),
+            }
+        };
+        let older = reading(now + 2_000, 0.2);
+        let newer = reading(now + 3_000, 0.3);
+        assert_eq!(older.snapshot.observed_at, now);
+        assert_eq!(newer.snapshot.observed_at, now);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/out-of-order-scoped-writes";
+        cache.store(key, newer.clone()).unwrap();
+        cache.store(key, older).unwrap();
+        let loaded = cache.load(now + 4_000).remove(key).unwrap();
+        assert_eq!(loaded.snapshot.scoped_observed_at, Some(now + 3_000));
+        assert_eq!(loaded.snapshot.ordering_stamp(), now + 3_000);
+        assert_eq!(loaded, newer);
+        assert_eq!(
+            loaded
+                .snapshot
+                .windows
+                .iter()
+                .find(|window| window.kind == crate::account::WindowKind::Scoped)
+                .unwrap()
+                .used,
+            0.3
+        );
     }
 
     #[test]

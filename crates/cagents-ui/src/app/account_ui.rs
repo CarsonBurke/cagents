@@ -4466,8 +4466,8 @@ impl Cagents {
             Outcome::Answered {
                 identity, snapshot, ..
             } if state.snapshot.as_ref().is_some_and(|current| {
-                snapshot.observed_at < current.observed_at
-                    && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+                snapshot.ordering_stamp() < current.ordering_stamp()
+                    && current.ordering_stamp() <= now.saturating_add(schedule::CLOCK_SLACK)
             }) =>
             {
                 if ticket.force
