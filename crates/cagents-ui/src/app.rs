@@ -14703,6 +14703,10 @@ impl Cagents {
         });
         let navigation_blocked = self.modal_is_open() || repository_blocks;
         let covered = self.pull_request_restore_covered();
+        // This runs after every update: leave a queue nothing can leave alone.
+        if self.deferred_navigation.is_empty() || (navigation_blocked && covered) {
+            return Task::none();
+        }
         let mut ready = Vec::new();
         for message in std::mem::take(&mut self.deferred_navigation) {
             let blocked = if matches!(&message, Message::RestorePullRequestDialog { .. }) {
