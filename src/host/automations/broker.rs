@@ -306,36 +306,33 @@ impl Handle {
             }
             return Ok(());
         }
-        let directory =
-            match service::validate_target(host, &claim.definition, &claim.target_identity)
-                .and_then(|directory| {
-                    agent_execution::selected_account(&claim.definition.agent).map(|_| directory)
-                })
-                .and_then(|directory| {
-                    // Saved before modes were checked per provider: say so
-                    // on the run instead of starting it under another policy.
-                    claim
-                        .definition
-                        .agent
-                        .check_permission_mode()
-                        .map(|()| directory)
-                }) {
-                Ok(directory) => directory,
-                Err(error) => {
-                    let now = service::now()?;
-                    let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
-                    registry.fail_automation_start(claim.firing.id, error, now, true)?;
-                    if claim.definition.precheck.is_some() {
-                        // Target/account refusal happened before Worker::launch.
-                        registry.confirm_unlaunched_automation_precheck(
-                            claim.firing.id,
-                            claim.firing.revision,
-                            now,
-                        )?;
-                    }
-                    return Ok(());
+        // A definition that can never start pauses before its precheck runs,
+        // as accepting its firing would pause it without one.
+        let directory = match claim
+            .definition
+            .startable()
+            .and_then(|()| {
+                service::validate_target(host, &claim.definition, &claim.target_identity)
+            })
+            .and_then(|directory| {
+                agent_execution::selected_account(&claim.definition.agent).map(|_| directory)
+            }) {
+            Ok(directory) => directory,
+            Err(error) => {
+                let now = service::now()?;
+                let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+                registry.fail_automation_start(claim.firing.id, error, now, true)?;
+                if claim.definition.precheck.is_some() {
+                    // Target/account refusal happened before Worker::launch.
+                    registry.confirm_unlaunched_automation_precheck(
+                        claim.firing.id,
+                        claim.firing.revision,
+                        now,
+                    )?;
                 }
-            };
+                return Ok(());
+            }
+        };
         if let Some(accepted) = claim.accepted {
             agent_execution::dispatch_accepted_in_directory(host, accepted, directory)?;
         } else if let Some(precheck) = claim.definition.precheck {
@@ -1345,6 +1342,59 @@ mod tests {
                 .state,
             FiringState::Interrupted
         );
+    }
+
+    #[test]
+    fn a_definition_that_can_no_longer_start_pauses_before_its_precheck() {
+        let (_directory, host, handle, automation) = manual_precheck_fixture();
+        let enabled = handle
+            .0
+            .registry
+            .lock()
+            .unwrap()
+            .set_automation_enabled(
+                automation.id,
+                automation.revision,
+                Some(crate::automations::Occurrence {
+                    due_ms: 60_000,
+                    local: "1970-01-01T00:01".into(),
+                }),
+                true,
+                100,
+            )
+            .unwrap();
+        let (mut claim, launching) = handle
+            .claim_manual(
+                automation.id,
+                enabled.execution_revision,
+                Uuid::new_v4(),
+                None,
+                true,
+                200,
+            )
+            .unwrap();
+        assert_eq!(claim.firing.state, FiringState::Prechecking);
+        // As read back from a definition saved before each provider's
+        // permission modes were checked; the fixture's target never exists,
+        // so this is refused first or not at all.
+        claim.definition.agent.permission_mode = Some("never".into());
+        let firing = claim.firing.id;
+        handle.launch(&host, claim).unwrap();
+        drop(launching);
+        let registry = handle.0.registry.lock().unwrap();
+        let firing = registry.automation_firing(firing).unwrap();
+        assert_eq!(firing.state, FiringState::Failed);
+        assert!(
+            firing
+                .diagnostic
+                .as_deref()
+                .unwrap()
+                .starts_with("Claude Code has no permission mode \"never\"")
+        );
+        assert!(!handle.0.workers.lock().unwrap().contains_key(&firing.id));
+        let automation = registry.automation(automation.id).unwrap();
+        assert!(!automation.enabled);
+        assert!(automation.next.is_none());
     }
 
     #[test]

@@ -379,6 +379,15 @@ pub struct Definition {
 }
 
 impl Definition {
+    /// Refuses a saved definition that can no longer start, saying how to
+    /// recover: one saved before each provider's permission modes were
+    /// checked may name another provider's mode.
+    pub fn startable(&self) -> Result<(), String> {
+        self.agent.check_permission_mode().map_err(|error| {
+            format!("{error}. Edit the automation's permission mode to run it again.")
+        })
+    }
+
     /// Cheap structural checks shared by clients. The daemon separately checks
     /// cron/timezone semantics, account authority and canonical target identity.
     pub fn validate(&self) -> Result<(), String> {

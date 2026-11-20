@@ -1674,6 +1674,12 @@ fn accept_firing(
         }
         Destination::New(spec)
     };
+    // A definition that can never start, whichever agent it would use, pauses
+    // the automation rather than failing again at every occurrence.
+    if let Err(diagnostic) = definition.startable() {
+        refuse_start(tx, automation, firing, diagnostic, now_ms)?;
+        return Ok(None);
+    }
     let creates_agent = matches!(&destination, Destination::New(_));
     let request = Submit {
         name: None,
@@ -1739,6 +1745,42 @@ fn accept_firing(
             Ok(None)
         }
     }
+}
+
+/// Fails a firing before anything is created for it and pauses its
+/// automation, as `fail_automation_start` does for one refused at launch.
+fn refuse_start(
+    tx: &Transaction<'_>,
+    automation: &mut Automation,
+    firing: &mut Firing,
+    mut diagnostic: String,
+    now_ms: u64,
+) -> Result<(), String> {
+    crate::agent_execution::truncate(
+        &mut diagnostic,
+        crate::agent_execution::MAX_DIAGNOSTIC_BYTES,
+    );
+    firing.state = FiringState::Failed;
+    firing.finished_ms = Some(now_ms);
+    firing.diagnostic = Some(diagnostic);
+    automation.active_firing = None;
+    if automation.execution_revision == firing.revision {
+        automation.enabled = false;
+        automation.next = None;
+        automation.updated_ms = now_ms;
+        // Attention checks the saved rows; the caller writes them again with
+        // the same state.
+        write_firing(tx, firing)?;
+        write_automation(tx, automation)?;
+        automation_audit::record(tx, automation, LifecycleCause::StartPaused, Some(firing.id))?;
+        automation_notifications::queue(
+            tx,
+            automation,
+            LifecycleCause::StartPaused,
+            Some(firing.id),
+        )?;
+    }
+    Ok(())
 }
 
 fn occurrence_key(revision: u64, trigger: &crate::automations::Trigger) -> String {
@@ -4615,5 +4657,84 @@ mod tests {
         );
         assert!(!registry.automation(created.id).unwrap().enabled);
     }
+    #[test]
+    fn a_saved_definition_that_can_no_longer_start_pauses_its_automation() {
+        for precheck in [false, true] {
+            let (mut registry, _directory, mut definition) = fixture();
+            definition.session_mode = SessionMode::Fresh;
+            definition.agent.permission_mode = Some("default".into());
+            if precheck {
+                definition = history_precheck_definition(definition);
+            }
+            let created = registry
+                .create_automation(definition, 0, test_identity())
+                .unwrap();
+            let enabled = registry
+                .set_automation_enabled(
+                    created.id,
+                    created.revision,
+                    Some(history_occurrence(1)),
+                    true,
+                    1,
+                )
+                .unwrap();
+            // Saved before each provider's permission modes were checked.
+            for (table, column, key) in [
+                ("automations", "record", "id"),
+                ("automation_revisions", "definition", "automation"),
+            ] {
+                let changed = registry
+                    .db
+                    .execute(
+                        &format!(
+                            "UPDATE {table} SET {column}=replace({column},                              '\"permission_mode\":\"default\"', '\"permission_mode\":\"never\"')                              WHERE {key}=?1"
+                        ),
+                        [created.id.to_string()],
+                    )
+                    .unwrap();
+                assert_eq!(changed, 1);
+            }
+            let (_, claim) =
+                history_claim_manual(&mut registry, enabled.id, enabled.execution_revision, 100);
+            let firing = if precheck {
+                // Refused only once its precheck has passed.
+                assert_eq!(claim.firing.state, FiringState::Prechecking);
+                assert!(
+                    registry
+                        .finish_automation_precheck(
+                            claim.firing.id,
+                            crate::host::automations::precheck::Outcome::Passed,
+                            200,
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+                registry.automation_firing(claim.firing.id).unwrap()
+            } else {
+                claim.firing
+            };
+            assert_eq!(firing.state, FiringState::Failed, "precheck {precheck}");
+            assert_eq!(firing.run, None);
+            assert_eq!(
+                firing.diagnostic.as_deref(),
+                Some(
+                    "Claude Code has no permission mode \"never\"; choose default, manual, auto, \
+                     acceptEdits, plan, dontAsk or bypassPermissions. Edit the automation's \
+                     permission mode to run it again."
+                )
+            );
+            let automation = registry.automation(created.id).unwrap();
+            assert!(!automation.enabled, "precheck {precheck}");
+            assert!(automation.next.is_none());
+            assert_eq!(automation.active_firing, None);
+            let receipt = &registry
+                .automation_audit(created.id, None, 1)
+                .unwrap()
+                .events[0];
+            assert_eq!(receipt.cause, LifecycleCause::StartPaused);
+            assert_eq!(receipt.firing, Some(firing.id));
+        }
+    }
+
     include!("automations/history_tests.rs");
 }
