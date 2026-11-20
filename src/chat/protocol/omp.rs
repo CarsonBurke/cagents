@@ -111,11 +111,15 @@ struct Omp {
     started: bool,
     busy: bool,
     turn_outcome: Option<crate::notifications::Kind>,
+    turn_error: Option<String>,
     agent_turn_active: bool,
     expected_session: Option<String>,
     session_id: Option<String>,
     state_request: Option<String>,
     history_request: Option<String>,
+    /// The latest assistant error across history pages. A live turn invalidates
+    /// the outer option so a late page cannot restore an older turn's error.
+    history_error: Option<Option<String>>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
     dropped_chunks: HashMap<String, (usize, usize)>,
@@ -386,6 +390,9 @@ impl Omp {
         self.receive(frame)
     }
     fn history_page(&mut self, cursor: Option<&str>) -> Value {
+        if cursor.is_none() {
+            self.history_error = Some(None);
+        }
         let mut request = self.request("get_messages_page");
         request["limit"] = 100.into();
         if let Some(cursor) = cursor {
@@ -1124,6 +1131,8 @@ impl Adapter for Omp {
                         {
                             self.ready = false;
                             self.history_request = None;
+                            self.history_error = None;
+                            self.turn_error = None;
                             self.requests.clear();
                             self.calls.clear();
                             self.call_order.clear();
@@ -1322,12 +1331,26 @@ impl Adapter for Omp {
                     "get_available_commands" => step.events.extend(commands(data)),
                     "get_messages_page" => {
                         for message in data["messages"].as_array().into_iter().flatten() {
+                            if text(message, "role") == "assistant"
+                                && let Some(error) = &mut self.history_error
+                            {
+                                *error = assistant_error(message);
+                            }
                             step.events
                                 .extend(self.message_items(message).into_iter().map(Event::Item));
                         }
                         if let Some(cursor) = data["nextCursor"].as_str() {
                             step.writes.push(self.history_page(Some(cursor)));
                         } else {
+                            let error = self.history_error.take().flatten();
+                            if !self.busy
+                                && let Some(message) = error
+                            {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                            }
                             self.ready = true;
                             self.started = true;
                             step.events.push(Event::Ready(true));
@@ -1380,6 +1403,7 @@ impl Adapter for Omp {
                         "stop" | "length" => Some(Kind::Succeeded),
                         _ => None,
                     };
+                    self.turn_error = assistant_error(&frame["message"]);
                 }
                 step.events.extend(
                     self.message_items(&frame["message"])
@@ -1518,6 +1542,8 @@ impl Adapter for Omp {
                 if text(&frame, "type") == "agent_start" {
                     step.events.push(Event::TurnStarted);
                     self.turn_outcome = None;
+                    self.turn_error = None;
+                    self.history_error = None;
                     self.agent_turn_active = true;
                     if let Some(execution) = &mut self.execution {
                         // An old idle reply cannot finish a run after a newer
@@ -1567,6 +1593,17 @@ impl Adapter for Omp {
                 };
                 self.busy = false;
                 step = self.refresh();
+                // A failed assistant reply may be retried within the turn.
+                // Show its reason only once the final outcome is known.
+                if finished
+                    && let Some(message) = self.turn_error.take()
+                    && outcome == Some(crate::notifications::Kind::Failed)
+                {
+                    step.events.push(Event::Error {
+                        message,
+                        fatal: false,
+                    });
+                }
                 if finished
                     && let Some(execution) = self
                         .execution
@@ -1730,6 +1767,16 @@ fn model_id(value: &Value) -> Option<String> {
         value["id"].as_str()?
     ))
 }
+fn assistant_error(message: &Value) -> Option<String> {
+    if text(message, "role") != "assistant" || text(message, "stopReason") != "error" {
+        return None;
+    }
+    message["errorMessage"]
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_owned)
+}
+
 fn message_key(value: &Value) -> String {
     format!(
         "{}:{}",
@@ -2841,6 +2888,217 @@ mod tests {
         );
         assert_eq!(adapter.execution.as_ref().unwrap().run, next);
         assert!(!adapter.execution.as_ref().unwrap().settled);
+    }
+
+    #[test]
+    fn failed_assistant_message_keeps_provider_error_reason() {
+        let mut adapter = Omp {
+            ready: true,
+            started: true,
+            session_id: Some("01a131b1-7d42-7126-9a3c-e19d00316562".into()),
+            ..Omp::default()
+        };
+        let prompt = adapter
+            .command(Command::Prompt {
+                text: "Hello".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let message = json!({
+            "role":"assistant","timestamp":1,"content":[],
+            "stopReason":"error","errorMessage":"API quota exhausted"
+        });
+        let frames = [
+            json!({"type":"response","command":"prompt","id":prompt.writes[0]["id"],"success":true}),
+            json!({"type":"agent_start"}),
+            json!({"type":"message_end","message":message}),
+            json!({"type":"agent_end","isTerminal":true,"messages":[message]}),
+        ];
+        let mut events = Vec::new();
+        for (index, frame) in frames.into_iter().enumerate() {
+            let step = adapter.receive(frame).unwrap();
+            if index < 3 {
+                assert!(
+                    !step
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::Error { .. })),
+                    "an intermediate reply must not surface a terminal error: {step:#?}"
+                );
+            }
+            events.extend(step.events);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::TurnFinished {
+                    outcome: crate::notifications::Kind::Failed,
+                    ..
+                }
+            )),
+            "the turn must have failed: {events:#?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event,
+                Event::Error { message, fatal: false } if message == "API quota exhausted")),
+            "provider reason was discarded: {events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Error { .. }))
+                .count(),
+            1
+        );
+        let mut snapshot = chat::Snapshot {
+            ready: true,
+            ..Default::default()
+        };
+        chat::runtime::project_events_for_test(&mut snapshot, events);
+        assert_eq!(snapshot.error.as_deref(), Some("API quota exhausted"));
+        assert!(snapshot.ready);
+        assert!(!snapshot.busy);
+        let duplicate = adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        assert!(
+            !duplicate
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn terminal_error_uses_only_the_last_assistant_failure_reason() {
+        use crate::notifications::Kind;
+        for (stop_reason, reason, outcome, expected) in [
+            ("stop", json!("stale reason"), Kind::Succeeded, None),
+            ("aborted", json!("stale reason"), Kind::Cancelled, None),
+            (
+                "error",
+                json!("Replacement reason"),
+                Kind::Failed,
+                Some("Replacement reason"),
+            ),
+            ("error", Value::Null, Kind::Failed, None),
+            ("error", json!(""), Kind::Failed, None),
+            ("error", json!(" \n "), Kind::Failed, None),
+        ] {
+            let mut adapter = Omp::default();
+            adapter.receive(json!({"type":"agent_start"})).unwrap();
+            let failed = adapter.receive(json!({"type":"message_end","message":{
+                "role":"assistant","content":[],"stopReason":"error","errorMessage":"API quota exhausted"
+            }})).unwrap();
+            let intermediate = adapter
+                .receive(json!({"type":"agent_end","isTerminal":false}))
+                .unwrap();
+            assert!(
+                !failed
+                    .events
+                    .iter()
+                    .chain(&intermediate.events)
+                    .any(|event| matches!(event, Event::Error { .. } | Event::TurnFinished { .. }))
+            );
+            let reply = adapter
+                .receive(json!({"type":"message_end","message":{
+                    "role":"assistant","content":[],"stopReason":stop_reason,"errorMessage":reason
+                }}))
+                .unwrap();
+            assert!(
+                !reply
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            let terminal = adapter
+                .receive(json!({"type":"agent_end","isTerminal":true}))
+                .unwrap();
+            assert!(terminal.events.iter().any(|event| matches!(event,
+                Event::TurnFinished { outcome: actual, .. } if *actual == outcome)));
+            let errors = terminal
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Error {
+                        message,
+                        fatal: false,
+                    } => Some(message.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors, expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn history_restores_only_the_latest_assistant_error_after_all_pages() {
+        for (later, expected) in [
+            (
+                json!({"role":"user","content":"retry"}),
+                Some("API quota exhausted"),
+            ),
+            (
+                json!({"role":"assistant","content":[],"stopReason":"stop"}),
+                None,
+            ),
+            (
+                json!({"role":"assistant","content":[],"stopReason":"error","errorMessage":"Replacement reason"}),
+                Some("Replacement reason"),
+            ),
+        ] {
+            let mut adapter = Omp::default();
+            let request = adapter.history_page(None);
+            let first = adapter.receive(json!({
+                "type":"response","command":"get_messages_page","id":request["id"],"success":true,
+                "data":{"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"API quota exhausted"}],"nextCursor":"next"}
+            })).unwrap();
+            assert!(
+                !first
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            let last = adapter.receive(json!({
+                "type":"response","command":"get_messages_page","id":first.writes[0]["id"],"success":true,
+                "data":{"messages":[later]}
+            })).unwrap();
+            let mut snapshot = chat::Snapshot::default();
+            chat::runtime::project_events_for_test(&mut snapshot, last.events);
+            assert_eq!(snapshot.error.as_deref(), expected);
+            assert!(snapshot.ready);
+            assert!(!snapshot.busy);
+        }
+    }
+
+    #[test]
+    fn live_turn_invalidates_the_error_in_pending_history_pages() {
+        let mut adapter = Omp::default();
+        let request = adapter.history_page(None);
+        let first = adapter.receive(json!({
+            "type":"response","command":"get_messages_page","id":request["id"],"success":true,
+            "data":{"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Old reason"}],"nextCursor":"next"}
+        })).unwrap();
+        adapter.receive(json!({"type":"agent_start"})).unwrap();
+        adapter
+            .receive(json!({"type":"message_end","message":{
+                "role":"assistant","content":[],"stopReason":"stop"
+            }}))
+            .unwrap();
+        adapter
+            .receive(json!({"type":"agent_end","isTerminal":true}))
+            .unwrap();
+        let last = adapter.receive(json!({
+            "type":"response","command":"get_messages_page","id":first.writes[0]["id"],"success":true,
+            "data":{"messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Old reason"}]}
+        })).unwrap();
+        assert!(
+            !last
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
     }
 
     #[test]
