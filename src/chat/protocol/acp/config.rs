@@ -257,6 +257,7 @@ impl Config {
         };
         let mut events = Vec::with_capacity(3);
         if let Some(models) = self.models() {
+            let ids = models.values();
             events.push(Event::Models {
                 models: models
                     .choices
@@ -268,6 +269,7 @@ impl Config {
                             &choice.value,
                             &models.current,
                             &levels,
+                            &ids,
                             &combined,
                         ),
                     })

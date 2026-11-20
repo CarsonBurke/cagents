@@ -6631,9 +6631,13 @@ impl Cagents {
             None if account.failure.is_none() => {
                 rows.push(design::caption("Checking usage…").into());
             }
-            // No check has answered, so whether it is signed in is unknown,
-            // and signing in is a way forward whatever the failure was.
-            None if !account.account.is_brokered() => {
+            // No check of an ACP agent's sign-in has answered, so whether it
+            // is signed in is unknown, and signing in is a way forward
+            // whatever the failure was - except an agent that is not there.
+            None if account.account.provider.speaks_acp()
+                && !account.account.is_brokered()
+                && self.account_ui.installed.get(&account.account.provider) != Some(&false) =>
+            {
                 rows.push(
                     design::caption(format!(
                         "cagents could not check whether {} is signed in. Sign in if it is not.",

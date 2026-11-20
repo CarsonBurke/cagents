@@ -56,31 +56,36 @@ pub(super) async fn probe_antigravity(
 
 /// Probes with `command`, an `agy acp` keeping its data in `data`.
 ///
-/// Whatever the agent saved of a probe's session is removed afterwards,
-/// whether the probe finished, failed or was abandoned by its timeout, and
-/// again before the next probe, for anything a probe cut short at a moment
-/// no cleanup could follow: nothing in `data` is anyone's conversation.
+/// One probe of `data` runs at a time, so none removes another's session
+/// while it is open. Whatever the agent saved of a probe's session is
+/// removed afterwards, whether the probe finished, failed or was abandoned by
+/// its timeout, and again before the next probe, for anything a probe cut
+/// short at a moment no cleanup could follow: nothing in `data` is anyone's
+/// conversation.
 async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Probed, String> {
     let workspace = data.join("workspace");
-    {
+    let lock = {
         let (data, workspace) = (data.clone(), workspace.clone());
         tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&data)?;
+            let lock = crate::instance::owned_lock(&data.join(PROBE_LOCK), libc::LOCK_EX)?;
             forget(&data);
-            std::fs::create_dir_all(&workspace)
+            std::fs::create_dir_all(&workspace)?;
+            Ok::<_, std::io::Error>(lock)
         })
         .await
         .map_err(|error| error.to_string())?
-        .map_err(|_| "Antigravity's probe directory could not be created".to_owned())?;
-    }
+        .map_err(|_| "Antigravity's probe directory could not be prepared".to_owned())?
+    };
     command.current_dir(&workspace);
     // Declared before the session, so it is dropped after the session's
     // process group is killed.
-    let mut abandoned = Forgetting(Some(data));
+    let mut claim = Claim(Some((data, lock)));
     let mut session = Session::spawn(command).await?;
     let result = open(&mut session, &workspace).await;
     let result = super::after_close(result, session.close()).await;
-    if let Some(data) = abandoned.0.take() {
-        let _ = tokio::task::spawn_blocking(move || forget(&data)).await;
+    if let Some(claimed) = claim.0.take() {
+        let _ = tokio::task::spawn_blocking(move || release(claimed)).await;
     }
     let Observed {
         value: opened,
@@ -88,6 +93,10 @@ async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Pro
     } = result?;
     Ok(probed("Antigravity", opened, observed_at))
 }
+
+/// The lock a probe of a data directory holds there from before it starts
+/// the agent until its session is forgotten.
+const PROBE_LOCK: &str = ".cagents-probe.lock";
 
 /// The session stores of a probe's data directory, in which Antigravity
 /// names every entry after its session: `conversations/<id>.db`,
@@ -123,17 +132,27 @@ fn forget(data: &Path) {
     }
 }
 
-/// Forgets a probe's sessions when the probe is dropped before it could:
-/// abandoned by its timeout. The removal runs on a blocking thread, since a
-/// drop cannot wait for it.
-struct Forgetting(Option<PathBuf>);
+/// A probe's hold on its data directory: its sessions are forgotten, then
+/// the directory is left to the next probe.
+type Claimed = (PathBuf, crate::instance::OwnedLock);
 
-impl Drop for Forgetting {
+fn release((data, lock): Claimed) {
+    forget(&data);
+    drop(lock);
+}
+
+/// Releases a probe's data directory when the probe is dropped before it
+/// could: abandoned by its timeout. The removal runs on a blocking thread,
+/// since a drop cannot wait for it; without a runtime, the next probe's
+/// own sweep removes it.
+struct Claim(Option<Claimed>);
+
+impl Drop for Claim {
     fn drop(&mut self) {
-        if let Some(data) = self.0.take()
+        if let Some(claimed) = self.0.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
-            runtime.spawn_blocking(move || forget(&data));
+            runtime.spawn_blocking(move || release(claimed));
         }
     }
 }
@@ -301,10 +320,14 @@ fn opened(result: &Value) -> Opened {
         .collect();
     let catalog = select("model").and_then(|option| {
         let current = option["currentValue"].as_str().unwrap_or_default();
-        let models = values(option)
+        let offered = values(option);
+        let ids = offered.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let models = offered
             .into_iter()
             .map(|(id, label)| Model {
-                reasoning: crate::chat::acp_levels::model_levels(&id, current, &levels, &combined),
+                reasoning: crate::chat::acp_levels::model_levels(
+                    &id, current, &levels, &ids, &combined,
+                ),
                 id,
                 label,
             })
@@ -525,12 +548,20 @@ mod tests {
             probed.snapshot.plan_display_name.as_deref(),
             Some("Fixture tier")
         );
+        // Each model with its own levels, as the fixture's agy offers them.
         let catalog = probed.catalog.unwrap();
-        assert!(
-            catalog
-                .models
-                .iter()
-                .all(|model| model.reasoning == ["low", "medium", "high", "xhigh"])
+        let levels = catalog
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.reasoning.join(" ")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            levels,
+            [
+                ("gemini-3.8-flash", "low medium high".to_owned()),
+                ("gemini-4-neon", "low medium high xhigh".to_owned()),
+                ("gpt-oss-120b-medium", String::new()),
+            ]
         );
         assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
 
@@ -565,6 +596,42 @@ mod tests {
         while !agent.sessions().is_empty() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
+    }
+
+    /// A second probe, such as a sign-in's check beside the account's own,
+    /// waits for the first rather than sweeping away its open session.
+    #[tokio::test]
+    async fn a_probe_waits_for_another_rather_than_removing_its_session() {
+        let agent = Agent::new();
+        agent.mark("hang-probe");
+        let mut first = Box::pin(probe_antigravity_in(agent.data(), agent.command()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while agent.sessions().len() < SESSION_STORES.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent saved no session"
+            );
+            tokio::select! {
+                result = &mut first => panic!("the hung probe answered: {:?}", result.err()),
+                () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+        let mut second = tokio::spawn(probe_antigravity_in(agent.data(), agent.command()));
+        tokio::select! {
+            _ = &mut second => panic!("the second probe did not wait"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
+        assert_eq!(agent.sessions().len(), SESSION_STORES.len());
+        // The first gives up; the second then runs, and leaves nothing.
+        std::fs::remove_file(agent.directory.path().join("state/hang-probe")).unwrap();
+        drop(first);
+        let probed = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+            .await
+            .expect("the second probe finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(probed.snapshot.status, UsageStatus::Ok);
         assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
     }
 }

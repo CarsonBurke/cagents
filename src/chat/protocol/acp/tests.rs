@@ -1067,6 +1067,25 @@ fn a_turn_refused_for_no_allowance_keeps_the_provider_s_reason() {
             "subscription allowance unavailable: the server sent no usage data"}}),
     );
     assert_eq!(chat::no_allowance_reason(provider, &message), None);
+    // Words the agent only echoes, such as a request it failed to send,
+    // are not its reason.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error", "data": {
+            "message": "the tool call failed",
+            "request": {"prompt": "why does the API answer 402 Payment Required?"}}}),
+    );
+    assert_eq!(chat::no_allowance_reason(provider, &message), None);
+    // An HTTP status the agent reports is its own.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error",
+            "data": {"status": 402, "message": "model request failed"}}),
+    );
+    assert_eq!(
+        chat::no_allowance_reason(provider, &message),
+        Some("model request failed")
+    );
 }
 
 #[test]

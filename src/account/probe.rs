@@ -334,14 +334,15 @@ fn prepare(
     let Some(program) = find_executable(account.provider.executable(), search_path) else {
         return unavailable(format!("{} is not installed", cli_name(account.provider)));
     };
-    // An ACP agent keeps its sign-in in that home, so one installed without
-    // it has never been signed in, which is what the reader needs to do.
+    // An ACP agent writes that home the first time it runs, so one
+    // installed without it has never been signed in, which is what the
+    // reader needs to do; there is nothing to start it for.
     if !set_up {
         return Prepared::Done(answered(
             None,
             UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
-                format!("Signed out of {}", cli_name(account.provider)),
+                format!("Not signed in to {}", cli_name(account.provider)),
                 now,
             ),
         ));
@@ -2789,6 +2790,105 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// An ACP account's answer stands, without starting its CLI, while
+    /// nothing it depends on changed and it is young enough to trust; an
+    /// explicit refresh, a changed sign-in record or an answer it does not
+    /// vouch for is probed. An agent installed but never run is signed out
+    /// without being started.
+    #[test]
+    fn an_acp_account_is_probed_only_when_its_answer_can_have_changed() {
+        const CHILD: &str = "CAGENTS_ACP_PREPARE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            // The child reads its homes from these, never the reader's own.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::probe::tests::an_acp_account_is_probed_only_when_its_answer_can_have_changed",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for program in ["muse", "agy"] {
+            std::fs::write(bin.join(program), "#!/bin/sh\nexit 99\n").unwrap();
+            make_executable(&bin.join(program));
+        }
+        std::fs::create_dir_all(root.join("config/muse")).unwrap();
+        std::fs::write(root.join("config/muse/auth.json"), b"{}").unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let muse = Account::system(Provider::Muse);
+        let key = muse.cache_key().unwrap();
+        let path = Some(bin.as_os_str());
+        let now = crate::chat::now_ms().unwrap();
+        // Answered from the cache, as opposed to probed.
+        let reused = |force: bool| match prepare(&muse, Some(&cache), force, now, path) {
+            Prepared::Done(Outcome::Answered { snapshot, .. }) => {
+                assert_eq!(snapshot.source, UsageSource::Cache);
+                assert_eq!(snapshot.observed_at, now);
+                Some(snapshot.status)
+            }
+            Prepared::Done(_) => panic!("neither answered nor probed"),
+            Prepared::Probe { .. } => None,
+        };
+        let Prepared::Probe { fingerprint, .. } = prepare(&muse, Some(&cache), false, now, path)
+        else {
+            panic!("a first look did not probe");
+        };
+        let fingerprint = fingerprint.expect("Muse's inputs are read");
+        // Older than another window's answer would be shared for.
+        let observed_at = now - STALE_AFTER - 1;
+        let store = |status| {
+            let mut snapshot = UsageSnapshot::state(status, "probed", observed_at);
+            snapshot.source = UsageSource::Probe;
+            let entry = Entry {
+                identity: None,
+                snapshot,
+            };
+            cache
+                .store_observed(&key, entry, Some(fingerprint.clone()))
+                .unwrap();
+        };
+        store(UsageStatus::Ok);
+        assert_eq!(reused(false), Some(UsageStatus::Ok));
+        assert_eq!(reused(true), None);
+        store(UsageStatus::NeedsLogin);
+        assert_eq!(reused(false), Some(UsageStatus::NeedsLogin));
+        // No allowance changes with a subscription bought elsewhere.
+        store(UsageStatus::Limited);
+        assert_eq!(reused(false), None);
+        store(UsageStatus::Ok);
+        std::fs::write(
+            root.join("config/muse/auth.json"),
+            b"{\"signed\": \"again\"}",
+        )
+        .unwrap();
+        assert_eq!(reused(false), None);
+
+        // Antigravity is installed, but has never run: no ~/.gemini.
+        let agy = Account::system(Provider::Antigravity);
+        match prepare(&agy, Some(&cache), false, now, path) {
+            Prepared::Done(Outcome::Answered { snapshot, .. }) => {
+                assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+                assert_eq!(
+                    snapshot.detail.as_deref(),
+                    Some("Not signed in to Antigravity")
+                );
+            }
+            _ => panic!("an Antigravity that never ran was started"),
+        }
     }
 
     /// The system Claude login's two records, as the probe reads them: the

@@ -94,12 +94,21 @@ pub(super) fn fingerprint(
     )
 }
 
-/// Whether an unchanged fingerprint vouches for an answer of `status`: it
-/// covers Muse's sign-in, but not Antigravity's, in the keyring, so a
+/// Whether an unchanged fingerprint vouches for an answer of `status`.
+///
+/// A working sign-in stands while nothing it depends on changed. A sign-in
+/// that does not work stands only where the fingerprint covers it: Muse's,
+/// in its `auth.json`, but not Antigravity's, in the keyring, so a
 /// signed-out Antigravity is asked again on schedule, the moment it is most
-/// likely to be signed in from outside cagents.
+/// likely to be signed in from outside cagents. A login refused for having
+/// no allowance changes with a subscription bought elsewhere, and an answer
+/// that could not be had says nothing, so both are asked again.
 pub(super) fn vouches_for(provider: Provider, status: UsageStatus) -> bool {
-    provider == Provider::Muse || status != UsageStatus::NeedsLogin
+    match status {
+        UsageStatus::Ok | UsageStatus::Warning => true,
+        UsageStatus::NeedsLogin => provider == Provider::Muse,
+        UsageStatus::Limited | UsageStatus::Unavailable => false,
+    }
 }
 
 #[cfg(test)]
@@ -151,5 +160,7 @@ mod tests {
         assert!(vouches_for(Provider::Muse, UsageStatus::NeedsLogin));
         assert!(vouches_for(Provider::Antigravity, UsageStatus::Ok));
         assert!(!vouches_for(Provider::Antigravity, UsageStatus::NeedsLogin));
+        // A subscription bought elsewhere leaves no trace here.
+        assert!(!vouches_for(Provider::Muse, UsageStatus::Limited));
     }
 }

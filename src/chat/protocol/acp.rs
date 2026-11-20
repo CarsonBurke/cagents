@@ -92,20 +92,37 @@ pub fn auth_required(error: &Value) -> bool {
 pub const SIGN_IN_PREFIX: &str = chat::ACP_SIGN_IN_PREFIX;
 
 /// Whether an error reply refuses the request because the login has no
-/// usage allowance. ACP has no code for it, so this reads the agent's words
-/// for the HTTP status and Muse's own reason; an allowance Muse merely has
-/// no figures for is not this.
+/// usage allowance. ACP has no code for it, so this reads the agent's own
+/// words for it - its message, its data's message, details, reason and code,
+/// and an HTTP status - and nothing else the data carries, such as an echoed
+/// request whose text could say anything. An allowance Muse merely has no
+/// figures for is not this.
 pub fn no_allowance(error: &Value) -> bool {
-    // Bounded: an error's data can carry a whole request.
-    let text: String = error.to_string().chars().take(8192).collect();
-    let text = text.to_ascii_lowercase();
-    [
-        "payment required",
-        "no_allowance",
-        "no subscription allowance",
-    ]
-    .iter()
-    .any(|phrase| text.contains(phrase))
+    let data = &error["data"];
+    if [&data["reason"], &data["code"]]
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|value| value.trim().eq_ignore_ascii_case("no_allowance"))
+        || [&data["status"], &data["statusCode"]]
+            .iter()
+            .any(|status| status.as_i64() == Some(402))
+    {
+        return true;
+    }
+    [&error["message"], &data["message"], &data["details"], data]
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|words| {
+            // Bounded: a detail can carry a whole response.
+            let words = words
+                .chars()
+                .take(2048)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            words.contains("402 payment required")
+                || words.contains("no subscription allowance")
+                || words.contains("(no_allowance)")
+        })
 }
 
 pub fn create(
