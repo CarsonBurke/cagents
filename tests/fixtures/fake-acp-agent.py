@@ -449,8 +449,9 @@ class Agent:
             session.update({"sessionUpdate": "usage_update", "used": 0, "size": 0,
                             "_meta": {"dev.muse": {"contextSizeUnknown": True}}}, record=False)
         else:
-            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000,
-                            "cost": {"amount": 0.0012, "currency": "USD"}}, record=False)
+            # Antigravity reports its context window, never a cost.
+            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000},
+                           record=False)
         if session.id in self.cancelled:
             stop = "cancelled"
         result = {"stopReason": stop}

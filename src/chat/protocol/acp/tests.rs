@@ -1128,6 +1128,14 @@ fn plans_commands_modes_titles_and_usage_are_published() {
             title: Some("Fix the build".into())
         }]
     );
+    // Muse's name for a session it has not named is no name.
+    let step = acp
+        .receive(update(
+            &session,
+            json!({"sessionUpdate": "session_info_update", "title": "New session"}),
+        ))
+        .unwrap();
+    assert!(step.events.is_empty(), "{:?}", step.events);
     let step = acp
         .receive(update(
             &session,
@@ -1491,5 +1499,35 @@ fn a_confirmed_identity_replaces_the_conversation_a_terminal_resumes() {
     assert_eq!(
         arguments,
         ["--agent", "--conversation", "--conversation", "new"]
+    );
+}
+
+/// Muse lists its modes starting with running everything unasked; the reader
+/// is offered them in the order Claude's modes of the same meanings take.
+#[test]
+fn muse_modes_are_offered_from_most_to_least_cautious() {
+    let mut acp = Acp {
+        cwd: "/work/project".into(),
+        ..Acp::new(&muse::PROFILE)
+    };
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), muse_initialize()))
+        .unwrap();
+    let mut new = muse_new();
+    let modes = json!([
+        {"name": "Allow all", "value": "allowAll"},
+        {"name": "Ask before unmatched actions", "value": "promptUnmatched"},
+        {"name": "Ask on request", "value": "onRequest"},
+        {"name": "Deny unmatched actions", "value": "denyUnmatched"}]);
+    new["configOptions"][0]["options"] = modes;
+    let step = acp.receive(reply(only_write(&opened), new)).unwrap();
+    let offered = step.events.iter().find_map(|event| match event {
+        Event::Capabilities(capabilities) => Some(capabilities.permission_modes.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        offered.unwrap(),
+        ["manual", "auto", "dontAsk", "bypassPermissions"]
     );
 }

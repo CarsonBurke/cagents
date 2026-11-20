@@ -1338,7 +1338,7 @@ fn pane_labels(app: &mut Cagents, card: CardId) -> Vec<String> {
     labels
 }
 
-fn buttons(app: &Cagents, card: CardId) -> Vec<(String, bool)> {
+pub(super) fn buttons(app: &Cagents, card: CardId) -> Vec<(String, bool)> {
     let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
     tree.root()
         .iter()

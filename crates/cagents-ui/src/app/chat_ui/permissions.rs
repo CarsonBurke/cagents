@@ -303,7 +303,11 @@ impl Runtime {
                 content.push(
                     widget::button::custom(
                         widget::column::with_children(vec![
-                            design::body(view::permission_mode_label(mode)).into(),
+                            design::body(view::permission_mode_label(
+                                self.session.launch.provider,
+                                mode,
+                            ))
+                            .into(),
                             design::caption(mode_description(self.session.launch.provider, mode))
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
                                 .into(),

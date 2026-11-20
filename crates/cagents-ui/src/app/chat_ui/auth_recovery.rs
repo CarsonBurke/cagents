@@ -176,8 +176,7 @@ pub(super) fn view<'a>(
     let label = if let Some(recovery) = recovery {
         let enabled = enabled && runtime.recovery_available() && !recovery.signing_in;
         draft = recovery.draft;
-        let resume_enabled =
-            enabled && recovery.login_change.is_none() && (!draft || runtime.has_unsent_draft());
+        let resume_enabled = enabled && recovery.login_change.is_none();
         login_change = recovery.login_change;
         controls.push(
             crate::ui_controls::button::primary("Sign in")
@@ -185,11 +184,17 @@ pub(super) fn view<'a>(
                 .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
                 .into(),
         );
-        controls.push(
-            crate::ui_controls::button::secondary(if draft { "Send again" } else { "Resume chat" })
-                .on_press_maybe(resume_enabled.then_some(action(Action::ResumeAfterSignIn(target))))
-                .into(),
-        );
+        // A draft's message is back in the composer, whose Send starts the
+        // conversation again; a second control here would do the same.
+        if !draft {
+            controls.push(
+                crate::ui_controls::button::secondary("Resume chat")
+                    .on_press_maybe(
+                        resume_enabled.then_some(action(Action::ResumeAfterSignIn(target))),
+                    )
+                    .into(),
+            );
+        }
         controls.push(
             crate::ui_controls::button::secondary("Open accounts")
                 .on_press(Message::AccountUi(account_ui::Action::OpenPane))

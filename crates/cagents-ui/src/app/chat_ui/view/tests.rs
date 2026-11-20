@@ -12515,3 +12515,82 @@ fn a_lone_coordinating_step_still_running_says_so() {
         "{texts:?}"
     );
 }
+
+/// A draft names the reasoning level only where its chosen model offers it:
+/// Muse's muse-wonder-1.0 offers none, so a level kept from muse-spark-1.2
+/// is not shown beside it (#3380).
+#[test]
+fn draft_label_names_only_a_reasoning_level_the_chosen_model_offers() {
+    let (mut runtime, _handle) = furnished_runtime();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.active_model = None;
+    snapshot.models = vec![
+        chat::Model {
+            reasoning: vec!["xhigh".into()],
+            ..model("muse-spark-1.2", "muse-spark-1.2")
+        },
+        model("muse-wonder-1.0", "muse-wonder-1.0"),
+    ];
+    snapshot.reasoning = Some("xhigh".into());
+    let label = |snapshot: &chat::Snapshot, id: &'static str, provider| {
+        footer_model_label(
+            snapshot,
+            ChosenModel {
+                id: Some(id),
+                reasoning: snapshot.reasoning.as_deref(),
+            },
+            true,
+            provider,
+            FooterFit::Wide,
+            None,
+        )
+        .into_owned()
+    };
+    assert_eq!(
+        label(snapshot, "muse-spark-1.2", Provider::Muse),
+        "muse-spark-1.2 · Extra high"
+    );
+    assert_eq!(
+        label(snapshot, "muse-wonder-1.0", Provider::Muse),
+        "muse-wonder-1.0"
+    );
+    // A level the model's list leaves out is not its level either.
+    snapshot.models[0].reasoning = vec!["low".into()];
+    assert_eq!(
+        label(snapshot, "muse-spark-1.2", Provider::Muse),
+        "muse-spark-1.2"
+    );
+    // Claude and Codex catalogs can leave a model's levels unlisted.
+    assert_eq!(
+        label(snapshot, "muse-wonder-1.0", Provider::Claude),
+        "muse-wonder-1.0 · Extra high"
+    );
+}
+
+/// Muse's modes mean what Claude's of the same names do only roughly: they
+/// keep Muse's own words rather than Claude's (#3380).
+#[test]
+fn muse_modes_keep_their_own_names() {
+    for (mode, muse, claude) in [
+        ("manual", "Ask before unmatched", "Ask before edits"),
+        ("auto", "Ask on request", "Auto"),
+        ("dontAsk", "Deny unmatched", "Don't ask"),
+        ("bypassPermissions", "Allow all", "YOLO"),
+    ] {
+        assert_eq!(permission_mode_label(Provider::Muse, mode), muse);
+        assert_eq!(permission_mode_label(Provider::Claude, mode), claude);
+    }
+    assert_eq!(
+        permission_mode_label(Provider::Antigravity, "acceptEdits"),
+        "Auto-accept edits"
+    );
+}
+
+#[test]
+fn a_spend_below_one_cent_never_reads_as_free() {
+    assert_eq!(dollars(0), "$0.00");
+    assert_eq!(dollars(1_200), "<$0.01");
+    assert_eq!(dollars(9_999), "<$0.01");
+    assert_eq!(dollars(10_000), "$0.01");
+    assert_eq!(dollars(1_234_567), "$1.23");
+}
