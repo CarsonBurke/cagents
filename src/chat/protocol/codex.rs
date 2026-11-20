@@ -4170,6 +4170,7 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
             _ => (original.to_owned(), ChangeKind::Updated),
         };
         changes.push(FileChange {
+            lines: crate::chat::LineOrigin::File,
             path,
             kind,
             // Reporting an absent patch as an empty one would render a real
@@ -4259,6 +4260,7 @@ fn turn_diff_changes(diff: &str) -> Vec<FileChange> {
                 };
             let body = &section[header_end..];
             Some(FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path,
                 kind,
                 // A change with no hunks keeps what its header says of it,

@@ -5002,6 +5002,7 @@ fn file_change_rename_points_at_the_destination_and_keeps_the_source() {
     assert_eq!(
         changes[0],
         FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/new.rs".into(),
             kind: ChangeKind::Renamed {
                 from: "src/old.rs".into()

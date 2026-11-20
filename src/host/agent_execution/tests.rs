@@ -5797,6 +5797,7 @@ fn console_lines_summarize_steps_without_their_payloads() {
         )
     };
     let change = |path: &str, kind| FileChange {
+        lines: crate::chat::LineOrigin::File,
         path: path.into(),
         kind,
         diff: "+SECRET_DIFF".into(),
@@ -6152,6 +6153,7 @@ fn console_prints_a_provider_notice_as_one_unlabelled_line() {
 #[test]
 fn console_counts_the_files_a_paged_edit_adds_in_each_part() {
     let change = |path: &str| chat::FileChange {
+        lines: crate::chat::LineOrigin::File,
         path: path.into(),
         kind: chat::ChangeKind::Updated,
         diff: String::new(),

@@ -9443,6 +9443,7 @@ fn a_lone_file_step_names_its_file_on_the_collapsed_strip() {
         role: chat::Role::Assistant,
         content: ItemContent::Changes {
             changes: vec![chat::FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path: "/project/src/platform/a.rs".into(),
                 kind: chat::ChangeKind::Updated,
                 diff: String::new(),

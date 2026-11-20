@@ -224,6 +224,9 @@ struct Comparison<'a> {
     /// Appended variants of the named enum that the older client is sent as
     /// one it knows, and added fields of the named struct it is sent without.
     restated: Vec<(&'static str, &'static str)>,
+    /// Fields of the named struct in `older` that the other side decodes a
+    /// message without, because it decodes in that side's protocol.
+    decoded_without: Vec<(&'static str, &'static str)>,
     /// When present, only these outer variants belong to the proven contract.
     /// Nested enums remain unrestricted and must agree in full.
     selected: Vec<(&'static str, Vec<&'static str>)>,
@@ -272,7 +275,17 @@ impl Comparison<'_> {
                     })
                     .cloned()
                     .collect();
-                self.named(direction, old, &new, path);
+                // A field an update source never sent is one this side
+                // decodes its message without (see `decoding_from`).
+                let old: Vec<_> = old
+                    .iter()
+                    .filter(|(name, _)| {
+                        direction == Direction::Request
+                            || !self.decoded_without.contains(&(older, name.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                self.named(direction, &old, &new, path);
             }
             (Container::Enum(old), Container::Enum(new)) => {
                 let gate = self
@@ -417,6 +430,7 @@ fn differences(
         gated,
         refused,
         restated,
+        decoded_without: Vec::new(),
         selected: Vec::new(),
         visited: BTreeSet::new(),
         differences: Vec::new(),
@@ -606,14 +620,41 @@ fn lifecycle_differences(
     restated: &[(&'static str, &'static str)],
     selected: &[(&'static str, Vec<&'static str>)],
 ) -> Vec<String> {
+    decoding_lifecycle_differences(older, current, restated, &[], selected)
+}
+
+/// The fields this side decodes a source of `protocol`'s messages without.
+fn decoded_for(protocol: u16) -> Vec<(&'static str, &'static str)> {
+    DECODED_WITHOUT
+        .iter()
+        .filter(|(.., since)| protocol < *since)
+        .flat_map(|(container, fields, _)| fields.iter().map(move |field| (*container, *field)))
+        .collect()
+}
+
+/// As [`lifecycle_differences`], where this side decodes the older side's
+/// messages without `decoded` fields.
+fn decoding_lifecycle_differences(
+    older: &Shapes,
+    current: &Shapes,
+    restated: &[(&'static str, &'static str)],
+    decoded: &[(&'static str, &'static str)],
+    selected: &[(&'static str, Vec<&'static str>)],
+) -> Vec<String> {
     let mut changed = Vec::new();
-    for (older, current) in [(older, current), (current, older)] {
+    for (reversed, (older, current)) in [(false, (older, current)), (true, (current, older))] {
         let mut comparison = Comparison {
             older,
             current,
             gated: Vec::new(),
             refused: Vec::new(),
             restated: restated.to_vec(),
+            // Compared the other way round, `older` is this side's types.
+            decoded_without: if reversed {
+                decoded.to_vec()
+            } else {
+                Vec::new()
+            },
             selected: selected.to_vec(),
             visited: BTreeSet::new(),
             differences: Vec::new(),
@@ -642,12 +683,19 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
     for protocol in crate::update::source::protocols() {
         let older = recorded(protocol);
         let restated = restated_for(protocol);
+        let decoded = decoded_for(protocol);
         let selected = selected_for(protocol);
-        let mut changed = lifecycle_differences(&older, &current_recording, &restated, &selected);
+        let mut changed = decoding_lifecycle_differences(
+            &older,
+            &current_recording,
+            &restated,
+            &decoded,
+            &selected,
+        );
         // Also compare actual Rust types: regenerating the current fixture
         // cannot bless an incompatible change to an admitted source's subset.
-        changed.extend(lifecycle_differences(
-            &older, &current, &restated, &selected,
+        changed.extend(decoding_lifecycle_differences(
+            &older, &current, &restated, &decoded, &selected,
         ));
         assert!(
             changed.is_empty(),

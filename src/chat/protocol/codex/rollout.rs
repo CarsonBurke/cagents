@@ -393,6 +393,7 @@ fn turn_item(item: &Value) -> Option<(Role, ItemContent)> {
                     changes
                         .iter()
                         .map(|(path, change)| FileChange {
+                            lines: crate::chat::LineOrigin::File,
                             path: path.clone(),
                             kind: match change["type"].as_str() {
                                 Some("add") => ChangeKind::Added,

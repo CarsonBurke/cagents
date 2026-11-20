@@ -3479,6 +3479,7 @@ fn find_matches_displayed_command_labels_directories_and_changed_paths() {
     assert!(contains_text(&command, "workspace"));
     let change = ItemContent::Changes {
         changes: vec![chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/Über.rs".into(),
             kind: chat::ChangeKind::Updated,
             diff: "+line".into(),
@@ -19165,6 +19166,7 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
     );
     let changes = ItemContent::Changes {
         changes: vec![chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/app.rs".to_owned(),
             diff: "@@\n-old\n+new\n".to_owned(),
             kind: chat::ChangeKind::Updated,
@@ -19208,6 +19210,7 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
 fn change_token_separates_renames_that_differ_only_in_their_source() {
     let renamed = |from: &str| ItemContent::Changes {
         changes: vec![chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "src/new.rs".to_owned(),
             diff: String::new(),
             kind: chat::ChangeKind::Renamed {
