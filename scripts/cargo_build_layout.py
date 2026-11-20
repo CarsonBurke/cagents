@@ -120,8 +120,15 @@ class BuildProfile:
             for package in _entries(build / "build"):
                 if not _directory(package):
                     return unknown
+                # A legacy build directory is named exactly like its
+                # fingerprint. A modern package whose name merely ends in a
+                # legacy unit's hash is read as a modern package below.
                 match = LEGACY_UNIT.fullmatch(package.name)
-                if legacy and match and match[2] in legacy_units:
+                if legacy and match and legacy_units.get(match[2], (None,))[0] == match[1]:
+                    # Unit-hash directories would make it a modern package
+                    # too, and the name cannot say which it is.
+                    if any(UNIT_HASH.fullmatch(entry.name) for entry in _entries(package)):
+                        return unknown
                     # Do not inspect the contents of a legacy OUT_DIR.
                     outputs[match[2]].append(package)
                     continue

@@ -103,6 +103,27 @@ class CargoBuildLayout(unittest.TestCase):
         self.assertEqual(profile.dependency_lists, tuple(sorted((legacy[2], modern[2]))))
         self.assertEqual(profile.build_script_outputs, tuple(sorted((legacy[3], modern[3]))))
 
+    def test_modern_package_ending_in_a_legacy_hash_is_not_that_legacy_unit(self):
+        unit_hash = "0123456789abcdef"
+        legacy = self.legacy(package="old", unit_hash=unit_hash)
+        modern = self.modern(package=f"new-{unit_hash}", unit_hash="fedcba9876543210")
+        profile = self.directories.profile("debug")
+        self.assertEqual(profile.layout, "mixed")
+        self.assertEqual(profile.units, (
+            ArtifactUnit(f"new-{unit_hash}", "fedcba9876543210", modern[0],
+                         (modern[0].parent,), (modern[2],), (modern[3],)),
+            ArtifactUnit("old", unit_hash, legacy[0],
+                         (legacy[0], legacy[1], legacy[2], legacy[3].parent), (legacy[2],), (legacy[3],)),
+        ))
+        self.assertEqual(profile.dependency_lists, tuple(sorted((legacy[2], modern[2]))))
+        self.assertEqual(profile.build_script_outputs, tuple(sorted((legacy[3], modern[3]))))
+
+    def test_legacy_build_directory_holding_modern_units_is_unknown(self):
+        unit_hash = "0123456789abcdef"
+        self.legacy(package="same", unit_hash=unit_hash)
+        self.modern(package=f"same-{unit_hash}", unit_hash="fedcba9876543210")
+        self.assert_unknown(self.directories.profile("debug"))
+
     def test_private_inventory_uses_build_directory_and_public_lists_use_target(self):
         private = self.modern()
         public = self.write(self.target / "debug/cagents.d")
