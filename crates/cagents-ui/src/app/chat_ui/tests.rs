@@ -19321,7 +19321,9 @@ fn file_review_replies_finish_while_modal_input_is_blocked() {
         card: CardId::new(),
         generation: 1,
     };
-    assert!(Action::ChangesLoaded(target, 1, Err("reply".into())).allowed_while_modal());
+    assert!(
+        Action::ChangesLoaded(target, 1, Err("reply".into()), Arc::from([])).allowed_while_modal()
+    );
     assert!(
         Action::ChangedFileResolved(target, 1, "/reported".into(), Err("reply".into()))
             .allowed_while_modal()
