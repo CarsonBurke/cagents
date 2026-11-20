@@ -17027,9 +17027,11 @@ impl Application for Cagents {
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
         // `sync_window_title`.
-        let has_multiple_panes = self.workspace.cards().len() > 1;
+        // A pane out of sight while its close is decided is not one the
+        // reader has: hiding the last one shows the empty workspace.
+        let has_multiple_panes = self.workspace.shown().nth(1).is_some();
 
-        let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
+        let workspace: Element<'_, Message> = if self.workspace.shown().next().is_none() {
             let directory = self
                 .terminal_directory()
                 .unwrap_or_else(|| STARTING_DIRECTORY.clone());

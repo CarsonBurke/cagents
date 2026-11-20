@@ -1010,17 +1010,22 @@ impl Workspace {
     /// Convert a drag's rendered width back into a preference. Underfilled
     /// strips expand proportionally, so storing the visible width directly
     /// would expand it again and make the divider jump ahead of the pointer.
+    /// A pane out of sight takes no room, so only the shown ones count.
     pub fn preferred_width_for_resize(&self, id: CardId, visible_width: f32) -> f32 {
-        if self.cards.len() < 2 {
+        let shown = self
+            .cards
+            .iter()
+            .filter(|card| !self.is_hidden(card.id))
+            .collect::<Vec<_>>();
+        if shown.len() < 2 {
             return visible_width;
         }
         let available = (self.viewport_width
             - self.config.leading_padding
             - self.config.trailing_padding
-            - self.config.gap * self.cards.len().saturating_sub(1) as f32)
+            - self.config.gap * shown.len().saturating_sub(1) as f32)
             .max(0.0);
-        let others = self
-            .cards
+        let others = shown
             .iter()
             .filter(|card| card.id != id)
             .map(|card| {
@@ -4760,6 +4765,25 @@ mod tests {
             .set_card_width(id, CardWidth::Fraction(preferred / 7_680.0))
             .unwrap();
         assert!((workspace.geometry().card(id).unwrap().width() - rendered - 16.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dragging_beside_a_hidden_pane_tracks_the_rendered_width() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.25); 3], 1_440.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.hide_card(ids[2]).unwrap();
+        for id in [ids[0], ids[1]] {
+            for visible in [600.0, 700.0, 500.0] {
+                let preferred = workspace.preferred_width_for_resize(id, visible);
+                workspace
+                    .set_card_width(id, CardWidth::Fraction(preferred / 1_440.0))
+                    .unwrap();
+                assert!(
+                    (workspace.geometry().card(id).unwrap().width() - visible).abs() < 0.001,
+                    "the divider stays under the pointer"
+                );
+            }
+        }
     }
 
     #[test]
