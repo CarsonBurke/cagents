@@ -902,7 +902,7 @@ fn drive_terminal_review_with(
                 if !labels.is_empty() && waiting.as_ref() != Some(&labels) {
                     writeln!(
                         terminal,
-                        "Waiting for these conversations to finish their turns:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
+                        "Waiting for these conversations to finish their current work:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
                         labels.join("\n  ")
                     )?;
                     waiting = Some(labels);

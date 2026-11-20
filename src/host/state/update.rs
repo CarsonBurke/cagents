@@ -1,5 +1,7 @@
 use super::*;
-use crate::update::impact::{DaemonImpact, Disposition, Policy, SessionImpact, SessionKind};
+use crate::update::impact::{
+    DaemonImpact, Disposition, Policy, QUEUED_MESSAGES, SessionImpact, SessionKind,
+};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 
@@ -349,8 +351,13 @@ impl HostState {
                         .unwrap_or(record.session.launch.provider.label()),
                     &record.session.launch.recipe.working_directory,
                 ),
+                // The paired console shares this id and is not listed on its
+                // own; a replacement console process is a different owner.
                 identity: identity(&(
                     record.execution_instance,
+                    self.terminals
+                        .get(&id)
+                        .map(|terminal| terminal.handle.execution_instance()),
                     &record.session,
                     confirmed,
                     record.handle.native_continuity(),
@@ -374,8 +381,6 @@ impl HostState {
 /// Waiting for idle can last as long as a subagent's own background work,
 /// which may never end while the conversation looks finished, so the reason
 /// names any such subagent and how to update sooner.
-const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
-
 fn waits_for_idle_reason(hold: &crate::chat::WorkHold) -> String {
     let wait = "The update will wait for this conversation to become idle, then resume it.";
     let held = hold.beyond_turn();

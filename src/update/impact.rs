@@ -24,6 +24,9 @@ pub enum SessionKind {
 /// confirming its work settled, and asks for it to be closed. Every source
 /// line since the candidate line (128) reports it in exactly these words, so
 /// the updater can recognize the one blocker that closing resolves.
+/// A conversation has messages accepted for it but not yet delivered. They
+/// cannot be carried through an update, so it waits under either policy.
+pub const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
 pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +76,9 @@ impl SessionImpact {
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
             Disposition::WaitsForIdle => {
                 let tasks = self.interrupted_subagents.len();
-                if tasks == 0 {
+                if self.reason == QUEUED_MESSAGES {
+                    "Messages sent to it are still waiting to be delivered; the update waits for them.".into()
+                } else if tasks == 0 {
                     "Finishing its turn; the update waits.".into()
                 } else {
                     let noun = if tasks == 1 { "task" } else { "tasks" };

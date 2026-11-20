@@ -3556,13 +3556,9 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         assert!(queued.blockers.is_empty());
         assert_eq!(queued.sessions[0].disposition, Disposition::WaitsForIdle);
         assert!(queued.sessions[0].interrupted_subagents.is_empty());
-        assert!(
-            queued.sessions[0]
-                .reason
-                .contains("still waiting to be delivered"),
-            "{}",
-            queued.sessions[0].reason
-        );
+        // The review shows why it waits, not that it is finishing a turn.
+        let shown = queued.sessions[0].review().reason;
+        assert!(shown.contains("still waiting to be delivered"), "{shown}");
     }
     let capability = state.shutdown_preflight(now).unwrap().capability;
     assert_eq!(capability.background_subagents, 1);
