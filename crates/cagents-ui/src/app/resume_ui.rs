@@ -971,6 +971,9 @@ impl Cagents {
                 // the picker.
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
+                if let Some(target) = self.nested_modal_focus_target() {
+                    return iced::widget::operation::focus(target).map(cosmic::Action::App);
+                }
                 self.workspace
                     .focused()
                     .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
