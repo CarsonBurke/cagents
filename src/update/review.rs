@@ -9,7 +9,11 @@ use std::{
     fmt::Write,
 };
 
-const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
+/// The tab stays open through the update, and Resume conversation in the
+/// new tab (+) menu only returns to an open tab, so the tab is where its
+/// conversation reopens or says why it can't.
+const CHAT_RECOVERY: &str =
+    "Open its tab; if the conversation doesn't reopen, the tab says what to do";
 
 /// Reconcile observations before grouping: a pane has exactly one outcome.
 #[derive(Debug, PartialEq, Eq)]
@@ -832,7 +836,7 @@ mod tests {
         );
         assert!(
             review
-                .contains("    parser · General · beta: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu\n"),
+                .contains("    parser · General · beta: its conversation could not be confirmed. Open its tab; if the conversation doesn't reopen, the tab says what to do\n"),
             "{review}"
         );
         assert!(
@@ -1147,7 +1151,7 @@ mod tests {
             ),
             "{review}"
         );
-        assert!(review.contains("    chat · beta: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu"), "{review}");
+        assert!(review.contains("    chat · beta: its conversation could not be confirmed. Open its tab; if the conversation doesn't reopen, the tab says what to do"), "{review}");
         assert!(review.contains("    terminal · beta: its terminal could not be matched. Press Reconnect in the pane to check the saved terminal"), "{review}");
         assert!(!review.contains("Keep running ("), "{review}");
     }

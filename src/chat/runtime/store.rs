@@ -1385,9 +1385,6 @@ impl Store {
         }
         drop(rows);
         drop(statement);
-        if stopped.is_empty() {
-            return Ok(());
-        }
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         for (id, metadata) in &stopped {
             transaction
@@ -1397,11 +1394,19 @@ impl Store {
                 )
                 .map_err(|e| e.to_string())?;
         }
+        // Delegated edits can be the only live rows left, even when the main
+        // transcript has no steps to stop. Keep both projections atomic.
+        let revision = self.file_revision.saturating_add(1);
+        let files_stopped =
+            file_changes::stop_running_edits(&transaction, revision).map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if files_stopped {
+            self.file_revision = revision;
+        }
         for (id, _) in &stopped {
             self.changed(id);
         }
-        self.dirty = true;
+        self.dirty |= !stopped.is_empty() || files_stopped;
         Ok(())
     }
     fn changed(&mut self, id: &str) {

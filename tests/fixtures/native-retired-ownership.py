@@ -3,8 +3,8 @@
 
 The caller must first retire and reap its synthetic Claude actor normally.
 This helper changes only that retired actor's recorded recipe, not live state.
-Version 5 recognizes schema 22 shared views and schema 23 to 28 normalized
-panes with descriptor format 1. Schemas 24 to 28 only add tables beside them. --restore undoes only this helper's recorded CAS.
+Version 6 recognizes schema 22 shared views and schema 23 to 29 normalized
+panes with descriptor format 1. Schemas 24 to 29 only add tables beside them. --restore undoes only this helper's recorded CAS.
 --self-test uses invented in-memory SQLite, never an app or provider home.
 """
 import argparse
@@ -17,9 +17,9 @@ import sqlite3
 import stat
 import uuid
 
-VERSION = 5
+VERSION = 6
 # Normalized pane layouts. Later schemas add tables but keep these columns.
-NORMALIZED = range(23, 29)
+NORMALIZED = range(23, 30)
 NATIVE_TABLES = {'native_actor_ownerships', 'native_actor_retirements'}
 
 
@@ -339,7 +339,7 @@ def self_test():
             count += 1
         else:
             raise AssertionError('Accepted unindexed legacy card')
-    for version in [0, 29]:
+    for version in [0, 30]:
         with closing(database(version)) as db:
             try:
                 selected_card(db, thread)

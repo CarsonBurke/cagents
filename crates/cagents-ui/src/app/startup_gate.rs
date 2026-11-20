@@ -425,8 +425,8 @@ impl Cagents {
     }
 
     /// What is true of each kind of unsettled pane, since opening one does
-    /// different things: a failed pane offers a retry, a held one says what it
-    /// waits for, and an out-of-step one is already working.
+    /// different things: a failed pane says why and what can be done, a held
+    /// one says what it waits for, and an out-of-step one is already working.
     fn startup_unsettled_sentences(
         &self,
         failures: &[CardId],
@@ -441,7 +441,7 @@ impl Cagents {
         if !failed.is_empty() {
             let them = pronoun(failed.len());
             sentences.push(format!(
-                "{} could not reconnect: {}. Open {them} to see why and retry.",
+                "{} could not reconnect: {}. Open {them} to see why and what to do next.",
                 saved_panes(failed.len()),
                 self.startup_pane_names(&failed),
             ));

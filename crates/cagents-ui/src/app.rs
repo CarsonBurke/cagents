@@ -1312,7 +1312,6 @@ impl OwedProjection {
 /// and the postlude that follow it.
 struct UpdateEntry {
     notice_control: Option<NoticeSeverity>,
-    attention_scope_changed: bool,
     /// The update's workspace pipeline timing is on, so its chrome
     /// projection times its phases too.
     timed: bool,
@@ -3191,6 +3190,18 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::BrowserNavigate(_) => true,
         _ => false,
     }
+}
+
+/// Whether `message` may change which projects and worktrees attention
+/// covers, so a pending notification activation no longer applies.
+fn changes_attention_scope(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RepositoryLoaded { result: Ok(_), .. }
+            | Message::DeviceProjectLoaded { result: Ok(_), .. }
+            | Message::AttachedWorktreePrsResolved { .. }
+            | Message::GitUi(_)
+    )
 }
 
 /// Timers that exist only to repaint elapsed time or a progress animation.
@@ -5921,6 +5932,9 @@ pub struct Cagents {
     source_control_mutations: HashMap<PathBuf, SourceControlMutation>,
     operation_recovery: crate::operation_recovery::Shared,
     account_ui: account_ui::Accounts,
+    /// The sign-ins running in open terminals, which the account views ask
+    /// after every frame.
+    sign_ins: account_ui::SignIns,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
     automation_approval: automation_approval::State,
@@ -6007,6 +6021,10 @@ pub struct Cagents {
     /// What the messages dispatched since the last projection owe it; see
     /// [`Cagents::dispatch`].
     owed_projection: Option<OwedProjection>,
+    /// A message dispatched in this update, its own or one a handler
+    /// dispatched within it, may have changed which projects and worktrees
+    /// attention covers. An update run within another keeps the other's.
+    attention_scope_changed: bool,
     /// How many updates are running their message's handler: a dispatch
     /// made while none is has no update to project what it owes.
     dispatching: u32,
@@ -10398,52 +10416,12 @@ impl Cagents {
         if let keyboard::Event::ModifiersChanged(modifiers) = &event {
             self.keyboard_modifiers = *modifiers;
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
-            if let keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                repeat,
-                ..
-            } = &event
-            {
-                match key {
-                    // Layout-independent, like the other Ctrl chords.
-                    keyboard::Key::Character(_)
-                        if modifiers.command()
-                            && !modifiers.shift()
-                            && !modifiers.alt()
-                            && !modifiers.logo()
-                            && key
-                                .to_latin(*physical_key)
-                                .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
-                    {
-                        // A held chord copies once.
-                        if *repeat {
-                            return (Task::none(), Projection::Unchanged);
-                        }
-                        let image = gallery.selected_image();
-                        return (
-                            self.handle_chat_ui(chat_ui::Action::Image(
-                                image,
-                                chat_ui::images::ImageCommand::Copy,
-                            )),
-                            Projection::Full,
-                        );
-                    }
-                    // Escape is the viewer's own (`Gallery::view`), so that
-                    // one an open context menu claims closes only the menu.
-                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                        self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                    }
-                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                        self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                    }
-                    _ => {}
-                }
-            }
-            // Stepping through the gallery changes only the viewer.
-            return (Task::none(), Projection::Unchanged);
+        // The viewer dialog, a modal, takes every key. Its own Escape and an
+        // open context menu's are answered in `Gallery::dialog_view`.
+        if self.chat_ui.image_dialog.is_some() {
+            return self
+                .image_key(chat_ui::images::ViewerHost::Dialog, &event)
+                .unwrap_or((Task::none(), Projection::Unchanged));
         }
         if !captured
             && !self.workspace_inputs_blocked()
@@ -10703,6 +10681,10 @@ impl Cagents {
         if let Some(task) = self.chat_picker_key(&event) {
             return (task, Projection::Full);
         }
+        // Behind every popup, question and overlay in front of the pane.
+        if let Some(answer) = self.pane_image_key(&event, captured) {
+            return answer;
+        }
         if let Some(card) = self.workspace.focused()
             && !self.pane_content_inputs_blocked(card)
             && self.terminal_find.get(&card).is_some_and(|find| find.open)
@@ -10867,6 +10849,17 @@ impl Cagents {
             // Until its input is drawn the pane's title holds the keyboard
             // in its place: a focus aimed at a control that is not in the
             // tree blurs every widget instead. See `focus_pane_keyboard`.
+            // An image viewer over the transcript holds the pane's keyboard
+            // in the composer's place, so a press on the image or a return
+            // to the pane leaves the arrows browsing. What is typed still
+            // reaches the composer (`type_into_chat_input`).
+            Some(CardRuntime::Chat(runtime))
+                if self.chat_input_drawn(card)
+                    && runtime.image_viewer.is_some()
+                    && runtime.focus_control() == "chat-composer" =>
+            {
+                chat_ui::images::viewer_focus(card)
+            }
             Some(CardRuntime::Chat(runtime)) if self.chat_input_drawn(card) => {
                 card_control_id(card, runtime.focus_control())
             }
@@ -14587,7 +14580,7 @@ impl Cagents {
             || self.dirty_repository_close.is_some()
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
+            || self.chat_ui.image_dialog.is_some()
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
             || self.chat_close_dialog_visible()
@@ -15894,7 +15887,7 @@ impl Cagents {
             && self.transient_work_close.is_none()
             && !self.automation_ui.draft_dialog_open()
             && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
+            && self.chat_ui.image_dialog.is_none()
             && self.terminal_paste.is_none()
             && !self.session_recovery.open()
             && !self.daemon_health_ui.confirmation
@@ -16198,6 +16191,7 @@ impl Application for Cagents {
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::installation().into(),
+            sign_ins: account_ui::SignIns::default(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -16263,6 +16257,7 @@ impl Application for Cagents {
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             owed_projection: None,
+            attention_scope_changed: false,
             dispatching: 0,
             frame_clock: FrameClock::default(),
             latency: crate::performance::InteractionLatency::default(),
@@ -16650,8 +16645,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
-            return Some(gallery.view());
+        if let Some(gallery) = &self.chat_ui.image_dialog {
+            return Some(gallery.dialog_view());
         }
         if let Some(dialog) = self.terminal_paste_dialog() {
             return Some(dialog);
@@ -17246,32 +17241,29 @@ impl Application for Cagents {
         #[cfg(not(any(test, feature = "development")))]
         let settled_projection = Task::none();
         let notice_control = self.notice_control_severity();
-        let attention_scope_changed = matches!(
-            &message,
-            Message::RepositoryLoaded { result: Ok(_), .. }
-                | Message::DeviceProjectLoaded { result: Ok(_), .. }
-                | Message::AttachedWorktreePrsResolved { .. }
-                | Message::GitUi(_)
-        );
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
+        // An update can run inside another's admission, before that one's
+        // handler: its postlude answers only for its own messages.
+        let enclosing_scope_changed = std::mem::take(&mut self.attention_scope_changed);
         self.dispatching += 1;
         let task = self.dispatch(message);
         self.dispatching -= 1;
-        self.finish_update(
+        let task = self.finish_update(
             task,
             UpdateEntry {
                 notice_control,
-                attention_scope_changed,
                 timed: _workspace_timing.is_some(),
                 settled_projection,
                 #[cfg(any(test, feature = "development"))]
                 oracle_message,
             },
-        )
+        );
+        self.attention_scope_changed = enclosing_scope_changed;
+        task
     }
 }
 
@@ -17376,7 +17368,7 @@ impl Cagents {
             && (matches!(&message, Message::Sidebar(action) if workspace_destination(action).is_some())
                 || self.update_prepared
                 || self.workspace_inputs_blocked()
-                || self.chat_ui.image_viewer.is_some())
+                || self.chat_ui.image_dialog.is_some())
         {
             self.cancel_workspace_preview();
         }
@@ -17430,6 +17422,8 @@ impl Cagents {
         if self.dispatching == 0 {
             return self.update(message);
         }
+        // Noted before admission, as a message held back still arrived.
+        self.attention_scope_changed |= changes_attention_scope(&message);
         let (message, settled) = match self.admit(message) {
             ControlFlow::Continue(admitted) => admitted,
             ControlFlow::Break(refused) => return refused,
@@ -19541,7 +19535,6 @@ impl Cagents {
     fn finish_update(&mut self, task: Task<Message>, entry: UpdateEntry) -> Task<Message> {
         let UpdateEntry {
             notice_control,
-            attention_scope_changed,
             timed,
             settled_projection,
             #[cfg(any(test, feature = "development"))]
@@ -19682,7 +19675,7 @@ impl Cagents {
         ]);
         let _postlude_trace = crate::performance::ui_trace::projection("Postlude");
         projection_stage!("chat_failures", self.reconcile_chat_failure_presentations());
-        if attention_scope_changed {
+        if std::mem::take(&mut self.attention_scope_changed) {
             self.notification_ui.scope_changed();
         }
         projection_stage!("pull_request_labels", self.sync_pull_request_labels());
@@ -19696,6 +19689,9 @@ impl Cagents {
         // mounted visible chats are inspected by this bounded handoff.
         let limit_usage =
             projection_stage!("chat_limit_accounts", self.refresh_chat_limit_accounts());
+        // After everything above that may open, end or close a terminal or
+        // change the accounts, so the frame looks the sign-ins up.
+        projection_stage!("sign_ins", self.sync_sign_ins());
         // Last, after everything above that may change the accounts, so the
         // frame this update ends in reads its conversations' account choices.
         projection_stage!(

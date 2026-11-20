@@ -1503,7 +1503,15 @@ impl State {
                         self.manual_requests.remove(&firing.automation);
                     }
                     self.notice = Some(format!("Run requested: {}", state_label(firing.state)));
-                    self.history.insert(0, firing);
+                    if let Some(current) = self
+                        .history
+                        .iter_mut()
+                        .find(|current| current.id == firing.id)
+                    {
+                        *current = firing;
+                    } else {
+                        self.history.insert(0, firing);
+                    }
                 }
                 Ok(Response::Removed) => {
                     self.lifecycle = None;
@@ -7750,6 +7758,171 @@ mod tests {
             })
         ));
         assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn uncertain_manual_retry_does_not_duplicate_polled_history() {
+        let owner = automation();
+        let mut state = State {
+            selected: Some(owner.clone()),
+            rows: vec![owner.summary(None)],
+            history_status: HistoryStatus::Loaded,
+            ..State::default()
+        };
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::RunNow { request, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("manual request");
+        };
+        let error = "Connection lost after send";
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err(error.into())),
+        });
+        assert_eq!(state.error.as_deref(), Some(error));
+
+        let mut firing = history_firing(100, crate::automations::FiringState::Succeeded);
+        firing.automation = owner.id;
+        firing.revision = owner.execution_revision;
+        firing.trigger = crate::automations::Trigger::Manual { request };
+        firing.finished_ms = Some(200);
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("poll automation");
+        };
+        assert_eq!(id, owner.id);
+        let Some(Effect::Request {
+            sequence,
+            request: Request::History { id, .. },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner.clone())))),
+        })
+        else {
+            panic!("poll history");
+        };
+        assert_eq!(id, Some(owner.id));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                vec![firing.clone()],
+                false,
+            )))),
+        });
+        assert_eq!(state.history, vec![firing.clone()]);
+        assert_eq!(
+            state.manual_requests.get(&owner.id),
+            Some(&(owner.execution_revision, request))
+        );
+
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request:
+                Request::RunNow {
+                    id,
+                    execution_revision,
+                    request: retried,
+                    ..
+                },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("retry original receipt");
+        };
+        assert_eq!(id, owner.id);
+        assert_eq!(execution_revision, owner.execution_revision);
+        assert_eq!(retried, request);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Firing(firing.clone()))),
+        });
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .filter(|row| row.id == firing.id)
+                .count(),
+            1,
+            "one idempotent run must appear only once in history"
+        );
+        assert_eq!(state.history, vec![firing]);
+        assert!(!state.manual_requests.contains_key(&owner.id));
+    }
+
+    #[test]
+    fn manual_firing_receipts_update_in_place_and_prepend_only_new_runs() {
+        use crate::automations::{FiringState, Trigger};
+
+        let owner = automation();
+        let mut firing = history_firing(100, FiringState::Running);
+        firing.automation = owner.id;
+        firing.revision = owner.execution_revision;
+        let Trigger::Manual { request } = firing.trigger else {
+            panic!("manual firing");
+        };
+        let mut newer = history_firing(200, FiringState::Succeeded);
+        newer.automation = owner.id;
+        let mut older = history_firing(50, FiringState::Succeeded);
+        older.automation = owner.id;
+        let next = history_cursor(history_key(&older));
+        let mut state = State {
+            selected: Some(owner.clone()),
+            history: vec![newer.clone(), firing.clone(), older.clone()],
+            history_status: HistoryStatus::Loaded,
+            history_next: Some(next.clone()),
+            history_newer: true,
+            manual_requests: std::collections::BTreeMap::from([(
+                owner.id,
+                (owner.execution_revision, request),
+            )]),
+            ..State::default()
+        };
+        firing.state = FiringState::Succeeded;
+        firing.finished_ms = Some(150);
+        firing.diagnostic = Some("Completed after the last poll".into());
+        for (receipt_index, mut expected) in [
+            (1, vec![newer.clone(), firing.clone(), older.clone()]),
+            (
+                0,
+                vec![
+                    history_firing(300, FiringState::Accepted),
+                    newer,
+                    firing,
+                    older,
+                ],
+            ),
+        ] {
+            state.update(Action::RunNow);
+            let generation = state.confirmation.as_ref().unwrap().generation;
+            let Some(Effect::Request {
+                sequence,
+                request: Request::RunNow { request, .. },
+            }) = state.update(Action::Confirm(generation))
+            else {
+                panic!("confirmed manual run");
+            };
+            let mut receipt = expected[receipt_index].clone();
+            receipt.automation = owner.id;
+            receipt.revision = owner.execution_revision;
+            receipt.trigger = Trigger::Manual { request };
+            expected[receipt_index] = receipt.clone();
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Firing(receipt))),
+            });
+            assert_eq!(state.history, expected);
+            assert_eq!(state.history_next, Some(next.clone()));
+            assert!(state.history_newer);
+            assert!(!state.manual_requests.contains_key(&owner.id));
+        }
     }
 
     #[test]
