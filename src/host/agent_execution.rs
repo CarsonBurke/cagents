@@ -22,6 +22,7 @@ mod directory;
 pub(super) use directory::{live_sessions, named};
 pub(super) mod mailbox;
 mod ownership;
+pub(super) mod prompt_cache;
 pub(super) mod terminals;
 mod transcript;
 pub(super) use ownership::{

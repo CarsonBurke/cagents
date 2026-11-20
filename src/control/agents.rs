@@ -4303,6 +4303,7 @@ mod tests {
                 observed_at: None,
                 ordinary_usage_allowed: None,
             }),
+            cache: None,
         };
         let members = [member];
         assert!(member_of(&members, AgentId::new()).is_none());

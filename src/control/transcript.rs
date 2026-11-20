@@ -415,6 +415,7 @@ mod tests {
             active_at: Some(60_000),
             limit: None,
             account: None,
+            cache: None,
         }
     }
 

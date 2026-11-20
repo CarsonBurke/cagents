@@ -913,6 +913,7 @@ mod tests {
             active_at: None,
             limit: None,
             account: None,
+            cache: None,
         }
     }
 
@@ -1244,6 +1245,7 @@ mod tests {
             active_at: Some(0),
             limit: None,
             account: None,
+            cache: None,
         };
         let mut members = Members {
             channel,

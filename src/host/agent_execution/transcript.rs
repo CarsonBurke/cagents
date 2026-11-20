@@ -428,6 +428,7 @@ mod tests {
             active_at: None,
             limit: None,
             account: None,
+            cache: None,
         }
     }
 
