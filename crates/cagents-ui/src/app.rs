@@ -11985,10 +11985,7 @@ impl Cagents {
         // A pane with no inspector here, such as an application page, has
         // no toggle either.
         let inspector = card.is_some() && self.pane_has_inspector(id);
-        // A rail stands in for the toggle while the pane is too narrow.
-        let inspector_closed = inspector
-            && self.pane_inspector_layout(id).is_none()
-            && !self.pane_inspectors.is_railed(id);
+        let inspector_closed = inspector && self.pane_shows_inspector_toggle(id);
         let toolbar_toggle = || inspector_closed.then(|| self.pane_inspector_toggle(id, false));
         let toolbar_hosts_toggle = browser_session.is_some()
             || matches!(

@@ -1397,7 +1397,7 @@ impl Cagents {
     }
 
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
-        let trailing_clearance = if self.pane_inspector_layout(card).is_none() {
+        let trailing_clearance = if self.pane_shows_inspector_toggle(card) {
             crate::app::pane_inspector::TOGGLE_CLEARANCE
         } else {
             0.0
