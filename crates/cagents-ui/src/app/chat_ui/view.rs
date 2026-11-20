@@ -5699,12 +5699,13 @@ impl Runtime {
             )
                 .hash(hasher);
         }
-        // Only this item's controls change on copy: what its last copy said
-        // there, which a later copy or its lapse replaces.
+        // Only this item's controls change on copy: which of them its last
+        // copy answers at, and what it said there. Copying again refreshes
+        // how long that shows without changing what is drawn.
         self.copy_feedback
             .as_ref()
             .filter(|feedback| feedback.key.item() == item.id)
-            .map(|feedback| feedback.at)
+            .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
             .hash(hasher);
         cached
             .map(|cached| {

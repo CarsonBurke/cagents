@@ -242,7 +242,7 @@ async fn rebind_receipt(
     .and_then(|result| result)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CopyPart {
     Text,
     Input,
