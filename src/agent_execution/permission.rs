@@ -489,7 +489,7 @@ fn launched_mode(
                 .flatten()
                 .map(str::to_owned)
                 .or_else(|| environment("CLAUDE_CODE_PERMISSION_MODE"))
-                .or_else(|| crate::chat::claude_configured_default_mode(recipe))?;
+                .or_else(|| crate::chat::claude_settings_default_mode(recipe))?;
             Mode::parse(provider, &named)
         }
         Provider::Codex => {
@@ -497,8 +497,16 @@ fn launched_mode(
                 return Some(Mode::Codex(Approval::Never, Sandbox::DangerFullAccess));
             }
             // A profile or configuration override may set either, so only
-            // a command line naming both is known.
-            if switch(&["-c", "--config", "-p", "--profile"]) {
+            // a command line naming both is known. The reasoning effort an
+            // agent's launch names is the one override that sets neither.
+            if switch(&["-p", "--profile"])
+                || options.iter().any(|(flag, value)| {
+                    matches!(*flag, "-c" | "--config")
+                        && value
+                            .and_then(crate::chat::fresh::codex_config_effort)
+                            .is_none()
+                })
+            {
                 return None;
             }
             let full_auto = switch(&["--full-auto"]);
@@ -880,7 +888,7 @@ mod tests {
             environment: [("CLAUDE_CODE_PERMISSION_MODE".into(), "plan".into())].into(),
             unset_environment: Default::default(),
         };
-        let cases: [(&str, &[&str], Tier); 21] = [
+        let cases: [(&str, &[&str], Tier); 22] = [
             ("claude", &["--dangerously-skip-permissions"], Tier::Full),
             (
                 "claude",
@@ -952,6 +960,19 @@ mod tests {
                 &["resume", "thread", "-a", "never", "-s", "read-only"],
                 Tier::ReadOnly,
             ),
+            // The reasoning effort an agent's launch names sets neither.
+            (
+                "codex",
+                &[
+                    "-a",
+                    "untrusted",
+                    "-s",
+                    "read-only",
+                    "--config",
+                    "model_reasoning_effort=low",
+                ],
+                Tier::ReadOnly,
+            ),
             // An option of unknown arity leaves what follows it unknown.
             (
                 "claude",
@@ -980,7 +1001,15 @@ mod tests {
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let read_only = recipe(&["--ask-for-approval", "untrusted", "--sandbox", "read-only"]);
+        // As an agent's launch names it, with a reasoning effort.
+        let read_only = recipe(&[
+            "--config",
+            "model_reasoning_effort=low",
+            "--ask-for-approval",
+            "untrusted",
+            "--sandbox",
+            "read-only",
+        ]);
         let ceiling = Ceiling::conversation(Provider::Codex, None, &read_only);
         assert_eq!(ceiling.tier(), Tier::ReadOnly);
         assert_eq!(

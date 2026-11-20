@@ -5,7 +5,7 @@ use super::{Provider, Session};
 pub(super) const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
 /// The only Codex config override with an equivalent native fresh-thread field.
-pub(super) fn codex_config_effort(value: &str) -> Option<&str> {
+pub(crate) fn codex_config_effort(value: &str) -> Option<&str> {
     value
         .strip_prefix(CODEX_REASONING_EFFORT_KEY)
         .and_then(|rest| rest.strip_prefix('='))

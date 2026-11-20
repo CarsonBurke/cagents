@@ -1,7 +1,10 @@
 //! What a connection that authenticated as an agent session may do. It reads
 //! every terminal, but changes only those its lineage controls: its own
 //! session, the terminals it started and the sessions of the agents it
-//! delegated to. Anything outside the terminal surface stays with the user.
+//! delegated to. Typing into a delegated agent's session or console acts as
+//! the person at it, who can approve the agent's tool requests, so only an
+//! agent whose own approvals are not limited may do it. Anything outside the
+//! terminal surface stays with the user.
 //!
 //! The boundary is the `cagents` CLI, which authenticates before it changes a
 //! terminal from inside a hosted session. A process that reaches the socket
@@ -19,6 +22,9 @@ enum Access<'a> {
     Open,
     /// Changes a terminal that other connections share.
     Control(TerminalId),
+    /// Sends input to a terminal's program, as a person typing, pasting or
+    /// clicking at it would.
+    Input(TerminalId),
     Spawn(&'a TerminalSession),
     /// Belongs to the user alone, or carries an authority of its own.
     Refused,
@@ -63,8 +69,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Input { terminal_id, .. }
         | R::Paste { terminal_id, .. }
         | R::Key { terminal_id, .. }
-        | R::Mouse { terminal_id, .. }
-        | R::Focus { terminal_id, .. }
+        | R::Mouse { terminal_id, .. } => Access::Input(*terminal_id),
+        R::Focus { terminal_id, .. }
         | R::Scroll { terminal_id, .. }
         | R::Resize { terminal_id, .. }
         | R::SetTheme { terminal_id, .. }
@@ -152,6 +158,9 @@ pub(in crate::host) fn authenticate(
         )),
         _ => {
             state.agent_clients.insert(client_id, lineage);
+            state
+                .agent_client_authorities
+                .insert(client_id, authority.clone());
             Ok(())
         }
     }
@@ -172,16 +181,51 @@ pub(in crate::host) fn admit(
             "An agent session's connection may only read terminals and change its own",
         )),
         Access::Spawn(session) => fresh(host, session),
-        Access::Control(terminal) => {
-            if controls(host, lineage, terminal).map_err(internal)? {
-                Ok(())
-            } else {
-                Err(denied(format!(
+        Access::Control(terminal) | Access::Input(terminal) => {
+            let control = controls(host, lineage, terminal).map_err(internal)?;
+            let Some(control) = control else {
+                return Err(denied(format!(
                     "Terminal {terminal} belongs to another session; message it with `cagents send` instead"
-                )))
+                )));
+            };
+            match (access(request), control) {
+                (Access::Input(_), Control::Delegated { agent, console }) => {
+                    typing_into(host, client_id, &agent, console)
+                }
+                _ => Ok(()),
             }
         }
     }
+}
+
+/// Refuses input into a delegated agent's session or console from an agent
+/// whose own approvals are limited: whatever it types there, such as an
+/// `/answer` approving a tool request, the agent reads as its person's.
+fn typing_into(
+    host: &SharedHost,
+    client_id: ClientId,
+    agent: &crate::agent_execution::Agent,
+    console: bool,
+) -> Result<(), ProtocolError> {
+    let authority = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_client_authorities
+        .get(&client_id)
+        .cloned()
+        .unwrap_or_default();
+    let ceiling = super::caller_ceiling(host, &authority).map_err(denied)?;
+    if ceiling.as_ref().is_none_or(|ceiling| ceiling.may_approve()) {
+        return Ok(());
+    }
+    let name = agent
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("agent {}", agent.id));
+    let surface = if console { "console" } else { "session" };
+    Err(denied(format!(
+        "This agent can't type into {name}'s {surface} because its approvals are limited. Use `cagents agent message` instead."
+    )))
 }
 
 /// Records that the agent session a connection acts for starts `terminal`,
@@ -237,36 +281,52 @@ fn fresh(host: &SharedHost, session: &TerminalSession) -> Result<(), ProtocolErr
     Ok(())
 }
 
-/// Whether `lineage` may change `terminal`: it is that lineage's own session,
-/// one it started, or the session or console of an agent it delegated to.
-fn controls(host: &SharedHost, lineage: Lineage, terminal: TerminalId) -> Result<bool, String> {
+/// Why a lineage may change a terminal.
+enum Control {
+    /// It is the lineage's own session, or a terminal it started.
+    Own,
+    /// It is the session, or the console, of an agent the lineage delegated to.
+    Delegated {
+        agent: crate::agent_execution::Agent,
+        console: bool,
+    },
+}
+
+/// Whether `lineage` may change `terminal`, and why: it is that lineage's own
+/// session, one it started, or the session or console of an agent it
+/// delegated to.
+fn controls(
+    host: &SharedHost,
+    lineage: Lineage,
+    terminal: TerminalId,
+) -> Result<Option<Control>, String> {
     let registry = registry(host)?;
     let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
     let target = registry
         .session_lineage(terminal)?
         .unwrap_or(Lineage(terminal));
     if target == lineage || registry.terminal_owner(target)? == Some(lineage) {
-        return Ok(true);
+        return Ok(Some(Control::Own));
     }
     for agent in registry.agents(Some(&Origin::Child { parent: lineage }))? {
         let sessions = agent
             .session
             .as_ref()
-            .map(|session| session.id())
+            .map(|session| (session.id(), false))
             .into_iter()
-            .chain(agent.console.as_ref().map(|console| console.id));
-        for session in sessions {
+            .chain(agent.console.as_ref().map(|console| (console.id, true)));
+        for (session, console) in sessions.collect::<Vec<_>>() {
             if session == terminal
                 || registry
                     .session_lineage(session)?
                     .unwrap_or(Lineage(session))
                     == target
             {
-                return Ok(true);
+                return Ok(Some(Control::Delegated { agent, console }));
             }
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn denied(message: impl Into<String>) -> ProtocolError {

@@ -3900,6 +3900,46 @@ mod tests {
         assert_eq!(claude_configured_default_mode(&recipe), None);
     }
 
+    /// cagents pins the system choice only on a managed account's native
+    /// conversation; the account's terminal reads its own home's settings.
+    #[test]
+    #[cfg(feature = "host")]
+    fn a_managed_claude_terminal_reads_its_own_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let account = homes.path(Provider::Claude, uuid::Uuid::new_v4());
+        let system = directory.path().join("system");
+        let project = directory.path().join("project");
+        for path in [&account, &system, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            system.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            account.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        let recipe = LaunchRecipe {
+            unset_environment: ["HOME".into(), "CLAUDE_CODE_PERMISSION_MODE".into()].into(),
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: project,
+            environment: [("CLAUDE_CONFIG_DIR".into(), account.display().to_string())].into(),
+        };
+        assert_eq!(
+            claude_configured_default_mode_in(&recipe, Some(&homes), Some(&system)).as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(
+            claude_settings_default_mode(&recipe).as_deref(),
+            Some("plan")
+        );
+    }
+
     #[test]
     #[cfg(any(feature = "host", feature = "ui"))]
     fn managed_claude_accounts_follow_the_current_global_permission_default() {
@@ -4333,6 +4373,18 @@ pub fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
     let homes = crate::account::home::Homes::installation();
     let system_home = crate::account::Account::system(Provider::Claude).resolved_home();
     claude_configured_default_mode_in(recipe, homes.as_ref(), system_home.as_deref())
+}
+
+/// The `permissions.defaultMode` a Claude CLI reads itself under `recipe`:
+/// its own configuration home's, without the system choice cagents pins
+/// for a managed account's native conversation, which a terminal does not
+/// receive. A project's own choice, or a remote device's, is unknown.
+#[cfg(feature = "host")]
+pub(crate) fn claude_settings_default_mode(recipe: &LaunchRecipe) -> Option<String> {
+    if crate::device::is_remote() {
+        return None;
+    }
+    claude_configured_default_mode_in(recipe, None, None)
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]

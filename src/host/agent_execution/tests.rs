@@ -5749,7 +5749,7 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     ));
 
     // A delegated agent's session is its owner's to change, not the reverse.
-    let mut delegated = request;
+    let mut delegated = request.clone();
     delegated.idempotency_key = "delegated".into();
     let child = submit(&host, &authority(agent), delegated).unwrap();
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
@@ -5772,8 +5772,63 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
             },
         )
     };
-    change(AGENT, child_session).unwrap();
+    let session_of = |agent: AgentId| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .session
+            .unwrap()
+            .id()
+    };
+    let resize = |client: u64, terminal_id: TerminalId| {
+        super::terminals::admit(
+            &host,
+            client,
+            &ClientRequest::Resize {
+                terminal_id,
+                size: crate::terminal_ipc::WireTerminalSize {
+                    columns: 100,
+                    rows: 30,
+                    cell_width_px: 9,
+                    cell_height_px: 18,
+                },
+            },
+        )
+    };
+    // Typing into a delegated agent's session acts as its person, who may
+    // approve its tool requests, so an agent whose own approvals are limited,
+    // as a plain shell's count, may only arrange it.
+    let limited = |result: Result<(), crate::terminal_ipc::ProtocolError>| {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+        assert!(
+            error.message.ends_with(
+                "'s session because its approvals are limited. Use `cagents agent message` instead."
+            ),
+            "{}",
+            error.message
+        );
+    };
+    for request in [
+        ClientRequest::Input {
+            terminal_id: child_session,
+            bytes: b"/answer request-1 allow\n".to_vec(),
+        },
+        ClientRequest::Paste {
+            terminal_id: child_session,
+            text: "allow".into(),
+            origin: crate::terminal::PasteOrigin::Clipboard,
+        },
+    ] {
+        limited(super::terminals::admit(&host, AGENT, &request));
+    }
+    resize(AGENT, child_session).unwrap();
     change(PEER, child_session).unwrap_err();
+    // A person still types into it.
+    change(USER, child_session).unwrap();
     const CHILD: u64 = 4;
     host.lock().unwrap().register_client(CHILD);
     request_as(
@@ -5788,6 +5843,33 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         change(CHILD, agent).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
     );
+    // So at every depth: the child, which asks for approval itself, cannot
+    // type into its own child's session, nor can its parent.
+    let mut nested = request.clone();
+    nested.idempotency_key = "grandchild".into();
+    let grandchild = submit(&host, &authority(child_session), nested).unwrap();
+    assert_eq!(settled(&host, grandchild.run.id).state, State::Succeeded);
+    let grandchild_session = session_of(grandchild.agent.id);
+    limited(change(CHILD, grandchild_session));
+    assert_eq!(
+        change(AGENT, grandchild_session).unwrap_err().code,
+        ProtocolErrorCode::PermissionDenied
+    );
+
+    // An agent that runs with nothing asking may type into its child's.
+    let full = TerminalId::new();
+    let mut unrestricted = shell(full);
+    unrestricted.launch.program = root.join("bin/claude").display().to_string();
+    unrestricted.launch.arguments = vec!["--dangerously-skip-permissions".into()];
+    spawn_as(USER, unrestricted).unwrap();
+    const FULL: u64 = 5;
+    host.lock().unwrap().register_client(FULL);
+    authenticate(FULL, full).unwrap();
+    let mut trusted = request.clone();
+    trusted.idempotency_key = "trusted".into();
+    let trusted = submit(&host, &authority(full), trusted).unwrap();
+    assert_eq!(settled(&host, trusted.run.id).state, State::Succeeded);
+    change(FULL, session_of(trusted.agent.id)).unwrap();
 
     // The user changes every terminal, and an agent's connection forgets
     // whom it acted for once it disconnects.
