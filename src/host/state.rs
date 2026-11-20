@@ -68,6 +68,9 @@ pub(crate) type SharedHost = Arc<HostLock>;
 
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
+    /// Finite presentation revisions outlive disconnected viewports. Hidden
+    /// reconnects suppress replay instead of sending their retained revision.
+    presentation_watermark: u64,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
@@ -1062,6 +1065,9 @@ impl HostState {
                     .map(|record| record.handle.clone())
             })
             .collect::<Vec<_>>();
+        for (terminal_id, _) in &terminals {
+            self.retain_presentation_watermark(client_id, *terminal_id);
+        }
         self.subscriptions.disconnect(client_id);
         for (terminal_id, old_visibility) in terminals {
             self.refresh_presentation_owner(terminal_id);
@@ -1112,18 +1118,20 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<(), ProtocolError> {
-        let record = self
-            .terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
+        if !self.terminals.contains_key(&terminal_id) {
+            return Err(not_found(terminal_id));
+        }
         if !self.subscriptions.attached(client_id, terminal_id) {
             return Ok(());
         }
+        self.retain_presentation_watermark(client_id, terminal_id);
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
         let new_visibility = self.subscriptions.visibility(terminal_id);
         if old_visibility != new_visibility {
-            record.handle.set_host_visibility(new_visibility);
+            self.terminals[&terminal_id]
+                .handle
+                .set_host_visibility(new_visibility);
         }
         self.refresh_presentation_owner(terminal_id);
         self.disarm_output_if_observed(terminal_id);
@@ -1665,6 +1673,7 @@ impl HostState {
             terminal_id,
             TerminalRecord {
                 screen_lost_after_crash: false,
+                presentation_watermark: 0,
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),

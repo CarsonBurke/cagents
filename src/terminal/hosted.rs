@@ -24,9 +24,10 @@ use super::{
     TerminalSize, TerminalWake,
     ipc::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
-        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, ServerEnvelope,
-        ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot, TerminalSpawnOptions,
-        TerminalVisibility, WireTerminalSize, daemon_socket_path, write_frame,
+        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, SUPPRESS_GRID_REPLAY,
+        ServerEnvelope, ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot,
+        TerminalSpawnOptions, TerminalVisibility, WireTerminalSize, daemon_socket_path,
+        write_frame,
     },
 };
 
@@ -663,7 +664,7 @@ impl HostedPublishedState {
         // Reconnect/attach replay has no visibility vote yet. A hidden view
         // needs semantic history, not a grid; reveal will request a real cursor.
         if !self.is_visible() {
-            return u64::MAX;
+            return SUPPRESS_GRID_REPLAY;
         }
         let snapshot = self.snapshot.load();
         if snapshot.detached {
@@ -671,6 +672,10 @@ impl HostedPublishedState {
         } else {
             snapshot.generation
         }
+    }
+
+    fn needs_snapshot(&self, generation: u64, snapshot_pending: bool) -> bool {
+        self.is_visible() && generation > self.snapshot_cursor() && !snapshot_pending
     }
 
     /// Records that the UI drew `observed_generation`, returning the redraw
@@ -3019,10 +3024,7 @@ fn serve_connection(
                 terminal_id: redraw_id,
                 generation,
             } if envelope.request_id.is_none() && redraw_id == terminal_id => {
-                if published.is_visible()
-                    && generation > published.snapshot_cursor()
-                    && !snapshot_pending
-                {
+                if published.needs_snapshot(generation, snapshot_pending) {
                     if send_request(
                         connection.writer(),
                         &proof,
@@ -3083,10 +3085,7 @@ fn serve_connection(
                 published
                     .event_sequence
                     .fetch_max(event_sequence, Ordering::AcqRel);
-                if published.is_visible()
-                    && generation > published.snapshot_cursor()
-                    && !snapshot_pending
-                {
+                if published.needs_snapshot(generation, snapshot_pending) {
                     if send_request(
                         connection.writer(),
                         &proof,
@@ -3277,10 +3276,88 @@ fn publish_event(
     }
 }
 
+/// The real client publication state, retained across host-handler test steps.
+#[cfg(all(test, feature = "host"))]
+pub(crate) struct RetainedPresentationFixture(HostedPublishedState);
+
+#[cfg(all(test, feature = "host"))]
+impl RetainedPresentationFixture {
+    pub(crate) fn new() -> Self {
+        Self(HostedPublishedState::new(None, true, Arc::new(|_| {})))
+    }
+
+    pub(crate) fn set_visibility(&self, visibility: TerminalVisibility) {
+        if visibility == TerminalVisibility::Hibernated {
+            self.0.hibernate();
+        } else {
+            self.0.set_visibility(visibility);
+        }
+    }
+
+    pub(crate) fn cursor(&self) -> u64 {
+        self.0.snapshot_cursor()
+    }
+
+    pub(crate) fn needs_snapshot(&self, generation: u64) -> bool {
+        self.0.needs_snapshot(generation, false)
+    }
+
+    pub(crate) fn apply(&self, snapshot: TerminalSnapshot) -> bool {
+        self.0.apply(snapshot)
+    }
+
+    pub(crate) fn frame(&self) -> Arc<RenderSnapshot> {
+        self.0.frame()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod explicit_authority_tests;
     mod input_rejection_tests;
+
+    mod reconnect_publication {
+        use super::*;
+
+        fn reveal(visibility: TerminalVisibility) {
+            let published = HostedPublishedState::new(None, true, Arc::new(|_| {}));
+            let grid = |generation| RenderSnapshot {
+                generation,
+                columns: 1,
+                rows: 1,
+                ..RenderSnapshot::empty()
+            };
+            assert!(published.apply(TerminalSnapshot::full(&grid(100))));
+            if visibility == TerminalVisibility::Hibernated {
+                published.hibernate();
+            } else {
+                published.set_visibility(visibility);
+            }
+            assert_eq!(published.snapshot_cursor(), SUPPRESS_GRID_REPLAY);
+            assert!(!published.needs_snapshot(101, false));
+            published.set_visible(true);
+            assert!(published.needs_snapshot(101, false));
+            assert!(!published.needs_snapshot(101, true));
+            assert!(published.apply(TerminalSnapshot::full(&grid(99))));
+            assert_eq!(published.frame().generation, 100);
+            for generation in [101, 102, 103] {
+                assert!(published.needs_snapshot(generation, false));
+                assert!(published.apply(TerminalSnapshot::full(&grid(generation))));
+                assert_eq!(published.frame().generation, generation);
+                assert!(!published.needs_snapshot(generation, false));
+            }
+        }
+
+        #[test]
+        fn hidden_reveal_preserves_the_finite_publication_watermark() {
+            reveal(TerminalVisibility::Hidden);
+        }
+
+        #[test]
+        fn hibernated_reveal_preserves_the_finite_publication_watermark() {
+            reveal(TerminalVisibility::Hibernated);
+        }
+    }
 
     use std::{os::unix::net::UnixListener, sync::atomic::AtomicUsize};
 
@@ -4244,7 +4321,10 @@ mod tests {
             TerminalEvent::AgentActivityChanged(None)
         );
         assert_eq!(wakes.load(Ordering::Relaxed), 2);
-        assert_eq!(published.snapshot_cursor(), u64::MAX);
+        assert_eq!(
+            published.snapshot_cursor(),
+            crate::terminal_ipc::SUPPRESS_GRID_REPLAY
+        );
         assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 0);
         assert!(published.acknowledgement_rx.try_recv().is_err());
     }
@@ -4338,7 +4418,10 @@ mod tests {
         assert_eq!(published.generation.load(Ordering::Acquire), 0);
         assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 0);
         assert!(published.acknowledgement_rx.try_recv().is_err());
-        assert_eq!(published.snapshot_cursor(), u64::MAX);
+        assert_eq!(
+            published.snapshot_cursor(),
+            crate::terminal_ipc::SUPPRESS_GRID_REPLAY
+        );
     }
 
     #[test]
