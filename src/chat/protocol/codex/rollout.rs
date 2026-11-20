@@ -280,14 +280,13 @@ impl RawTurn {
         // own IDs without a parent link. Only a unique preceding candidate
         // can account for that work. Keep all wrappers as candidates, even
         // after an output: a yielded cell can still finish a child later.
-        // A yielded cell whose later child completes after the wrapper's
-        // output is a known limitation: that child is not attributed here.
+        // Attribute a unique candidate regardless of output order; finish
+        // decides whether its children can replace it.
         let mut candidates = self.calls.iter_mut().filter(|call| {
             call.matches(recorded, item) && (call.call_id.is_none() || call.opaque_exec)
         });
         if let Some(call) = candidates.next()
             && candidates.next().is_none()
-            && !call.finished
         {
             call.represented = true;
         }
@@ -870,6 +869,22 @@ mod tests {
     }
 
     #[test]
+    fn code_mode_wrapper_suppression_is_independent_of_output_and_child_order() {
+        for output_type in ["function_call_output", "custom_tool_call_output"] {
+            let wrapper = json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper","name":"exec","input":"run check"}});
+            let output = json!({"type":"response_item","payload":{"type":output_type,"call_id":"wrapper","output":"check passed"}});
+            let child = completed(
+                json!({"type":"CommandExecution","id":"exec-child","command":"cargo test","status":"completed"}),
+            );
+            let child_before_output =
+                tool_summary(&lines(&[wrapper.clone(), child.clone(), output.clone()]));
+            let output_before_child = tool_summary(&lines(&[wrapper, output, child]));
+            assert_eq!(output_before_child, child_before_output, "{output_type}");
+            assert_eq!(output_before_child, ["command cargo test"], "{output_type}");
+        }
+    }
+
+    #[test]
     fn two_idless_calls_of_one_kind_keep_both_beside_a_completed_item() {
         let rollout = lines(&[
             json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"first\"}"}}),
@@ -904,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_or_finished_wrappers_are_not_superseded_by_other_work() {
+    fn wrapper_attribution_requires_a_unique_candidate() {
         let raw = |id: &str| json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":id,"name":"exec","input":id}});
         let command = completed(
             json!({"type":"CommandExecution","id":"exec-child","command":"cargo test","status":"completed"}),
@@ -920,7 +935,7 @@ mod tests {
                 json!({"type":"response_item","payload":{"type":output_type,"call_id":"first","output":"no commands"}}),
                 command.clone(),
             ]);
-            assert_eq!(tool_summary(&finished), ["tool exec", "command cargo test"]);
+            assert_eq!(tool_summary(&finished), ["command cargo test"]);
 
             // An output may yield while the first wrapper's child keeps
             // running. Its late completion cannot be assigned to the second.
