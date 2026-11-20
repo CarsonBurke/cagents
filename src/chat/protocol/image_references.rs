@@ -207,7 +207,7 @@ pub(super) mod legacy {
     const LIST_OPEN: &str = "\n<cagents-image-inputs>";
     const LIST_CLOSE: &str = "</cagents-image-inputs>";
 
-    pub(in crate::chat::protocol) fn marker(reference: &ImageReference) -> Result<String, String> {
+    pub(in crate::chat) fn marker(reference: &ImageReference) -> Result<String, String> {
         reference.validate()?;
         let marker = format!(
             "{}{OPEN}{}{CLOSE}",
@@ -250,7 +250,7 @@ pub(super) mod legacy {
         crate::chat::attachment_assets::restore_reference(&reference, source)
     }
 
-    pub(in crate::chat::protocol) fn image_list(
+    pub(in crate::chat) fn image_list(
         references: &[Option<ImageReference>],
     ) -> Result<String, String> {
         super::check_image_count(references.len())?;

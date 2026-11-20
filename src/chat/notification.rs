@@ -1,10 +1,14 @@
 //! A bounded live-turn excerpt, independent of transcript paging.
 #[cfg(feature = "host")]
-use super::{Event, ItemContent, Phase, Role, Snapshot, ToolStatus};
+use super::Snapshot;
+#[cfg(any(feature = "host", feature = "test-support"))]
+use super::{Event, ItemContent, Phase, Role, ToolStatus};
+#[cfg(any(feature = "host", feature = "test-support"))]
+use crate::notifications::presentation;
 #[cfg(feature = "host")]
-use crate::notifications::{Content, Kind, RequestType, presentation};
+use crate::notifications::{Content, Kind, RequestType};
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "test-support"))]
 const RETAINED_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,11 +21,12 @@ pub struct Preview {
     keep_at_start: bool,
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "test-support"))]
 impl Preview {
     /// A decoder has just proved this buffered context belongs to the start
     /// in the same step. Consume exactly that reset, then resume normal turn
     /// boundaries; a later acknowledgement must not restore this older copy.
+    #[cfg(feature = "host")]
     pub(super) fn at_observed_start(mut self) -> Self {
         self.keep_at_start = true;
         self
@@ -109,6 +114,7 @@ impl Preview {
         }
     }
 
+    #[cfg(feature = "host")]
     fn conversation(&self, provider_title: Option<&str>) -> String {
         let title = presentation::title(provider_title.unwrap_or_default());
         if title.is_empty() {
@@ -119,7 +125,7 @@ impl Preview {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "test-support"))]
 fn tool_verb(status: ToolStatus, noun: &str) -> String {
     format!(
         "{noun} {}",
@@ -136,7 +142,7 @@ fn tool_verb(status: ToolStatus, noun: &str) -> String {
     )
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "test-support"))]
 fn bounded(text: &str, bytes: usize) -> String {
     let mut end = text.len().min(bytes);
     while !text.is_char_boundary(end) {
