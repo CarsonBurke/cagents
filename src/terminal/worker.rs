@@ -76,6 +76,8 @@ const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
 const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
 /// Total budget for hangup, escalation and an authoritative holder exit report.
 const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// Keep a bounded tail for exact-child exit and PTY/session confirmation.
+const CHILD_SHUTDOWN_CONFIRMATION_RESERVE: Duration = CHILD_HANGUP_GRACE;
 /// Actual OS joins happen off-caller; ordinary shutdown shares this deadline.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for the PTY reader to leave its blocking read
@@ -509,6 +511,10 @@ struct PublishedState {
     shutdown_requested: AtomicBool,
     #[cfg(test)]
     shutdown_census_failure: AtomicBool,
+    #[cfg(test)]
+    shutdown_census_delay: Mutex<Option<Sender<Instant>>>,
+    #[cfg(test)]
+    test_holder_reservation: Mutex<Option<crate::daemon::child_reaper::Reservation>>,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
     command_budget: OnceLock<Arc<admission::Budget>>,
@@ -617,6 +623,10 @@ impl PublishedState {
             shutdown_requested: AtomicBool::new(false),
             #[cfg(test)]
             shutdown_census_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            shutdown_census_delay: Mutex::new(None),
+            #[cfg(test)]
+            test_holder_reservation: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
             command_budget: OnceLock::new(),
@@ -3160,15 +3170,33 @@ impl Worker {
                 // Before the holder forks, so nothing this launch starts
                 // predates its record.
                 crate::lineage_birth::record_instance_launch(&session)?;
-                (
+                #[cfg(test)]
+                let reservation = published.test_holder_reservation.lock().unwrap().take();
+                #[cfg(test)]
+                let held = if let Some(reservation) = reservation {
+                    holder::spawn_reserved(
+                        command,
+                        pty_size(current_size),
+                        child_exit_tx,
+                        config.holder_recovery.clone(),
+                        reservation,
+                    )?
+                } else {
                     holder::spawn_recoverable(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
-                    )?,
-                    Vec::new(),
-                )
+                    )?
+                };
+                #[cfg(not(test))]
+                let held = holder::spawn_recoverable(
+                    command,
+                    pty_size(current_size),
+                    child_exit_tx,
+                    config.holder_recovery.clone(),
+                )?;
+                (held, Vec::new())
             }
         };
         // The holder reaps the root, so its pid identifies it only while the
@@ -3726,6 +3754,11 @@ impl Worker {
                     .load(Ordering::Acquire)
                 {
                     close_processes::fail_next_census_for_test();
+                }
+                #[cfg(test)]
+                if let Some(finished) = self.published.shutdown_census_delay.lock().unwrap().take()
+                {
+                    close_processes::delay_next_census_for_test(finished);
                 }
                 let result = shutdown_child_exit(
                     &self.child,
@@ -6009,9 +6042,12 @@ fn shutdown_child_exit(
     let deadline = Instant::now() + CHILD_SHUTDOWN_DEADLINE;
     let report = exits.try_recv().ok();
     if !checked {
+        // Capture must leave both the full HUP grace and time to confirm KILL.
+        let kill_deadline = deadline - CHILD_SHUTDOWN_CONFIRMATION_RESERVE;
+        let capture_deadline = kill_deadline - CHILD_HANGUP_GRACE;
         let captured = identity
             .ok_or_else(|| "Child identity unavailable".to_owned())
-            .and_then(|root| FrozenFamily::capture(root, deadline));
+            .and_then(|root| FrozenFamily::capture(root, capture_deadline));
         match captured {
             Ok(mut family) => {
                 if let Err(error) = family.hangup(child) {
@@ -6024,7 +6060,7 @@ fn shutdown_child_exit(
                         // the first set even if the shell exits during capture.
                         let stopped = FrozenFamily::capture(
                             identity.expect("captured root identity"),
-                            deadline,
+                            kill_deadline,
                         )
                         .and_then(|mut current| current.kill_survivors());
                         if let Err(error) = stopped {
