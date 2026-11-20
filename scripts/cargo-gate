@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=35
+gate_version=36
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -161,6 +161,9 @@ Environment:
                          builds are not timed out; default unbounded
   CAGENTS_BUILD_SLOTS    Memory shares on this host; default three quarters
                          of its memory in shares of 4 GiB, at least 2
+  CAGENTS_BUILD_EXTRA_SHARES
+                         Shares beyond those, taken only while memory allows;
+                         default 2, or 0 when CAGENTS_BUILD_SLOTS is set
   CAGENTS_BUILD_SHARES   Shares this build takes; default by kind, 1 for a
                          check or the CLI lane, 2 for a host or UI build
   CAGENTS_BUILD_LOCK     First share's lock file; the others add .1, .2, ...

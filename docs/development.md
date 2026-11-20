@@ -678,6 +678,20 @@ not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
 the first), and builds offloaded to the host take them too.
 
+Builds rarely reach their peaks together: with every share on fw16 held,
+builds' anonymous memory came to about a third of their shares' on average and
+never past 18 GiB of the 32. So two more shares follow the host's count
+(`CAGENTS_BUILD_EXTRA_SHARES` sets how many; none where `CAGENTS_BUILD_SLOTS`
+is set, as for a lock used as a mutex). A build takes extra shares only when
+they complete what it needs, and only while there is memory for it: its own
+shares' memory and 4 GiB for each extra share another build holds must fit
+both in `MemAvailable` less 8 GiB and in what the build slice's `MemoryHigh`
+leaves above its builds' anonymous memory, and memory pressure (PSI "some"
+over 10 seconds) must be at most 1%. Otherwise it waits at the head of the
+queue as for any share, says so, and those behind it wait too. The extra
+shares overcommit the slice's `MemoryHigh`, below: where builds run in scopes,
+it throttles builds whose peaks coincide after all.
+
 A build with nothing to compile does not wait in that queue. When its shares
 are not free at once, a `build`, `check`, `clippy`, `--no-run` or the build
 phase of `test`, `bench` or `run` first runs as a probe: Cargo with one job,
