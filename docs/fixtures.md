@@ -1104,9 +1104,24 @@ PR merges to remove the task's checkouts from the host.
 speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
 does, with its configuration options for model, thinking level and mode and
 its older `models` and `modes` lists. Run as `muse...` or with
-`FAKE_ACP_SHAPE=muse`, it offers Muse's model and mode options instead, with
-no thinking level. It ignores its arguments, so a launch recipe written for
-the real agent runs it unchanged. It contacts no model, account or network.
+`FAKE_ACP_SHAPE=muse`, it copies Muse 1.4.24 instead: its four modes, a
+`-contributor` model beside each ordinary one, a reasoning option only on
+`muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
+soon as a session opens, and usage with no context size. It ignores its
+arguments, so a launch recipe written for the real agent runs it unchanged.
+It contacts no model, account or network.
+
+In the Muse shape, three account commands answer the way `muse` does, so the
+fixture can stand in for `muse-upstream` on a fixture `PATH`:
+
+| Command | The fixture |
+| --- | --- |
+| `usage --json` | prints Muse's no-allowance report, or exits 1 with `not logged in` when signed out |
+| `logout` | signs out: every later `session/new`, `session/load` and prompt answers Muse's `log in to Muse before opening a session` |
+| `login` | prints a made-up device code, waits `FAKE_ACP_LOGIN_SECONDS` (default 2), and signs back in |
+
+Signing out is a `signed-out` file under `FAKE_ACP_STATE`, so it lasts
+across processes until `login`.
 
 It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
 replays a conversation from an earlier process and `session/list` finds it.

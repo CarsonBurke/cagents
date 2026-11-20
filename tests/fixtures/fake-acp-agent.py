@@ -40,6 +40,11 @@ Environment switches:
   FAKE_ACP_REPLAY=N         a loaded conversation starts with N extra
                             exchanges, for long histories
   FAKE_ACP_LOG=FILE         append every frame received, one per line
+  FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
+
+In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
+account commands. Signing out lasts, as a file under FAKE_ACP_STATE, until
+`login`.
 """
 import json
 import os
@@ -80,7 +85,17 @@ MUSE_MODES = [
     ("onRequest", "Ask on request", "Ask for approval only when the action requires it"),
     ("denyUnmatched", "Deny unmatched actions", "Refuse any action no permission rule covers"),
 ]
-MUSE_MODELS = [("muse-spark-1.2", "muse-spark-1.2"), ("muse-wonder-1.0", "muse-wonder-1.0")]
+MUSE_MODELS = [("muse-spark-1.2", "muse-spark-1.2"), ("muse-spark-1.2-contributor",
+                                                    "muse-spark-1.2-contributor"),
+               ("muse-wonder-1.0", "muse-wonder-1.0")]
+# Muse 1.4.24 offers a reasoning option only for some models, listing just
+# the tiers its catalog describes, with the description as the name.
+MUSE_LEVELS = {
+    "muse-spark-1.2": [("xhigh", "Use this for deepest analysis and complex fixes.")],
+    "muse-spark-1.2-contributor": [("xhigh", "Use this for deepest analysis and complex fixes.")],
+}
+# Muse names a new session with two random words before it is asked anything.
+MUSE_NAMES = ["cyan-wezen", "quiet-heron", "weathered-planetesimal"]
 COMMANDS = [
     {"name": "compact", "description": "Summarize the conversation to free context"},
     {"name": "review", "description": "Review the current changes",
@@ -111,7 +126,15 @@ def fail(id, code, message):
 
 
 def signed_out(id):
-    fail(id, -32000, "Authentication required: sign in to the fake agent")
+    if SHAPE == "muse":
+        fail(id, -32000, "log in to Muse before opening a session")
+    else:
+        fail(id, -32000, "Authentication required: sign in to the fake agent")
+
+
+def logged_out():
+    """Signed out until `login`: the state's marker, written by `logout`."""
+    return os.path.exists(os.path.join(STATE, "signed-out"))
 
 
 class Session:
@@ -149,7 +172,15 @@ class Session:
                  "currentValue": self.model,
                  "options": [{"value": v, "name": n} for v, n in models]}
         if SHAPE == "muse":
-            return [mode, model]
+            levels = MUSE_LEVELS.get(self.model)
+            if not levels:
+                return [mode, model]
+            if self.level not in [v for v, _ in levels]:
+                self.level = levels[0][0]
+            return [mode, model,
+                    {"id": "thought_level", "name": "Reasoning effort",
+                     "category": "thought_level", "type": "select", "currentValue": self.level,
+                     "options": [{"value": v, "name": n} for v, n in levels]}]
         level = {"id": "thought_level", "name": "Thinking Level", "category": "thought_level",
                  "type": "select", "currentValue": self.level,
                  "options": [{"value": v, "name": n} for v, n in AGY_LEVELS]}
@@ -280,7 +311,7 @@ class Agent:
                        "authMethods": [{"id": "muse-login", "name": "Log in to Muse"}]})
 
     def on_session_new(self, id, params):
-        if AUTH == "new":
+        if AUTH == "new" or logged_out():
             return signed_out(id)
         session = Session(str(uuid.uuid4()), params.get("cwd", ""))
         self.sessions[session.id] = session
@@ -288,9 +319,14 @@ class Agent:
         reply(id, session.setup())
         session.update({"sessionUpdate": "available_commands_update",
                         "availableCommands": COMMANDS}, record=False)
+        if SHAPE == "muse":
+            session.title = MUSE_NAMES[int(session.id[:8], 16) % len(MUSE_NAMES)]
+            self.remember(session)
+            session.update({"sessionUpdate": "session_info_update", "title": session.title},
+                           record=False)
 
     def on_session_load(self, id, params):
-        if AUTH == "load":
+        if AUTH == "load" or logged_out():
             return signed_out(id)
         session = Session(params["sessionId"], params.get("cwd", ""))
         if not os.path.exists(session.path()):
@@ -337,6 +373,9 @@ class Agent:
             session.model = value
         else:
             session.level = value
+        if SHAPE == "muse" and option == "model":
+            # The options a model offers change with it.
+            session.level = None
         reply(id, {"configOptions": session.config_options()})
 
     def on_session_set_mode(self, id, params):
@@ -352,7 +391,7 @@ class Agent:
         session = self.sessions.get(params.get("sessionId"))
         if session is None:
             return fail(id, -32002, "Unknown session")
-        if AUTH == "prompt":
+        if AUTH == "prompt" or logged_out():
             return signed_out(id)
         self.cancelled.discard(session.id)
         blocks = params.get("prompt") or []
@@ -405,12 +444,19 @@ class Agent:
             self.think(session, "Considering the question.")
             self.say(session, "Fake answer to: " + text.strip().splitlines()[0][:200]
                      if text.strip() else "Fake answer.")
-        session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000,
-                        "cost": {"amount": 0.0012, "currency": "USD"}}, record=False)
+        if SHAPE == "muse":
+            # Muse reports no context window size.
+            session.update({"sessionUpdate": "usage_update", "used": 0, "size": 0,
+                            "_meta": {"dev.muse": {"contextSizeUnknown": True}}}, record=False)
+        else:
+            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000,
+                            "cost": {"amount": 0.0012, "currency": "USD"}}, record=False)
         if session.id in self.cancelled:
             stop = "cancelled"
-        reply(id, {"stopReason": stop,
-                   "usage": {"totalTokens": 30, "inputTokens": 20, "outputTokens": 10}})
+        result = {"stopReason": stop}
+        if SHAPE == "agy":
+            result["usage"] = {"totalTokens": 30, "inputTokens": 20, "outputTokens": 10}
+        reply(id, result)
 
     def say(self, session, text, message=None):
         message = message or str(uuid.uuid4())
@@ -517,7 +563,40 @@ class Agent:
         os.replace(os.path.join(STATE, "index.json.tmp"), os.path.join(STATE, "index.json"))
 
 
+def command_line(arguments):
+    """Muse's account commands, for a fixture installed as `muse-upstream`:
+    `usage --json`, `login` and `logout`. Anything else serves ACP."""
+    if SHAPE != "muse" or not arguments or arguments[0] not in ("usage", "login", "logout"):
+        return None
+    marker = os.path.join(STATE, "signed-out")
+    os.makedirs(STATE, exist_ok=True)
+    if arguments[0] == "logout":
+        open(marker, "w").close()
+        print("Logged out of Muse.")
+        return 0
+    if arguments[0] == "login":
+        print("To log in, open https://example.invalid/device and enter the code FAKE-CODE.")
+        sys.stdout.flush()
+        time.sleep(float(os.environ.get("FAKE_ACP_LOGIN_SECONDS") or 2))
+        if os.path.exists(marker):
+            os.remove(marker)
+        print("Logged in to Muse.")
+        return 0
+    if AUTH or os.path.exists(marker):
+        print("muse usage: not logged in: run `muse login` first", file=sys.stderr)
+        return 1
+    if "--json" in arguments:
+        print(json.dumps({"allowance": None, "hint": None, "reason": "no_allowance",
+                          "schemaVersion": 1}))
+    else:
+        print("No subscription allowance.")
+    return 0
+
+
 if __name__ == "__main__":
+    status = command_line(sys.argv[1:])
+    if status is not None:
+        sys.exit(status)
     try:
         Agent().run()
     except (SystemExit, BrokenPipeError, KeyboardInterrupt):

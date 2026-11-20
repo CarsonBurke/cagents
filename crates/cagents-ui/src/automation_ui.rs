@@ -3531,10 +3531,11 @@ fn firing_state_label(firing: &Firing) -> String {
 
 /// The providers an automation can run, in the order the editor lists them:
 /// those with native chat, which every scheduled agent runs as.
-const AUTOMATION_PROVIDERS: [Provider; 4] = [
+const AUTOMATION_PROVIDERS: [Provider; 5] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Antigravity,
+    Provider::Muse,
     Provider::Omp,
 ];
 
