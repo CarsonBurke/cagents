@@ -3,6 +3,17 @@ use super::*;
 
 pub(super) const UNAVAILABLE: &str = chat::TEXT_COPY_UNAVAILABLE;
 
+/// What a copy whose text this window no longer has says, with where it
+/// can still be copied from.
+pub(super) fn unavailable_in(provider: Provider) -> String {
+    let owner = match provider {
+        // Its transcript is the reader's conversation with Claude.
+        Provider::Claude => "Claude",
+        provider => provider.label(),
+    };
+    format!("{UNAVAILABLE} Open {owner}'s transcript to copy it.")
+}
+
 /// A details copy whose diagnostic changed between the click and the read.
 const DETAILS_CHANGED: &str = "These details changed while copying. Copy them again.";
 
@@ -168,6 +179,11 @@ impl Runtime {
     fn copy_state_where(&self, at: impl Fn(&CopyKey) -> bool) -> CopyState {
         match &self.copy_feedback {
             Some(feedback) if at(&feedback.key) => match &feedback.refusal {
+                // Text this window no longer has is still in the provider's
+                // transcript, and the reader is told whose.
+                Some(refusal) if &**refusal == UNAVAILABLE => {
+                    CopyState::Refused(unavailable_in(self.session.launch.provider).into())
+                }
                 Some(refusal) => CopyState::Refused(refusal.clone()),
                 None => CopyState::Copied,
             },
@@ -1074,6 +1090,19 @@ mod tests {
         }
     }
 
+    /// Text this window no longer has is sent to the transcript that has it.
+    #[test]
+    fn an_unavailable_copy_names_the_transcript_to_copy_it_from() {
+        assert_eq!(
+            unavailable_in(Provider::Claude),
+            "The full text of this message is no longer saved here. Open Claude's transcript to copy it."
+        );
+        assert_eq!(
+            unavailable_in(Provider::Codex),
+            "The full text of this message is no longer saved here. Open Codex's transcript to copy it."
+        );
+    }
+
     /// Each state names itself to a reader who can't see its icon.
     #[test]
     fn a_copy_control_names_what_its_copy_did() {
@@ -1221,6 +1250,12 @@ mod tests {
             assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert_eq!(copy_refusal(runtime), Some(UNAVAILABLE), "{scope:?}");
+            // Shown with whose transcript still has it.
+            let provider = runtime.session.launch.provider;
+            assert!(matches!(
+                runtime.copy_state("step", None),
+                CopyState::Refused(shown) if *shown == *unavailable_in(provider)
+            ));
         }
     }
 
