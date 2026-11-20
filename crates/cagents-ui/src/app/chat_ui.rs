@@ -4205,10 +4205,8 @@ impl Runtime {
         draft_has_local_work(
             self.has_unsent_text(),
             self.unsent_attachments(),
-            self.session.is_unstarted()
-                && (self.draft_model_chosen
-                    || saved_model
-                        .is_some_and(|model| model.provider == self.session.launch.provider)),
+            (self.draft_model_chosen && self.session.is_unstarted())
+                || saved_model.is_some_and(|model| model.applies_to(&self.session)),
         )
     }
 
@@ -5077,6 +5075,7 @@ impl Runtime {
     }
     fn draft_model(&self) -> Option<ChatDraftModel> {
         self.is_draft().then(|| ChatDraftModel {
+            session: self.session.id,
             provider: self.session.launch.provider,
             model: self.snapshot.selected_model.clone(),
             reasoning: self.snapshot.reasoning.clone(),
@@ -8937,10 +8936,10 @@ impl Cagents {
             .chat_ui
             .draft_models
             .iter()
-            .filter(|(card, _)| {
+            .filter(|(card, model)| {
                 open_cards.contains(card)
                     && self.card_state(**card).is_some_and(|state| {
-                        matches!(&state.kind, CardKind::Chat(session) if session.is_unstarted())
+                        matches!(&state.kind, CardKind::Chat(session) if model.applies_to(session))
                     })
             })
             .map(|(card, model)| (*card, model.clone()))
@@ -9485,15 +9484,15 @@ impl Cagents {
         self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.blocked_details.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        let saved_model = self.chat_ui.draft_models.remove(&card);
-        let model_chosen = saved_model
-            .as_ref()
-            .is_some_and(|saved| saved.provider == session.launch.provider);
-        tracing::debug!(target: "cagents::draft_model", ?card,
-            provider = ?session.launch.provider, ?saved_model, "opening draft");
-        if let Some(saved) = saved_model
-            && saved.provider == session.launch.provider
-        {
+        // A choice made in another draft, such as the one this card held
+        // before a peer replaced it, is not this draft's.
+        let saved_model = self
+            .chat_ui
+            .draft_models
+            .remove(&card)
+            .filter(|saved| saved.applies_to(&session));
+        let model_chosen = saved_model.is_some();
+        if let Some(saved) = saved_model {
             snapshot.selected_model = saved.model;
             snapshot.reasoning = saved.reasoning;
         }
@@ -9715,8 +9714,7 @@ impl Cagents {
                 .unwrap_or_default(),
             self.chat_ui.draft_models.get(&card).is_some_and(|model| {
                 self.card_state(card).is_some_and(|state| {
-                    matches!(&state.kind, CardKind::Chat(session)
-                        if session.is_unstarted() && session.launch.provider == model.provider)
+                    matches!(&state.kind, CardKind::Chat(session) if model.applies_to(session))
                 })
             }),
         )

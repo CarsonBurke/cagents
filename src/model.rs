@@ -1613,10 +1613,22 @@ impl<'a> IntoIterator for &'a mut Cards {
 /// `model: None` is the provider's default, chosen or never changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatDraftModel {
+    /// The draft this was chosen in. A card whose conversation is replaced by
+    /// another, even of the same provider, does not take this choice with it.
+    pub session: TerminalId,
     pub provider: crate::agent::Provider,
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning: Option<String>,
+}
+
+impl ChatDraftModel {
+    /// Whether `session` is the unstarted draft this choice was made in.
+    pub fn applies_to(&self, session: &crate::chat::Session) -> bool {
+        session.is_unstarted()
+            && session.id == self.session
+            && session.launch.provider == self.provider
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

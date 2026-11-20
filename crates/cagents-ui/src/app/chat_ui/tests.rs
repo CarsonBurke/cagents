@@ -15336,6 +15336,7 @@ fn saved_draft_model_automatic_picks_keep_the_empty_draft() {
         assert!(app.navigation_save.is_some());
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
         let chosen = ChatDraftModel {
+            session: chat_runtime(&app, card).session.id,
             provider: Provider::Claude,
             model: (pick != 2).then(|| "other-model".into()),
             reasoning: (pick == 1).then(|| "low".into()),
@@ -15432,12 +15433,12 @@ fn saved_draft_model_follows_retained_content_through_shared_startup() {
 }
 
 #[test]
-fn saved_draft_model_only_work_is_retained_through_shared_startup() {
+fn a_model_only_draft_a_peer_replaced_is_neither_copied_nor_inherited() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = reasoning_action_draft(&mut app, Provider::Claude);
     Arc::make_mut(&mut app.durable).workspace_model_identity = Some(uuid::Uuid::new_v4());
     let saved = app.persistent_workspace();
-    let chosen = saved.chat_draft_models[&card].clone();
+    assert!(saved.chat_draft_models.contains_key(&card));
     let mut restored = reload_draft_model_workspace(&saved);
     let mut pane = crate::workspace_model::views::Pane::from_card(
         restored.card_state(card).unwrap(),
@@ -15447,24 +15448,21 @@ fn saved_draft_model_only_work_is_retained_through_shared_startup() {
     let CardKind::Chat(replacement) = &mut pane.kind else {
         unreachable!()
     };
+    // A peer's unstarted draft of the same provider replaced this one.
     replacement.id = TerminalId::new();
     let (task, retained) = restored.admit_shared_chat(&pane);
     drop(task);
-    let retained = retained.expect("a model choice alone is local draft work");
-    assert_eq!(restored.chat_ui.draft_models.get(&retained), Some(&chosen));
+    // A read-only copy of an empty draft would be a pane with nothing in it.
+    assert_eq!(retained, None);
     let replacement = chat_runtime(&restored, card);
     assert_eq!(replacement.snapshot.selected_model, None);
     assert_eq!(replacement.snapshot.reasoning, None);
-    let retained_pane = crate::workspace_model::views::Pane::from_card(
-        restored.card_state(retained).unwrap(),
-        restored.durable.card_scopes.get(&retained).cloned(),
-    )
-    .unwrap();
-    drop(restored.admit_shared_chat(&retained_pane));
-    let runtime = chat_runtime(&restored, retained);
-    assert!(runtime.composer.is_empty());
-    assert_eq!(runtime.snapshot.selected_model, chosen.model);
-    assert_eq!(runtime.snapshot.reasoning, chosen.reasoning);
+    assert!(
+        !restored
+            .persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
 }
 
 #[test]
@@ -15494,6 +15492,10 @@ fn saved_draft_model_checkpoint_reopens_after_the_workspace_save_is_refused() {
     let loaded = loaded.unwrap();
     let mut restored = draft_model_app_from_loaded_workspace(loaded);
     restored.session = Some(writer);
+    let CardKind::Chat(source) = &restored.card_state(card).unwrap().kind else {
+        unreachable!()
+    };
+    let source = source.id;
     let mut pane = crate::workspace_model::views::Pane::from_card(
         restored.card_state(card).unwrap(),
         restored.durable.card_scopes.get(&card).cloned(),
@@ -15562,7 +15564,29 @@ fn saved_draft_model_checkpoint_reopens_after_the_workspace_save_is_refused() {
         loaded.chat_drafts[&retained],
         "checkpoint keeps the text and choice"
     );
+    // The adoption committed the peer's draft to this card before the refused
+    // snapshot could drop the choice made in the draft it replaced.
+    let CardKind::Chat(adopted) = &loaded
+        .cards
+        .iter()
+        .find(|state| state.id == card)
+        .unwrap()
+        .kind
+    else {
+        unreachable!()
+    };
+    assert_ne!(adopted.id, source);
+    assert!(!loaded.chat_draft_models.contains_key(&card));
     let mut reopened = draft_model_app_from_loaded_workspace(loaded);
+    let replacement = crate::workspace_model::views::Pane::from_card(
+        reopened.card_state(card).unwrap(),
+        reopened.durable.card_scopes.get(&card).cloned(),
+    )
+    .unwrap();
+    drop(reopened.admit_shared_chat(&replacement));
+    let runtime = chat_runtime(&reopened, card);
+    assert_eq!(runtime.snapshot.selected_model, None);
+    assert_eq!(runtime.snapshot.reasoning, None);
     let pane = crate::workspace_model::views::Pane::from_card(
         reopened.card_state(retained).unwrap(),
         reopened.durable.card_scopes.get(&retained).cloned(),
@@ -15605,6 +15629,7 @@ fn saved_draft_model_picks_schedule_their_own_save() {
         assert_eq!(
             app.durable.chat_draft_models[&card],
             ChatDraftModel {
+                session: chat_runtime(&app, card).session.id,
                 provider: Provider::Claude,
                 model: Some("other-model".into()),
                 reasoning: Some(effort.into()),
@@ -15632,6 +15657,7 @@ fn a_drafts_model_and_effort_survive_reopening_the_window() {
     assert_eq!(
         saved.chat_draft_models[&card],
         ChatDraftModel {
+            session: chat_runtime(&app, card).session.id,
             provider: Provider::Claude,
             model: Some("other-model".into()),
             reasoning: Some("low".into()),
@@ -15750,6 +15776,7 @@ fn a_saved_draft_model_for_another_provider_is_ignored() {
     app.chat_ui.draft_models.insert(
         card,
         ChatDraftModel {
+            session: chat_runtime(&app, card).session.id,
             provider: Provider::Codex,
             model: Some("other-model".into()),
             reasoning: Some("low".into()),

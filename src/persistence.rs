@@ -386,9 +386,10 @@ impl RetainedChatCopy {
             || !matches!(&self.copy.kind, CardKind::Chat(session) if session == &self.source)
             || !self.source.has_valid_native_continuity()
             || (self.source.owned_codex_listener.is_some() && !self.source.owns_codex_listener())
-            || self.draft_model.as_ref().is_some_and(|model| {
-                !self.source.is_unstarted() || model.provider != self.source.launch.provider
-            })
+            || self
+                .draft_model
+                .as_ref()
+                .is_some_and(|model| !model.applies_to(&self.source))
         {
             return Err(invalid_state!(
                 "Retained chat copy changed its captured source"
@@ -2312,10 +2313,13 @@ impl StateStore {
         state
             .chat_waiting_messages
             .retain(|id, _| open_chats.contains_key(id));
-        state.chat_draft_models.retain(|id, _| {
+        // A choice applies only to the draft it was made in. A replacement
+        // committed before the snapshot that would have dropped the choice
+        // does not inherit it.
+        state.chat_draft_models.retain(|id, model| {
             open_chats
                 .get(id)
-                .is_some_and(|session| session.is_unstarted())
+                .is_some_and(|session| model.applies_to(session))
         });
         // A closed chat's draft waits for that chat to reopen as another card.
         state
@@ -4491,10 +4495,10 @@ fn save_workspace_transaction(
     let models = state
         .chat_draft_models
         .iter()
-        .filter(|(id, _)| {
+        .filter(|(id, model)| {
             open_chats
                 .get(id)
-                .is_some_and(|session| session.is_unstarted())
+                .is_some_and(|session| model.applies_to(session))
         })
         .map(|(id, model)| (*id, model.clone()))
         .collect::<HashMap<_, _>>();
@@ -8731,12 +8735,13 @@ mod tests {
             }
             source.terminal = None;
             let chat = workspace.cards[0].id;
-            workspace.cards[0].kind = CardKind::Chat(source);
             let model = crate::model::ChatDraftModel {
+                session: source.id,
                 provider: crate::agent::Provider::Claude,
                 model: Some("other-model".into()),
                 reasoning: Some("low".into()),
             };
+            workspace.cards[0].kind = CardKind::Chat(source);
             workspace.chat_draft_models.insert(chat, model.clone());
             workspace
                 .chat_draft_models
@@ -8774,6 +8779,52 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn an_adopted_replacement_does_not_reopen_on_the_drafts_choice() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = directory.path().join("adopted-model.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        source.launch.session_id = None;
+        source.terminal = None;
+        let card = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        workspace.chat_draft_models.insert(
+            card,
+            crate::model::ChatDraftModel {
+                session: source.id,
+                provider: crate::agent::Provider::Claude,
+                model: Some("haiku".into()),
+                reasoning: Some("low".into()),
+            },
+        );
+        SaveLane::default().save(&store, &workspace).unwrap();
+        // A peer's unstarted draft of the same provider is adopted, and the
+        // process ends before the snapshot that would drop the choice.
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        assert!(replacement.is_unstarted());
+        store
+            .adopt_chat_identity(card, source.id, &replacement)
+            .unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let saved = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|state| state.id == card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(replacement)
+        );
+        assert!(saved.chat_draft_models.is_empty());
     }
 
     #[test]
@@ -8980,6 +9031,7 @@ mod tests {
         let original = workspace.cards[0].id;
         workspace.cards[0].kind = CardKind::Chat(source.clone());
         let model = crate::model::ChatDraftModel {
+            session: source.id,
             provider: crate::agent::Provider::Claude,
             model: Some("haiku".into()),
             reasoning: Some("low".into()),
@@ -9020,7 +9072,8 @@ mod tests {
             .unwrap();
         assert_eq!(saved.chat_drafts[&copy.copy.id], copy.draft);
         assert_eq!(saved.chat_draft_models.get(&copy.copy.id), Some(&model));
-        assert_eq!(saved.chat_draft_models.get(&original), Some(&model));
+        // The replacement now on the original card is another draft.
+        assert_eq!(saved.chat_draft_models.get(&original), None);
         assert_eq!(
             reopened.load_card(original, None).unwrap().unwrap().kind,
             CardKind::Chat(replacement)
