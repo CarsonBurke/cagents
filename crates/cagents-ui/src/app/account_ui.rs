@@ -2981,15 +2981,14 @@ impl Cagents {
 
     /// New classified rejections invalidate partial live reports as evidence
     /// of reset inventory. One queued forced read survives an older probe.
+    /// For a provider that reports no usage, a conversation's report that its
+    /// sign-in or allowance needs attention is what the chip should show.
     pub(super) fn account_limit_reported(
         &mut self,
         provider: Provider,
         recipe: &LaunchRecipe,
     ) -> Task<Message> {
-        if !matches!(provider, Provider::Claude | Provider::Codex) {
-            return Task::none();
-        }
-        let Some(id) = self.chat_account(provider, recipe) else {
+        let Some(id) = self.reporting_account(provider, recipe) else {
             return Task::none();
         };
         let now = now_ms();
@@ -3001,6 +3000,20 @@ impl Cagents {
         }
         self.probe_account(&id, Trigger::Limit, now)
             .unwrap_or_else(Task::none)
+    }
+
+    /// The account a conversation's rejection is reported against: the one
+    /// it runs on, or for an ACP provider, whose conversations all run on
+    /// its own sign-in, the system account.
+    fn reporting_account(&self, provider: Provider, recipe: &LaunchRecipe) -> Option<AccountId> {
+        match provider {
+            Provider::Claude | Provider::Codex => self.chat_account(provider, recipe),
+            Provider::Antigravity | Provider::Muse => {
+                let id = Account::system(provider).id();
+                self.account_ui.account(&id).is_some().then_some(id)
+            }
+            Provider::Omp => None,
+        }
     }
 
     /// Account discovery can bind a previously unknown launch home. Keep the
@@ -3018,7 +3031,7 @@ impl Cagents {
                 (runtime.limit_refresh_pending
                     && runtime.is_visible()
                     && self
-                        .chat_account(
+                        .reporting_account(
                             runtime.session.launch.provider,
                             &runtime.session.launch.recipe,
                         )
@@ -6606,9 +6619,30 @@ impl Cagents {
                     .into(),
             );
         }
+        let sign_in = |label: &'static str| {
+            crate::ui_controls::button::primary(label)
+                .on_press_maybe(
+                    (!self.account_sign_in_running(&account.account))
+                        .then(|| Message::AccountUi(Action::SignIn(account.id.clone()))),
+                )
+                .into()
+        };
         match &account.snapshot {
             None if account.failure.is_none() => {
                 rows.push(design::caption("Checking usage…").into());
+            }
+            // No check has answered, so whether it is signed in is unknown,
+            // and signing in is a way forward whatever the failure was.
+            None if !account.account.is_brokered() => {
+                rows.push(
+                    design::caption(format!(
+                        "cagents could not check whether {} is signed in. Sign in if it is not.",
+                        account.name()
+                    ))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                    .into(),
+                );
+                rows.push(sign_in("Sign in"));
             }
             None => {}
             Some(snapshot) => match snapshot.status {
@@ -6626,15 +6660,7 @@ impl Cagents {
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                     );
-                    rows.push(
-                        crate::ui_controls::button::primary("Sign in")
-                            .on_press_maybe(
-                                (!self.account_sign_in_running(&account.account)).then(|| {
-                                    Message::AccountUi(Action::SignIn(account.id.clone()))
-                                }),
-                            )
-                            .into(),
-                    );
+                    rows.push(sign_in("Sign in"));
                 }
                 UsageStatus::Unavailable => {
                     rows.push(
@@ -6670,10 +6696,24 @@ impl Cagents {
                         )
                     }));
                     if snapshot.windows.is_empty() {
-                        rows.push(
-                            design::caption("No usage limits are reported for this account.")
-                                .into(),
-                        );
+                        rows.push(if account::reports_usage_limits(account.account.provider) {
+                            design::caption("No usage limits are reported for this account.").into()
+                        } else {
+                            // It has limits all the same; what is known is
+                            // what its own check said, such as a login with
+                            // no allowance at all.
+                            let limited = snapshot.status == UsageStatus::Limited;
+                            design::caption(snapshot.detail.clone().unwrap_or_else(|| {
+                                format!("{} does not report its usage limits.", account.name())
+                            }))
+                            .class(if limited {
+                                cosmic::theme::Text::Custom(design::warning_text)
+                            } else {
+                                cosmic::theme::Text::Default
+                            })
+                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                            .into()
+                        });
                     }
                     if let Some(credits) = &snapshot.credits {
                         rows.push(

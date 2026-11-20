@@ -148,6 +148,17 @@ impl Column {
         Self::Updated,
     ];
 
+    /// The columns `provider`'s accounts have something to show in: a
+    /// provider that reports no usage limits has no figures, only its plan
+    /// and how its sign-in stands.
+    fn shown(provider: Provider) -> &'static [Self] {
+        if account::reports_usage_limits(provider) {
+            &Self::ORDER
+        } else {
+            &[Self::Plan, Self::Status, Self::Updated]
+        }
+    }
+
     fn width(self, usage: f32) -> f32 {
         match self {
             Self::Plan => 72.0,
@@ -187,6 +198,11 @@ struct Layout {
 const TOOLBAR_MIN_WIDTH: f32 = 600.0;
 
 fn layout(width: f32) -> Layout {
+    layout_of(width, &Column::ORDER)
+}
+
+/// [`layout`] for a table of only the `shown` columns.
+fn layout_of(width: f32, shown: &[Column]) -> Layout {
     let available = width.min(MAX_WIDTH) - 2.0 * GUTTER;
     let needed = |columns: &[Column], usage: f32| {
         ACCOUNT_MIN_WIDTH
@@ -198,7 +214,10 @@ fn layout(width: f32) -> Layout {
             + COLUMN_SPACING
     };
     let compact_toolbar = available < TOOLBAR_MIN_WIDTH;
-    let mut columns = Column::ORDER.to_vec();
+    let mut columns = Column::ORDER
+        .into_iter()
+        .filter(|column| shown.contains(column))
+        .collect::<Vec<_>>();
     for drop in Column::DROP_ORDER {
         if needed(&columns, USAGE_WIDTH) <= available {
             return Layout {
@@ -329,6 +348,7 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
             || !rows(state, provider, state.table.sort).is_empty()
             || (provider == Provider::Omp && state.omp_problem().is_some())
         {
+            let layout = layout_of(width, Column::shown(provider));
             sections.push(group(app, provider, &layout, project));
         }
     }
@@ -1435,6 +1455,28 @@ pub(in crate::app) mod tests {
         // Between asks the phase is `Waiting` again, with the terminal ended.
         login.attempts = 1;
         assert_eq!(login_caption(&login), "Checking which account signed in…");
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_limits_has_no_usage_columns() {
+        for provider in [Provider::Antigravity, Provider::Muse] {
+            let wide = layout_of(1_400.0, Column::shown(provider));
+            assert_eq!(
+                wide.columns,
+                [Column::Plan, Column::Status, Column::Updated],
+                "{provider:?}"
+            );
+            // Its few columns fit where a reporting provider's would not.
+            let narrow = layout_of(700.0, Column::shown(provider));
+            assert_eq!(narrow.columns, wide.columns, "{provider:?}");
+            assert!(!narrow.stacked);
+        }
+        for provider in [Provider::Claude, Provider::Codex] {
+            assert_eq!(
+                layout_of(1_400.0, Column::shown(provider)).columns,
+                Column::ORDER.to_vec()
+            );
+        }
     }
 
     #[test]
