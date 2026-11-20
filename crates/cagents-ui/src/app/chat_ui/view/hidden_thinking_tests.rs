@@ -308,7 +308,7 @@ fn a_lone_steps_open_choice_survives_its_strip() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.cards
         .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-    // The reader opens the lone row.
+    // The reader opens the lone row, then the agent thinks.
     drop(app.handle_chat_ui(Action::Toggle(target, "c1".into())));
     let mut snapshot = (*handle.snapshot()).clone();
     snapshot.generation += 1;
@@ -318,14 +318,21 @@ fn a_lone_steps_open_choice_survives_its_strip() {
     runtime.refresh();
     preparation::drain_fixture(runtime);
     assert!(runtime.turns[0].thinking);
-    assert!(
-        runtime.group_open(&runtime.turns[0]),
-        "the strip opens over it"
-    );
-    // Closing the strip closes the row it turns back into.
+    let only = |runtime: &Runtime| runtime.lone_step(&runtime.turns[0]).map(|step| step.index);
+    assert_eq!(only(runtime), Some(1), "an open row stays where it is");
+    // Closing it closes the group's strip in its place, whose time counts.
+    drop(app.handle_chat_ui(Action::Toggle(target, "c1".into())));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert_eq!(only(runtime), None);
+    assert!(!runtime.steps_shown(&runtime.turns[0]));
+    // Opening the strip opens the step it stands for, as its row.
     let key = runtime.turns[0].key.clone();
     drop(app.handle_chat_ui(Action::ToggleTurn(target, key)));
     let runtime = app.chat_runtime_mut(target).unwrap();
-    assert!(!runtime.group_open(&runtime.turns[0]));
-    assert!(!runtime.item_expanded("c1"));
+    assert!(runtime.item_expanded("c1"));
+    assert_eq!(only(runtime), Some(1));
+    assert!(
+        runtime.group_open(&runtime.turns[0]),
+        "the group follows its step"
+    );
 }

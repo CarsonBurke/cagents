@@ -5616,7 +5616,7 @@ impl Runtime {
                 // A group of one step is that step. `for_each_turn_part`
                 // places the strip only when a step is not drawn as a
                 // failure, so a lone one here is drawn as a row.
-                if let Some(only) = turn.lone_step()
+                if let Some(only) = self.lone_step(turn)
                     && let Some((item, cached)) = placed(only.index)
                 {
                     return widget::container(scroll::item(

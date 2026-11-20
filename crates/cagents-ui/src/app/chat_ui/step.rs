@@ -340,10 +340,33 @@ impl Runtime {
         }
     }
 
+    /// The step a group is drawn as, when it is drawn as its only step's
+    /// row. While the agent thinks after that step with its row closed, the
+    /// group is its closed strip instead, of the row's height and at its
+    /// place, whose time counts on as the agent works; opening it opens the
+    /// row, as the strip stands for that step.
+    pub(super) fn lone_step<'t>(&self, turn: &'t turn::Turn) -> Option<&'t turn::Placed> {
+        let [only] = turn.steps.as_slice() else {
+            return None;
+        };
+        let open = || {
+            self.step_items()
+                .get(only.index)
+                .is_some_and(|item| self.item_expanded(&item.id))
+        };
+        (!turn.thinking || open()).then_some(only)
+    }
+
+    /// Whether a group's strip stands for its only step, as it does while
+    /// the agent thinks after that step with the step's row closed.
+    pub(super) fn strip_stands_for_step(&self, turn: &turn::Turn) -> bool {
+        turn.steps.len() == 1 && self.lone_step(turn).is_none()
+    }
+
     /// Whether a group's steps are on screen: a lone step always is, as its
     /// own row, and the steps of several when their strip is open.
     pub(super) fn steps_shown(&self, turn: &turn::Turn) -> bool {
-        turn.lone_step().is_some() || self.group_open(turn)
+        self.lone_step(turn).is_some() || !self.strip_stands_for_step(turn) && self.group_open(turn)
     }
 
     /// One group's activity: a summary line and how long the work took,
@@ -365,7 +388,7 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let key = turn.key.as_str();
-        let open = self.group_open(turn);
+        let open = !self.strip_stands_for_step(turn) && self.group_open(turn);
         let elapsed = if turn.running {
             self.source_now_ms()
                 .and_then(|now| turn.duration_label(now))
@@ -457,7 +480,14 @@ impl Runtime {
         cached: &CachedItem,
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
-        self.step_row(item, cached, settings, self.strip_status(turn))
+        // Thinking after the step leaves it as it ended; the closing line
+        // says the agent is still at work.
+        let status = if turn.thinking {
+            turn.outcome
+        } else {
+            self.strip_status(turn)
+        };
+        self.step_row(item, cached, settings, status)
     }
 
     fn step_row(

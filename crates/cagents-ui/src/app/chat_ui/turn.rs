@@ -161,17 +161,6 @@ impl Turn {
         self.working_for(now).map(super::disclosure::duration)
     }
 
-    /// The step this group is drawn as, when it is drawn as its only step's
-    /// row rather than as a strip. While the agent thinks after that step,
-    /// the group is its strip, so its time counts on as the agent works, as
-    /// it does once a second step joins.
-    pub(super) fn lone_step(&self) -> Option<&Placed> {
-        match self.steps.as_slice() {
-            [only] if !self.thinking => Some(only),
-            _ => None,
-        }
-    }
-
     /// Fills in the summary once the group's membership is final.
     fn describe<'c, T: Borrow<Item>>(&mut self, items: &[T], presented: &impl Presented<'c>) {
         // A single step names itself, because "1 step" tells the reader
@@ -474,10 +463,9 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     ..
                 }) = thinking
                 {
-                    turns[at]
-                        .pauses
-                        .extend(thinking.take().and_then(Thinking::pause));
+                    turns[at].pauses.extend(thinking.and_then(Thinking::pause));
                 }
+                thinking = None;
             }
             continue;
         }
@@ -1766,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_step_followed_by_thinking_is_drawn_as_its_group() {
+    fn a_lone_step_followed_by_thinking_keeps_its_group_thinking() {
         let items = vec![
             text("prompt", Role::User, Phase::Final, false),
             timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
@@ -1774,15 +1762,12 @@ mod tests {
         ];
         let turns = group(&items, &unasked(), Working);
         assert!(turns[0].thinking);
-        assert_eq!(turns[0].lone_step(), None, "a strip, whose time counts on");
         assert!(
             turns[0].summary.ends_with(" · working"),
             "{}",
             turns[0].summary
         );
-        let turns = group(&items, &unasked(), plain);
-        assert!(!turns[0].thinking);
-        assert_eq!(turns[0].lone_step().map(|step| step.index), Some(1));
+        assert!(!group(&items, &unasked(), plain)[0].thinking);
     }
 
     #[test]
@@ -1893,6 +1878,19 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(pauses(&turns[0]), [(2, 3, 3_000)]);
         assert_eq!(pauses(&turns[1]), [(0, 4, 5_000)]);
+        // Thinking after an answer ends at a question too, whether it would
+        // have led the next strip or followed the group's prose.
+        for (said, phase) in [("answer", Phase::Final), ("progress", Phase::Commentary)] {
+            let mut items = items.clone();
+            items.insert(
+                3,
+                timed(text(said, Role::Assistant, phase, false), 3_000, 3_000),
+            );
+            let turns = group(&items, &asked, plain);
+            let last = turns.last().expect("the work after the question");
+            assert_eq!(steps(last), [6, 7], "{said}");
+            assert_eq!(pauses(last), [(0, 5, 5_000)], "{said}");
+        }
     }
 
     #[test]
