@@ -6741,7 +6741,7 @@ fn a_railed_chat_reserves_no_toggle_clearance() {
     let rail = bounds.rail.expect("the rail");
     let gap = rail.x - (row.x + row.width);
     assert!(
-        gap >= step::GAP_S - 0.1 && gap < crate::app::pane_inspector::TOGGLE_CLEARANCE,
+        (step::GAP_S - 0.1..crate::app::pane_inspector::TOGGLE_CLEARANCE).contains(&gap),
         "{row:?} / {rail:?}"
     );
 }
