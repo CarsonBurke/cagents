@@ -159,9 +159,35 @@ impl State {
             return None;
         }
         let attempt = self.uncertain.get(reset_id)?;
-        if attempt.reset.kind == account::resets::ResetKind::WeeklySession
-            || attempt.identity.as_ref() != identity
-        {
+        // Match the reset backend's login check, not display-only plan metadata.
+        // The attempt keeps its original identity and idempotency binding.
+        let same_login = match (attempt.identity.as_ref(), identity) {
+            (Some(expected), Some(actual)) => {
+                let same = |actual: &str, expected: &str| {
+                    !actual.trim().is_empty() && actual.trim().eq_ignore_ascii_case(expected.trim())
+                };
+                expected.disputed_by.is_none()
+                    && actual.disputed_by.is_none()
+                    && actual
+                        .email
+                        .as_deref()
+                        .zip(expected.email.as_deref())
+                        .is_some_and(|(actual, expected)| same(actual, expected))
+                    && expected
+                        .organization
+                        .as_deref()
+                        .filter(|org| !org.trim().is_empty())
+                        .is_none_or(|expected| {
+                            actual
+                                .organization
+                                .as_deref()
+                                .is_some_and(|actual| same(actual, expected))
+                        })
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if attempt.reset.kind == account::resets::ResetKind::WeeklySession || !same_login {
             return None;
         }
         let attempt = attempt.clone();
@@ -1261,6 +1287,192 @@ pub(in crate::app) mod tests {
         assert!(state.finish(&second.key, ConsumeStatus::Reset, "Used".into()));
         state.prepare(grant, 2, None, "accounts".into());
         assert_ne!(state.confirmation.as_ref().unwrap().key, first.key);
+    }
+
+    #[test]
+    fn a_normal_probe_plan_change_preserves_original_key_reset_recovery() {
+        for plan in [None, Some("plus")] {
+            let now = now_ms();
+            let mut app = context_inspector_test_app(false);
+            let id = Account::system(Provider::Codex).id();
+            let identity = Identity {
+                email: Some("reset@example.com".into()),
+                organization: Some("fixture-organization".into()),
+                plan: plan.map(str::to_owned),
+                disputed_by: None,
+            };
+            let mut grant = reset(ResetScope::Account);
+            grant.id = "codex/next".into();
+            grant.available_count = 1;
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+            snapshot.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+            snapshot.resets = vec![grant.clone()];
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.identity = Some(identity.clone());
+            state.snapshot = Some(snapshot.clone());
+
+            drop(app.update(Message::AccountUi(Action::ResetStart(
+                id.clone(),
+                grant.id.clone(),
+                "accounts".into(),
+                false,
+            ))));
+            let key = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .confirmation
+                .as_ref()
+                .expect("the available grant asks for confirmation")
+                .key
+                .clone();
+            drop(app.update(Message::AccountUi(Action::ResetConfirm(id.clone()))));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.reset.pending.as_ref().unwrap().key, key);
+            let owner = state.owner;
+            drop(app.update(Message::AccountUi(Action::ResetFinished {
+                id: id.clone(),
+                owner,
+                key: key.clone(),
+                result: Ok(ConsumeOutcome {
+                    status: ConsumeStatus::Unconfirmed,
+                    message: None,
+                    snapshot: None,
+                }),
+            })));
+            assert!(
+                app.account_ui
+                    .account(&id)
+                    .unwrap()
+                    .reset
+                    .uncertain
+                    .contains_key(&grant.id)
+            );
+
+            let (owner, ticket) =
+                app.account_ui
+                    .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+            let refreshed = Identity {
+                plan: Some("pro".into()),
+                ..identity.clone()
+            };
+            snapshot.observed_at = now_ms();
+            drop(app.update(Message::AccountUi(Action::Probed {
+                id: id.clone(),
+                owner,
+                ticket,
+                outcome: Outcome::Answered {
+                    identity: Some(refreshed.clone()),
+                    snapshot: Box::new(snapshot),
+                    catalog: None,
+                },
+            })));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.identity.as_ref(), Some(&refreshed));
+            let controls = app.usage_reset_controls(state).unwrap();
+            assert!(controls.recovery_enabled);
+            assert!(next_reset(&controls.snapshot, &controls.state, controls.now).is_none());
+
+            let retry = app.update(Message::AccountUi(Action::ResetRecover(
+                id.clone(),
+                grant.id.clone(),
+            )));
+            let attempt = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .pending
+                .as_ref()
+                .expect("a plan-only refresh must submit the original reset request");
+            assert_eq!(attempt.key, key);
+            assert_eq!(attempt.reset, grant);
+            assert_eq!(attempt.identity.as_ref(), Some(&identity));
+            assert!(retry.units() > 0, "recovery dispatches the saved request");
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_changed_or_unverifiable_logins() {
+        let original = Identity {
+            email: Some("reset@example.com".into()),
+            organization: Some("fixture-organization".into()),
+            plan: Some("plus".into()),
+            disputed_by: None,
+        };
+        let grant = reset(ResetScope::Account);
+        let mut state = State::default();
+        state.prepare(grant.clone(), 2, Some(original.clone()), "accounts".into());
+        let attempt = state.submit(&grant, 2, Some(&original)).unwrap();
+        assert!(state.finish(
+            &attempt.key,
+            ConsumeStatus::Unconfirmed,
+            "Unconfirmed".into()
+        ));
+        for identity in [
+            Some(Identity {
+                email: Some("other@example.com".into()),
+                ..original.clone()
+            }),
+            Some(Identity {
+                email: None,
+                ..original.clone()
+            }),
+            Some(Identity {
+                email: Some(" ".into()),
+                ..original.clone()
+            }),
+            Some(Identity {
+                organization: Some("another-organization".into()),
+                ..original.clone()
+            }),
+            Some(Identity {
+                organization: None,
+                ..original.clone()
+            }),
+            Some(Identity {
+                disputed_by: Some("other@example.com".into()),
+                ..original.clone()
+            }),
+            None,
+        ] {
+            let mut state = state.clone();
+            assert!(state.recover(&grant.id, identity.as_ref()).is_none());
+            assert!(!state.in_flight());
+            assert_eq!(state.uncertain.get(&grant.id).unwrap().key, attempt.key);
+        }
+    }
+
+    #[test]
+    fn recovery_matches_the_backend_login_without_rebinding_the_request() {
+        for organization in [None, Some(" fixture-organization ")] {
+            let original = Identity {
+                email: Some(" Reset@Example.com ".into()),
+                organization: organization.map(str::to_owned),
+                plan: None,
+                disputed_by: None,
+            };
+            let current = Identity {
+                email: Some("reset@example.com".into()),
+                organization: Some("FIXTURE-ORGANIZATION".into()),
+                plan: Some("pro".into()),
+                disputed_by: None,
+            };
+            let grant = reset(ResetScope::Account);
+            let mut state = State::default();
+            state.prepare(grant.clone(), 2, Some(original.clone()), "accounts".into());
+            let attempt = state.submit(&grant, 2, Some(&original)).unwrap();
+            assert!(state.finish(
+                &attempt.key,
+                ConsumeStatus::Unconfirmed,
+                "Unconfirmed".into()
+            ));
+            let retry = state.recover(&grant.id, Some(&current)).unwrap();
+            assert_eq!(retry.key, attempt.key);
+            assert_eq!(retry.identity, Some(original));
+        }
     }
 
     #[test]
