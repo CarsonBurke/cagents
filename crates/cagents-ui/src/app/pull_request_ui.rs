@@ -147,6 +147,7 @@ impl Cagents {
                 for state in self.pull_request_inspector.conversations.values_mut() {
                     state.update(watch.clone());
                 }
+                self.place_inspected_work();
                 Task::none()
             }
             Action::Choose { card, key } => {
@@ -287,6 +288,26 @@ impl Cagents {
         };
         let directory = &session.launch.recipe.working_directory;
         self.lists_worktree(directory).then(|| directory.clone())
+    }
+
+    /// Fits each inspected conversation's latest list into the rows its
+    /// Work section shows, with what Projects lists now. Which rows there
+    /// are depends on both, so this runs when a list arrives and when
+    /// Projects' worktrees change.
+    pub(super) fn place_inspected_work(&mut self) {
+        let heres: Vec<(CardId, Option<PathBuf>)> = self
+            .pull_request_inspector
+            .conversations
+            .keys()
+            .map(|card| (*card, self.inspected_here(*card)))
+            .collect();
+        let paths = &self.worktree_paths;
+        let openable = |path: &std::path::Path| paths.lists(path);
+        for (card, here) in heres {
+            if let Some(state) = self.pull_request_inspector.conversations.get_mut(&card) {
+                state.place(here.as_deref(), &openable);
+            }
+        }
     }
 
     /// Whether Projects lists a worktree at `path`, so its changes can be
@@ -613,6 +634,61 @@ mod tests {
         assert!(app.pull_request_inspector.conversation(chat).is_none());
         drop(app.handle_pull_request_ui(listed(conversation, 2, &rows, true)));
         assert_eq!(app.work_summary(reopened_id).shown.as_ref(), Some(&key));
+    }
+
+    /// The row of the worktree the chat runs in, shown once Projects lists
+    /// it, keeps its place when later work arrives, though Projects began
+    /// listing it between two of the conversation's lists.
+    #[test]
+    fn the_chats_own_worktree_row_is_placed_when_projects_lists_it() {
+        let (
+            mut app,
+            Panes {
+                conversation, chat, ..
+            },
+        ) = conversation_app();
+        app.sync_pull_request_inspector();
+        let rows = |app: &Cagents| -> Vec<String> {
+            let here = app.inspected_here(chat);
+            let openable = |path: &std::path::Path| app.lists_worktree(path);
+            app.pull_request_inspector
+                .conversation(chat)
+                .unwrap()
+                .work(here.as_deref(), &openable)
+                .iter()
+                .map(|work| match work.pull_request() {
+                    Some(row) => format!("#{}", row.number),
+                    None => work.scope_label(),
+                })
+                .collect()
+        };
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[(1, Relation::Created)], true)));
+        assert_eq!(rows(&app), ["#1"]);
+
+        // Projects begins to list the chat's working directory.
+        *app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "tmp".into(),
+            "/tmp".into(),
+            vec![SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                "/tmp".into(),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.refresh_sidebar_worktree_panes();
+        assert_eq!(rows(&app), ["#1", "tmp"]);
+
+        let both = [(1, Relation::Created), (2, Relation::Pushed)];
+        drop(app.handle_pull_request_ui(listed(conversation, 2, &both, false)));
+        assert_eq!(rows(&app), ["#1", "tmp", "#2"]);
     }
 
     #[test]
