@@ -10454,6 +10454,106 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
 }
 
 #[test]
+fn compact_folder_root_badge_survives_a_visible_channel() {
+    use crate::agent::{Activity, ActivityState, Provider};
+    let mut folder = project().with_kind(ProjectKind::Folder);
+    folder.worktrees.clear();
+    let root = compact_attention_terminal(CardId::new());
+    let mut durable = Arc::new(crate::model::WorkspaceState {
+        cards: vec![root.clone()].into(),
+        card_scopes: [(root.id, folder.repository.clone())].into_iter().collect(),
+        ..Default::default()
+    });
+    let mut state = expanded_worktree_state();
+    state.set_card_activity(
+        root.id,
+        Activity {
+            provider: Provider::Omp,
+            state: ActivityState::Working,
+        },
+    );
+
+    // Creating and selecting a channel leaves the running root terminal
+    // outside it. Its completion arrives while that empty channel is current.
+    let channel = crate::model::ProjectChannel {
+        title_source: Default::default(),
+        id: ChannelId::new(),
+        project_id: folder.id,
+        title: "Child work".into(),
+        ordinal: 1,
+        shared: true,
+        cards: Vec::new(),
+        focused: None,
+    };
+    folder.channels.push(SidebarChannel::new(
+        channel.id,
+        channel.title.clone(),
+        true,
+        None,
+        false,
+        0,
+        true,
+        1,
+    ));
+    Arc::make_mut(&mut durable).active_channel = Some(channel.id);
+    Arc::make_mut(&mut durable).channels.push(channel.clone());
+    let mut model = SidebarModel::ready(SidebarMode::Compact, vec![folder]);
+    state.clear_agent_activity(root.id);
+    state.observe_card_update(root.id);
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(state.filter, SidebarFilter::All);
+    assert!(state.query.is_empty());
+    assert!(!durable.channels[0].cards.contains(&root.id));
+    assert_eq!(state.project_attention(channel.project_id).unread, 1);
+    assert_eq!(
+        drawn_rows(&model, &state, true),
+        vec![
+            SelectionRow::Project(channel.project_id),
+            SelectionRow::Channel(channel.id),
+        ],
+        "the selected channel is drawn, and the Folder root has no pane row"
+    );
+    let unread_counts = |model: &SidebarModel, state: &SidebarState| {
+        drawn_texts(project_list(model, state, true, false), COMPACT_WIDTH)
+            .into_iter()
+            .filter_map(|(text, _)| text.parse::<usize>().ok())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        unread_counts(&model, &state),
+        vec![1],
+        "the compact Folder chip must show the root's unread completion"
+    );
+
+    // The channel's own news belongs on its row, leaving only the root's
+    // news on the chip rather than repeating the full project count there.
+    let child = compact_attention_terminal(CardId::new());
+    Arc::make_mut(&mut durable).cards.push(child.clone());
+    Arc::make_mut(&mut durable).channels[0].cards.push(child.id);
+    model.projects[0].channels[0] = model.projects[0].channels[0]
+        .clone()
+        .with_attention(AttentionSummary::card(None, true, false));
+    state.observe_card_update(child.id);
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(state.project_attention(channel.project_id).unread, 2);
+    assert_eq!(unread_counts(&model, &state), vec![1, 1]);
+
+    state.apply(&SidebarAction::ToggleProject(channel.project_id));
+    assert_eq!(unread_counts(&model, &state), vec![2]);
+    state.apply(&SidebarAction::ToggleProject(channel.project_id));
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+    assert_eq!(
+        drawn_rows(&model, &state, true),
+        vec![
+            SelectionRow::Project(channel.project_id),
+            SelectionRow::Channel(channel.id),
+            SelectionRow::Card(root.id),
+        ]
+    );
+    assert_eq!(unread_counts(&model, &state), vec![1, 1]);
+}
+
+#[test]
 fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
     use crate::agent::{Activity, ActivityState, Provider};
     let mut sidebar = Sidebar::roomy();
