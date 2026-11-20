@@ -37,6 +37,7 @@ use super::{
 };
 use crate::{agent::Provider, chat::Model};
 
+mod acp;
 mod muse;
 mod reset_consume;
 #[cfg(test)]
@@ -444,11 +445,8 @@ async fn probe_cli(
         Provider::Claude => probe_claude_with_path(account, program, search_path, cache).await,
         Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
+        Provider::Antigravity => acp::probe_antigravity(account, program, search_path).await,
         Provider::Muse => muse::probe_muse(account, program, search_path).await,
-        Provider::Antigravity => Err(format!(
-            "cagents does not read {} account usage yet",
-            account.provider.label()
-        )),
     }
 }
 

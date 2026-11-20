@@ -22,6 +22,7 @@ use crate::notifications::Kind;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+pub mod antigravity;
 mod config;
 mod history;
 pub mod muse;
@@ -470,9 +471,10 @@ impl Acp {
         self.segment = None;
         let (kind, notice) = match outcome {
             Ok(result) => {
-                // The unstable `PromptResponse.usage` is read as this turn's
-                // own tokens, so turns add up; an agent that reports a
-                // running total instead would be counted again each turn.
+                // The unstable `PromptResponse.usage` is this turn's own
+                // tokens, so turns add up: Antigravity 1.5.12's second turn
+                // of a conversation reports only its own input, apart from
+                // what it read from cache, as Claude's do.
                 if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
                     let count = |key: &str| usage[key].as_u64().unwrap_or(0);
                     self.usage.input_tokens += count("inputTokens");

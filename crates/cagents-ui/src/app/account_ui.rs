@@ -1930,12 +1930,24 @@ fn chip_with_window(
         }
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
             let Some(window) = window_of(snapshot) else {
-                return Chip {
-                    text: "No limits".into(),
-                    usage_fraction: None,
-                    tone: ChipTone::Current,
-                    essential: false,
-                    tooltip: format!("{name} reports no usage limits for this account"),
+                return if account::reports_usage_limits(account.account.provider) {
+                    Chip {
+                        text: "No limits".into(),
+                        usage_fraction: None,
+                        tone: ChipTone::Current,
+                        essential: false,
+                        tooltip: format!("{name} reports no usage limits for this account"),
+                    }
+                } else {
+                    Chip {
+                        text: "Limits not reported".into(),
+                        usage_fraction: None,
+                        tone: ChipTone::Current,
+                        essential: false,
+                        tooltip: format!(
+                            "{name} is signed in. It does not report its usage limits, so cagents cannot show them."
+                        ),
+                    }
                 };
             };
             let stale = is_stale(snapshot, now);
@@ -2004,11 +2016,16 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Claude, _) => &["auth", "login", "--claudeai"],
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
+        (Provider::Antigravity, _) => ANTIGRAVITY_LOGIN,
         // A device code shown in the terminal, approved in any browser.
         (Provider::Muse, _) => &["login"],
-        (Provider::Omp | Provider::Antigravity, _) => return None,
+        (Provider::Omp, _) => return None,
     })
 }
+
+/// Antigravity's sign-in, which its ACP server offers a client to run in a
+/// terminal: Google's, in the browser, after which `agy` exits.
+const ANTIGRAVITY_LOGIN: &[&str] = &["acp", "--login", "--disable-telemetry"];
 
 /// The terminal that runs `account`'s login command: the CLI at `program`,
 /// the same executable the probes run, started in the reader's home - not in
@@ -8257,6 +8274,11 @@ mod tests {
         assert!(is_sign_in(&recipe("muse", &["login"])));
         assert!(!is_sign_in(&recipe("muse-upstream", &["acp"])));
         assert!(!is_sign_in(&recipe("agy", &["login"])));
+        assert!(is_sign_in(&recipe(
+            "/usr/bin/agy",
+            &["acp", "--login", "--disable-telemetry"]
+        )));
+        assert!(!is_sign_in(&recipe("agy", &["acp"])));
         assert!(!is_sign_in(&recipe("claude", &[])));
         assert!(!is_sign_in(&recipe("claude", &["login"])));
         assert!(!is_sign_in(&recipe(
@@ -8315,6 +8337,52 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
+    /// Antigravity's probe answers a working sign-in with its plan and no
+    /// limits. That system login is listed, with its plan, and its chip says
+    /// it reports no limits; signed out, it asks for sign-in again.
+    #[test]
+    fn a_signed_in_antigravity_login_is_listed_with_its_plan_and_unreported_limits() {
+        let mut app = context_inspector_test_app(false);
+        let provider = Provider::Antigravity;
+        let id = Account::system(provider).id();
+        app.account_ui.installed.insert(provider, true);
+        assert!(!table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+        let answer = |app: &mut Cagents, status, plan: Option<&str>| {
+            let now = app.account_ui.now_ms;
+            let (owner, ticket) = admit_actual_ticket(app, &id, now);
+            let mut snapshot = UsageSnapshot::state(status, "probed", now);
+            snapshot.plan_display_name = plan.map(str::to_owned);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: plan.map(|plan| Identity {
+                        plan: Some(plan.into()),
+                        ..Identity::default()
+                    }),
+                    snapshot: Box::new(snapshot),
+                },
+            })));
+            app.account_ui.now_ms = now + schedule::MANUAL_DEBOUNCE + 1;
+        };
+        answer(&mut app, UsageStatus::Ok, Some("Google AI Pro"));
+        assert!(table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+        let state = app.account_ui.account(&id).unwrap();
+        let snapshot = state.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.plan_display_name.as_deref(), Some("Google AI Pro"));
+        let shown = chip(
+            state,
+            "Antigravity",
+            app.account_ui.now_ms,
+            Default::default(),
+        );
+        assert_eq!(shown.text, "Limits not reported");
+        answer(&mut app, UsageStatus::NeedsLogin, None);
+        assert_eq!(app.account_ui.provider_status(provider), "Sign in again");
+    }
+
     #[test]
     fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
         let mut app = context_inspector_test_app(false);

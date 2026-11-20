@@ -1297,6 +1297,72 @@ fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings(
     )));
 }
 
+/// An agent that hits its account's usage limit is not asking the person
+/// anything, so the conversation must not read as waiting for input: not
+/// while the error is fresh, and not after the agent failed and was resumed.
+#[test]
+fn a_child_usage_limit_never_reads_as_the_conversation_waiting_for_input() {
+    let limit = "You've hit your weekly limit · resets Nov 23, 9am (America/Vancouver)";
+    let error = |uuid: &str| json!({"type":"assistant","uuid":uuid,"parent_tool_use_id":"worker","error":"rate_limit","message":{"id":uuid,"content":[{"type":"text","text":limit}]}});
+    let mut adapter = Claude::default();
+    let mut snapshot = chat::Snapshot::default();
+    let mut feed = |snapshot: &mut chat::Snapshot, frame: Value| {
+        crate::chat::runtime::project_events_for_test(
+            snapshot,
+            adapter.receive(frame).unwrap().events,
+        );
+    };
+    for frame in [
+        scoped_call(
+            None,
+            "launch-worker",
+            "worker",
+            "Agent",
+            json!({"run_in_background":true}),
+        ),
+        json!({"type":"user","uuid":"worker-launched","tool_use_result":{"isAsync":true,"status":"async_launched","agentId":"worker-task"},"message":{"content":[{"type":"tool_result","tool_use_id":"worker","content":"Launched"}]}}),
+        json!({"type":"system","subtype":"task_started","task_id":"worker-task","tool_use_id":"worker","task_type":"local_agent"}),
+        json!({"type":"assistant","uuid":"worker-progress","parent_tool_use_id":"worker","message":{"id":"worker-progress","content":[{"type":"text","text":"Checking the build"}]}}),
+        error("worker-limit"),
+    ] {
+        feed(&mut snapshot, frame);
+    }
+    let worker = &snapshot.subagents[0];
+    assert_eq!(worker.status, ToolStatus::Running);
+    assert!(
+        worker.detail.contains("weekly limit"),
+        "the agent's row says why"
+    );
+    assert_eq!(snapshot.activity(), chat::ActivityState::Working);
+    assert_eq!(snapshot.subagent_activity().waiting, 0);
+
+    // The agent ends on the limit; a later frame repeating its error must not
+    // leave a mark that its resumed run would read as waiting.
+    feed(
+        &mut snapshot,
+        json!({"type":"system","subtype":"task_notification","uuid":"worker-failed","task_id":"worker-task","tool_use_id":"worker","status":"failed","summary":"Agent terminated early due to an API error"}),
+    );
+    assert_eq!(snapshot.subagents[0].status, ToolStatus::Failed);
+    feed(&mut snapshot, error("worker-limit-again"));
+    feed(
+        &mut snapshot,
+        scoped_call(
+            None,
+            "resume-worker",
+            "resume",
+            "SendMessage",
+            json!({"to":"worker-task","message":"Usage is back; carry on"}),
+        ),
+    );
+    feed(
+        &mut snapshot,
+        json!({"type":"system","subtype":"task_started","task_id":"worker-task","tool_use_id":"resume","task_type":"local_agent"}),
+    );
+    assert_eq!(snapshot.subagents[0].status, ToolStatus::Running);
+    assert_eq!(snapshot.activity(), chat::ActivityState::Working);
+    assert_eq!(snapshot.subagent_activity().waiting, 0);
+}
+
 #[test]
 fn retryable_child_error_is_scoped_and_only_actual_child_activity_clears_it() {
     let mut adapter = Claude {
@@ -1306,7 +1372,7 @@ fn retryable_child_error_is_scoped_and_only_actual_child_activity_clears_it() {
     let failure = "You've hit your limit · resets 1:30pm (America/Los_Angeles)";
     let error = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"waiting-child","event":{"type":"error","error":{"type":"rate_limit_error","message":failure}}})).unwrap();
     assert!(
-        matches!(error.events.as_slice(), [Event::SubagentItem { id:owner, item }, Event::Subagent { id, status:None, waiting:Some(true), detail:Some(detail), .. }]
+        matches!(error.events.as_slice(), [Event::SubagentItem { id:owner, item }, Event::Subagent { id, status:None, waiting:None, detail:Some(detail), .. }]
             if owner=="waiting-child" && id=="waiting-child" && detail.contains(failure)
             && chat::failure::provider_error_text(Provider::Claude,item)==Some(detail.as_str()))
     );
@@ -1661,10 +1727,8 @@ fn replayed_and_historical_child_answers_do_not_clear_a_later_retry_failure() {
     let failure = adapter.receive(json!({"type":"stream_event","parent_tool_use_id":"blocked-child","event":{"type":"error","error":{"type":"rate_limit_error","message":"quota exceeded"}}})).unwrap();
     assert!(failure.events.iter().any(|event| matches!(
         event,
-        Event::Subagent {
-            waiting: Some(true),
-            ..
-        }
+        Event::Subagent { id, waiting: None, detail: Some(detail), .. }
+            if id == "blocked-child" && detail.contains("quota exceeded")
     )));
     let clears = |events: &[Event]| {
         events.iter().any(|event| matches!(event, Event::Subagent { id, waiting:Some(false), detail:Some(detail), .. } if id=="blocked-child" && detail.is_empty()))
@@ -5783,7 +5847,7 @@ fn recorded_current_agent_scene_counts_only_direct_current_work() {
             activity.on_background_work,
             activity.failed.len()
         ),
-        (3, 1, 1, 1)
+        (4, 0, 1, 1)
     );
     assert_eq!(activity.failed[0].id, "toolu_failed");
     assert!(activity.failed[0].detail.contains("rollback"));
@@ -5805,7 +5869,8 @@ fn recorded_current_agent_scene_counts_only_direct_current_work() {
             .iter()
             .any(|agent| agent.status == ToolStatus::Stopped)
     );
-    assert_eq!(snapshot.activity(), chat::ActivityState::Waiting);
+    // Planner's rate limit is its own state; nothing asks the reader.
+    assert_eq!(snapshot.activity(), chat::ActivityState::Working);
     assert!(snapshot.holds_work());
     let failed_transcript = snapshot
         .subagents
@@ -6302,7 +6367,8 @@ fn fixture_subagent_scene_publishes_each_named_state() {
     };
     expect("explore-logs", "Read logs", ToolStatus::Succeeded, false);
     expect("scout", "Scout", ToolStatus::Running, false);
-    expect("planner", "Planner", ToolStatus::Running, true);
+    // Planner's rate limit is its own state, not a question for the reader.
+    expect("planner", "Planner", ToolStatus::Running, false);
     expect("builder", "Builder", ToolStatus::Failed, false);
     // Stopping a background agent ends its task, as the fixture reports.
     let stop = adapter

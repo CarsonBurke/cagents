@@ -50,7 +50,60 @@ impl Press {
     }
 }
 
+/// Whether a card can take a message it is given, as its pane shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Readiness {
+    /// Its provider takes it, now or after the running turn.
+    Takes,
+    /// Its provider has stopped, and this action, its pane's own way back,
+    /// brings back one that will.
+    Recovers(Press),
+    /// Nothing here can bring back a provider to take it now.
+    Cannot,
+}
+
 impl Runtime {
+    /// Whether this card can take a message, and what must bring its
+    /// provider back first. A stopped card answers as its pane does: with
+    /// the action on its primary button, when that can be pressed now and
+    /// leads back to a conversation.
+    pub(super) fn readiness(&self, transitioning: bool, fresh_available: bool) -> Readiness {
+        if self.closed_elsewhere || self.is_draft() {
+            return Readiness::Cannot;
+        }
+        let idle = !transitioning
+            && self.commands.is_idle()
+            && self.attachment_chooser_pending.is_none()
+            && self.pastes_pending == 0;
+        if self.capacity_refused {
+            return if idle {
+                Readiness::Recovers(Press::Reconnect)
+            } else {
+                Readiness::Cannot
+            };
+        }
+        let stopped = self.disconnected || self.snapshot.exited;
+        if self.start_blocked.is_some() || (stopped && self.auth_error().is_none()) {
+            return match self
+                .stopped_with_offer(transitioning, false, fresh_available)
+                .primary
+            {
+                Some((
+                    _,
+                    press @ (Press::Reconnect | Press::ResumeSaved | Press::Reopen),
+                    true,
+                )) => Readiness::Recovers(press),
+                _ => Readiness::Cannot,
+            };
+        }
+        // Signing in again is the person's to do, and read-only history
+        // with a live reader takes no messages.
+        if stopped || self.snapshot.read_only_reason.is_some() {
+            return Readiness::Cannot;
+        }
+        Readiness::Takes
+    }
+
     #[cfg(test)]
     pub(super) fn stopped(&self, transitioning: bool, resuming: bool) -> Stopped {
         self.stopped_with_offer(transitioning, resuming, self.offers_fresh_conversation())

@@ -237,10 +237,16 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("CLAUDE_CONFIG_DIR"),
         Provider::Codex => Some("CODEX_HOME"),
-        // Neither has a home variable of its own: cagents uses only their
-        // system account.
+        // None of these has a home variable of its own: cagents uses only
+        // their system account.
         Provider::Omp | Provider::Antigravity | Provider::Muse => None,
     }
+}
+
+/// Whether a provider reports its accounts' usage limits. One that does not
+/// has limits all the same; cagents just cannot show them.
+pub fn reports_usage_limits(provider: Provider) -> bool {
+    !matches!(provider, Provider::Antigravity | Provider::Muse)
 }
 
 /// Documented process credentials and provider selectors that outrank a CLI's
@@ -516,12 +522,13 @@ impl Account {
 
     /// The system accounts, which every installation reports on whether or
     /// not it added any account of its own. Omp brokers its own accounts,
-    /// which are found in its usage record rather than listed here. Muse
-    /// has only its system sign-in.
-    pub fn system_accounts() -> [Self; 3] {
+    /// which are found in its usage record rather than listed here.
+    /// Antigravity and Muse have only their system sign-ins.
+    pub fn system_accounts() -> [Self; 4] {
         [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
+            Self::system(Provider::Antigravity),
             Self::system(Provider::Muse),
         ]
     }
@@ -531,9 +538,10 @@ impl Account {
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
     /// The providers whose usage is reported, in the order they are listed.
-    pub const REPORTED: [Provider; 4] = [
+    pub const REPORTED: [Provider; 5] = [
         Provider::Claude,
         Provider::Codex,
+        Provider::Antigravity,
         Provider::Muse,
         Provider::Omp,
     ];
@@ -622,8 +630,8 @@ impl Account {
                 if self.provider == Provider::Muse {
                     return muse_config(environment);
                 }
-                let variable = home_variable(self.provider)?;
-                if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
+                if let Some(variable) = home_variable(self.provider)
+                    && let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
                     && !inherited_selections(environment).contains(&variable)
                 {
                     return Some(PathBuf::from(explicit));
@@ -632,7 +640,9 @@ impl Account {
                 let directory = match self.provider {
                     Provider::Claude => ".claude",
                     Provider::Codex => ".codex",
-                    Provider::Omp | Provider::Antigravity | Provider::Muse => return None,
+                    // Its sign-in, beside every Gemini CLI's.
+                    Provider::Antigravity => ".gemini",
+                    Provider::Omp | Provider::Muse => return None,
                 };
                 Some(Path::new(&home).join(directory))
             }
@@ -665,8 +675,6 @@ impl Account {
 
     /// [`Self::launch_home`] against `environment`.
     pub fn launch_home_in(&self, environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        // A CLI with no home variable is never told where its home is.
-        home_variable(self.provider)?;
         let home = self.home_directory(environment)?;
         if !matches!(self.home, AccountHome::System) || self.provider != Provider::Claude {
             return Some(home);
@@ -1715,7 +1723,20 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
-        // Muse keeps its login in its XDG configuration and is told nothing.
+        // Antigravity names no variable for its home, and shares Gemini's.
+        let antigravity = Account::system(Provider::Antigravity);
+        assert_eq!(
+            antigravity.home_directory(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.gemini"))
+        );
+        // Its launches resolve that home on their own; with no variable to
+        // export, binding a recipe to it leaves the recipe unchanged.
+        assert_eq!(
+            antigravity.launch_home_in(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.gemini"))
+        );
+        // Muse keeps its login in its XDG configuration, which it too
+        // resolves on its own.
         let muse = Account::system(Provider::Muse);
         assert_eq!(
             muse.home_directory(&environment(&[("HOME", "/home/a")])),
@@ -1730,7 +1751,7 @@ mod tests {
         );
         assert_eq!(
             muse.launch_home_in(&environment(&[("HOME", "/home/a")])),
-            None
+            Some(PathBuf::from("/home/a/.config/muse"))
         );
         assert_eq!(claude.probe_environment(), None);
         // The system Claude login exports no home of its own, so the CLI
