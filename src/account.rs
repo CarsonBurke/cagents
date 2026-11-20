@@ -1090,6 +1090,10 @@ pub struct UsageSnapshot {
     pub ordinary_usage_allowed: Option<bool>,
     /// Unix milliseconds at which these figures were observed.
     pub observed_at: u64,
+    /// Unix milliseconds of the newest model-only live report, used to order
+    /// reports rather than establish account-wide freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_observed_at: Option<u64>,
     pub source: UsageSource,
     /// The plan the usage response named, where it named one.
     pub plan: Option<String>,
@@ -1117,6 +1121,7 @@ impl UsageSnapshot {
             status,
             ordinary_usage_allowed: None,
             observed_at,
+            scoped_observed_at: None,
             source: UsageSource::Probe,
             plan: None,
             plan_display_name: None,
@@ -1211,8 +1216,14 @@ impl LiveReport {
     /// stamp from before the clock was set back. A login report carries no
     /// figures and is never taken.
     pub fn apply(self, current: &mut UsageSnapshot, observed_at: u64, now: u64) -> bool {
-        if current.observed_at > observed_at
-            && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+        let latest_observed_at = match &self {
+            Self::Claude(_) => current
+                .observed_at
+                .max(current.scoped_observed_at.unwrap_or(0)),
+            _ => current.observed_at,
+        };
+        if latest_observed_at > observed_at
+            && latest_observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
         {
             return false;
         }
@@ -1569,6 +1580,7 @@ mod tests {
             status: UsageStatus::Ok,
             ordinary_usage_allowed: None,
             observed_at: 0,
+            scoped_observed_at: None,
             source: UsageSource::Probe,
             plan: None,
             plan_display_name: None,
@@ -2258,6 +2270,7 @@ mod tests {
             status: UsageStatus::Ok,
             ordinary_usage_allowed: None,
             observed_at,
+            scoped_observed_at: None,
             source: UsageSource::Probe,
             plan: Some("max".into()),
             plan_display_name: None,

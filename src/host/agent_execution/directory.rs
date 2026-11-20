@@ -840,6 +840,7 @@ mod tests {
             status,
             ordinary_usage_allowed: None,
             observed_at,
+            scoped_observed_at: None,
             source: UsageSource::Live,
             plan: None,
             plan_display_name: None,

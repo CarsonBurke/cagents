@@ -11610,6 +11610,7 @@ mod app_tests {
                 status: UsageStatus::Ok,
                 ordinary_usage_allowed: None,
                 observed_at: now,
+                scoped_observed_at: None,
                 source: UsageSource::Probe,
                 plan: None,
                 plan_display_name: None,

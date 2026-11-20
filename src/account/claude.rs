@@ -324,6 +324,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         status,
         ordinary_usage_allowed: None,
         observed_at,
+        scoped_observed_at: None,
         source: UsageSource::Probe,
         plan,
         plan_display_name: metadata.display_name,
@@ -861,6 +862,7 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
         window.binding = false;
     }
     if !account_wide {
+        snapshot.scoped_observed_at = Some(observed_at);
         if matches!(snapshot.status, UsageStatus::Ok | UsageStatus::Warning) {
             snapshot.refresh_status(false, snapshot.status == UsageStatus::Warning);
         }
@@ -1386,6 +1388,45 @@ mod tests {
         assert_eq!(usage.status, UsageStatus::Ok);
         assert_eq!(usage.observed_at, now + 3);
         assert!(routing::available(&usage, now + 3));
+    }
+
+    #[test]
+    fn a_delayed_model_only_report_cannot_rewind_a_newer_window() {
+        use super::super::{LiveReport, routing};
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                {"kind": "weekly_all", "percent": 40, "resets_at": "2030-01-07T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        assert!(routing::available(&usage, now));
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.1, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut usage, now + 3_000, now + 3_000));
+        assert_eq!(usage.observed_at, now);
+        assert!(routing::available(&usage, now + 3_000));
+        let latest = usage.clone();
+        let delayed = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "seven_day_overage_included",
+            "utilization": 1.0, "resetsAt": (now / 1_000 + 1) as i64,
+        }))
+        .unwrap();
+        assert!(!LiveReport::Claude(delayed).apply(&mut usage, now + 2_000, now + 4_000));
+        assert_eq!(usage, latest);
+        let fable = usage
+            .windows
+            .iter()
+            .find(|window| window.key == FABLE)
+            .unwrap();
+        assert_eq!(fable.used, 0.1);
+        assert_eq!(fable.resets_at, Some(1_893_456_000));
+        assert!(routing::available(&usage, now + 4_000));
     }
 
     #[test]
