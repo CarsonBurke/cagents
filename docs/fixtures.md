@@ -409,7 +409,7 @@ evidence drive click 'Pull requests' >/dev/null
 evidence drive wait 'cache-key' --timeout 60 >/dev/null
 evidence drive click 'cache-key' >/dev/null
 evidence drive wait 'read only' --timeout 30 >/dev/null
-evidence drive wait 'New comment' --timeout 30 >/dev/null
+evidence drive wait 'empty locale' --timeout 30 >/dev/null
 evidence shot offline-review
 ```
 
