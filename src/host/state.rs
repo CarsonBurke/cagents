@@ -1286,6 +1286,26 @@ impl HostState {
             .collect()
     }
 
+    /// Every terminal or conversation identity this daemon holds, is starting,
+    /// adopting or still retiring, in identity order. A terminal is reserved
+    /// in `spawning` before its worker opens a transcript, so a transcript
+    /// listed before this is read and named by none of these has no writer
+    /// here. Erring towards inclusion only keeps a file one pass longer.
+    pub(crate) fn resident_terminal_ids(&self) -> Vec<TerminalId> {
+        let mut resident: BTreeSet<TerminalId> = self.terminals.keys().copied().collect();
+        resident.extend(self.spawning.iter().copied());
+        resident.extend(self.startup_custody.iter().copied());
+        resident.extend(self.terminal_retirements.keys().copied());
+        resident.extend(self.publication_pending.keys().copied());
+        resident.extend(self.chats.keys().copied());
+        resident.extend(self.chat_spawning.keys().copied());
+        resident.extend(self.chat_handoffs.keys().copied());
+        resident.extend(self.historical_chat_retirements.keys().copied());
+        resident.extend(self.native_closing.keys().copied());
+        resident.extend(self.native_actor_startups.keys().copied());
+        resident.into_iter().collect()
+    }
+
     /// The descriptors after `after`, in identity order, until their encoding
     /// would pass `budget` bytes, and whether the page ends the inventory. A
     /// page always holds at least one descriptor when any follows `after`.

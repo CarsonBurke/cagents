@@ -285,7 +285,12 @@ use crate::{
 /// Version 193 appends `Member::cache`, the daemon's estimate of when a
 /// session's prompt cache expires. Every reply carrying a `Member` is already
 /// refused to the candidate line's CLI, so no older client decodes it.
-pub const PROTOCOL_VERSION: u16 = 193;
+///
+/// Version 194 appends `ListResidentTerminals` and its `ResidentTerminals`
+/// reply, which name every terminal the daemon holds or is starting so a
+/// window never prunes a transcript whose writer may still append. An older
+/// client never sends it.
+pub const PROTOCOL_VERSION: u16 = 194;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -765,6 +770,10 @@ pub enum ClientRequest {
     ListPage {
         after: Option<TerminalId>,
     },
+    /// Every terminal this daemon holds or is starting, read at one instant.
+    /// Unlike the inventory it includes terminals still being spawned, whose
+    /// transcript writers may already have created their files.
+    ListResidentTerminals,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1229,6 +1238,10 @@ pub enum ServerResponse {
     ListedPage {
         terminals: Vec<TerminalDescriptor>,
         complete: bool,
+    },
+    /// The reply to `ListResidentTerminals`, in identity order.
+    ResidentTerminals {
+        terminals: Vec<TerminalId>,
     },
 }
 

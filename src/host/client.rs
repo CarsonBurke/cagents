@@ -168,6 +168,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
         request,
         ClientRequest::List
             | ClientRequest::ListPage { .. }
+            | ClientRequest::ListResidentTerminals
             | ClientRequest::Input { .. }
             | ClientRequest::Key { .. }
             | ClientRequest::Mouse { .. }
@@ -531,6 +532,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
             | ClientRequest::StartupState
             | ClientRequest::List
             | ClientRequest::ListPage { .. }
+            | ClientRequest::ListResidentTerminals
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
             | ClientRequest::Snapshot { .. }
@@ -616,6 +618,23 @@ fn listed_in_one_reply(
         _ => Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
             "The terminal inventory is too large to list in one reply; update cagents to list it",
+            false,
+        )),
+    }
+}
+
+/// The resident identities as one reply, or a refusal once it passes `limit`,
+/// which no real daemon reaches: an identity encodes in 17 bytes.
+fn resident_in_one_reply(
+    terminals: Vec<crate::model::TerminalId>,
+    limit: usize,
+) -> Result<ServerResponse, ProtocolError> {
+    let response = ServerResponse::ResidentTerminals { terminals };
+    match postcard::experimental::serialized_size(&response) {
+        Ok(size) if size <= limit => Ok(response),
+        _ => Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "This daemon holds too many terminals to name them in one reply",
             false,
         )),
     }
@@ -1958,6 +1977,17 @@ fn process_admitted_request(
                     terminals,
                     complete,
                 },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ListResidentTerminals => {
+            let terminals = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .resident_terminal_ids();
+            Ok((
+                resident_in_one_reply(terminals, LIST_REPLY_LIMIT)?,
                 Vec::new(),
                 false,
             ))

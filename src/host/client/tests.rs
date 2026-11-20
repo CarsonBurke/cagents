@@ -4045,6 +4045,35 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     }
 }
 
+/// #3388: a terminal's worker creates its transcript while the spawn is still
+/// reserved, before the inventory lists it, so the resident census must name
+/// it for a window to keep that file.
+#[test]
+fn the_resident_census_names_a_terminal_still_being_spawned() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    let host = Arc::new(crate::host::state::HostLock::new(
+        super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("resident-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        }),
+    ));
+    host.lock().unwrap().register_client(1);
+    let spawning = TerminalId::new();
+    host.lock().unwrap().reserve_spawn(spawning).unwrap();
+
+    let (response, _, _) = process_request(&host, 1, ClientRequest::ListResidentTerminals).unwrap();
+
+    assert_eq!(
+        response,
+        ServerResponse::ResidentTerminals {
+            terminals: vec![spawning],
+        }
+    );
+    assert!(host.lock().unwrap().list(1).is_empty());
+}
+
 #[test]
 fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};

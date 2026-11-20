@@ -168,7 +168,10 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::PrepareUpgrade { .. }
         | R::PrepareConfirmedUpgrade { .. }
         | R::ChatCapacitySet { .. }
-        | R::Work(crate::work::Request::Remove(_)) => Access::Held,
+        | R::Work(crate::work::Request::Remove(_))
+        // Recovery may still adopt an original that is not resident yet, and
+        // a window prunes the transcripts this leaves out.
+        | R::ListResidentTerminals => Access::Held,
     }
 }
 
