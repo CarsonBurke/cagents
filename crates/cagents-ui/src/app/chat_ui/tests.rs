@@ -20359,7 +20359,8 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         Ok(whole.clone()),
     ));
     assert_chat_copy_task_writes(task, &whole);
-    let request = text_copy::Request::for_test(handle, excerpted).with_prefix("cargo build");
+    let request =
+        text_copy::Request::for_test(handle, excerpted).for_step(CopyPart::Text, "cargo build");
     let task = app.handle_chat_ui(Action::MessageCopied(
         target,
         "long".into(),
@@ -20801,6 +20802,7 @@ fn shared_code_copy_keeps_exact_bytes_typed_target_and_clipboard_intent_until_ef
 
 #[test]
 fn logical_message_copy_completion_refuses_destructive_changes_after_last_page() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20832,13 +20834,55 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             request,
             Ok(body),
         )));
-        assert_chat_copy_task_has_no_effects(task, change);
-        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none());
+        if change == "rewrite" {
+            // The rewritten item is read again; only that read reaches the
+            // clipboard.
+            assert!(runtime.error.is_none());
+            handle.disconnect_for_test();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut effects =
+                    iced::runtime::task::into_stream(task).expect("a rewrite reads again");
+                tokio::time::timeout(Duration::from_secs(1), effects.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MessageCopied(target, id, reread, _),
+            ))) = completion
+            else {
+                panic!("a rewrite reads again before it writes");
+            };
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                id,
+                reread,
+                Ok("replacement".into()),
+            )));
+            assert_chat_copy_task_writes(task, "replacement");
+        } else {
+            assert_chat_copy_task_has_no_effects(task, change);
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
+                "{change}"
+            );
+        }
     }
 }
 
+/// A publication that reaches the client after a read was accepted, but
+/// before its write is polled, writes nothing stale. The copy is handled as if
+/// the publication had come first: it reads again or says why it can't.
 #[test]
-fn logical_message_copy_deferred_write_refuses_destructive_publication_before_poll() {
+fn logical_message_copy_deferred_write_reads_again_after_destructive_publication_before_poll() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20873,7 +20917,53 @@ fn logical_message_copy_deferred_write_refuses_destructive_publication_before_po
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         // The ordinary UI refresh has not consumed this publication.
-        assert_chat_copy_task_has_no_clipboard_write(task, change);
+        let effects = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    iced::runtime::task::into_stream(task)
+                        .expect("a deferred write")
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .expect("deferred copy and its acknowledgement timer must settle")
+            });
+        let mut bounced = None;
+        for effect in effects {
+            match effect {
+                iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                    ..
+                }) => panic!("{change}: a stale read reached the clipboard"),
+                iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    Action::MessageCopied(target, id, request, result),
+                ))) => bounced = Some((target, id, request, result)),
+                _ => {}
+            }
+        }
+        let (target, id, request, result) =
+            bounced.unwrap_or_else(|| panic!("{change}: the copy is handled again"));
+        let task = app.update(Message::ChatUi(Action::MessageCopied(
+            target, id, request, result,
+        )));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none(), "{change}");
+        if change == "rewrite" {
+            assert!(runtime.error.is_none(), "{change}");
+            assert!(
+                iced::runtime::task::into_stream(task).is_some(),
+                "{change}: the rewritten item is read again"
+            );
+        } else {
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
+                "{change}"
+            );
+            assert_chat_copy_task_has_no_effects(task, change);
+        }
     }
 }
 

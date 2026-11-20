@@ -389,6 +389,30 @@ separate; the app's responsive inspector state is preserved. Single-word OCR
 locators tolerate split text runs. The unique `Retry` locator targets the existing
 **Retry save** button even when OCR splits that label into two boxes.
 
+## A copy whose text changed
+
+A message's Copy reads its whole text from the daemon's transcript store,
+which refuses the read if the item changed after the snapshot the app copied
+from. That happens only when a provider rewrites the item within the few
+milliseconds a read takes, so development builds under `native-evidence`
+refuse every such read as changed while
+`home/.config/fixture-text-copy-changed` exists in `CAGENTS_EVIDENCE_FIXTURE`.
+The store's sources stay as they are, so the app has nothing newer to read
+and shows the refusal in the chat's error line. Remove the file and the same
+Copy succeeds. Only the conversation's own items are refused; a subagent's
+copies are unaffected.
+
+```sh
+scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-changed'
+# Click a finished reply's Copy, and capture the error line.
+scripts/native-evidence env rm '{fixture}/home/.config/fixture-text-copy-changed'
+```
+
+This covers the store noticing the change first. When the app's snapshot sees
+it first, the app reads the item again before the store answers; the unit
+tests in `text_copy::tests` cover that order. The fault is absent from builds
+without the `development` feature, and contacts no provider.
+
 ## An offline Codex
 
 A session started with `--codex PEER`, or a `pair` given it, has a `codex` on

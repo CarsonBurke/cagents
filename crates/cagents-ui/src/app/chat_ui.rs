@@ -15171,16 +15171,10 @@ impl Cagents {
                 }
             }
             Action::CopyMessage(target, id, source) => {
-                return self.start_message_copy(target, id, source, String::new());
+                return self.start_message_copy(target, id, None, source);
             }
             Action::CopyStep(target, id, part, source) => {
-                let prefix = self
-                    .chat_runtime_mut(target)
-                    .and_then(|runtime| runtime.active_item(&id))
-                    .and_then(|item| step_copy_prefix(&part, &item.content));
-                if let Some(prefix) = prefix {
-                    return self.start_message_copy(target, id, Some(source), prefix);
-                }
+                return self.start_message_copy(target, id, Some(part), Some(source));
             }
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);

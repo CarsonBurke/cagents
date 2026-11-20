@@ -2045,6 +2045,9 @@ impl<'a> TranscriptPart<'a> {
 /// envelope, with headroom; longer accumulated streams fail explicitly.
 pub const TEXT_COPY_PAGE_BYTES: usize = TRANSCRIPT_PART_BYTES;
 pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// Why a copy whose text changed before it finished put nothing on the
+/// clipboard. The store refuses with it, and the UI shows it.
+pub const TEXT_COPY_CHANGED: &str = "This text changed while copying. Copy it again.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextCopyPage {
