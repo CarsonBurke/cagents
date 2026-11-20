@@ -6000,7 +6000,7 @@ fn exited_terminal_retries_with_fresh_spawn_identity_and_exit_metadata() {
         }
     );
 
-    let relaunched = fresh_terminal_relaunch(&session);
+    let relaunched = fresh_terminal_relaunch(&session).unwrap();
     assert_ne!(relaunched.id, exited_id);
     // It succeeds exactly the session it replaces.
     assert_eq!(relaunched.predecessor, Some(exited_id));
@@ -6017,6 +6017,95 @@ fn exited_terminal_retries_with_fresh_spawn_identity_and_exit_metadata() {
             ..
         } if exit == last_exit
     ));
+}
+
+mod cleared_conversation {
+    use super::*;
+
+    fn session() -> TerminalSession {
+        let mut card = restored_live_terminal("claude");
+        let CardKind::Terminal(session) = &mut card.kind else {
+            unreachable!();
+        };
+        session.launch.arguments = vec![
+            "--resume".into(),
+            "a1b2c3d4-1111-4111-8111-123456789abc".into(),
+            "--model".into(),
+            "sonnet".into(),
+        ];
+        session.resume_hint =
+            Some(serde_json::json!({"version": 2, "recipe": session.launch}).to_string());
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        session.clone()
+    }
+
+    #[test]
+    fn relaunch_and_start_open_the_picker_after_exact_identity_was_withheld() {
+        let session = session();
+        let picker = crate::model::agent_recovery::picker_recipe(&session.launch).unwrap();
+        assert!(matches!(
+            terminal_start_mode(&session),
+            Ok(TerminalStartMode::Spawn(recipe)) if recipe == picker
+        ));
+        let relaunched = fresh_terminal_relaunch(&session).unwrap();
+        assert_ne!(relaunched.id, session.id);
+        assert_eq!(relaunched.predecessor, Some(session.id));
+        assert_eq!(relaunched.launch, picker);
+        assert!(matches!(
+            terminal_start_mode(&relaunched),
+            Ok(TerminalStartMode::Spawn(recipe)) if recipe == picker
+        ));
+    }
+
+    #[test]
+    fn missing_or_legacy_hints_keep_the_exact_saved_resume() {
+        let mut session = session();
+        let exact = crate::model::agent_recovery::resume_recipe(&session.launch).unwrap();
+        for hint in [None, Some("legacy-provider-session".into())] {
+            session.resume_hint = hint;
+            assert_eq!(session.agent_resume_recipe(), Some(exact.clone()));
+            assert!(matches!(
+                terminal_start_mode(&session),
+                Ok(TerminalStartMode::Spawn(recipe)) if recipe == exact
+            ));
+        }
+        let mut current = session.launch.clone();
+        current.arguments[1] = "a1b2c3d4-2222-4111-8111-123456789abc".into();
+        session.resume_hint = crate::model::agent_recovery::hint_from_launch(&current);
+        let current = crate::model::agent_recovery::resume_recipe(&current).unwrap();
+        assert_eq!(session.agent_resume_recipe(), Some(current.clone()));
+        assert!(matches!(
+            terminal_start_mode(&session),
+            Ok(TerminalStartMode::Spawn(recipe)) if recipe == current
+        ));
+    }
+
+    #[test]
+    fn recognition_only_uses_saved_picker_configuration_or_refuses_unsafe_replay() {
+        let mut session = session();
+        let picker = crate::model::agent_recovery::picker_recipe(&session.launch).unwrap();
+        let mut observed = session.launch.clone();
+        observed.arguments.push("--unknown-option".into());
+        session.resume_hint =
+            Some(serde_json::json!({"version": 2, "recipe": observed}).to_string());
+        assert!(matches!(
+            terminal_start_mode(&session),
+            Ok(TerminalStartMode::Spawn(recipe)) if recipe == picker
+        ));
+        assert_eq!(fresh_terminal_relaunch(&session).unwrap().launch, picker);
+
+        session.launch = observed.clone();
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: observed,
+            last_exit: None,
+        };
+        assert!(session.agent_resume_recipe().is_none());
+        assert!(terminal_start_mode(&session).is_err());
+        assert!(fresh_terminal_relaunch(&session).is_err());
+    }
 }
 
 /// However it ended, a restored terminal is presented the same way it was
@@ -6470,7 +6559,7 @@ fn restored_successful_terminal_is_completed_without_automatic_relaunch() {
     let session = app.ended_terminal(card).unwrap();
     assert_eq!(session.id, identity);
     // Relaunch remains an explicit action with a fresh host identity.
-    assert_ne!(fresh_terminal_relaunch(session).id, identity);
+    assert_ne!(fresh_terminal_relaunch(session).unwrap().id, identity);
 }
 
 /// A channel and a repository with two worktrees, each holding a terminal.

@@ -3303,9 +3303,19 @@ mod tests {
             recovery_plan(source).unwrap(),
             (claude(&["--bare", "--resume"]), RecoveryKind::Picker)
         );
-        // An exact identity always wins over the picker.
+        // Recognition-only evidence still withholds a stale exact selector
+        // from the terminal's original launch.
         source.launch = claude(&["--resume", "12345678-1234-4234-8234-123456789abc"]);
-        assert_eq!(recovery_plan(source).unwrap().1, RecoveryKind::Exact);
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (claude(&["--resume"]), RecoveryKind::Picker)
+        );
+        // An authoritative exact hint wins over the picker.
+        source.resume_hint = crate::model::agent_recovery::hint_from_launch(&source.launch);
+        assert_eq!(
+            recovery_plan(source).unwrap(),
+            (source.launch.clone(), RecoveryKind::Exact)
+        );
     }
 
     #[test]

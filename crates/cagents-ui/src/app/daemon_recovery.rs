@@ -587,7 +587,7 @@ fn reconcile_on<'a>(
         recovery = kind,
         "relaunching a terminal whose daemon is gone"
     );
-    let mut replacement = super::fresh_terminal_relaunch(&session);
+    let mut replacement = super::fresh_terminal_relaunch(&session)?;
     replacement.id = replacement_id;
     // Named for the identity it now records. A file named for any other is
     // neither openable as this terminal's nor kept by the next launch's prune.
