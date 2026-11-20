@@ -678,6 +678,20 @@ not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
 the first), and builds offloaded to the host take them too.
 
+Builds rarely reach their peaks together: with every share on fw16 held,
+builds' anonymous memory came to about a third of their shares' on average and
+never past 18 GiB of the 32. So two more shares follow the host's count
+(`CAGENTS_BUILD_EXTRA_SHARES` sets how many; none where `CAGENTS_BUILD_SLOTS`
+is set, as for a lock used as a mutex). A build takes extra shares only when
+they complete what it needs, and only while there is memory for it: its own
+shares' memory and 4 GiB for each extra share another build holds must fit
+both in `MemAvailable` less 8 GiB and in what the build slice's `MemoryHigh`
+leaves above its builds' anonymous memory, and memory pressure (PSI "some"
+over 10 seconds) must be at most 1%. Otherwise it waits at the head of the
+queue as for any share, says so, and those behind it wait too. The extra
+shares overcommit the slice's `MemoryHigh`, below: where builds run in scopes,
+it throttles builds whose peaks coincide after all.
+
 A build with nothing to compile does not wait in that queue. When its shares
 are not free at once, a `build`, `check`, `clippy`, `--no-run` or the build
 phase of `test`, `bench` or `run` first runs as a probe: Cargo with one job,
@@ -791,8 +805,15 @@ a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 
 GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
-at most once every two minutes and checks every new first-parent commit in
-order. Its first run checks the current tip. Each commit gets five separate
+at most once every two minutes and checks its newest commit whenever it has
+moved. A passing tip vouches for the commits merged before it: for one of them
+to hide a break, a later one would have to undo it. When the tip fails after a
+passing check, the sentinel bisects the first-parent commits in between for
+each lane the tip fails, checking only that lane, and comments on the issue
+the earliest commit at which each fails. It does not fetch again until it has,
+so a bisection that cannot finish, such as on a dirty checkout or a comment
+GitHub keeps refusing, holds the sentinel until it is fixed. Each tip it checks
+gets five separate
 `scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 `-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
@@ -808,7 +829,7 @@ the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
-Once the newest commit it checked compiles, warnings or not, the sentinel also
+Once the newest commit it checked, the tip it last saw, compiles, warnings or not, the sentinel also
 builds the three executables [native evidence](#native-evidence) runs for that
 commit and keeps
 them under `builds/` in its state directory, for the six newest such commits,
@@ -995,10 +1016,14 @@ Each slot's build output is bounded by its lease. Cargo removes nothing, and
 every feature lane, profile and kind of target of the `cagents` crate keeps
 an incremental session of 1–6 GiB, so slots on fw16 grew to about 97 GiB
 each, 40–60 GiB of it incremental state. Once a lease holds a slot, and no
-earlier command of the slot's is still running, it keeps the incremental
-state of the crates the slot compiled most recently until they fill
-`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses it
-included, and moves the rest out of the target; with `0` it keeps none. Every
+earlier command of the slot's is still running, it first moves out each
+crate's superseded sessions. Rustc starts a compile from the crate's newest
+finished session and removes the older ones only when the crate next
+compiles, so a crate compiled twice keeps a session nothing reads again; on
+fw16 removing them freed about 39% of the slots' incremental state. It then keeps the
+incremental state of the crates the slot compiled most recently until they
+fill `CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses
+it included, and moves the rest out of the target; with `0` it keeps none. Every
 6 hours it also moves out compiled units no build has looked at for 3 days,
 such as old versions after a dependency update. Cargo reads the fingerprint
 of every unit in a build's graph, even one it doesn't compile, so a unit is
@@ -2330,8 +2355,9 @@ scripts/native-evidence stop
   ignored goes to the host, so make sure a stray file, such as a local `.env`,
   is ignored or removed before you build.
 - **Builds.** A main commit the host's
-  [sentinel](#watching-main-after-merges) has built, such as a recent
-  `origin/main`, usually compiles nothing: the host copies its executables.
+  [sentinel](#watching-main-after-merges) has built, a tip of `origin/main`
+  it checked, compiles nothing: the host copies its executables. A commit
+  merged in a burst with others before a check is not built this way.
   Any other checkout builds through its own `scripts/cargo-gate`, in its own
   build slot and target as `mise run dev` does, so what you already built for
   the change is reused while that slot is free; the three executables then go from here to the task,

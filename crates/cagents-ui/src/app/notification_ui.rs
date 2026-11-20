@@ -278,6 +278,18 @@ impl State {
             .focused
     }
 
+    /// Records an activation attempt in progress, as a blocked activation
+    /// leaves one.
+    #[cfg(test)]
+    pub(super) fn attempt_activation_for_test(&mut self, workspace: &Arc<WorkspaceState>) {
+        self.activation_attempt = Some((Arc::downgrade(workspace), true, uuid::Uuid::nil(), 0));
+    }
+
+    #[cfg(test)]
+    pub(super) fn activation_attempted_for_test(&self) -> bool {
+        self.activation_attempt.is_some()
+    }
+
     #[cfg(test)]
     pub(super) fn acknowledged_for_test(&self, id: uuid::Uuid) -> bool {
         self.acknowledged.contains(&id)

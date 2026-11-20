@@ -19,7 +19,8 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
     let outcome = match event.evidence.kind {
         Kind::Succeeded => "Response ready",
         Kind::Failed => "Run failed",
-        Kind::Cancelled => "Run cancelled",
+        // A turn the person stopped, in the words the transcript uses.
+        Kind::Cancelled => "Run stopped",
         Kind::Interrupted => "Outcome unconfirmed",
         Kind::Waiting => match content.and_then(|content| content.request) {
             Some(RequestType::Approval) => "Approval needed",
@@ -281,6 +282,12 @@ mod tests {
                 Some(RequestType::Question),
                 "Updated B: preserve config_file.rs?",
                 "Question for you: Updated B: preserve config_file.rs?",
+            ),
+            (
+                Kind::Cancelled,
+                None,
+                "Running the integration suite.",
+                "Run stopped: Running the integration suite.",
             ),
             (
                 Kind::Failed,

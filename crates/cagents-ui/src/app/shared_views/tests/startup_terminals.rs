@@ -1458,7 +1458,10 @@ fn a_held_restored_pane_is_reported_with_its_hold() {
         "{report}"
     );
     // Opening it completes that start, so that is what the report offers.
-    assert!(report.contains("Open it to see why and retry"), "{report}");
+    assert!(
+        report.contains("Open it to see why and what to do next"),
+        "{report}"
+    );
     assert!(
         report.contains("Nothing was closed or restarted"),
         "{report}"
