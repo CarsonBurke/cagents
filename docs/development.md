@@ -1009,10 +1009,14 @@ Each slot's build output is bounded by its lease. Cargo removes nothing, and
 every feature lane, profile and kind of target of the `cagents` crate keeps
 an incremental session of 1–6 GiB, so slots on fw16 grew to about 97 GiB
 each, 40–60 GiB of it incremental state. Once a lease holds a slot, and no
-earlier command of the slot's is still running, it keeps the incremental
-state of the crates the slot compiled most recently until they fill
-`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses it
-included, and moves the rest out of the target; with `0` it keeps none. Every
+earlier command of the slot's is still running, it first moves out each
+crate's superseded sessions. Rustc starts a compile from the crate's newest
+finished session and removes the older ones only when the crate next
+compiles, so a crate compiled twice keeps a session nothing reads again; on
+fw16 removing them freed about 39% of the slots' incremental state. It then keeps the
+incremental state of the crates the slot compiled most recently until they
+fill `CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses
+it included, and moves the rest out of the target; with `0` it keeps none. Every
 6 hours it also moves out compiled units no build has looked at for 3 days,
 such as old versions after a dependency update. Cargo reads the fingerprint
 of every unit in a build's graph, even one it doesn't compile, so a unit is

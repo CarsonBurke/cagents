@@ -1205,9 +1205,15 @@ class Jobserver(unittest.TestCase):
         self.at_build_pace()
         idle = self.join()
         busy = self.join()
-        # The idle build keeps one in its pipe.
-        [held] = self.compiling([busy])
-        self.assertGreaterEqual(held, self.TOKENS - 2, held)
+        self.wait_for(lambda: waiting(idle.give) == 1, "the idle build's token in its pipe")
+        # Every token the idle build leaves comes to the busy one, each waited
+        # for rather than sampled, and comes back as its jobs end and start.
+        self.take(busy, self.TOKENS - 1)
+        for _ in range(20):
+            self.give_back(busy, 1)
+            self.take(busy, 1)
+        self.settle(idle, busy)
+        self.assertEqual(self.counts(idle, busy), (0, [1, self.TOKENS - 1]))
 
     def test_what_a_killed_build_host_took_is_given_back_by_another(self):
         other = self.join()
