@@ -430,3 +430,75 @@ fn owed_projections_merge_to_what_both_need() {
         assert_eq!(second.merge(first), merged, "{label} reversed");
     }
 }
+
+/// A message a handler dispatches within its update counts for attention as
+/// the update's own message does: one that may change the projects and
+/// worktrees attention covers drops a pending notification activation, so
+/// the activation is tried again against the new scope.
+#[test]
+fn a_nested_message_that_changes_attention_scope_resets_the_activation() {
+    for (message, changes_scope) in [
+        (Message::GitUi(git_ui::Action::Changed), true),
+        (Message::RunCommand(Command::FocusPane2), false),
+    ] {
+        let (mut app, _, _) = two_pane_app();
+        app.notification_ui
+            .attempt_activation_for_test(&app.durable);
+        // As a handler would, within its update, which then finishes.
+        app.dispatching = 1;
+        let task = app.dispatch(message);
+        app.dispatching = 0;
+        drop(app.finish_update(
+            task,
+            UpdateEntry {
+                notice_control: None,
+                timed: false,
+                settled_projection: Task::none(),
+                oracle_message: None,
+            },
+        ));
+        assert_eq!(
+            !app.notification_ui.activation_attempted_for_test(),
+            changes_scope,
+            "changes scope: {changes_scope}"
+        );
+        assert!(
+            !app.attention_scope_changed,
+            "the update consumed the change"
+        );
+    }
+}
+
+/// Admission can run a whole repository reconciliation update before the
+/// message's handler. That update must not answer for the message's scope
+/// change: an activation retried within it still sees the old scope.
+#[test]
+fn an_update_run_during_admission_leaves_the_message_its_scope_change() {
+    let (mut app, _, _) = two_pane_app();
+    app.pending_repository_reconciliation
+        .push(PathBuf::from("/nonexistent/repository"));
+    app.dispatching = 1;
+    let task = app.dispatch(Message::GitUi(git_ui::Action::Changed));
+    app.dispatching = 0;
+    assert!(
+        app.pending_repository_reconciliation.is_empty(),
+        "admission reconciled first"
+    );
+    assert!(
+        app.attention_scope_changed,
+        "the reconciliation's update kept the message's change"
+    );
+    // As an activation retried during the reconciliation would.
+    app.notification_ui
+        .attempt_activation_for_test(&app.durable);
+    drop(app.finish_update(
+        task,
+        UpdateEntry {
+            notice_control: None,
+            timed: false,
+            settled_projection: Task::none(),
+            oracle_message: None,
+        },
+    ));
+    assert!(!app.notification_ui.activation_attempted_for_test());
+}
