@@ -1051,6 +1051,15 @@ struct SaveTicket {
 }
 
 impl EditorDocument {
+    /// Whether the buffer is written as prose, Markdown or plain text, which
+    /// [`crate::settings::EditorWrap::prose`] wraps.
+    fn is_prose(&self) -> bool {
+        self.markdown
+            || self.source.extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("txt") || extension.eq_ignore_ascii_case("text")
+            })
+    }
+
     fn durability_warning(&self) -> Option<&str> {
         // Cleanup resolution does not qualify the earlier disk durability.
         // Keep the warning visible until Reload or a successful Save does.
@@ -2413,7 +2422,7 @@ pub struct RepositoryRuntime {
     /// be, while that is the whole story of the diff surface.
     basis_resolution: Option<BasisResolution>,
     auto_save: bool,
-    wrap_lines: bool,
+    wrap: crate::settings::EditorWrap,
     line_height: f32,
     syntax_theme: crate::settings::EditorSyntaxTheme,
     listed_directories: BTreeSet<PathBuf>,
@@ -2609,7 +2618,7 @@ impl RepositoryRuntime {
             diff_basis: DiffBasis::IndexToWorktree,
             basis_resolution: None,
             auto_save: true,
-            wrap_lines: false,
+            wrap: crate::settings::EditorWrap::default(),
             line_height: 1.5,
             syntax_theme: crate::settings::EditorSyntaxTheme::Auto,
             listed_directories: BTreeSet::new(),
@@ -2738,8 +2747,8 @@ impl RepositoryRuntime {
     }
 
     /// Changes presentation without replacing the open buffer or its edit history.
-    pub fn set_wrap_lines(&mut self, wrap_lines: bool) {
-        self.wrap_lines = wrap_lines;
+    pub fn set_wrap(&mut self, wrap: crate::settings::EditorWrap) {
+        self.wrap = wrap;
     }
 
     /// Changes the editor's relative line height without replacing the buffer.
@@ -10793,7 +10802,7 @@ fn editable_document_view<'a>(
                 card,
                 action: EditorLspAction::Definition(caret_position(&document.content, at)),
             })
-            .wrapping(if runtime.wrap_lines {
+            .wrapping(if runtime.wrap.wraps(document.is_prose()) {
                 iced::advanced::text::Wrapping::WordOrGlyph
             } else {
                 iced::advanced::text::Wrapping::None

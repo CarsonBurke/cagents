@@ -8749,6 +8749,26 @@ fn headless_renderer() -> cosmic::Renderer {
 }
 
 #[test]
+fn markdown_and_plain_text_buffers_wrap_as_prose() {
+    for (path, markdown, prose) in [
+        ("notes.md", true, true),
+        ("README", true, true),
+        ("notes.txt", false, true),
+        ("NOTES.TEXT", false, true),
+        ("src/main.rs", false, false),
+        ("Makefile", false, false),
+    ] {
+        let document = EditorDocument::unlinked(
+            PathBuf::from(path),
+            String::new(),
+            blake3::hash(b""),
+            markdown,
+        );
+        assert_eq!(document.is_prose(), prose, "{path}");
+    }
+}
+
+#[test]
 fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
     let card = CardId::new();
     let text = format!("{}\nsecond line", "x".repeat(256));
@@ -8769,7 +8789,10 @@ fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
     // Toggling back exercises reflow of an already mounted editor.
     for (wrap, expected_line) in [(false, 1), (true, 0), (false, 1)] {
         let cursor = runtime.cursor_position();
-        runtime.set_wrap_lines(wrap);
+        runtime.set_wrap(crate::settings::EditorWrap {
+            lines: wrap,
+            prose: false,
+        });
         assert_eq!(runtime.cursor_position(), cursor);
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
