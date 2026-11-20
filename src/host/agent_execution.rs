@@ -2557,13 +2557,15 @@ fn console_text(snapshot: &chat::Snapshot, now: u64) -> (String, bool) {
     // A provider opens its next text block empty, which has no line to hold.
     let writing = snapshot.busy
         && snapshot.items.last().is_some_and(|item| {
-            matches!(
-                item.content,
-                chat::ItemContent::Text {
-                    thinking: false,
-                    ..
-                }
-            ) && console_line(item, now).is_some()
+            item.role == chat::Role::Assistant
+                && matches!(
+                    item.content,
+                    chat::ItemContent::Text {
+                        thinking: false,
+                        ..
+                    }
+                )
+                && console_line(item, now).is_some()
         });
     if writing {
         text.pop();
@@ -2595,6 +2597,7 @@ fn console_paged_files(snapshot: &chat::Snapshot) -> std::collections::HashMap<&
 /// What the provider's harness said about the session, as one unlabelled line,
 /// the way the native chat recesses it. Adapters file command output and whole
 /// protocol frames under this role, so only the start of plain text is shown.
+/// A cut notice ends with an ellipsis.
 fn console_notice(text: &str) -> Option<String> {
     let text = text.trim();
     if serde_json::from_str::<serde_json::Value>(text)
@@ -2603,8 +2606,10 @@ fn console_notice(text: &str) -> Option<String> {
         return None;
     }
     let mut line = text.lines().next()?.trim_end().to_owned();
-    if line.len() > CONSOLE_NOTICE_BYTES {
-        crate::agent_execution::truncate(&mut line, CONSOLE_NOTICE_BYTES);
+    let cut = crate::agent_execution::truncate(&mut line, CONSOLE_NOTICE_BYTES - '…'.len_utf8())
+        || text.lines().skip(1).any(|line| !line.trim().is_empty());
+    if cut {
+        line.push('…');
     }
     line.push('\n');
     Some(line)

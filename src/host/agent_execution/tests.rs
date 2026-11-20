@@ -6013,6 +6013,27 @@ fn console_text_leaves_only_a_line_still_being_written_open() {
     assert_eq!(text, "Assistant: About to run the tests.\n");
 }
 
+#[test]
+fn console_text_prints_a_notice_that_ends_a_busy_run() {
+    let mut snapshot = console_snapshot(&["One."], true);
+    snapshot.items.push(std::sync::Arc::new(chat::Item {
+        started_at: None,
+        id: "notice".into(),
+        role: chat::Role::System,
+        content: chat::ItemContent::Text {
+            text: "Reconnecting to the model".into(),
+            thinking: false,
+            phase: Default::default(),
+        },
+        at: None,
+    }));
+    assert!(
+        console_text(&snapshot, 0)
+            .0
+            .ends_with("Reconnecting to the model\n")
+    );
+}
+
 /// A line the client printed never comes back shorter, which would make it
 /// look new when the front of a long transcript is dropped.
 #[test]
@@ -6127,10 +6148,12 @@ fn console_prints_a_provider_notice_as_one_unlabelled_line() {
     );
     assert_eq!(
         line("output", "Current model: example\nsecond\nthird").as_deref(),
-        Some("Current model: example\n"),
+        Some("Current model: example…\n"),
         "command output filed as a notice stays one line"
     );
+    assert_eq!(line("done", "Done\n\n").as_deref(), Some("Done\n"));
     let long = line("long", &"x".repeat(5_000)).unwrap();
+    assert!(long.ends_with("…\n"));
     assert!(long.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", long.len());
     assert_eq!(
         line(
