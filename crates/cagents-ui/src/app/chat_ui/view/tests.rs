@@ -10239,12 +10239,73 @@ fn submit_tooltips_name_the_chord_the_preference_bound() {
         (PromptMode::Steer, 1, true, "Ctrl+Shift+Enter"),
         (PromptMode::Queue, 1, false, "Ctrl+Shift+Enter"),
     ] {
-        let (_, label) = submit_control(mode, slot, enter_sends);
+        let (_, label) = submit_control(mode, slot, enter_sends, None);
         assert!(
             label.ends_with(chord),
             "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
         );
     }
+}
+
+/// An empty composer in a refused conversation, read-only or not, says why
+/// it sends nothing rather than inviting a message or staying blank. Only a
+/// conversation changing hands leaves it blank.
+#[test]
+fn an_empty_refused_composer_says_why_it_cannot_send() {
+    use blocked_recovery::Reopen;
+    for (reopen, fresh, expected) in [
+        (
+            Reopen::AfterRestart,
+            false,
+            "Messages can be sent once this conversation reopens",
+        ),
+        (
+            Reopen::UpdateRecovery,
+            false,
+            "Messages can be sent once this conversation reopens",
+        ),
+        (
+            Reopen::UpdateStopped,
+            false,
+            "Reopen this conversation to send a message",
+        ),
+        (
+            Reopen::Unproven,
+            true,
+            "Start a new conversation to send a message",
+        ),
+        (
+            Reopen::Unproven,
+            false,
+            "This conversation can't take new messages",
+        ),
+    ] {
+        let unsendable = Some(reopen.unsendable(fresh));
+        assert_eq!(
+            composer_hint(false, unsendable, false, Some(PromptMode::Send), false),
+            expected,
+            "{reopen:?}"
+        );
+        // The main agent's own label doesn't hide the refusal either.
+        assert_eq!(
+            composer_hint(false, unsendable, true, Some(PromptMode::Send), false),
+            expected,
+            "{reopen:?}"
+        );
+        assert_eq!(
+            composer_hint(true, unsendable, false, Some(PromptMode::Send), false),
+            "",
+            "{reopen:?}"
+        );
+    }
+    assert_eq!(
+        composer_hint(false, None, false, Some(PromptMode::Send), false),
+        "Message"
+    );
+    assert_eq!(
+        composer_hint(false, None, true, Some(PromptMode::Send), false),
+        "Message main agent"
+    );
 }
 
 /// A chip the reader cannot read is worse than no chip: the point of it is
