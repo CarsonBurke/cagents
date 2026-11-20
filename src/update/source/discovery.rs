@@ -522,7 +522,11 @@ mod tests {
                 let frame = if prefix_trickle {
                     [4u32.to_be_bytes().as_slice(), b"body"].concat()
                 } else {
-                    server.write_all(&4u32.to_be_bytes()).unwrap();
+                    // The reader may already have timed out and closed its
+                    // end before this thread first runs.
+                    if server.write_all(&4u32.to_be_bytes()).is_err() {
+                        return;
+                    }
                     b"body".to_vec()
                 };
                 for byte in frame {
