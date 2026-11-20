@@ -3931,8 +3931,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Reads the file list and v2 status through the bounded, cancellable executor.
     ///
-    /// This does not read file contents, line counts, refs or remotes. Each Git
-    /// command uses [`MAX_FILE_INVENTORY_OUTPUT_BYTES`]; a process, output-limit
+    /// It runs only `git ls-files` and `git status` and adds no enrichment of its
+    /// own: no file contents, line counts or remote queries. `git status` itself
+    /// still reads the branch's upstream for ahead/behind counts and may hash
+    /// changed files to tell whether they were modified. Each Git command uses [`MAX_FILE_INVENTORY_OUTPUT_BYTES`]; a process, output-limit
     /// or parse failure returns an error rather than an incomplete inventory.
     pub fn file_inventory(
         &self,
