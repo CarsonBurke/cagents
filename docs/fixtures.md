@@ -747,6 +747,7 @@ does not sandbox the real executable's network access.
 | A populated saved Claude conversation before starting a provider | [`tests/fixtures/claude-resume-history.py`](#saved-claude-history) |
 | A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
 | A pane Close the registry refuses and keeps the pane through | [`.cagents-fixture-refuse-close`](#a-refused-pane-close) |
+| Saved Claude terminals after a reboot, one of them cleared with `/clear` | [`tests/fixtures/cleared-terminal-recovery.py`](#saved-claude-terminals-after-a-reboot) |
 
 ### A refused pane close
 
@@ -832,6 +833,48 @@ account's Claude home. Use a fresh evidence task when its provider home already
 exists. Save the stopped fixture with `native-evidence save-seed` so both sides
 restore the same transcript and physical provider-home identity, then open its
 project and choose **Resume conversation** in the app.
+
+### Saved Claude terminals after a reboot
+
+[`tests/fixtures/cleared-terminal-recovery.py`](../tests/fixtures/cleared-terminal-recovery.py)
+prepares a seed holding two saved Claude terminals, each launched as
+`claude --resume ID`, to restore as they are after the machine restarts. In
+one of them, `/clear` has moved Claude Code to a new conversation that has no
+transcript yet. The other is still in the conversation it resumed. The
+terminals run the synthetic provider's
+[interactive form](chat-composer-fixture.md), so the daemon's real foreground
+observation records each one's recovery hint. The script launches nothing
+itself.
+
+From the build host's User shell, in a fresh task with `TASK` its directory:
+
+```sh
+helper=tests/fixtures/cleared-terminal-recovery.py
+scripts/native-evidence --task "$TASK" start before
+python3 -I "$helper" history "$TASK/fixture"
+scripts/native-evidence --task "$TASK" cli project open '{fixture}/project'
+scripts/native-evidence --task "$TASK" drive click main --settle 2
+scripts/native-evidence --task "$TASK" cli terminal spawn --cwd '{fixture}/project' -- \
+    claude --resume a1b2c3d4-1111-4111-8111-000000003390   # prints the terminal ID
+scripts/native-evidence --task "$TASK" cli terminal spawn --cwd '{fixture}/project' -- \
+    claude --resume a1b2c3d4-2222-4111-8111-000000003390
+scripts/native-evidence --task "$TASK" cli terminal write FIRST_TERMINAL_ID $'/clear\r'
+python3 -I "$helper" inspect "$TASK/fixture"   # hint_version 2 for the first, 1 for the second
+scripts/native-evidence --task "$TASK" stop
+python3 -I "$helper" reboot "$TASK/fixture"
+scripts/native-evidence --task "$TASK" save-seed
+```
+
+The window adopts each CLI-spawned terminal as a pane. Wait until `inspect`
+shows the hint versions above before stopping: observation and saving run in
+the background. `reboot` stands in for a restart. Each record of the current
+kernel boot in the stopped fixture's stores, including the panes' terminal
+proofs and the session store's last boot, then names an earlier boot instead.
+Nothing else changes. It refuses while anything holds a store open, and
+writes `cleared-terminal-reboot.json` once. Every later `start` restores the
+two panes as **Terminal unavailable**, and **Retry** relaunches each one.
+The terminal then shows the conversation it resumed, or Claude Code's
+conversation picker.
 
 ### A permanent first-start refusal
 
