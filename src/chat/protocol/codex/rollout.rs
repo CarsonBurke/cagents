@@ -5,14 +5,14 @@
 //! first turn. Codex's own harness context travels among the user messages
 //! and is left out. Tool calls come from the richer `item_completed` turn
 //! items, which carry exit codes and edited paths. A raw call is kept unless
-//! an item in the same turn records its kind of tool work, so calls no item
+//! an item in the same turn records that invocation's work, so calls no item
 //! describes stay visible beside the richer items. Turns written before Codex
 //! recorded turn items keep all their raw calls. One rollout can hold both:
 //! a newer Codex appends to a conversation an older one began, and a forked
 //! thread replays its parent's turns with their raw calls alone.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{BufRead, BufReader, Read},
     path::Path,
 };
@@ -116,7 +116,17 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                 if let Some(id) = payload["call_id"].as_str().filter(|id| !id.is_empty()) {
                     turn.call_ids.insert(id.to_owned(), turn.calls.len());
                 }
-                turn.calls.push((items.len(), item(line_id(), call)));
+                turn.calls.push(RawCall {
+                    at: items.len(),
+                    item: item(line_id(), call),
+                    call_id: payload["call_id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                    represented: false,
+                    finished: false,
+                    opaque_exec: payload["type"] == "custom_tool_call" && payload["name"] == "exec",
+                });
             }
             (Some("response_item"), Some("function_call_output" | "custom_tool_call_output")) => {
                 turn.output(payload)
@@ -195,17 +205,39 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
 /// model invokes, and a writer that records tool turn items also records the
 /// same work as richer `item_completed` items, though not one for one: a
 /// single `exec` call can run several commands. Each raw call is superseded
-/// only by an item recording that kind of tool work in the same turn. Calls
+/// only by an item recording that invocation's work in the same turn. Calls
 /// no item describes keep their original positions, including all calls in
 /// turns written by an older Codex, replayed from a parent thread, or
 /// interrupted before a tool item completed. Turns begin at `task_started`;
 /// an interrupted turn ends at the next one.
 #[derive(Default)]
 struct RawTurn {
-    calls: Vec<(usize, Item)>,
+    calls: Vec<RawCall>,
     call_ids: HashMap<String, usize>,
-    recorded: HashSet<Recorded>,
-    mcp_tools: HashSet<String>,
+}
+
+struct RawCall {
+    at: usize,
+    item: Item,
+    call_id: Option<String>,
+    represented: bool,
+    finished: bool,
+    opaque_exec: bool,
+}
+
+impl RawCall {
+    fn matches(&self, kind: Recorded, item: &Value) -> bool {
+        let ItemContent::Tool { name, .. } = &self.item.content else {
+            return false;
+        };
+        superseded_by(name) == Some(kind)
+            || (name == "spawn_agent" && kind == Recorded::SubAgentActivity)
+            || (kind == Recorded::McpToolCall
+                && item["tool"].as_str().is_some_and(|tool| {
+                    name.strip_suffix(tool)
+                        .is_some_and(|prefix| prefix.ends_with("__"))
+                }))
+    }
 }
 
 impl RawTurn {
@@ -216,7 +248,9 @@ impl RawTurn {
         else {
             return;
         };
-        if let ItemContent::Tool { output, .. } = &mut self.calls[*index].1.content {
+        let call = &mut self.calls[*index];
+        call.finished = true;
+        if let ItemContent::Tool { output, .. } = &mut call.item.content {
             *output = bounded(&value_text(&payload["output"]));
         }
     }
@@ -229,36 +263,47 @@ impl RawTurn {
             Some("WebSearch") => Recorded::WebSearch,
             Some("CollabAgentToolCall") => Recorded::CollabAgentToolCall,
             Some("SubAgentActivity") if item["kind"] == "started" => Recorded::SubAgentActivity,
-            Some("McpToolCall") => {
-                if let Some(tool) = item["tool"].as_str() {
-                    self.mcp_tools.insert(tool.to_owned());
-                }
-                return;
-            }
+            Some("McpToolCall") => Recorded::McpToolCall,
             _ => return,
         };
-        self.recorded.insert(recorded);
+        // Direct tool items carry their invocation's call_id as their id.
+        // Identical inputs and concurrent calls must still remain distinct.
+        if let Some(id) = item["id"].as_str().filter(|id| !id.is_empty())
+            && let Some(index) = self.call_ids.get(id)
+            && let Some(call) = self.calls.get_mut(*index)
+            && call.matches(recorded, item)
+        {
+            call.represented = true;
+            return;
+        }
+        // Older raw calls can lack IDs; code-mode exec children have their
+        // own IDs without a parent link. Only a unique preceding candidate
+        // can account for that work. Keep all wrappers as candidates, even
+        // after an output: a yielded cell can still finish a child later.
+        // Attribute a unique candidate regardless of output order; finish
+        // decides whether its children can replace it.
+        let mut candidates = self.calls.iter_mut().filter(|call| {
+            call.matches(recorded, item) && (call.call_id.is_none() || call.opaque_exec)
+        });
+        if let Some(call) = candidates.next()
+            && candidates.next().is_none()
+        {
+            call.represented = true;
+        }
     }
 
     /// Ends this turn, keeping each raw call no turn item describes.
     fn finish(&mut self, kept: &mut Vec<(usize, Item)>) {
-        let Self {
-            calls,
-            recorded,
-            mcp_tools,
-            ..
-        } = std::mem::take(self);
-        kept.extend(calls.into_iter().filter(|(_, call)| {
-            let ItemContent::Tool { name, .. } = &call.content else {
-                return true;
-            };
-            !superseded_by(name).is_some_and(|kind| recorded.contains(&kind))
-                && !(name == "spawn_agent" && recorded.contains(&Recorded::SubAgentActivity))
-                && !mcp_tools.iter().any(|tool| {
-                    name.strip_suffix(tool)
-                        .is_some_and(|prefix| prefix.ends_with("__"))
-                })
-        }));
+        self.call_ids.clear();
+        kept.extend(
+            std::mem::take(&mut self.calls)
+                .into_iter()
+                // A child can finish while its opaque wrapper is still
+                // running more work. Only the wrapper's own output lets
+                // its attributed children replace it.
+                .filter(|call| !call.represented || (call.opaque_exec && !call.finished))
+                .map(|call| (call.at, call.item)),
+        );
     }
 }
 
@@ -270,6 +315,7 @@ enum Recorded {
     WebSearch,
     CollabAgentToolCall,
     SubAgentActivity,
+    McpToolCall,
 }
 
 /// A person's or the agent's message. Developer instructions and the
@@ -567,10 +613,11 @@ mod tests {
             ),
             json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"text":"secret plan"}]}}),
             completed(json!({"type":"Reasoning","id":"r1","summary_text":["secret plan"]})),
-            json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"text(await tools.exec_command({cmd:`cargo test`}))"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper-checks","name":"exec","input":"text(await tools.exec_command({cmd:`cargo test`}))"}}),
             completed(
                 json!({"type":"CommandExecution","id":"c1","command":["/usr/bin/bash","-lc","cargo test login"],"cwd":"file:///repo","status":"completed","exit_code":1,"aggregated_output":"1 failed"}),
             ),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-checks","output":"1 failed"}}),
             completed(
                 json!({"type":"FileChange","id":"f1","changes":{"/repo/src/auth.rs":{"type":"update","unified_diff":"-a\n+b"}},"status":"completed"}),
             ),
@@ -591,8 +638,8 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "line-4", "msg_r", "line-7", "c1", "f1", "msg_c", "amsg_1", "line-18", "line-19",
-                "line-20", "line-21"
+                "line-4", "msg_r", "line-7", "c1", "f1", "msg_c", "amsg_1", "line-19", "line-20",
+                "line-21", "line-22"
             ]
         );
         let text = |index: usize| match &items[index].content {
@@ -671,7 +718,7 @@ mod tests {
             completed(
                 json!({"type":"UserMessage","id":"u1","content":[{"type":"Text","text":"Run the new checks"}]}),
             ),
-            raw("exec"),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper-checks","name":"exec","input":"run both checks"}}),
             raw("update_plan"),
             completed(
                 json!({"type":"CommandExecution","id":"c1","command":"cargo test","status":"completed","exit_code":0}),
@@ -679,6 +726,7 @@ mod tests {
             completed(
                 json!({"type":"CommandExecution","id":"c2","command":"cargo clippy","status":"completed","exit_code":0}),
             ),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-checks","output":"checks passed"}}),
             raw("exec"),
             raw("spawn_agent"),
             message("assistant", "New checks pass."),
@@ -721,6 +769,7 @@ mod tests {
                 "tool update_plan",
                 "command cargo test",
                 "command cargo clippy",
+                "tool exec",
                 "tool spawn_agent",
                 "New checks pass.",
                 "Tidy up",
@@ -742,18 +791,180 @@ mod tests {
     }
 
     #[test]
+    fn completed_invocations_leave_other_calls_of_the_same_kind_visible() {
+        for (name, item) in [
+            (
+                "exec_command",
+                json!({"type":"CommandExecution","command":"same command","status":"completed"}),
+            ),
+            (
+                "exec",
+                json!({"type":"CommandExecution","command":"same command","status":"completed"}),
+            ),
+            (
+                "apply_patch",
+                json!({"type":"FileChange","changes":{},"status":"completed"}),
+            ),
+            (
+                "send_input",
+                json!({"type":"CollabAgentToolCall","tool":"sendInput","status":"completed"}),
+            ),
+            (
+                "mcp__github__list_issues",
+                json!({"type":"McpToolCall","tool":"list_issues","arguments":{},"status":"completed"}),
+            ),
+        ] {
+            let raw = |id: &str| json!({"type":"response_item","payload":{"type":"function_call","call_id":id,"name":name,"arguments":"{\"cmd\":\"same command\"}"}});
+            // Both invocations have identical inputs, and the second is
+            // already pending when the first finishes.
+            let mut item = item;
+            item["id"] = "first".into();
+            let rollout = lines(&[
+                json!({"type":"event_msg","payload":{"type":"task_started"}}),
+                raw("first"),
+                raw("second"),
+                completed(item.clone()),
+            ]);
+            let items = parse(rollout.as_bytes());
+            assert_eq!(items.len(), 2, "{name}: {items:#?}");
+            assert_eq!(items[0].id, "line-2", "{name}: the other call stays");
+            assert_eq!(items[1].id, "first", "{name}: the completed call wins");
+
+            item["id"] = "unrelated".into();
+            let items = parse(lines(&[raw("second"), completed(item)]).as_bytes());
+            assert_eq!(items.len(), 2, "{name}: different IDs cannot supersede");
+        }
+    }
+
+    #[test]
+    fn code_mode_wrapper_stays_visible_until_its_output_arrives() {
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper","name":"exec","input":"run check, then migration"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-a","command":"cargo test","status":"completed"}),
+            ),
+        ]);
+        assert_eq!(tool_summary(&rollout), ["tool exec", "command cargo test"]);
+    }
+
+    #[test]
+    fn code_mode_wrapper_with_output_is_replaced_by_its_completed_children() {
+        for output_type in ["function_call_output", "custom_tool_call_output"] {
+            let rollout = lines(&[
+                json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper","name":"exec","input":"run both checks"}}),
+                completed(
+                    json!({"type":"CommandExecution","id":"exec-a","command":"cargo test","status":"completed"}),
+                ),
+                completed(
+                    json!({"type":"CommandExecution","id":"exec-b","command":"cargo clippy","status":"completed"}),
+                ),
+                json!({"type":"response_item","payload":{"type":output_type,"call_id":"wrapper","output":"checks passed"}}),
+            ]);
+            assert_eq!(
+                tool_summary(&rollout),
+                ["command cargo test", "command cargo clippy"],
+                "{output_type}",
+            );
+        }
+    }
+
+    #[test]
+    fn code_mode_wrapper_suppression_is_independent_of_output_and_child_order() {
+        for output_type in ["function_call_output", "custom_tool_call_output"] {
+            let wrapper = json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper","name":"exec","input":"run check"}});
+            let output = json!({"type":"response_item","payload":{"type":output_type,"call_id":"wrapper","output":"check passed"}});
+            let child = completed(
+                json!({"type":"CommandExecution","id":"exec-child","command":"cargo test","status":"completed"}),
+            );
+            let child_before_output =
+                tool_summary(&lines(&[wrapper.clone(), child.clone(), output.clone()]));
+            let output_before_child = tool_summary(&lines(&[wrapper, output, child]));
+            assert_eq!(output_before_child, child_before_output, "{output_type}");
+            assert_eq!(output_before_child, ["command cargo test"], "{output_type}");
+        }
+    }
+
+    #[test]
+    fn two_idless_calls_of_one_kind_keep_both_beside_a_completed_item() {
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"first\"}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"second\"}"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-a","command":"first","status":"completed"}),
+            ),
+        ]);
+        assert_eq!(
+            tool_summary(&rollout),
+            ["tool exec_command", "tool exec_command", "command first"]
+        );
+    }
+
+    #[test]
+    fn code_mode_completions_do_not_hide_a_later_wrapper() {
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper-first","name":"exec","input":"run both checks"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-a","command":"cargo test","status":"completed"}),
+            ),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-b","command":"cargo clippy","status":"completed"}),
+            ),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-first","output":"checks passed"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper-second","name":"exec","input":"run migration"}}),
+        ]);
+        assert_eq!(
+            tool_summary(&rollout),
+            ["command cargo test", "command cargo clippy", "tool exec"]
+        );
+    }
+
+    #[test]
+    fn wrapper_attribution_requires_a_unique_candidate() {
+        let raw = |id: &str| json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":id,"name":"exec","input":id}});
+        let command = completed(
+            json!({"type":"CommandExecution","id":"exec-child","command":"cargo test","status":"completed"}),
+        );
+        let overlapping = lines(&[raw("first"), raw("second"), command.clone()]);
+        assert_eq!(
+            tool_summary(&overlapping),
+            ["tool exec", "tool exec", "command cargo test"]
+        );
+        for output_type in ["function_call_output", "custom_tool_call_output"] {
+            let finished = lines(&[
+                raw("first"),
+                json!({"type":"response_item","payload":{"type":output_type,"call_id":"first","output":"no commands"}}),
+                command.clone(),
+            ]);
+            assert_eq!(tool_summary(&finished), ["command cargo test"]);
+
+            // An output may yield while the first wrapper's child keeps
+            // running. Its late completion cannot be assigned to the second.
+            let yielded = lines(&[
+                raw("first"),
+                json!({"type":"response_item","payload":{"type":output_type,"call_id":"first","output":"still running"}}),
+                raw("second"),
+                command.clone(),
+            ]);
+            assert_eq!(
+                tool_summary(&yielded),
+                ["tool exec", "tool exec", "command cargo test"]
+            );
+        }
+    }
+
+    #[test]
     fn raw_calls_no_item_describes_stay_beside_command_items() {
         let rollout = lines(&[
             json!({"type":"event_msg","payload":{"type":"task_started"}}),
             json!({"type":"response_item","payload":{"type":"function_call","call_id":"call-first","name":"exec_command","arguments":"{\"cmd\":\"cargo test\"}"}}),
             json!({"type":"response_item","payload":{"type":"function_call","name":"spawn_agent","arguments":"{}"}}),
             completed(
-                json!({"type":"CommandExecution","id":"exec-first","command":"cargo test","status":"completed","exit_code":0}),
+                json!({"type":"CommandExecution","id":"call-first","command":"cargo test","status":"completed","exit_code":0}),
             ),
             json!({"type":"response_item","payload":{"type":"function_call","call_id":"call-second","name":"exec_command","arguments":"{\"cmd\":\"cargo clippy\"}"}}),
             json!({"type":"response_item","payload":{"type":"function_call","name":"wait_agent","arguments":"{}"}}),
             completed(
-                json!({"type":"CommandExecution","id":"exec-second","command":"cargo clippy","status":"completed","exit_code":0}),
+                json!({"type":"CommandExecution","id":"call-second","command":"cargo clippy","status":"completed","exit_code":0}),
             ),
             json!({"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{}"}}),
         ]);
@@ -956,21 +1167,27 @@ mod tests {
             json!({"type":"event_msg","payload":{"type":"task_started"}}),
             json!({"type":"response_item","payload":{"type":"function_call","call_id":"child","name":"exec_command","arguments":"{}"}}),
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"child","output":"raw wrapper result"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"unmatched","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"unmatched","output":"unmatched result"}}),
             completed(
-                json!({"type":"CommandExecution","id":"command","command":"checks","status":"completed","exit_code":0,"aggregated_output":"richer result"}),
+                json!({"type":"CommandExecution","id":"child","command":"checks","status":"completed","exit_code":0,"aggregated_output":"richer result"}),
             ),
             json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"plan","name":"update_plan","input":"plan"}}),
             json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"plan","output":"plan result"}}),
         ]);
         let items = parse(rollout.as_bytes());
-        assert_eq!(items.len(), 3, "{items:#?}");
+        assert_eq!(items.len(), 4, "{items:#?}");
         assert!(matches!(&items[0].content, ItemContent::Tool { output, .. }
             if output == "parent result"));
         assert!(
-            matches!(&items[1].content, ItemContent::Command { output, .. }
+            matches!(&items[1].content, ItemContent::Tool { name, output, .. }
+            if name == "exec_command" && output == "unmatched result")
+        );
+        assert!(
+            matches!(&items[2].content, ItemContent::Command { output, .. }
             if output == "richer result")
         );
-        assert!(matches!(&items[2].content, ItemContent::Tool { output, .. }
+        assert!(matches!(&items[3].content, ItemContent::Tool { output, .. }
             if output == "plan result"));
     }
 }
