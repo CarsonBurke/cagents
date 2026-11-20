@@ -5992,7 +5992,7 @@ pub struct Cagents {
     owed_projection: Option<OwedProjection>,
     /// A message dispatched in this update, its own or one a handler
     /// dispatched within it, may have changed which projects and worktrees
-    /// attention covers.
+    /// attention covers. An update run within another keeps the other's.
     attention_scope_changed: bool,
     /// How many updates are running their message's handler: a dispatch
     /// made while none is has no update to project what it owes.
@@ -17221,10 +17221,13 @@ impl Application for Cagents {
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }
+        // An update can run inside another's admission, before that one's
+        // handler: its postlude answers only for its own messages.
+        let enclosing_scope_changed = std::mem::take(&mut self.attention_scope_changed);
         self.dispatching += 1;
         let task = self.dispatch(message);
         self.dispatching -= 1;
-        self.finish_update(
+        let task = self.finish_update(
             task,
             UpdateEntry {
                 notice_control,
@@ -17233,7 +17236,9 @@ impl Application for Cagents {
                 #[cfg(any(test, feature = "development"))]
                 oracle_message,
             },
-        )
+        );
+        self.attention_scope_changed = enclosing_scope_changed;
+        task
     }
 }
 
