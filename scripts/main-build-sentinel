@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 """Check main's newest commit through the fw16 gate whenever it moves, find
-which first-parent commit broke it when it fails after passing, then build the
-newest one that compiles for native evidence to start from."""
+the first-parent commit at which each failing lane first fails when it fails
+after passing, then build the newest checked commit that compiles for native
+evidence to start from."""
 import argparse
 import fcntl
 import json
@@ -131,30 +132,36 @@ def check_commit(repository, directory, sha, lanes):
 
 
 def bisect(repository, directory, state):
-    """Narrows the first-parent commits between the last passing one and the
-    failing tip down to the first that fails a lane the tip fails, checking
-    only those lanes, and names it on the issue."""
+    """For each lane the tip fails, narrows the first-parent commits between
+    the last passing one and the tip down to the earliest at which that lane
+    fails, checking only that lane, and names those commits on the issue."""
     search = state["bisect"]
     path = directory / "state.json"
     commits = search["commits"]
-    # commits[good] passes and commits[bad] fails; -1 is the last passing commit.
-    while search["bad"] - search["good"] > 1:
-        middle = (search["good"] + search["bad"]) // 2
-        statuses, warnings = check_commit(repository, directory, commits[middle], search["lanes"])
-        fails = failed_lanes({"lanes": statuses, "warnings": warnings})
-        search["bad" if fails else "good"] = middle
-        save(path, state)
-    first = commits[search["bad"]]
+    # For each lane, commits[good] passes it and commits[bad] fails it; -1 is
+    # the last passing commit. A commit's other lanes are not checked.
+    for lane, bounds in search["lanes"].items():
+        while bounds["bad"] - bounds["good"] > 1:
+            middle = (bounds["good"] + bounds["bad"]) // 2
+            statuses, warnings = check_commit(repository, directory, commits[middle], [lane])
+            fails = failed_lanes({"lanes": statuses, "warnings": warnings})
+            bounds["bad" if fails else "good"] = middle
+            save(path, state)
     if state.get("issue"):
-        subject = git(repository, "show", "-s", "--format=%s", first)
+        found = {}
+        for lane, bounds in search["lanes"].items():
+            found.setdefault(commits[bounds["bad"]], []).append(lane)
+        lines = [f"- `{sha}` ({git(repository, 'show', '-s', '--format=%s', sha)}): "
+                 f"{', '.join(lanes)}" for sha, lanes in found.items()]
         # Persisted first, so a failed call retries the comment, not the checks.
         state["retry_after"] = time.time() + 120
         save(path, state)
         github(directory, state, "issue", "comment", str(state["issue"]), "--body",
-               f"First failing commit: `{first}` ({subject}). Bisected the "
-               f"{len(commits)} first-parent commits after `{search['after']}`, the last that "
-               f"passed, in the failing lane{'s' * (len(search['lanes']) != 1)}: "
-               f"{', '.join(search['lanes'])}.")
+               f"Bisected the {len(commits)} first-parent commits after `{search['after']}`, the "
+               "last that passed. The earliest commit at which each failing lane fails:\n\n"
+               + "\n".join(lines) + "\n\nA lane that broke, was fixed and broke again in this "
+               "range, or failed for a reason outside the code, can point earlier than the break "
+               "the tip shows; its log under `logs/` on fw16 says which.")
         state.pop("retry_after", None)
     state.pop("bisect")
     save(path, state)
@@ -337,7 +344,7 @@ def tick_locked(repository, directory, github_repository):
             # Only a break since a passing commit has a first failing commit.
             if failed and between and state.get("checked") and state.get("checked") == state.get("last_good"):
                 state["bisect"] = {"after": state["checked"], "commits": [*between, pending["sha"]],
-                                   "lanes": failed, "good": -1, "bad": len(between)}
+                                   "lanes": {lane: {"good": -1, "bad": len(between)} for lane in failed}}
             state["checked"] = pending["sha"]
             if not any(pending["lanes"].values()):
                 state["compiled"] = pending["sha"]

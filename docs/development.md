@@ -794,9 +794,12 @@ GitHub's script checks do not compile Rust. On fw16,
 at most once every two minutes and checks its newest commit whenever it has
 moved. A passing tip vouches for the commits merged before it: for one of them
 to hide a break, a later one would have to undo it. When the tip fails after a
-passing check, the sentinel bisects the first-parent commits in between, in
-the lanes the tip fails only, and names the first failing commit on the issue.
-It does not fetch again until it has. Each checked commit gets five separate
+passing check, the sentinel bisects the first-parent commits in between for
+each lane the tip fails, checking only that lane, and comments on the issue
+the earliest commit at which each fails. It does not fetch again until it has,
+so a bisection that cannot finish, such as on a dirty checkout or a comment
+GitHub keeps refusing, holds the sentinel until it is fixed. Each tip it checks
+gets five separate
 `scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 `-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
@@ -812,7 +815,7 @@ the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
-Once the newest commit it checked compiles, warnings or not, the sentinel also
+Once the newest commit it checked, the tip it last saw, compiles, warnings or not, the sentinel also
 builds the three executables [native evidence](#native-evidence) runs for that
 commit and keeps
 them under `builds/` in its state directory, for the six newest such commits,
@@ -2338,8 +2341,9 @@ scripts/native-evidence stop
   ignored goes to the host, so make sure a stray file, such as a local `.env`,
   is ignored or removed before you build.
 - **Builds.** A main commit the host's
-  [sentinel](#watching-main-after-merges) has built, such as a recent
-  `origin/main`, usually compiles nothing: the host copies its executables.
+  [sentinel](#watching-main-after-merges) has built, a tip of `origin/main`
+  it checked, compiles nothing: the host copies its executables. A commit
+  merged in a burst with others before a check is not built this way.
   Any other checkout builds through its own `scripts/cargo-gate`, in its own
   build slot and target as `mise run dev` does, so what you already built for
   the change is reused while that slot is free; the three executables then go from here to the task,
