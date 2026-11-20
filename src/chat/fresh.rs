@@ -19,7 +19,7 @@ pub(super) fn codex_config_effort(value: &str) -> Option<&str> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ArgumentArity {
+pub(crate) enum ArgumentArity {
     Switch,
     Value,
     Values,
@@ -27,7 +27,7 @@ pub(super) enum ArgumentArity {
 
 /// Shared with the native Claude constructor so selector-looking option values
 /// are consumed as data in both paths. Transport branches keep their own checks.
-pub(super) fn claude_arity(flag: &str) -> Option<ArgumentArity> {
+pub(crate) fn claude_arity(flag: &str) -> Option<ArgumentArity> {
     use ArgumentArity::*;
     Some(match flag {
         "--model"

@@ -165,10 +165,13 @@ printf 'spawn\n' >> "$HOME/../spawns"
 printf '%s\n' "$@" > "$HOME/../claude-arguments"
 n=0
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+# Confirms the mode it was launched in, as Claude's initialize reply does.
+confirmed='{}'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --session-id|--resume) shift; session=$1 ;;
     --session-id=*|--resume=*) session=${1#*=} ;;
+    --permission-mode) shift; confirmed="{\"current_permission_mode\":\"$1\"}" ;;
   esac
   shift
 done
@@ -177,7 +180,7 @@ while IFS= read -r frame; do
     *'"type":"control_request"'*)
       id=${frame#*'"request_id":"'}
       id=${id%%'"'*}
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed"
       ;;
     *'"type":"control_response"'*)
       # The answer to a permission request raised below finishes its turn;
@@ -983,13 +986,13 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     // admission: pending transport must still refuse an idle close.
     let provider = path.parent().unwrap().join("bin/claude");
     let script = std::fs::read_to_string(&provider).unwrap();
-    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed""#;
     let refreshed = r#"      case "$frame" in
         *'"subtype":"get_context_usage"'*)
           printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":424242,"maxTokens":1000000}}}\n' "$id"
           ;;
         *)
-          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed"
           ;;
       esac"#;
     assert_eq!(script.matches(original).count(), 1);
@@ -1144,13 +1147,13 @@ done
 fn hold_provider_initialization(root: &Path) {
     let provider = root.join("bin/claude");
     let script = std::fs::read_to_string(&provider).unwrap();
-    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed""#;
     let held = r#"      case "$frame" in
         *'"subtype":"initialize"'*)
           while [ ! -e "$HOME/../initialize-release" ]; do sleep 0.01; done
           ;;
       esac
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed""#;
     assert_eq!(script.matches(original).count(), 1);
     std::fs::write(&provider, script.replace(original, held)).unwrap();
 }
@@ -3952,6 +3955,199 @@ fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
             Instant::now() < deadline,
             "the agent never asked: {reply:?} {:?}",
             status(host, &Authority::default(), agent)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The live session an agent runs in, with the authority it was issued.
+fn agent_authority(host: &SharedHost, agent: AgentId) -> Authority {
+    let registry = registry(host).unwrap();
+    let mut registry = registry.lock().unwrap();
+    let session = registry.agent(agent).unwrap().session.unwrap();
+    registry.register_agent_authority(&session).unwrap()
+}
+
+/// An agent never starts a child with more permission than its own, and
+/// never approves its child's tool requests unless nothing asks it either.
+#[test]
+fn an_agent_gives_its_children_no_more_permission_than_its_own() {
+    if isolated("an_agent_gives_its_children_no_more_permission_than_its_own").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let person = Authority::default();
+    let spawn = |authority: &Authority, key: &str, provider, mode: Option<&str>, prompt: &str| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.provider = provider;
+        spec.permission_mode = mode.map(str::to_owned);
+        request.prompt = prompt.into();
+        request.idempotency_key = key.into();
+        submit(&host, authority, request)
+    };
+    let mode = |accepted: &Accepted| accepted.agent.spec.permission_mode.clone();
+    let launched = || std::fs::read_to_string(root.join("claude-arguments")).unwrap();
+
+    // A person's own connection starts what it asks for, as before.
+    let parent = spawn(
+        &person,
+        "parent",
+        Provider::Claude,
+        Some("default"),
+        "parent",
+    )
+    .unwrap();
+    assert_eq!(mode(&parent).as_deref(), Some("default"));
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let unrestricted = spawn(
+        &person,
+        "person-bypass",
+        Provider::Claude,
+        Some("bypassPermissions"),
+        "work",
+    )
+    .unwrap();
+    assert_eq!(mode(&unrestricted).as_deref(), Some("bypassPermissions"));
+    settled(&host, unrestricted.run.id);
+
+    let agent = agent_authority(&host, parent.agent.id);
+    assert_eq!(
+        spawn(
+            &agent,
+            "looser",
+            Provider::Claude,
+            Some("bypassPermissions"),
+            "work"
+        )
+        .unwrap_err(),
+        "This agent runs in default mode, so it can't start a child in bypassPermissions."
+    );
+    assert_eq!(
+        spawn(
+            &agent,
+            "unranked",
+            Provider::Claude,
+            Some("dontAsk"),
+            "work"
+        )
+        .unwrap_err(),
+        "cagents can't compare Claude Code mode dontAsk with this agent's own, so an agent can't start a child in it; start it yourself."
+    );
+    assert_eq!(
+        spawn(
+            &agent,
+            "codex-looser",
+            Provider::Codex,
+            Some("never"),
+            "work"
+        )
+        .unwrap_err(),
+        "This agent runs in default mode, so it can't start a Codex child in never/workspace-write."
+    );
+
+    // An omitted mode is the parent's own.
+    let inherited = spawn(
+        &agent,
+        "inherited",
+        Provider::Claude,
+        None,
+        "ASK_PERMISSION",
+    )
+    .unwrap();
+    assert_eq!(mode(&inherited).as_deref(), Some("default"));
+    let asked = pending(&host, &agent, inherited.agent.id);
+    assert!(
+        launched().contains("--permission-mode\ndefault\n"),
+        "{}",
+        launched()
+    );
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(asked.kind, chat::RequestKind::Approval);
+    let control = |command| -> Result<Vec<chat::Request>, String> {
+        match process(
+            &host,
+            agent.clone(),
+            Operation::Control {
+                agent: inherited.agent.id,
+                command,
+            },
+        )? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    let answer = |action: &str| Control::Answer {
+        request_id: asked.id.clone(),
+        action: action.into(),
+        answers: Vec::new(),
+    };
+    assert_eq!(
+        control(answer("allow")).unwrap_err(),
+        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+    );
+    assert!(control(answer("allow_session")).is_err());
+    assert!(!root.join("decisions").exists(), "nothing was approved");
+    assert!(control(answer("deny")).unwrap().is_empty());
+    assert_eq!(settled(&host, inherited.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "deny\n"
+    );
+
+    // Another provider's child gets the strictest mode of the parent's tier.
+    let codex = spawn(&agent, "codex", Provider::Codex, None, "work").unwrap();
+    assert_eq!(mode(&codex).as_deref(), Some("untrusted/workspace-write"));
+    settled(&host, codex.run.id);
+
+    // A parent whose mode is not confirmed counts as asking for approval.
+    let unknown = spawn(&person, "unknown", Provider::Claude, None, "unknown").unwrap();
+    assert_eq!(mode(&unknown), None);
+    assert_eq!(settled(&host, unknown.run.id).state, State::Succeeded);
+    let unknown = agent_authority(&host, unknown.agent.id);
+    assert_eq!(
+        spawn(
+            &unknown,
+            "unknown-looser",
+            Provider::Claude,
+            Some("acceptEdits"),
+            "work"
+        )
+        .unwrap_err(),
+        "This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a child in acceptEdits."
+    );
+    let asking = spawn(&unknown, "unknown-asking", Provider::Claude, None, "work").unwrap();
+    assert_eq!(mode(&asking).as_deref(), Some("default"));
+    settled(&host, asking.run.id);
+    let stricter = spawn(
+        &unknown,
+        "unknown-plan",
+        Provider::Claude,
+        Some("plan"),
+        "work",
+    )
+    .unwrap();
+    assert_eq!(mode(&stricter).as_deref(), Some("plan"));
+    settled(&host, stricter.run.id);
+}
+
+fn pending(host: &SharedHost, authority: &Authority, agent: AgentId) -> Vec<chat::Request> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = process(host, authority.clone(), Operation::Requests(agent));
+        if let Ok(Reply::Requests(requests)) = &reply
+            && !requests.is_empty()
+        {
+            return requests.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never asked: {reply:?}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -6924,5 +7120,37 @@ fn an_acp_agent_s_launch_names_its_mode_in_its_own_words() {
     assert_eq!(
         launch_options(&spec("default")),
         ["--model", "gemini-3.8-flash", "--effort", "low"]
+    );
+}
+
+#[test]
+fn a_codex_agent_s_launch_names_its_approval_and_sandbox() {
+    use crate::agent::Provider;
+    use crate::agent_execution::{Spec, Surface, Target};
+    let spec = |mode: &str| Spec {
+        provider: Provider::Codex,
+        account: None,
+        target: Target {
+            repository: "/work".into(),
+            directory: "/work".into(),
+            placement: None,
+        },
+        surface: Surface::Chat,
+        model: None,
+        permission_mode: Some(mode.into()),
+        reasoning_effort: None,
+    };
+    assert_eq!(
+        launch_options(&spec("untrusted/workspace-write")),
+        [
+            "--ask-for-approval",
+            "untrusted",
+            "--sandbox",
+            "workspace-write"
+        ]
+    );
+    assert_eq!(
+        launch_options(&spec("on-request")),
+        ["--ask-for-approval", "on-request"]
     );
 }

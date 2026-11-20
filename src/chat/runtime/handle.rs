@@ -657,6 +657,16 @@ impl Handle {
             Owner::Remote(remote) => remote.state().idle,
         }
     }
+    /// The provider-confirmed permission mode. A local actor reads it
+    /// without publishing a snapshot.
+    pub(crate) fn permission_mode(&self) -> Option<String> {
+        match &self.0 {
+            Owner::Local(local) => local.permission_mode(),
+            Owner::Remote(remote) => remote
+                .snapshot(None)
+                .and_then(|snapshot| snapshot.permission_mode),
+        }
+    }
     pub(crate) fn requests(&self) -> Vec<chat::Request> {
         match &self.0 {
             Owner::Local(local) => local.requests(),

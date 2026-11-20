@@ -109,6 +109,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     permission_modes: &["manual", "auto", "dontAsk", "bypassPermissions"],
     // Its terminal's `--approval-mode` names, the own names of `acp.modes`.
     permission_mode_aliases: &["untrusted", "on-request", "never"],
+    permission_sandboxes: &[],
     acp: Some(super::Acp {
         mode_option: "--approval-mode",
         effort_option: "--reasoning-effort",

@@ -89,6 +89,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
         "bypassPermissions",
     ],
     permission_mode_aliases: &[],
+    permission_sandboxes: &[],
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,

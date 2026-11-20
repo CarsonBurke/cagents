@@ -11,6 +11,7 @@ use std::path::PathBuf;
 pub(crate) mod bundled;
 pub mod directory;
 pub mod mailbox;
+pub mod permission;
 pub mod transcript;
 
 use serde::{Deserialize, Serialize};

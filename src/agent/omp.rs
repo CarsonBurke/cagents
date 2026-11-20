@@ -78,6 +78,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     native_chat: true,
     permission_modes: &["always-ask", "write", "yolo"],
     permission_mode_aliases: &[],
+    permission_sandboxes: &[],
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,

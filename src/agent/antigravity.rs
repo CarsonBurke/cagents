@@ -84,6 +84,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     native_chat: true,
     permission_modes: &["default", "acceptEdits", "auto", "plan"],
     permission_mode_aliases: &[],
+    permission_sandboxes: &[],
     acp: Some(super::Acp {
         mode_option: "--mode",
         effort_option: "--effort",

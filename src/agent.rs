@@ -169,6 +169,9 @@ struct ProviderAdapter {
     /// Other names the provider's own terminal gives the same modes, which a
     /// launch or a saved automation may use instead.
     permission_mode_aliases: &'static [&'static str],
+    /// Sandboxes a mode may name after its approval policy and a `/`, as in
+    /// Codex's `on-request/read-only`.
+    permission_sandboxes: &'static [&'static str],
     /// What cagents knows of a provider whose native chat is the Agent
     /// Client Protocol, for one that serves it.
     acp: Option<Acp>,
@@ -372,8 +375,13 @@ impl Provider {
         self.adapter().permission_mode_aliases
     }
 
+    /// Sandboxes a mode may name after `/`.
+    pub fn permission_sandboxes(self) -> &'static [&'static str] {
+        self.adapter().permission_sandboxes
+    }
+
     /// The permission modes this provider takes, as its help and errors name
-    /// them: "a, b or c", then any terminal aliases.
+    /// them: "a, b or c", then any sandbox suffix or terminal aliases.
     pub fn permission_mode_choices(self) -> String {
         fn list(names: &[&str]) -> String {
             match names {
@@ -382,20 +390,25 @@ impl Provider {
                 [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
             }
         }
-        match self.permission_mode_aliases() {
-            [] => list(self.permission_modes()),
-            aliases => format!(
-                "{}, or its terminal's {}",
-                list(self.permission_modes()),
-                list(aliases)
-            ),
+        let mut choices = list(self.permission_modes());
+        if let sandboxes @ [_, ..] = self.permission_sandboxes() {
+            let sandboxes: Vec<_> = sandboxes.iter().map(|sandbox| format!("/{sandbox}")).collect();
+            let sandboxes: Vec<_> = sandboxes.iter().map(String::as_str).collect();
+            choices = format!("{choices}, each optionally followed by {}", list(&sandboxes));
         }
+        if let aliases @ [_, ..] = self.permission_mode_aliases() {
+            choices = format!("{choices}, or its terminal's {}", list(aliases));
+        }
+        choices
     }
 
     /// Refuses a permission mode this provider has no such mode for, such as
     /// another provider's, naming the ones it has.
     pub fn check_permission_mode(self, mode: &str) -> Result<(), String> {
-        if self.permission_modes().contains(&mode) || self.permission_mode_aliases().contains(&mode)
+        let (named, sandbox) = mode.split_once('/').map_or((mode, None), |(named, sandbox)| (named, Some(sandbox)));
+        let sandbox_known = sandbox.is_none_or(|sandbox| self.permission_sandboxes().contains(&sandbox));
+        if sandbox_known && self.permission_modes().contains(&named)
+            || self.permission_mode_aliases().contains(&mode)
         {
             return Ok(());
         }
