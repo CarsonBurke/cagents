@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ceditor" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="coral" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF8A55"/><stop offset="1" stop-color="#EE5A24"/></linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#74CCBC"/><stop offset="1" stop-color="#46988A"/></linearGradient>
+    <linearGradient id="slate" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7C8FB2"/><stop offset="1" stop-color="#5A6B8C"/></linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#ECEAE6"/></linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2A3043"/><stop offset="1" stop-color="#181C28"/></linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".45"/><stop offset=".3" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0B0D14" flood-opacity=".35"/></filter>
+  </defs>
+  <g filter="url(#sh)">
+  <rect x="14" y="16" width="84" height="98" rx="8" fill="#C0BFBC"/>
+  <rect x="14" y="12" width="84" height="98" rx="8" fill="url(#ivory)"/>
+  <path d="M 22 12 H 90 A 8 8 0 0 1 98 20 V 28 H 14 V 20 A 8 8 0 0 1 22 12 Z" fill="url(#teal)"/>
+  <rect x="14" y="26" width="84" height="2" fill="#2C6E64" opacity=".5"/>
+  </g>
+  <rect x="36" y="38" width="24" height="5" rx="2.5" fill="#EE5A24" opacity="0.9"/>
+  <rect x="44" y="50" width="40" height="5" rx="2.5" fill="#46988A" opacity="1"/>
+  <rect x="18" y="59" width="76" height="11" fill="#DDF2EE"/>
+  <rect x="44" y="62" width="26" height="5" rx="2.5" fill="#3D3846" opacity="1"/>
+  <rect x="44" y="74" width="34" height="5" rx="2.5" fill="#5A6B8C" opacity="0.8"/>
+  <rect x="36" y="86" width="18" height="5" rx="2.5" fill="#9A9996" opacity="1"/>
+  <rect x="28" y="38" width="4" height="5" rx="1.5" fill="#C0BFBC"/>
+  <rect x="28" y="50" width="4" height="5" rx="1.5" fill="#C0BFBC"/>
+  <rect x="28" y="62" width="4" height="5" rx="1.5" fill="#46988A"/>
+  <rect x="28" y="74" width="4" height="5" rx="1.5" fill="#C0BFBC"/>
+  <rect x="28" y="86" width="4" height="5" rx="1.5" fill="#C0BFBC"/>
+  <g filter="url(#sh)" transform="translate(0 0)">
+  <path d="M 84 70 H 112 V 78 H 102 V 104 H 112 V 112 H 84 V 104 H 94 V 78 H 84 Z" fill="#B83D16" transform="translate(0 4)"/>
+  <path d="M 84 70 H 112 V 78 H 102 V 104 H 112 V 112 H 84 V 104 H 94 V 78 H 84 Z" fill="url(#coral)" stroke="#B83D16" stroke-width="1" stroke-linejoin="round"/>
+  </g>
+</svg>

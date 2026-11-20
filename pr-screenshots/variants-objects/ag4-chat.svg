@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cagents" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="coral" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF8A55"/><stop offset="1" stop-color="#EE5A24"/></linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#74CCBC"/><stop offset="1" stop-color="#46988A"/></linearGradient>
+    <linearGradient id="slate" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7C8FB2"/><stop offset="1" stop-color="#5A6B8C"/></linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#ECEAE6"/></linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2A3043"/><stop offset="1" stop-color="#181C28"/></linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".45"/><stop offset=".3" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0B0D14" flood-opacity=".35"/></filter>
+  </defs>
+  <g filter="url(#sh)">
+  <path d="M 28 76 L 22 92 L 42 78 Z" fill="#B83D16"/>
+  <g>
+    <rect x="12" y="19" width="78" height="60" rx="16" fill="#B83D16"/>
+    <rect x="12" y="14" width="78" height="60" rx="16" fill="url(#coral)"/>
+    <rect x="12" y="14" width="78" height="60" rx="16" fill="url(#gloss)"/>
+  </g>
+  <circle cx="34" cy="44" r="6" fill="#FFF7ED"/>
+  <circle cx="51" cy="44" r="6" fill="#FFF7ED"/>
+  <circle cx="68" cy="44" r="6" fill="#FFF7ED"/>
+  </g>
+  <g filter="url(#sh)">
+  <path d="M 100 104 L 108 118 L 88 106 Z" fill="#0E1119"/>
+  <rect x="40" y="52" width="76" height="56" rx="14" fill="#0E1119"/>
+  <rect x="40" y="48" width="76" height="56" rx="14" fill="url(#screen)"/>
+  <rect x="40.8" y="48.8" width="74.4" height="54.4" rx="13.2" fill="none" stroke="#fff" stroke-opacity=".14" stroke-width="1.6"/>
+  <path d="M 54 63 L 63 72 L 54 81" fill="none" stroke="#FF8A55" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="72" y="78" width="22" height="6.5" rx="3.25" fill="#FFFFFF" opacity="1"/>
+  </g>
+</svg>
