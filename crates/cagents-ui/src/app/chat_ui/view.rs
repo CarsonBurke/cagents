@@ -349,13 +349,15 @@ fn user_bubble<'a>(
 }
 
 /// Reserve an external action row so hovering never shifts the transcript.
-/// The hover also keeps its controls visible while they are keyboard-focused.
+/// The hover also keeps its controls visible while they are keyboard-focused,
+/// and while `pinned`: when they say something, such as why a copy failed.
 pub(super) fn message_actions<'a>(
     message: Element<'a, Message>,
     actions: Element<'a, Message>,
     alignment: Alignment,
+    pinned: bool,
 ) -> Element<'a, Message> {
-    super::hover::over(
+    super::hover::over_pinned(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
@@ -368,6 +370,7 @@ pub(super) fn message_actions<'a>(
             .height(Length::Fill)
             .align_x(alignment)
             .align_y(Alignment::End),
+        pinned,
     )
 }
 
@@ -5696,11 +5699,12 @@ impl Runtime {
             )
                 .hash(hasher);
         }
-        // Only this item's badge changes on copy. Its dismissal timer does not
-        // affect what the row draws.
-        self.copied
+        // Only this item's controls change on copy: what its last copy said
+        // there, which a later copy or its lapse replaces.
+        self.copy_feedback
             .as_ref()
-            .is_some_and(|(id, _)| *id == item.id)
+            .filter(|feedback| feedback.key.item() == item.id)
+            .map(|feedback| feedback.at)
             .hash(hasher);
         cached
             .map(|cached| {
@@ -6188,13 +6192,15 @@ impl Runtime {
         )
     }
 
+    /// Whether item `id`'s own Copy is saying why it didn't copy.
+    pub(super) fn copy_note_shown(&self, id: &str) -> bool {
+        self.copy_state(id, None).refusal().is_some()
+    }
+
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
+        let state = self.copy_state(&item.id, None);
         let mut controls = vec![small_icon(
-            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                Icon::Check
-            } else {
-                Icon::Copy
-            },
+            state.icon(),
             "Copy this message",
             if item.logical_copy_body().is_some()
                 && !self
@@ -6210,7 +6216,15 @@ impl Runtime {
                 Action::Copy(self.target, item.id.clone(), CopyPart::Text)
             },
         )];
-        if let Some((at, stamp, full)) = self
+        // Why the copy didn't go through, beside the Copy that tries again.
+        // It stands in for the timestamp until it lapses.
+        if let Some(refusal) = state.refusal() {
+            controls.push(
+                design::caption(refusal.to_string())
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .into(),
+            );
+        } else if let Some((at, stamp, full)) = self
             .presentation_cache()
             .get(&item.id)
             .and_then(|cached| cached.stamp.as_ref())
@@ -6524,6 +6538,7 @@ impl Runtime {
             message,
             self.message_copy(item),
             Alignment::End,
+            self.copy_note_shown(&item.id),
         ))
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -6742,6 +6757,7 @@ impl Runtime {
                     .into(),
                 self.message_copy(item),
                 Alignment::Start,
+                self.copy_note_shown(&item.id),
             )
         };
         widget::container(body)
@@ -6835,6 +6851,7 @@ impl Runtime {
                 prose::view(cached, settings, self.target, self.find.as_deref()),
                 self.message_copy(item),
                 Alignment::Start,
+                self.copy_note_shown(&item.id),
             ))
             .max_width(design::READABLE_MEASURE)
             .width(Length::Fill)
@@ -6905,6 +6922,7 @@ impl Runtime {
                         prose::view(cached, settings, target, self.find.as_deref()),
                         self.message_copy(item),
                         Alignment::Start,
+                        self.copy_note_shown(&item.id),
                     ))
                     .padding([step::GAP_S, step::GAP_M])
                     .max_width(design::READABLE_MEASURE)
@@ -6939,6 +6957,7 @@ impl Runtime {
             prose::view(cached, settings, self.target, self.find.as_deref()),
             self.message_copy(item),
             Alignment::Start,
+            self.copy_note_shown(&item.id),
         ))
         .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)

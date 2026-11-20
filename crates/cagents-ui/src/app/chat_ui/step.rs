@@ -100,13 +100,21 @@ pub(super) fn code_surface(
         .into(),
         None => body.into(),
     };
-    code_frame(body, caption.map(str::to_owned), copy)
+    code_frame(
+        body,
+        caption.map(str::to_owned),
+        copy,
+        super::text_copy::CopyState::Ready,
+    )
 }
 
+/// `body` in its surface, under a header with its `caption` and, with `copy`,
+/// a Copy showing `state`: what its last copy said.
 pub(super) fn code_frame<'a>(
     body: Element<'a, Message>,
     caption: Option<String>,
     copy: Option<Action>,
+    state: super::text_copy::CopyState,
 ) -> Element<'a, Message> {
     let Some(caption) = caption else {
         return widget::container(body)
@@ -138,14 +146,32 @@ pub(super) fn code_frame<'a>(
     .spacing(GAP_XS)
     .width(Length::Fill);
     match copy {
-        Some(copy) => iced::widget::hover(
-            block,
-            widget::container(small_icon(Icon::Copy, "Copy this block", copy))
+        Some(copy) => {
+            let refusal = state.refusal().cloned();
+            let mut controls = Vec::with_capacity(2);
+            // Why the copy didn't go through, beside the Copy that tries again.
+            if let Some(refusal) = &refusal {
+                controls.push(
+                    design::caption(refusal.to_string())
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .into(),
+                );
+            }
+            controls.push(small_icon(state.icon(), "Copy this block", copy));
+            super::hover::over_pinned(
+                block,
+                widget::container(
+                    widget::row::with_children(controls)
+                        .spacing(GAP_XS)
+                        .align_y(Alignment::Center),
+                )
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_x(Alignment::End)
                 .align_y(Alignment::Start),
-        ),
+                refusal.is_some(),
+            )
+        }
         None => block.into(),
     }
 }
@@ -267,6 +293,7 @@ impl Runtime {
             ),
             Some(caption.to_owned()),
             Some(copy),
+            self.copy_state(&item.id, Some(&part)),
         )
     }
 
@@ -519,6 +546,7 @@ impl Runtime {
                     self.step_detail(item, cached, settings),
                     self.message_copy(item),
                     Alignment::Start,
+                    self.copy_note_shown(&item.id),
                 ))
                 .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
                 .width(Length::Fill)
