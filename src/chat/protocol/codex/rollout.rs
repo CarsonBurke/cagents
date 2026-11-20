@@ -12,6 +12,7 @@
 //! thread replays its parent's turns with their raw calls alone.
 
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Read},
     path::Path,
 };
@@ -112,6 +113,9 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                         status: ToolStatus::Succeeded,
                     },
                 );
+                if let Some(id) = payload["call_id"].as_str().filter(|id| !id.is_empty()) {
+                    turn.call_ids.insert(id.to_owned(), turn.calls.len());
+                }
                 turn.calls.push(RawCall {
                     at: items.len(),
                     item: item(line_id(), call),
@@ -125,13 +129,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                 });
             }
             (Some("response_item"), Some("function_call_output" | "custom_tool_call_output")) => {
-                if let Some(id) = payload["call_id"].as_str() {
-                    for call in &mut turn.calls {
-                        if call.call_id.as_deref() == Some(id) {
-                            call.finished = true;
-                        }
-                    }
-                }
+                turn.output(payload)
             }
             (Some("event_msg"), Some("item_completed")) => {
                 turn.record(&payload["item"]);
@@ -215,6 +213,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
 #[derive(Default)]
 struct RawTurn {
     calls: Vec<RawCall>,
+    call_ids: HashMap<String, usize>,
 }
 
 struct RawCall {
@@ -242,6 +241,20 @@ impl RawCall {
 }
 
 impl RawTurn {
+    fn output(&mut self, payload: &Value) {
+        let Some(index) = payload["call_id"]
+            .as_str()
+            .and_then(|id| self.call_ids.get(id))
+        else {
+            return;
+        };
+        let call = &mut self.calls[*index];
+        call.finished = true;
+        if let ItemContent::Tool { output, .. } = &mut call.item.content {
+            *output = bounded(&value_text(&payload["output"]));
+        }
+    }
+
     fn record(&mut self, item: &Value) {
         let recorded = match item["type"].as_str() {
             Some("CommandExecution") => Recorded::CommandExecution,
@@ -256,10 +269,9 @@ impl RawTurn {
         // Direct tool items carry their invocation's call_id as their id.
         // Identical inputs and concurrent calls must still remain distinct.
         if let Some(id) = item["id"].as_str().filter(|id| !id.is_empty())
-            && let Some(call) = self
-                .calls
-                .iter_mut()
-                .find(|call| call.call_id.as_deref() == Some(id) && call.matches(recorded, item))
+            && let Some(index) = self.call_ids.get(id)
+            && let Some(call) = self.calls.get_mut(*index)
+            && call.matches(recorded, item)
         {
             call.represented = true;
             return;
@@ -283,6 +295,7 @@ impl RawTurn {
 
     /// Ends this turn, keeping each raw call no turn item describes.
     fn finish(&mut self, kept: &mut Vec<(usize, Item)>) {
+        self.call_ids.clear();
         kept.extend(
             std::mem::take(&mut self.calls)
                 .into_iter()
@@ -1033,5 +1046,133 @@ mod tests {
         assert!(
             matches!(&items[4].content, ItemContent::Delivery { body, .. } if body == "Summary so far")
         );
+    }
+
+    #[test]
+    fn raw_tool_results_reach_full_transcripts() {
+        use crate::agent_execution::transcript::{Builder, Content, Query};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        for (call_type, output_type, input_key) in [
+            ("function_call", "function_call_output", "arguments"),
+            ("custom_tool_call", "custom_tool_call_output", "input"),
+        ] {
+            let rollout = lines(&[
+                json!({"type":"event_msg","payload":{"type":"task_started"}}),
+                json!({"type":"response_item","payload":{"type":call_type,"call_id":"call-one","name":"exec_command",input_key:"{\"cmd\":\"./migrate\"}"}}),
+                json!({"type":"response_item","payload":{"type":output_type,"call_id":"call-one","output":"migration stopped: database connection refused"}}),
+            ]);
+            std::fs::write(&path, rollout).unwrap();
+            let items = read(&path).unwrap();
+            let mut builder = Builder::new(&Query {
+                session: "saved-thread".into(),
+                before: None,
+                limit: 10,
+                tools: true,
+                full: true,
+            });
+            for item in items.iter().rev() {
+                assert!(builder.push(item));
+            }
+            let (entries, earlier) = builder.finish(true).unwrap();
+            assert_eq!(earlier, None);
+            assert_eq!(entries.len(), 1);
+            assert!(
+                matches!(&entries[0].content, Content::Tool(tool)
+                    if tool.name == "exec_command"
+                        && tool.summary == "./migrate"
+                        && tool.status == ToolStatus::Succeeded
+                        && tool.output.as_ref().is_some_and(|output|
+                            output.text == "migration stopped: database connection refused"
+                                && output.omitted == 0)),
+                "saved tool output was discarded ({call_type}): {entries:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_tool_results_match_ids_in_replayed_and_new_turns() {
+        let rollout = lines(&[
+            // Fork replay may precede the first task_started record.
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"first","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"second","name":"exec","input":"checks"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"","name":"sleep","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"second","output":"second result"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"first","output":"first result"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","output":"missing ID"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"","output":"empty ID"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"unknown","output":"unknown ID"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"first","output":"unmatched in this turn"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"first","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"first","output":"new turn result"}}),
+        ]);
+        let items = parse(rollout.as_bytes());
+        let tools: Vec<_> = items
+            .iter()
+            .map(|item| match &item.content {
+                ItemContent::Tool { name, output, .. } => (name.as_str(), output.as_str()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                ("exec_command", "first result"),
+                ("exec", "second result"),
+                ("update_plan", ""),
+                ("sleep", ""),
+                ("exec_command", "new turn result"),
+            ]
+        );
+        assert_eq!(items[0].id, "line-0");
+        assert_eq!(items[4].id, "line-11");
+    }
+
+    #[test]
+    fn raw_tool_results_keep_the_existing_utf8_output_bound() {
+        let output = "€".repeat(TOOL_OUTPUT / 3 + 1);
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"large","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"large","output":output}}),
+        ]);
+        let items = parse(rollout.as_bytes());
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0].content, ItemContent::Tool { output, .. }
+            if output == &"€".repeat(TOOL_OUTPUT / 3)));
+    }
+
+    #[test]
+    fn raw_tool_results_preserve_richer_item_deduplication() {
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"parent","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"parent","output":"parent result"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"child","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"child","output":"raw wrapper result"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"unmatched","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"unmatched","output":"unmatched result"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"child","command":"checks","status":"completed","exit_code":0,"aggregated_output":"richer result"}),
+            ),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"plan","name":"update_plan","input":"plan"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"plan","output":"plan result"}}),
+        ]);
+        let items = parse(rollout.as_bytes());
+        assert_eq!(items.len(), 4, "{items:#?}");
+        assert!(matches!(&items[0].content, ItemContent::Tool { output, .. }
+            if output == "parent result"));
+        assert!(
+            matches!(&items[1].content, ItemContent::Tool { name, output, .. }
+            if name == "exec_command" && output == "unmatched result")
+        );
+        assert!(
+            matches!(&items[2].content, ItemContent::Command { output, .. }
+            if output == "richer result")
+        );
+        assert!(matches!(&items[3].content, ItemContent::Tool { output, .. }
+            if output == "plan result"));
     }
 }
