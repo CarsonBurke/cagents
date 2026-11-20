@@ -180,6 +180,11 @@ fn a_proof_answers_one_challenge_and_its_capability_ends_with_the_connection() {
         Origin::Child { parent: expected }
     );
 
+    assert_eq!(
+        host.lock().unwrap().agent_clients.get(&client),
+        Some(&expected)
+    );
+
     // The nonce was spent: the same proof cannot be presented again.
     let replay = authenticate_at(&path, &host, client, peer, session, &proof).unwrap_err();
     assert_eq!(replay.code, ProtocolErrorCode::PermissionDenied);
@@ -239,4 +244,22 @@ fn only_a_session_of_this_computer_has_a_challenge_signed() {
     let unknown = Authority::session(uuid::Uuid::new_v4().to_string());
     let error = sign_at(&path, &host, &unknown, "fw16", &nonce).unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+}
+
+#[test]
+fn a_connection_acting_for_another_session_cannot_prove_a_peer() {
+    let (_directory, path) = store();
+    let host = super::super::service::test_host();
+    let (peer, session) = (uuid::Uuid::new_v4(), Lineage(TerminalId::new()));
+    register(&path, peer, key(5));
+    let local = Lineage(TerminalId::new());
+    host.lock().unwrap().agent_clients.insert(4, local);
+
+    let nonce = challenge(&host, 4).unwrap();
+    let proof = crate::device_trust::proof(&key(5), &nonce, peer, session);
+    let error = authenticate_at(&path, &host, 4, peer, session, &proof).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    let state = host.lock().unwrap();
+    assert_eq!(state.agent_clients.get(&4), Some(&local));
+    assert!(state.peers.capabilities.is_empty());
 }

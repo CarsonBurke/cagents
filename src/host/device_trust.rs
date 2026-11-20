@@ -68,6 +68,13 @@ impl Peers {
             .map(|capability| capability.lineage)
     }
 
+    /// Whether `token` is the capability `client`'s proof was issued.
+    pub(in crate::host) fn issued_to(&self, token: &str, client: ClientId) -> bool {
+        self.capabilities
+            .get(token)
+            .is_some_and(|capability| capability.client == client)
+    }
+
     pub(crate) fn disconnect(&mut self, client: ClientId) {
         self.challenges.remove(&client);
         self.capabilities
@@ -419,11 +426,21 @@ pub(in crate::host) fn authenticate_at(
         return Err(denied("The device proof is not valid"));
     }
     let lineage = crate::device_trust::peer_lineage(peer, lineage);
-    let token = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .peers
-        .issue(client, lineage);
+    // The connection acts for the peer session from here on, whether or not
+    // it also authenticates with the capability, so it is admitted only to
+    // what a session may do.
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    match state.agent_clients.get(&client) {
+        Some(bound) if *bound != lineage => {
+            return Err(denied(
+                "This connection already acts for another agent session",
+            ));
+        }
+        _ => {
+            state.agent_clients.insert(client, lineage);
+        }
+    }
+    let token = state.peers.issue(client, lineage);
     Ok(Authority::session(token))
 }
 

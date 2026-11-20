@@ -4765,6 +4765,38 @@ fn a_linked_computers_session_owns_the_agents_it_starts_on_the_device() {
     let remote =
         device_trust::authenticate_at(&trust, &host, client, peer, lineage, &proof).unwrap();
 
+    // Its proof holds the connection to a session's scope, whether or not it
+    // goes on to authenticate: what is the person's alone is refused, and so
+    // is every authority but the capability the proof issued.
+    use crate::terminal_ipc::{ClientRequest, ProtocolErrorCode, ServerResponse};
+    let _delivery = host.lock().unwrap().register_client(client);
+    let dispatch = |request| crate::host::client::process_request(&host, client, request);
+    for refused in [
+        ClientRequest::DeviceTrust {
+            request: Request::Links,
+        },
+        ClientRequest::Agent {
+            authority: Authority::default(),
+            operation: Operation::List,
+        },
+        ClientRequest::Agent {
+            authority: local.clone(),
+            operation: Operation::List,
+        },
+    ] {
+        let error = dispatch(refused).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PermissionDenied, "{error:?}");
+    }
+    let (listed, ..) = dispatch(ClientRequest::Agent {
+        authority: remote.clone(),
+        operation: Operation::List,
+    })
+    .unwrap();
+    assert!(
+        matches!(listed, ServerResponse::Agent(Reply::Listed(ref agents)) if agents.is_empty()),
+        "{listed:?}"
+    );
+
     let mut linked = request;
     linked.idempotency_key = "linked".into();
     let child = submit(&host, &remote, linked).unwrap();
