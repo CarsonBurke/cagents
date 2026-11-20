@@ -276,6 +276,33 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
     assert!(!acp.initialization_pending());
 }
 
+/// agy's thinking option lists Extra for every model, but Flash's combined
+/// identifiers say it has none: a launch asking for it is not sent it.
+#[test]
+fn agy_is_never_sent_a_level_the_chosen_model_lacks() {
+    let mut acp = adapter(
+        &["--model", "gemini-3.8-flash", "--reasoning", "xhigh"],
+        None,
+    );
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), agy_initialize()))
+        .unwrap();
+    let step = acp.receive(reply(only_write(&opened), agy_new())).unwrap();
+    let setting = only_write(&step).clone();
+    assert_eq!(setting["params"]["configId"], "model");
+    let mut options = agy_new()["configOptions"].clone();
+    options[0]["currentValue"] = json!("gemini-3.8-flash");
+    options[1]["currentValue"] = json!("xhigh");
+    let step = acp
+        .receive(reply(&setting, json!({"configOptions": options})))
+        .unwrap();
+    assert!(step.writes.is_empty(), "{:?}", step.writes);
+    // Nor is Flash reported running at a level it doesn't have.
+    assert!(step.events.iter().any(|event| matches!(event,
+        Event::ActiveModel(Some(model)) if model.id == "gemini-3.8-flash" && model.reasoning.is_none())));
+}
+
 #[test]
 fn muse_offers_models_and_modes_without_reasoning_levels() {
     let mut acp = adapter(&["--model", "muse-spark-1.2", "--reasoning", "high"], None);
@@ -1572,7 +1599,7 @@ fn a_confirmed_identity_replaces_the_conversation_a_terminal_resumes() {
 /// Muse lists its modes starting with running everything unasked; the reader
 /// is offered them in the order Claude's modes of the same meanings take.
 #[test]
-fn muse_modes_are_offered_from_most_to_least_cautious() {
+fn muse_modes_are_offered_in_the_order_of_claude_s_equivalents() {
     let mut acp = Acp {
         cwd: "/work/project".into(),
         ..Acp::new(&muse::PROFILE)

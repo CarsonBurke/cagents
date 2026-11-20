@@ -4547,7 +4547,14 @@ impl Runtime {
                                     (
                                         Icon::List,
                                         "Leave plan mode".into(),
-                                        format!("Return to {}", permission_mode_label(self.session.launch.provider, back)).into(),
+                                        format!(
+                                            "Return to {}",
+                                            permission_mode_label(
+                                                self.session.launch.provider,
+                                                back,
+                                            )
+                                        )
+                                        .into(),
                                         None,
                                     )
                                 }
@@ -6835,8 +6842,8 @@ impl Runtime {
 }
 
 /// The name of `provider`'s permission mode `mode`, which cagents knows by
-/// what it means. Muse's modes share their meanings with Claude's but work
-/// by its permission rules, so they keep Muse's own names, shortened.
+/// what it means. Muse's modes correspond only roughly to Claude's: they
+/// work by Muse's permission rules, so they keep Muse's own names, shortened.
 pub(super) fn permission_mode_label(provider: Provider, mode: &str) -> &str {
     match (provider, mode) {
         (Provider::Muse, "manual") => "Ask before unmatched",
@@ -7402,6 +7409,7 @@ fn footer_model_label<'a>(
         active
             .reasoning
             .as_deref()
+            .filter(offered)
             .filter(|effort| Some(*effort) != active.default_reasoning.as_deref())
     });
     match effort.filter(|effort| !effort.is_empty()) {

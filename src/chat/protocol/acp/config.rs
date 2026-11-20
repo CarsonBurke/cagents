@@ -131,6 +131,7 @@ impl Config {
                 "model",
             );
         }
+        self.remember_levels();
     }
 
     /// The complete set of config options, as `config_option_update` and
@@ -150,32 +151,49 @@ impl Config {
             }
         }
         (self.model, self.reasoning, self.mode) = (model, reasoning, mode);
-        if let Some(model) = &self.model {
-            let levels = self.reasoning.as_ref().map(Select::values);
-            self.levels_seen
-                .insert(model.current.clone(), levels.unwrap_or_default());
-        }
+        self.remember_levels();
     }
 
-    /// The reasoning levels `model` offers, as far as the agent has said.
-    /// Combined identifiers in the `models` state, such as agy's
-    /// `gemini-4-neon-high`, name every model's own levels. Otherwise only
-    /// the models that have been current are known; another lists none.
-    fn levels_of(&self, model: &str) -> Vec<String> {
-        let combined = self.legacy_models.as_ref().filter(|models| {
+    /// Keeps the levels the reasoning option now lists as the current
+    /// model's. Only a listed model is kept, so the record stays as small
+    /// as the agent's own list.
+    fn remember_levels(&mut self) {
+        let Some(models) = self.models() else {
+            return;
+        };
+        if models.name_of(&models.current).is_none() {
+            return;
+        }
+        let current = models.current.clone();
+        let levels = self.reasoning.as_ref().map(Select::values);
+        self.levels_seen.insert(current, levels.unwrap_or_default());
+    }
+
+    /// The combined identifiers in the `models` state, such as agy's
+    /// `gemini-4-neon-high`, where they name models' reasoning levels.
+    fn combined_models(&self) -> Option<&Select> {
+        self.legacy_models.as_ref().filter(|models| {
             models
                 .choices
                 .iter()
                 .any(|choice| self.split_model(&choice.value).is_some())
-        });
+        })
+    }
+
+    /// The reasoning levels `model` offers, as far as the agent has said.
+    /// `combined`, from [`Self::combined_models`], names every model's own
+    /// levels. Otherwise only the models that have been current are known;
+    /// another lists none.
+    fn levels_of(&self, model: &str, combined: Option<&Select>) -> Vec<String> {
         match (&self.reasoning, combined) {
             (Some(reasoning), Some(combined)) => reasoning
                 .choices
                 .iter()
                 .filter(|level| {
-                    combined.choices.iter().any(|choice| {
-                        choice.value.rsplit_once('-') == Some((model, level.value.as_str()))
-                    })
+                    combined
+                        .choices
+                        .iter()
+                        .any(|choice| joins(&choice.value, model, &level.value))
                 })
                 .map(|level| level.value.clone())
                 .collect(),
@@ -196,10 +214,13 @@ impl Config {
     /// `model` read as an offered model and an offered reasoning level
     /// joined by a hyphen, as a combined model identifier names both.
     pub fn split_model(&self, model: &str) -> Option<(String, String)> {
-        let reasoning = self.reasoning.as_ref()?;
-        let (base, level) = model.rsplit_once('-')?;
-        (self.offers_model(base) && reasoning.name_of(level).is_some())
-            .then(|| (base.to_owned(), level.to_owned()))
+        self.reasoning.as_ref()?.choices.iter().find_map(|level| {
+            let base = model
+                .strip_suffix(level.value.as_str())?
+                .strip_suffix('-')?;
+            self.offers_model(base)
+                .then(|| (base.to_owned(), level.value.clone()))
+        })
     }
 
     /// The agent changed its mode itself, as `current_mode_update` reports.
@@ -249,10 +270,19 @@ impl Config {
             .is_some_and(|select| select.name_of(model).is_some())
     }
 
+    /// Whether the current model offers `level`: the option may list
+    /// levels another model has, as agy's lists Extra for every model.
     pub fn offers_reasoning(&self, level: &str) -> bool {
-        self.reasoning
+        let listed = self
+            .reasoning
             .as_ref()
-            .is_some_and(|select| select.name_of(level).is_some())
+            .is_some_and(|select| select.name_of(level).is_some());
+        listed
+            && self.models().is_none_or(|models| {
+                self.levels_of(&models.current, self.combined_models())
+                    .iter()
+                    .any(|offered| offered == level)
+            })
     }
 
     pub fn offers_mode(&self, mode: &str) -> bool {
@@ -282,9 +312,16 @@ impl Config {
     /// The events that publish the model choice, the active model and the
     /// mode as they now stand.
     pub fn events(&self) -> Vec<Event> {
-        let current_reasoning = self.reasoning.as_ref().map(|select| select.current.clone());
+        let combined = self.combined_models();
         let mut events = Vec::with_capacity(3);
         if let Some(models) = self.models() {
+            // A model that offers no level runs at none, whatever the
+            // option still says.
+            let current_reasoning = self
+                .reasoning
+                .as_ref()
+                .map(|select| select.current.clone())
+                .filter(|level| self.offers_reasoning(level));
             events.push(Event::Models {
                 models: models
                     .choices
@@ -292,7 +329,7 @@ impl Config {
                     .map(|choice| Model {
                         id: choice.value.clone(),
                         label: choice.name.clone(),
-                        reasoning: self.levels_of(&choice.value),
+                        reasoning: self.levels_of(&choice.value, combined),
                     })
                     .collect(),
                 selected: Some(models.current.clone()),
@@ -341,4 +378,12 @@ fn legacy(
             })
             .collect(),
     })
+}
+
+/// Whether `combined` is `model` and `level` joined by a hyphen.
+fn joins(combined: &str, model: &str, level: &str) -> bool {
+    combined
+        .strip_suffix(level)
+        .and_then(|rest| rest.strip_suffix('-'))
+        == Some(model)
 }

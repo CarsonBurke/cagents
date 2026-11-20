@@ -24,9 +24,9 @@ pub static PROFILE: Profile = Profile {
     // By what each does, in Muse's words: "Ask for approval when no
     // permission rule covers the action", "Ask for approval only when the
     // action requires it", "Refuse any action no permission rule covers" and
-    // "Run every action without asking for approval". Offered in this order,
-    // as Claude's modes with the same meanings are, rather than Muse's own,
-    // which leads with running everything unasked.
+    // "Run every action without asking for approval". Offered in the order
+    // of the Claude modes they roughly correspond to, rather than Muse's
+    // own, which leads with running everything unasked.
     modes: &[
         (PROMPT_UNMATCHED, "manual"),
         (ON_REQUEST, "auto"),
