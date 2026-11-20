@@ -2112,7 +2112,7 @@ Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
 
-Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.6 GiB. A clean checkout of a main commit that the [main build sentinel](#watching-main-after-merges) has built takes its executables instead, without compiling, so build `before` from a recent `origin/main`. `build SIDE CHECKOUT --executables DIR` takes executables already built elsewhere from exactly that checkout, as the remote route below does. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.6 GiB. A clean checkout of a main commit that the [main build sentinel](#watching-main-after-merges) has built takes its executables instead, without compiling, so build `before` from the newest `origin/main` tip it checked. `build SIDE CHECKOUT --executables DIR` takes executables already built elsewhere from exactly that checkout, as the remote route below does. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
 export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
@@ -2355,16 +2355,19 @@ scripts/native-evidence stop
   ignored goes to the host, so make sure a stray file, such as a local `.env`,
   is ignored or removed before you build.
 - **Builds.** A main commit the host's
-  [sentinel](#watching-main-after-merges) has built, a tip of `origin/main`
-  it checked, compiles nothing: the host copies its executables. A commit
-  merged in a burst with others before a check is not built this way.
+  [sentinel](#watching-main-after-merges) has built compiles nothing: the
+  host copies its executables. It builds only the tips it checks, usually one
+  commit in each burst of merges, and keeps the six newest; `ls
+  ~/.local/state/cagents-main-sentinel/builds` on the host lists them. If the
+  commit you started from isn't one, capture the before side from the nearest
+  of them instead, provided nothing merged between the two touches what your
+  change affects, and name that revision as the before side.
   Any other checkout builds through its own `scripts/cargo-gate`, in its own
   build slot and target as `mise run dev` does, so what you already built for
   the change is reused while that slot is free; the three executables then go from here to the task,
   sent as differences from the task's previous ones. Any other revision builds
   in a shared slot on the host. Capture the before side at the start of the
-  work, while the main commit you started from is among the sentinel's recent
-  builds.
+  work, while the tip you capture it from is still among the six.
 - **One tool.** Both sides run the `native-evidence` and synthetic provider of
   the checkout you run it from, copied to `.worktrees/cev-TASK-tool`, as a local
   run would. When a side is that checkout, as `--after .` is, it uses this
