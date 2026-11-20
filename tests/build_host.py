@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -403,7 +404,187 @@ class TheBuildsEnvironment(BuildHostFixture):
         result = self.run_host("count", env=env)
         memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         # /proc/meminfo's total is a little below the physical pages'.
-        self.assertIn(int(result.stdout), range(2, max(2, memory * 3 // 4 // 2**32) + 1))
+        # Two extra shares follow the host's own.
+        self.assertIn(int(result.stdout), range(4, max(2, memory * 3 // 4 // 2**32) + 3))
+
+
+class ExtraShares(BuildHostFixture):
+    """Past the host's shares, a build takes an extra one only while memory
+    allows, in the same line as any other."""
+
+    slots = 2
+    GiB = 2**30
+
+    def setUp(self):
+        super().setUp()
+        self.proc = self.root / "proc"
+        (self.proc / "pressure").mkdir(parents=True)
+        self.env |= {"CAGENTS_BUILD_EXTRA_SHARES": "2", "CAGENTS_BUILD_PROC": str(self.proc)}
+        self.memory(available=64 * self.GiB)
+        # The host's own shares are another build's.
+        for index in range(self.slots):
+            self.hold(self.share(index))
+
+    def memory(self, available=None, pressure=0.0):
+        """The host's MemAvailable and memory pressure, as the kernel shows them."""
+        if available is not None:
+            self.write(self.proc / "meminfo", f"MemTotal:       {64 * 2**20} kB\n"
+                       f"MemFree:          123456 kB\nMemAvailable:   {available // 1024} kB\n")
+        self.write(self.proc / "pressure/memory",
+                   f"some avg10={pressure:.2f} avg60=0.05 avg300=0.04 total=4877431889\n"
+                   f"full avg10={pressure / 2:.2f} avg60=0.03 avg300=0.02 total=4427153170\n")
+
+    def write(self, path, text):
+        # Whole, as /proc shows it: a reader never sees half of it.
+        path.with_name(path.name + ".new").write_text(text)
+        path.with_name(path.name + ".new").replace(path)
+
+    def assert_waits(self, name, label):
+        time.sleep(0.6)
+        self.assertFalse(self.started(name), label)
+
+    def test_an_extra_share_is_taken_when_memory_holds_the_build_and_the_floor(self):
+        self.memory(available=(2 * 4 + 8) * self.GiB)
+        build = self.held_build("extra", 2)
+        self.wait_for(lambda: self.started("extra"), "the build on extra shares")
+        self.assertTrue(self.is_locked(self.share(2)) and self.is_locked(self.share(3)))
+        status, _stdout, stderr = self.finish(build, "extra")
+        self.assertEqual(status, 0, stderr)
+        self.assertNotIn("waiting", stderr)
+        self.assertFalse(self.is_locked(self.share(2)) or self.is_locked(self.share(3)))
+
+    def test_a_build_waits_while_memory_available_is_short_and_starts_once_it_is_not(self):
+        self.memory(available=(4 + 8) * self.GiB - 1)
+        build = self.held_build("short", 1)
+        self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the build to queue")
+        self.assert_waits("short", "an extra share was taken without the memory for it")
+        self.assertFalse(self.is_locked(self.share(2)))
+        self.memory(available=(4 + 8) * self.GiB)
+        self.wait_for(lambda: self.started("short"), "the build once memory allowed")
+        status, _stdout, stderr = self.finish(build, "short")
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("waiting for 1 of the 2 build memory shares", stderr)
+        self.assertIn("an extra share is free, but not the memory for it", stderr)
+        self.assertIn("admitted on 1 extra build memory share, as memory allows", stderr)
+
+    def test_extra_shares_others_hold_count_against_memory_available(self):
+        # Another build took an extra share and may not have used its memory yet.
+        self.hold(self.share(2))
+        self.memory(available=(4 + 8) * self.GiB)
+        build = self.held_build("second", 1)
+        self.assert_waits("second", "memory counted once for two builds")
+        self.memory(available=(2 * 4 + 8) * self.GiB)
+        self.wait_for(lambda: self.started("second"), "the build once memory held both")
+        self.assertTrue(self.is_locked(self.share(3)))
+        self.assertEqual(self.finish(build, "second")[0], 0)
+
+    def test_a_build_waits_under_memory_pressure_and_starts_once_it_eases(self):
+        self.memory(pressure=5.0)
+        build = self.held_build("pressed", 1)
+        self.assert_waits("pressed", "an extra share was taken under memory pressure")
+        self.memory(pressure=1.0)
+        self.wait_for(lambda: self.started("pressed"), "the build once pressure eased")
+        self.assertEqual(self.finish(build, "pressed")[0], 0)
+
+    def test_without_memory_readings_no_extra_share_is_taken(self):
+        for missing in ("meminfo", "pressure/memory"):
+            with self.subTest(missing=missing):
+                self.memory(available=64 * self.GiB)
+                (self.proc / missing).unlink()
+                build = self.held_build(f"blind-{missing[:3]}", 1, "--wait-seconds", "1")
+                status, _stdout, stderr = self.finish(build)
+                self.assertEqual(status, 124, stderr)
+                self.assertFalse(self.started(f"blind-{missing[:3]}"))
+
+    def test_a_build_short_of_memory_keeps_its_place_at_the_head_of_the_line(self):
+        self.memory(available=(2 * 4 + 8) * self.GiB - 1)
+        head = self.held_build("head", 2)
+        self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the head")
+        behind = self.held_build("behind", 1)
+        self.wait_for(lambda: "lock" in Path(f"/proc/{behind.pid}/wchan").read_text(),
+                      "the smaller build to queue behind it")
+        # Memory enough for the smaller build alone goes to neither.
+        self.memory(available=(4 + 8) * self.GiB)
+        self.assert_waits("behind", "a smaller build overtook the head on extra shares")
+        self.assertFalse(self.started("head"))
+        self.memory(available=(2 * 4 + 8) * self.GiB)
+        self.wait_for(lambda: self.started("head"), "the head once memory allowed")
+        # The head holds both extra shares: the one behind waits for a share.
+        self.assert_waits("behind", "more shares were taken than the host and its extras have")
+        self.assertEqual(self.finish(head, "head")[0], 0)
+        self.wait_for(lambda: self.started("behind"), "the smaller build after the head")
+        self.assertEqual(self.finish(behind, "behind")[0], 0)
+        self.assertEqual([call["arguments"] for call in self.calls()], [["head"], ["behind"]])
+
+    def test_no_more_than_the_extra_shares_are_taken_however_much_memory_is_free(self):
+        first, second = self.held_build("first", 1), self.held_build("second", 1)
+        self.wait_for(lambda: self.started("first") and self.started("second"), "two extra shares")
+        third = self.held_build("third", 1)
+        self.assert_waits("third", "a third extra share was taken")
+        self.assertEqual(self.finish(first, "first")[0], 0)
+        self.wait_for(lambda: self.started("third"), "the third build once an extra share freed")
+        self.assertEqual([self.finish(build, name)[0] for build, name in
+                          ((second, "second"), (third, "third"))], [0, 0])
+
+    def test_extra_shares_are_taken_only_to_complete_a_build(self):
+        # One extra share is free and the other is another build's: taking
+        # the free one would leave this build holding it on memory it may
+        # not have when a second share frees.
+        other = self.hold(self.share(3))
+        build = self.held_build("pair", 2)
+        self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the build to queue")
+        self.assert_waits("pair", "a build started on one share of two")
+        self.assertFalse(self.is_locked(self.share(2)), "a partial extra share was held")
+        other.close()
+        self.wait_for(lambda: self.started("pair"), "the build once both extra shares freed")
+        self.assertEqual(self.finish(build, "pair")[0], 0)
+
+    def test_a_build_that_need_not_wait_takes_an_extra_share_only_if_memory_allows(self):
+        env = {"CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": str(self.slots),
+               "CAGENTS_BUILD_EXTRA_SHARES": "2", "CAGENTS_BUILD_SCOPE": "0",
+               "CAGENTS_BUILD_PROC": str(self.proc)}
+        said = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, env), contextlib.redirect_stderr(said):
+            self.memory(available=(4 + 8) * self.GiB - 1)
+            with self.assertRaises(build_host.Busy):
+                with build_host.shares(1, None, queue_up=False):
+                    self.fail("admitted without the memory for an extra share")
+            self.assertFalse(self.is_locked(self.share(2)))
+            self.memory(available=(4 + 8) * self.GiB)
+            with build_host.shares(1, None, queue_up=False):
+                self.assertTrue(self.is_locked(self.share(2)))
+            self.assertFalse(self.is_locked(self.share(2)))
+        self.assertIn("admitted on 1 extra build memory share", said.getvalue())
+
+    def test_the_build_slices_room_under_its_cap_bounds_extra_shares(self):
+        stat = self.root / "memory.stat"
+        budget = 32 * self.GiB
+        with unittest.mock.patch.object(build_host, "budget", return_value=budget):
+            for anonymous, allowed in ((budget - 8 * self.GiB, True), (budget - 8 * self.GiB + 1, False)):
+                with self.subTest(anonymous=anonymous):
+                    self.write(stat, f"anon {anonymous}\nfile 123456789\nfile_dirty 0\n")
+                    with unittest.mock.patch.dict(os.environ, {"CAGENTS_BUILD_PROC": str(self.proc)}):
+                        self.assertEqual(build_host.memory_allows(8 * self.GiB, str(stat)), allowed)
+            with unittest.mock.patch.dict(os.environ, {"CAGENTS_BUILD_PROC": str(self.proc)}):
+                # A slice no build has started holds nothing; an unreadable one bars them.
+                self.assertTrue(build_host.memory_allows(8 * self.GiB, str(self.root / "none")))
+                self.write(stat, "file 1\n")
+                self.assertFalse(build_host.memory_allows(8 * self.GiB, str(stat)))
+
+    def test_the_host_has_two_extra_shares_unless_its_share_count_is_configured(self):
+        for env, extra in (({}, 2), ({"CAGENTS_BUILD_SLOTS": "1"}, 0),
+                           ({"CAGENTS_BUILD_SLOTS": "1", "CAGENTS_BUILD_EXTRA_SHARES": "3"}, 3)):
+            with self.subTest(env=env), unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(build_host.extra_share_count(), extra)
+
+    def test_a_configured_share_count_has_no_extra_shares_unless_they_are_set(self):
+        env = {key: value for key, value in self.env.items() if key != "CAGENTS_BUILD_EXTRA_SHARES"}
+        result = self.run_host("build", "--wait-seconds", "1", "--", str(self.cargo), "mutex", env=env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(self.calls(), [])
+        result = self.run_host("build", "--", "true", env=self.env | {"CAGENTS_BUILD_EXTRA_SHARES": "x"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("CAGENTS_BUILD_EXTRA_SHARES must be a whole number", result.stderr)
 
 
 class CargoPhases(BuildHostFixture):
