@@ -55,8 +55,8 @@ Files under FAKE_ACP_STATE switch states that last across processes:
 
 Run with `--app-data-dir DIR`, as cagents' Antigravity probe runs `agy acp`,
 it saves each new session's files under ~/.gemini/DIR the way agy does
-(`conversations/ID.db` and `brain/ID/`), so a probe can be checked for
-leaving them behind.
+(`conversations/ID.db`, `brain/ID/`, `annotations/ID.pbtxt` and
+`implicit/ID.pb`), so a probe can be checked for leaving them behind.
 
 In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
 account commands.
@@ -365,6 +365,9 @@ class Agent:
             os.makedirs(os.path.join(APP_DATA, "brain", session.id), exist_ok=True)
             os.makedirs(os.path.join(APP_DATA, "conversations"), exist_ok=True)
             open(os.path.join(APP_DATA, "conversations", session.id + ".db"), "w").close()
+            for store, suffix in (("annotations", ".pbtxt"), ("implicit", ".pb")):
+                os.makedirs(os.path.join(APP_DATA, store), exist_ok=True)
+                open(os.path.join(APP_DATA, store, session.id + suffix), "w").close()
             if marked("hang-probe"):
                 # A probe that never hears back, as one that timed out.
                 while self.inbox.get() is not None:

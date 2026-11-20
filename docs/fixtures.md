@@ -1140,12 +1140,13 @@ fixture can stand in for `muse-upstream` on a fixture `PATH`:
 
 | Command | The fixture |
 | --- | --- |
-| `usage --json` | prints Muse's no-allowance report, or exits 1 with `not logged in` when signed out |
+| `usage --json` | prints an allowance with no figures, Muse's no-allowance report while `no-allowance` is marked, or exits 1 with `not logged in` when signed out |
 | `logout` | signs out: every later `session/new`, `session/load` and prompt answers Muse's `log in to Muse before opening a session` |
 | `login` | prints a made-up device code, waits `FAKE_ACP_LOGIN_SECONDS` (default 2), and signs back in |
 
 Signing out is a `signed-out` file under `FAKE_ACP_STATE`, so it lasts
-across processes until `login`.
+across processes until `login`. With `FAKE_ACP_AUTH_FILE` set, `login` also
+writes that file and `logout` removes it, as Muse keeps its `auth.json`.
 
 It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
 replays a conversation from an earlier process and `session/list` finds it.
@@ -1165,6 +1166,7 @@ The first of these words a prompt contains chooses what it does:
 | `title` | names the conversation |
 | `refuse` | ends the turn as a refusal |
 | `auth` | answers that sign-in is required |
+| `allowance` | refuses the turn as a login with no usage allowance |
 | `/compact`, at the start | compacts the conversation |
 
 Anything else gets a thought and `Fake answer to: ...`. These variables add
@@ -1177,18 +1179,34 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+| `FAKE_ACP_AUTH_FILE=PATH` | the sign-in record Muse's `login` writes and `logout` removes; only ever a fixture's own file |
+
+These files under `FAKE_ACP_STATE` switch states that last across processes:
+
+| File | Effect |
+| --- | --- |
+| `signed-out` | every new or loaded session and every prompt answers that sign-in is required |
+| `no-allowance` | every prompt is refused as a login with no usage allowance, and Muse's `usage --json` reports none |
+| `hang-probe` | a session opened by the account probe (`--app-data-dir`) never answers, as one that times out |
+
+Run with `--app-data-dir DIR`, as the Antigravity account probe runs
+`agy acp`, it saves each new session's files under `~/.gemini/DIR` the way
+agy does (`conversations/ID.db`, `brain/ID/`, `annotations/ID.pbtxt` and
+`implicit/ID.pb`), so a test can check that a probe leaves none behind.
 
 `native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
 fixture as `bin/agy` and `bin/muse-upstream`, through
 [`tests/fixtures/fixture-acp.sh`](../tests/fixtures/fixture-acp.sh), with a
 `bin/muse` that runs `muse-upstream` behind root options as a reader's own
 wrapper might. Each keeps its sessions in the fixture's `acp/agy` or
-`acp/muse`. While `acp/agy/signed-out` exists, `agy` answers every new or
-loaded session that sign-in is required, and the app's sign-in, `agy acp
---login`, removes it:
+`acp/muse`, and Muse starts signed in, with the fixture's
+`config/muse/auth.json`. While `acp/agy/signed-out` exists, `agy` answers
+every new or loaded session that sign-in is required, and the app's sign-in,
+`agy acp --login`, removes it:
 
 ```sh
-evidence env touch '{fixture}/acp/agy/signed-out'
+evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/acp/agy/signed-out"'
+evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/acp/muse/no-allowance"'
 ```
 
 A plain start installs neither, so Antigravity and Muse are not installed.
