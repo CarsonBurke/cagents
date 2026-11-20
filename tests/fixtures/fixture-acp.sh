@@ -8,6 +8,9 @@
 # refuses every new or loaded session as signed out, and `agy acp --login`
 # removes it, as a sign-in in the browser would. Muse's sign-in commands are
 # the fake agent's own.
+#
+# Every frame the agent receives goes to acp/AGENT/frames.log, so a check can
+# read which settings and prompts cagents sent.
 set -eu
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fixture=${here%/bin}
@@ -17,6 +20,7 @@ case ${0##*/} in
 esac
 export FAKE_ACP_SHAPE=$shape
 export FAKE_ACP_STATE="${FAKE_ACP_STATE:-$fixture/acp/$shape}"
+export FAKE_ACP_LOG="${FAKE_ACP_LOG:-$FAKE_ACP_STATE/frames.log}"
 mkdir -p -- "$FAKE_ACP_STATE"
 if [ "$shape" = agy ]; then
     for argument in "$@"; do
