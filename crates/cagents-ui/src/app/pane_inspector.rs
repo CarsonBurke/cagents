@@ -797,6 +797,15 @@ impl Cagents {
     }
 
     /// Whether the pane has an inspector to open and show now.
+    /// Whether the pane floats its inspector's toggle over its content: it
+    /// has an inspector, does not draw it, and no rail stands in for it.
+    /// Content keeps clear of the toggle only then.
+    pub(super) fn pane_shows_inspector_toggle(&self, card: CardId) -> bool {
+        self.pane_has_inspector(card)
+            && self.pane_inspector_layout(card).is_none()
+            && !self.pane_inspectors.is_railed(card)
+    }
+
     pub(super) fn pane_has_inspector(&self, card: CardId) -> bool {
         self.inspector_availability(card) == Availability::Available
     }
