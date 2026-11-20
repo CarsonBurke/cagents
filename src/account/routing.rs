@@ -318,7 +318,8 @@ mod tests {
             if provider == Provider::Codex {
                 cases.extend([(denied, false), (allowed, true)]);
             }
-            for (snapshot, expected) in cases {
+            for (index, (mut snapshot, expected)) in cases.into_iter().enumerate() {
+                snapshot.observed_at = now + index as u64 + 1;
                 cache
                     .store(
                         &alternate.cache_key().unwrap(),

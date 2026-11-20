@@ -306,6 +306,11 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
             .collect(),
         None => keyed_windows(limits),
     };
+    // An explicit empty scoped list observes emptiness; omitted scoped data
+    // carries no evidence about that part.
+    let scoped_observed_at = (limits["model_scoped"].as_array().is_some_and(Vec::is_empty)
+        && limits["limits"].as_array().is_none_or(Vec::is_empty))
+    .then_some(observed_at);
     let credits = credits(limits);
     // An object (or metadata about credits/plan) is not positive quota.
     // Missing or malformed windows must not authorize automatic routing.
@@ -324,7 +329,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         status,
         ordinary_usage_allowed: None,
         observed_at,
-        scoped_observed_at: None,
+        scoped_observed_at,
         source: UsageSource::Probe,
         plan,
         plan_display_name: metadata.display_name,
@@ -1006,6 +1011,215 @@ mod tests {
             existing.merged(&older, now, UsageMerge::IncomingSnapshot),
             older,
             "registration accepts the incoming whole snapshot unconditionally",
+        );
+    }
+
+    #[test]
+    fn equal_stamp_status_ties_are_restrictive_and_commutative() {
+        let now = 1_790_000_000_000;
+        let statuses = [
+            UsageStatus::Ok,
+            UsageStatus::Warning,
+            UsageStatus::Unavailable,
+            UsageStatus::Limited,
+            UsageStatus::NeedsLogin,
+        ];
+        for (index, &left_status) in statuses.iter().enumerate() {
+            for &right_status in &statuses[index..] {
+                let mut left = UsageSnapshot::state(left_status, "left", now);
+                left.source = UsageSource::Live;
+                left.plan = Some("plan a".into());
+                let mut right = UsageSnapshot::state(right_status, "right", now);
+                right.plan = Some("plan z".into());
+                right.ordinary_usage_allowed = Some(false);
+                let merged = left.merged(&right, now, UsageMerge::IndependentScopes);
+                assert_eq!(merged.status, right_status);
+                assert_eq!(
+                    merged,
+                    right.merged(&left, now, UsageMerge::IndependentScopes)
+                );
+                for snapshot in [&left, &right, &merged] {
+                    assert_eq!(
+                        *snapshot,
+                        snapshot.merged(snapshot, now, UsageMerge::IndependentScopes)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equal_stamp_figures_keep_restrictive_windows_in_both_parts() {
+        let now = 1_790_000_000_000;
+        let mut left = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":90,"resets_at":"2030-01-01T00:00:00Z"},
+                {"kind":"weekly_scoped","percent":80,"scope":{"surface":"Fable"},
+                    "resets_at":"2030-01-01T00:00:00Z"},
+                {"kind":"weekly_all","percent":10}
+            ]}}),
+            now,
+        );
+        let mut right = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":20,"resets_at":"2030-01-02T00:00:00Z"},
+                {"kind":"weekly_scoped","percent":30,"scope":{"surface":"Fable"},
+                    "resets_at":"2030-01-02T00:00:00Z"},
+                {"kind":"weekly_scoped","percent":40,"scope":{"surface":"Opus"}}
+            ]}}),
+            now,
+        );
+        left.scoped_observed_at = Some(now);
+        right.scoped_observed_at = Some(now);
+        left.windows[0].label = "left metadata".into();
+        right.windows[0].label = "right metadata".into();
+        let merged = left.merged(&right, now, UsageMerge::IndependentScopes);
+        assert_eq!(
+            merged,
+            right.merged(&left, now, UsageMerge::IndependentScopes)
+        );
+        assert_eq!(merged.windows.len(), 4);
+        for (key, used) in [("session", 0.9), ("weekly_scoped:Fable", 0.8)] {
+            let window = merged
+                .windows
+                .iter()
+                .find(|window| window.key == key)
+                .unwrap();
+            assert_eq!(window.used, used);
+            assert_eq!(window.resets_at, Some(1_893_542_400));
+        }
+        assert_eq!(
+            merged
+                .windows
+                .iter()
+                .find(|window| window.key == "session")
+                .unwrap()
+                .label,
+            "right metadata"
+        );
+        for snapshot in [&left, &right, &merged] {
+            assert_eq!(
+                *snapshot,
+                snapshot.merged(snapshot, now, UsageMerge::IndependentScopes)
+            );
+        }
+    }
+
+    fn scoped_merge_fixture(now: u64) -> UsageSnapshot {
+        let mut snapshot = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":20},
+                {"kind":"weekly_scoped","percent":80,"scope":{"surface":"Fable"}}
+            ]}}),
+            now,
+        );
+        snapshot.scoped_observed_at = Some(now);
+        snapshot
+    }
+
+    #[test]
+    fn a_newer_snapshot_without_scoped_evidence_keeps_scoped_figures_and_stamp() {
+        let now = 1_790_000_000_000;
+        let old = scoped_merge_fixture(now);
+        let newer = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":30}
+            ]}}),
+            now + 1_000,
+        );
+        let merged = old.merged(&newer, now + 1_000, UsageMerge::IndependentScopes);
+        assert_eq!(merged.observed_at, now + 1_000);
+        assert_eq!(merged.scoped_observed_at, Some(now));
+        assert_eq!(
+            merged
+                .windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped),
+            old.windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped)
+        );
+        assert_eq!(
+            merged,
+            newer.merged(&old, now + 1_000, UsageMerge::IndependentScopes)
+        );
+    }
+
+    #[test]
+    fn account_only_reports_preserve_scoped_evidence_across_clock_rollback() {
+        use super::super::{LiveReport, schedule};
+        let now = 1_790_000_000_000;
+        let mut snapshot = scoped_merge_fixture(now);
+        let future = now + 10 * schedule::CLOCK_SLACK;
+        snapshot.scoped_observed_at = Some(future);
+        let scoped = snapshot
+            .windows
+            .iter()
+            .find(|window| window.kind == WindowKind::Scoped)
+            .unwrap()
+            .clone();
+        let update =
+            parse_rate_limit_event(&json!({"status":"rejected","rateLimitType":"five_hour"}))
+                .unwrap();
+        assert!(LiveReport::Claude(update).apply(&mut snapshot, now + 1_000, now + 1_000));
+        assert_eq!(snapshot.observed_at, now + 1_000);
+        assert_eq!(snapshot.status, UsageStatus::Limited);
+        assert_eq!(snapshot.scoped_observed_at, Some(future));
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped),
+            Some(&scoped)
+        );
+    }
+
+    #[test]
+    fn equal_effective_scoped_stamps_use_a_deterministic_representation() {
+        let now = 1_790_000_000_000;
+        let explicit = scoped_merge_fixture(now);
+        let mut implicit = explicit.clone();
+        implicit.scoped_observed_at = None;
+        let merged = explicit.merged(&implicit, now, UsageMerge::IndependentScopes);
+        assert_eq!(
+            merged,
+            implicit.merged(&explicit, now, UsageMerge::IndependentScopes)
+        );
+        assert_eq!(merged.scoped_observed_at, Some(now));
+        for snapshot in [&explicit, &implicit] {
+            assert_eq!(
+                *snapshot,
+                snapshot.merged(snapshot, now, UsageMerge::IndependentScopes)
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicitly_empty_scoped_observation_replaces_older_figures() {
+        let now = 1_790_000_000_000;
+        let old = scoped_merge_fixture(now);
+        let empty = parse_usage(
+            &json!({"rate_limits":{
+                "five_hour":{"utilization":30},"model_scoped":[]
+            }}),
+            now + 1_000,
+        );
+        assert_eq!(empty.scoped_observed_at, Some(now + 1_000));
+        let merged = old.merged(&empty, now + 1_000, UsageMerge::IndependentScopes);
+        assert_eq!(merged, empty);
+        assert_eq!(
+            merged,
+            empty.merged(&old, now + 1_000, UsageMerge::IndependentScopes)
+        );
+        assert!(
+            !merged
+                .windows
+                .iter()
+                .any(|window| window.kind == WindowKind::Scoped)
+        );
+        assert_eq!(
+            merged.merged(&old, now + 1_000, UsageMerge::IndependentScopes),
+            merged
         );
     }
 

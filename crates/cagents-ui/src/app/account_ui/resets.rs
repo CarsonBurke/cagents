@@ -2292,6 +2292,8 @@ pub(in crate::app) mod tests {
                 }
             }
             snapshot.resets[0].available_count = 0;
+            snapshot.observed_at = now + 1;
+            snapshot.scoped_observed_at = Some(now + 1);
             drop(app.finish_usage_reset(
                 id.clone(),
                 owner,

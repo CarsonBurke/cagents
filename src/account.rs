@@ -1125,7 +1125,9 @@ pub struct UsageSnapshot {
     /// Unix milliseconds at which these figures were observed.
     pub observed_at: u64,
     /// Unix milliseconds of scoped/model figures observed separately from
-    /// the account part. None uses the complete snapshot's `observed_at`.
+    /// the account part. None uses `observed_at` when scoped windows exist;
+    /// with no scoped windows it means this part was not observed. Some with
+    /// no scoped windows records an explicitly observed empty part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoped_observed_at: Option<u64>,
     pub source: UsageSource,
@@ -1159,56 +1161,86 @@ pub enum UsageMerge {
 }
 
 impl UsageSnapshot {
-    /// Merge independent Claude account and model evidence. Complete probes
-    /// stamp both parts with `observed_at`; a model-only report supplies its
-    /// own scoped stamp. A credible stamp beats one left beyond CLOCK_SLACK
-    /// by a clock rollback, in either argument order. Ties keep `self`.
-    ///
-    /// Only scoped windows and their stamp belong to the model part. All
-    /// other fields (including reset inventory and eligibility) belong to
-    /// the account part. Other merge modes preserve each caller's previous
-    /// whole-snapshot replacement, tie and clock-rollback behavior.
+    /// Merge Claude's account and model evidence by their own credible
+    /// stamps. A missing scoped part leaves its prior figures and stamp
+    /// intact; an explicitly stamped empty part replaces older figures.
+    /// Equal stamps combine restrictive figures with deterministic metadata.
+    /// Other modes preserve the callers' whole-snapshot replacement rules.
     pub fn merged(&self, incoming: &Self, now: u64, mode: UsageMerge) -> Self {
-        let newer = |existing: u64, incoming: u64| match mode {
-            UsageMerge::IndependentScopes => match (
-                Self::stamp_is_credible(existing, now),
-                Self::stamp_is_credible(incoming, now),
-            ) {
-                (true, false) => false,
-                (false, true) => true,
-                _ => incoming > existing,
-            },
-            UsageMerge::OrderedSnapshot => {
-                incoming >= existing || !Self::stamp_is_credible(existing, now)
-            }
-            UsageMerge::OrderedSnapshotWithoutRollback => incoming >= existing,
-            UsageMerge::IncomingSnapshot => true,
-        };
+        use std::cmp::Ordering;
         if mode != UsageMerge::IndependentScopes {
-            return if newer(self.observed_at, incoming.observed_at) {
+            let newer = match mode {
+                UsageMerge::OrderedSnapshot => {
+                    incoming.observed_at >= self.observed_at
+                        || !Self::stamp_is_credible(self.observed_at, now)
+                }
+                UsageMerge::OrderedSnapshotWithoutRollback => {
+                    incoming.observed_at >= self.observed_at
+                }
+                UsageMerge::IncomingSnapshot => true,
+                UsageMerge::IndependentScopes => unreachable!(),
+            };
+            return if newer {
                 incoming.clone()
             } else {
                 self.clone()
             };
         }
-        let account = if newer(self.observed_at, incoming.observed_at) {
-            incoming
-        } else {
-            self
+        if self == incoming {
+            return self.clone();
+        }
+        let compare = |left, right| {
+            Self::stamp_is_credible(left, now)
+                .cmp(&Self::stamp_is_credible(right, now))
+                .then_with(|| left.cmp(&right))
         };
-        let scoped = if newer(
-            self.scoped_observed_at.unwrap_or(self.observed_at),
-            incoming.scoped_observed_at.unwrap_or(incoming.observed_at),
-        ) {
-            incoming
-        } else {
-            self
+        let account_order = compare(self.observed_at, incoming.observed_at);
+        // Equal stamps keep the more restrictive value so the merge doesn't depend on arrival order and stays on the safe side.
+        let account = match account_order {
+            Ordering::Less => incoming,
+            Ordering::Greater => self,
+            Ordering::Equal => {
+                if self.account_tie_key() >= incoming.account_tie_key() {
+                    self
+                } else {
+                    incoming
+                }
+            }
         };
         let mut merged = account.clone();
-        if !std::ptr::eq(account, scoped) {
+        merged
+            .windows
+            .retain(|window| window.kind != WindowKind::Scoped);
+        if account_order == Ordering::Equal {
+            merged.windows = Self::tied_windows(self, incoming, false);
+            merged.ordinary_usage_allowed = std::cmp::max_by_key(
+                self.ordinary_usage_allowed,
+                incoming.ordinary_usage_allowed,
+                Self::permission_rank,
+            );
+        }
+        let left_stamp = self.scoped_stamp();
+        let right_stamp = incoming.scoped_stamp();
+        let scoped_order = match (left_stamp, right_stamp) {
+            (Some(left), Some(right)) => compare(left, right),
+            _ => left_stamp.cmp(&right_stamp),
+        };
+        let scoped = if scoped_order == Ordering::Less {
+            incoming
+        } else {
+            self
+        };
+        let scoped_stamp = scoped.scoped_stamp();
+        if scoped_order == Ordering::Equal {
             merged
                 .windows
-                .retain(|window| window.kind != WindowKind::Scoped);
+                .extend(Self::tied_windows(self, incoming, true));
+            merged.scoped_observed_at = scoped_stamp.filter(|stamp| {
+                self.scoped_observed_at.is_some()
+                    || incoming.scoped_observed_at.is_some()
+                    || *stamp != merged.observed_at
+            });
+        } else {
             merged.windows.extend(
                 scoped
                     .windows
@@ -1216,11 +1248,94 @@ impl UsageSnapshot {
                     .filter(|window| window.kind == WindowKind::Scoped)
                     .cloned(),
             );
-            merged.scoped_observed_at = scoped.scoped_observed_at.or_else(|| {
-                (scoped.observed_at != account.observed_at).then_some(scoped.observed_at)
-            });
+            merged.scoped_observed_at = scoped
+                .scoped_observed_at
+                .or_else(|| scoped_stamp.filter(|stamp| *stamp != merged.observed_at));
         }
         merged
+    }
+
+    fn scoped_stamp(&self) -> Option<u64> {
+        self.scoped_observed_at.or_else(|| {
+            self.windows
+                .iter()
+                .any(|window| window.kind == WindowKind::Scoped)
+                .then_some(self.observed_at)
+        })
+    }
+
+    fn permission_rank(allowed: &Option<bool>) -> u8 {
+        match allowed {
+            Some(true) => 0,
+            None => 1,
+            Some(false) => 2,
+        }
+    }
+
+    fn account_tie_key(&self) -> (u8, u8, String) {
+        let status = match self.status {
+            UsageStatus::Ok => 0,
+            UsageStatus::Warning => 1,
+            UsageStatus::Unavailable => 2,
+            UsageStatus::Limited => 3,
+            UsageStatus::NeedsLogin => 4,
+        };
+        let metadata = serde_json::to_string(&(
+            &self.resets,
+            &self.credits,
+            self.source,
+            &self.plan,
+            &self.plan_display_name,
+            &self.rate_limit_tier,
+            &self.detail,
+        ))
+        .expect("usage metadata serializes");
+        (
+            status,
+            Self::permission_rank(&self.ordinary_usage_allowed),
+            metadata,
+        )
+    }
+
+    fn tied_windows(left: &Self, right: &Self, scoped: bool) -> Vec<UsageWindow> {
+        let mut windows = std::collections::BTreeMap::<&str, UsageWindow>::new();
+        for window in left
+            .windows
+            .iter()
+            .chain(&right.windows)
+            .filter(|window| (window.kind == WindowKind::Scoped) == scoped)
+        {
+            windows
+                .entry(&window.key)
+                .and_modify(|existing| {
+                    let used = if existing.used.total_cmp(&window.used).is_lt() {
+                        window.used
+                    } else {
+                        existing.used
+                    };
+                    let resets_at = existing.resets_at.max(window.resets_at);
+                    let metadata = |window: &UsageWindow| {
+                        (
+                            match window.kind {
+                                WindowKind::Session => 0,
+                                WindowKind::Weekly => 1,
+                                WindowKind::Scoped => 2,
+                                WindowKind::Other => 3,
+                            },
+                            window.label.clone(),
+                            window.span_secs,
+                            window.binding,
+                        )
+                    };
+                    if metadata(window) > metadata(existing) {
+                        *existing = window.clone();
+                    }
+                    existing.used = used;
+                    existing.resets_at = resets_at;
+                })
+                .or_insert_with(|| window.clone());
+        }
+        windows.into_values().collect()
     }
 
     fn stamp_is_credible(stamp: u64, now: u64) -> bool {
@@ -1337,18 +1452,30 @@ impl LiveReport {
                     .windows
                     .iter()
                     .any(|window| window.kind == WindowKind::Scoped);
-                let scoped_stamp = current.scoped_observed_at.unwrap_or(current.observed_at);
+                let scoped_only = update.status.is_none()
+                    && update
+                        .windows
+                        .iter()
+                        .all(|window| window.kind == WindowKind::Scoped);
+                let scoped_stamp = current.scoped_stamp();
                 let mut incoming = current.clone();
                 claude::merge_live(&mut incoming, update, observed_at);
                 if reports_scoped {
                     incoming.scoped_observed_at = Some(observed_at);
-                } else if UsageSnapshot::stamp_is_credible(scoped_stamp, now) {
+                } else if let Some(scoped_stamp) = scoped_stamp {
                     // An account-only report carries no newer model figures.
-                    // Keep their own credible stamp. A stamp from before a
-                    // clock rollback is cleared by merge_live as before.
+                    // Keep their own stamp even across a clock rollback;
+                    // only a scoped observation can renew scoped evidence.
                     incoming.scoped_observed_at = Some(scoped_stamp);
                 }
-                let merged = current.merged(&incoming, now, UsageMerge::IndependentScopes);
+                if scoped_only {
+                    incoming.status = current.status;
+                }
+                let mut merged = current.merged(&incoming, now, UsageMerge::IndependentScopes);
+                if scoped_only && matches!(merged.status, UsageStatus::Ok | UsageStatus::Warning) {
+                    // Derive model warnings only from the scoped figures the merge accepted.
+                    merged.refresh_status(false, merged.status == UsageStatus::Warning);
+                }
                 if merged == *current {
                     return false;
                 }
