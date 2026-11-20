@@ -4329,6 +4329,7 @@ fn pull_request_failure_leaves_focus_with_an_open_chrome_menu() {
 
             let _ = app.update(Message::SubmitPullRequest);
             assert!(app.pull_request_dialog.is_none());
+            app.status = Some(TransientNotice::error("another failure"));
             let _ = app.update(Message::ChromeUi(action.clone()));
             assert!(app.chrome_ui.is_open(), "{action:?}");
             let _ = app.update(Message::PullRequestCreated {
