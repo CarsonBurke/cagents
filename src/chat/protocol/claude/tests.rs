@@ -14595,3 +14595,36 @@ fn read_images_are_named_for_their_files_and_their_scaling_notes_are_not_shown()
         .count();
     assert_eq!(reads, 2);
 }
+
+/// Only a Read names the image it returned. Any other image Claude Code sends
+/// carries no boilerplate description, so the transcript and text copies fall
+/// back to what they know of it.
+#[test]
+fn an_image_no_read_returned_has_no_description() {
+    let mut adapter = Claude::default();
+    let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}});
+    let frames = [
+        json!({"type":"assistant","uuid":"sent","message":{"id":"msg-sent","role":"assistant","content":[image.clone()]}}),
+        json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_shot","name":"Bash","input":{"command":"grim shot.png"}}]}}),
+        json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_shot","content":[image]}]}}),
+    ];
+    let images = frames
+        .into_iter()
+        .flat_map(|frame| adapter.receive(frame).unwrap().events)
+        .filter_map(|event| match event {
+            Event::Item(Item {
+                id,
+                content: ItemContent::Image { description, .. },
+                ..
+            }) => Some((id, description)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        images,
+        [
+            ("msg-sent:0".to_owned(), String::new()),
+            ("toolu_shot:image:0".to_owned(), String::new()),
+        ]
+    );
+}
