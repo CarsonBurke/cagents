@@ -1315,7 +1315,11 @@ impl Drop for Residence {
     fn drop(&mut self) {
         // No completion receipt or discovery retirement until every owned
         // descendant is reaped. A stuck child leaves this small owner alive.
-        while !self.child.terminate(Duration::from_secs(2)).unwrap_or(false) {
+        while !self
+            .child
+            .terminate(Duration::from_secs(2))
+            .unwrap_or(false)
+        {
             std::thread::sleep(Duration::from_millis(100));
         }
         // Nothing else may: once the provider is gone, an unrecordable release
