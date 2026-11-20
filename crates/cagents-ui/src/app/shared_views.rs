@@ -3567,6 +3567,9 @@ impl Cagents {
         });
         phase.mark("selected_save");
         tasks.push(self.run_deferred_default_pane());
+        // A closed pane a view brought back after its conversation stopped
+        // goes again, now that the views it is removed from are settled.
+        tasks.push(self.remove_stopped_returns());
         // Presentation-only projection preserves every notification attribution
         // input: source, membership, ownership, placement and project identity.
         // Journal snapshots attribute their own new evidence independently.

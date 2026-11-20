@@ -12254,27 +12254,94 @@ fn share_close_source(app: &mut Cagents, card: CardId) -> crate::workspace_model
 /// and what reopening it restores, keep what was confirmed. That holds for a
 /// first close, which takes the pane away at once, and for a close after a
 /// refusal, which waits on its pane for the daemon.
+/// Makes a shared channel the active one, for the panes opened next.
+fn active_shared_channel(app: &mut Cagents) -> crate::model::ChannelId {
+    let channel = crate::model::ChannelId::new();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.channels.push(crate::model::ProjectChannel {
+        id: channel,
+        project_id: crate::model::ProjectId::new(),
+        title: "shared".into(),
+        title_source: Default::default(),
+        ordinal: 1,
+        shared: true,
+        cards: vec![],
+        focused: None,
+    });
+    durable.active_channel = Some(channel);
+    channel
+}
+
+/// Gives `channel` a view holding `card` as it is saved now, and reconciles
+/// the window with it. Returns that pane.
+fn show_in_channel_view(
+    app: &mut Cagents,
+    channel: crate::model::ChannelId,
+    card: CardId,
+) -> crate::workspace_model::views::Pane {
+    use crate::workspace_model::{
+        ModelChannel, ModelProject,
+        views::{Pane, Scope, View},
+    };
+    let original = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+    let mut view = View::empty(channel);
+    view.revision = 1;
+    view.panes.push(original.clone());
+    app.workspace_model.identity = uuid::Uuid::new_v4();
+    app.workspace_model.projects = vec![ModelProject {
+        repository: FIXTURE_DIRECTORY.into(),
+        name: "Fixture".into(),
+        kind: Default::default(),
+        ordinal: 1,
+    }];
+    app.workspace_model.channels = vec![ModelChannel {
+        id: channel,
+        repository: FIXTURE_DIRECTORY.into(),
+        title: "shared".into(),
+        title_source: Default::default(),
+        ordinal: 1,
+    }];
+    app.workspace_model.views = vec![view.clone()];
+    app.shared_views
+        .initialize(Scope::Channel(channel), view.panes.clone());
+    drop(app.reconcile_shared_views());
+    original
+}
+
+/// The view refuses the window's removal of `card`, which it still shows, and
+/// the window reconciles with it.
+fn view_refuses_removal(app: &mut Cagents, channel: crate::model::ChannelId, card: CardId) {
+    use crate::workspace_model::views::{Change, Scope};
+    app.publish_view_changes();
+    let operation = app
+        .shared_views
+        .pending
+        .iter()
+        .find(|(_, _, change)| {
+            matches!(change, Change::Remove { id, .. } if *id == card)
+                || matches!(change, Change::RemoveSource { before, .. } if before.id == card)
+        })
+        .map(|(operation, _, _)| *operation)
+        .expect("the window published the removal");
+    app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
+    drop(app.reconcile_shared_views());
+}
+
+/// The shared view publishes `panes` as its next revision, which the window
+/// reconciles with.
+fn view_publishes(app: &mut Cagents, panes: Vec<crate::workspace_model::views::Pane>) {
+    let view = &mut app.workspace_model.views[0];
+    view.panes = panes;
+    view.revision += 1;
+    drop(app.reconcile_shared_views());
+}
+
 #[test]
 fn a_chat_close_removes_the_pane_its_view_holds_and_keeps_its_confirmed_identity() {
-    use crate::workspace_model::{
-        ModelChannel, ModelEdit, ModelProject,
-        views::{Change, Pane, Scope, View},
-    };
+    use crate::workspace_model::{ModelEdit, views::Change};
     for held in [false, true] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let channel = crate::model::ChannelId::new();
-        let durable = Arc::make_mut(&mut app.durable);
-        durable.channels.push(crate::model::ProjectChannel {
-            id: channel,
-            project_id: crate::model::ProjectId::new(),
-            title: "shared".into(),
-            title_source: Default::default(),
-            ordinal: 1,
-            shared: true,
-            cards: vec![],
-            focused: None,
-        });
-        durable.active_channel = Some(channel);
+        let channel = active_shared_channel(&mut app);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let confirmed = app.chat_return_session(card).unwrap();
         assert!(confirmed.launch.session_id.is_some());
@@ -12283,28 +12350,7 @@ fn a_chat_close_removes_the_pane_its_view_holds_and_keeps_its_confirmed_identity
             saved.launch.session_id = None;
         }
         // The channel's view holds the pane as it was last saved.
-        let original = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
-        let mut view = View::empty(channel);
-        view.revision = 1;
-        view.panes.push(original.clone());
-        app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.workspace_model.projects = vec![ModelProject {
-            repository: FIXTURE_DIRECTORY.into(),
-            name: "Fixture".into(),
-            kind: Default::default(),
-            ordinal: 1,
-        }];
-        app.workspace_model.channels = vec![ModelChannel {
-            id: channel,
-            repository: FIXTURE_DIRECTORY.into(),
-            title: "shared".into(),
-            title_source: Default::default(),
-            ordinal: 1,
-        }];
-        app.workspace_model.views = vec![view.clone()];
-        app.shared_views
-            .initialize(Scope::Channel(channel), view.panes.clone());
-        drop(app.reconcile_shared_views());
+        let original = show_in_channel_view(&mut app, channel, card);
         let (tx, published) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         if held {
@@ -12354,6 +12400,144 @@ fn a_chat_close_removes_the_pane_its_view_holds_and_keeps_its_confirmed_identity
             .map(|(state, _)| &state.kind);
         assert_eq!(reopened, Some(&CardKind::Chat(confirmed)), "held: {held}");
     }
+}
+
+/// A view that brings a closed pane back while its conversation stops keeps
+/// it waiting. When another window puts a different conversation in that
+/// pane meanwhile, the stop settling neither takes the pane away nor puts the
+/// closed conversation back in it: it attaches to the one it now holds,
+/// whether the stop succeeded or was refused.
+#[test]
+fn a_stop_leaves_a_returned_pane_another_window_gave_a_new_conversation() {
+    for refused in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let channel = active_shared_channel(&mut app);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let original = show_in_channel_view(&mut app, channel, card);
+        drop(app.update(Message::CloseCard(card)));
+        let target = app
+            .background_close_for_test(card)
+            .expect("it stops in the background");
+        // The view refuses the removal, and still shows the pane.
+        view_refuses_removal(&mut app, channel, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.holds_reopen(card), "refused={refused}");
+        // Another window puts a new conversation in that pane.
+        let mut replacement = original.clone();
+        let CardKind::Chat(other) = &mut replacement.kind else {
+            unreachable!()
+        };
+        other.id = TerminalId::new();
+        other.launch.session_id = Some("019e0000-0000-7000-8000-0000000000bb".into());
+        let other = other.clone();
+        view_publishes(&mut app, vec![replacement]);
+        assert!(app.chat_ui.attempt(card).is_none(), "refused={refused}");
+
+        let result = if refused {
+            Err("the daemon kept it".to_owned())
+        } else {
+            Ok(())
+        };
+        drop(app.update(Message::ChatUi(Action::Retired(target, result))));
+        assert!(
+            app.card_state(card).unwrap().existence.is_open(),
+            "refused={refused}: the pane stays"
+        );
+        assert_eq!(
+            app.chat_return_session(card).map(|session| session.id),
+            Some(other.id),
+            "refused={refused}: it keeps the new conversation"
+        );
+        assert!(
+            app.chat_ui.attempt(card).is_some(),
+            "refused={refused}: and attaches to it"
+        );
+    }
+}
+
+/// A view that brings a closed pane back after its conversation has stopped
+/// puts it in the strip and takes it away again in the same reconciliation,
+/// leaving nothing loading in its place.
+#[test]
+fn a_pane_a_view_brings_back_after_its_stop_goes_once_it_is_placed() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let channel = active_shared_channel(&mut app);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    show_in_channel_view(&mut app, channel, card);
+    drop(app.update(Message::CloseCard(card)));
+    let target = app.background_close_for_test(card).unwrap();
+    drop(app.update(Message::ChatUi(Action::Retired(target, Ok(())))));
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+
+    // The view's refusal of the removal arrives only now, so the pane comes
+    // back with nothing left to stop, and the window removes it again.
+    view_refuses_removal(&mut app, channel, card);
+    app.publish_view_changes();
+    assert!(
+        app.shared_views.pending.iter().any(|(_, _, change)| {
+            use crate::workspace_model::views::Change;
+            matches!(change, Change::Remove { id, .. } if *id == card)
+                || matches!(change, Change::RemoveSource { before, .. } if before.id == card)
+        }),
+        "the pane came back and its removal went again: open {:?}, placed {}, runtime {}, \
+         waiting {:?}, notice {:?}, pending {:?}",
+        app.card_state(card).map(|state| state.existence.is_open()),
+        app.workspace.order().any(|placed| placed == card),
+        app.cards.contains_key(&card),
+        app.chat_ui.stopped_returns,
+        app.status,
+        app.shared_views.pending,
+    );
+    assert!(
+        !app.card_state(card)
+            .is_some_and(|state| state.existence.is_open()),
+        "the pane goes again"
+    );
+    assert!(!app.cards.contains_key(&card), "nothing is left loading");
+    assert!(!app.workspace.order().any(|placed| placed == card));
+    assert!(app.chat_ui.attempt(card).is_none());
+}
+
+/// A shared pane a launch shows from its saved descriptor, while the last
+/// window's stop of that conversation is still unanswered, attaches only
+/// once the stop settles: admitting the pane does not attach it beside the
+/// provider being ended. The closed pane then goes, as it was asked to.
+#[test]
+fn a_shared_pane_admitted_while_its_stop_is_asked_again_waits_for_it() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let channel = active_shared_channel(&mut app);
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let session = app.chat_return_session(card).unwrap();
+    let original = show_in_channel_view(&mut app, channel, card);
+    let open = app.persistent_workspace();
+    drop(app.update(Message::CloseCard(card)));
+    let closed = app.persistent_workspace();
+    assert_eq!(stopping(&app), vec![(session.id, None)]);
+
+    // The next launch: the view still holds the pane, which shows its saved
+    // descriptor until the view admits it.
+    let mut next = crate::app::tests::context_inspector_test_app(false);
+    next.durable = closed;
+    Arc::make_mut(&mut next.durable).cards = open.cards.clone();
+    next.workspace = Cagents::rebuild_workspace(&next.durable);
+    next.await_shared_chat_admission(card, session.clone());
+    drop(next.resume_stopping_chats());
+    let target = next.background_close_for_test(card).expect("asked again");
+    drop(next.admit_shared_chat(&original));
+    assert!(
+        next.chat_ui.attempt(card).is_none(),
+        "nothing attaches to the conversation being stopped"
+    );
+    assert!(next.holds_reopen(card));
+
+    drop(next.update(Message::ChatUi(Action::Retired(target, Ok(())))));
+    assert!(
+        !next
+            .card_state(card)
+            .is_some_and(|state| state.existence.is_open()),
+        "the pane goes"
+    );
+    assert!(next.durable.stopping_chats.is_empty());
 }
 
 #[test]

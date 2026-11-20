@@ -241,6 +241,15 @@ impl Cagents {
             if !self.awaits_attachment(card) {
                 continue;
             }
+            // Another window put a different conversation in the pane while
+            // it waited. This stop is nothing to that one, which attaches as
+            // any pane a view shows does.
+            if let Some(session) = self.chat_return_session(card)
+                && !shares_conversation(&session, &closing.session)
+            {
+                tasks.push(self.open_chat(card, session, chat::Intent::Restore));
+                continue;
+            }
             tasks.push(match &refused {
                 // The closed pane itself, back because a shared view kept it,
                 // holds what that view knows of the conversation now.
@@ -344,12 +353,20 @@ impl Cagents {
             // closed before the removal reached it. The conversation has
             // stopped, so the pane goes again.
             if self.chat_ui.stopped_closes.contains(&card) {
-                return self.remove_chat_card(card, None).unwrap_or_else(Task::none);
+                if self.workspace.order().any(|placed| placed == card) {
+                    return self.remove_chat_card(card, None).unwrap_or_else(Task::none);
+                }
+                // The view is still putting the pane in the strip, which
+                // removes it once it is there.
+                self.cards.remove(&card);
+                self.chat_ui.stopped_returns.insert(card);
+                return Task::none();
             }
             // The last window closed before hearing the stop: the launch asks
             // again, and the pane waits for that answer, unattached (see
             // `resume_stopping_chats`).
             if self.awaits_stop(&session) {
+                self.stash_unsent_chat(card);
                 self.cards.remove(&card);
                 return Task::none();
             }
@@ -360,9 +377,32 @@ impl Cagents {
         {
             closing.reopens.push(card);
         }
-        // It waits unattached, as a held reopen does.
+        // It waits unattached, as a held reopen does, keeping what it had
+        // not sent.
+        self.stash_unsent_chat(card);
         self.cards.remove(&card);
         Task::none()
+    }
+
+    /// Takes away again each closed pane a shared view brought back after its
+    /// conversation stopped, now that the strip shows it.
+    pub(in crate::app) fn remove_stopped_returns(&mut self) -> Task<Message> {
+        let placed = self
+            .workspace
+            .order()
+            .filter(|card| self.chat_ui.stopped_returns.contains(card))
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for card in placed {
+            self.chat_ui.stopped_returns.remove(&card);
+            let open = self
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open());
+            if open && let Some(task) = self.remove_chat_card(card, None) {
+                tasks.push(task);
+            }
+        }
+        Task::batch(tasks)
     }
 
     /// Puts a pane that holds the conversation whose stop was refused back on

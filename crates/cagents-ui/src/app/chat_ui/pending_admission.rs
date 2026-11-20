@@ -409,7 +409,10 @@ impl Cagents {
             }
             CardKind::Chat(session) => {
                 self.cards.entry(pane.id).or_insert(CardRuntime::Loading);
-                self.open_chat(pane.id, session.clone(), chat::Intent::Restore)
+                // A conversation still stopping after its pane closed, or
+                // whose stop was refused, attaches as any pane a view shows
+                // it on does: after the stop, or to what still runs.
+                self.attach_shared_chat(pane.id, session.clone())
             }
             _ => Task::none(),
         };

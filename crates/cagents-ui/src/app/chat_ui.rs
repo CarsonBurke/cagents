@@ -1306,6 +1306,9 @@ pub(super) struct State {
     /// heard of the close, as when the window closed first, can bring one
     /// back; it goes again rather than attach.
     stopped_closes: HashSet<CardId>,
+    /// Such panes a view brought back before putting them in the strip: they
+    /// go once it has.
+    stopped_returns: HashSet<CardId>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -1389,6 +1392,7 @@ impl Default for State {
             close_refused: HashSet::new(),
             refusals_to_show: HashMap::new(),
             stopped_closes: HashSet::new(),
+            stopped_returns: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             peer_started: HashMap::new(),
