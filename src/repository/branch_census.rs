@@ -55,8 +55,10 @@ pub fn parse_ref_tips(output: &[u8]) -> Result<Vec<RefTip>, GitParseError> {
                 format!("expected {TIP_FIELDS} fields, found {}", fields.len()),
             ));
         };
-        let refname = std::str::from_utf8(refname)
-            .map_err(|_| malformed(FORMAT, index, "ref name is not UTF-8"))?;
+        // One unsupported name must not discard facts for other branches.
+        let Ok(refname) = std::str::from_utf8(refname) else {
+            continue;
+        };
         if refname.is_empty() {
             return Err(malformed(FORMAT, index, "empty ref name"));
         }
@@ -89,8 +91,10 @@ pub fn parse_divergence(output: &[u8]) -> Result<BTreeMap<String, Divergence>, G
         else {
             return Err(malformed(FORMAT, index, "missing ahead-behind field"));
         };
-        let refname = std::str::from_utf8(refname)
-            .map_err(|_| malformed(FORMAT, index, "ref name is not UTF-8"))?;
+        // Keep the same supported-name policy as the branch-tip census.
+        let Ok(refname) = std::str::from_utf8(refname) else {
+            continue;
+        };
         let divergence = parse_counts(counts_field)
             .ok_or_else(|| malformed(FORMAT, index, "ahead-behind is not two counts"))?;
         counts.insert(refname.to_owned(), divergence);
@@ -436,6 +440,51 @@ mod tests {
     fn malformed_ref_tips_are_refused() {
         assert!(parse_ref_tips(b"refs/heads/main\0nothex\0\0\0\0\n").is_err());
         assert!(parse_ref_tips(format!("refs/heads/main\0{A}\0\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn ref_tips_skip_non_utf8_names_without_aliasing_supported_refs() {
+        let mut output = b"refs/heads/legacy-\xff\0".to_vec();
+        output.extend_from_slice(
+            format!(
+                "{A}\0\0\0\nrefs/heads/main\0{A}\0\0\0\n\
+                 refs/heads/legacy-\u{fffd}\0{B}\0\0\0\n"
+            )
+            .as_bytes(),
+        );
+        let tips = parse_ref_tips(&output).unwrap();
+        assert_eq!(tips.len(), 2);
+        assert_eq!(tips[0].refname, "refs/heads/main");
+        assert_eq!(tips[1].refname, "refs/heads/legacy-\u{fffd}");
+        assert_eq!(tips[1].oid, B);
+    }
+
+    #[test]
+    fn divergence_skips_non_utf8_names_without_aliasing_supported_refs() {
+        let mut output = b"refs/heads/legacy-\xff\x009 77\0\n".to_vec();
+        output.extend_from_slice(
+            "refs/heads/main\x000 0\0\nrefs/heads/legacy-\u{fffd}\x001 2\0\n".as_bytes(),
+        );
+        let counts = parse_divergence(&output).unwrap();
+        assert_eq!(
+            counts,
+            BTreeMap::from([
+                (
+                    "refs/heads/main".to_owned(),
+                    Divergence {
+                        ahead: 0,
+                        behind: 0
+                    }
+                ),
+                (
+                    "refs/heads/legacy-\u{fffd}".to_owned(),
+                    Divergence {
+                        ahead: 1,
+                        behind: 2
+                    }
+                ),
+            ])
+        );
     }
 
     #[test]

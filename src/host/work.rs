@@ -1919,6 +1919,155 @@ mod tests {
         }))
     }
 
+    #[cfg(unix)]
+    fn non_utf8_branch_work_cards(previous_scan: bool) {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        fn git(root: &Path, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(arguments)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let linked = directory.path().join("linked");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, ["init", "-q", "-b", "main"]);
+        git(&root, ["commit", "-q", "--allow-empty", "-m", "initial"]);
+        git(
+            &root,
+            [
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let repository = root.join(".git");
+        let handle = polling_handle();
+        handle.shared().track(&repository, "repo").forge = Forge::NotGitHub;
+        let refresh = || {
+            let job = {
+                let mut shared = handle.shared();
+                let tracked = shared.projects.get_mut(&repository).unwrap();
+                tracked.scans_started += 1;
+                Job {
+                    repository: repository.clone(),
+                    id: tracked.id,
+                    previous: tracked.local.clone(),
+                    change: full_change(),
+                    hints: tracked.hints.clone(),
+                    sequence: tracked.scans_started,
+                }
+            };
+            let result = scan::scan(scan::Input {
+                id: job.id,
+                repository: &job.repository,
+                previous: job.previous.as_deref(),
+                change: &job.change,
+                hints: &job.hints,
+                now_unix_ms: now_unix_ms(),
+                cancellation: &handle.0.cancellation,
+            });
+            handle.publish(job, result);
+        };
+        if previous_scan {
+            refresh();
+            assert!(handle.shared().projects[&repository].local.is_some());
+        }
+
+        // Git accepts this ref, but the board cannot use its name as text.
+        git(
+            &root,
+            [
+                OsStr::new("update-ref"),
+                OsStr::from_bytes(b"refs/heads/legacy-\xff"),
+                OsStr::new("HEAD"),
+            ],
+        );
+        git(
+            &linked,
+            ["commit", "-q", "--allow-empty", "-m", "feature work"],
+        );
+        let head = git(&linked, ["rev-parse", "HEAD"]);
+        std::fs::write(root.join("primary.txt"), "primary work\n").unwrap();
+        std::fs::write(linked.join("feature.txt"), "linked work\n").unwrap();
+        refresh();
+
+        let shared = handle.shared();
+        let tracked = &shared.projects[&repository];
+        let board = board::assemble(
+            &[board::ProjectView {
+                repository: &repository,
+                name: &tracked.name,
+                local: tracked.local.as_deref(),
+                scan_error: tracked.scan_error.as_deref(),
+                forge: &tracked.forge,
+                snapshot: None,
+            }],
+            &board::Context {
+                now_unix_ms: now_unix_ms(),
+                stale_after_days: shared.stale_after_days,
+                pins: &shared.pins,
+                session_activity: &shared.session_activity,
+                sessions: &[],
+                tickets: &shared.tickets,
+                linear_unavailable: None,
+            },
+        );
+        assert_eq!(board.projects[0].scan_error, None);
+        assert_eq!(board.items.len(), 2, "both ordinary worktrees have cards");
+        for branch in ["main", "feature"] {
+            let item = board
+                .items
+                .iter()
+                .find(|item| item.branch.as_deref() == Some(branch))
+                .unwrap();
+            assert_eq!(item.error, None);
+            assert_eq!(item.dirty.as_ref().unwrap().paths, 1);
+            if branch == "feature" {
+                assert_eq!(item.head.as_ref().unwrap().oid, head);
+                assert_eq!(item.comparison.as_ref().unwrap().ahead, 1);
+            }
+        }
+        assert_eq!(
+            tracked.local.as_ref().unwrap().branch_names,
+            BTreeSet::from(["feature".to_owned(), "main".to_owned()])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_branch_preserves_first_work_cards() {
+        non_utf8_branch_work_cards(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_branch_preserves_refreshed_work_cards() {
+        non_utf8_branch_work_cards(true);
+    }
+
     #[test]
     fn last_work_watcher_detaching_restores_idle_polling_without_an_extra_read() {
         let handle = polling_handle();
