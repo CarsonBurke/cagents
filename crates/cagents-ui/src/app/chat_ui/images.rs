@@ -1352,8 +1352,7 @@ impl Cagents {
     /// A key for the focused pane's image viewer, which holds that pane's
     /// keyboard rather than the whole window's. A key a control took, such
     /// as an arrow or Ctrl+C in the composer, is that control's; so is
-    /// Escape there, which hands the keyboard to the viewer
-    /// ([`Action::FocusImage`]) for a second Escape to close it.
+    /// Escape there, which closes the viewer itself.
     pub(in crate::app) fn pane_image_key(
         &mut self,
         event: &iced::keyboard::Event,

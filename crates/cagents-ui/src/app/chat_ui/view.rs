@@ -3822,11 +3822,23 @@ impl Runtime {
                             Action::AcceptSuggestion(target, suggestion.clone()),
                         )));
                     }
+                    let picking = self.model_picker.is_some()
+                        || self.account_picker
+                        || self.permission_picker;
+                    // Escape closes the topmost layer first: an open image
+                    // above the draft goes before a running turn, which the
+                    // next Escape interrupts.
+                    if viewing
+                        && !picking
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::CloseImage(
+                            images::ViewerHost::Pane(target),
+                        ))));
+                    }
                     if snapshot.busy
                         && available
-                        && self.model_picker.is_none()
-                        && !self.account_picker
-                        && !self.permission_picker
+                        && !picking
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Interrupt(
@@ -3865,14 +3877,6 @@ impl Runtime {
                     }
                     let binding =
                         word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press));
-                    // Escape leaves the draft for the image viewer above it
-                    // rather than for nowhere. Claiming the key keeps this
-                    // press from closing the viewer too; the next one does.
-                    if viewing && matches!(binding, Some(text_editor::Binding::Unfocus)) {
-                        return Some(text_editor::Binding::Custom(action(Action::FocusImage(
-                            target,
-                        ))));
-                    }
                     if matches!(binding, Some(text_editor::Binding::Paste)) {
                         Some(text_editor::Binding::Custom(action(Action::Paste(target))))
                     } else {

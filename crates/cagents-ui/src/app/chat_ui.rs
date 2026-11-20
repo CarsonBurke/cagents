@@ -459,7 +459,8 @@ pub enum Action {
     Figure(Target, u64, images::figure::Command),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
-    /// Keyboard to the pane's image viewer, from its composer's Escape.
+    /// Keyboard to the pane's image viewer, as sending from its composer
+    /// hands it back.
     FocusImage(Target),
     CloseImage(images::ViewerHost),
     ImageNext(images::ViewerHost, bool),

@@ -4,7 +4,7 @@
 //! goes to whatever holds the keyboard.
 use super::super::tests::{chat_runtime, draft_chat, live_chat, task_focuses};
 use super::*;
-use crate::app::dialog_ui::tests::{focus_after_key, key_control, key_press};
+use crate::app::dialog_ui::tests::{key_control, key_press};
 use images::{Gallery, ViewerHost, viewer_focus};
 use keyboard::key::Named;
 
@@ -188,43 +188,46 @@ fn keys_go_to_the_composer_or_the_viewer_by_where_the_keyboard_is() {
     assert_eq!(chat_runtime(&app, card).composer.text().trim_end(), "W");
 }
 
+/// Escape in the composer closes the topmost layer first (#3435): an open
+/// image goes before a running turn, which the next Escape interrupts. With
+/// neither, Escape only leaves the draft.
 #[test]
-fn escape_in_the_composer_hands_the_keyboard_to_the_viewer() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target, _) = viewing(&mut app);
-    let composer = card_control_id(card, "chat-composer");
-    let (messages, captured) = key_control(
-        app.chat_view(card),
-        composer.clone(),
-        key_press(Named::Escape),
-    );
-    assert!(
-        captured,
-        "the press that leaves the draft doesn't also close the viewer"
-    );
-    assert!(
-        matches!(messages.as_slice(), [Message::ChatUi(Action::FocusImage(found))] if *found == target),
-        "{messages:?}"
-    );
-    // The viewer takes the keyboard and leaves Escape for the app to close
-    // it with.
-    assert_eq!(
-        focus_after_key(
+fn escape_in_the_composer_closes_the_image_before_interrupting() {
+    for busy in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, _) = viewing(&mut app);
+        Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = busy;
+        let composer = card_control_id(card, "chat-composer");
+        let (messages, captured) = key_control(
             app.chat_view(card),
-            viewer_focus(card),
-            key_press(Named::Escape)
-        ),
-        (Some(viewer_focus(card)), false)
-    );
+            composer.clone(),
+            key_press(Named::Escape),
+        );
+        assert!(captured, "busy {busy}: the press goes no further");
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::ChatUi(Action::CloseImage(ViewerHost::Pane(found)))] if *found == target
+            ),
+            "busy {busy}: {messages:?}"
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert!(shown(&app, target).is_none(), "busy {busy}");
 
-    // With no viewer, the composer's Escape is still only a blur.
-    drop(
-        app.update(Message::ChatUi(Action::CloseImage(ViewerHost::Pane(
-            target,
-        )))),
-    );
-    let (messages, captured) = key_control(app.chat_view(card), composer, key_press(Named::Escape));
-    assert!(!captured && messages.is_empty(), "{messages:?}");
+        let (messages, captured) =
+            key_control(app.chat_view(card), composer, key_press(Named::Escape));
+        if busy {
+            assert!(captured);
+            assert!(
+                matches!(messages.as_slice(), [Message::ChatUi(Action::Interrupt(found))] if *found == target),
+                "{messages:?}"
+            );
+        } else {
+            assert!(!captured && messages.is_empty(), "{messages:?}");
+        }
+    }
 }
 
 #[test]
@@ -595,13 +598,12 @@ fn the_image_menu_claims_the_escape_that_closes_it() {
     assert!(!send(&mut element, escape), "and is gone");
 }
 
-/// The composer keeps its own keys while an image is open above it: the
-/// arrows move its caret, and while a turn runs its Escape still interrupts
-/// rather than handing the keyboard to the viewer.
+/// The composer keeps its arrows while an image is open above it: they move
+/// its caret rather than browse.
 #[test]
-fn a_focused_composer_keeps_its_arrows_and_its_interrupt() {
+fn a_focused_composer_keeps_its_arrows() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target, images) = viewing(&mut app);
+    let (card, target, _) = viewing(&mut app);
     let composer = card_control_id(card, "chat-composer");
     app.chat_runtime_mut(target)
         .unwrap()
@@ -617,21 +619,6 @@ fn a_focused_composer_keeps_its_arrows_and_its_interrupt() {
             "{messages:?}"
         );
     }
-
-    Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
-    let (messages, captured) = key_control(app.chat_view(card), composer, key_press(Named::Escape));
-    assert!(captured);
-    assert!(
-        matches!(messages.as_slice(), [Message::ChatUi(Action::Interrupt(found))] if *found == target),
-        "{messages:?}"
-    );
-    assert_eq!(
-        shown(&app, target),
-        Some(images::ImageRef::Viewer(
-            ViewerHost::Pane(target),
-            images[0].1
-        ))
-    );
 }
 
 /// The images belong to the transcript they came from, so showing a
