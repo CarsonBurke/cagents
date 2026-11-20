@@ -49,6 +49,18 @@ fn seeding_channel() -> Window {
     window
 }
 
+/// A composed chat in a window whose daemon has yet to answer whether it has
+/// a shared registry at all.
+fn connecting_window() -> Window {
+    let mut window = window();
+    window.app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
+    window.app.workspace_model.views.clear();
+    compose_default_chat(&mut window.app, window.target);
+    drop(window.app.reconcile_shared_views());
+    drain(&window.rx);
+    window
+}
+
 fn drain(rx: &TestModelRequests) {
     while rx.try_recv().is_ok() {}
 }
@@ -268,4 +280,71 @@ fn taking_a_held_message_back_cancels_its_start() {
     );
     seed_applied(&mut window, Vec::new(), Vec::new());
     assert!(window.app.chat_start_attempt(window.card).is_none());
+}
+
+#[test]
+fn deleting_a_channel_whose_first_message_waits_deletes_it_and_starts_nothing() {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    let Scope::Channel(channel) = window.scope.clone() else {
+        unreachable!("the window's scope is its channel")
+    };
+    // A held message has started nothing, so deleting its channel goes on to
+    // close the channel's chat, as for any draft, rather than waiting for a
+    // start that only the channel's admission could release.
+    drop(window.app.delete_channel(channel));
+    assert!(
+        window.app.channel_ui.closing_sessions(channel),
+        "deleting the channel does not wait on the held message"
+    );
+    // Until its chat closes with it, a channel being deleted admits nothing.
+    seed_applied(&mut window, Vec::new(), Vec::new());
+    assert!(window.app.chat_start_attempt(window.card).is_none());
+}
+
+#[test]
+fn a_first_message_sent_while_connecting_starts_once_the_daemon_has_no_registry() {
+    let mut window = connecting_window();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Unavailable(
+                "this daemon has no shared workspace".into(),
+            )),
+    );
+    assert_started_once(&mut window);
+}
+
+#[test]
+fn a_first_message_sent_while_connecting_waits_for_the_registry_it_joins() {
+    let mut window = connecting_window();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    let mut model = window.app.workspace_model.clone();
+    model.identity = uuid::Uuid::new_v4();
+    model.sequence += 1;
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Connected(model)),
+    );
+    // Joining seeds the channel, chat and all, in that registry; the message
+    // waits for the seed's receipt rather than starting before the registry
+    // has the pane.
+    assert!(window.app.shared_views.seeding.contains(&window.scope));
+    assert!(window.app.first_send_held(window.card));
+    assert!(window.app.chat_start_attempt(window.card).is_none());
+    let seeded = std::iter::from_fn(|| window.rx.try_recv().ok())
+        .find_map(|edit| match edit {
+            ModelEdit::SeedView { scope, panes, .. } if scope == window.scope => Some(panes),
+            _ => None,
+        })
+        .expect("joining seeds the channel");
+    assert!(seeded.iter().any(|pane| pane.id == window.card));
+
+    seed_applied(&mut window, seeded, Vec::new());
+    assert_started_once(&mut window);
 }

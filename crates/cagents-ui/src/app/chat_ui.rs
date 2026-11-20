@@ -9858,11 +9858,15 @@ impl Cagents {
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
-        // A reopened conversation still being prepared starts once that ends,
-        // and a first message held for its channel starts once that loads.
-        self.chat_ui.phases.contains_key(&card)
-            || self.reopen_preparing(card)
-            || self.first_send_held(card)
+        // A first message held for its channel starts once that loads.
+        self.chat_start_in_flight(card) || self.first_send_held(card)
+    }
+    /// Whether `card` has a start under way that removing it must wait out.
+    /// A reopened conversation still being prepared starts once that ends.
+    /// A first message held for its channel has started nothing: it stays
+    /// with its draft, and is waited out like any start once released.
+    pub(super) fn chat_start_in_flight(&self, card: CardId) -> bool {
+        self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
     }
     /// Whether `card` has begun starting its conversation, as opposed to
     /// waiting for that start to be allowed.

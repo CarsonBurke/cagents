@@ -7311,6 +7311,29 @@ fn used_default_chat_reserves_one_insert_before_empty_view_projection() {
     );
 }
 
+#[test]
+fn an_unused_default_chat_gives_way_to_a_pane_another_window_adds() {
+    let (mut app, channel, _, pane) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    app.workspace_model.views = vec![View::empty(channel)];
+    drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+    let card = app.workspace.focused().unwrap();
+    drop(app.reconcile_shared_views());
+    assert_eq!(app.local_view_cards(&Scope::Channel(channel)), vec![card]);
+    // Never shared, but never going to be: an untouched automatic composer
+    // is not a chat awaiting publication.
+    let mut view = View::empty(channel);
+    view.revision = 1;
+    view.panes.push(pane.clone());
+    app.workspace_model.views = vec![view];
+    drop(app.reconcile_shared_views());
+    assert_eq!(
+        app.local_view_cards(&Scope::Channel(channel)),
+        vec![pane.id]
+    );
+}
+
 fn first_start_save_completion(save: Task<Message>) -> super::super::chat_ui::Action {
     std::thread::spawn(move || {
         use cosmic::iced::futures::StreamExt;
