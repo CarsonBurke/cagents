@@ -17,7 +17,8 @@ use std::sync::Arc;
 /// An image whose reference the draft no longer holds.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Detached {
-    /// Where it stood among the attachments when it left.
+    /// Where it stood among the attachments the moment it left, after any
+    /// image that left before it.
     index: usize,
     attachment: Attachment,
 }
@@ -86,9 +87,6 @@ pub(super) fn reconcile(
     };
     let mut changed = false;
     let mut index = 0;
-    // Where each leaving image stood before this edit, so that images that
-    // leave together return in their order.
-    let mut left = 0;
     while index < attachments.len() {
         let leaves = attachments[index]
             .reference
@@ -97,18 +95,15 @@ pub(super) fn reconcile(
             && !holds(&attachments[index]);
         if leaves {
             let attachment = attachments.remove(index);
-            detached.push(Detached {
-                index: index + left,
-                attachment,
-            });
-            left += 1;
+            detached.push(Detached { index, attachment });
             changed = true;
         } else {
             index += 1;
         }
     }
-    // The most recently detached return first, so undoing several removals
-    // puts each back where it was.
+    // Each index was read after the images detached before it had gone, so
+    // putting them back newest first undoes the removals exactly, whether
+    // they left in one edit or over several an undo step joins.
     let mut returning = Vec::new();
     detached.retain(|entry| {
         let back = holds(&entry.attachment);
@@ -117,8 +112,7 @@ pub(super) fn reconcile(
         }
         !back
     });
-    returning.sort_by_key(|entry| entry.index);
-    for entry in returning {
+    for entry in returning.into_iter().rev() {
         let id = entry
             .attachment
             .reference
@@ -329,6 +323,36 @@ mod tests {
             let before = inline(&cut, &attachments);
             assert!(reconcile(&full, &before, &mut attachments, &mut detached));
             assert_eq!(attachments, all);
+        });
+    }
+
+    #[test]
+    fn images_that_leave_over_several_edits_return_together_in_their_order() {
+        attachment_assets::with_test_image(|first| {
+            let second = attachment_assets::test_image("second.png");
+            let third = attachment_assets::test_image("third.png");
+            let all = vec![first.clone(), second.clone(), third.clone()];
+            let token = |a: &Attachment| a.reference.as_ref().unwrap().token();
+            let full = format!("{} {} {}", token(&first), token(&second), token(&third));
+            // Each removal is its own edit, and one undo step brings every
+            // reference back at once: forward Delete held at the start takes
+            // the first two from the head of the tray; the other pair leaves
+            // from both ends.
+            for gone in [[&first, &second], [&first, &third]] {
+                let mut attachments = all.clone();
+                let mut detached = Vec::new();
+                let mut text = full.clone();
+                for image in gone {
+                    let before = inline(&text, &attachments);
+                    text = text.replacen(&token(image), "", 1);
+                    assert!(reconcile(&text, &before, &mut attachments, &mut detached));
+                }
+                assert_eq!(attachments.len(), 1);
+                let before = inline(&text, &attachments);
+                assert!(reconcile(&full, &before, &mut attachments, &mut detached));
+                assert_eq!(attachments, all);
+                assert!(detached.is_empty());
+            }
         });
     }
 
