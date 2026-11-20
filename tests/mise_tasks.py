@@ -102,8 +102,14 @@ class Structure(unittest.TestCase):
                 self.assertLessEqual(packages(lanes[sentinel]) or {"cagents"}, packages(arguments) or {"cagents"})
                 self.assertLessEqual(features(lanes[sentinel]), features(arguments))
                 task = self.tasks[f"check:{lane}"]
-                self.assertIn('default="--all-targets"', self.config["vars"]["all_targets"])
-                self.assertEqual(task.get("usage"), "{{vars.all_targets}}")
+                self.assertIn('default="--all-targets"', task.get("usage", ""))
+
+    def test_no_usage_spec_names_a_var(self):
+        # mise 2025.9.9 renders vars in `run` but passes `usage` verbatim, so
+        # a templated spec fails to parse as soon as the task gets arguments.
+        for name, task in self.tasks.items():
+            with self.subTest(task=name):
+                self.assertNotIn("{{", task.get("usage", ""))
 
     def test_no_task_reunifies_host_and_ui(self):
         variables = self.config["vars"]
