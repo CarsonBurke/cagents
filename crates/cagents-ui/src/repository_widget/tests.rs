@@ -9154,7 +9154,7 @@ fn the_editable_buffer_is_highlighted_by_the_grammar_its_name_names() {
 /// Both inputs the highlighter takes, checked where they are decided.
 #[test]
 fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
-    use cosmic::iced::advanced::text::Highlighter as _;
+    use cosmic::iced::{advanced::text::Highlighter as _, highlighter};
 
     /// Whether a token resolves to a grammar that actually colours
     /// `line`, rather than to the plain-text fallback that colours nothing.
@@ -9165,7 +9165,7 @@ fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
         };
         highlighter::Highlighter::new(&settings)
             .highlight_line(line)
-            .any(|(_, highlight)| highlight.color().is_some())
+            .any(|(_, highlight): (_, highlighter::Highlight)| highlight.color().is_some())
     }
 
     for (path, line) in [

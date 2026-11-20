@@ -31,7 +31,7 @@ use cosmic::iced::advanced::{
 };
 use cosmic::{
     Element,
-    iced::{self, Alignment, Font, Length, Task, highlighter, keyboard},
+    iced::{self, Alignment, Font, Length, Task, keyboard},
     widget::{self, markdown},
 };
 
@@ -10756,13 +10756,17 @@ fn editable_document_view<'a>(
             // Before `highlight_with`: `id` is only offered by the
             // not-yet-highlighted builder.
             .id(editor_focus_id(card))
-            .highlight_with::<highlighter::Highlighter>(
-                highlighter_settings(
-                    &document.source,
-                    runtime.syntax_theme,
-                    cosmic::theme::is_dark(),
-                ),
-                |highlight, _theme: &cosmic::Theme| highlight.to_format(),
+            .highlight_with::<crate::editor_highlight::Highlighter>(
+                crate::editor_highlight::Settings {
+                    code: highlighter_settings(
+                        &document.source,
+                        runtime.syntax_theme,
+                        cosmic::theme::is_dark(),
+                    ),
+                    markdown: document.markdown,
+                    font: runtime.editor_font,
+                },
+                crate::editor_highlight::format,
             )
             .font(runtime.editor_font)
             .find_matches(

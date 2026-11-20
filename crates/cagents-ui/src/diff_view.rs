@@ -385,6 +385,23 @@ impl Drop for SyntaxLease {
     }
 }
 
+impl SyntaxLease {
+    pub(crate) fn syntaxes(&self) -> &parsing::SyntaxSet {
+        &self.0
+    }
+}
+
+/// The syntect palette the `theme` setting selects for a light or dark
+/// application, from the same bundled set iced's highlighter loads.
+pub(crate) fn syntect_theme(
+    theme: crate::settings::EditorSyntaxTheme,
+    dark: bool,
+) -> &'static highlighting::Theme {
+    static THEMES: LazyLock<highlighting::ThemeSet> =
+        LazyLock::new(highlighting::ThemeSet::load_defaults);
+    &THEMES.themes[syntect_theme_name(theme, dark)]
+}
+
 pub(crate) fn syntax_lease() -> SyntaxLease {
     static CACHE: LazyLock<Arc<SyntaxCache>> = LazyLock::new(|| Arc::new(SyntaxCache::new(LINGER)));
     CACHE.acquire()
@@ -408,8 +425,6 @@ impl HighlightParser {
         theme: crate::settings::EditorSyntaxTheme,
         syntaxes: SyntaxLease,
     ) -> Self {
-        static THEMES: LazyLock<highlighting::ThemeSet> =
-            LazyLock::new(highlighting::ThemeSet::load_defaults);
         let syntax = syntaxes
             .0
             .find_syntax_by_token(token)
@@ -419,9 +434,8 @@ impl HighlightParser {
             syntaxes,
             parser,
             stack: parsing::ScopeStack::new(),
-            highlighters: [false, true].map(|dark| {
-                highlighting::Highlighter::new(&THEMES.themes[syntect_theme_name(theme, dark)])
-            }),
+            highlighters: [false, true]
+                .map(|dark| highlighting::Highlighter::new(syntect_theme(theme, dark))),
             styles: HashMap::new(),
         }
     }
