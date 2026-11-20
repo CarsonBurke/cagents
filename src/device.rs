@@ -305,6 +305,19 @@ impl Cancellation {
     fn is_cancelled(&self) -> bool {
         self.flag.load(std::sync::atomic::Ordering::Acquire)
     }
+    /// Waits up to `timeout` for cancellation, and says whether it came.
+    fn wait(&self, timeout: Duration) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut descriptor = libc::pollfd {
+            fd: self.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        // SAFETY: one valid pollfd, which outlives the call.
+        unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        self.is_cancelled()
+    }
     fn cancel(&self) {
         self.flag.store(true, std::sync::atomic::Ordering::Release);
         let _ = self.writer.shutdown(std::net::Shutdown::Both);
@@ -523,6 +536,7 @@ impl ConnectionContext {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(io::Error::other("device connection is closed"));
         }
+        evict_stopped(bridge);
         if let Some(bridge) = bridge.as_ref() {
             return Ok(bridge.transport.directory.join("daemon.sock"));
         }
@@ -558,8 +572,47 @@ impl ConnectionContext {
         Ok(path)
     }
 }
+/// Forgets a bridge whose worker has stopped, so the next connection builds
+/// another rather than being sent to a socket nothing accepts on.
+fn evict_stopped(bridge: &mut Option<Bridge>) {
+    if bridge.as_ref().is_some_and(|bridge| {
+        bridge.transport.cancelled.is_cancelled()
+            || bridge
+                .worker
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished)
+    }) {
+        drop(bridge.take());
+    }
+}
+/// Accept errors that pass on their own: the process or system is out of
+/// descriptors or memory for the moment, or a client gave up while queued.
+fn transient_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ECONNABORTED)
+    )
+}
+/// The longest a bridge waits before accepting again after a transient error.
+const ACCEPT_BACKOFF_LIMIT: Duration = Duration::from_secs(1);
+fn record_bridge_error(transport: &Transport, error: &io::Error) {
+    *transport
+        .last_error
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(format!(
+        "the local bridge could not accept a connection: {error}"
+    ));
+}
 fn run_bridge(listener: UnixListener, transport: Arc<Transport>) {
+    run_bridge_with(listener, transport, UnixListener::accept);
+}
+fn run_bridge_with(
+    listener: UnixListener,
+    transport: Arc<Transport>,
+    mut accept: impl FnMut(&UnixListener) -> io::Result<(UnixStream, std::os::unix::net::SocketAddr)>,
+) {
     let mut workers = Vec::new();
+    let mut backoff = Duration::ZERO;
     while !transport.cancelled.is_cancelled() {
         // Reap completed connections during normal operation, not just on close.
         let mut index = 0;
@@ -570,8 +623,9 @@ fn run_bridge(listener: UnixListener, transport: Arc<Transport>) {
                 index += 1;
             }
         }
-        match listener.accept() {
+        match accept(&listener) {
             Ok((stream, _)) => {
+                backoff = Duration::ZERO;
                 let owned = transport.clone();
                 if let Ok(worker) = thread::Builder::new().name("cagents-device-connection".into())
                     .spawn(move || {
@@ -588,7 +642,23 @@ fn run_bridge(listener: UnixListener, transport: Arc<Transport>) {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            // Streams already connected keep working; new connections wait
+            // until there is room for them again.
+            Err(error) if transient_accept_error(&error) => {
+                if backoff.is_zero() {
+                    tracing::warn!(device = transport.device.name, %error, "the device bridge could not accept a connection; retrying");
+                }
+                record_bridge_error(&transport, &error);
+                backoff = (backoff * 2).clamp(Duration::from_millis(10), ACCEPT_BACKOFF_LIMIT);
+                if transport.cancelled.wait(backoff) {
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(device = transport.device.name, %error, "the device bridge stopped accepting connections; the next connection starts another");
+                record_bridge_error(&transport, &error);
+                break;
+            }
         }
     }
     transport.cancelled.cancel();
@@ -1406,6 +1476,94 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!path.exists());
         assert!(context.socket_path().is_err());
+    }
+
+    fn emfile() -> io::Error {
+        io::Error::from_raw_os_error(libc::EMFILE)
+    }
+
+    #[test]
+    fn a_bridge_keeps_accepting_after_running_out_of_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(
+            Device {
+                name: "fixture".into(),
+                host: "must-not-connect".into(),
+                executable: "cagents".into(),
+            },
+            directory.path().to_path_buf(),
+        );
+        let path = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let mut failures = 3;
+        let owned = transport.clone();
+        let worker = thread::spawn(move || {
+            run_bridge_with(listener, owned, move |listener| {
+                if failures > 0 {
+                    failures -= 1;
+                    return Err(emfile());
+                }
+                // Counted rather than forwarded, so no SSH starts; the loop
+                // goes straight back to accepting.
+                let (stream, _) = listener.accept()?;
+                drop(stream);
+                accepted_tx.send(()).unwrap();
+                Err(io::ErrorKind::Interrupted.into())
+            })
+        });
+        let _client = UnixStream::connect(&path).unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!worker.is_finished());
+        assert!(!transport.cancelled.is_cancelled());
+        let error = transport.last_error.lock().unwrap().clone().unwrap();
+        assert!(error.contains(&emfile().to_string()), "{error}");
+        transport.cancelled.cancel();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_stopped_bridge_is_rebuilt_rather_than_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let transport = fixture_transport(
+            Device {
+                name: "fixture".into(),
+                host: "must-not-connect".into(),
+                executable: "cagents".into(),
+            },
+            directory.path().to_path_buf(),
+        );
+        let listener = UnixListener::bind(directory.path().join("daemon.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let owned = transport.clone();
+        let worker = thread::spawn(move || {
+            run_bridge_with(listener, owned, |_| {
+                Err(io::Error::from_raw_os_error(libc::EBADF))
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(transport.cancelled.is_cancelled());
+        assert!(transport.last_error.lock().unwrap().is_some());
+
+        let mut stopped = Some(Bridge {
+            transport: transport.clone(),
+            worker: Some(worker),
+        });
+        evict_stopped(&mut stopped);
+        assert!(stopped.is_none());
+
+        // A bridge still running stays.
+        let live = fixture_transport(transport.device.clone(), directory.path().join("live"));
+        let mut running = Some(Bridge {
+            transport: live,
+            worker: None,
+        });
+        evict_stopped(&mut running);
+        assert!(running.is_some());
     }
 
     #[test]
