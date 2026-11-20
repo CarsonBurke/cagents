@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -102,6 +103,12 @@ NOT_APPLICABLE = {
 # it is still covered by the inventory and must call its language's guard.
 EXTERNAL_GUARDED = {
     "rehearsal-startup-bind.c": "tests/rehearse_update_retry_bind.py",
+}
+
+OUTSIDE_GUARDED = {
+    "scripts/native-evidence-seed.py": "StateWriterContracts",
+    "scripts/rehearse_update_fault.py": "OutsideScriptContracts",
+    "scripts/run-redraw-latency": "OutsideScriptContracts and tests/redraw_latency.py",
 }
 
 
@@ -448,6 +455,17 @@ class Inventory(unittest.TestCase):
             self.assertEqual(discovered - declared, {"claude", "nested/provider.rb"},
                              "shebang providers must reach the explicit inventory check")
 
+    def test_standalone_fixture_writers_call_the_shared_helper(self):
+        for filename, contract in OUTSIDE_GUARDED.items():
+            with self.subTest(script=filename, contract=contract):
+                source = (ROOT / filename).read_text()
+                self.assertRegex(source, r"\brequire_fixture_home\s*\(?")
+                self.assertIn("fixture-home.sh" if filename.endswith("run-redraw-latency")
+                              else "fixture_home", source)
+        redraw = (ROOT / "scripts/run-redraw-latency").read_text()
+        self.assertRegex(redraw, r'>"\$output/\.cagents-fixture-root"')
+        self.assertRegex(redraw, r'>"\$sandbox/\.cagents-fixture-root"')
+
     def test_workspace_state_boundaries_call_the_python_helper(self):
         guarded = ("apply.py", "claude.py", "codex.py", "codex_check.py", "repositories.py", "generate.py")
         not_applicable = {
@@ -711,6 +729,244 @@ for _case, _variable, _provided_default in SECONDARY_CASES:
         setattr(SecondaryPathContracts,
                 "test_" + _case.filename.replace(".", "_").replace("-", "_")
                 + "_" + _variable.lower() + "_" + _scenario, _secondary_contract)
+
+
+class OutsideScriptContracts(Home):
+    """Standalone writers use invented files and harmless shell delegates only."""
+
+    def prepare_fault(self, *, marked=False, legacy=True):
+        self.fault_root = self.account
+        if marked:
+            (self.fault_root / MARKER).touch(mode=0o600)
+        if legacy:
+            (self.fault_root / ".rehearse-update").write_text(str(self.fault_root) + "\n")
+        prefix = self.fault_root / "home/.local/share/cagents-install"
+        self.candidate = prefix / "versions/contract"
+        (self.candidate / "bin").mkdir(parents=True)
+        (prefix / "current").symlink_to("versions/contract")
+        (self.fault_root / "logs").mkdir()
+        # A maintenance delegate only prints its environment. It cannot start
+        # an application, daemon, provider, compositor or native runner.
+        delegate = ('#!/bin/sh\nprintf "%s\\n" "$HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" '
+                    '"$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" '
+                    '"$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"\n')
+        for name in ("cagents", "cagentsd"):
+            target = self.candidate / "bin" / name
+            target.write_text(delegate)
+            target.chmod(0o700)
+        self.archive_input = self.base / "archive-input"
+        self.archive_input.mkdir()
+        name = "cagents-contract-x86_64-unknown-linux-gnu.tar.gz"
+        self.source_archive = self.archive_input / name
+        with tarfile.open(self.source_archive, "w:gz") as archive:
+            archive.add(self.candidate, arcname="cagents-contract")
+        digest = hashlib.sha256(self.source_archive.read_bytes()).hexdigest()
+        (self.archive_input / "SHA256SUMS").write_text(f"{digest}  {name}\n")
+        # Run a copied source/helper tree without -B. Refusal snapshots include
+        # that tree, so importing the guard must not create __pycache__ files.
+        self.fault_source = self.base / "source/scripts"
+        self.fault_source.mkdir(parents=True)
+        shutil.copy2(ROOT / "scripts/rehearse_update_fault.py", self.fault_source)
+        shutil.copy2(PYTHON_HELPER, self.fault_source)
+        shell = self.base / "source/tests/fixtures/lib"
+        shell.mkdir(parents=True)
+        shutil.copy2(SHELL_HELPER, shell)
+
+    def fault_command(self, *, archive=False, version="contract"):
+        script = self.fault_source / "rehearse_update_fault.py"
+        bootstrap = ("import runpy,sys;sys.path.insert(0,sys.argv[1]);"
+                     "script=sys.argv[2];sys.argv=sys.argv[2:];"
+                     "runpy.run_path(script,run_name='__main__')")
+        return [sys.executable, "-I", "-c", bootstrap, str(self.fault_source), str(script),
+                str(self.fault_root), version,
+                *(["--archive-dir", str(self.archive_input)] if archive else [])]
+
+    def assert_fault_refusal(self, path, *, archive=False, variable="HOME"):
+        before = snapshot(self.base)
+        result = self.run_command(self.fault_command(archive=archive))
+        self.assert_refusal(result, variable, path)
+        self.assertEqual(snapshot(self.base), before,
+                         "refusal must not mutate state or create source/helper bytecode")
+
+    def install_fault(self):
+        result = self.run_command(self.fault_command())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.candidate / "bin/cagentsd"
+
+    def outside(self):
+        path = self.base / "unmarked-output"
+        path.mkdir()
+        (path / "keep").write_text("invented account state\n")
+        return path
+
+    def test_fault_writer_refuses_bare_unmarked_root_without_bytecode_or_state_changes(self):
+        self.prepare_fault(legacy=False)
+        self.assert_fault_refusal(self.fault_root)
+
+    def test_fault_writer_unset_home_does_not_adopt_unmarked_explicit_root(self):
+        self.prepare_fault(legacy=False)
+        for variable in ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+            self.env.pop(variable, None)
+        self.assert_fault_refusal(self.fault_root)
+
+    def test_fault_writer_accepts_marked_root_and_creates_guarded_wrapper(self):
+        self.prepare_fault(marked=True)
+        daemon = self.install_fault()
+        self.assertIn("require_fixture_home HOME", daemon.read_text())
+        self.assertTrue(daemon.with_name("cagentsd-rehearsal-real").is_file())
+        result = self.run_command(["sh", str(daemon)])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.strip(), "forced rehearsal daemon startup failure")
+        self.assertTrue((self.fault_root / "logs/daemon-start-failure.txt").is_file())
+
+    def test_fault_archive_refuses_unmarked_root_before_mutation(self):
+        self.prepare_fault()
+        self.assert_fault_refusal(self.fault_root, archive=True)
+
+    def test_fault_archive_accepts_marked_root_with_read_only_unmarked_source(self):
+        self.prepare_fault(marked=True)
+        before = snapshot(self.archive_input)
+        result = self.run_command(self.fault_command(archive=True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destination = self.fault_root / "startup-fault-archive"
+        self.assertEqual(result.stdout.strip(), str(destination))
+        self.assertTrue((destination / self.source_archive.name).is_file())
+        self.assertEqual(snapshot(self.archive_input), before)
+
+    def test_fault_writer_preserves_stricter_legacy_root_and_version_checks(self):
+        self.prepare_fault(marked=True, legacy=False)
+        before = snapshot(self.base)
+        result = self.run_command(self.fault_command())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".rehearse-update", result.stderr)
+        self.assertEqual(snapshot(self.base), before)
+        (self.fault_root / ".rehearse-update").write_text(str(self.fault_root) + "\n")
+        before = snapshot(self.base)
+        result = self.run_command(self.fault_command(version="../outside"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("single version name", result.stderr)
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_fault_writer_refuses_symlinked_logs_before_candidate_mutation(self):
+        self.prepare_fault(marked=True)
+        outside = self.outside()
+        (self.fault_root / "logs").rmdir()
+        (self.fault_root / "logs").symlink_to(outside, target_is_directory=True)
+        self.assert_fault_refusal(outside)
+
+    def test_fault_writer_refuses_symlinked_failure_receipt(self):
+        self.prepare_fault(marked=True)
+        target = self.outside() / "receipt.txt"
+        (self.fault_root / "logs/daemon-start-failure.txt").symlink_to(target)
+        self.assert_fault_refusal(target)
+
+    def test_fault_writer_refuses_symlinked_fault_log(self):
+        self.prepare_fault(marked=True)
+        target = self.outside() / "fault.txt"
+        (self.fault_root / "logs/startup-fault.txt").symlink_to(target)
+        self.assert_fault_refusal(target)
+
+    def test_fault_archive_refuses_symlinked_output_before_creating_any_archive(self):
+        self.prepare_fault(marked=True)
+        outside = self.outside()
+        (self.fault_root / "startup-fault-archive").symlink_to(outside, target_is_directory=True)
+        self.assert_fault_refusal(outside, archive=True)
+
+    def test_fault_writer_refuses_symlinked_candidate_before_mutation(self):
+        self.prepare_fault(marked=True)
+        outside = self.outside()
+        shutil.rmtree(self.candidate)
+        self.candidate.symlink_to(outside, target_is_directory=True)
+        self.assert_fault_refusal(outside)
+
+    def test_generated_fault_wrapper_refuses_removed_marker_before_startup(self):
+        self.prepare_fault(marked=True)
+        daemon = self.install_fault()
+        (self.fault_root / MARKER).unlink()
+        before = snapshot(self.base)
+        self.assert_refusal(self.run_command(["sh", str(daemon)]), "HOME", self.fault_root)
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_generated_fault_wrapper_maintenance_uses_only_marked_fixture_paths(self):
+        self.prepare_fault(marked=True)
+        daemon = self.install_fault()
+        # The inherited caller paths are unmarked; the wrapper explicitly
+        # supplies its own marked fixture paths before harmless delegation.
+        before = snapshot(self.base)
+        result = self.run_command(["sh", str(daemon), "--version"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        home = self.fault_root / "home"
+        expected = [home, home / ".claude", home / ".codex", home / ".local/share",
+                    home / ".config", home / ".cache", home / ".local/state", self.fault_root / "rt"]
+        self.assertEqual(result.stdout.splitlines(), [str(path) for path in expected])
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_generated_fault_wrapper_refuses_symlinked_provider_home_before_delegation(self):
+        self.prepare_fault(marked=True)
+        daemon = self.install_fault()
+        outside = self.outside()
+        (self.fault_root / "home/.claude").symlink_to(outside, target_is_directory=True)
+        before = snapshot(self.base)
+        result = self.run_command(["sh", str(daemon), "--version"])
+        self.assert_refusal(result, "CLAUDE_CONFIG_DIR", outside)
+        self.assertEqual(snapshot(self.base), before)
+
+    def redraw_startup(self, *, marked=True, unset_caller=False, output="marked", symlink=None):
+        # Execute the actual runner's environment/guard function in isolation.
+        # Top-level build, UI, cleanup and workload commands are never loaded.
+        source = (ROOT / "scripts/run-redraw-latency").read_text()
+        match = re.search(r"(?ms)^in_sandbox\(\) \(\n.*?^\)\n", source)
+        self.assertIsNotNone(match, "the runner must expose its guarded sandbox command boundary")
+        sandbox = self.home / "redraw-sandbox"
+        base = sandbox / "1"
+        (base / "home").mkdir(parents=True)
+        if marked:
+            (sandbox / MARKER).touch(mode=0o600)
+        if symlink:
+            (base / "home" / symlink).symlink_to(self.account, target_is_directory=True)
+        if unset_caller:
+            for variable in ("HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+                self.env.pop(variable, None)
+        output_path = sandbox / "result.json" if output == "marked" else self.account / "result.json"
+        self.env["CAGENTS_LATENCY_OUTPUT"] = str(output_path)
+        if output == "unset":
+            self.env.pop("CAGENTS_LATENCY_OUTPUT")
+        script = ('. "$1"\nsandbox=$2\nrun=1\nno_shims=$PATH\n' + match.group(0)
+                  + '\nin_sandbox sh -c \'printf "%s\\n" "$HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME"\'\n')
+        before = snapshot(self.base)
+        result = self.run_command(["sh", "-c", script, "redraw-fixture-startup", str(SHELL_HELPER), str(sandbox)])
+        if not marked:
+            self.assert_refusal(result, "HOME", base / "home")
+        elif symlink:
+            self.assert_refusal(result, "CLAUDE_CONFIG_DIR" if symlink == ".claude" else "CODEX_HOME", self.account)
+        elif output != "marked":
+            self.assert_refusal(result, "CAGENTS_LATENCY_OUTPUT", "<unset>" if output == "unset" else output_path)
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(),
+                             [str(base / "home"), str(base / "home/.claude"), str(base / "home/.codex")])
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_redraw_startup_refuses_unmarked_sandbox_before_command_execution(self):
+        self.redraw_startup(marked=False)
+
+    def test_redraw_startup_accepts_marked_sandbox_with_harmless_command(self):
+        self.redraw_startup()
+
+    def test_redraw_startup_supplies_marked_provider_paths_when_caller_variables_are_unset(self):
+        self.redraw_startup(unset_caller=True)
+
+    def test_redraw_startup_refuses_unmarked_output_before_command_execution(self):
+        self.redraw_startup(output="unmarked")
+
+    def test_redraw_startup_refuses_unset_output_before_command_execution(self):
+        self.redraw_startup(output="unset")
+
+    def test_redraw_startup_refuses_symlinked_claude_home(self):
+        self.redraw_startup(symlink=".claude")
+
+    def test_redraw_startup_refuses_symlinked_codex_home(self):
+        self.redraw_startup(symlink=".codex")
 
 
 if __name__ == "__main__":

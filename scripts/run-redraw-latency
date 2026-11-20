@@ -4,6 +4,7 @@ set -eu
 umask 077
 caller_cwd=$PWD
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$root/tests/fixtures/lib/fixture-home.sh"
 cd "$root"
 usage() {
     printf '%s\n' 'Usage: sh scripts/run-redraw-latency [NEW_PRIVATE_OUTPUT_DIRECTORY]' \
@@ -54,8 +55,10 @@ if [ "$#" -eq 1 ]; then
     mkdir -m 700 -- "$output"
     output=$(CDPATH= cd -- "$output" && pwd)
 else
-    output=$(mktemp -d /tmp/cagents-redraw-latency.XXXXXXXX)
+    output=$(mktemp -d "${TMPDIR:-/tmp}/cagents-redraw-latency.XXXXXXXX")
 fi
+printf '%s\n' 'Fixture provider and app state stays below this root.' >"$output/.cagents-fixture-root"
+require_fixture_home CAGENTS_LATENCY_OUTPUT "$output"
 # Keep the three implementation feature graphs isolated, as in run-development.
 # Use Cargo's executable paths: build.target can come from config as well as
 # the environment, and a guessed target/release path can select an older build.
@@ -65,7 +68,8 @@ cli=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" cagents \
     --locked --release --no-default-features --features development,host --bin cagentsd >/dev/null
 ui=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" cagents-ui \
     --locked --release -p cagents-ui --features development,latency-harness --bin cagents-ui)
-sandbox=$(mktemp -d /tmp/cagents-latency-runtime.XXXXXXXX)
+sandbox=$(mktemp -d "${TMPDIR:-/tmp}/cagents-latency-runtime.XXXXXXXX")
+printf '%s\n' 'Fixture provider and app state stays below this root.' >"$sandbox/.cagents-fixture-root"
 # PATH without mise's shims, which re-execute forever under a moved HOME.
 no_shims=
 rest=$PATH:
@@ -84,6 +88,16 @@ in_sandbox() (
     base=$sandbox/$run
     export HOME=$base/home XDG_RUNTIME_DIR=$base/runtime XDG_CONFIG_HOME=$base/config
     export XDG_DATA_HOME=$base/data XDG_CACHE_HOME=$base/cache XDG_STATE_HOME=$base/state
+    export CLAUDE_CONFIG_DIR=$base/home/.claude CODEX_HOME=$base/home/.codex
+    require_fixture_home HOME
+    require_fixture_home CLAUDE_CONFIG_DIR
+    require_fixture_home CODEX_HOME
+    require_fixture_home XDG_RUNTIME_DIR
+    require_fixture_home XDG_CONFIG_HOME
+    require_fixture_home XDG_DATA_HOME
+    require_fixture_home XDG_CACHE_HOME
+    require_fixture_home XDG_STATE_HOME
+    require_fixture_home CAGENTS_LATENCY_OUTPUT
     PATH=$no_shims
     exec "$@"
 )
@@ -102,6 +116,14 @@ export RUST_LOG=off
 run=1
 while [ "$run" -le 5 ]; do
     base=$sandbox/$run
+    require_fixture_home HOME "$base/home"
+    require_fixture_home CLAUDE_CONFIG_DIR "$base/home/.claude"
+    require_fixture_home CODEX_HOME "$base/home/.codex"
+    require_fixture_home XDG_RUNTIME_DIR "$base/runtime"
+    require_fixture_home XDG_CONFIG_HOME "$base/config"
+    require_fixture_home XDG_DATA_HOME "$base/data"
+    require_fixture_home XDG_CACHE_HOME "$base/cache"
+    require_fixture_home XDG_STATE_HOME "$base/state"
     mkdir -p -m 700 "$base/home" "$base/runtime" "$base/config" "$base/data" "$base/cache" "$base/state"
     active_runtime=$base/runtime
     export CAGENTS_LATENCY_RUN=$run CAGENTS_LATENCY_OUTPUT=$output/run-$run.json
