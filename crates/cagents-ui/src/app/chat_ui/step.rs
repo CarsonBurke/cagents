@@ -472,8 +472,8 @@ impl Runtime {
         // no time of its own.
         if chat::is_stopped_notice(&item.content) {
             return disclosure::row(
-                chat::STOPPED.to_string(),
-                chat::STOPPED.to_string(),
+                chat::STOPPED_NOTICE.to_string(),
+                chat::STOPPED_NOTICE.to_string(),
                 Icon::Ended,
                 None,
                 None,

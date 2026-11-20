@@ -1549,7 +1549,7 @@ pub fn remote_for_repository(
             .fetch_url
             .as_deref()
             .and_then(remote_repository_key)
-            .is_some_and(|candidate| candidate == *key)
+            .is_some_and(|candidate| candidate.same_repository(key))
     });
     let first = matching.next()?;
     Some(
@@ -4032,11 +4032,11 @@ mod tests {
 
     #[test]
     fn remote_for_repository_prefers_origin_among_matching_remotes() {
-        let key = GitHubRepoKey::new("github.com", None, "acme", "widgets").unwrap();
+        let key = GitHubRepoKey::new("github.com", None, "Acme", "Widgets").unwrap();
         let remotes = [
-            remote("upstream", "git@github.com:acme/widgets.git"),
+            remote("upstream", "git@github.com:ACME/widgets.git"),
             remote("fork", "https://github.com/someone/widgets.git"),
-            remote("origin", "https://github.com/acme/widgets"),
+            remote("origin", "https://github.com/acme/WIDGETS"),
         ];
         assert_eq!(
             remote_for_repository(&remotes, &key).as_deref(),
@@ -4064,6 +4064,35 @@ mod tests {
             ),
             None,
             "a remote without a fetch URL cannot be fetched from",
+        );
+    }
+
+    #[test]
+    fn remote_for_repository_keeps_host_port_and_repository_boundaries() {
+        let key = GitHubRepoKey::new("github.example", Some(8443), "Acme", "Widgets").unwrap();
+        for url in [
+            "https://other.example:8443/acme/widgets.git",
+            "https://github.example/acme/widgets.git",
+            "https://github.example:9443/acme/widgets.git",
+            "https://github.example:8443/another/widgets.git",
+            "https://github.example:8443/acme/another.git",
+        ] {
+            assert_eq!(
+                remote_for_repository(&[remote("origin", url)], &key),
+                None,
+                "{url} must not match {key:?}",
+            );
+        }
+        assert_eq!(
+            remote_for_repository(
+                &[remote(
+                    "origin",
+                    "ssh://git@github.example:8443/acme/widgets.git"
+                )],
+                &key,
+            )
+            .as_deref(),
+            Some("origin"),
         );
     }
 

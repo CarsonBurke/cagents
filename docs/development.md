@@ -678,6 +678,20 @@ not passed over by builds that need one. The shares are the lock files
 `/var/tmp/cagents-cargo.lock`, `.1`, `.2`, ... (`CAGENTS_BUILD_LOCK` names
 the first), and builds offloaded to the host take them too.
 
+Builds rarely reach their peaks together: with every share on fw16 held,
+builds' anonymous memory came to about a third of their shares' on average and
+never past 18 GiB of the 32. So two more shares follow the host's count
+(`CAGENTS_BUILD_EXTRA_SHARES` sets how many; none where `CAGENTS_BUILD_SLOTS`
+is set, as for a lock used as a mutex). A build takes extra shares only when
+they complete what it needs, and only while there is memory for it: its own
+shares' memory and 4 GiB for each extra share another build holds must fit
+both in `MemAvailable` less 8 GiB and in what the build slice's `MemoryHigh`
+leaves above its builds' anonymous memory, and memory pressure (PSI "some"
+over 10 seconds) must be at most 1%. Otherwise it waits at the head of the
+queue as for any share, says so, and those behind it wait too. The extra
+shares overcommit the slice's `MemoryHigh`, below: where builds run in scopes,
+it throttles builds whose peaks coincide after all.
+
 A build with nothing to compile does not wait in that queue. When its shares
 are not free at once, a `build`, `check`, `clippy`, `--no-run` or the build
 phase of `test`, `bench` or `run` first runs as a probe: Cargo with one job,
@@ -791,8 +805,15 @@ a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 
 GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
-at most once every two minutes and checks every new first-parent commit in
-order. Its first run checks the current tip. Each commit gets five separate
+at most once every two minutes and checks its newest commit whenever it has
+moved. A passing tip vouches for the commits merged before it: for one of them
+to hide a break, a later one would have to undo it. When the tip fails after a
+passing check, the sentinel bisects the first-parent commits in between for
+each lane the tip fails, checking only that lane, and comments on the issue
+the earliest commit at which each fails. It does not fetch again until it has,
+so a bisection that cannot finish, such as on a dirty checkout or a comment
+GitHub keeps refusing, holds the sentinel until it is fixed. Each tip it checks
+gets five separate
 `scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 `-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
@@ -808,7 +829,7 @@ the one main is held to. Its logs hold Cargo's rendered diagnostics, and
 `logs/SHA-LANE-warnings.log` the counted warnings, each once; for a lane that
 compiled, the issue shows those rather than the log's tail.
 
-Once the newest commit it checked compiles, warnings or not, the sentinel also
+Once the newest commit it checked, the tip it last saw, compiles, warnings or not, the sentinel also
 builds the three executables [native evidence](#native-evidence) runs for that
 commit and keeps
 them under `builds/` in its state directory, for the six newest such commits,
@@ -995,10 +1016,14 @@ Each slot's build output is bounded by its lease. Cargo removes nothing, and
 every feature lane, profile and kind of target of the `cagents` crate keeps
 an incremental session of 1–6 GiB, so slots on fw16 grew to about 97 GiB
 each, 40–60 GiB of it incremental state. Once a lease holds a slot, and no
-earlier command of the slot's is still running, it keeps the incremental
-state of the crates the slot compiled most recently until they fill
-`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses it
-included, and moves the rest out of the target; with `0` it keeps none. Every
+earlier command of the slot's is still running, it first moves out each
+crate's superseded sessions. Rustc starts a compile from the crate's newest
+finished session and removes the older ones only when the crate next
+compiles, so a crate compiled twice keeps a session nothing reads again; on
+fw16 removing them freed about 39% of the slots' incremental state. It then keeps the
+incremental state of the crates the slot compiled most recently until they
+fill `CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses
+it included, and moves the rest out of the target; with `0` it keeps none. Every
 6 hours it also moves out compiled units no build has looked at for 3 days,
 such as old versions after a dependency update. Cargo reads the fingerprint
 of every unit in a build's graph, even one it doesn't compile, so a unit is
@@ -2087,7 +2112,7 @@ Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
 
-Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.6 GiB. A clean checkout of a main commit that the [main build sentinel](#watching-main-after-merges) has built takes its executables instead, without compiling, so build `before` from a recent `origin/main`. `build SIDE CHECKOUT --executables DIR` takes executables already built elsewhere from exactly that checkout, as the remote route below does. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+Build before taking a native slot, and never wait for Cargo while holding one: other native sessions queue behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.6 GiB. A clean checkout of a main commit that the [main build sentinel](#watching-main-after-merges) has built takes its executables instead, without compiling, so build `before` from the newest `origin/main` tip it checked. `build SIDE CHECKOUT --executables DIR` takes executables already built elsewhere from exactly that checkout, as the remote route below does. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
 export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
@@ -2293,8 +2318,20 @@ terminal. A session detached by an explicit `start` keeps running until
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
-stops the session even when a step fails, and brings back the shots. The
-individual commands work too, for a session you drive step by step:
+stops the session even when a step fails, and brings back the shots.
+
+`drive` passes its arguments to the host's `niri-harness`, so a steps file
+uses that harness's commands: `drive hover X,Y` moves the pointer (there is no
+`move`). `drive wait TEXT` and `drive click TEXT` match one target that
+`drive observe` reads off the screen. When the harness reads the screen by
+OCR, as it does when the app's accessibility tree is unreachable, a title of
+several words, such as a chat's in the sidebar, can read as one target per
+word. So wait for and click one distinctive word of it, such as
+`Long` for a chat titled "Long chat", or click the coordinates `drive --json
+observe` gives. When a wait might fail, save `drive observe` and a `shot`
+before the step exits, so the failed run shows what was on screen.
+
+The individual commands work too, for a session you drive step by step:
 
 ```sh
 export CAGENTS_EVIDENCE_REMOTE=fw16 CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
@@ -2318,15 +2355,19 @@ scripts/native-evidence stop
   ignored goes to the host, so make sure a stray file, such as a local `.env`,
   is ignored or removed before you build.
 - **Builds.** A main commit the host's
-  [sentinel](#watching-main-after-merges) has built, such as a recent
-  `origin/main`, usually compiles nothing: the host copies its executables.
+  [sentinel](#watching-main-after-merges) has built compiles nothing: the
+  host copies its executables. It builds only the tips it checks, usually one
+  commit in each burst of merges, and keeps the six newest; `ls
+  ~/.local/state/cagents-main-sentinel/builds` on the host lists them. If the
+  commit you started from isn't one, capture the before side from the nearest
+  of them instead, provided nothing merged between the two touches what your
+  change affects, and name that revision as the before side.
   Any other checkout builds through its own `scripts/cargo-gate`, in its own
   build slot and target as `mise run dev` does, so what you already built for
   the change is reused while that slot is free; the three executables then go from here to the task,
   sent as differences from the task's previous ones. Any other revision builds
   in a shared slot on the host. Capture the before side at the start of the
-  work, while the main commit you started from is among the sentinel's recent
-  builds.
+  work, while the tip you capture it from is still among the six.
 - **One tool.** Both sides run the `native-evidence` and synthetic provider of
   the checkout you run it from, copied to `.worktrees/cev-TASK-tool`, as a local
   run would. When a side is that checkout, as `--after .` is, it uses this

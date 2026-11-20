@@ -5757,6 +5757,107 @@ fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after
 }
 
 #[test]
+fn provider_exit_stops_pending_claude_file_edits_in_cached_and_fresh_queries() {
+    use super::super::FileChangeReply;
+    for (name, input) in [
+        (
+            "Edit",
+            serde_json::json!({"file_path":"a.rs","old_string":"old","new_string":"new"}),
+        ),
+        (
+            "Write",
+            serde_json::json!({"file_path":"a.rs","content":"new\n"}),
+        ),
+    ] {
+        let call = serde_json::json!({
+            "type":"assistant", "uuid":"call", "message":{
+                "id":"message", "role":"assistant", "content":[{
+                    "type":"tool_use", "id":"edit", "name":name, "input":input
+                }]
+            }
+        });
+        let (_directory, handle) = claude_initialization_pipe(&format!(
+            "print(json.dumps({{'type': 'control_response', 'response': {{'subtype': 'success', 'request_id': request['request_id'], 'response': {{}}}}}}), flush=True)\n\
+             print({call:?}, flush=True)\n\
+             json.loads(sys.stdin.readline())\n\
+             sys.exit(7)\n",
+            call = call.to_string(),
+        ));
+        // Keep the provider blocked until its running edit has been published.
+        let running = until(&handle, |snapshot| {
+            snapshot.file_changes.files.len() == 1 && snapshot.file_changes.files[0].pending == 1
+        });
+        let file = &running.file_changes.files[0];
+        let Some(FileChangeReply::Patches(before)) = handle
+            .file_query(&Command::LoadFileChangePatches {
+                request_id: 1,
+                key: file.key.clone(),
+                cursor: None,
+                revision: file.revision,
+            })
+            .unwrap()
+        else {
+            panic!("expected running patch");
+        };
+        assert!(before.error.is_none());
+        assert_eq!(before.patches[0].status, ToolStatus::Running);
+        handle.command(Command::Refresh).unwrap();
+        let stopped = until(&handle, |snapshot| snapshot.exited && handle.is_completed());
+        handle.close().unwrap();
+        assert!(
+            stopped.items.iter().any(|item| matches!(
+                item.content,
+                ItemContent::Changes {
+                    status: ToolStatus::Stopped,
+                    ..
+                }
+            )),
+            "the transcript must stop the {name} call"
+        );
+        let Some(FileChangeReply::Files(fresh)) = handle
+            .file_query(&Command::LoadFileChanges {
+                request_id: 2,
+                after: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected retained file list");
+        };
+        let Some(FileChangeReply::Patches(after)) = handle
+            .file_query(&Command::LoadFileChangePatches {
+                request_id: 3,
+                key: file.key.clone(),
+                cursor: None,
+                revision: file.revision,
+            })
+            .unwrap()
+        else {
+            panic!("expected retained patch");
+        };
+        assert!(after.error.is_none());
+        assert_eq!(after.patches[0].diff, before.patches[0].diff);
+        let published = &stopped.file_changes.files[0];
+        let queried = &fresh.files[0];
+        assert_eq!(
+            (
+                (published.pending, published.failed, published.succeeded),
+                (queried.pending, queried.failed, queried.succeeded),
+                after.patches[0].status,
+            ),
+            ((0, 1, 0), (0, 1, 0), ToolStatus::Stopped),
+            "provider exit must stop {name} in the published summary, fresh list and patch"
+        );
+        assert_eq!(stopped.file_changes.files, fresh.files);
+        assert_eq!(stopped.file_changes.revision, fresh.revision);
+        assert!(fresh.revision > running.file_changes.revision);
+        assert!(queried.revision > file.revision);
+        assert_eq!(after.revision, queried.revision);
+        assert_eq!(fresh.total_files, 1);
+        assert_eq!(fresh.applied_files, 0);
+    }
+}
+
+#[test]
 fn file_changes_cache_queries_remain_available_after_provider_exit() {
     struct CacheFixture;
     impl Adapter for CacheFixture {

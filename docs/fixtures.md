@@ -176,9 +176,9 @@ evidence cli --json agent spawn --provider claude --model haiku --surface chat \
 # The turn has replayed once its answer is in the transcript.
 evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/projects/*/*.jsonl && exit 0; sleep 1; done; exit 1'
 
-# Open the chat from its sidebar row.
-evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
-evidence drive click 'Locale cache work' >/dev/null
+# Open the chat from its sidebar row, by one word of its title.
+evidence drive wait 'Locale' --timeout 30 >/dev/null
+evidence drive click 'Locale' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
 evidence drive hover 1,1 >/dev/null
 # Open the pane's inspector (Ctrl+Shift+I) unless it already is.
@@ -388,6 +388,30 @@ output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's images
 separate; the app's responsive inspector state is preserved. Single-word OCR
 locators tolerate split text runs. The unique `Retry` locator targets the existing
 **Retry save** button even when OCR splits that label into two boxes.
+
+## A copy whose text changed
+
+A message's Copy reads its whole text from the daemon's transcript store,
+which refuses the read if the item changed after the snapshot the app copied
+from. That happens only when a provider rewrites the item within the few
+milliseconds a read takes, so development builds under `native-evidence`
+refuse every such read as changed while
+`home/.config/fixture-text-copy-changed` exists in `CAGENTS_EVIDENCE_FIXTURE`.
+The store's sources stay as they are, so the app has nothing newer to read
+and shows the refusal in the chat's error line. Remove the file and the same
+Copy succeeds. Only the conversation's own items are refused; a subagent's
+copies are unaffected.
+
+```sh
+scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-changed'
+# Click a finished reply's Copy, and capture the error line.
+scripts/native-evidence env rm '{fixture}/home/.config/fixture-text-copy-changed'
+```
+
+This covers the store noticing the change first. When the app's snapshot sees
+it first, the app reads the item again before the store answers; the unit
+tests in `text_copy::tests` cover that order. The fault is absent from builds
+without the `development` feature, and contacts no provider.
 
 ## An offline Codex
 
@@ -823,8 +847,8 @@ python3 tests/fixtures/native-retired-ownership.py \
     ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
 ```
 
-The helper recognizes only schema 22 shared views or schema 23 to 28
-normalized panes with descriptor format 1. Schemas 24 to 28 add tables beside
+The helper recognizes only schema 22 shared views or schema 23 to 29
+normalized panes with descriptor format 1. Schemas 24 to 29 add tables beside
 those panes without changing their columns. It requires one current committed Claude pane
 for that exact thread, matching ownership source and proof, and a completed
 retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
@@ -1104,9 +1128,24 @@ PR merges to remove the task's checkouts from the host.
 speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
 does, with its configuration options for model, thinking level and mode and
 its older `models` and `modes` lists. Run as `muse...` or with
-`FAKE_ACP_SHAPE=muse`, it offers Muse's model and mode options instead, with
-no thinking level. It ignores its arguments, so a launch recipe written for
-the real agent runs it unchanged. It contacts no model, account or network.
+`FAKE_ACP_SHAPE=muse`, it copies Muse 1.4.24 instead: its four modes, a
+`-contributor` model beside each ordinary one, a reasoning option only on
+`muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
+soon as a session opens, and usage with no context size. It ignores its
+arguments, so a launch recipe written for the real agent runs it unchanged.
+It contacts no model, account or network.
+
+In the Muse shape, three account commands answer the way `muse` does, so the
+fixture can stand in for `muse-upstream` on a fixture `PATH`:
+
+| Command | The fixture |
+| --- | --- |
+| `usage --json` | prints Muse's no-allowance report, or exits 1 with `not logged in` when signed out |
+| `logout` | signs out: every later `session/new`, `session/load` and prompt answers Muse's `log in to Muse before opening a session` |
+| `login` | prints a made-up device code, waits `FAKE_ACP_LOGIN_SECONDS` (default 2), and signs back in |
+
+Signing out is a `signed-out` file under `FAKE_ACP_STATE`, so it lasts
+across processes until `login`.
 
 It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
 replays a conversation from an earlier process and `session/list` finds it.

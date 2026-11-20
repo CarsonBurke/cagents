@@ -176,7 +176,7 @@ impl Cagents {
             || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
             || self.device_ui.open
-            || self.chat_ui.image_viewer.is_some()
+            || self.chat_ui.image_dialog.is_some()
             || self.terminal_paste.is_some()
             || self.session_recovery.open()
     }

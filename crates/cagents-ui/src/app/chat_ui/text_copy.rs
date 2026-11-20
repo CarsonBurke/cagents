@@ -1,6 +1,9 @@
 //! Logical message Copy reads canonical source pages off the UI thread.
 use super::*;
 
+pub(super) const UNAVAILABLE: &str =
+    "This text is unavailable in the local copy cache. Open the provider transcript to recover it.";
+
 /// All production UI surfaces share one clipboard intent context. A request
 /// owns this context so async task polling never depends on thread-local state.
 #[derive(Clone, Default)]
@@ -64,9 +67,13 @@ pub struct Request {
     handle: Arc<ClientHandle>,
     source: chat::TextCopySource,
     conversation_revision: u64,
+    /// The part of a step this copies, or `None` for a whole message.
+    part: Option<CopyPart>,
     /// What the clipboard holds ahead of the source's text, such as the
     /// command a step's whole copy starts with.
     prefix: String,
+    /// Whether this already read the item again after its text changed.
+    retried: bool,
 }
 
 #[derive(Clone)]
@@ -97,7 +104,94 @@ impl FailureRequest {
     }
 }
 
+/// The item of `snapshot` whose whole text `source` copies. Its text may
+/// have grown since `source` was captured.
+fn item_with_source<'a>(
+    snapshot: &'a Snapshot,
+    source: &chat::TextCopySource,
+) -> Option<&'a chat::Item> {
+    let (items, sources) = match &source.scope {
+        chat::TextCopyScope::Conversation => {
+            (&snapshot.items, &snapshot.text_copy_sources.conversation)
+        }
+        chat::TextCopyScope::Subagent { id } => (
+            &snapshot
+                .subagents
+                .iter()
+                .find(|agent| agent.id == *id)?
+                .items,
+            snapshot.text_copy_sources.children.get(id)?,
+        ),
+    };
+    let index = sources.iter().position(|candidate| {
+        candidate
+            .as_ref()
+            .is_some_and(|current| compatible(source, current))
+    })?;
+    items.get(index).map(AsRef::as_ref)
+}
+
 impl Request {
+    fn read(self, target: Target, id: String) -> Task<Message> {
+        let handle = self.handle.clone();
+        let source = self.source.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChatUi(Action::MessageCopied(target, id, self, result))
+        })
+    }
+
+    /// This copy of item `id` again, from what `snapshot` now holds for it,
+    /// or `None` once the item or its whole text is gone.
+    fn reread(&self, snapshot: &Snapshot, id: &str) -> Option<Self> {
+        let (items, sources, index) = match &self.source.scope {
+            // The store keeps a conversation item's cache and token when it
+            // rewrites the item. Its ID is no key: a long message's parts and
+            // a provider item can share one.
+            chat::TextCopyScope::Conversation => {
+                let sources = &snapshot.text_copy_sources.conversation;
+                let index = sources.iter().position(|source| {
+                    source.as_ref().is_some_and(|source| {
+                        source.cache == self.source.cache && source.token == self.source.token
+                    })
+                })?;
+                (&snapshot.items, sources, index)
+            }
+            // A rewritten child item gets a new source, so it is found by ID.
+            chat::TextCopyScope::Subagent { id: child } => {
+                let items = &snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| agent.id == *child)?
+                    .items;
+                let index = items.iter().position(|item| item.id == id)?;
+                (
+                    items,
+                    snapshot.text_copy_sources.children.get(child)?,
+                    index,
+                )
+            }
+        };
+        let source = sources
+            .get(index)?
+            .clone()
+            .filter(|source| source.scope == self.source.scope)?;
+        let prefix = match &self.part {
+            Some(part) => step_copy_prefix(part, &items[index].content)?,
+            None => String::new(),
+        };
+        Some(Self {
+            source,
+            conversation_revision: snapshot.text_copy_sources.conversation_revision,
+            prefix,
+            retried: true,
+            ..self.clone()
+        })
+    }
+
     fn snapshot_is_current(&self, snapshot: &Snapshot) -> bool {
         match &self.source.scope {
             // Paging and verified appends do not revoke the captured prefix.
@@ -131,10 +225,15 @@ impl Request {
             handle,
             source,
             conversation_revision,
+            part: None,
             prefix: String::new(),
+            retried: false,
         }
     }
-    pub(super) fn with_prefix(mut self, prefix: &str) -> Self {
+    /// The same request as the copy of a step's `part`, with the prefix
+    /// that part puts ahead of its source.
+    pub(super) fn for_step(mut self, part: CopyPart, prefix: &str) -> Self {
+        self.part = Some(part);
         self.prefix = prefix.into();
         self
     }
@@ -296,12 +395,14 @@ impl Cagents {
         }
     }
 
+    /// Copies the whole text of item `id`, or of its step `part`, from
+    /// `source`.
     pub(super) fn start_message_copy(
         &mut self,
         target: Target,
         id: String,
+        part: Option<CopyPart>,
         source: Option<chat::TextCopySource>,
-        prefix: String,
     ) -> Task<Message> {
         let context = current_context();
         let intent = context.advance();
@@ -309,8 +410,22 @@ impl Cagents {
             return Task::none();
         };
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
-            runtime.error = Some("This text is unavailable in the local copy cache. Open the provider transcript to recover it.".into());
+            runtime.error = Some(UNAVAILABLE.into());
             return Task::none();
+        };
+        let prefix = match &part {
+            // By its source: a step's ID may also be a long message's
+            // generated part ID.
+            Some(part) => match item_with_source(&runtime.snapshot, &source)
+                .and_then(|item| step_copy_prefix(part, &item.content))
+            {
+                Some(prefix) => prefix,
+                None => {
+                    runtime.error = Some(UNAVAILABLE.into());
+                    return Task::none();
+                }
+            },
+            None => String::new(),
         };
         let Some(handle) = runtime.handle().cloned() else {
             runtime.error =
@@ -323,15 +438,11 @@ impl Cagents {
             handle: handle.clone(),
             source: source.clone(),
             conversation_revision: runtime.snapshot.text_copy_sources.conversation_revision,
+            part,
             prefix,
+            retried: false,
         };
-        cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-            Message::ChatUi(Action::MessageCopied(target, id, request, result))
-        })
+        request.read(target, id)
     }
 
     pub(super) fn finish_message_copy(
@@ -361,24 +472,48 @@ impl Cagents {
             chat::TextCopyScope::Conversation => runtime.selected_subagent.is_none(),
             chat::TextCopyScope::Subagent { id } => runtime.selected_subagent.as_ref() == Some(id),
         };
-        if !scope_is_current || !request.snapshot_is_current(&current_snapshot) {
+        if !scope_is_current {
             return Task::none();
+        }
+        // The text changed under the read, whether this client saw it first or
+        // the store did. Read the item once more as it is now, rather than
+        // dropping the copy without a word. A source the store refused, and
+        // this client has nothing newer for, would only be refused again.
+        let refused = result
+            .as_ref()
+            .is_err_and(|error| error == chat::TEXT_COPY_CHANGED);
+        if refused || !request.snapshot_is_current(&current_snapshot) {
+            // It may have been accepted once, before its write found the
+            // source changed.
+            if runtime
+                .copied
+                .as_ref()
+                .is_some_and(|(copied, _)| *copied == id)
+            {
+                runtime.copied = None;
+            }
+            return match request.reread(&current_snapshot, &id) {
+                Some(reread)
+                    if !request.retried && !(refused && reread.source == request.source) =>
+                {
+                    reread.read(target, id)
+                }
+                Some(_) => {
+                    runtime.error = Some(chat::TEXT_COPY_CHANGED.into());
+                    Task::none()
+                }
+                None => {
+                    runtime.error = Some(UNAVAILABLE.into());
+                    Task::none()
+                }
+            };
         }
         match result {
             Ok(text) => {
                 let at = Instant::now();
-                runtime.copied = Some((id, at));
-                let text = match request.prefix.as_str() {
-                    "" => text,
-                    prefix if text.is_empty() => prefix.to_owned(),
-                    prefix => format!("{prefix}\n\n{text}"),
-                };
-                let context = request.context.clone();
-                let intent = request.intent;
+                runtime.copied = Some((id.clone(), at));
                 Task::batch([
-                    clipboard_write(context, intent, text, move || {
-                        request.snapshot_is_current(&request.handle.snapshot())
-                    }),
+                    message_clipboard_write(target, id, request, text),
                     cosmic::task::future(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
                         Message::ChatUi(Action::ClearCopied(target, at))
@@ -462,6 +597,41 @@ fn clipboard_write(
     })
 }
 
+/// Writes the text `request` read for item `id`, checked like
+/// [`clipboard_write`] when the effect is polled. A source that changed after
+/// the read was accepted is read again, as if the change had come first,
+/// rather than dropping the copy without a word.
+fn message_clipboard_write(
+    target: Target,
+    id: String,
+    request: Request,
+    text: String,
+) -> Task<Message> {
+    let mut read = Some((id, request, text));
+    iced::Task::done(()).then(move |_| {
+        let Some((id, request, text)) = read.take() else {
+            return Task::none();
+        };
+        if !request.context.is_current(request.intent) {
+            return Task::none();
+        }
+        if !request.snapshot_is_current(&request.handle.snapshot()) {
+            return cosmic::task::message(Message::ChatUi(Action::MessageCopied(
+                target,
+                id,
+                request,
+                Ok(text),
+            )));
+        }
+        let text = match request.prefix.as_str() {
+            "" => text,
+            prefix if text.is_empty() => prefix.to_owned(),
+            prefix => format!("{prefix}\n\n{text}"),
+        };
+        iced::clipboard::write(text).map(cosmic::Action::App)
+    })
+}
+
 fn compatible(captured: &chat::TextCopySource, current: &chat::TextCopySource) -> bool {
     captured.cache == current.cache
         && captured.scope == current.scope
@@ -473,6 +643,392 @@ fn compatible(captured: &chat::TextCopySource, current: &chat::TextCopySource) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CHILD: &str = "child";
+
+    fn step(command: &str) -> Arc<chat::Item> {
+        Arc::new(chat::Item {
+            id: "step".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: command.into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: "excerpt".into(),
+            },
+            at: None,
+            started_at: None,
+        })
+    }
+
+    /// The source of the step at `revision`. The store keeps a conversation
+    /// item's cache and token when it rewrites the item; a child item's
+    /// rewrite gets a new cache.
+    fn source(scope: &chat::TextCopyScope, revision: u64) -> chat::TextCopySource {
+        token_source(scope, 7, revision)
+    }
+
+    fn token_source(
+        scope: &chat::TextCopyScope,
+        token: u64,
+        revision: u64,
+    ) -> chat::TextCopySource {
+        chat::TextCopySource {
+            cache: match scope {
+                chat::TextCopyScope::Conversation => uuid::Uuid::from_u128(1),
+                chat::TextCopyScope::Subagent { .. } => uuid::Uuid::new_v4(),
+            },
+            scope: scope.clone(),
+            token,
+            revision,
+            bytes: 300 * 1024,
+        }
+    }
+
+    /// Publishes `item` with `source` as the only item of `scope`, or none
+    /// at all, as the store does when it rewrites or removes it.
+    fn publish(
+        handle: &ClientHandle,
+        scope: &chat::TextCopyScope,
+        item: Option<(Arc<chat::Item>, chat::TextCopySource)>,
+    ) {
+        let mut snapshot = (*handle.snapshot()).clone();
+        let (items, sources) = item
+            .map(|(item, source)| (vec![item], vec![Some(source)]))
+            .unzip();
+        let (items, sources) = (items.unwrap_or_default(), sources.unwrap_or_default());
+        match scope {
+            chat::TextCopyScope::Conversation => {
+                snapshot.items = items;
+                snapshot.text_copy_sources.conversation = sources;
+                snapshot.text_copy_sources.conversation_revision += 1;
+            }
+            chat::TextCopyScope::Subagent { id } => {
+                snapshot.subagents = vec![chat::Subagent {
+                    id: id.clone(),
+                    kind: "Scout".into(),
+                    description: String::new(),
+                    status: chat::ToolStatus::Running,
+                    model: None,
+                    waiting: false,
+                    detail: String::new(),
+                    background: true,
+                    items,
+                }];
+                snapshot
+                    .text_copy_sources
+                    .children
+                    .insert(id.clone(), sources);
+            }
+        }
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+    }
+
+    /// A focused chat showing a running step in `scope`, and a request to
+    /// copy that step with its command.
+    fn copy_fixture(scope: chat::TextCopyScope) -> (Cagents, Target, Arc<ClientHandle>, Request) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = super::super::tests::history_fixture(&mut app);
+        app.workspace.focus(card).unwrap();
+        let source = source(&scope, 1);
+        publish(&handle, &scope, Some((step("cargo build"), source.clone())));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        if let chat::TextCopyScope::Subagent { id } = &scope {
+            runtime.selected_subagent = Some(id.clone());
+        }
+        runtime.refresh();
+        let request =
+            Request::for_test(handle.clone(), source).for_step(CopyPart::Text, "cargo build");
+        // A read reaches no daemon here: it fails at once, and its completion
+        // carries the request it read with.
+        handle.disconnect_for_test();
+        (app, target, handle, request)
+    }
+
+    /// The read `task` starts, which must be the only thing it does.
+    fn read_by(task: Task<Message>, target: Target) -> Request {
+        use iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task).expect("a read");
+                let effect = tokio::time::timeout(Duration::from_secs(1), effects.next())
+                    .await
+                    .expect("the read settles")
+                    .expect("the read completes");
+                let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    Action::MessageCopied(read_target, id, request, _),
+                ))) = effect
+                else {
+                    panic!("a changed copy reads again and writes nothing yet");
+                };
+                assert_eq!((read_target, id.as_str()), (target, "step"));
+                assert!(effects.next().await.is_none());
+                request
+            })
+    }
+
+    fn written(task: Task<Message>) -> Option<String> {
+        use iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut effects = iced::runtime::task::into_stream(task)?;
+                while let Some(effect) = effects.next().await {
+                    if let iced::runtime::Action::Clipboard(
+                        iced::runtime::clipboard::Action::Write { contents, .. },
+                    ) = effect
+                    {
+                        return Some(contents);
+                    }
+                }
+                None
+            })
+    }
+
+    fn scopes() -> [chat::TextCopyScope; 2] {
+        [
+            chat::TextCopyScope::Conversation,
+            chat::TextCopyScope::Subagent { id: CHILD.into() },
+        ]
+    }
+
+    #[test]
+    fn a_copy_whose_text_changed_reads_the_step_again_as_it_is_now() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            // A child item the provider rewrites gets a new source, with a
+            // new cache, so the step is found again by its ID.
+            let rewritten = source(&scope, 2);
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build --release"), rewritten.clone())),
+            );
+            let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
+            let reread = read_by(task, target);
+            assert_eq!(reread.source, rewritten, "{scope:?}");
+            assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+            assert!(app.chat_runtime_mut(target).unwrap().error.is_none());
+
+            let task = app.finish_message_copy(target, "step".into(), reread, Ok("new".into()));
+            assert_eq!(
+                written(task).as_deref(),
+                Some("cargo build --release\n\nnew"),
+                "the clipboard holds the step as it is now: {scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_whose_text_changes_again_while_it_reads_again_says_so() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build"), source(&scope, 2))),
+            );
+            let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
+            let reread = read_by(task, target);
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build"), source(&scope, 3))),
+            );
+            let task = app.finish_message_copy(target, "step".into(), reread, Ok("stale".into()));
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.error.as_deref(), Some(chat::TEXT_COPY_CHANGED));
+            assert!(runtime.copied.is_none());
+        }
+    }
+
+    /// The store can see the change before this client's snapshot does. Its
+    /// refusal reads the step again once this client has the change, and
+    /// says so at once while it has nothing newer to read.
+    #[test]
+    fn a_copy_the_store_refuses_as_changed_reads_again_only_from_a_newer_source() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let changed = || Err(chat::TEXT_COPY_CHANGED.to_owned());
+            let (mut app, target, _, request) = copy_fixture(scope.clone());
+            let task = app.finish_message_copy(target, "step".into(), request, changed());
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                Some(chat::TEXT_COPY_CHANGED)
+            );
+
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            let rewritten = source(&scope, 2);
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build"), rewritten.clone())),
+            );
+            let task = app.finish_message_copy(target, "step".into(), request, changed());
+            let reread = read_by(task, target);
+            assert_eq!(reread.source, rewritten, "{scope:?}");
+            assert!(app.chat_runtime_mut(target).unwrap().error.is_none());
+
+            // The store refuses the second read too: it says so, rather than
+            // reading a third time.
+            let task = app.finish_message_copy(target, "step".into(), reread, changed());
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            assert_eq!(
+                app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                Some(chat::TEXT_COPY_CHANGED)
+            );
+        }
+    }
+
+    /// A step's copy starts with its command, found by its source even when
+    /// an earlier row, such as a long message's part, has the step's ID.
+    #[test]
+    fn a_step_copy_takes_its_command_from_its_own_row_when_an_id_repeats() {
+        let _context = isolated_context();
+        let scope = chat::TextCopyScope::Conversation;
+        let (mut app, target, handle, request) = copy_fixture(scope.clone());
+        let text = Arc::new(chat::Item {
+            content: ItemContent::Text {
+                text: "a part of a long answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            ..(*step("")).clone()
+        });
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = vec![text, step("cargo build")];
+        snapshot.text_copy_sources.conversation = vec![
+            Some(token_source(&scope, 3, 1)),
+            Some(request.source.clone()),
+        ];
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        let task = app.start_message_copy(
+            target,
+            "step".into(),
+            Some(CopyPart::Text),
+            Some(request.source.clone()),
+        );
+        let started = read_by(task, target);
+        assert_eq!(started.source, request.source);
+        assert_eq!(started.prefix, "cargo build");
+    }
+
+    /// A publication can be handled before a copy captured from the
+    /// interface it replaced. Output appended in it leaves the copy valid.
+    #[test]
+    fn a_step_copy_starts_when_its_output_grew_before_the_copy_was_handled() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            let grown = chat::TextCopySource {
+                bytes: request.source.bytes + 1024,
+                ..request.source.clone()
+            };
+            publish(&handle, &scope, Some((step("cargo build"), grown)));
+            app.chat_runtime_mut(target).unwrap().refresh();
+            let task = app.start_message_copy(
+                target,
+                "step".into(),
+                Some(CopyPart::Text),
+                Some(request.source.clone()),
+            );
+            let started = read_by(task, target);
+            assert_eq!(started.source, request.source, "{scope:?}");
+            assert_eq!(started.prefix, "cargo build", "{scope:?}");
+        }
+    }
+
+    /// A step copy captured before a rewrite it is handled after says its
+    /// text is unavailable rather than doing nothing.
+    #[test]
+    fn a_step_copy_rewritten_before_the_copy_was_handled_says_it_is_unavailable() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            publish(
+                &handle,
+                &scope,
+                Some((step("cargo build"), source(&scope, 2))),
+            );
+            app.chat_runtime_mut(target).unwrap().refresh();
+            let task = app.start_message_copy(
+                target,
+                "step".into(),
+                Some(CopyPart::Text),
+                Some(request.source.clone()),
+            );
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.error.as_deref(), Some(UNAVAILABLE), "{scope:?}");
+        }
+    }
+
+    /// A conversation item's ID can repeat in the window: a long message's
+    /// parts get generated IDs, and a provider item may have one of them.
+    /// Its reread follows its own source, not the first row with its ID.
+    #[test]
+    fn a_changed_conversation_copy_reads_its_own_item_again_when_an_id_repeats() {
+        let _context = isolated_context();
+        let scope = chat::TextCopyScope::Conversation;
+        let (mut app, target, handle, request) = copy_fixture(scope.clone());
+        let other = token_source(&scope, 3, 1);
+        let rewritten = source(&scope, 2);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = vec![step("cargo test"), step("cargo build --release")];
+        snapshot.text_copy_sources.conversation = vec![Some(other), Some(rewritten.clone())];
+        snapshot.text_copy_sources.conversation_revision += 1;
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
+        let reread = read_by(task, target);
+        assert_eq!(reread.source, rewritten);
+        assert_eq!(reread.prefix, "cargo build --release");
+    }
+
+    #[test]
+    fn a_copy_whose_step_was_removed_says_its_text_is_unavailable() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, handle, request) = copy_fixture(scope.clone());
+            publish(&handle, &scope, None);
+            let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
+            assert!(
+                iced::runtime::task::into_stream(task).is_none(),
+                "{scope:?}"
+            );
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert_eq!(runtime.error.as_deref(), Some(UNAVAILABLE));
+            assert!(runtime.copied.is_none());
+        }
+    }
 
     #[test]
     fn appended_prefix_is_valid_but_rewrite_scope_and_cache_changes_are_not() {

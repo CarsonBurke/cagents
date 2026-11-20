@@ -35,7 +35,7 @@ pub enum AgentCommand {
         /// Unique lowercase handle among your open agents, such as reviewer.
         #[arg(long)]
         name: Option<String>,
-        /// claude, codex, agy or omp; defaults to the calling session's.
+        /// claude, codex, agy, muse or omp; defaults to the calling session's.
         #[arg(long, value_parser = parse_provider)]
         provider: Option<Provider>,
         /// The open project to work in, by any directory inside it; defaults
@@ -62,11 +62,11 @@ pub enum AgentCommand {
         surface: String,
         #[arg(long)]
         #[arg(
-            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. Antigravity: a model ID such as gemini-3.8-flash. OMP: provider/model. The native chat model picker lists available IDs"
+            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. Antigravity: a model ID such as gemini-3.8-flash. Muse: a model ID such as muse-spark-1.2. OMP: provider/model. The native chat model picker lists available IDs"
         )]
         model: Option<String>,
         #[arg(long, value_name = "MODE")]
-        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. Antigravity: default, acceptEdits, auto or plan. OMP: always-ask, write or yolo",
+        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions. OMP: always-ask, write or yolo",
             hide_possible_values = true,
             value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
@@ -213,7 +213,7 @@ pub struct ShowArgs {
 }
 
 /// The providers an agent can be spawned with: those with native chat.
-const CHOOSE_PROVIDER: &str = "Choose --provider claude, codex, agy or omp";
+const CHOOSE_PROVIDER: &str = "Choose --provider claude, codex, agy, muse or omp";
 
 pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL

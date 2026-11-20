@@ -1904,8 +1904,11 @@ fn chip_with_window(
                 .clone()
                 .unwrap_or_else(|| format!("{name} reports no usage")),
         },
+        // A limit with no window to show, as for a login with no allowance at
+        // all, is still a limit.
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
-            if snapshot.ordinary_usage_allowed == Some(false) =>
+            if snapshot.ordinary_usage_allowed == Some(false)
+                || (snapshot.status == UsageStatus::Limited && window_of(snapshot).is_none()) =>
         {
             Chip {
                 text: "Limited".into(),
@@ -1916,7 +1919,13 @@ fn chip_with_window(
                     ChipTone::Attention
                 },
                 essential: true,
-                tooltip: format!("{name} reports usage is limited"),
+                // Only a window-less limit says why in its detail; another
+                // limit's detail describes its windows, not the limit.
+                tooltip: snapshot
+                    .detail
+                    .clone()
+                    .filter(|_| window_of(snapshot).is_none())
+                    .unwrap_or_else(|| format!("{name} reports usage is limited")),
             }
         }
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
@@ -2008,7 +2017,9 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
         (Provider::Antigravity, _) => ANTIGRAVITY_LOGIN,
-        (Provider::Omp | Provider::Muse, _) => return None,
+        // A device code shown in the terminal, approved in any browser.
+        (Provider::Muse, _) => &["login"],
+        (Provider::Omp, _) => return None,
     })
 }
 
@@ -2058,7 +2069,14 @@ fn login_launch_with_path(
             .iter()
             .map(|name| (*name).into())
             .collect(),
-        program: program.to_str()?.to_owned(),
+        // Muse's `muse` may be a wrapper that cannot run `login`.
+        program: account.provider.subcommand_program(
+            program.to_str()?,
+            &home,
+            search_path
+                .and_then(|path| path.to_str())
+                .unwrap_or_default(),
+        ),
         arguments: command
             .iter()
             .map(|argument| (*argument).to_owned())
@@ -2070,14 +2088,54 @@ fn login_launch_with_path(
     Some(recipe)
 }
 
+/// The provider sign-ins running in open terminals, as of a workspace and
+/// an account list, so a frame asks whether an account is signing in without
+/// passing over every card or resolving any account's home.
+#[derive(Default)]
+pub(super) struct SignIns {
+    /// The workspace the sign-ins were read from. Holding it weakly pins its
+    /// allocation, so a changed workspace always has a different address.
+    source: std::sync::Weak<WorkspaceState>,
+    /// The [`Accounts`] revision each sign-in's accounts were matched at.
+    accounts: u64,
+    running: Vec<RunningSignIn>,
+}
+
+/// An open terminal whose sign-in process has not ended.
+struct RunningSignIn {
+    card: CardId,
+    launch: LaunchRecipe,
+    /// The listed accounts it signs in to (see [`signs_in`]).
+    accounts: Vec<Account>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIGN_IN_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has passed over every card for the sign-ins
+/// running in them.
+#[cfg(test)]
+pub(super) fn sign_in_scans() -> usize {
+    SIGN_IN_SCANS.with(std::cell::Cell::get)
+}
+
 /// Whether the sign-in `recipe` signs `account` in: whether it names the
 /// account's home, as every sign-in on an account with a home of its own
 /// does, and one started before cagents stopped exporting the system default
 /// did; or names none, as one on the system account does (see
 /// [`Account::launch_home`]).
 fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
-    let Some(variable) = account::home_variable(account.provider) else {
+    // Another provider's login signs in none of this one's accounts, though
+    // neither names a home.
+    if sign_in_provider(recipe) != Some(account.provider) {
         return false;
+    }
+    // A provider without a home of its own, as Muse, has only its system
+    // account, which every one of its sign-ins signs in.
+    let Some(variable) = account::home_variable(account.provider) else {
+        return account.is_system();
     };
     let named = recipe
         .environment
@@ -2085,12 +2143,12 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
         .filter(|value| !value.is_empty() && !recipe.unset_environment.contains(variable))
         .map(PathBuf::from);
     match named {
-        Some(named) => account.resolved_home() == Some(named),
+        Some(named) => resolved_home(account) == Some(named),
         // An unset home is the CLI's default, which only a system account
         // exporting no home of its own resolves (as `ProviderChoices::running`).
         None => {
             account.is_system()
-                && (!recipe.unset_environment.contains(variable) || account.launch_home().is_none())
+                && (!recipe.unset_environment.contains(variable) || launch_home(account).is_none())
         }
     }
 }
@@ -2112,18 +2170,19 @@ fn signed_in(session: &TerminalSession) -> bool {
 /// Whether `recipe` runs a provider's sign-in, as [`login_launch`] builds
 /// it or as a reader types it.
 pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
-    let program = Path::new(&recipe.program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let arguments: Vec<&str> = recipe.arguments.iter().map(String::as_str).collect();
-    matches!(
-        (program, arguments.as_slice()),
-        ("claude", ["auth", "login"])
-            | ("claude", ["auth", "login", "--claudeai"])
-            | ("codex", ["login"])
-            | ("codex", ["login", "--device-auth"])
-    ) || (program == "agy" && arguments == ANTIGRAVITY_LOGIN)
+    sign_in_provider(recipe).is_some()
+}
+
+/// The provider whose login `recipe` runs, if it runs one: the command
+/// [`login_arguments`] gives, or Claude's older `auth login`.
+fn sign_in_provider(recipe: &LaunchRecipe) -> Option<Provider> {
+    let (provider, arguments) = Provider::launched(recipe)?;
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let login = [false, true]
+        .into_iter()
+        .filter_map(|device| login_arguments(provider, device))
+        .any(|login| login == arguments.as_slice());
+    (login || (provider == Provider::Claude && arguments == ["auth", "login"])).then_some(provider)
 }
 
 #[cfg(test)]
@@ -2190,6 +2249,9 @@ impl<'a> RecipeHome<'a> {
 #[derive(Default)]
 pub(super) struct Accounts {
     state: State,
+    /// Counts the times the state was reached mutably, so a value derived
+    /// from it can tell it may have changed (see [`SignIns`]).
+    revision: u64,
     /// One for each way [`AccountUsageDisplay`] states usage, which the
     /// settings choose between.
     choices: [std::cell::OnceCell<Choices>; AccountUsageDisplay::ALL.len()],
@@ -2199,6 +2261,7 @@ impl From<State> for Accounts {
     fn from(state: State) -> Self {
         Self {
             state,
+            revision: 0,
             choices: Default::default(),
         }
     }
@@ -2217,6 +2280,7 @@ impl std::ops::DerefMut for Accounts {
         for choices in &mut self.choices {
             choices.take();
         }
+        self.revision = self.revision.wrapping_add(1);
         &mut self.state
     }
 }
@@ -4872,19 +4936,91 @@ impl Cagents {
     }
 
     pub(super) fn account_sign_in_running(&self, account: &Account) -> bool {
-        if self.account_ui.account(&account.id()).is_some_and(|state| {
-            state.account == *account && self.account_ui.preparing_logins.contains(&state.owner)
-        }) {
+        let listed = self
+            .account_ui
+            .account(&account.id())
+            .filter(|state| state.account == *account);
+        if listed.is_some_and(|state| self.account_ui.preparing_logins.contains(&state.owner)) {
             return true;
         }
-        self.durable.cards.iter().any(|card| {
-            card.existence.is_open()
-                && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
-                && matches!(&card.kind, CardKind::Terminal(session)
-                    if is_sign_in(&session.launch)
-                        && !terminal_ended(session)
-                        && signs_in(account, &session.launch))
+        let failed = |card: CardId| matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)));
+        // Within an update the workspace or the accounts may have moved on
+        // from the index, which the update's end brings up to date.
+        if !self.sign_ins_current() {
+            return self
+                .running_sign_ins()
+                .any(|(card, launch)| !failed(card) && signs_in(account, launch));
+        }
+        self.sign_ins.running.iter().any(|sign_in| {
+            !failed(sign_in.card)
+                && if listed.is_some() {
+                    sign_in.accounts.contains(account)
+                } else {
+                    signs_in(account, &sign_in.launch)
+                }
         })
+    }
+
+    /// The open terminals running a provider's sign-in whose process has not
+    /// ended, whether or not their runtime failed. A pass over every card.
+    fn running_sign_ins(&self) -> impl Iterator<Item = (CardId, &LaunchRecipe)> {
+        #[cfg(test)]
+        SIGN_IN_SCANS.with(|count| count.set(count.get() + 1));
+        self.durable
+            .cards
+            .iter()
+            .filter_map(|card| match &card.kind {
+                CardKind::Terminal(session)
+                    if card.existence.is_open()
+                        && is_sign_in(&session.launch)
+                        && !terminal_ended(session) =>
+                {
+                    Some((card.id, &session.launch))
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether [`Self::sign_ins`] was read from the current workspace and
+    /// matched against the current accounts.
+    fn sign_ins_current(&self) -> bool {
+        self.sign_ins.source.as_ptr() == Arc::as_ptr(&self.durable)
+            && self.sign_ins.accounts == self.account_ui.revision
+    }
+
+    /// Brings [`Self::sign_ins`] up to the workspace and the accounts, at the
+    /// end of an update, so the frame it ends in looks the sign-ins up.
+    ///
+    /// The cards are read again only when the workspace changed, which is
+    /// how a sign-in terminal opens, ends or closes. The accounts each signs
+    /// in to are matched again when the accounts may have changed, which
+    /// costs nothing while no sign-in runs.
+    pub(super) fn sync_sign_ins(&mut self) {
+        if self.sign_ins_current() {
+            return;
+        }
+        if self.sign_ins.source.as_ptr() != Arc::as_ptr(&self.durable) {
+            let running = self
+                .running_sign_ins()
+                .map(|(card, launch)| RunningSignIn {
+                    card,
+                    launch: launch.clone(),
+                    accounts: Vec::new(),
+                })
+                .collect();
+            self.sign_ins.running = running;
+            self.sign_ins.source = Arc::downgrade(&self.durable);
+        }
+        for sign_in in &mut self.sign_ins.running {
+            sign_in.accounts = self
+                .account_ui
+                .accounts
+                .iter()
+                .filter(|state| signs_in(&state.account, &sign_in.launch))
+                .map(|state| state.account.clone())
+                .collect();
+        }
+        self.sign_ins.accounts = self.account_ui.revision;
     }
 
     /// Opens a terminal running a provider's login, which keeps no
@@ -8040,6 +8176,34 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_without_a_window_reads_as_limited_not_unlimited() {
+        // Muse reports a login with no subscription allowance this way.
+        let mut limited = snapshot(Vec::new(), NOW);
+        limited.status = UsageStatus::Limited;
+        limited.detail = Some("This Muse login has no subscription allowance".into());
+        let summary = chip(
+            &state_with(Some(limited)),
+            "Muse",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(summary.text, "Limited");
+        assert_eq!(summary.tone, ChipTone::Attention);
+        assert_eq!(
+            summary.tooltip,
+            "This Muse login has no subscription allowance"
+        );
+
+        let unlimited = chip(
+            &state_with(Some(snapshot(Vec::new(), NOW))),
+            "Muse",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(unlimited.text, "No limits");
+    }
+
+    #[test]
     fn old_figures_and_figures_from_before_a_reset_are_shown_as_of_when_they_were_read() {
         let observed = NOW - schedule::DISPLAY_STALE_AFTER - 1;
         let old = chip(
@@ -8171,6 +8335,31 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_sign_in_signs_in_its_system_account() {
+        let system = Account::system(Provider::Muse);
+        let launch = login_launch(
+            &system,
+            Path::new("/opt/bin/muse-upstream"),
+            PathBuf::from("/h"),
+            false,
+        )
+        .expect("Muse logs in");
+        assert_eq!(launch.arguments, ["login"]);
+        assert_eq!(Provider::recognize_launch(&launch), None);
+        assert!(is_sign_in(&launch));
+        assert!(signs_in(&system, &launch));
+        assert!(!signs_in(&Account::system(Provider::Codex), &launch));
+        let claude = login_launch(
+            &Account::system(Provider::Claude),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/h"),
+            false,
+        )
+        .expect("Claude logs in");
+        assert!(!signs_in(&Account::system(Provider::Codex), &claude));
+    }
+
+    #[test]
     fn only_a_providers_sign_in_is_kept_off_the_disk() {
         let recipe = |program: &str, arguments: &[&str]| LaunchRecipe {
             unset_environment: Default::default(),
@@ -8189,6 +8378,12 @@ mod tests {
         )));
         assert!(is_sign_in(&recipe("codex", &["login"])));
         assert!(is_sign_in(&recipe("codex", &["login", "--device-auth"])));
+        // Muse's login runs through its upstream executable, as cagents
+        // starts it, or through the `muse` a reader types.
+        assert!(is_sign_in(&recipe("/opt/bin/muse-upstream", &["login"])));
+        assert!(is_sign_in(&recipe("muse", &["login"])));
+        assert!(!is_sign_in(&recipe("muse-upstream", &["acp"])));
+        assert!(!is_sign_in(&recipe("agy", &["login"])));
         assert!(is_sign_in(&recipe(
             "/usr/bin/agy",
             &["acp", "--login", "--disable-telemetry"]
@@ -9378,6 +9573,176 @@ mod app_tests {
         }));
         assert!(!app.account_sign_in_running(&account));
         assert!(app.account_ui.browser_preparing);
+    }
+
+    /// Opens `id`'s sign-in terminal through the update that receives its
+    /// prepared CLI, returning the terminal's card.
+    fn sign_in_through_update(app: &mut Cagents, id: &AccountId) -> CardId {
+        let owner = app.account_ui.probe_owner(id).unwrap();
+        let _ = app.sign_in(id.clone(), true);
+        let cards: BTreeSet<CardId> = app.durable.cards.iter().map(|card| card.id).collect();
+        let _ = app.update(Message::AccountUi(Action::LoginReady {
+            owner,
+            id: id.clone(),
+            provider: Provider::Codex,
+            device: true,
+            program: Ok(("/tools/codex".into(), None)),
+        }));
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(|card| !cards.contains(&card.id))
+            .expect("the sign-in opened a terminal")
+            .id;
+        assert!(!app.account_ui.preparing_logins.contains(&owner));
+        card
+    }
+
+    /// Ends an update whose handler returns before owing a projection, so
+    /// only what every update runs at its end can bring the index up.
+    fn end_bare_update(app: &mut Cagents) {
+        assert!(app.transient_work_close.is_none());
+        let _ = app.update(Message::ReturnToDeviceBeforeClose);
+    }
+
+    /// Asks after `account`'s sign-in before the update that changed what it
+    /// reads has ended, which passes over the cards rather than trust the
+    /// index.
+    fn running_mid_update(app: &Cagents, account: &Account) -> bool {
+        let scans = sign_in_scans();
+        let running = app.account_sign_in_running(account);
+        assert_eq!(sign_in_scans(), scans + 1, "the stale index was not read");
+        running
+    }
+
+    /// A frame asks after an account's sign-in on every draw. Once the update
+    /// that opened it ends, the answer is looked up: no pass over the cards
+    /// and no account's home resolved, for the account signing in or another.
+    #[test]
+    fn a_frame_looks_up_a_running_sign_in_without_scanning_the_cards() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let mut logins = linked_logins(
+            &mut app,
+            directory.path(),
+            &["work@example.com", "home@example.com"],
+        );
+        let (_, other) = logins.pop().unwrap();
+        let (_, id) = logins.pop().unwrap();
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let other = app.account_ui.account(&other).unwrap().account.clone();
+        sign_in_through_update(&mut app, &id);
+
+        let (scans, homes) = (sign_in_scans(), home_resolutions());
+        for _ in 0..3 {
+            assert!(app.account_sign_in_running(&account));
+            assert!(!app.account_sign_in_running(&other));
+        }
+        assert_eq!(sign_in_scans(), scans, "a frame passes over no card");
+        assert_eq!(
+            home_resolutions(),
+            homes,
+            "a frame resolves no account's home"
+        );
+    }
+
+    /// The index follows its terminal: opening the sign-in, its process
+    /// ending, a relaunch, and the terminal's close each show from the end of
+    /// the update that made them. A failed runtime stops the sign-in at once.
+    #[test]
+    fn the_sign_in_index_follows_its_terminal_opening_ending_and_closing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        // Read from the index, never from a fallback pass over the cards.
+        let running = |app: &Cagents| {
+            let scans = sign_in_scans();
+            let running = app.account_sign_in_running(&account);
+            assert_eq!(sign_in_scans(), scans, "the index was current");
+            running
+        };
+        end_bare_update(&mut app);
+        assert!(!running(&app));
+
+        let card = sign_in_through_update(&mut app, &id);
+        assert!(running(&app), "opening the sign-in");
+
+        let fresh = match &app.card_state(card).unwrap().kind {
+            CardKind::Terminal(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        app.retire_ended_terminal(card, 1, None, false);
+        assert!(!running_mid_update(&app, &account));
+        end_bare_update(&mut app);
+        assert!(!running(&app), "its process ending");
+
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(fresh);
+        assert!(running_mid_update(&app, &account));
+        end_bare_update(&mut app);
+        assert!(running(&app), "a relaunch that started");
+
+        let runtime = app.cards.remove(&card);
+        app.cards.insert(card, CardRuntime::Failed("gone".into()));
+        assert!(!running(&app), "a failed runtime, without an update");
+        match runtime {
+            Some(runtime) => app.cards.insert(card, runtime),
+            None => app.cards.remove(&card),
+        };
+        assert!(running(&app));
+
+        // Closing a running terminal waits on the daemon, so until it confirms
+        // the sign-in runs on.
+        let _ = app.close_card_unasked(card);
+        end_bare_update(&mut app);
+        assert!(running(&app), "a close the daemon has not confirmed");
+        // Every close that lands retires the durable card.
+        app.card_state_mut(card).unwrap().existence =
+            super::super::project_ui::removed_existence("closed by user");
+        assert!(!running_mid_update(&app, &account));
+        end_bare_update(&mut app);
+        assert!(!running(&app), "closing the terminal");
+    }
+
+    /// Accounts that change under a running sign-in are matched again: the
+    /// index follows the account list, not the one it was built against.
+    #[test]
+    fn a_running_sign_in_is_matched_again_when_its_account_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let original = app.account_ui.account(&id).unwrap().account.clone();
+        sign_in_through_update(&mut app, &id);
+        assert!(app.account_sign_in_running(&original));
+
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let mut registry = app.account_ui.registry.clone();
+        registry.unregister(key);
+        registry
+            .link(Provider::Codex, key, elsewhere, None, None, 2)
+            .unwrap();
+        app.account_ui.set_registry(registry);
+        let moved = app.account_ui.account(&id).unwrap().account.clone();
+        assert_ne!(moved, original);
+        assert!(!running_mid_update(&app, &moved));
+        assert!(running_mid_update(&app, &original));
+        end_bare_update(&mut app);
+        let scans = sign_in_scans();
+        assert!(
+            !app.account_sign_in_running(&moved),
+            "the terminal signs in to the old home, not the account's new one"
+        );
+        assert!(
+            app.account_sign_in_running(&original),
+            "an unlisted account is still asked"
+        );
+        assert_eq!(sign_in_scans(), scans);
     }
 
     #[test]

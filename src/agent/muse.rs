@@ -1,7 +1,7 @@
-//! Muse, Meta's terminal coding agent. It runs only in a terminal until
-//! cagents speaks its Agent Client Protocol server.
+//! Muse, Meta's terminal coding agent. Its native chat is its Agent Client
+//! Protocol server, `muse acp` (see `chat::protocol::acp::muse`).
 use super::{Provider, ProviderAdapter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     provider: Provider::Muse,
@@ -103,11 +103,66 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     // `muse resume` alone opens the session picker for the workspace.
     resume_picker: true,
     latest_selectors: &["--last"],
-    native_chat: false,
-    // Muse serves ACP too; its profile describes it once cagents drives it.
-    acp: None,
+    native_chat: true,
+    acp: Some(super::Acp {
+        mode_option: "--approval-mode",
+        effort_option: "--reasoning-effort",
+        // Its terminal's approval modes, which its sessions call "Ask before
+        // unmatched actions", "Ask on request" and "Allow all". The session's
+        // fourth, "Deny unmatched actions", has no terminal option.
+        modes: &[
+            ("untrusted", "manual"),
+            ("on-request", "auto"),
+            ("never", "bypassPermissions"),
+        ],
+        default_mode: "on-request",
+    }),
     #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]
-    create_chat: |_| Err(Provider::Muse.native_chat_refusal()),
+    create_chat: |launch| {
+        crate::chat::protocol::acp::create(&crate::chat::protocol::acp::muse::PROFILE, launch)
+    },
 };
+
+/// The executable a wrapper named `muse` conventionally runs.
+const UPSTREAM: &str = "muse-upstream";
+
+/// The Muse executable that takes a subcommand first, for `program`. Muse
+/// refuses a root option before a subcommand, so a `muse` that is a wrapper
+/// adding root options cannot run `acp`, `login` or `usage`; the launcher it
+/// wraps, `muse-upstream`, can. That is chosen when it is beside `program`
+/// or on `path`; otherwise `program` is. A relative `program` or `path` entry
+/// is taken from `directory`, as a launch's is.
+pub(super) fn subcommand_program(program: &str, directory: &Path, path: &str) -> String {
+    let named = Path::new(program);
+    if named.file_name().and_then(|name| name.to_str()) != Some(ADAPTER.executable) {
+        return program.to_owned();
+    }
+    let runnable = |path: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(directory.join(path))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    if program.contains('/') {
+        let beside = named.with_file_name(UPSTREAM);
+        if runnable(&beside) {
+            return beside.to_string_lossy().into_owned();
+        }
+    }
+    if std::env::split_paths(path)
+        .map(|directory| directory.join(UPSTREAM))
+        .any(|candidate| runnable(&candidate))
+    {
+        return UPSTREAM.to_owned();
+    }
+    program.to_owned()
+}
+
+/// Models Muse marks "contributor": cheaper because Meta may use the
+/// conversation, including messages between sessions, for product
+/// improvement. cagents shares no data unless asked, so it never offers them.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub fn offers_model(model: &str) -> bool {
+    !model.ends_with("-contributor")
+}

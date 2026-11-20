@@ -1400,7 +1400,7 @@ impl Survivors {
                 })
             });
             let action = if recorded {
-                "choose Resume conversation in the new tab (+) menu to continue"
+                "open its tab to continue"
             } else {
                 "start a new conversation to continue"
             };

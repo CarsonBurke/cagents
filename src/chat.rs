@@ -2045,6 +2045,9 @@ impl<'a> TranscriptPart<'a> {
 /// envelope, with headroom; longer accumulated streams fail explicitly.
 pub const TEXT_COPY_PAGE_BYTES: usize = TRANSCRIPT_PART_BYTES;
 pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// Why a copy whose text changed before it finished put nothing on the
+/// clipboard. The store refuses with it, and the UI shows it.
+pub const TEXT_COPY_CHANGED: &str = "This text changed while copying. Copy it again.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextCopyPage {
@@ -2530,11 +2533,11 @@ pub enum ItemContent {
         reference: Option<ImageReference>,
     },
     /// Something another agent or the provider harness delivered to this
-    /// conversation: a report, a message, a background-work notice, or context
-    /// the provider added without attributing it to the user.
+    /// conversation: a report, a message, a background-work notice, or where
+    /// the provider compacted its context, with the summary that replaced it.
     ///
     /// It can arrive in the user's slot and the agent acts on it as on a
-    /// prompt; provider context uses the System role. The user did not write
+    /// prompt; a compaction uses the System role. The user did not write
     /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
@@ -2551,7 +2554,7 @@ pub enum ItemContent {
         /// message. Empty when there is none.
         summary: String,
         /// A report/message with harness framing removed, a notice's quoted
-        /// output, or provider context retained verbatim without interpretation.
+        /// output, or a compaction's summary retained verbatim.
         body: String,
     },
 }
@@ -2563,7 +2566,7 @@ pub enum DeliveryKind {
     /// A message from a teammate or another session.
     Message,
     /// A provider/harness notice, including background-work events and
-    /// provider context. An empty sender makes no agent-origin claim.
+    /// compaction. An empty sender makes no agent-origin claim.
     Notice,
 }
 
@@ -2580,7 +2583,9 @@ impl DeliveryKind {
 }
 
 /// The summary of the notice that marks where the person stopped a turn.
-pub const STOPPED: &str = "Stopped";
+/// It says who stopped it, so it neither repeats the stopped step's own
+/// "Stopped" just above it nor reads as the agent giving up.
+pub const STOPPED_NOTICE: &str = "You stopped this turn";
 
 /// The status detail of a conversation whose last turn was stopped before it
 /// finished, whichever provider ran it.
@@ -2597,7 +2602,7 @@ pub fn stopped_notice(id: String) -> Item {
             kind: DeliveryKind::Notice,
             from: String::new(),
             sender: String::new(),
-            summary: STOPPED.into(),
+            summary: STOPPED_NOTICE.into(),
             body: String::new(),
         },
         started_at: None,
@@ -2610,7 +2615,7 @@ pub fn is_stopped_notice(content: &ItemContent) -> bool {
     matches!(
         content,
         ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body }
-            if summary == STOPPED && body.is_empty() && from.is_empty() && sender.is_empty()
+            if summary == STOPPED_NOTICE && body.is_empty() && from.is_empty() && sender.is_empty()
     )
 }
 

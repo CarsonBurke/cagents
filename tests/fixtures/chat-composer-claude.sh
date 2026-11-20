@@ -289,7 +289,10 @@ long_history_turn() {
 # frames are also recorded in the synthetic history, as Claude records them;
 # system frames, such as a background task's lifecycle, are live only. A frame
 # with "_history": true is only recorded, as Claude records a queued
-# notification. A frame with "_live": true is only emitted, as a subagent's
+# notification; with "_linked": true as well, it joins the conversation's
+# parent chain where it stands, as Claude records what it adds to the
+# model's context and streams differently, such as a skill's instructions.
+# A frame with "_live": true is only emitted, as a subagent's
 # frames are, which Claude records in the subagent's own transcript. A line
 # {"_sleep": SECONDS} pauses while still servicing controls; interruption or
 # input EOF discards the remaining replay. A line
@@ -348,7 +351,11 @@ frames_turn() {
         fi
         frame=$(printf '%s' "$spec" | jq -c --arg turn "$turn" 'walk(if type == "string" then gsub("@TURN@"; $turn) else . end)')
         if [ "$(printf '%s' "$frame" | jq -r '._history // false')" = true ]; then
-            printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            if [ "$(printf '%s' "$frame" | jq -r '._linked // false')" = true ]; then
+                persist_record "$(printf '%s' "$frame" | jq -c 'del(._history, ._linked)')"
+            else
+                printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            fi
             continue
         fi
         if [ "$(printf '%s' "$frame" | jq -r '._live // false')" = true ]; then

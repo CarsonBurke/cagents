@@ -13,6 +13,10 @@ mod image_references;
 pub mod omp;
 mod terminal_output;
 
+/// The step that shows context a hook added for the model, whichever
+/// provider ran the hook.
+pub(crate) const HOOK_CONTEXT: &str = "Hook context";
+
 /// Startup recovery for the same card and exact conversation. Unavailable
 /// means another attempt may succeed after an external condition changes;
 /// it promises neither immediate success nor automatic replay of uncertain

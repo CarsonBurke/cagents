@@ -485,6 +485,84 @@ mod tests {
     }
 
     #[test]
+    fn codex_running_command_remains_after_an_earlier_command_completes() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "01a1b0ba-e200-7000-8000-000000000002";
+        let day = home.path().join("codex/sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        let records = [
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","call_id":"call-first","name":"exec_command","arguments":"{\"cmd\":\"git status --short\"}"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"call-first","command":"git status --short","status":"completed","exit_code":0,"aggregated_output":""}}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call","call_id":"call-second","name":"exec_command","arguments":"{\"cmd\":\"./migrate-production\"}"}}),
+        ];
+        std::fs::write(
+            day.join(format!("rollout-2026-11-06T12-00-00-{id}.jsonl")),
+            records
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let source = Source {
+            launch: Launch {
+                provider: Provider::Codex,
+                session_id: Some(id.into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: home.path().into(),
+                    environment: [
+                        ("HOME".to_owned(), home.path().display().to_string()),
+                        ("CODEX_HOME".to_owned(), "codex".to_owned()),
+                    ]
+                    .into(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        for tools in [true, false] {
+            let (items, earlier) = source.open().unwrap().newest().unwrap();
+            assert!(!earlier);
+            let query = Query {
+                session: id.into(),
+                before: None,
+                limit: 10,
+                tools,
+                full: false,
+            };
+            let mut builder = Builder::new(&query);
+            for item in items.iter().rev() {
+                assert!(builder.push(item));
+            }
+            let (entries, earlier) = builder.finish(true).unwrap();
+            assert_eq!(earlier, None);
+            if tools {
+                assert!(
+                    entries.iter().any(|entry| matches!(
+                        &entry.content,
+                        Content::Tool(tool) if tool.summary.contains("./migrate-production")
+                    )),
+                    "active command is missing: {entries:#?}"
+                );
+                assert_eq!(entries.len(), 2, "the completed call is listed only once");
+            } else {
+                assert!(
+                    matches!(
+                        entries.as_slice(),
+                        [entry] if matches!(
+                            &entry.content,
+                            Content::Tools(run) if run.calls.iter().map(|call| call.count).sum::<u32>() == 2
+                        )
+                    ),
+                    "both calls must count in the compact transcript: {entries:#?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn codex_history_is_read_from_the_sessions_own_rollout() {
         let home = tempfile::tempdir().unwrap();
         let id = "01a1b0ba-e200-7000-8000-000000000002";

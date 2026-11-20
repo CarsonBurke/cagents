@@ -767,7 +767,7 @@ impl Cagents {
                 match result {
                     Ok(handle) => {
                         self.device_ui.open = false;
-                        self.chat_ui.image_viewer = Some(chat_ui::images::Gallery::file(
+                        self.chat_ui.image_dialog = Some(chat_ui::images::Gallery::file(
                             image.path,
                             image.device.as_deref(),
                             handle,
@@ -1788,7 +1788,7 @@ mod tests {
         }));
         assert!(!app.device_ui.open && !app.device_ui.busy);
         assert!(app.device_ui.pending.is_none() && app.device_ui.image.is_none());
-        assert!(app.chat_ui.image_viewer.is_some());
+        assert!(app.chat_ui.image_dialog.is_some());
         assert!(
             app.device_ui.file.is_none(),
             "an image never becomes editable text"
@@ -1817,7 +1817,7 @@ mod tests {
             generation: old_generation,
             result: Ok(handle()),
         }));
-        assert!(app.chat_ui.image_viewer.is_none());
+        assert!(app.chat_ui.image_dialog.is_none());
         let new = app.update_device(Action::OpenFile {
             path: "/remote/new.png".into(),
             fragment: None,
@@ -1844,7 +1844,7 @@ mod tests {
                 .unwrap()
                 .contains("/remote/new.png on FW16")
         );
-        assert!(app.chat_ui.image_viewer.is_none());
+        assert!(app.chat_ui.image_dialog.is_none());
         drop((old, new));
     }
 

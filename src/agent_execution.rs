@@ -933,7 +933,7 @@ mod tests {
             }
         }
         assert!(Provider::Antigravity.has_native_chat());
-        assert!(!Provider::Muse.has_native_chat());
+        assert!(Provider::Muse.has_native_chat());
     }
 
     #[test]

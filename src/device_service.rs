@@ -1984,8 +1984,9 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     let arguments = match account.provider {
         Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
         Provider::Codex => vec!["login".into(), "--device-auth".into()],
+        Provider::Muse => vec!["login".into()],
         Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
-        Provider::Antigravity | Provider::Muse => {
+        Provider::Antigravity => {
             return Err(format!(
                 "open {} in a terminal on this device to sign in",
                 account.provider.label()
@@ -2008,11 +2009,17 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     if let Some(path) = search_path.and_then(|path| path.into_string().ok()) {
         environment.insert("PATH".into(), path);
     }
+    let program = program
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "provider executable is not UTF-8")?;
     let mut recipe = crate::model::LaunchRecipe {
-        program: program
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "provider executable is not UTF-8")?,
+        // Muse's `muse` may be a wrapper that cannot run `login`.
+        program: account.provider.subcommand_program(
+            &program,
+            std::path::Path::new("/"),
+            environment.get("PATH").map_or("", String::as_str),
+        ),
         arguments,
         working_directory: std::env::var_os("HOME")
             .map(PathBuf::from)

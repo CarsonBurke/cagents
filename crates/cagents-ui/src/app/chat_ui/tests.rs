@@ -359,49 +359,6 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
 }
 
 #[test]
-fn image_gallery_is_modal_and_reuses_the_transcript_handle() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let card = draft_chat(&mut app);
-    let runtime = match app.cards.get_mut(&card).unwrap() {
-        CardRuntime::Chat(runtime) => runtime,
-        _ => unreachable!(),
-    };
-    let content = ItemContent::Image {
-        path: "/fixture/image.png".into(),
-        description: "Generated image".into(),
-        reference: None,
-    };
-    let mut cached = CachedItem::new(&content, runtime.syntax_theme);
-    cached.image = Some(iced::widget::image::Handle::from_rgba(
-        1,
-        1,
-        vec![0, 0, 0, 255],
-    ));
-    runtime.cache.insert("image".into(), cached);
-    Arc::make_mut(&mut runtime.snapshot).items = vec![
-        chat::Item {
-            id: "image".into(),
-            role: chat::Role::Assistant,
-            content,
-            started_at: None,
-            at: None,
-        }
-        .into(),
-    ];
-    let target = runtime.target;
-    drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
-    assert!(app.chat_ui.image_viewer.is_some());
-    assert!(app.modal_is_open());
-    assert!(app.dialog().is_some());
-    let before = app.pane_inspectors.visible().count();
-    drop(app.update(Message::ToggleContextInspector));
-    assert_eq!(app.pane_inspectors.visible().count(), before);
-    assert!(Action::ImageNext(true).allowed_while_modal());
-    assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
-    drop(app.update(Message::ChatUi(Action::CloseImage)));
-    assert!(!app.modal_is_open());
-}
-#[test]
 fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
     use iced::clipboard::mime::AsMimeTypes;
     use iced::futures::StreamExt;
@@ -514,11 +471,26 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
         .unwrap()
         .image = Some(shown.clone());
 
-    // Open image from the menu opens the viewer on the same pixels.
+    // Open image from the menu opens the viewer on the same pixels, in the
+    // pane that shows them.
     drop(app.image_command(preview, images::ImageCommand::Open));
-    let viewer = app.chat_ui.image_viewer.as_ref().unwrap().selected_image();
-    assert_eq!(viewer, images::ImageRef::Viewer(shown.id()));
-    assert!(Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
+    let host = images::ViewerHost::Pane(target);
+    let viewer = app.image_viewer(host).unwrap().selected_image(host);
+    assert_eq!(viewer, images::ImageRef::Viewer(host, shown.id()));
+    assert!(
+        !app.modal_is_open(),
+        "the viewer is the pane's, not a dialog"
+    );
+    // Its controls sit under a dialog like the rest of the pane, while the
+    // dialog viewer's are the dialog's own.
+    assert!(!Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
+    assert!(
+        Action::Image(
+            images::ImageRef::Viewer(images::ViewerHost::Dialog, shown.id()),
+            images::ImageCommand::Copy
+        )
+        .allowed_while_modal()
+    );
     assert!(Action::ImageCopied(text_copy::Intent::begin(), Ok(None)).allowed_while_modal());
     assert!(!Action::Image(preview, images::ImageCommand::Copy).allowed_while_modal());
 
@@ -551,98 +523,21 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
     assert_eq!(copied(&mut app, run(press)), ["image/png"]);
     assert_eq!(notice(&app).1, "Copied image");
     assert!(
-        app.chat_ui.image_viewer.is_some(),
+        app.image_viewer(host).is_some(),
         "copying keeps the viewer open"
     );
-
-    // Escape is the viewer's own rather than the app-wide key handler's,
-    // so nothing focused beneath the viewer can claim it first, while the
-    // Escape that its open context menu claims closes only that menu.
-    let escape = keyboard::Event::KeyPressed {
-        key: keyboard::Key::Named(keyboard::key::Named::Escape),
-        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
-        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-        location: keyboard::Location::Standard,
-        modifiers: keyboard::Modifiers::empty(),
-        text: None,
-        repeat: false,
-    };
-    drop(app.update(Message::KeyEvent {
-        event: escape.clone(),
-        captured: true,
-    }));
-    assert!(app.chat_ui.image_viewer.is_some());
-    {
-        use iced::advanced::layout::{Layout, Limits};
-        use iced::advanced::widget::Tree;
-        use iced::advanced::{Shell, clipboard, mouse};
-        let renderer = crate::app::tests::headless_renderer();
-        let window = iced::Size::new(1000.0, 800.0);
-        let viewport = iced::Rectangle::with_size(window);
-        let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
-        let mut element = gallery.view();
-        let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &Limits::new(iced::Size::ZERO, window),
-        );
-        let pointer = mouse::Cursor::Available(viewport.center());
-        let send = |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                tree,
-                &event,
-                Layout::new(&node),
-                pointer,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            messages
-                .iter()
-                .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
-                .count()
-        };
-        let menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
-            element
-                .as_widget_mut()
-                .overlay(
-                    tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &viewport,
-                    iced::Vector::ZERO,
-                )
-                .is_some()
-        };
-        send(
-            &mut element,
-            &mut tree,
-            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
-        );
-        assert!(
-            menu_open(&mut element, &mut tree),
-            "the image's menu opened"
-        );
-        assert_eq!(
-            send(
-                &mut element,
-                &mut tree,
-                iced::Event::Keyboard(escape.clone())
-            ),
-            0
-        );
-        assert!(
-            !menu_open(&mut element, &mut tree),
-            "Escape closed the menu"
-        );
-        assert_eq!(
-            send(&mut element, &mut tree, iced::Event::Keyboard(escape)),
-            1
-        );
-    }
+    // A text field that took the chord, such as the composer copying its
+    // selection, keeps it: the image is not copied over that.
+    app.status = None;
+    app.notices.entries.clear();
+    assert!(
+        run(app.update(Message::KeyEvent {
+            event: control_c(false),
+            captured: true,
+        }))
+        .is_empty()
+    );
+    assert!(app.status.is_none() && app.notices.entries.is_empty());
 }
 
 #[test]
@@ -8564,7 +8459,7 @@ pub(super) fn answer_start(
 /// Focus is a widget operation, not a message. Each operation the task
 /// issues is shown two controls the way a widget tree would show them:
 /// the one asked about, and another that holds the keyboard.
-fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+pub(super) fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
     task_focuses_from(task, control, &widget::Id::new("the control in use"))
 }
 
@@ -20464,7 +20359,8 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         Ok(whole.clone()),
     ));
     assert_chat_copy_task_writes(task, &whole);
-    let request = text_copy::Request::for_test(handle, excerpted).with_prefix("cargo build");
+    let request =
+        text_copy::Request::for_test(handle, excerpted).for_step(CopyPart::Text, "cargo build");
     let task = app.handle_chat_ui(Action::MessageCopied(
         target,
         "long".into(),
@@ -20906,6 +20802,7 @@ fn shared_code_copy_keeps_exact_bytes_typed_target_and_clipboard_intent_until_ef
 
 #[test]
 fn logical_message_copy_completion_refuses_destructive_changes_after_last_page() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20937,13 +20834,55 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             request,
             Ok(body),
         )));
-        assert_chat_copy_task_has_no_effects(task, change);
-        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none());
+        if change == "rewrite" {
+            // The rewritten item is read again; only that read reaches the
+            // clipboard.
+            assert!(runtime.error.is_none());
+            handle.disconnect_for_test();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut effects =
+                    iced::runtime::task::into_stream(task).expect("a rewrite reads again");
+                tokio::time::timeout(Duration::from_secs(1), effects.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MessageCopied(target, id, reread, _),
+            ))) = completion
+            else {
+                panic!("a rewrite reads again before it writes");
+            };
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                id,
+                reread,
+                Ok("replacement".into()),
+            )));
+            assert_chat_copy_task_writes(task, "replacement");
+        } else {
+            assert_chat_copy_task_has_no_effects(task, change);
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
+                "{change}"
+            );
+        }
     }
 }
 
+/// A publication that reaches the client after a read was accepted, but
+/// before its write is polled, writes nothing stale. The copy is handled as if
+/// the publication had come first: it reads again or says why it can't.
 #[test]
-fn logical_message_copy_deferred_write_refuses_destructive_publication_before_poll() {
+fn logical_message_copy_deferred_write_reads_again_after_destructive_publication_before_poll() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20978,7 +20917,53 @@ fn logical_message_copy_deferred_write_refuses_destructive_publication_before_po
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         // The ordinary UI refresh has not consumed this publication.
-        assert_chat_copy_task_has_no_clipboard_write(task, change);
+        let effects = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    iced::runtime::task::into_stream(task)
+                        .expect("a deferred write")
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .expect("deferred copy and its acknowledgement timer must settle")
+            });
+        let mut bounced = None;
+        for effect in effects {
+            match effect {
+                iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                    ..
+                }) => panic!("{change}: a stale read reached the clipboard"),
+                iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    Action::MessageCopied(target, id, request, result),
+                ))) => bounced = Some((target, id, request, result)),
+                _ => {}
+            }
+        }
+        let (target, id, request, result) =
+            bounced.unwrap_or_else(|| panic!("{change}: the copy is handled again"));
+        let task = app.update(Message::ChatUi(Action::MessageCopied(
+            target, id, request, result,
+        )));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none(), "{change}");
+        if change == "rewrite" {
+            assert!(runtime.error.is_none(), "{change}");
+            assert!(
+                iced::runtime::task::into_stream(task).is_some(),
+                "{change}: the rewritten item is read again"
+            );
+        } else {
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
+                "{change}"
+            );
+            assert_chat_copy_task_has_no_effects(task, change);
+        }
     }
 }
 

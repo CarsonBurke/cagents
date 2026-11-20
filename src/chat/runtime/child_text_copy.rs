@@ -170,7 +170,9 @@ pub(super) fn read(
                 })
                 .map(|current| (index, current))
         })
-        .ok_or("Child text copy source changed or was trimmed")?;
+        // As the conversation's store says: the client may not have seen the
+        // change yet, and reads the item again when it does.
+        .ok_or(crate::chat::TEXT_COPY_CHANGED)?;
     let body = agent
         .items
         .get(index)
@@ -332,8 +334,12 @@ mod tests {
             "猫犬\r\n "
         );
         full(&mut state, "child", "same", "rewritten");
-        assert!(read(&state, &initial, 0).is_err());
-        assert!(read(&state, &streamed, 0).is_err());
+        for stale in [&initial, &streamed] {
+            assert_eq!(
+                read(&state, stale, 0).unwrap_err(),
+                crate::chat::TEXT_COPY_CHANGED
+            );
+        }
         assert_ne!(source(&state, "child", 0).cache, initial.cache);
         assert_eq!(
             read(&state, &source(&state, "child", 0), 0).unwrap().text,
