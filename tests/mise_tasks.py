@@ -29,6 +29,10 @@ PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui"}, "brows
 
 
 # Which lane task checks each lane of main's build check.
+# The usage spec each lane task and each no-argument aggregate repeats.
+ALL_TARGETS = ('arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" '
+               'help="Cargo arguments, after --; they replace the default --all-targets"')
+NO_ARGUMENTS = 'arg "[unexpected]..." var=#true hide=#true'
 SENTINEL_LANES = {"cli": "cli", "host": "host", "ui": "ui", "app": "ui", "browser": "browser"}
 
 
@@ -102,7 +106,14 @@ class Structure(unittest.TestCase):
                 self.assertLessEqual(packages(lanes[sentinel]) or {"cagents"}, packages(arguments) or {"cagents"})
                 self.assertLessEqual(features(lanes[sentinel]), features(arguments))
                 task = self.tasks[f"check:{lane}"]
-                self.assertIn('default="--all-targets"', task.get("usage", ""))
+
+    def test_lane_and_aggregate_tasks_repeat_one_usage_spec(self):
+        for name in ("check:cli", "check:host", "check:ui", "check:browser", "test:cli", "test:host", "test:ui"):
+            with self.subTest(task=name):
+                self.assertEqual(self.tasks[name].get("usage"), ALL_TARGETS)
+        for name in ("check", "test", "ci"):
+            with self.subTest(task=name):
+                self.assertEqual(self.tasks[name].get("usage"), NO_ARGUMENTS)
 
     def test_no_usage_spec_names_a_var(self):
         # mise 2025.9.9 renders vars in `run` but passes `usage` verbatim, so
