@@ -18,8 +18,8 @@ const PNG: &str = "image/png";
 pub enum ImageRef {
     /// A transcript preview of the conversation `Target` shows.
     Transcript(Target, Id),
-    /// An entry of the open image viewer.
-    Viewer(Id),
+    /// An entry of the image viewer open in `ViewerHost`.
+    Viewer(ViewerHost, Id),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -167,7 +167,7 @@ pub(in crate::app) fn menu(
         .map(|(label, command)| Item::Button(label, None, MenuCommand(image, command)))
         .collect();
     let mut key_binds = HashMap::new();
-    if matches!(image, ImageRef::Viewer(_)) {
+    if matches!(image, ImageRef::Viewer(..)) {
         key_binds.insert(
             KeyBind {
                 modifiers: vec![Modifier::Ctrl],
@@ -263,10 +263,8 @@ impl Cagents {
         command: ImageCommand,
     ) -> Task<Message> {
         let resolved = match image {
-            ImageRef::Viewer(id) => self
-                .chat_ui
-                .image_viewer
-                .as_ref()
+            ImageRef::Viewer(host, id) => self
+                .image_viewer(host)
                 .and_then(|gallery| gallery.resolve(id)),
             ImageRef::Transcript(target, id) => self
                 .chat_runtime_mut(target)
@@ -415,7 +413,7 @@ mod tests {
         };
         let id = Handle::from_rgba(1, 1, vec![0; 4]).id();
         let preview = ImageRef::Transcript(target, id);
-        let viewer = ImageRef::Viewer(id);
+        let viewer = ImageRef::Viewer(ViewerHost::Pane(target), id);
         assert_eq!(
             entries(preview, true, false),
             [

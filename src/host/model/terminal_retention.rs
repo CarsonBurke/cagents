@@ -676,6 +676,7 @@ mod tests {
         let mut before = table_rows(&db);
         assert!(!before.contains_key("terminal_retention_pins"));
         assert!(!before.contains_key("shared_terminal_retention_pins"));
+        assert!(!before.contains_key("deleted_channels"));
         assert_eq!(before["automation_notifications"].len(), 1);
         assert_eq!(before["automation_lifecycle"].len(), 2);
         assert_eq!(before["shared_view_edits"].len(), 1);
@@ -790,8 +791,13 @@ mod tests {
                     rusqlite::types::Value::Integer(prior_sequence + 1);
                 migrated_binding = Some(bindings);
             }
-            // Schema 28 adds private pane chat ownership, which starts empty.
-            for table in ["pane_chat_starts", "pane_chat_allocations"] {
+            // Schema 28 adds private pane chat ownership and schema 29 adds
+            // deletion history; neither backfills records for this fixture.
+            for table in [
+                "pane_chat_starts",
+                "pane_chat_allocations",
+                "deleted_channels",
+            ] {
                 assert_eq!(after.remove(table).unwrap(), Vec::<Vec<_>>::new());
             }
             assert_eq!(

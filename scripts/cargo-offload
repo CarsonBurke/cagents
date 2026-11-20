@@ -789,6 +789,34 @@ def evict(slot, path):
     os.rename(path, os.path.join(evicted, f"{time.time_ns()}-{os.getpid()}-{os.path.basename(path)}"))
 
 
+def session_time(name):
+    """When rustc started the incremental session `name`, as the number its
+    name begins with, or None for a name that is not a finalized session's:
+    `s-TIME-RANDOM-SVH`, TIME in base 36. A session being written ends in
+    `-working` instead of an SVH."""
+    parts = name.split("-")
+    if len(parts) != 4 or parts[0] != "s" or parts[3] == "working":
+        return None
+    try:
+        return int(parts[1], 36)
+    except ValueError:
+        return None
+
+
+def superseded(crate):
+    """The finalized sessions in the incremental directory `crate` that a
+    newer finalized session there supersedes. Rustc starts each compile of a
+    crate from its newest finalized session and removes the older ones only
+    at the start of the next, so one compiled twice keeps two, and rustc never
+    reads the older again."""
+    sessions = []
+    for entry in os.scandir(crate):
+        started = session_time(entry.name)
+        if started is not None and entry.is_dir(follow_symlinks=False):
+            sessions.append((started, entry.name))
+    return [name for _, name in sorted(sessions)[:-1]]
+
+
 def trim(slot, budget, pressed):
     """Bounds the build output of `slot`, whose lease and `running` lock the
     caller holds, so no build of its own runs there: keeps the incremental
@@ -811,10 +839,29 @@ def trim(slot, budget, pressed):
     except (OSError, ValueError):
         known = {}
     measured, crates = {}, []
+    moved = 0
     for incremental in target_directories(slot, "incremental"):
         for crate in os.scandir(incremental):
             if not crate.is_dir(follow_symlinks=False):
                 continue
+            # What rustc would remove at the crate's next compile goes first,
+            # so the budget keeps sessions a compile can start from.
+            try:
+                if not in_use(crate.path):
+                    for name in superseded(crate.path):
+                        session = os.path.join(crate.path, name)
+                        size = known.get(os.path.relpath(session, slot))
+                        if not isinstance(size, int) or size < 0:
+                            size = tree_size(session, set())
+                        evict(slot, session)
+                        moved += size
+                        # Its lock file, which rustc removes with the session.
+                        try:
+                            os.unlink(os.path.join(crate.path, name.rsplit("-", 1)[0] + ".lock"))
+                        except FileNotFoundError:
+                            pass
+            except OSError:
+                pass
             size, last, seen = 0, 0.0, set()
             for session in os.scandir(crate.path):
                 try:
@@ -833,7 +880,7 @@ def trim(slot, budget, pressed):
                 measured[key] = known[key]
                 size += known[key]
             crates.append((last, size, crate.path))
-    kept = moved = 0
+    kept = 0
     # The crates compiled most recently stay until they fill the budget,
     # the one that crosses it included: the next build most likely needs
     # the large session it compiled last. The rest go.

@@ -271,6 +271,9 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
             next.generation += 1;
             handle.publish_snapshot_for_test(next);
             app.chat_runtime_mut(target).unwrap().refresh();
+            // A stale completion reads the item again. No daemon answers
+            // here, so that read fails at once instead of waiting for one.
+            handle.disconnect_for_test();
             clipboard(
                 app.handle_chat_ui(Action::MessageCopied(
                     target,

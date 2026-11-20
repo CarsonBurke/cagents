@@ -1891,7 +1891,11 @@ mod tests {
         assert!(reloaded.is_default(&default));
         assert!(!reloaded.is_default(&Account::system(Provider::Claude)));
         assert!(reloaded.is_default(&Account::system(Provider::Codex)));
-        assert_eq!(reloaded.accounts(Some(&homes)).len(), 4);
+        // The system accounts and the one registered here.
+        assert_eq!(
+            reloaded.accounts(Some(&homes)).len(),
+            Account::system_accounts().len() + 1
+        );
     }
 
     #[test]

@@ -218,13 +218,27 @@ pub fn expand_linked_home(value: &str, home: Option<&std::ffi::OsStr>) -> Result
     Ok(path)
 }
 
+/// Where Muse keeps its login: `$XDG_CONFIG_HOME/muse`, by the base
+/// directory spec, which ignores a relative value.
+fn muse_config(environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    environment("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|config| config.is_absolute())
+        .or_else(|| {
+            environment("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| Path::new(&home).join(".config"))
+        })
+        .map(|config| config.join("muse"))
+}
+
 /// The environment variable a provider's CLI reads its home from.
 pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("CLAUDE_CONFIG_DIR"),
         Provider::Codex => Some("CODEX_HOME"),
-        // Neither has a home variable of its own: cagents uses only their
-        // system account.
+        // None of these has a home variable of its own: cagents uses only
+        // their system account.
         Provider::Omp | Provider::Antigravity | Provider::Muse => None,
     }
 }
@@ -232,7 +246,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
 /// Whether a provider reports its accounts' usage limits. One that does not
 /// has limits all the same; cagents just cannot show them.
 pub fn reports_usage_limits(provider: Provider) -> bool {
-    !matches!(provider, Provider::Antigravity)
+    !matches!(provider, Provider::Antigravity | Provider::Muse)
 }
 
 /// Documented process credentials and provider selectors that outrank a CLI's
@@ -509,12 +523,13 @@ impl Account {
     /// The system accounts, which every installation reports on whether or
     /// not it added any account of its own. Omp brokers its own accounts,
     /// which are found in its usage record rather than listed here.
-    /// Antigravity has only its system sign-in.
-    pub fn system_accounts() -> [Self; 3] {
+    /// Antigravity and Muse have only their system sign-ins.
+    pub fn system_accounts() -> [Self; 4] {
         [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
             Self::system(Provider::Antigravity),
+            Self::system(Provider::Muse),
         ]
     }
 
@@ -523,10 +538,11 @@ impl Account {
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
     /// The providers whose usage is reported, in the order they are listed.
-    pub const REPORTED: [Provider; 4] = [
+    pub const REPORTED: [Provider; 5] = [
         Provider::Claude,
         Provider::Codex,
         Provider::Antigravity,
+        Provider::Muse,
         Provider::Omp,
     ];
 
@@ -611,6 +627,9 @@ impl Account {
             | AccountHome::Managed { path, .. }
             | AccountHome::Linked { path, .. } => Some(path.clone()),
             AccountHome::System => {
+                if self.provider == Provider::Muse {
+                    return muse_config(environment);
+                }
                 if let Some(variable) = home_variable(self.provider)
                     && let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
                     && !inherited_selections(environment).contains(&variable)
@@ -1802,6 +1821,24 @@ mod tests {
         assert_eq!(
             antigravity.launch_home_in(&environment(&[("HOME", "/home/a")])),
             Some(PathBuf::from("/home/a/.gemini"))
+        );
+        // Muse keeps its login in its XDG configuration, which it too
+        // resolves on its own.
+        let muse = Account::system(Provider::Muse);
+        assert_eq!(
+            muse.home_directory(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.config/muse"))
+        );
+        assert_eq!(
+            muse.home_directory(&environment(&[
+                ("HOME", "/home/a"),
+                ("XDG_CONFIG_HOME", "/config")
+            ])),
+            Some(PathBuf::from("/config/muse"))
+        );
+        assert_eq!(
+            muse.launch_home_in(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.config/muse"))
         );
         assert_eq!(claude.probe_environment(), None);
         // The system Claude login exports no home of its own, so the CLI

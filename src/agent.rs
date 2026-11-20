@@ -23,6 +23,8 @@ mod antigravity;
 #[cfg(feature = "host")]
 pub(crate) use antigravity::MODES as ANTIGRAVITY_MODES;
 mod muse;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) use muse::offers_model as muse_offers_model;
 mod omp;
 
 #[cfg(feature = "host")]
@@ -333,6 +335,18 @@ impl Provider {
             .find(|provider| provider.programs().any(|program| program == name))
     }
 
+    /// The executable that runs one of this provider's subcommands, such as
+    /// its ACP server or its login, for `program`, the one its terminal runs.
+    /// They differ only where `program` is a wrapper that puts options before
+    /// any subcommand: Muse's `muse`. A relative `program` or `path` entry is
+    /// taken from `directory`.
+    pub fn subcommand_program(self, program: &str, directory: &Path, path: &str) -> String {
+        match self {
+            Self::Muse => muse::subcommand_program(program, directory, path),
+            _ => program.to_owned(),
+        }
+    }
+
     /// Whether cagents can run this provider's conversations as native chat.
     /// A provider without it is recognised in a terminal but never offered,
     /// converted or started as a native conversation.
@@ -377,7 +391,7 @@ impl Provider {
     /// The provider a launch runs, whatever it runs it for, and the arguments
     /// it passes that provider: a known executable, or an interpreter running
     /// one of the provider's known entrypoints.
-    pub(crate) fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
+    pub fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
         if Self::is_interpreter(&launch.program) {
             let script = Path::new(launch.arguments.first()?);
             let provider = ADAPTERS

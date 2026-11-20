@@ -2202,11 +2202,14 @@ impl AppSettings {
                 "inspector_width must be between 320 and 480",
             ));
         }
-        if !(0.25..=1.0).contains(&self.chat_content_fraction)
-            || !(0.25..=1.0).contains(&self.default_native_pane_fraction)
-        {
+        if !(0.25..=1.0).contains(&self.chat_content_fraction) {
             return Err(SettingsError::Invalid(
-                "Native pane and chat content widths must be between 0.25 and 1.0",
+                "chat_content_fraction must be between 0.25 and 1.0",
+            ));
+        }
+        if !(0.25..=1.0).contains(&self.default_native_pane_fraction) {
+            return Err(SettingsError::Invalid(
+                "default_native_pane_fraction must be between 0.25 and 1.0",
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
@@ -3686,6 +3689,42 @@ mod tests {
                 }
                 .validate()
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn both_invalid_pane_fractions_fall_back_without_losing_other_settings() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = path_in(&directory);
+        let defaults = AppSettings::default();
+        let settings = AppSettings {
+            chat_content_fraction: 1.5,
+            default_native_pane_fraction: 1.5,
+            default_column_fraction: 0.6,
+            ..defaults.clone()
+        };
+        fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+
+        let loaded = load_detailed(&path).unwrap();
+        assert_eq!(
+            loaded.settings.chat_content_fraction,
+            defaults.chat_content_fraction
+        );
+        assert_eq!(
+            loaded.settings.default_native_pane_fraction,
+            defaults.default_native_pane_fraction
+        );
+        assert_eq!(loaded.settings.default_column_fraction, 0.6);
+        let notes = loaded.set_aside().collect::<Vec<_>>();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        for key in ["chat_content_fraction", "default_native_pane_fraction"] {
+            assert!(
+                notes.iter().any(|note| {
+                    note.contains(&format!("“{key}”"))
+                        && note.contains(&format!("{key} must be between 0.25 and 1.0"))
+                }),
+                "{notes:?}"
             );
         }
     }

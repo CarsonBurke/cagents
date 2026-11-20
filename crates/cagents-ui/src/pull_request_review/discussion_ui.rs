@@ -392,6 +392,7 @@ impl State {
     }
 
     pub(super) fn update_discussion(&mut self, action: Action) -> ActionTask {
+        let text_edit = matches!(&action, Action::Composer(action) | Action::Summary(action) if action.is_edit());
         self.discussion.revision = self.discussion.revision.wrapping_add(1);
         if matches!(
             &action,
@@ -405,19 +406,19 @@ impl State {
         ) {
             self.discussion.composer_revision = self.discussion.composer_revision.wrapping_add(1);
         }
-        if matches!(
-            &action,
-            Action::Composer(_)
-                | Action::Summary(_)
-                | Action::Cancel
-                | Action::Finished { .. }
-                | Action::AcknowledgeUnknown
-                | Action::Event(_)
-                | Action::Begin(_)
-                | Action::BeginFile(_)
-                | Action::Reply(_)
-                | Action::Edit(_)
-        ) {
+        if text_edit
+            || matches!(
+                &action,
+                Action::Cancel
+                    | Action::Finished { .. }
+                    | Action::AcknowledgeUnknown
+                    | Action::Event(_)
+                    | Action::Begin(_)
+                    | Action::BeginFile(_)
+                    | Action::Reply(_)
+                    | Action::Edit(_)
+            )
+        {
             self.cache_dirty = true;
             self.discussion.drafts_saved = false;
         }
@@ -577,8 +578,11 @@ impl State {
             // completion replaces the draft, holds them back.
             Action::Composer(action) if !self.discussion.busy => {
                 if let Some(composer) = &mut self.discussion.composer {
+                    let edit = action.is_edit();
                     composer.content.perform(action);
-                    composer.markdown = markdown::parse(&composer.content.text()).collect();
+                    if edit {
+                        composer.markdown = markdown::parse(&composer.content.text()).collect();
+                    }
                 }
             }
             Action::Preview if !self.discussion.busy => {
@@ -2316,6 +2320,59 @@ pub(crate) mod tests {
         let composer = state.discussion.composer.as_ref().unwrap();
         assert_eq!(composer.destination, Destination::Line(mapped));
         assert_eq!(composer.content.text().trim(), "x");
+    }
+
+    #[test]
+    fn cursor_and_selection_in_a_draft_do_not_dirty_the_review_cache() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Comment draft");
+        state.discussion.summary = text_editor::Content::with_text("Review summary");
+        state.cache_dirty = false;
+        state.discussion.drafts_saved = true;
+
+        for action in [
+            text_editor::Action::Move(text_editor::Motion::Right),
+            text_editor::Action::Select(text_editor::Motion::Left),
+            text_editor::Action::SelectAll,
+            text_editor::Action::Click(cosmic::iced::Point::ORIGIN),
+        ] {
+            drop(state.update_discussion(Action::Composer(action.clone())));
+            assert!(!state.cache_dirty);
+            assert!(state.discussion.drafts_saved);
+
+            drop(state.update_discussion(Action::Summary(action)));
+            assert!(!state.cache_dirty);
+            assert!(state.discussion.drafts_saved);
+        }
+    }
+
+    #[test]
+    fn an_edit_in_a_draft_dirties_the_review_cache() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let typed = text_editor::Action::Edit(text_editor::Edit::Insert('x'));
+
+        for action in [Action::Composer(typed.clone()), Action::Summary(typed)] {
+            state.cache_dirty = false;
+            state.discussion.drafts_saved = true;
+            drop(state.update_discussion(action));
+            assert!(state.cache_dirty);
+            assert!(!state.discussion.drafts_saved);
+        }
+
+        assert!(
+            state
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text()
+                .contains('x')
+        );
+        assert!(state.discussion.summary.text().contains('x'));
     }
 
     #[test]

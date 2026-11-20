@@ -518,7 +518,7 @@ unified_exec = true
     fn await_daemon(&self) {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let output = self.output(&["daemon", "status"]);
+            let output = self.output_until(&["daemon", "status"], deadline);
             if output.status.success()
                 && serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"]["running"]
                     == true
@@ -531,23 +531,13 @@ unified_exec = true
     }
 
     fn output(&self, arguments: &[&str]) -> Output {
-        let mut child = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
-                panic!("CLI timed out: {arguments:?}: {output:?}");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
+        self.output_until(arguments, Instant::now() + Duration::from_secs(90))
+    }
+
+    fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
+        let mut command = Self::command(self.root.path(), Path::new(env!("CARGO_BIN_EXE_cagents")));
+        command.arg("--json").args(arguments);
+        let output = run_until(command, deadline);
         self.agents.observe(&output);
         output
     }
@@ -716,6 +706,48 @@ fn processes() -> Vec<(Identity, String)> {
         .collect()
 }
 
+fn run_until(mut command: Command, deadline: Instant) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let stdout = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let stderr = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait().unwrap(), true);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let output = Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    };
+    if timed_out {
+        panic!(
+            "CLI timed out: {:?}: {output:?}",
+            command.get_args().collect::<Vec<_>>()
+        );
+    }
+    output
+}
+
 fn until<T>(timeout: Duration, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + timeout;
     loop {
@@ -844,6 +876,25 @@ fn running_command_survives(scenario: &str, marker: &str, requests: usize) {
     });
     assert_one_uninterrupted_turn(&fixture, scenario, &servers, requests);
     close(&fixture, &mut window, &chat);
+}
+
+#[test]
+fn run_until_drains_output_larger_than_a_pipe() {
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2",
+    ]);
+    let started = Instant::now();
+    let output = run_until(command, started + Duration::from_secs(20));
+    let elapsed = started.elapsed();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout.len(), 1048576);
+    assert_eq!(output.stderr.len(), 1048576);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "capture took {elapsed:?}"
+    );
 }
 
 #[test]

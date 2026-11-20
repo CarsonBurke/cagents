@@ -283,10 +283,15 @@ fn muse_offers_models_and_modes_without_reasoning_levels() {
     let step = acp
         .receive(reply(&setting, json!({"configOptions": options})))
         .unwrap();
-    // A reasoning level the agent has no option for is reported, not sent.
+    // A reasoning level chosen with a model that offers none is left
+    // behind with the model it was chosen for, not reported or sent.
     assert!(step.writes.is_empty());
-    assert!(step.events.iter().any(|event| matches!(event,
-        Event::Error { message, fatal: false } if message.contains("reasoning level"))));
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
     let capabilities = step
         .events
         .iter()
@@ -302,6 +307,75 @@ fn muse_offers_models_and_modes_without_reasoning_levels() {
             .iter()
             .any(|event| matches!(event, Event::Ready(true)))
     );
+}
+
+#[test]
+fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
+    let ready = |arguments: &[&str]| {
+        let mut acp = adapter(arguments, None);
+        let initialize = acp.initialize().unwrap();
+        let opened = acp
+            .receive(reply(only_write(&initialize), muse_initialize()))
+            .unwrap();
+        let step = acp.receive(reply(only_write(&opened), muse_new())).unwrap();
+        (acp, step)
+    };
+    // A level asked for alone, which the agent has no option for, is
+    // reported rather than sent.
+    let (_, step) = ready(&["--reasoning", "high"]);
+    assert!(step.writes.is_empty());
+    assert!(step.events.iter().any(|event| matches!(event,
+        Event::Error { message, fatal: false } if message.contains("reasoning level"))));
+
+    // A switch to a model without the conversation's level, as from Muse's
+    // spark-1.2 to wonder, changes the model and nothing else.
+    let (mut acp, _) = ready(&[]);
+    let step = acp
+        .command(Command::SetModel {
+            model: "muse-spark-1.2".into(),
+            reasoning: Some("xhigh".into()),
+        })
+        .unwrap();
+    let setting = only_write(&step).clone();
+    let mut options = muse_new()["configOptions"].clone();
+    options[1]["currentValue"] = json!("muse-spark-1.2");
+    options
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"category": "thought_level",
+        "currentValue": "xhigh", "id": "thought_level", "name": "Reasoning effort",
+        "options": [{"name": "Extra high", "value": "xhigh"}], "type": "select"}));
+    let step = acp
+        .receive(reply(&setting, json!({"configOptions": options})))
+        .unwrap();
+    // spark-1.2 offers the level, so it is still asked for.
+    assert_eq!(only_write(&step)["params"]["configId"], "thought_level");
+    let step = acp
+        .receive(reply(only_write(&step), json!({"configOptions": options})))
+        .unwrap();
+    assert!(step.writes.is_empty());
+    let step = acp
+        .command(Command::SetModel {
+            model: "muse-wonder-full-1.0".into(),
+            reasoning: Some("xhigh".into()),
+        })
+        .unwrap();
+    let setting = only_write(&step).clone();
+    let step = acp
+        .receive(reply(
+            &setting,
+            json!({"configOptions": muse_new()["configOptions"]}),
+        ))
+        .unwrap();
+    assert!(step.writes.is_empty());
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
+    assert!(step.events.iter().any(|event| matches!(event,
+        Event::ActiveModel(Some(model)) if model.id == "muse-wonder-full-1.0" && model.reasoning.is_none())));
 }
 
 #[test]

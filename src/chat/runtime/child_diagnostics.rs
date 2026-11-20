@@ -253,7 +253,7 @@ impl Backing {
         }
         let mut internal = source.clone();
         internal.scope = TextCopyScope::Conversation;
-        let mut page = match store.text_copy(&internal, offset) {
+        let mut page = match store.copy_page(&internal, offset, false) {
             Ok(page) => page,
             Err(error) => {
                 self.clear();
