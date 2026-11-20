@@ -126,6 +126,12 @@ impl Cagents {
                 ));
                 continue;
             };
+            // No session starts in a project or worktree being removed, as
+            // none starts for a first message sent there. Held, the message
+            // goes with its pane, or starts once a removal that fails ends.
+            if self.deleting_card_reason(card).is_some() {
+                continue;
+            }
             // The reconcile publishes a scope's new panes; this only covers a
             // pane whose scope was admitted without its projection changing.
             if !self.shared_views.registry_unavailable
@@ -186,7 +192,7 @@ impl Cagents {
         ])
     }
 
-    /// Offers the refused scopes to the shared workspace again and sends the
+    /// Offers the refused scope to the shared workspace again and sends the
     /// message that came back. Its start then waits for the scope as any
     /// first message does, so a second refusal returns it here again.
     pub(super) fn retry_refused_view_send(&mut self, target: Target) -> Task<Message> {
@@ -198,7 +204,9 @@ impl Cagents {
         }
         runtime.view_refused = false;
         runtime.error = None;
-        self.retry_view_seeds();
+        if let Some(scope) = self.draft_start_scope(target.card) {
+            self.retry_view_seed(&scope);
+        }
         self.handle_chat_ui(Action::Submit(target, PromptMode::Send))
     }
 }

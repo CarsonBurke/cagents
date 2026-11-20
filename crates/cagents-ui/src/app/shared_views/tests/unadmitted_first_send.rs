@@ -348,3 +348,55 @@ fn a_first_message_sent_while_connecting_waits_for_the_registry_it_joins() {
     seed_applied(&mut window, seeded, Vec::new());
     assert_started_once(&mut window);
 }
+
+#[test]
+fn retry_loads_its_own_channel_while_another_channel_still_retries() {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    let scope = window.scope.clone();
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::SeedRefused {
+                scope: scope.clone(),
+                attempt: window.app.shared_views.seed_attempts[&scope],
+                error: "The registry could not store these panes".into(),
+            }),
+    );
+    assert!(window.app.chat_error(window.card).is_some());
+    // Another channel's retry still awaits its receipt, which keeps the
+    // notice's Retry for every refused channel unavailable meanwhile.
+    let other = Scope::Channel(ChannelId::new());
+    window.app.shared_views.seed_failures.insert(
+        other.clone(),
+        "The registry could not store these panes".into(),
+    );
+    window.app.shared_views.seeding.insert(other);
+    assert!(!window.app.can_retry_view_seeds());
+
+    drain(&window.rx);
+    let save = window
+        .app
+        .handle_chat_ui(Action::RetryRefusedView(window.target));
+    assert!(window.app.shared_views.seeding.contains(&scope));
+    let start = complete(&mut window, save);
+    assert_held(&window, start);
+    let pane = Pane::from_card(window.app.card_state(window.card).unwrap(), None).unwrap();
+    seed_applied(&mut window, vec![pane], Vec::new());
+    assert_started_once(&mut window);
+}
+
+#[test]
+fn a_held_message_waits_out_the_removal_of_its_worktree() {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    window.app.project_ui.begin_deleting(PathBuf::from("/repo"));
+    assert!(window.app.deleting_card_reason(window.card).is_some());
+    // The channel loads while the chat's worktree is being deleted: nothing
+    // starts in a directory being emptied.
+    seed_applied(&mut window, Vec::new(), Vec::new());
+    assert!(window.app.first_send_held(window.card));
+    assert!(window.app.chat_start_attempt(window.card).is_none());
+}
