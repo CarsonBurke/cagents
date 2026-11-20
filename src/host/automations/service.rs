@@ -610,7 +610,7 @@ mod tests {
         let changed = rusqlite::Connection::open(&path)
             .unwrap()
             .execute(
-                "UPDATE automations SET record=replace(record,                  '\"permission_mode\":\"plan\"', '\"permission_mode\":\"never\"') WHERE id=?1",
+                "UPDATE automations SET record=replace(record, '\"permission_mode\":\"plan\"', '\"permission_mode\":\"never\"') WHERE id=?1",
                 [automation.id.to_string()],
             )
             .unwrap();

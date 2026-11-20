@@ -4687,7 +4687,7 @@ mod tests {
                     .db
                     .execute(
                         &format!(
-                            "UPDATE {table} SET {column}=replace({column},                              '\"permission_mode\":\"default\"', '\"permission_mode\":\"never\"')                              WHERE {key}=?1"
+                            "UPDATE {table} SET {column}=replace({column}, '\"permission_mode\":\"default\"', '\"permission_mode\":\"never\"') WHERE {key}=?1"
                         ),
                         [created.id.to_string()],
                     )

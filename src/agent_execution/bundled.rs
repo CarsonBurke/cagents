@@ -59,33 +59,7 @@ pub(crate) fn install(
     else {
         return;
     };
-    let mut roots = Vec::new();
-    if !matches!(provider, Some(Provider::Claude | Provider::Antigravity)) {
-        // Codex and OMP document the user .agents skill provider, and Muse
-        // loads its skills as the user's own (Muse 1.4.24's `muse skills
-        // list` shows them with scope "user"). This remains under the
-        // process HOME, including an explicitly overridden one.
-        roots.push((home.join(".agents"), true));
-    }
-    if matches!(provider, None | Some(Provider::Antigravity)) {
-        // Antigravity reads `.agents/skills` only from the workspace up to
-        // its repository root; a user's own are in its global configuration,
-        // `~/.gemini/config/skills` (its own data is beside it, in
-        // `~/.gemini/antigravity-cli`). An Antigravity agent gets the bundle
-        // there before its first run; a shell that may run it later, only
-        // once that configuration exists.
-        roots.push((home.join(".gemini").join("config"), provider.is_some()));
-    }
-    if provider.is_none() || provider == Some(Provider::Claude) {
-        let selected = environment
-            .get("CLAUDE_CONFIG_DIR")
-            .filter(|root| !root.is_empty());
-        roots.push(match selected {
-            Some(root) => (cwd.join(root), false),
-            None => (home.join(".claude"), true),
-        });
-    }
-    for (root, create_root) in roots {
+    for (root, create_root) in roots(provider, environment, cwd, &home) {
         #[cfg(test)]
         if in_account_home(&root) {
             continue;
@@ -104,6 +78,47 @@ pub(crate) fn install(
                 "cannot install bundled agent skill; cagents --json agent remains available");
         }
     }
+}
+
+/// Each configuration root `provider`'s skills are read from, beside whether
+/// installing may create it. A shell lists Antigravity's only once it exists,
+/// so launching one never warns about an agent the user has not set up.
+fn roots(
+    provider: Option<Provider>,
+    environment: &BTreeMap<String, String>,
+    cwd: &Path,
+    home: &Path,
+) -> Vec<(std::path::PathBuf, bool)> {
+    let mut roots = Vec::new();
+    if !matches!(provider, Some(Provider::Claude | Provider::Antigravity)) {
+        // Codex and OMP document the user .agents skill provider, and Muse
+        // loads its skills as the user's own (Muse 1.4.24's `muse skills
+        // list` shows them with scope "user"). This remains under the
+        // process HOME, including an explicitly overridden one.
+        roots.push((home.join(".agents"), true));
+    }
+    if matches!(provider, None | Some(Provider::Antigravity)) {
+        // Antigravity reads `.agents/skills` only from the workspace up to
+        // its repository root; a user's own are in its global configuration,
+        // `~/.gemini/config/skills` (its own data is beside it, in
+        // `~/.gemini/antigravity-cli`). An Antigravity agent gets the bundle
+        // there before its first run; a shell that may run it later, only
+        // once that configuration exists.
+        let config = home.join(".gemini").join("config");
+        if provider.is_some() || config.is_dir() {
+            roots.push((config, provider.is_some()));
+        }
+    }
+    if provider.is_none() || provider == Some(Provider::Claude) {
+        let selected = environment
+            .get("CLAUDE_CONFIG_DIR")
+            .filter(|root| !root.is_empty());
+        roots.push(match selected {
+            Some(root) => (cwd.join(root), false),
+            None => (home.join(".claude"), true),
+        });
+    }
+    roots
 }
 
 /// Unit tests launch providers and shells with the developer's inherited
@@ -622,6 +637,30 @@ mod tests {
         // Muse loads `~/.agents/skills` as the user's own skills.
         install(Some(Provider::Muse), &environment, directory.path());
         assert_eq!(std::fs::read_to_string(&agents).unwrap(), CONTENT);
+    }
+
+    #[test]
+    fn a_shell_lists_only_roots_it_can_install_into() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let environment = BTreeMap::from([("HOME".into(), home.to_str().unwrap().into())]);
+        // Each root left uncreated must already be there, or installing into
+        // it fails and every terminal launch warns.
+        let installable = || {
+            roots(None, &environment, directory.path(), &home)
+                .into_iter()
+                .all(|(root, create)| create || install_at(&root, false).is_ok())
+        };
+        assert!(installable());
+        std::fs::create_dir(home.join(".gemini")).unwrap();
+        assert!(installable());
+        std::fs::create_dir(home.join(".gemini/config")).unwrap();
+        assert!(
+            roots(None, &environment, directory.path(), &home)
+                .contains(&(home.join(".gemini/config"), false))
+        );
+        assert!(installable());
     }
 
     #[test]
