@@ -66,9 +66,8 @@ pub enum AgentCommand {
         )]
         model: Option<String>,
         #[arg(long, value_name = "MODE")]
-        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. Antigravity: default, acceptEdits, auto or plan. OMP: always-ask, write or yolo",
-            hide_possible_values = true,
-            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
+        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never, optionally followed by /read-only, /workspace-write or /danger-full-access for its sandbox. Antigravity: default, acceptEdits, auto or plan. OMP: always-ask, write or yolo. An agent's child gets no more than the agent's own mode",
+            value_parser = permission_mode)]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long, value_name = "EFFORT")]
@@ -550,6 +549,40 @@ impl Handles {
 
     fn name(self, id: impl std::fmt::Display) -> String {
         super::format::prefix(&id.to_string(), self.0).to_owned()
+    }
+}
+
+/// A `--permission-mode` value one of the providers names.
+fn permission_mode(value: &str) -> Result<String, String> {
+    const MODES: [&str; 14] = [
+        "default",
+        "manual",
+        "auto",
+        "acceptEdits",
+        "plan",
+        "dontAsk",
+        "bypassPermissions",
+        "untrusted",
+        "on-failure",
+        "on-request",
+        "never",
+        "always-ask",
+        "write",
+        "yolo",
+    ];
+    let codex = value.split_once('/').is_some_and(|(approval, sandbox)| {
+        matches!(
+            approval,
+            "untrusted" | "on-failure" | "on-request" | "never"
+        ) && matches!(
+            sandbox,
+            "read-only" | "workspace-write" | "danger-full-access"
+        )
+    });
+    if MODES.contains(&value) || codex {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("unknown permission mode {value:?}"))
     }
 }
 
