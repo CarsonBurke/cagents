@@ -2207,6 +2207,9 @@ harness, it provides:
   UI-thread work by phase and message; see "UI thread trace" in
   `docs/performance.md`. Add `--workspace-trace` to record shared-model update
   timing, scope projection choices and activity redraw intervals. Add
+  `--daemon-trace FILTER` to write the daemon's tracing, at a `RUST_LOG`
+  filter such as `cagents::chat::runtime=debug,warn`, to
+  `logs/daemon-SIDE.log`; the app takes the same filter. Add
   `--projection-oracle` to check every narrowed update projection against the
   full one; such a session repairs what it finds and so behaves like one that
   projects everything, and its log is the evidence. See "Busy terminals and
