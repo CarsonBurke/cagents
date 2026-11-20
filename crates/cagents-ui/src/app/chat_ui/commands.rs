@@ -1129,6 +1129,136 @@ mod tests {
         }
     }
 
+    mod history_consumed {
+        use super::*;
+
+        fn recall_prompt(
+            app: &mut Cagents,
+            card: CardId,
+            draft: &str,
+            attachments: Vec<Attachment>,
+        ) -> Target {
+            let _ = app.workspace.resize_viewport(1200.0);
+            let target = chat_runtime(app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.show(true);
+            runtime.history = vec!["earlier prompt".into()];
+            runtime.replace_draft(text_editor::Content::with_text(draft));
+            runtime.replace_attachments(attachments);
+            drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+            let runtime = chat_runtime(app, card);
+            assert_eq!(runtime.composer.text(), "earlier prompt");
+            assert_eq!(runtime.unsent_text(), draft);
+            assert_eq!(runtime.history_cursor, Some(0));
+            assert!(runtime.history_attachment_stash.is_some());
+            target
+        }
+
+        fn assert_restored_draft(runtime: &Runtime, draft: &str, attachments: &[Attachment]) {
+            assert_eq!(runtime.attachments.as_slice(), attachments);
+            assert_eq!(runtime.composer.text(), draft);
+            assert!(runtime.history_cursor.is_none());
+            assert!(runtime.history_stash.is_none());
+            assert!(runtime.history_attachment_stash.is_none());
+        }
+
+        fn send_recalled_prompt(draft: &str, attachments: Vec<Attachment>) {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = recall_prompt(&mut app, card, draft, attachments.clone());
+            let cursor = chat_runtime(&app, card)
+                .history_stash
+                .as_ref()
+                .unwrap()
+                .cursor();
+
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            let runtime = chat_runtime(&app, card);
+            assert_restored_draft(runtime, draft, &attachments);
+            assert_eq!(runtime.composer.cursor(), cursor);
+            let outgoing = runtime
+                .commands
+                .in_flight()
+                .unwrap()
+                .outgoing
+                .as_ref()
+                .unwrap();
+            assert_eq!(outgoing.prompt.text(), "earlier prompt");
+            assert!(outgoing.prompt.attachments.is_empty());
+            settle(&mut app, card, Ok(()));
+            let runtime = chat_runtime(&app, card);
+            assert_restored_draft(runtime, draft, &attachments);
+            assert_eq!(runtime.history, ["earlier prompt"]);
+            assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+
+            drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+            assert_eq!(chat_runtime(&app, card).composer.text(), "earlier prompt");
+            assert_eq!(chat_runtime(&app, card).history_cursor, Some(0));
+            drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+            let runtime = chat_runtime(&app, card);
+            assert_restored_draft(runtime, draft, &attachments);
+            assert_eq!(runtime.composer.cursor(), cursor);
+        }
+
+        #[test]
+        fn sending_recalled_prompt_restores_the_stashed_draft() {
+            send_recalled_prompt("draft before recall", Vec::new());
+        }
+
+        #[test]
+        fn sending_recalled_prompt_restores_the_stashed_image_draft() {
+            chat::attachment_assets::with_test_image(|image| {
+                let draft = format!(
+                    "draft before recall {}",
+                    image.reference.as_ref().unwrap().token()
+                );
+                send_recalled_prompt(&draft, vec![image]);
+            });
+        }
+
+        #[test]
+        fn queuing_recalled_prompt_restores_the_stashed_draft() {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            publish(&mut app, card, |snapshot| {
+                snapshot.capabilities.queue = false;
+                snapshot.busy = true;
+            });
+            let draft = "draft before recall";
+            let target = recall_prompt(&mut app, card, draft, Vec::new());
+
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Queue))));
+            let runtime = chat_runtime(&app, card);
+            assert_restored_draft(runtime, draft, &[]);
+            assert_eq!(runtime.followups.len(), 1);
+            assert_eq!(runtime.followups[0].text, "earlier prompt");
+            assert!(runtime.commands.in_flight().is_none());
+            publish(&mut app, card, |snapshot| snapshot.busy = false);
+            assert_eq!(
+                chat_runtime(&app, card)
+                    .commands
+                    .in_flight()
+                    .unwrap()
+                    .followups
+                    .len(),
+                1
+            );
+            settle(&mut app, card, Ok(()));
+            let runtime = chat_runtime(&app, card);
+            assert_restored_draft(runtime, draft, &[]);
+            assert!(runtime.followups.is_empty());
+            assert_eq!(runtime.history, ["earlier prompt"]);
+            assert_eq!(app.persistent_workspace().chat_drafts[&card], draft);
+
+            drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+            assert_eq!(chat_runtime(&app, card).composer.text(), "earlier prompt");
+            assert_eq!(chat_runtime(&app, card).history_cursor, Some(0));
+            drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+            let runtime = chat_runtime(&app, card);
+            assert_restored_draft(runtime, draft, &[]);
+        }
+    }
+
     /// The message leaves the composer and shows in the transcript the
     /// moment it is sent, while the provider has yet to answer, and the
     /// composer stays open for the next one.
