@@ -361,7 +361,9 @@ impl Claude {
         let mut page = None;
         for event in step.events {
             match event {
-                chat::Event::History { items, has_earlier } => page = Some((items, has_earlier)),
+                chat::Event::History {
+                    items, has_earlier, ..
+                } => page = Some((items, has_earlier)),
                 chat::Event::HistoryError(error) => return Err(error),
                 _ => {}
             }

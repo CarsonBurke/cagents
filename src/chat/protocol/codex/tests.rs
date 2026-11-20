@@ -2744,7 +2744,15 @@ fn history_loading_lasts_until_the_provider_response_and_refresh_coalesces() {
         adapter.history_loading,
         "the requested latest reread follows the older page"
     );
-    assert!(matches!(answer.events[0], Event::History { .. }));
+    // Codex never says how much history is left: the reader is shown that
+    // there is more, by the control at the window's start.
+    assert!(matches!(
+        answer.events[0],
+        Event::History {
+            unfetched: None,
+            ..
+        }
+    ));
     assert_eq!(answer.writes.len(), 2);
     assert_eq!(answer.writes[0]["method"], "thread/read");
     assert_eq!(answer.writes[1]["method"], "thread/turns/list");
@@ -2754,7 +2762,13 @@ fn history_loading_lasts_until_the_provider_response_and_refresh_coalesces() {
         .receive(json!({"id":answer.writes[1]["id"],"result":{"data":[],"nextCursor":null}}))
         .unwrap();
     assert!(!adapter.history_loading);
-    assert!(matches!(latest.events[0], Event::LatestHistory { .. }));
+    assert!(matches!(
+        latest.events[0],
+        Event::LatestHistory {
+            unfetched: None,
+            ..
+        }
+    ));
     assert_eq!(latest.events.last(), Some(&Event::HistoryLoading(false)));
 }
 

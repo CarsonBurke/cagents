@@ -91,13 +91,30 @@ impl Memory {
         anchor.contexts[index].used = anchor.clock;
         anchor.contexts[index].edge = Some(edge);
     }
-    pub(super) fn clear_latest(&self) {
+    /// Have the conversation's item at `index` start `at` below the
+    /// viewport's top once a window holding it is laid out. Moving to history
+    /// that is not loaded replaces every row, so no row survives to anchor the
+    /// reader: this is the place they asked for instead.
+    pub(super) fn land(&self, index: u64, at: f32) {
+        self.0.borrow_mut().landing = Some(Landing { index, at });
+    }
+    /// Forget where the reader asked to land: they are back in loaded rows.
+    pub(super) fn cancel_landing(&self) {
+        self.0.borrow_mut().landing = None;
+    }
+    /// The conversation index the reader is waiting to land on.
+    pub(super) fn landing(&self) -> Option<u64> {
+        self.0.borrow().landing.map(|landing| landing.index)
+    }
+    /// Let the main transcript's reader go from `edge`, if they are held
+    /// there.
+    pub(super) fn release(&self, edge: Edge) {
         if let Some(context) = self
             .0
             .borrow_mut()
             .contexts
             .iter_mut()
-            .find(|context| context.subagent.is_none() && context.edge == Some(Edge::Latest))
+            .find(|context| context.subagent.is_none() && context.edge == Some(edge))
         {
             context.edge = None;
         }
@@ -327,7 +344,7 @@ pub(super) fn transcript_observed<'a>(
     restoration_pending: bool,
     preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
-    history: History,
+    history: History<'a>,
 ) -> Element<'a, Message> {
     transcript_impl(
         content.into(),
@@ -347,11 +364,15 @@ pub(super) fn transcript_observed<'a>(
 
 /// The history around the loaded window that the transcript stands in for.
 #[derive(Clone, Copy, Default)]
-pub(super) struct History {
+pub(super) struct History<'a> {
     /// Whether there is history before and after the loaded window.
     pub pages: Pages,
     /// The item a page slides the window around.
     pub pivot: Option<Pivot>,
+    /// The space standing for history before and after the window.
+    pub unloaded: view::Unloaded,
+    /// The loaded item the reader asked to land on, see [`Memory::land`].
+    pub landing: Option<&'a str>,
 }
 
 /// The item a page slides the window around, by its place among the
@@ -381,7 +402,7 @@ fn transcript_impl<'a>(
     restoration_pending: bool,
     preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
-    history: History,
+    history: History<'a>,
 ) -> Element<'a, Message> {
     let captured = Rc::new(Cell::new(false));
     let content = widget::scrollable(Element::new(InputCapture {
@@ -983,7 +1004,7 @@ struct Anchored<'a> {
     restoration_pending: bool,
     preparing: HashSet<&'a str>,
     find_intent: Option<find_navigation::Intent>,
-    history: History,
+    history: History<'a>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1016,6 +1037,8 @@ struct Position {
     /// layout, while it was measured where the reader left it. Once the
     /// viewport moves there, the row is mounted and the place can be exact.
     estimated: bool,
+    /// The place is the one the reader asked to land on.
+    landed: bool,
 }
 
 impl Position {
@@ -1023,6 +1046,7 @@ impl Position {
         Self {
             top,
             estimated: false,
+            landed: false,
         }
     }
 }
@@ -1046,6 +1070,10 @@ struct Context {
     follow_end: bool,
     edge: Option<Edge>,
     preserve: Option<PreserveRefresh>,
+    /// Space stood for unloaded history around the window where the reader
+    /// was placed, so their distance from the top is a place in the whole
+    /// conversation.
+    spaced: bool,
 }
 impl Context {
     /// The saved rows that intersected the saved viewport.
@@ -1067,6 +1095,7 @@ impl Context {
         rows: &[(&str, Rectangle)],
         placeholders: &HashSet<&str>,
         follow_end: bool,
+        landing: Option<(&str, f32)>,
     ) -> Position {
         let Some((previous, top)) = self.geometry.zip(self.top) else {
             return Position::exact(if self.subagent.is_some() {
@@ -1154,23 +1183,48 @@ impl Context {
                     .find(|(.., estimated)| !estimated)
             })
             .or_else(|| visible().filter(chunk).filter_map(surviving).next())
-            .or_else(|| visible().filter_map(surviving).next())
-            .or_else(|| {
-                // Front eviction can remove every visible exchange. Keep the
-                // nearest surviving boundary instead of jumping to live output.
-                // Its row was not in view, so mounting it would not refine
-                // the reader's place.
-                self.rows
-                    .iter()
-                    .filter_map(surviving)
-                    .min_by(|(a, ..), (b, ..)| {
-                        (a.bounds.y - top)
-                            .abs()
-                            .total_cmp(&(b.bounds.y - top).abs())
-                    })
-                    .map(|(row, bounds, _)| (row, bounds, false))
-            });
-        let fallback = if self.preserve.is_some_and(|preserve| preserve.arrived) {
+            .or_else(|| visible().filter_map(surviving).next());
+        // No row the reader sees survives when they moved into history that
+        // was not loaded. The item they asked for places them, where the
+        // window that arrived holds it.
+        if overlap.is_none()
+            && let Some((id, at)) = landing
+            && let Some(bounds) = next_rows.get(id)
+        {
+            return Position {
+                top: (bounds.y - at).clamp(0.0, next.travel()),
+                estimated: placeholders.contains(id),
+                landed: true,
+            };
+        }
+        // A reader who saw only the space standing for unloaded history is
+        // kept at their distance from the conversation's start, so that the
+        // space stays still while history loads around them. What the space
+        // was estimated wrong by moves the rows below them instead.
+        let in_space = self.spaced && visible().next().is_none();
+        let overlap = overlap.or_else(|| {
+            if in_space {
+                return None;
+            }
+            // Front eviction can remove every visible exchange. Keep the
+            // nearest surviving boundary instead of jumping to live output.
+            // Its row was not in view, so mounting it would not refine
+            // the reader's place.
+            self.rows
+                .iter()
+                .filter_map(surviving)
+                .min_by(|(a, ..), (b, ..)| {
+                    (a.bounds.y - top)
+                        .abs()
+                        .total_cmp(&(b.bounds.y - top).abs())
+                })
+                .map(|(row, bounds, _)| (row, bounds, false))
+        });
+        // With history space around the window, a distance from the top is
+        // still about the same place in the conversation when no row the
+        // reader saw survives, as when a track click moved them into history
+        // that has now loaded. Without it, the end is the only place known.
+        let fallback = if self.spaced || self.preserve.is_some_and(|preserve| preserve.arrived) {
             top.clamp(0.0, next.travel())
         } else {
             next.travel()
@@ -1187,6 +1241,7 @@ impl Context {
             Position {
                 top: (new.y + within).clamp(0.0, next.travel()),
                 estimated,
+                landed: false,
             }
         })
     }
@@ -1242,6 +1297,14 @@ struct Anchor {
     /// The primary button is held down over the transcript, as while its
     /// scrollbar thumb is dragged.
     held: bool,
+    landing: Option<Landing>,
+}
+
+/// Where the reader asked to be in history that was not loaded yet.
+#[derive(Clone, Copy, Debug)]
+struct Landing {
+    index: u64,
+    at: f32,
 }
 
 impl Anchor {
@@ -1296,7 +1359,8 @@ impl Anchor {
     /// A wheel heading for an edge asks for its page once: further notches
     /// toward the same edge, before the page moves the window, would only
     /// cost the model an update each. A reader who turns back, or a window
-    /// around another item, asks again.
+    /// around another item, asks again. In unloaded history every notch is
+    /// reported, since each moves where the window has to go.
     fn ahead_once(
         &mut self,
         direction: Option<view::Page>,
@@ -1304,7 +1368,7 @@ impl Anchor {
         scroll: Scroll,
         pivot: Option<&str>,
     ) -> Option<view::Page> {
-        if !wheel || scroll.at_top() || scroll.at_bottom() {
+        if !wheel || scroll.at_top() || scroll.at_bottom() || scroll.unseen().is_some() {
             return direction;
         }
         let Some(page) = direction else {
@@ -1393,6 +1457,7 @@ impl Anchor {
             current_top,
             follow_end,
             true,
+            History::default(),
         ) {
             Placement::Settled(bottom) => bottom,
             Placement::Estimated(_) => unreachable!("a settling pass decides"),
@@ -1412,6 +1477,7 @@ impl Anchor {
         current_top: Option<f32>,
         follow_end: bool,
         settle: bool,
+        history: History<'_>,
     ) -> Placement {
         if let Some(index) = self.active
             && let Some(top) = current_top
@@ -1422,6 +1488,7 @@ impl Anchor {
         let index = self.context_index(subagent);
         self.clock += 1;
         let seed = self.seed.take();
+        let landing = self.landing;
         let context = &mut self.contexts[index];
         if context.geometry.is_none()
             && let Some(seed) = seed
@@ -1443,11 +1510,19 @@ impl Anchor {
         let freeze_reading = old_bottom.is_some_and(|bottom| bottom > 0.5)
             && context.geometry.is_some_and(|previous| previous != next);
         let edge = context.edge;
+        let landing = history
+            .landing
+            .zip(landing)
+            .map(|(id, landing)| (id, landing.at));
         let position = match edge {
             Some(Edge::Start) => Position::exact(0.0),
             Some(Edge::End | Edge::Latest) => Position::exact(next.travel()),
-            None => context.position(next, rows, placeholders, follow_end),
+            None => context.position(next, rows, placeholders, follow_end, landing),
         };
+        // Once the window holds the item, the reader is placed: by it, or
+        // by rows they still see.
+        let landing_used = position.landed
+            || landing.is_some_and(|(id, _)| rows.iter().any(|(row, _)| *row == id));
         if position.estimated && !settle {
             // Remembering this pass would replace the measured place with the
             // estimate, and the next pass would faithfully keep the estimate.
@@ -1458,10 +1533,15 @@ impl Anchor {
             return Placement::Estimated(next.travel() - position.top);
         }
         let top = position.top;
+        // The place is now one in this layout, and the space in it.
+        context.spaced = history.unloaded != view::Unloaded::default();
         // Either explicit edge remains deliberate while a nonempty prepared
         // source fits, including a child that would otherwise start on growth.
-        // A genuine empty reset consumes it.
-        if next.travel() > 0.0 || rows.is_empty() {
+        // A genuine empty reset consumes it. The start is not here yet while
+        // space stands for history before the window: the reader waits at
+        // its top as each page arrives, until moving lets them go.
+        let start_pending = edge == Some(Edge::Start) && history.unloaded.before > 0.0;
+        if (next.travel() > 0.0 || rows.is_empty()) && !start_pending {
             context.edge = None;
         }
         context.follow_end = follow_end && (rows.is_empty() || edge != Some(Edge::Start));
@@ -1481,8 +1561,12 @@ impl Anchor {
         if switched {
             self.pending_input = None;
         }
+        if landing_used {
+            self.landing = None;
+        }
         Placement::Settled(
-            (edge.is_some()
+            (position.landed
+                || edge.is_some()
                 || switched
                 || freeze_reading
                 || old_bottom.is_none_or(|old| (old - bottom).abs() > 0.5))
@@ -1510,12 +1594,13 @@ fn navigation_input(
             } else {
                 // A wheel within reach of a loaded edge is a reader heading
                 // there: the page they are heading for is fetched ahead of
-                // them. Elsewhere a notch is only reading, and asks nothing
-                // of the model.
+                // them, and past it the window moves to them. Elsewhere a
+                // notch is only reading, and asks nothing of the model.
+                let unseen = scroll.unseen().is_some();
                 before.and_then(|old| {
-                    if pages.earlier && top < old && scroll.prefetch_earlier() {
+                    if top < old && (unseen || (pages.earlier && scroll.prefetch_earlier())) {
                         Some(view::Page::Earlier)
-                    } else if pages.later && top > old && scroll.prefetch_later() {
+                    } else if top > old && (unseen || (pages.later && scroll.prefetch_later())) {
                         Some(view::Page::Newer)
                     } else {
                         None
@@ -1874,7 +1959,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 })
                 .map(|context| {
                     context
-                        .position(next, &rows, &placeholders, self.follow_end)
+                        .position(next, &rows, &placeholders, self.follow_end, None)
                         .top
                 })
                 .filter(|top| {
@@ -1921,6 +2006,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 top.0,
                 self.follow_end,
                 settle || pass + 1 == PASSES,
+                self.history,
             );
             let estimated = matches!(placement, Placement::Estimated(_));
             let offset = match placement {
@@ -2054,7 +2140,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 anchor.pending_input = navigation_input(
                     before.0,
                     top,
-                    Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                    Scroll::new(top, geometry.content.height, geometry.viewport.height)
+                        .with_unloaded(self.history.unloaded),
                     None,
                     false,
                     self.history.pages,
@@ -2245,6 +2332,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         saved_geometry.content.height,
                         saved_geometry.viewport.height,
                     )
+                    .with_unloaded(self.history.unloaded)
                     .with_kept(self.kept(&anchor));
                     let wheel = match event {
                         Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(match *delta {
@@ -2306,13 +2394,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     .captured
                     .as_ref()
                     .is_some_and(|captured| captured.get());
-            if (moved || wheel_intent)
-                && let Some(context) = anchor
+            if moved || wheel_intent {
+                // The reader moved on from where they asked to land; a
+                // window still on its way is placed by what they see now.
+                if self.subagent.is_none() {
+                    anchor.landing = None;
+                }
+                if let Some(context) = anchor
                     .contexts
                     .iter_mut()
                     .find(|context| context.subagent.as_deref() == self.subagent)
-            {
-                context.edge = None;
+                {
+                    context.edge = None;
+                }
             }
             if state.restore && self.restoration_pending && !moved {
                 return;
@@ -2339,6 +2433,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     || previous.geometry != geometry
             });
             let scroll = Scroll::new(top, geometry.content.height, geometry.viewport.height)
+                .with_unloaded(self.history.unloaded)
                 .with_kept(self.kept(&anchor));
             // Only navigation toward an edge can request its page. Content
             // scrollables own their gestures, including retries at their ends.

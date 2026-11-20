@@ -1924,6 +1924,7 @@ fn asynchronous_history_loading_ends_on_response_reset_or_provider_exit() {
         Event::History {
             items: Vec::new(),
             has_earlier: false,
+            unfetched: None,
         },
         Event::Reset {
             reason: "new conversation".into(),
@@ -2459,6 +2460,7 @@ fn older_history_cannot_replace_a_live_stream_and_reset_invalidates_identity() {
                 text("older", "duplicate"),
             ],
             has_earlier: true,
+            unfetched: None,
         },
     );
     apply_event(
@@ -2517,6 +2519,7 @@ fn replayed_parent_and_child_items_keep_the_first_live_delta_start() {
         Event::History {
             items: replayed.clone(),
             has_earlier: false,
+            unfetched: None,
         },
     );
     subagent(&mut state, "child").items = replayed.into_iter().map(Arc::new).collect();
@@ -2602,6 +2605,7 @@ fn observed_items_are_stamped_and_replayed_history_is_not() {
         Event::History {
             items: vec![text("older", "replay")],
             has_earlier: false,
+            unfetched: None,
         },
     );
     assert_eq!(state.items[0].at, None);
@@ -2800,6 +2804,7 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
                     Event::History {
                         items: vec![text("current", "current")],
                         has_earlier: true,
+                        unfetched: None,
                     },
                 ],
                 ..Step::default()
@@ -2818,6 +2823,7 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
                         vec![Event::History {
                             items: vec![text("older", "older")],
                             has_earlier: false,
+                            unfetched: None,
                         }]
                     }
                 }
@@ -3056,6 +3062,7 @@ fn notification_preview_uses_live_store_events_without_paging_or_tool_output() {
                 2 => vec![Event::History {
                     items: vec![text("old", "Historical answer must not notify")],
                     has_earlier: false,
+                    unfetched: None,
                 }],
                 3 => vec![Event::Request(super::super::Request {
                     kind: super::super::RequestKind::Question,

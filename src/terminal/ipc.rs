@@ -279,7 +279,12 @@ use crate::{
 /// as terminals. An older client has no encoding for either: an optional value
 /// naming one reaches it as absent, and any other message naming one is
 /// refused or withheld.
-pub const PROTOCOL_VERSION: u16 = 191;
+///
+/// Version 192 adds a chat snapshot's count of history before and after its
+/// loaded window, cached or still with the provider, and appends the `Seek`
+/// chat command that moves the window to any cached item. An older CLI is sent
+/// snapshots without the count, and an older update source is read without it.
+pub const PROTOCOL_VERSION: u16 = 192;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -310,8 +315,8 @@ mod older_clients;
 #[cfg(test)]
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
-    encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, HISTORY_EXTENTS, PLAN_AND_RESET_READINGS,
+    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -859,12 +864,26 @@ pub enum TerminalScroll {
     Row(u64),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ServerEnvelope {
     pub version: u16,
     pub request_id: Option<u64>,
     pub proof: HostSessionProof,
     pub message: ServerMessage,
+}
+
+/// Encoded as its [`ServerEnvelopeRef`] is, so an envelope in an older
+/// client's version encodes its message as that client decodes it.
+impl Serialize for ServerEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ServerEnvelopeRef {
+            version: self.version,
+            request_id: self.request_id,
+            proof: &self.proof,
+            message: &self.message,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// A host reply whose transcript may already be encoded by a retained helper.
@@ -2965,7 +2984,8 @@ mod tests {
 
     /// The daemon's writer serializes `ServerEnvelopeRef`, but every peer
     /// decodes `ServerEnvelope`. A field reorder or type change on either side
-    /// would silently mis-decode, so pin the encoding rather than the shape.
+    /// would silently mis-decode, so pin that what one encodes the other
+    /// decodes, rather than the shape.
     #[test]
     fn borrowed_envelope_encodes_identically() {
         let envelope = ServerEnvelope {
@@ -2991,6 +3011,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(owned, borrowed);
+        let decoded: ServerEnvelope = read_frame(&mut borrowed.as_slice()).unwrap().unwrap();
+        assert_eq!(decoded, envelope);
     }
 
     #[test]

@@ -2702,6 +2702,7 @@ fn history_reconnect_discards_old_request_generation_and_navigation() {
     runtime.deferred_page = Some(HistoryNavigation::Latest);
     runtime.earlier_asked = Some(1000.0);
     runtime.later_asked = Some(1000.0);
+    runtime.sought = Some(0);
     drop(app.handle_chat_ui(Action::Reconnect(target)));
     let reconnect = app.chat_ui.attempt(card).unwrap().target;
     let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
@@ -2717,6 +2718,7 @@ fn history_reconnect_discards_old_request_generation_and_navigation() {
     assert!(runtime.deferred_page.is_none());
     assert!(runtime.earlier_asked.is_none());
     assert!(runtime.later_asked.is_none());
+    assert!(runtime.sought.is_none());
     drop(app.handle_chat_ui(Action::Command(reconnect, Command::LoadEarlier)));
     assert_eq!(
         chat_runtime(&app, card).commands.in_flight().unwrap().page,
@@ -2838,6 +2840,271 @@ fn history_explicit_navigation_survives_wheeling_away_from_the_edge() {
         chat_runtime(&app, card).commands.in_flight().unwrap().page,
         Some(view::Page::Earlier)
     );
+}
+
+#[test]
+fn history_report_from_loaded_rows_cancels_an_earlier_landing() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.history = chat::HistoryExtent {
+        before: 400,
+        after: 0,
+        unfetched: Some(0),
+    };
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let unloaded = view::Unloaded {
+        before: 40_000.0,
+        after: 0.0,
+    };
+    // A drag reported in the space standing for earlier history, then, in
+    // the same batch of events, back among the loaded rows.
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(20_000.0, 50_000.0, 400.0).with_unloaded(unloaded),
+        None,
+    )));
+    assert!(chat_runtime(&app, card).scroll_memory.landing().is_some());
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(45_000.0, 50_000.0, 400.0).with_unloaded(unloaded),
+        None,
+    )));
+    assert_eq!(chat_runtime(&app, card).scroll_memory.landing(), None);
+}
+
+/// A reader who clicked far into history the provider has not handed over
+/// waits there while the window pages back toward them: each page that
+/// arrives off the window's start sends it back there for the next.
+/// A reader who takes the thumb to the top waits at the conversation's
+/// start while its history is fetched, as Home keeps them: once it is all
+/// loaded, no space is left above the window to place them in, so the start
+/// edge is what lands them on its first item.
+#[test]
+fn a_thumb_at_the_top_of_unfetched_history_waits_at_the_start() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.has_earlier = true;
+    snapshot.history = chat::HistoryExtent {
+        before: 0,
+        after: 0,
+        unfetched: Some(3),
+    };
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    // Three items' worth of space, less than half the viewport.
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(0.0, 6_000.0, 800.0).with_unloaded(view::Unloaded {
+            before: 300.0,
+            after: 0.0,
+        }),
+        None,
+    )));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.scroll_memory.edge(None), Some(scroll::Edge::Start));
+    assert_eq!(
+        runtime.commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+}
+
+/// A reader at the top of unfetched history, held at the start while its
+/// pages are fetched, with a subagent they can read meanwhile.
+fn reader_waiting_at_the_start(app: &mut Cagents) -> (CardId, Target, Arc<ClientHandle>) {
+    let (card, target, handle) = history_fixture(app);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.history = chat::HistoryExtent {
+        before: 0,
+        after: 0,
+        unfetched: Some(3),
+    };
+    snapshot.subagents.push(chat::Subagent {
+        id: "child".into(),
+        kind: "general-purpose".into(),
+        description: "Read the logs".into(),
+        status: chat::ToolStatus::Running,
+        model: None,
+        waiting: false,
+        detail: String::new(),
+        background: false,
+        items: Vec::new(),
+    });
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(0.0, 6_000.0, 800.0).with_unloaded(view::Unloaded {
+            before: 300.0,
+            after: 0.0,
+        }),
+        None,
+    )));
+    assert_eq!(
+        chat_runtime(app, card).commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+    (card, target, handle)
+}
+
+/// The page asked for arrives: one more of the conversation's earliest.
+fn earlier_page_arrives(app: &mut Cagents, card: CardId, handle: &ClientHandle, unfetched: u64) {
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.history.unfetched = Some(unfetched);
+    snapshot.items.insert(
+        0,
+        Arc::new(chat::Item {
+            id: format!("earlier-{unfetched}"),
+            role: chat::Role::User,
+            content: text("Earlier"),
+            started_at: None,
+            at: None,
+        }),
+    );
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(chat_runtime(app, card).target)
+        .unwrap()
+        .refresh();
+    settle(app, card, Ok(()));
+}
+
+/// A seek to the cached start that fails lets the reader go from it, and is
+/// sent again once they move there again.
+#[test]
+fn a_failed_seek_to_the_start_lets_the_reader_go() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.history = chat::HistoryExtent {
+        before: 5,
+        after: 0,
+        unfetched: Some(0),
+    };
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let top = view::Scroll::new(0.0, 6_000.0, 800.0).with_unloaded(view::Unloaded {
+        before: 500.0,
+        after: 0.0,
+    });
+    drop(app.handle_chat_ui(Action::Scrolled(target, None, top, None)));
+    assert_eq!(chat_runtime(&app, card).sought, Some(0));
+    assert!(chat_runtime(&app, card).commands.in_flight().is_some());
+    settle(&mut app, card, Err("history unavailable".into()));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.sought, None);
+    assert_eq!(runtime.scroll_memory.edge(None), None);
+    assert!(runtime.commands.in_flight().is_none());
+    drop(app.handle_chat_ui(Action::Scrolled(target, None, top, None)));
+    assert_eq!(chat_runtime(&app, card).sought, Some(0));
+    assert!(chat_runtime(&app, card).commands.in_flight().is_some());
+}
+
+/// Paging toward a reader waiting at the start waits while they read a
+/// subagent, and resumes when they come back to the main transcript.
+#[test]
+fn a_reader_back_from_a_subagent_resumes_paging_to_the_start() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = reader_waiting_at_the_start(&mut app);
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+    earlier_page_arrives(&mut app, card, &handle, 2);
+    assert!(chat_runtime(&app, card).commands.in_flight().is_none());
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.scroll_memory.edge(None), Some(scroll::Edge::Start));
+    assert_eq!(
+        runtime.commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+}
+
+/// What was deferred can be dropped, by a refresh or a reconnect among
+/// others; the reader still held at the start asks for the next page.
+#[test]
+fn a_reader_held_at_the_start_asks_for_each_page() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = reader_waiting_at_the_start(&mut app);
+    app.chat_runtime_mut(target).unwrap().deferred_page = None;
+    earlier_page_arrives(&mut app, card, &handle, 2);
+    assert_eq!(
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+}
+
+/// A page that fails lets the reader go from the start, and is not asked for
+/// again until they move.
+#[test]
+fn a_failed_page_lets_a_reader_go_from_the_start() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, _, _) = reader_waiting_at_the_start(&mut app);
+    settle(&mut app, card, Err("history unavailable".into()));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.scroll_memory.edge(None), None);
+    assert!(runtime.commands.in_flight().is_none());
+}
+
+#[test]
+fn history_paging_to_a_reader_in_unfetched_history_seeks_the_start_after_every_page() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let window = |app: &mut Cagents, before: u64, unfetched: u64| {
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.history = chat::HistoryExtent {
+            before,
+            after: 0,
+            unfetched: Some(unfetched),
+        };
+        snapshot.items = vec![Arc::new(chat::Item {
+            id: format!("item-{before}-{unfetched}"),
+            role: chat::Role::User,
+            content: text("Earlier"),
+            started_at: None,
+            at: None,
+        })];
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+    };
+    window(&mut app, 0, 1000);
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        view::Scroll::new(1000.0, 50_000.0, 400.0).with_unloaded(view::Unloaded {
+            before: 40_000.0,
+            after: 0.0,
+        }),
+        None,
+    )));
+    assert_eq!(
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+    for round in 0..2 {
+        // The page lands, and the window slides off the cached start.
+        window(&mut app, 15, 900 - round * 100);
+        settle(&mut app, card, Ok(()));
+        assert_eq!(chat_runtime(&app, card).sought, Some(0), "round {round}");
+        // The window is back at the start, and asks for the next page.
+        window(&mut app, 0, 900 - round * 100);
+        settle(&mut app, card, Ok(()));
+        assert_eq!(chat_runtime(&app, card).sought, None, "round {round}");
+        assert_eq!(
+            chat_runtime(&app, card).commands.in_flight().unwrap().page,
+            Some(view::Page::Earlier),
+            "round {round}"
+        );
+    }
 }
 
 #[test]

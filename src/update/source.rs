@@ -793,6 +793,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         190,
         "intermediate #3209 protocol; superseded by 191 without a qualified installed update source",
     ),
+    (
+        191,
+        "intermediate #3241 protocol; superseded by 192 without a qualified installed update source",
+    ),
 ];
 
 #[cfg(test)]
@@ -806,7 +810,9 @@ pub(crate) fn protocols() -> impl Iterator<Item = u16> {
 
 /// Whether a live update may start from a daemon serving this protocol. Every
 /// qualified source speaks this release's wire for the frozen lifecycle and
-/// inspector subset, so one client serves them all.
+/// inspector subset, so one client serves them all, except for fields a later
+/// protocol added that this build reads as absent from it under
+/// `terminal_ipc::decoding_from`.
 pub(crate) fn is_qualified_source(protocol: u16) -> bool {
     protocol == crate::terminal_ipc::PROTOCOL_VERSION
         || RELEASED_SOURCES

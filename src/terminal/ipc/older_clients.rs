@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 191,
+    proven_at: 192,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -119,15 +119,34 @@ pub(crate) const ANTIGRAVITY_AND_MUSE: u16 = 191;
 /// reported plan details. An earlier client is sent the reading without them.
 pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
 
+/// The first protocol whose chat snapshots say how much history lies outside
+/// their window. A client from before it is sent snapshots without it, and an
+/// update source from before it is read without it.
+pub(crate) const HISTORY_EXTENTS: u16 = 192;
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
 #[cfg(test)]
-const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[(
-    "cagents::account::info::UsageReading",
-    &["resets", "plan_display_name", "rate_limit_tier"],
-    PLAN_AND_RESET_READINGS,
-)];
+const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
+    (
+        "cagents::account::info::UsageReading",
+        &["resets", "plan_display_name", "rate_limit_tier"],
+        PLAN_AND_RESET_READINGS,
+    ),
+    ("cagents::chat::Snapshot", &["history"], HISTORY_EXTENTS),
+];
+
+/// Fields a later protocol added to a struct that this build reads as absent
+/// from a peer from before it, under [`decoding_from`], so an update source
+/// from before it may still answer the lifecycle and inspector subset with
+/// that struct: the struct's type name, the fields, and the protocol that
+/// added them. Each must be read with a `deserialize_with` that consumes
+/// nothing under [`decoding_before`]; the lifecycle proof accepts exactly
+/// these.
+#[cfg(test)]
+const READ_AS_ABSENT: &[(&str, &[&str], u16)] =
+    &[("cagents::chat::Snapshot", &["history"], HISTORY_EXTENTS)];
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
@@ -172,6 +191,8 @@ const WITHHELD_VARIANTS: &[(&str, &str, u16)] = &[
 thread_local! {
     /// The older protocol this thread is encoding a message for.
     static ENCODING_FOR: Cell<Option<u16>> = const { Cell::new(None) };
+    /// The older protocol this thread is decoding a message from.
+    static DECODING_FROM: Cell<Option<u16>> = const { Cell::new(None) };
 }
 
 /// Runs `encode` with this thread encoding for a client of `protocol`, so that
@@ -198,6 +219,27 @@ pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
 /// Whether the value being encoded goes to a client from before `protocol`.
 pub(crate) fn encoding_before(protocol: u16) -> bool {
     ENCODING_FOR.get().is_some_and(|older| older < protocol)
+}
+
+/// Runs `decode` with this thread decoding what a peer of `protocol` sent, so
+/// that a field a later protocol added is read as absent rather than from the
+/// bytes after it. Like [`encoding_for`], it applies only to what `decode`
+/// deserializes on this thread.
+pub(crate) fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u16>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECODING_FROM.set(self.0);
+        }
+    }
+    let older = (protocol < PROTOCOL_VERSION).then_some(protocol);
+    let _restore = Restore(DECODING_FROM.replace(older));
+    decode()
+}
+
+/// Whether the value being decoded came from a peer from before `protocol`.
+pub(crate) fn decoding_before(protocol: u16) -> bool {
+    DECODING_FROM.get().is_some_and(|older| older < protocol)
 }
 
 /// The older protocol a client opened its connection with, when this daemon
@@ -696,6 +738,71 @@ mod tests {
             encoding_for(PLAN_AND_RESET_READINGS, || postcard::to_stdvec(&readings)
                 .unwrap()),
             current
+        );
+    }
+
+    /// A snapshot goes to a peer from before history extents without one, and
+    /// is read from one without one: postcard is positional, so the fields
+    /// after it are read from their own bytes either way.
+    #[test]
+    fn a_snapshot_crosses_a_peer_from_before_history_extents_without_its_extent() {
+        use crate::chat::{HistoryExtent, Snapshot};
+        let snapshot = Snapshot {
+            has_earlier: true,
+            history: HistoryExtent {
+                before: 40,
+                after: 7,
+                unfetched: Some(300),
+            },
+            composer: Some("draft".into()),
+            history_loading: true,
+            ..Snapshot::default()
+        };
+        let older = encoding_for(HISTORY_EXTENTS - 1, || {
+            postcard::to_stdvec(&snapshot).unwrap()
+        });
+        let current = postcard::to_stdvec(&snapshot).unwrap();
+        assert!(
+            older.len() < current.len(),
+            "the older snapshot has no extent"
+        );
+        let read = decoding_from(HISTORY_EXTENTS - 1, || {
+            postcard::from_bytes::<Snapshot>(&older).unwrap()
+        });
+        assert_eq!(
+            read,
+            Snapshot {
+                history: HistoryExtent::default(),
+                ..snapshot.clone()
+            },
+            "every other field is read from its own bytes"
+        );
+        assert_eq!(
+            postcard::from_bytes::<Snapshot>(&current).unwrap(),
+            snapshot
+        );
+        assert_eq!(
+            encoding_for(HISTORY_EXTENTS, || postcard::to_stdvec(&snapshot).unwrap()),
+            current
+        );
+        assert_eq!(
+            decoding_from(HISTORY_EXTENTS, || postcard::from_bytes::<Snapshot>(
+                &current
+            )
+            .unwrap()),
+            snapshot
+        );
+        // The retained helper's JSON carries it, and one without it reads as
+        // none.
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(json.clone()).unwrap(),
+            snapshot
+        );
+        json.as_object_mut().unwrap().remove("history");
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(json).unwrap().history,
+            HistoryExtent::default()
         );
     }
 

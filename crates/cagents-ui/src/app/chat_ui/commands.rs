@@ -124,6 +124,11 @@ impl PendingCommand {
         }
     }
 
+    /// Whether this command moves the transcript window to an item.
+    pub(super) fn seeks(&self) -> bool {
+        matches!(self.repeat, Some(Command::Seek { .. }))
+    }
+
     /// Marks this command as carrying the held follow-ups `ids`, which
     /// together make `message`.
     pub(super) fn carry_followups(&mut self, ids: Vec<u64>, message: Outgoing) {

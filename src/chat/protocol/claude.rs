@@ -3532,6 +3532,7 @@ impl Adapter for Claude {
                     ),
                 )],
                 has_earlier: false,
+                unfetched: None,
             });
         }
         if let Some(mut history) = self.history.take() {
@@ -3545,6 +3546,7 @@ impl Adapter for Claude {
                 step.events.push(Event::History {
                     items: vec![history_notice("Some saved messages are not shown", body)],
                     has_earlier: false,
+                    unfetched: None,
                 });
             }
             self.history_outcomes = std::mem::take(&mut history.call_outcomes);
@@ -3555,6 +3557,7 @@ impl Adapter for Claude {
                     .filter(|id| history.agent_status.get(*id) == Some(&ToolStatus::Running))
                     .cloned(),
             );
+            let from = history.offset;
             let frames = history.page_for_start()?;
             let mut history_step = Step::default();
             for frame in frames {
@@ -3688,6 +3691,7 @@ impl Adapter for Claude {
             let mut items = settled(items);
             self.stop_earlier_steps(&mut items);
             step.events.push(Event::History {
+                unfetched: Some(history.unfetched(from - history.offset, items.len())),
                 items,
                 has_earlier: history.offset > 0,
             });
@@ -3894,6 +3898,9 @@ impl Adapter for Claude {
                 Err("File changes are served by the transcript cache".into())
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
+            Command::Seek { .. } => {
+                Err("History positions are served by the transcript cache".into())
+            }
             Command::ResumeAfterLogin { .. } => {
                 Err("Live login verification is available for Codex chats".into())
             }
@@ -3902,6 +3909,7 @@ impl Adapter for Claude {
                 let Some(mut history) = self.history.take() else {
                     return Err("Claude has no earlier persisted history".into());
                 };
+                let from = history.offset;
                 let frames = history.page();
                 let has_earlier = history.offset > 0;
                 self.history = Some(history);
@@ -3926,8 +3934,16 @@ impl Adapter for Claude {
                     .collect();
                 let mut items = settled(items);
                 self.stop_earlier_steps(&mut items);
+                let unfetched = self
+                    .history
+                    .as_mut()
+                    .map(|history| history.unfetched(from - history.offset, items.len()));
                 Ok(Step {
-                    events: vec![Event::History { items, has_earlier }],
+                    events: vec![Event::History {
+                        items,
+                        has_earlier,
+                        unfetched,
+                    }],
                     ..Step::default()
                 })
             }
@@ -7692,6 +7708,8 @@ struct History {
     /// Whether each skipped message is marked where it was. One whose
     /// parent could not be read has no known place.
     marked: bool,
+    /// How many links and items the pages handed over so far held.
+    handed: (usize, usize),
 }
 /// One step of the conversation, oldest first once indexed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7974,6 +7992,24 @@ struct Compaction {
     preceding: Option<String>,
 }
 impl History {
+    /// About how many items the links not handed over hold, once a page of
+    /// `links` of them held `items`: exact when none are left. Links hold
+    /// items at different rates, as a tool's result joins its call, so this
+    /// is at the rate of every page handed over so far.
+    fn unfetched(&mut self, links: usize, items: usize) -> u64 {
+        self.handed.0 += links;
+        self.handed.1 += items;
+        let (links, items) = self.handed;
+        if self.offset == 0 {
+            0
+        } else if links == 0 {
+            self.offset as u64
+        } else {
+            // A link left is history that exists, however few items it is
+            // estimated to hold.
+            ((self.offset as f64 * items as f64 / links as f64).round() as u64).max(1)
+        }
+    }
     /// The account configuration and resolved directory whose transcript a
     /// launch resumes. Only a launch that names neither exactly fails here.
     fn locate(launch: &Launch, id: &str) -> Result<(PathBuf, PathBuf), super::SetupError> {
@@ -8625,6 +8661,7 @@ impl History {
             damaged,
             oversized,
             marked,
+            handed: (0, 0),
         };
         history_branches::index_activity(&mut history, &nodes, &ambiguous, &task_notices)?;
         Ok(history)

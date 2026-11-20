@@ -1626,6 +1626,14 @@ pub struct Snapshot {
     pub exited: bool,
     pub has_earlier: bool,
     pub has_later: bool,
+    /// Where the presented window sits in the whole conversation, so a
+    /// reader's scrollbar can stand for all of it rather than the window.
+    #[serde(
+        default,
+        skip_serializing_if = "HistoryExtent::omitted",
+        deserialize_with = "HistoryExtent::read"
+    )]
+    pub history: HistoryExtent,
     pub composer: Option<String>,
     #[serde(default)]
     pub prompt_suggestion: Option<PromptSuggestion>,
@@ -1663,6 +1671,47 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+}
+
+/// How many transcript items lie on each side of the presented window.
+///
+/// An item the window shows only some parts of counts as inside it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryExtent {
+    /// Cached items before the window.
+    pub before: u64,
+    /// Cached items after the window.
+    pub after: u64,
+    /// Items before the cached ones that the provider has not handed over,
+    /// as it reported them: `None` when it cannot tell how many, although
+    /// `has_earlier` then still says that there are some.
+    pub unfetched: Option<u64>,
+}
+
+impl HistoryExtent {
+    /// Whether a snapshot goes to a client from before the extent, which is
+    /// sent it without. Postcard is positional, so the field is left out.
+    fn omitted(&self) -> bool {
+        crate::terminal_ipc::encoding_before(crate::terminal_ipc::HISTORY_EXTENTS)
+    }
+    /// Reads the extent, or nothing from a peer from before it: what follows
+    /// in its bytes is the snapshot's next field.
+    fn read<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::HISTORY_EXTENTS) {
+            return Ok(Self::default());
+        }
+        Self::deserialize(deserializer)
+    }
+    /// How many items the whole cached conversation holds, given how many
+    /// the window holds. That is items, not rows: a long message the window
+    /// shows as several parts is one item.
+    pub fn total(self, window_items: usize) -> u64 {
+        self.before + window_items as u64 + self.after
+    }
+    /// How many items, cached or not, are known to come before the window.
+    pub fn earlier(self) -> u64 {
+        self.before + self.unfetched.unwrap_or(0)
+    }
 }
 
 /// When a provider takes a message it is holding.
@@ -2097,7 +2146,8 @@ impl Command {
             | Self::LoadLater
             | Self::LoadFileChanges { .. }
             | Self::LoadFileChangePatches { .. }
-            | Self::ReadTextCopy { .. } => false,
+            | Self::ReadTextCopy { .. }
+            | Self::Seek { .. } => false,
         }
     }
 }
@@ -2180,6 +2230,11 @@ pub enum Command {
     ReadTextCopy {
         source: TextCopySource,
         offset: u64,
+    },
+    /// Present the cached window around the item at `index`, counted from the
+    /// start of the cached conversation; never asks the provider for history.
+    Seek {
+        index: u64,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3209,6 +3264,11 @@ pub enum Event {
     History {
         items: Vec<Item>,
         has_earlier: bool,
+        /// How many items the provider holds before this page and has not
+        /// handed over: exact when it knows its length, an estimate when it
+        /// can only tell roughly, and `None` when it cannot tell at all.
+        /// Meaningless once `has_earlier` is false, when there are none.
+        unfetched: Option<u64>,
     },
     TextDelta {
         id: String,
@@ -3289,6 +3349,8 @@ pub enum Event {
     LatestHistory {
         items: Vec<Item>,
         has_earlier: bool,
+        /// See [`Event::History`].
+        unfetched: Option<u64>,
     },
     /// Establish the cached/live boundary before an asynchronous newest-page
     /// request. Its response may arrive after newer live items.

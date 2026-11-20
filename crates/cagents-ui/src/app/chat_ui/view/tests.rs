@@ -12447,3 +12447,243 @@ fn a_lone_coordinating_step_still_running_says_so() {
         "{texts:?}"
     );
 }
+
+/// Unloaded history is space the scrollbar spans. Pages are fetched ahead of
+/// the reader relative to the loaded window inside it, and a reader in the
+/// space itself is somewhere the window has to move to (#3102).
+#[test]
+fn unloaded_history_space_places_the_reader_in_the_whole_conversation() {
+    let unloaded = Unloaded {
+        before: 10_000.0,
+        after: 4_000.0,
+    };
+    // 6000 px of loaded window between the spaces, an 800 px viewport, its
+    // halves meeting halfway down it.
+    let kept = Kept {
+        older_end: 13_000.0,
+        newer_start: 13_000.0,
+    };
+    let at = |top: f32| {
+        Scroll::new(top, 20_000.0, 800.0)
+            .with_unloaded(unloaded)
+            .with_kept(Some(kept))
+    };
+    assert_eq!(at(10_000.0).unseen(), None);
+    assert!(at(10_000.0).prefetch_earlier());
+    // Without the halves, as while the thumb is dragged, the window's edge
+    // asks for nothing: the reader moves on into the space instead.
+    assert!(!at(10_000.0).with_kept(None).prefetch_earlier());
+    assert!(!at(10_000.0).prefetch_later());
+    // Deep in the loaded window, nothing is fetched.
+    assert!(!at(12_600.0).prefetch_earlier());
+    assert!(!at(12_600.0).prefetch_later());
+    assert!(at(15_200.0).prefetch_later());
+    // Not at the scrollbar's ends, the reader is still at the window's.
+    assert!(!at(10_000.0).at_top());
+    assert_eq!(at(4_600.0).unseen(), Some(Unseen::Before(0.5)));
+    assert_eq!(at(17_600.0).unseen(), Some(Unseen::After(0.5)));
+    assert_eq!(at(0.0).unseen(), Some(Unseen::Before(0.04)));
+}
+
+/// The height given to unloaded items is what the loaded ones measured, and
+/// it holds while the reader stays in one window.
+#[test]
+fn history_estimate_follows_the_measured_window_only_when_it_changes() {
+    let first = HistoryEstimate::default().update((272, 128), 0.0);
+    assert_eq!(first.per_item(), HistoryEstimate::DEFAULT);
+    // Once the window is laid out, its measured height replaces the default.
+    let measured = first.update((272, 128), 128.0 * 300.0);
+    assert_eq!(measured.per_item(), 300.0);
+    // Further layout of the same window does not move the estimate.
+    assert_eq!(measured.update((272, 128), 128.0 * 500.0).per_item(), 300.0);
+    // A new window is estimated from what the previous one measured.
+    let slid = measured.update((208, 128), 128.0 * 250.0);
+    assert_eq!(slid.per_item(), 250.0);
+    let slid = slid.update((208, 128), 1.0);
+    assert_eq!(
+        slid.per_item(),
+        250.0,
+        "a measured window keeps its estimate"
+    );
+    // Each window measured is averaged in, so the space for history far
+    // from the reader moves less with each window they read.
+    let again = slid.update((144, 128), 128.0 * 350.0);
+    assert_eq!(again.per_item(), 300.0);
+    assert_eq!(again.update((80, 128), 128.0 * 300.0).per_item(), 300.0);
+}
+
+/// History counts items, where the window has a row for each part of a long
+/// message. The window's items, the history after it, and where a reader
+/// asked to land are all counted in items, not rows.
+#[test]
+fn history_counts_a_long_messages_parts_as_one_item() {
+    let (mut runtime, _) = furnished_runtime();
+    let part = |item: &str, index| {
+        chat::TranscriptPart {
+            item,
+            index,
+            layout: "text",
+            fields: [(index * 10, index * 10 + 10), (0, 0)],
+        }
+        .id()
+    };
+    let rows = [
+        // The window starts partway through a message.
+        part("a", 2),
+        part("a", 3),
+        "b".to_owned(),
+        "c".to_owned(),
+        part("c", 1),
+        part("c", 2),
+        // A provider ID that happens to look like another item's part.
+        part("z", 1),
+        "d".to_owned(),
+    ];
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.items = rows
+        .iter()
+        .map(|id| Arc::new(message(id, chat::Role::Assistant, "text", false, 0)))
+        .collect();
+    snapshot.has_later = true;
+    snapshot.history = chat::HistoryExtent {
+        before: 10,
+        after: 20,
+        unfetched: Some(0),
+    };
+    assert_eq!(runtime.window_items().collect::<Vec<_>>(), [0, 2, 3, 6, 7]);
+
+    runtime.scroll_memory.land(13, 0.0);
+    assert_eq!(runtime.landing_item(), Some(rows[6].as_str()));
+    runtime.scroll_memory.land(14, 0.0);
+    assert_eq!(runtime.landing_item(), Some("d"));
+    runtime.scroll_memory.land(15, 0.0);
+    assert_eq!(runtime.landing_item(), None, "past the window");
+
+    let unloaded = runtime.unloaded_history();
+    let window = 800.0;
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    // Just short of the end, the item beside the middle of the viewport, in
+    // the last of the space after the window.
+    let short = window / 2.0 + PAGE_REACH + 1.0;
+    let Some(Sought::Cached { index, .. }) = runtime.history_index(
+        Scroll::new(content - window - PAGE_REACH - 1.0, content, window).with_unloaded(unloaded),
+    ) else {
+        panic!("the end of the space after the window is cached");
+    };
+    let offset = ((1.0 - short / unloaded.after) * 20.0).floor() as u64;
+    assert_eq!(index, 10 + 5 + offset, "counted after the window's items");
+}
+
+/// The ends of the space standing for unloaded history are the ends of the
+/// conversation: a reader who drags the thumb to the top lands on its first
+/// item at the top, rather than on the item an estimate puts beside the
+/// middle of the viewport, and one who drags it to the bottom is at its
+/// newest history.
+#[test]
+fn the_ends_of_unloaded_history_are_the_conversations_ends() {
+    let (mut runtime, _) = furnished_runtime();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.has_earlier = true;
+    snapshot.has_later = true;
+    snapshot.history = chat::HistoryExtent {
+        before: 100,
+        after: 100,
+        unfetched: Some(0),
+    };
+    let unloaded = runtime.unloaded_history();
+    let window = 800.0;
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    let at = |from_top: f32| {
+        runtime.history_index(Scroll::new(from_top, content, window).with_unloaded(unloaded))
+    };
+    assert_eq!(at(0.0), Some(Sought::Start));
+    // A fling that settles a few points short has arrived too.
+    assert_eq!(at(PAGE_REACH), Some(Sought::Start));
+    assert_eq!(
+        runtime.history_start(),
+        Sought::Cached { index: 0, at: 0.0 }
+    );
+    let Some(Sought::Cached { index, .. }) = at(PAGE_REACH + 1.0) else {
+        panic!("short of the top, the reader is among the cached history");
+    };
+    assert!(index > 0, "the item beside the middle of the viewport");
+    assert_eq!(at(content - window), Some(Sought::Latest));
+    assert!(matches!(
+        at(content - window - PAGE_REACH - 1.0),
+        Some(Sought::Cached { .. })
+    ));
+
+    // History the provider still holds is where the conversation starts.
+    Arc::make_mut(&mut runtime.snapshot).history.unfetched = Some(300);
+    let unloaded = runtime.unloaded_history();
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    assert_eq!(
+        runtime.history_index(Scroll::new(0.0, content, window).with_unloaded(unloaded)),
+        Some(Sought::Start)
+    );
+    assert_eq!(runtime.history_start(), Sought::Unfetched);
+
+    // An item or so either side stands for less space than half the
+    // viewport, so at either end its middle is among the loaded rows; the
+    // reader there has still reached the conversation's end.
+    Arc::make_mut(&mut runtime.snapshot).history = chat::HistoryExtent {
+        before: 1,
+        after: 1,
+        unfetched: Some(0),
+    };
+    let unloaded = runtime.unloaded_history();
+    assert!(unloaded.before < window / 2.0 && unloaded.after < window / 2.0);
+    let content = unloaded.before + 6_000.0 + unloaded.after;
+    let at = |from_top: f32| {
+        runtime.history_index(Scroll::new(from_top, content, window).with_unloaded(unloaded))
+    };
+    assert_eq!(at(0.0), Some(Sought::Start));
+    assert_eq!(at(content - window), Some(Sought::Latest));
+    assert_eq!(at(content / 2.0), None, "among the loaded rows");
+}
+
+/// The space before the window stands for the history the provider has not
+/// handed over too, so the scrollbar spans the conversation from when it is
+/// opened. A reader in that part of it is waiting for the provider; one in
+/// the cached part is somewhere the window can move to straight away.
+#[test]
+fn unloaded_history_space_includes_what_the_provider_still_holds() {
+    let (mut runtime, _) = furnished_runtime();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.has_earlier = true;
+    snapshot.history = chat::HistoryExtent {
+        before: 100,
+        after: 0,
+        unfetched: Some(300),
+    };
+    let unloaded = runtime.unloaded_history();
+    let per_item = HistoryEstimate::DEFAULT;
+    assert!(
+        (unloaded.before - 400.0 * per_item).abs() <= super::super::unloaded::height(1, per_item),
+        "400 items' worth of space: {}",
+        unloaded.before
+    );
+    assert_eq!(unloaded.after, 0.0);
+    let window = 800.0;
+    let content = unloaded.before + 6_000.0;
+    let at = |middle: f32| {
+        Scroll::new(middle * unloaded.before - window / 2.0, content, window)
+            .with_unloaded(unloaded)
+    };
+    assert_eq!(runtime.history_index(at(0.5)), Some(Sought::Unfetched));
+    let Some(Sought::Cached { index, .. }) = runtime.history_index(at(0.9)) else {
+        panic!("the newest tenth of the space is cached");
+    };
+    assert!((58..=62).contains(&index), "{index}");
+    assert_eq!(runtime.history_index(at(1.1)), None);
+
+    // A provider that cannot tell how much it holds is shown by a control
+    // to load it at the window's start, rather than by space of no size.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.history = chat::HistoryExtent {
+        before: 0,
+        after: 0,
+        unfetched: None,
+    };
+    assert_eq!(runtime.unloaded_history(), Unloaded::default());
+}
