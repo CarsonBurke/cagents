@@ -106,9 +106,6 @@ impl<'p> LocalPane<'p> {
     }
 }
 
-/// Which scopes need local presentation projected. A selected pass still
-/// consults the complete canonical ownership set; it never treats a partial
-/// pane map as proof that a resource is unowned.
 /// Whether a new chat's first message may start its provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FirstSendAdmission {
@@ -120,6 +117,9 @@ pub(super) enum FirstSendAdmission {
     Refused,
 }
 
+/// Which scopes need local presentation projected. A selected pass still
+/// consults the complete canonical ownership set; it never treats a partial
+/// pane map as proof that a resource is unowned.
 #[derive(Clone, Copy)]
 enum ViewProjection<'a> {
     All,
@@ -3830,10 +3830,13 @@ impl Cagents {
         self.unpublished_chat(id) && !view.retired.contains(&id)
     }
 
-    /// Whether `id` is a chat this window has neither shared nor kept local.
+    /// Whether `id` is a chat this window has neither shared nor kept local,
+    /// and will share. An untouched automatic composer is never shared: it
+    /// gives way to what the view holds, as the projection decides.
     fn unpublished_chat(&self, id: CardId) -> bool {
         !self.shared_views.attached.contains(&id)
             && !self.shared_views.retained.contains(&id)
+            && !self.chat_is_unused_default(id)
             && self
                 .card_state(id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Chat(_)))

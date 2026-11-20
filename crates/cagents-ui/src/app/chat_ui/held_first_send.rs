@@ -99,40 +99,26 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for card in self.chat_ui.admission_holds.clone() {
-            let target = match self.cards.get(&card) {
-                Some(CardRuntime::Chat(runtime))
-                    if runtime.is_draft()
-                        && runtime
-                            .queued
-                            .as_ref()
-                            .is_some_and(|queued| queued.admission.is_some()) =>
-                {
-                    runtime.target
-                }
-                // Taken back, closed or replaced since: nothing to start.
-                _ => {
-                    self.chat_ui.admission_holds.remove(&card);
-                    continue;
-                }
+            let held = match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) if runtime.is_draft() => runtime
+                    .queued
+                    .as_ref()
+                    .and_then(|queued| queued.admission.as_ref())
+                    .map(|hold| (runtime.target, hold.start.registry)),
+                _ => None,
             };
-            let registry = self
-                .cards
-                .get(&card)
-                .and_then(|runtime| match runtime {
-                    CardRuntime::Chat(runtime) => runtime.queued.as_ref(),
-                    _ => None,
-                })
-                .and_then(|queued| queued.admission.as_ref())
-                .map(|hold| hold.start.registry);
+            // Taken back, closed or replaced since: nothing to start.
+            let Some((target, registry)) = held else {
+                self.chat_ui.admission_holds.remove(&card);
+                continue;
+            };
             // A message sent while the registry was still connecting was
             // bound to none, and starts in whichever registry this window
             // then joined; one bound to a registry this window has since left
             // must not start in another.
             let identity = self.workspace_model.identity;
             let Some(scope) = self.draft_start_scope(card).filter(|_| {
-                registry.is_some_and(|registry| {
-                    registry == identity || registry == crate::workspace_model::NO_REGISTRY
-                })
+                registry == identity || registry == crate::workspace_model::NO_REGISTRY
             }) else {
                 tasks.push(self.unhold_first_send(
                     target,
