@@ -2945,9 +2945,16 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
     };
     assert!(!snapshot.exited);
     assert!(!handle.is_completed());
-    // The chat's connection stays open beside its CLI view, so a frame about
-    // the view would end that chat's presentation.
-    assert_eq!(terminal_frames(&delivery), Vec::new());
+    // The chat's connection stays open beside its CLI view, so it must never
+    // become one of the view's subscribers.
+    assert!(
+        !host
+            .lock()
+            .unwrap()
+            .descriptor(1, terminal.id)
+            .unwrap()
+            .attached
+    );
     let worker = host.lock().unwrap().terminals[&terminal.id].handle.clone();
     let second = view(1, session.clone(), recipe.clone()).unwrap();
     assert!(matches!(second, ServerResponse::ChatTerminal { snapshot, .. } if !snapshot.exited));
@@ -2970,6 +2977,9 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
         assert!(Instant::now() < deadline, "terminal exit was not published");
         thread::sleep(Duration::from_millis(10));
     }
+    // Nothing about the view, from its start, its replay or its exit, reached
+    // the chat's connection, where it would have ended the chat.
+    assert_eq!(terminal_frames(&delivery), Vec::new());
     let mut retained = {
         let mut state = host.lock().unwrap();
         state.register_client(2);
@@ -3273,6 +3283,14 @@ fn control_client_closes_chat(slow: bool, return_terminal: bool) {
         else {
             panic!("chat did not return to terminal")
         };
+        assert!(
+            !host
+                .lock()
+                .unwrap()
+                .descriptor(1, terminal.id)
+                .unwrap()
+                .attached
+        );
         assert_eq!(terminal_frames(&delivery), Vec::new());
         // The terminal takes over the chat's lineage and its agents.
         assert_eq!(
