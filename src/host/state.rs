@@ -289,6 +289,9 @@ pub(crate) struct HostState {
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
+    /// The transcript each spawning terminal's worker opens, kept with its
+    /// reservation until the terminal's record carries it.
+    spawning_transcripts: BTreeMap<TerminalId, PathBuf>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
     startup_custody: BTreeSet<TerminalId>,
@@ -501,6 +504,7 @@ impl HostState {
             terminals: BTreeMap::new(),
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
+            spawning_transcripts: BTreeMap::new(),
             startup_custody: BTreeSet::new(),
             publication_pending: BTreeMap::new(),
             paused_update_terminals: BTreeSet::new(),
@@ -1287,11 +1291,12 @@ impl HostState {
     }
 
     /// Every terminal or conversation identity this daemon holds, is starting,
-    /// adopting or still retiring, in identity order. A terminal is reserved
-    /// in `spawning` before its worker opens a transcript, so a transcript
-    /// listed before this is read and named by none of these has no writer
-    /// here. Erring towards inclusion only keeps a file one pass longer.
-    pub(crate) fn resident_terminal_ids(&self) -> Vec<TerminalId> {
+    /// adopting or still retiring, in identity order, and every transcript
+    /// path those carry. A terminal is reserved in `spawning`, with its
+    /// transcript, before its worker opens that file, so a transcript listed
+    /// before this is read and named by none of these has no writer here.
+    /// Erring towards inclusion only keeps a file one pass longer.
+    pub(crate) fn resident_terminals(&self) -> (Vec<TerminalId>, Vec<PathBuf>) {
         let mut resident: BTreeSet<TerminalId> = self.terminals.keys().copied().collect();
         resident.extend(self.spawning.iter().copied());
         resident.extend(self.startup_custody.iter().copied());
@@ -1300,10 +1305,53 @@ impl HostState {
         resident.extend(self.chats.keys().copied());
         resident.extend(self.chat_spawning.keys().copied());
         resident.extend(self.chat_handoffs.keys().copied());
+        resident.extend(self.chat_close_reservations.keys().copied());
         resident.extend(self.historical_chat_retirements.keys().copied());
         resident.extend(self.native_closing.keys().copied());
         resident.extend(self.native_actor_startups.keys().copied());
-        resident.into_iter().collect()
+
+        let conversation_transcript = |session: &crate::chat::Session| {
+            session
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.transcript_path.clone())
+        };
+        let mut transcripts: BTreeSet<PathBuf> = self
+            .terminals
+            .values()
+            .filter_map(|record| record.session.transcript_path.clone())
+            .collect();
+        transcripts.extend(self.spawning_transcripts.values().cloned());
+        transcripts.extend(
+            self.chats
+                .values()
+                .filter_map(|record| conversation_transcript(&record.session)),
+        );
+        transcripts.extend(
+            self.chat_spawning
+                .values()
+                .filter_map(conversation_transcript),
+        );
+        transcripts.extend(
+            self.chat_close_reservations
+                .values()
+                .filter_map(conversation_transcript),
+        );
+        transcripts.extend(
+            self.historical_chat_retirements
+                .values()
+                .filter_map(conversation_transcript),
+        );
+        transcripts.extend(
+            self.chat_handoffs
+                .values()
+                .flat_map(super::chat::TerminalHandoff::transcript_paths)
+                .cloned(),
+        );
+        (
+            resident.into_iter().collect(),
+            transcripts.into_iter().collect(),
+        )
     }
 
     /// The descriptors after `after`, in identity order, until their encoding
@@ -1587,6 +1635,7 @@ impl HostState {
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
         self.browser_logins_spawning.remove(&terminal_id);
+        self.spawning_transcripts.remove(&terminal_id);
         if self.spawning.remove(&terminal_id) {
             self.inventory_generation += 1;
         }
@@ -4945,6 +4994,11 @@ fn start_terminal_view_owned_reserved(
             paired.then_some(&session),
             transition,
         )?;
+        if let Some(transcript) = &session.transcript_path {
+            state
+                .spawning_transcripts
+                .insert(terminal_id, transcript.clone());
+        }
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.

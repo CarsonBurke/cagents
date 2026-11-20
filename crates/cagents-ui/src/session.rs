@@ -627,9 +627,10 @@ pub struct SessionRuntime {
 /// Every window writes into one transcript directory, and a window records a
 /// new terminal only after the daemon has started it and its writer has
 /// created the file. So the directory is listed first and its owners are asked
-/// afterwards: the daemon names every terminal it holds or is starting, which
-/// covers a terminal no window has saved yet, and the window databases name
-/// the rest. If the daemon cannot answer, nothing is removed; if a window
+/// afterwards: the daemon names every terminal it holds or is starting, and the
+/// transcript each writes, which covers a terminal no window has saved yet, and
+/// the window databases name the rest. Owners claim files by name, because a
+/// terminal returned from a conversation appends to its predecessor's. If the daemon cannot answer, nothing is removed; if a window
 /// database cannot be read, no transcript is removed as orphaned.
 pub struct TranscriptPruner {
     store: Arc<StateStore>,
@@ -641,7 +642,7 @@ impl TranscriptPruner {
         let directories = instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
         let report = self.prune(
             &directories.data_dir().join("transcripts"),
-            resident_terminal_ids,
+            resident_transcript_names,
             instance::window_database_paths,
         )?;
         if report.removed() > 0 || report.refused > 0 {
@@ -666,7 +667,10 @@ impl TranscriptPruner {
     ) -> Result<TranscriptPruneReport, SessionError> {
         let listing = TranscriptListing::scan(transcripts)?;
         if listing.is_empty() {
-            return Ok(TranscriptPruneReport::default());
+            return Ok(TranscriptPruneReport {
+                refused: listing.refused(),
+                ..TranscriptPruneReport::default()
+            });
         }
         let resident = resident().map_err(SessionError::ResidentTerminalsUnknown)?;
         let mut owners = TranscriptOwners {
@@ -680,7 +684,7 @@ impl TranscriptPruner {
                     if path == self.database_path {
                         continue;
                     }
-                    match crate::persistence::read_live_terminal_ids(&path) {
+                    match crate::persistence::read_claimed_transcript_names(&path) {
                         Ok(ids) => owners.saved.extend(ids),
                         Err(error) => {
                             tracing::warn!(
@@ -708,10 +712,11 @@ impl TranscriptPruner {
     }
 }
 
-/// Every terminal the local daemon holds or is starting. No daemon, an older
-/// one, or a remote device's (which cannot speak for writers on this machine)
-/// leaves them unknown.
-fn resident_terminal_ids() -> Result<HashSet<String>, String> {
+/// The transcript names the local daemon's terminals and conversations hold or
+/// are starting: their ids, and the names of the transcripts they write. No
+/// daemon, an older one, or a remote device's (which cannot speak for writers
+/// on this machine) leaves them unknown.
+fn resident_transcript_names() -> Result<HashSet<String>, String> {
     if crate::device::is_remote() {
         return Err("this window's terminals run on a remote device".into());
     }
@@ -721,7 +726,18 @@ fn resident_terminal_ids() -> Result<HashSet<String>, String> {
     let resident = client
         .resident_terminals()
         .map_err(|error| error.to_string())?;
-    Ok(resident.into_iter().map(|id| id.to_string()).collect())
+    Ok(resident
+        .terminals
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            resident
+                .transcripts
+                .iter()
+                .filter_map(|path| crate::persistence::transcript_name(path))
+                .map(str::to_owned),
+        )
+        .collect())
 }
 
 impl std::fmt::Debug for SessionRuntime {

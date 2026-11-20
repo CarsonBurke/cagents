@@ -287,9 +287,9 @@ use crate::{
 /// refused to the candidate line's CLI, so no older client decodes it.
 ///
 /// Version 194 appends `ListResidentTerminals` and its `ResidentTerminals`
-/// reply, which name every terminal the daemon holds or is starting so a
-/// window never prunes a transcript whose writer may still append. An older
-/// client never sends it.
+/// reply, which name every terminal the daemon holds or is starting, and the
+/// transcripts they write, so a window never prunes a transcript whose writer
+/// may still append. An older client never sends it.
 pub const PROTOCOL_VERSION: u16 = 194;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
@@ -770,9 +770,10 @@ pub enum ClientRequest {
     ListPage {
         after: Option<TerminalId>,
     },
-    /// Every terminal this daemon holds or is starting, read at one instant.
-    /// Unlike the inventory it includes terminals still being spawned, whose
-    /// transcript writers may already have created their files.
+    /// Every terminal and conversation this daemon holds or is starting, and
+    /// the transcripts they write, read at one instant. Unlike the inventory
+    /// it includes terminals still being spawned, whose transcript writers
+    /// may already have created their files.
     ListResidentTerminals,
 }
 
@@ -1239,9 +1240,13 @@ pub enum ServerResponse {
         terminals: Vec<TerminalDescriptor>,
         complete: bool,
     },
-    /// The reply to `ListResidentTerminals`, in identity order.
+    /// The reply to `ListResidentTerminals`. `transcripts` names every
+    /// transcript path those terminals and conversations write or carry,
+    /// which is not always the one named for the terminal: a terminal
+    /// returned from a conversation appends to its predecessor's.
     ResidentTerminals {
         terminals: Vec<TerminalId>,
+        transcripts: Vec<PathBuf>,
     },
 }
 

@@ -623,13 +623,13 @@ fn listed_in_one_reply(
     }
 }
 
-/// The resident identities as one reply, or a refusal once it passes `limit`,
-/// which no real daemon reaches: an identity encodes in 17 bytes.
+/// The resident terminals as one reply, or a refusal once it passes `limit`,
+/// which no real daemon reaches: an identity encodes in 17 bytes and a
+/// transcript path in a few hundred.
 fn resident_in_one_reply(
-    terminals: Vec<crate::model::TerminalId>,
+    response: ServerResponse,
     limit: usize,
 ) -> Result<ServerResponse, ProtocolError> {
-    let response = ServerResponse::ResidentTerminals { terminals };
     match postcard::experimental::serialized_size(&response) {
         Ok(size) if size <= limit => Ok(response),
         _ => Err(ProtocolError::new(
@@ -1982,12 +1982,18 @@ fn process_admitted_request(
             ))
         }
         ClientRequest::ListResidentTerminals => {
-            let terminals = host
+            let (terminals, transcripts) = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .resident_terminal_ids();
+                .resident_terminals();
             Ok((
-                resident_in_one_reply(terminals, LIST_REPLY_LIMIT)?,
+                resident_in_one_reply(
+                    ServerResponse::ResidentTerminals {
+                        terminals,
+                        transcripts,
+                    },
+                    LIST_REPLY_LIMIT,
+                )?,
                 Vec::new(),
                 false,
             ))
