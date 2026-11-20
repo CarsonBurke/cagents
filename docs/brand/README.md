@@ -6,27 +6,31 @@
 | :-: | :-: |
 | <img src="../../packaging/dev.cagents.Cagents.svg" width="128" alt="cagents icon"> | <img src="../../packaging/io.github.cagents.ceditor.svg" width="128" alt="ceditor icon"> |
 
-Both icons are the same object: a dark machined bezel around a glass screen.
+Both icons share the same tactile 2.5D brushed-titanium switchboard chassis
+and recessed obsidian bay, following GNOME Circle / Libadwaita orthographic
+proportions.
 
-- **cagents** shows a split terminal with three panes, each with an agent
-  at its prompt and its own coloured cursor. It is what the app is for:
-  many agents working side by side.
-- **ceditor** shows one editor pane: line gutter, syntax-coloured code, the
-  current line lit, and an I-beam caret.
+- **cagents** houses three chunky vertical workspace modules — deep slate-navy,
+  cool teal-mint, and a focal coral-orange active lane etched with a crisp `>`
+  prompt chevron — communicating parallel coding agents with one workspace in
+  focus.
+- **ceditor** uses the same titanium chassis with a slim slate-navy gutter rail
+  beside a warm-ivory tactile editorial page, chunky syntax bars, and a focal
+  coral-orange caret so the two icons are unmistakable at a glance on a dock.
 
-At tray and task bar sizes (16-22 px) the detail falls away and each icon
-reduces to a dark tile with its coloured cursors, which keeps it
-recognisable.
+At tray and task bar sizes (16-22 px) both marks remain crisp and distinct:
+three coloured vertical lanes vs. a light editorial page with a dark gutter.
 
 ## Construction
 
-- Tile: a superellipse (n = 5) inset 8 px on the 128 px grid.
-- Bezel: vertical gradient `#565C6B` → `#2A2E37` → `#14161B`, with a rim
-  light that fades from the top edge.
-- Screen: 90 px square, radius 15, a radial glow `#15263A` → `#05070B` lit
-  from the upper left, a recessed edge, and a faint diagonal glare.
-- Agent colours: mint `#7CF5C8`, amber `#FFC46B`, lavender `#C3A6FF`. Each
-  cursor has a solid light core over a blurred glow of its colour.
+- Chassis: 108 × 101 px rounded rectangle (`rx = 18`) with an 8 px orthographic
+  bottom lip (`#8A847D` → `#58544F`) and brushed warm-titanium face
+  (`#DCD8D2` → `#918B83`) over a recessed obsidian bay (`#111722` → `#1D2534`).
+- Modules: 2.5D tactile keycaps (`rx = 5.5–6`) with subtle top rim highlights
+  and grounded bottom edges.
+- Palette: deep slate-navy (`#3C4B66` → `#2A364B`), cool teal-mint
+  (`#60B2A4` → `#469689`), warm ivory (`#FAF8F4` → `#EAE6DE`), and focal
+  coral-orange (`#FF7847` → `#E64F1E`).
 
 ## Files
 
