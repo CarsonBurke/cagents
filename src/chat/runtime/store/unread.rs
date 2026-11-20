@@ -12,7 +12,7 @@ use crate::chat::{Item, ItemContent};
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashSet;
 
-/// The newest items a first read serves.
+/// The newest items a read that starts again serves.
 const FIRST_ITEMS: usize = 256;
 /// Changed items remembered between reads; past this many, the next read
 /// starts again from the newest items.
@@ -26,7 +26,7 @@ const READ_BYTES: usize = 8 * 1024 * 1024;
 /// What has changed since the follower last read.
 #[derive(Debug, Default)]
 pub(super) enum Following {
-    /// Nothing has read yet, so nothing is remembered.
+    /// Nothing follows the conversation, so nothing is remembered.
     #[default]
     Not,
     Changed(HashSet<String>),
@@ -43,6 +43,26 @@ impl Following {
             }
         }
     }
+
+    /// What is remembered after a read that failed: what changed since, and
+    /// what the failed read was to serve, `previous`.
+    fn restored(self, previous: Self) -> Self {
+        match (self, previous) {
+            (Self::Changed(mut ids), Self::Changed(older)) => {
+                for id in older {
+                    ids.insert(id);
+                    if ids.len() > REMEMBERED {
+                        return Self::Lost;
+                    }
+                }
+                Self::Changed(ids)
+            }
+            (Self::Lost, Self::Changed(_)) => Self::Lost,
+            // The failed read was to start again from the newest items; the
+            // next one still is.
+            (_, previous) => previous,
+        }
+    }
 }
 
 /// One read of what changed in the conversation.
@@ -51,31 +71,81 @@ pub struct Unread {
     /// Changed items, oldest first, with whole bodies up to a bound.
     pub items: Vec<Item>,
     /// This read started from the newest items rather than from what
-    /// changed since the last: the first read, or one after more changed
-    /// than was remembered.
+    /// changed: the first read of a conversation not followed from its
+    /// start, or one after more changed than was remembered.
     pub restarted: bool,
-    /// Items before the oldest one served that this read did not serve.
-    /// Only a restarted read leaves any out.
+    /// The conversation has items older than any this read served that the
+    /// follower may never have been served: ones a restarted read left
+    /// out, or history the provider has not given cagents.
     pub has_earlier: bool,
     /// The newest item in the conversation, the only one still written to.
     pub newest: Option<String>,
+    /// Items asked for again that the conversation no longer has.
+    pub gone: Vec<String>,
 }
 
 impl Store {
-    /// The items changed since the last call, or the newest ones on the
-    /// first, together with the items `again` names. What does not fit in
-    /// one read is served by the next.
+    /// Remembers every change from now on, so the first read serves all of
+    /// them rather than starting from the newest items.
+    pub(in crate::chat::runtime) fn follow(&mut self) {
+        if matches!(self.following, Following::Not) {
+            self.following = Following::Changed(HashSet::new());
+        }
+    }
+
+    /// The items changed since the last call, or the newest ones when no
+    /// change was remembered, together with the items `again` names. What
+    /// does not fit in one read is served by the next. A read that fails
+    /// forgets nothing.
     pub(in crate::chat::runtime) fn unread(&mut self, again: &[String]) -> Result<Unread, String> {
+        let started = std::time::Instant::now();
         // Streamed prose waits for its next part before it is stored.
         self.flush_text().map_err(|error| error.to_string())?;
-        let mut unread = Unread::default();
-        let ids = match std::mem::replace(&mut self.following, Following::Changed(HashSet::new())) {
-            Following::Changed(mut ids) => {
-                ids.extend(again.iter().cloned());
-                let mut ordered = Vec::with_capacity(ids.len());
-                for id in ids {
-                    if let Some(ordinal) = self.ordinal(&id).map_err(|e| e.to_string())? {
-                        ordered.push((ordinal, id));
+        let previous = std::mem::replace(&mut self.following, Following::Changed(HashSet::new()));
+        let mut budget = READ_BYTES;
+        let read = self.read_following(&previous, again, &mut budget);
+        match &read {
+            Ok(unread) if !unread.items.is_empty() => tracing::debug!(
+                items = unread.items.len(),
+                bytes = READ_BYTES - budget,
+                restarted = unread.restarted,
+                micros = started.elapsed().as_micros() as u64,
+                "served a conversation's follower"
+            ),
+            Ok(_) => {}
+            Err(_) => {
+                let since = std::mem::take(&mut self.following);
+                self.following = since.restored(previous);
+            }
+        }
+        read.map_err(|error| error.to_string())
+    }
+
+    fn read_following(
+        &mut self,
+        previous: &Following,
+        again: &[String],
+        budget: &mut usize,
+    ) -> Result<Unread, StoreError> {
+        let mut unread = Unread {
+            has_earlier: self.provider_earlier,
+            ..Unread::default()
+        };
+        let ids = match previous {
+            Following::Changed(changed) => {
+                let mut ordered = Vec::with_capacity(changed.len() + again.len());
+                for id in changed {
+                    if let Some(ordinal) = self.ordinal(id)? {
+                        ordered.push((ordinal, id.clone()));
+                    }
+                }
+                for id in again {
+                    if changed.contains(id) {
+                        continue;
+                    }
+                    match self.ordinal(id)? {
+                        Some(ordinal) => ordered.push((ordinal, id.clone())),
+                        None => unread.gone.push(id.clone()),
                     }
                 }
                 ordered.sort();
@@ -83,51 +153,44 @@ impl Store {
             }
             Following::Not | Following::Lost => {
                 unread.restarted = true;
-                let mut statement = self
+                let mut newest = self
                     .db
-                    .prepare_cached("SELECT ordinal,id FROM items ORDER BY ordinal DESC LIMIT ?1")
-                    .map_err(|e| e.to_string())?;
-                let mut newest = statement
+                    .prepare_cached("SELECT ordinal,id FROM items ORDER BY ordinal DESC LIMIT ?1")?
                     .query_map([FIRST_ITEMS as i64 + 1], |row| {
                         Ok((row.get(0)?, row.get(1)?))
-                    })
-                    .map_err(|e| e.to_string())?
-                    .collect::<Result<Vec<(i64, String)>, _>>()
-                    .map_err(|e| e.to_string())?;
-                unread.has_earlier = newest.len() > FIRST_ITEMS || self.provider_earlier;
+                    })?
+                    .collect::<Result<Vec<(i64, String)>, _>>()?;
+                unread.has_earlier |= newest.len() > FIRST_ITEMS;
                 newest.truncate(FIRST_ITEMS);
                 newest.reverse();
+                let served = newest.iter().map(|(_, id)| id).collect::<HashSet<_>>();
+                for id in again {
+                    if !served.contains(id) && self.ordinal(id)?.is_none() {
+                        unread.gone.push(id.clone());
+                    }
+                }
                 newest
             }
         };
-        let mut budget = READ_BYTES;
-        let mut left = Vec::new();
+        let mut left = false;
         for (_, id) in ids {
-            if !left.is_empty() {
-                left.push(id);
-                continue;
-            }
-            match self.whole(&id, &mut budget).map_err(|e| e.to_string())? {
-                Some(item) => unread.items.push(item),
-                None => left.push(id),
-            }
-        }
-        if !left.is_empty() {
-            if unread.restarted {
-                // The newest are served first next time, so a restarted
-                // read gives up its oldest instead.
-                unread.has_earlier = true;
-            } else {
-                for id in &left {
-                    self.following.changed(id);
+            if !left {
+                match self.whole(&id, budget)? {
+                    Some(item) => {
+                        unread.items.push(item);
+                        continue;
+                    }
+                    None => left = true,
                 }
             }
+            // What does not fit is served by the next read.
+            self.following.changed(&id);
         }
         unread.newest = self
             .db
-            .prepare_cached("SELECT id FROM items ORDER BY ordinal DESC LIMIT 1")
-            .and_then(|mut statement| statement.query_row([], |row| row.get(0)).optional())
-            .map_err(|e| e.to_string())?;
+            .prepare_cached("SELECT id FROM items ORDER BY ordinal DESC LIMIT 1")?
+            .query_row([], |row| row.get(0))
+            .optional()?;
         Ok(unread)
     }
 
@@ -309,6 +372,103 @@ mod tests {
         assert!(served.starts_with("start\n"));
         assert!(served.ends_with("https://github.com/o/r/pull/9\n"));
         assert!(!served.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn a_conversation_followed_from_its_start_is_served_whole() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store.follow();
+        for index in 0..FIRST_ITEMS + 2 {
+            store
+                .apply(Event::Item(command(
+                    &format!("c{index}"),
+                    "",
+                    ToolStatus::Succeeded,
+                )))
+                .unwrap();
+        }
+        let first = store.unread(&[]).unwrap();
+        assert!(!first.restarted && !first.has_earlier);
+        assert_eq!(first.items.len(), FIRST_ITEMS + 2);
+        assert_eq!(first.items[0].id, "c0");
+    }
+
+    #[test]
+    fn a_restarted_read_over_budget_leaves_the_newer_items_for_the_next() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let big = "x".repeat(BODY_BYTES);
+        let count = READ_BYTES / BODY_BYTES + 2;
+        for index in 0..count {
+            store
+                .apply(Event::Item(command(
+                    &format!("b{index}"),
+                    &big,
+                    ToolStatus::Succeeded,
+                )))
+                .unwrap();
+        }
+        let first = store.unread(&[]).unwrap();
+        assert!(first.restarted);
+        // Nothing older than what was served was left out.
+        assert!(!first.has_earlier);
+        assert_eq!(first.items[0].id, "b0");
+        assert!(first.items.len() < count);
+        let rest = store.unread(&[]).unwrap();
+        assert!(!rest.restarted && !rest.has_earlier);
+        assert_eq!(first.items.len() + rest.items.len(), count);
+        assert_eq!(
+            rest.items.last().map(|item| item.id.as_str()),
+            Some(format!("b{}", count - 1).as_str())
+        );
+    }
+
+    #[test]
+    fn a_read_that_fails_forgets_nothing() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store.follow();
+        store
+            .apply(Event::Item(command("a", "out", ToolStatus::Succeeded)))
+            .unwrap();
+        store
+            .db
+            .execute_batch("ALTER TABLE chunks RENAME TO kept")
+            .unwrap();
+        assert!(store.unread(&[]).is_err());
+        store
+            .db
+            .execute_batch("ALTER TABLE kept RENAME TO chunks")
+            .unwrap();
+        assert_eq!(ids(&store.unread(&[]).unwrap()), ["a"]);
+
+        // A read that was to start again still does.
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::Item(command("a", "out", ToolStatus::Succeeded)))
+            .unwrap();
+        store
+            .db
+            .execute_batch("ALTER TABLE chunks RENAME TO kept")
+            .unwrap();
+        assert!(store.unread(&[]).is_err());
+        store
+            .db
+            .execute_batch("ALTER TABLE kept RENAME TO chunks")
+            .unwrap();
+        let unread = store.unread(&[]).unwrap();
+        assert!(unread.restarted);
+        assert_eq!(ids(&unread), ["a"]);
+    }
+
+    #[test]
+    fn an_item_asked_for_again_that_is_gone_is_named() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store.follow();
+        store
+            .apply(Event::Item(command("a", "", ToolStatus::Succeeded)))
+            .unwrap();
+        let unread = store.unread(&["a".into(), "missing".into()]).unwrap();
+        assert_eq!(ids(&unread), ["a"]);
+        assert_eq!(unread.gone, ["missing"]);
     }
 
     #[test]

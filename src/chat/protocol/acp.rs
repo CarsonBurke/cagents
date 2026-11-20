@@ -135,6 +135,7 @@ fn prepare(profile: &'static Profile, launch: &Launch) -> Result<(ProcessSpec, A
     // An agent's launcher or shell startup may print to stdout; such a line
     // is skipped unless it hides a protocol frame.
     spec.stdout_noise = Some(rpc::embedded_frame);
+    spec.followed = true;
     let settings = startup.settings;
     Ok((
         spec,

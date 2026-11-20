@@ -421,6 +421,22 @@ struct ProjectFacts {
 }
 
 impl ProjectFacts {
+    fn of(tracked: &super::Tracked) -> Self {
+        Self {
+            snapshot: tracked.snapshot.clone(),
+            local: tracked.local.clone(),
+            forge_error: match &tracked.forge {
+                crate::work::Forge::Unavailable { reason } => Some(reason.clone()),
+                crate::work::Forge::Synced { error, .. } => error.clone(),
+                crate::work::Forge::Pending | crate::work::Forge::NotGitHub => None,
+            },
+            synced_at_unix_ms: match &tracked.forge {
+                crate::work::Forge::Synced { at_unix_ms, .. } => Some(*at_unix_ms),
+                _ => None,
+            },
+        }
+    }
+
     fn repository(&self) -> Option<&GitHubRepoKey> {
         self.snapshot
             .as_deref()
@@ -507,6 +523,15 @@ enum Resolved {
 }
 
 impl Handle {
+    /// Tells the conversation loop about a chat the daemon now hosts. One
+    /// whose record is read is followed from the next pass rather than after
+    /// the loop's idle wait.
+    pub(in crate::host) fn chat_added(&self, provider: Provider) {
+        if recorded_provider(provider) {
+            self.0.conversations.signal.notify();
+        }
+    }
+
     fn conversations(&self) -> MutexGuard<'_, State> {
         self.0
             .conversations
@@ -532,7 +557,7 @@ impl Handle {
         {
             return Err("No such conversation".into());
         }
-        let facts = self.facts(host, conversation);
+        let facts = self.facts(host, conversation, true);
         let mut state = self.conversations();
         // A connection watches one conversation at a time.
         for watched in state.watched.values_mut() {
@@ -575,7 +600,7 @@ impl Handle {
             let Some(host) = self.0.host.upgrade() else {
                 break;
             };
-            let watched = super::super::service::attempt("Conversation pull requests", || {
+            let read = super::super::service::attempt("Conversation pull requests", || {
                 Ok(self.conversation_pass(&host))
             })
             .unwrap_or_else(|error| {
@@ -586,12 +611,14 @@ impl Handle {
             self.0
                 .conversations
                 .signal
-                .wait(observed, if watched { TICK } else { UNWATCHED });
+                .wait(observed, if read { TICK } else { UNWATCHED });
         }
     }
 
-    /// Reads, resolves and publishes every watched conversation once, and
-    /// reports whether any is watched.
+    /// Reads every watched conversation and every followed one once,
+    /// resolves and publishes the watched ones, and reports whether it read
+    /// any, so that the loop comes back after a tick rather than its idle
+    /// wait.
     fn conversation_pass(&self, host: &SharedHost) -> bool {
         // A conversation whose record is read is followed whether or not
         // anything shows it: the record serves only what changed since the
@@ -655,10 +682,8 @@ impl Handle {
                 })
                 .unwrap_or_default();
             let located = locate(host, *conversation, known.as_deref(), search_due);
-            // Finding a conversation's project starts tracking it on the
-            // board, so one nobody shows asks only when its read needs it.
             if watched {
-                facts.insert(*conversation, self.facts(host, *conversation));
+                facts.insert(*conversation, self.facts(host, *conversation, true));
             }
             let (source, mut cursors, mut items) = {
                 let mut state = self.conversations();
@@ -705,7 +730,7 @@ impl Handle {
                     .iter()
                     .any(|found| matches!(found.signal.reference, Reference::CurrentBranch { .. }))
             {
-                facts.insert(*conversation, self.facts(host, *conversation));
+                facts.insert(*conversation, self.facts(host, *conversation, false));
             }
             let mut state = self.conversations();
             if let Some(watched) = state.watched.get_mut(conversation)
@@ -765,10 +790,12 @@ impl Handle {
     }
 
     /// The board's facts for a conversation's directory. Watching a
-    /// conversation counts as reading its own project, which tracks it and
-    /// keeps that project's forge poll at the watched cadence; other projects
-    /// and the board's tickets are not read.
-    fn facts(&self, host: &SharedHost, conversation: TerminalId) -> Option<Facts> {
+    /// conversation counts as reading its own project, so `read` tracks it
+    /// and keeps that project's forge poll at the watched cadence; other
+    /// projects and the board's tickets are not read. A conversation nobody
+    /// shows is not read that way: it takes what the board already knows of
+    /// its project, if the board tracks it, and adds no forge poll.
+    fn facts(&self, host: &SharedHost, conversation: TerminalId, read: bool) -> Option<Facts> {
         let directory = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -787,24 +814,15 @@ impl Handle {
         let watching = shared.watching;
         let project = selected.and_then(|selected| {
             let (repository, name) = selected.into_iter().next()?;
+            if !read {
+                return shared.projects.get(&repository).map(ProjectFacts::of);
+            }
             let new = !shared.projects.contains_key(&repository);
             let tracked = shared.track(&repository, &name);
             if tracked.read(watching) {
                 self.0.forge.notify();
             }
-            let facts = ProjectFacts {
-                snapshot: tracked.snapshot.clone(),
-                local: tracked.local.clone(),
-                forge_error: match &tracked.forge {
-                    crate::work::Forge::Unavailable { reason } => Some(reason.clone()),
-                    crate::work::Forge::Synced { error, .. } => error.clone(),
-                    crate::work::Forge::Pending | crate::work::Forge::NotGitHub => None,
-                },
-                synced_at_unix_ms: match &tracked.forge {
-                    crate::work::Forge::Synced { at_unix_ms, .. } => Some(*at_unix_ms),
-                    _ => None,
-                },
-            };
+            let facts = ProjectFacts::of(tracked);
             if new {
                 self.0.scanner.notify();
             }

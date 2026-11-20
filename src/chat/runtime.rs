@@ -1833,6 +1833,9 @@ fn preflight_inner(
         return Err("Provider initialization exceeds stdin queue capacity".into());
     }
     let mut store = Store::new().map_err(SetupError::Unavailable)?;
+    if spec.followed {
+        store.follow();
+    }
     store.file_cwd = Some(spec.working_directory.clone());
     store.recognize_messages(spec.messages.clone());
     let mut metadata = Vec::new();
@@ -4575,6 +4578,7 @@ pub(crate) fn notification_frames_with_probe_for_test<R>(
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),

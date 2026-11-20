@@ -81,6 +81,9 @@ pub struct ProcessSpec {
     /// such output immediately fatal. The function reports whether a skipped
     /// line hides a protocol frame, which must never be dropped silently.
     pub(crate) stdout_noise: Option<fn(&[u8]) -> bool>,
+    /// The Work tracker reads this conversation from cagents' own record,
+    /// so the record remembers every change from the start for it.
+    pub(crate) followed: bool,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -106,6 +109,7 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
             execution: None,
             messages: None,
             stdout_noise: None,
+            followed: false,
             transport: TransportSpec::JsonLines,
             program: recipe.program.clone(),
             arguments: recipe.arguments.clone(),

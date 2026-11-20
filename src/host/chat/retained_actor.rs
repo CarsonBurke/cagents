@@ -2338,6 +2338,7 @@ fn restore_actor_inner(
     }
     let visible = record.subscribers.values().any(|visible| *visible);
     let retired = state.chats.insert(id, record);
+    state.chat_added(id);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);
     state.inventory_generation += 1;

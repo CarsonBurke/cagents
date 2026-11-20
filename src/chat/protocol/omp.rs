@@ -20,6 +20,7 @@ const MAX_CALLS: usize = 128;
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
+    spec.followed = true;
     let mut args = launch.recipe.arguments.iter();
     let mut kept = Vec::new();
     while let Some(arg) = args.next() {

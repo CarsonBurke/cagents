@@ -9,10 +9,10 @@
 //! content changed since the last read, whole, without touching what any
 //! window presents. An item is read once it has settled, so a command is
 //! read with its output and a message once it is no longer being written,
-//! and read again if it changes after that. A first read, or one after more
-//! changed between reads than the store remembers, starts from the newest
-//! items; what came before them and was never read makes the reading
-//! partial, and says so.
+//! and read again if it changes after that. The store remembers changes from
+//! the conversation's start; a read after more changed than it remembers
+//! starts from the newest items, and what came before them makes the
+//! reading partial, as does history the provider kept back.
 
 use super::transcript::{self, Found};
 use crate::{
@@ -20,23 +20,18 @@ use crate::{
     pull_request_signals::{self, Signal},
     work::TranscriptCoverage,
 };
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::BTreeSet;
 
-/// Items remembered as read, so a restarted read can tell whether it
-/// reached back to what was read before.
-const REMEMBERED: usize = 4096;
-/// Unsettled items asked for again on each read.
+/// Unfinished messages asked for again on each read.
 const HELD: usize = 1024;
 
 /// One conversation's reading state between reads.
 #[derive(Debug, Default)]
 pub(super) struct Items {
     started: bool,
-    /// Items read, in the order they were first read, to forget them by.
-    seen: HashSet<String>,
-    order: VecDeque<String>,
-    /// Items served before they settled. Settling changes most of them, but
-    /// not a message whose turn ended, so each read asks for them again.
+    /// Messages served while they were being written. A message is
+    /// finished by its turn ending, which changes nothing in it, so each
+    /// read asks for them again. Anything else that settles changes.
     held: BTreeSet<String>,
     /// Something before what was read was never read.
     partial: bool,
@@ -54,17 +49,14 @@ impl Items {
     /// `busy` or not.
     pub fn read(&mut self, unread: Unread, busy: bool, out: &mut Vec<Found>) {
         self.error = None;
-        // Earlier items exist, and the read does not reach back to one read
-        // before: the first read of a long conversation, or one that missed
-        // more changes than were remembered.
-        if unread.restarted
-            && unread.has_earlier
-            && unread
-                .items
-                .first()
-                .is_none_or(|item| !self.seen.contains(&item.id))
-        {
+        // Earlier items exist that may never have been read: the first read
+        // of a long conversation, one after more changed than was
+        // remembered, or history the provider kept back.
+        if unread.has_earlier {
             self.partial = true;
+        }
+        for id in &unread.gone {
+            self.held.remove(id);
         }
         for item in &unread.items {
             // Only the newest message can still be written to, and only
@@ -78,14 +70,14 @@ impl Items {
                         by_subagent: false,
                     }));
                 }
-                None => {
+                None if matches!(item.content, ItemContent::Text { .. }) => {
                     self.held.insert(item.id.clone());
                     while self.held.len() > HELD {
                         self.held.pop_first();
                     }
                 }
+                None => {}
             }
-            self.remember(&item.id);
         }
         self.started = true;
     }
@@ -103,17 +95,6 @@ impl Items {
             None if !self.started => TranscriptCoverage::Pending,
             None if self.partial => TranscriptCoverage::Partial,
             None => TranscriptCoverage::Complete,
-        }
-    }
-
-    fn remember(&mut self, id: &str) {
-        if self.seen.insert(id.to_owned()) {
-            self.order.push_back(id.to_owned());
-            while self.order.len() > REMEMBERED {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.seen.remove(&oldest);
-                }
-            }
         }
     }
 }
@@ -290,7 +271,8 @@ mod tests {
         assert_eq!(items.coverage(), TranscriptCoverage::Pending);
         let running = command("c", "gh pr create --fill", ToolStatus::Running, "");
         assert!(read(&mut items, restarted(vec![running], false), true).is_empty());
-        assert_eq!(items.again(), ["c"]);
+        // Finishing changes it, so it is served again without being asked.
+        assert!(items.again().is_empty());
         // Finished before its output arrived: what it printed is read when
         // the output changes it.
         let finished = command("c", "gh pr create --fill", ToolStatus::Succeeded, "");
@@ -378,7 +360,7 @@ mod tests {
                 Relation::Edited
             )]
         );
-        assert_eq!(items.again(), ["c"]);
+        assert!(items.again().is_empty());
     }
 
     #[test]
@@ -417,40 +399,56 @@ mod tests {
     }
 
     #[test]
-    fn a_read_that_does_not_reach_back_to_what_was_read_is_partial() {
+    fn a_read_that_left_out_earlier_items_makes_the_reading_partial_for_good() {
         let mut items = Items::default();
         read(
             &mut items,
-            restarted(vec![text("a", Role::User, "hi")], false),
+            changed(vec![text("a", Role::User, "hi")]),
             false,
         );
         assert_eq!(items.coverage(), TranscriptCoverage::Complete);
-        // Restarted, after more changed than the store remembers, but
-        // reaching back to an item read before.
-        read(
-            &mut items,
-            restarted(
-                vec![text("a", Role::User, "hi"), text("b", Role::User, "more")],
-                true,
-            ),
-            false,
-        );
-        assert_eq!(items.coverage(), TranscriptCoverage::Complete);
-        // Restarted past items never read.
+        // Restarted after more changed than the store remembers.
         read(
             &mut items,
             restarted(vec![text("z", Role::User, "later")], true),
             false,
         );
         assert_eq!(items.coverage(), TranscriptCoverage::Partial);
+        read(
+            &mut items,
+            changed(vec![text("y", Role::User, "on")]),
+            false,
+        );
+        assert_eq!(items.coverage(), TranscriptCoverage::Partial);
 
+        // History the provider kept back.
         let mut resumed = Items::default();
         read(
             &mut resumed,
-            restarted(vec![text("y", Role::User, "newest")], true),
+            Unread {
+                has_earlier: true,
+                ..changed(vec![text("y", Role::User, "newest")])
+            },
             false,
         );
         assert_eq!(resumed.coverage(), TranscriptCoverage::Partial);
+    }
+
+    #[test]
+    fn a_message_that_is_gone_is_no_longer_asked_for() {
+        let mut items = Items::default();
+        let writing = text("m", Role::Assistant, "Opening");
+        read(&mut items, changed(vec![writing]), true);
+        assert_eq!(items.again(), ["m"]);
+        read(
+            &mut items,
+            Unread {
+                gone: vec!["m".into()],
+                ..Unread::default()
+            },
+            false,
+        );
+        assert!(items.again().is_empty());
     }
 
     #[test]
@@ -463,15 +461,5 @@ mod tests {
         ));
         read(&mut items, restarted(Vec::new(), false), false);
         assert_eq!(items.coverage(), TranscriptCoverage::Complete);
-    }
-
-    #[test]
-    fn what_is_remembered_is_bounded() {
-        let mut items = Items::default();
-        for index in 0..REMEMBERED + 10 {
-            items.remember(&index.to_string());
-        }
-        assert_eq!(items.seen.len(), REMEMBERED);
-        assert!(!items.seen.contains("0"));
     }
 }

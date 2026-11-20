@@ -3054,6 +3054,7 @@ fn start_publishing(
         }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);
+        state.chat_added(id);
         if let Some(context) = &execution {
             context.installed();
         }

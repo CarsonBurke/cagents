@@ -507,12 +507,12 @@ impl Handle {
     }
     /// The items changed since the last call, whole, and whether the
     /// conversation is working; see [`super::Unread`]. Only a conversation
-    /// this process owns is followed this way: a retained actor's provider
-    /// keeps a transcript of its own.
+    /// this process owns is followed this way; a retained actor keeps its
+    /// record in another process.
     pub fn unread(&self, again: &[String]) -> Result<(super::Unread, bool), String> {
         match &self.0 {
             Owner::Local(local) => local.unread(again),
-            Owner::Remote(_) => Err("This chat is read from its transcript".into()),
+            Owner::Remote(_) => Err("it is kept by another process".into()),
         }
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {

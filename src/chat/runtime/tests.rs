@@ -333,6 +333,7 @@ fn parent_prompt_availability_tracks_whole_steps_independently_of_children() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -513,6 +514,7 @@ fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_pro
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -665,6 +667,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -775,6 +778,7 @@ fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::History,
@@ -1101,6 +1105,7 @@ fn update_readiness_fences_a_prompt_whose_caller_stopped_waiting() {
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -1194,6 +1199,7 @@ fn startup_cleanup_joins_the_exact_actor_before_releasing_ownership() {
     let context = Arc::new(ExecutionContext::default());
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: Some(context.clone()),
         messages: None,
         unset_environment: Default::default(),
@@ -1461,6 +1467,7 @@ fn queued_interrupt_rechecks_background_tasks_at_provider_dispatch() {
     let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -2695,6 +2702,7 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         );
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: if cleanup_only {
                 Some(Arc::new(super::super::protocol::ExecutionContext::default()))
             } else {
@@ -2774,6 +2782,7 @@ fn identity_only_context_never_recaptures_a_replacement_directory() {
     assert!(context.pinned_launch_directory().is_err());
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: Some(context),
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -2840,6 +2849,7 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
     for unrelated in [None, Some("different failure"), Some("page failed")] {
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -2979,6 +2989,7 @@ fn actor_publishes_completion_only_after_the_entire_frame_and_late_children() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3113,6 +3124,7 @@ fn notification_preview_uses_live_store_events_without_paging_or_tool_output() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3225,6 +3237,7 @@ fn notification_waiting_context_revises_without_an_activity_transition() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3301,6 +3314,7 @@ fn presentation_serves_multiple_readers_and_resyncs_missed_revisions() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3371,6 +3385,7 @@ fn native_child_receives_only_the_preserved_source_environment() {
     ]);
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3398,6 +3413,7 @@ fn native_child_receives_only_the_preserved_source_environment() {
 fn selected_account_removals_win_at_the_native_child_boundary() {
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -3502,6 +3518,7 @@ fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory
     let socket = directory.path().join("server").join("control.sock");
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3560,6 +3577,7 @@ fn an_account_report_reaches_the_surfaces_without_touching_the_conversation() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3642,6 +3660,7 @@ fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3728,6 +3747,7 @@ fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3767,6 +3787,7 @@ fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
 fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3899,6 +3920,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4035,6 +4057,7 @@ fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4490,6 +4513,7 @@ fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
 fn json_lines_spec(arguments: Vec<String>, program: &str) -> ProcessSpec {
     ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4732,6 +4756,7 @@ fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
     }
     let spec = ProcessSpec {
         stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4763,6 +4788,7 @@ fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
     );
     let spec = ProcessSpec {
         stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4796,6 +4822,7 @@ fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
 fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
     let spec = ProcessSpec {
         stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4818,6 +4845,7 @@ fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
 fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -5138,6 +5166,7 @@ fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5187,6 +5216,7 @@ fn provider_exit_during_a_write_reports_its_exit_status_not_the_broken_pipe() {
     let release = directory.path().join("release");
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -5254,6 +5284,7 @@ fn a_provider_is_never_handed_a_parent_session() {
     use std::io::Read;
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -5298,6 +5329,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
     use std::io::{BufRead, Write};
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -5372,6 +5404,7 @@ fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -5569,6 +5602,7 @@ fn a_detached_command_outlives_a_closed_or_finished_provider() {
     ] {
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -5665,6 +5699,7 @@ fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -5889,6 +5924,7 @@ fn file_changes_cache_queries_remain_available_after_provider_exit() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),

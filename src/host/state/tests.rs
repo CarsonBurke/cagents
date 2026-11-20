@@ -3450,6 +3450,7 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
     environment.extend(selected.clone());
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
