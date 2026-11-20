@@ -148,24 +148,17 @@ pub struct State {
     slots: Vec<Slot>,
 }
 
-/// What one Work row is known by.
+/// What one Work row is known by: its pull request, its worktree, or both
+/// once the worktree is found to head the pull request.
 #[derive(Debug, Clone)]
-enum Slot {
-    /// Its pull request, its worktree, or both once the worktree is found
-    /// to head the pull request.
-    Work {
-        pull_request: Option<(GitHubRepoKey, u64)>,
-        worktree: Option<PathBuf>,
-    },
-    /// The worktree the conversation runs in, listed when none of the work
-    /// is in a worktree Projects lists: it follows the work listed before
-    /// it was first shown, and precedes work found since.
-    Here,
+struct Slot {
+    pull_request: Option<(GitHubRepoKey, u64)>,
+    worktree: Option<PathBuf>,
 }
 
 impl Slot {
     fn of(work: &Work<'_>) -> Self {
-        Self::Work {
+        Self {
             pull_request: work
                 .pull_request()
                 .map(|row| (row.repository.clone(), row.number)),
@@ -174,20 +167,9 @@ impl Slot {
     }
 
     fn pull_request(&self) -> Option<(&GitHubRepoKey, u64)> {
-        match self {
-            Self::Work {
-                pull_request: Some((repository, number)),
-                ..
-            } => Some((repository, *number)),
-            _ => None,
-        }
-    }
-
-    fn worktree(&self) -> Option<&Path> {
-        match self {
-            Self::Work { worktree, .. } => worktree.as_deref(),
-            Self::Here => None,
-        }
+        self.pull_request
+            .as_ref()
+            .map(|(repository, number)| (repository, *number))
     }
 
     /// Whether `work` is this row's pull request or is in its worktree.
@@ -205,7 +187,7 @@ impl Slot {
     }
 
     fn same_worktree(&self, other: Option<&Path>) -> bool {
-        other.is_some() && self.worktree() == other
+        other.is_some() && self.worktree.as_deref() == other
     }
 }
 
@@ -251,7 +233,6 @@ impl State {
                 self.revision = revision;
                 self.list = Some(list);
                 self.lost = false;
-                self.place_rows();
             }
             // The last list stays: it is what was true, and the daemon's own
             // health is reported elsewhere.
@@ -302,37 +283,22 @@ impl State {
     }
 
     /// Every piece of work the conversation did, in the order its rows were
-    /// first shown. `here` is the worktree the conversation runs in, listed
-    /// last when none of the work is in a worktree Projects lists, which
+    /// first shown, as [`Self::place`] last placed them; work it hasn't
+    /// placed goes last. `here` is the worktree the conversation runs in,
+    /// listed when none of the work is in a worktree Projects lists, which
     /// `openable` says, so its changes stay a click away.
     pub(crate) fn work<'a>(
         &'a self,
         here: Option<&'a Path>,
         openable: &dyn Fn(&Path) -> bool,
     ) -> Vec<Work<'a>> {
-        let place = |work: &Work<'_>| {
+        let mut work = self.listed_work(here, openable);
+        work.sort_by_cached_key(|work| {
             self.slots
                 .iter()
                 .position(|slot| slot.names(work))
                 .unwrap_or(usize::MAX)
-        };
-        let mut work = self.listed_work();
-        work.sort_by_cached_key(place);
-        if let Some(here) = here
-            && !work.is_empty()
-            && !work
-                .iter()
-                .any(|work| work.worktree().is_some_and(openable))
-        {
-            let at = self
-                .slots
-                .iter()
-                .position(|slot| matches!(slot, Slot::Here))
-                .map_or(work.len(), |slot| {
-                    work.partition_point(|work| place(work) < slot)
-                });
-            work.insert(at, Work::Here(here));
-        }
+        });
         work
     }
 
@@ -367,8 +333,13 @@ impl State {
     }
 
     /// The work the latest list names, as the daemon orders it: pull
-    /// requests first, then the worktrees none of them heads.
-    fn listed_work(&self) -> Vec<Work<'_>> {
+    /// requests first, then the worktrees none of them heads, then `here`
+    /// when none of those is in a worktree `openable` says Projects lists.
+    fn listed_work<'a>(
+        &'a self,
+        here: Option<&'a Path>,
+        openable: &dyn Fn(&Path) -> bool,
+    ) -> Vec<Work<'a>> {
         let mut work: Vec<Work<'_>> = self
             .rows()
             .iter()
@@ -379,17 +350,30 @@ impl State {
             })
             .collect();
         work.extend(self.worktrees_alone().map(Work::Worktree));
+        if let Some(here) = here
+            && !work.is_empty()
+            && !work
+                .iter()
+                .any(|work| work.worktree().is_some_and(openable))
+        {
+            work.push(Work::Here(here));
+        }
         work
     }
 
-    /// Fits the latest list into the rows already shown: a row keeps its
-    /// place while anything it is known by is still listed, taking on what
-    /// the list now knows it by; two rows the list finds are one piece of
-    /// work become one, in the earlier's place; and work the list names
-    /// for the first time goes last. A row whose work is no longer listed
-    /// leaves.
-    fn place_rows(&mut self) {
-        let listed: Vec<Slot> = self.listed_work().iter().map(Slot::of).collect();
+    /// Fits the latest list, with `here` and `openable` as [`Self::work`]
+    /// takes them, into the rows already shown: a row keeps its place while
+    /// anything it is known by is still listed, taking on what the list now
+    /// knows it by; two rows the list finds are one piece of work become
+    /// one, in the earlier's place; and work the list names for the first
+    /// time goes last. A row whose work is no longer listed leaves. Placing
+    /// the same list again changes nothing.
+    pub(super) fn place(&mut self, here: Option<&Path>, openable: &dyn Fn(&Path) -> bool) {
+        let listed: Vec<Slot> = self
+            .listed_work(here, openable)
+            .iter()
+            .map(Slot::of)
+            .collect();
         // Each row goes to the work with its pull request, else to the work
         // in its worktree, so a worktree moved to another pull request's
         // branch takes no row from a pull request still listed.
@@ -403,33 +387,25 @@ impl State {
                     .or_else(|| {
                         listed
                             .iter()
-                            .position(|slot| known.same_worktree(slot.worktree()))
+                            .position(|slot| known.same_worktree(slot.worktree.as_deref()))
                     })
             })
             .collect();
         let mut next = self.slots.len();
-        let mut placed: Vec<(usize, Slot)> = Vec::with_capacity(listed.len() + 1);
-        let any = !listed.is_empty();
-        for (index, slot) in listed.into_iter().enumerate() {
-            let place = owners
-                .iter()
-                .position(|owner| *owner == Some(index))
-                .unwrap_or_else(|| {
-                    next += 1;
-                    next - 1
-                });
-            placed.push((place, slot));
-        }
-        // Shown only beside work, the conversation's own worktree keeps its
-        // row while there is any, and first follows what is listed now.
-        if any {
-            let here = self
-                .slots
-                .iter()
-                .position(|slot| matches!(slot, Slot::Here))
-                .unwrap_or(next);
-            placed.push((here, Slot::Here));
-        }
+        let mut placed: Vec<(usize, Slot)> = listed
+            .into_iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                let place = owners
+                    .iter()
+                    .position(|owner| *owner == Some(index))
+                    .unwrap_or_else(|| {
+                        next += 1;
+                        next - 1
+                    });
+                (place, slot)
+            })
+            .collect();
         // Stable, so new work keeps the daemon's order among itself.
         placed.sort_by_key(|(place, _)| *place);
         self.slots = placed.into_iter().map(|(_, slot)| slot).collect();
@@ -1481,6 +1457,12 @@ mod tests {
         }
     }
 
+    /// `watch` arriving and its rows placed, with no worktree of its own.
+    fn show(state: &mut State, watch: Watch) {
+        state.update(watch);
+        state.place(None, &|_| true);
+    }
+
     /// What each Work row is, top to bottom.
     fn rows_of(state: &State) -> Vec<String> {
         state
@@ -1502,74 +1484,89 @@ mod tests {
         let conversation = TerminalId::new();
         state.retarget(Some(conversation));
         // What the transcript names before GitHub has answered.
-        state.update(with_worktrees(
-            conversation,
-            1,
-            vec![row(41, Relation::Created)],
-            vec![
-                worktree("/docs", None),
-                worktree("/retry", None),
-                worktree("/cache", None),
-            ],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                1,
+                vec![row(41, Relation::Created)],
+                vec![
+                    worktree("/docs", None),
+                    worktree("/retry", None),
+                    worktree("/cache", None),
+                ],
+            ),
+        );
         assert_eq!(rows_of(&state), ["#41", "docs", "retry", "cache"]);
 
         // `/retry` heads #38, `/cache` heads #41, and #35 is found. The
         // daemon lists pull requests first, which would move every row.
-        state.update(with_worktrees(
-            conversation,
-            2,
-            vec![
-                row(41, Relation::Created),
-                row(38, Relation::Pushed),
-                row(35, Relation::Updated),
-            ],
-            vec![
-                worktree("/docs", None),
-                worktree("/retry", Some(38)),
-                worktree("/cache", Some(41)),
-            ],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                2,
+                vec![
+                    row(41, Relation::Created),
+                    row(38, Relation::Pushed),
+                    row(35, Relation::Updated),
+                ],
+                vec![
+                    worktree("/docs", None),
+                    worktree("/retry", Some(38)),
+                    worktree("/cache", Some(41)),
+                ],
+            ),
+        );
         // `/retry` became #38 where it was; `/cache` is #41's, so its row
         // joined #41's, and #35 comes after what was shown.
         assert_eq!(rows_of(&state), ["#41", "docs", "#38", "#35"]);
 
         // A relation that changes the daemon's order moves nothing either.
-        state.update(with_worktrees(
-            conversation,
-            3,
-            vec![
-                row(35, Relation::Created),
-                row(38, Relation::Pushed),
-                row(41, Relation::Updated),
-            ],
-            vec![
-                worktree("/docs", None),
-                worktree("/retry", Some(38)),
-                worktree("/cache", Some(41)),
-            ],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                3,
+                vec![
+                    row(35, Relation::Created),
+                    row(38, Relation::Pushed),
+                    row(41, Relation::Updated),
+                ],
+                vec![
+                    worktree("/docs", None),
+                    worktree("/retry", Some(38)),
+                    worktree("/cache", Some(41)),
+                ],
+            ),
+        );
         assert_eq!(rows_of(&state), ["#41", "docs", "#38", "#35"]);
 
         // Work that leaves takes its row with it; what follows closes up.
-        state.update(with_worktrees(
-            conversation,
-            4,
-            vec![row(41, Relation::Created), row(35, Relation::Updated)],
-            vec![worktree("/docs", None), worktree("/cache", Some(41))],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                4,
+                vec![row(41, Relation::Created), row(35, Relation::Updated)],
+                vec![worktree("/docs", None), worktree("/cache", Some(41))],
+            ),
+        );
         assert_eq!(rows_of(&state), ["#41", "docs", "#35"]);
 
         // Another conversation starts from the daemon's order, even for a
         // worktree the last one showed in a later row.
         let other = TerminalId::new();
         state.retarget(Some(other));
-        state.update(with_worktrees(
-            other,
-            1,
-            vec![row(7, Relation::Created)],
-            vec![worktree("/docs", None)],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                other,
+                1,
+                vec![row(7, Relation::Created)],
+                vec![worktree("/docs", None)],
+            ),
+        );
         assert_eq!(rows_of(&state), ["#7", "docs"]);
     }
 
@@ -1580,40 +1577,54 @@ mod tests {
         let mut state = State::default();
         let conversation = TerminalId::new();
         state.retarget(Some(conversation));
-        state.update(with_worktrees(
-            conversation,
-            1,
-            vec![row(1, Relation::Created)],
-            vec![worktree("/a", Some(1)), worktree("/docs", None)],
-        ));
-        state.update(with_worktrees(
-            conversation,
-            2,
-            vec![row(1, Relation::Created), row(2, Relation::Pushed)],
-            vec![worktree("/a", Some(1)), worktree("/docs", None)],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                1,
+                vec![row(1, Relation::Created)],
+                vec![worktree("/a", Some(1)), worktree("/docs", None)],
+            ),
+        );
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                2,
+                vec![row(1, Relation::Created), row(2, Relation::Pushed)],
+                vec![worktree("/a", Some(1)), worktree("/docs", None)],
+            ),
+        );
         assert_eq!(rows_of(&state), ["#1", "docs", "#2"]);
         // `/a` checks out #2's branch.
-        state.update(with_worktrees(
-            conversation,
-            3,
-            vec![row(1, Relation::Created), row(2, Relation::Pushed)],
-            vec![worktree("/a", Some(2)), worktree("/docs", None)],
-        ));
+        show(
+            &mut state,
+            with_worktrees(
+                conversation,
+                3,
+                vec![row(1, Relation::Created), row(2, Relation::Pushed)],
+                vec![worktree("/a", Some(2)), worktree("/docs", None)],
+            ),
+        );
         assert_eq!(rows_of(&state), ["#1", "docs", "#2"]);
     }
 
     /// The conversation's own worktree, listed when none of its work is in
-    /// a worktree Projects lists, keeps its row as work arrives after it.
+    /// a worktree Projects lists, keeps its row as work arrives after it,
+    /// and when it is found to be work itself; while it isn't listed, it
+    /// holds no row for later.
     #[test]
     fn the_conversations_own_worktree_keeps_its_row() {
-        let mut state = State::default();
-        let conversation = TerminalId::new();
-        state.retarget(Some(conversation));
         let here = Path::new("/main");
-        let rows = |state: &State| -> Vec<String> {
+        let conversation = TerminalId::new();
+        // Projects lists the conversation's own worktree, and `/a` when
+        // `a_listed` says so.
+        let fill = |state: &mut State, watch: Watch, a_listed: bool| -> Vec<String> {
+            let openable = |path: &Path| path == here || (a_listed && path == Path::new("/a"));
+            state.update(watch);
+            state.place(Some(here), &openable);
             state
-                .work(Some(here), &|_| false)
+                .work(Some(here), &openable)
                 .iter()
                 .map(|work| match work.pull_request() {
                     Some(row) => format!("#{}", row.number),
@@ -1621,20 +1632,62 @@ mod tests {
                 })
                 .collect()
         };
-        state.update(with_worktrees(
-            conversation,
-            1,
-            vec![row(1, Relation::Created)],
-            Vec::new(),
-        ));
-        assert_eq!(rows(&state), ["#1", "main"]);
-        state.update(with_worktrees(
-            conversation,
-            2,
-            vec![row(1, Relation::Created), row(2, Relation::Pushed)],
-            Vec::new(),
-        ));
-        assert_eq!(rows(&state), ["#1", "main", "#2"]);
+
+        let mut state = State::default();
+        state.retarget(Some(conversation));
+        let list =
+            |revision, rows, worktrees| with_worktrees(conversation, revision, rows, worktrees);
+        assert_eq!(
+            fill(
+                &mut state,
+                list(1, vec![row(1, Relation::Created)], Vec::new()),
+                false
+            ),
+            ["#1", "main"]
+        );
+        let both = || vec![row(1, Relation::Created), row(2, Relation::Pushed)];
+        assert_eq!(
+            fill(&mut state, list(2, both(), Vec::new()), false),
+            ["#1", "main", "#2"]
+        );
+        // The conversation edits its own worktree: the row is that work now.
+        assert_eq!(
+            fill(
+                &mut state,
+                list(3, both(), vec![worktree("/main", None)]),
+                false
+            ),
+            ["#1", "main", "#2"]
+        );
+
+        // Hidden while #1 is checked out where Projects lists it, it
+        // follows #2 once #1 is no longer checked out there.
+        let mut state = State::default();
+        state.retarget(Some(conversation));
+        assert_eq!(
+            fill(
+                &mut state,
+                list(
+                    1,
+                    vec![row(1, Relation::Created)],
+                    vec![worktree("/a", Some(1))]
+                ),
+                true
+            ),
+            ["#1"]
+        );
+        assert_eq!(
+            fill(
+                &mut state,
+                list(2, both(), vec![worktree("/a", Some(1))]),
+                true
+            ),
+            ["#1", "#2"]
+        );
+        assert_eq!(
+            fill(&mut state, list(3, both(), Vec::new()), true),
+            ["#1", "#2", "main"]
+        );
     }
 
     /// The height the list reports is the height it lays out at, so its

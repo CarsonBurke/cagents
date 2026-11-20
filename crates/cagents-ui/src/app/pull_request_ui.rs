@@ -144,8 +144,19 @@ impl Cagents {
                 // a projection follows its conversation; follow it now, or
                 // its first list would be dropped and it would read forever.
                 self.sync_pull_request_inspector();
-                for state in self.pull_request_inspector.conversations.values_mut() {
-                    state.update(watch.clone());
+                let heres: Vec<(CardId, Option<PathBuf>)> = self
+                    .pull_request_inspector
+                    .conversations
+                    .keys()
+                    .map(|card| (*card, self.inspected_here(*card)))
+                    .collect();
+                let paths = &self.worktree_paths;
+                let openable = |path: &std::path::Path| paths.lists(path);
+                for (card, here) in heres {
+                    if let Some(state) = self.pull_request_inspector.conversations.get_mut(&card) {
+                        state.update(watch.clone());
+                        state.place(here.as_deref(), &openable);
+                    }
                 }
                 Task::none()
             }
