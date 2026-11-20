@@ -16252,10 +16252,10 @@ mod peer_draft_tests;
 #[path = "chat_ui/startup_restore_tests.rs"]
 mod startup_restore_tests;
 
-/// How many cached items restoring Find's disclosures has examined to drop a
-/// report body it revealed.
 #[cfg(test)]
 thread_local! { static REPORT_COLLAPSE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+/// How many cached items restoring Find's disclosures has examined to drop a
+/// report body it revealed.
 #[cfg(test)]
 pub(super) fn report_collapse_visits() -> usize {
     REPORT_COLLAPSE_VISITS.with(std::cell::Cell::get)
