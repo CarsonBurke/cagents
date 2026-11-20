@@ -7,7 +7,7 @@
 //! `{"sessions": [{"sessionId", "cwd", "title", "updatedAt"}]}` in one page,
 //! unordered; the protocol allows more pages through `nextCursor`.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
     time::Duration,
@@ -44,12 +44,22 @@ pub struct Listed {
     pub updated_at_unix_ms: Option<i64>,
 }
 
+/// Why an agent's conversations could not be listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unlisted {
+    /// It needs its sign-in first.
+    SignedOut,
+    /// It failed, stopped or did not answer in time. What went wrong is
+    /// logged, not shown.
+    Failed,
+}
+
 /// Every conversation `account`'s agent lists, newest first. `Ok(None)` when
 /// it is not installed or does not list its conversations.
 pub async fn list(
     account: &Account,
     search_path: Option<&OsStr>,
-) -> Result<Option<Vec<Listed>>, String> {
+) -> Result<Option<Vec<Listed>>, Unlisted> {
     let provider = account.provider;
     let label = super::cli_name(provider);
     let arguments: &[&str] = match provider {
@@ -73,19 +83,38 @@ pub async fn list(
     };
     let mut command = command_with_path(account, &program, search_path);
     command.args(arguments);
-    tokio::time::timeout(TIMEOUT, async {
-        let mut session = Session::spawn(command).await?;
+    let listed = tokio::time::timeout(TIMEOUT, async {
+        let mut session = Session::spawn(command).await.map_err(Asked::Failed)?;
         let listed = ask(&mut session).await;
-        session.close().await;
+        // The answer is in; the agent's exit is not waited on for it.
+        tokio::spawn(session.close());
         listed
     })
     .await
-    .map_err(|_| format!("{label} did not list its conversations in time"))?
-    .map_err(|error| format!("{label} could not list its conversations: {error}"))
+    .unwrap_or_else(|_| Err(Asked::Failed("it did not answer in time".into())));
+    listed.map_err(|asked| match asked {
+        Asked::SignedOut => Unlisted::SignedOut,
+        Asked::Failed(error) => {
+            tracing::info!(%error, "{label} could not list its conversations");
+            Unlisted::Failed
+        }
+    })
+}
+
+/// How asking went wrong.
+enum Asked {
+    SignedOut,
+    Failed(String),
+}
+
+impl From<String> for Asked {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
 }
 
 /// `initialize`, then `session/list` page by page.
-async fn ask(session: &mut Session) -> Result<Option<Vec<Listed>>, String> {
+async fn ask(session: &mut Session) -> Result<Option<Vec<Listed>>, Asked> {
     session
         .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": 1,
@@ -168,10 +197,11 @@ fn conversation(entry: &Value) -> Option<Listed> {
     })
 }
 
-fn refusal(error: &Value) -> String {
+fn refusal(error: &Value) -> Asked {
     if error["code"].as_i64() == Some(AUTH_REQUIRED) {
-        "sign in first".into()
-    } else {
+        return Asked::SignedOut;
+    }
+    Asked::Failed(
         error["message"]
             .as_str()
             .map(str::trim)
@@ -179,8 +209,8 @@ fn refusal(error: &Value) -> String {
             .map_or_else(
                 || "it refused".into(),
                 |message| message[..message.floor_char_boundary(message.len().min(240))].to_owned(),
-            )
-    }
+            ),
+    )
 }
 
 /// The reply to request `id`, refusing any request of the agent's own and
@@ -252,11 +282,32 @@ pub fn held<'a>(
     locks
         .into_iter()
         .filter(|(_, lock)| {
-            std::fs::symlink_metadata(lock)
-                .is_ok_and(|metadata| metadata.is_file() && locked.contains(&metadata.ino()))
+            let Ok(metadata) = std::fs::symlink_metadata(lock) else {
+                return false;
+            };
+            // The lock table names a file by its inode alone, which another
+            // file system can share, so a holder must have this file open.
+            metadata.is_file()
+                && locked.get(&metadata.ino()).is_some_and(|holders| {
+                    holders
+                        .iter()
+                        .any(|&pid| holds_open(pid, (metadata.dev(), metadata.ino())))
+                })
         })
         .map(|(id, _)| id)
         .collect()
+}
+
+/// Whether process `pid` has the file `(device, inode)` open.
+fn holds_open(pid: u32, file: (u64, u64)) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(descriptors) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    descriptors.flatten().any(|descriptor| {
+        std::fs::metadata(descriptor.path())
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == file)
+    })
 }
 
 /// The `.session.lock` of each of `ids` Muse keeps under `sessions`, by its
@@ -290,25 +341,36 @@ fn muse_session_locks(sessions: &Path, ids: &HashSet<&str>) -> Vec<(String, Path
     found
 }
 
-/// The inodes of every file `/proc/locks` says is locked, whatever kind of
-/// lock, by its `MAJOR:MINOR:INODE` field. The device is not compared: a
-/// Btrfs subvolume's files report another device than the lock table does.
-fn locked_inodes(table: &str) -> HashSet<u64> {
-    table
-        .lines()
-        .filter_map(|line| {
-            line.split_whitespace().find_map(|field| {
-                let mut parts = field.split(':');
-                let (major, minor, inode) = (parts.next()?, parts.next()?, parts.next()?);
-                (parts.next().is_none()
-                    && [major, minor]
-                        .iter()
-                        .all(|part| !part.is_empty() && u32::from_str_radix(part, 16).is_ok()))
-                .then(|| inode.parse().ok())
-                .flatten()
-            })
-        })
-        .collect()
+/// The inode of every file `/proc/locks` says is locked, whatever kind of
+/// lock, by its `MAJOR:MINOR:INODE` field, with the processes holding it,
+/// by the field before. The device is not compared: a Btrfs subvolume's
+/// files report another device than the lock table does.
+fn locked_inodes(table: &str) -> HashMap<u64, Vec<u32>> {
+    let mut locked = HashMap::<u64, Vec<u32>>::new();
+    for line in table.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some((at, inode)) = fields.iter().enumerate().find_map(|(at, field)| {
+            let mut parts = field.split(':');
+            let (major, minor, inode) = (parts.next()?, parts.next()?, parts.next()?);
+            (parts.next().is_none()
+                && [major, minor]
+                    .iter()
+                    .all(|part| !part.is_empty() && u32::from_str_radix(part, 16).is_ok()))
+            .then(|| inode.parse::<u64>().ok().map(|inode| (at, inode)))
+            .flatten()
+        }) else {
+            continue;
+        };
+        let holders = locked.entry(inode).or_default();
+        // An open file description's lock names no process (-1).
+        if let Some(pid) = at
+            .checked_sub(1)
+            .and_then(|before| fields[before].parse::<u32>().ok())
+        {
+            holders.push(pid);
+        }
+    }
+    locked
 }
 
 #[cfg(test)]
@@ -419,10 +481,7 @@ mod tests {
         let error = list(&account, Some(refusing.path().as_os_str()))
             .await
             .unwrap_err();
-        assert_eq!(
-            error,
-            "Muse could not list its conversations: sign in first"
-        );
+        assert_eq!(error, Unlisted::SignedOut);
 
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -474,7 +533,14 @@ mod tests {
 267: POSIX  ADVISORY  READ 12 fd:01:42 1073741826 1073742335
 267: -> POSIX  ADVISORY  WRITE 13 fd:01:43 0 EOF
 ";
-        assert_eq!(locked_inodes(table), HashSet::from([598_782_030, 42, 43]));
+        assert_eq!(
+            locked_inodes(table),
+            HashMap::from([
+                (598_782_030, vec![2_436_558]),
+                (42, vec![12]),
+                (43, vec![13])
+            ])
+        );
         assert!(locked_inodes("garbage 1:2 x:y:z\n").is_empty());
     }
 

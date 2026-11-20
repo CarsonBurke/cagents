@@ -1,5 +1,8 @@
 use super::*;
-use crate::account::{Account, AccountId, probe::conversations::Listed};
+use crate::account::{
+    Account, AccountId,
+    probe::conversations::{Listed, Unlisted},
+};
 use crate::agent::Provider;
 use crate::chat;
 use crate::persistence::SavedConversation;
@@ -68,6 +71,9 @@ pub(super) struct State {
     asking: Vec<usize>,
     /// What each agent last listed, kept from one opening to the next.
     listings: HashMap<AccountId, Listing>,
+    /// The agents being asked now, whichever opening asked them, so opening
+    /// the picker again starts no second one.
+    in_flight: HashSet<AccountId>,
     /// The conversation `/resume` was typed in, which is not listed.
     hidden: Option<Identity>,
     /// Whether a chosen conversation waits for its retiring channel to
@@ -100,16 +106,15 @@ struct Listing {
     /// The directories its conversations ran in that no longer exist.
     missing: Arc<[PathBuf]>,
     /// Why the agent could not be asked last time.
-    error: Option<String>,
+    error: Option<Unlisted>,
 }
 
 /// What asking an agent for its conversations answered.
 #[derive(Debug, Clone)]
 pub struct Listened {
-    seed: usize,
     account: AccountId,
     /// `None` when the listing was fresh enough not to ask again.
-    listed: Option<Result<Option<Vec<Listed>>, String>>,
+    listed: Option<Result<Option<Vec<Listed>>, Unlisted>>,
     held: HashSet<String>,
     missing: Vec<PathBuf>,
 }
@@ -392,9 +397,8 @@ pub enum Action {
     /// Lists conversations from this far beyond where the picker was opened.
     Reach(Reach),
     Indexed(u64, Progress),
-    /// What an agent answered when the opening numbered so was asked for
-    /// its conversations.
-    Listed(u64, Box<Listened>),
+    /// What an agent answered when asked for its conversations.
+    Listed(Box<Listened>),
     Resume(CardId),
     More,
     Submit,
@@ -1163,7 +1167,7 @@ impl Cagents {
                 }
                 self.resume_indexed(progress)
             }
-            Action::Listed(generation, listened) => self.resume_listed(generation, *listened),
+            Action::Listed(listened) => self.resume_listed(*listened),
             Action::Resume(card) => {
                 if !self.resume_ui.open || self.resume_ui.loading {
                     return Task::none();
@@ -1329,7 +1333,6 @@ impl Cagents {
         if crate::device::is_remote() {
             return Task::none();
         }
-        let generation = self.resume_ui.generation;
         let mut tasks = Vec::new();
         for seed in 0..self.resume_ui.seed_homes.len() {
             let (account, home) = self.resume_ui.seed_homes[seed].clone();
@@ -1348,15 +1351,22 @@ impl Cagents {
                 self.apply_listing(seed, &cached);
             }
             let fresh = cached.at.is_some_and(|at| at.elapsed() < LISTING_FRESH);
+            if self.resume_ui.in_flight.contains(&id) {
+                // Its answer is listed in this opening when it comes.
+                self.resume_ui.asking.push(seed);
+                continue;
+            }
             if !fresh {
                 self.resume_ui.asking.push(seed);
+                self.resume_ui.in_flight.insert(id.clone());
             }
             let known = cached.conversations;
             tasks.push(cosmic::task::future(async move {
                 let listed = if fresh {
                     None
                 } else {
-                    let search_path = crate::account::probe::current_search_path();
+                    // The login shell's, once read, as the account check uses.
+                    let search_path = crate::account::probe::search_path().await;
                     Some(
                         crate::account::probe::conversations::list(
                             &account,
@@ -1392,32 +1402,34 @@ impl Cagents {
                 })
                 .await
                 .unwrap_or_default();
-                Message::ResumeConversation(Action::Listed(
-                    generation,
-                    Box::new(Listened {
-                        seed,
-                        account: id,
-                        listed,
-                        held,
-                        missing,
-                    }),
-                ))
+                Message::ResumeConversation(Action::Listed(Box::new(Listened {
+                    account: id,
+                    listed,
+                    held,
+                    missing,
+                })))
             }));
         }
         Task::batch(tasks)
     }
 
-    /// Keeps what an agent answered, and lists it if the opening that asked
-    /// is still the one shown.
-    fn resume_listed(&mut self, generation: u64, listened: Listened) -> Task<Message> {
+    /// Keeps what an agent answered, and lists it if the picker shows that
+    /// agent's conversations now, whichever opening asked.
+    fn resume_listed(&mut self, listened: Listened) -> Task<Message> {
         let Listened {
-            seed,
             account,
             listed,
             held,
             missing,
         } = listened;
         let state = &mut self.resume_ui;
+        if listed.is_some() {
+            state.in_flight.remove(&account);
+        }
+        let seed = state
+            .seed_homes
+            .iter()
+            .position(|(seeded, _)| seeded.id() == account);
         let listing = state.listings.entry(account).or_default();
         match listed {
             Some(Ok(listed)) => {
@@ -1435,9 +1447,9 @@ impl Cagents {
         listing.held = Arc::new(held);
         listing.missing = missing.into();
         let listing = listing.clone();
-        if !state.open || generation != state.generation {
+        let Some(seed) = seed.filter(|_| state.open) else {
             return Task::none();
-        }
+        };
         state.asking.retain(|asking| *asking != seed);
         self.apply_listing(seed, &listing);
         self.resume_rows_changed();
@@ -1559,11 +1571,17 @@ impl Cagents {
             .iter()
             .filter_map(|(account, _)| {
                 let listing = state.listings.get(&account.id())?;
-                let error = listing.error.as_ref()?;
-                Some(if listing.conversations.is_empty() {
-                    format!("{error}.")
-                } else {
-                    format!("{error}, so its list may be out of date.")
+                let agent = account.provider.label();
+                Some(match listing.error? {
+                    Unlisted::SignedOut => {
+                        format!("Sign in to {agent} to list its conversations here.")
+                    }
+                    Unlisted::Failed if listing.conversations.is_empty() => {
+                        format!("{agent} did not list its conversations. Open this again to retry.")
+                    }
+                    Unlisted::Failed => format!(
+                        "{agent} did not list its conversations, so these are the ones it listed before."
+                    ),
                 })
             })
             .collect()
@@ -2207,8 +2225,17 @@ impl Cagents {
                         .class(cosmic::theme::Text::Custom(design::warning_text))
                         .into(),
                 );
+            } else if row.held {
+                title.push(
+                    design::caption("Open elsewhere")
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .into(),
+                );
             }
-            title.push(design::caption(age(now, row.updated_at_unix_ms)).into());
+            // An agent need not say when a conversation was last active.
+            if row.updated_at_unix_ms > 0 {
+                title.push(design::caption(age(now, row.updated_at_unix_ms)).into());
+            }
             let contents = widget::column::with_children(vec![
                 widget::row::with_children(title)
                     .align_y(Alignment::Center)
@@ -2343,37 +2370,24 @@ impl Cagents {
             "Yesterday" => "yesterday".to_owned(),
             _ => when,
         };
-        let mut activity = vec![format!("Last active {when}")];
+        let mut activity = Vec::new();
+        if row.updated_at_unix_ms > 0 {
+            activity.push(format!("Last active {when}"));
+        }
         if let Some(summary) = summary {
             activity.push(messages(summary.messages()));
         }
         activity.extend(row.bytes.map(chat::approximate_size));
-        column = column.push(design::caption(activity.join(" · ")));
-        let warning = |text: String| {
-            design::caption(text).class(cosmic::theme::Text::Custom(design::warning_text))
-        };
+        if !activity.is_empty() {
+            column = column.push(design::caption(activity.join(" · ")));
+        }
         if row.open {
             column = column.push(design::caption("Already open. Resuming switches to it."));
-        } else if state.missing.contains(&row.directory) {
-            column = column.push(warning(if row.provider == Provider::Claude {
-                "Its folder no longer exists, so it opens read-only. Restore the folder to continue it.".to_owned()
-            } else {
-                "Its folder no longer exists. Restore the folder to resume it.".to_owned()
-            }));
-        } else if row.provider.speaks_acp() {
-            // Its agent's lock says whether it runs elsewhere, so recent
-            // activity alone does not.
-            if row.held {
-                column = column.push(warning(format!(
-                    "{} has it open in another window or terminal now.",
-                    row.provider.label()
-                )));
-            }
-        } else if now - row.updated_at_unix_ms < RECENT_MS {
-            column = column.push(warning(
-                "Active moments ago. It may still be running in another window or terminal."
-                    .to_owned(),
-            ));
+        } else if let Some(text) = resume_warning(row, now, state.missing.contains(&row.directory))
+        {
+            column = column.push(
+                design::caption(text).class(cosmic::theme::Text::Custom(design::warning_text)),
+            );
         }
         let section = |label: &'static str, text: &'a str, lines: usize| {
             widget::column::with_children(vec![
@@ -2418,6 +2432,32 @@ impl Cagents {
         column = column.push(design::caption(row.directory.display().to_string()));
         column.spacing(space::M).into()
     }
+}
+
+/// What may stop a conversation that is not open here from resuming as
+/// the reader expects: its folder is gone, or it may be running elsewhere.
+fn resume_warning(row: &Row, now: i64, missing: bool) -> Option<String> {
+    if missing {
+        return Some(if row.provider == Provider::Claude {
+            "Its folder no longer exists, so it opens read-only. Restore the folder to continue it."
+                .to_owned()
+        } else {
+            "Its folder no longer exists. Restore the folder to resume it.".to_owned()
+        });
+    }
+    if row.provider.speaks_acp() {
+        // Its agent's lock says whether it runs elsewhere, so recent
+        // activity alone does not.
+        return row.held.then(|| {
+            format!(
+                "{} has it open in another window or terminal now.",
+                row.provider.label()
+            )
+        });
+    }
+    (now - row.updated_at_unix_ms < RECENT_MS).then(|| {
+        "Active moments ago. It may still be running in another window or terminal.".to_owned()
+    })
 }
 
 /// A row's second line: who answered, where, and how much was said.
@@ -3863,20 +3903,23 @@ mod tests {
     const LATER: &str = "2d7b5e3a-4f6c-4b8d-8e9f-1a2b3c4d5e6f";
     const KEPT: &str = "3e8c6f4b-5a7d-4c9e-9f0a-2b3c4d5e6f7a";
 
-    /// What Antigravity lists, as answered to the opening numbered
-    /// `generation`.
-    fn listened(app: &mut Cagents, generation: u64, listed: Option<Vec<Listed>>, held: &[&str]) {
-        let account = app.resume_ui.seed_homes[0].0.id();
-        let _ = app.update_resume(Action::Listed(
-            generation,
-            Box::new(Listened {
-                seed: 0,
-                account,
-                listed: listed.map(|listed| Ok(Some(listed))),
-                held: held.iter().map(|id| (*id).to_owned()).collect(),
-                missing: Vec::new(),
-            }),
-        ));
+    /// What Antigravity answers when asked for its conversations.
+    fn listened(app: &mut Cagents, listed: Option<Vec<Listed>>, held: &[&str]) {
+        answered(app, listed.map(|listed| Ok(Some(listed))), held);
+    }
+
+    fn answered(
+        app: &mut Cagents,
+        listed: Option<Result<Option<Vec<Listed>>, Unlisted>>,
+        held: &[&str],
+    ) {
+        let account = crate::account::Account::system(Provider::Antigravity).id();
+        let _ = app.update_resume(Action::Listed(Box::new(Listened {
+            account,
+            listed,
+            held: held.iter().map(|id| (*id).to_owned()).collect(),
+            missing: Vec::new(),
+        })));
     }
 
     fn conversation(id: &str, directory: &Path, title: &str, updated_at_unix_ms: i64) -> Listed {
@@ -3888,23 +3931,49 @@ mod tests {
         }
     }
 
+    fn antigravity_seed(directory: &Path) -> chat::Session {
+        chat::fresh_session(
+            Provider::Antigravity,
+            TerminalId::new(),
+            directory.into(),
+            &crate::account::Account::system(Provider::Antigravity),
+        )
+        .unwrap()
+    }
+
+    /// Opens the picker afresh, as `open_resume` does, without its indexer.
+    fn reopen(app: &mut Cagents) -> u64 {
+        let state = &mut app.resume_ui;
+        state.open = true;
+        state.limit = PAGE;
+        state.generation += 1;
+        state.rows.clear();
+        state.visible.clear();
+        state.asking.clear();
+        state.seed_homes.clear();
+        state.hidden = None;
+        state.generation
+    }
+
+    fn listed_titles(app: &Cagents) -> Vec<(&str, bool)> {
+        let state = &app.resume_ui;
+        state
+            .visible
+            .iter()
+            .map(|&index| (state.rows[index].title.as_str(), state.rows[index].held))
+            .collect()
+    }
+
     /// Antigravity's conversations are listed as it lists them, those
     /// started outside cagents too; one cagents saved goes by the name the
-    /// agent gives it; and only one something holds is said to run.
+    /// agent gives it; and only one something holds is said to run, however
+    /// recently any was active.
     #[test]
     fn an_agent_lists_its_conversations_and_says_which_are_held() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.resume_ui.open = true;
-        app.resume_ui.limit = PAGE;
-        let generation = app.resume_ui.generation;
-        let seed = chat::fresh_session(
-            Provider::Antigravity,
-            TerminalId::new(),
-            directory.path().into(),
-            &crate::account::Account::system(Provider::Antigravity),
-        )
-        .unwrap();
+        let generation = reopen(&mut app);
+        let seed = antigravity_seed(directory.path());
         let mut known = SavedConversation {
             card: CardId::new(),
             title: chat_ui::chat_card_title(Provider::Antigravity).into(),
@@ -3920,47 +3989,45 @@ mod tests {
         assert_eq!(app.resume_ui.asking, [0]);
         assert_eq!(app.resume_asking().as_deref(), Some("Antigravity"));
 
+        let now = chat::now_ms().unwrap() as i64;
         listened(
             &mut app,
-            generation,
             Some(vec![
-                conversation(OUTSIDE, directory.path(), "From the terminal", 3_000),
+                conversation(OUTSIDE, directory.path(), "From the terminal", now),
                 conversation(
                     KNOWN,
                     directory.path(),
                     "Filter environment variables",
-                    2_000,
+                    now - 1,
                 ),
             ]),
             &[OUTSIDE],
         );
-        let state = &app.resume_ui;
-        assert!(state.asking.is_empty());
-        let titles = state
-            .visible
-            .iter()
-            .map(|&index| {
-                let row = &state.rows[index];
-                (row.title.as_str(), row.held, row.updated_at_unix_ms)
-            })
-            .collect::<Vec<_>>();
+        assert!(app.resume_ui.asking.is_empty());
         assert_eq!(
-            titles,
+            listed_titles(&app),
             [
-                ("From the terminal", true, 3_000),
-                ("Filter environment variables", false, 2_000),
+                ("From the terminal", true),
+                ("Filter environment variables", false),
             ]
         );
+        let state = &app.resume_ui;
         assert!(matches!(state.rows[1].source, Source::Saved(_)));
+        assert_eq!(state.rows[1].updated_at_unix_ms, now - 1);
+        // Active this very moment, but held by nothing: no warning.
+        assert_eq!(
+            resume_warning(&state.rows[0], now, false).as_deref(),
+            Some("Antigravity has it open in another window or terminal now.")
+        );
+        assert_eq!(resume_warning(&state.rows[1], now, false), None);
         let outside = state.rows[0].card;
 
         // Asked again, the agent no longer lists one; the one it still
-        // lists keeps its row, and whatever was resumed from it.
+        // lists keeps its row.
         listened(
             &mut app,
-            generation,
             Some(vec![
-                conversation(OUTSIDE, directory.path(), "From the terminal", 4_000),
+                conversation(OUTSIDE, directory.path(), "From the terminal", now),
                 conversation(ANOTHER, directory.path(), "Another", 500),
             ]),
             &[],
@@ -3976,78 +4043,126 @@ mod tests {
         let session = catalog::resumed(&state.seeds[0], id, &row.directory, None).unwrap();
         assert_eq!(session.launch.session_id.as_deref(), Some(OUTSIDE));
         assert_eq!(session.launch.provider, Provider::Antigravity);
+    }
 
-        // An answer to an earlier opening is kept for the next one, but
-        // changes nothing shown now.
-        app.resume_ui.generation = generation + 1;
-        app.resume_ui.rows.clear();
+    /// Opening the picker again while the agent is still being asked asks
+    /// no second one, and lists its answer when it comes; opening it again
+    /// soon after lists at once what it answered, asking only whether
+    /// something holds those conversations.
+    #[test]
+    fn an_agent_is_asked_once_however_often_the_picker_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let seed = antigravity_seed(directory.path());
+        let generation = reopen(&mut app);
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::saved(Vec::new(), vec![seed.clone()]),
+        ));
+        assert_eq!(app.resume_ui.in_flight.len(), 1);
+        let generation = reopen(&mut app);
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::saved(Vec::new(), vec![seed.clone()]),
+        ));
+        assert_eq!(app.resume_ui.asking, [0]);
+        assert_eq!(app.resume_ui.in_flight.len(), 1);
         listened(
             &mut app,
-            generation,
             Some(vec![conversation(LATER, directory.path(), "Later", 5_000)]),
             &[],
         );
-        assert!(app.resume_ui.rows.is_empty());
-        // The next opening lists at once what was listed last, and, asked
-        // so recently, asks the agent only whether something holds them.
+        assert!(app.resume_ui.in_flight.is_empty());
+        assert_eq!(listed_titles(&app), [("Later", false)]);
+
+        let generation = reopen(&mut app);
         let _ = app.update_resume(Action::Indexed(
-            generation + 1,
+            generation,
             Progress::saved(Vec::new(), vec![seed]),
         ));
         assert!(app.resume_ui.asking.is_empty());
-        let titles = app
-            .resume_ui
-            .rows
-            .iter()
-            .map(|row| row.title.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(titles, ["Later"]);
+        assert!(app.resume_ui.in_flight.is_empty());
+        assert_eq!(listed_titles(&app), [("Later", false)]);
+        // Whether something holds them comes after.
+        listened(&mut app, None, &[LATER]);
+        assert_eq!(listed_titles(&app), [("Later", true)]);
+        // Closed, the picker lists nothing more.
+        app.resume_ui.open = false;
+        app.resume_ui.rows.clear();
+        listened(&mut app, None, &[]);
+        assert!(app.resume_ui.rows.is_empty());
     }
 
-    /// Asking an agent that cannot answer says so beside the list, and
-    /// keeps what it listed before.
+    /// The conversation `/resume` was typed in is not listed, and a name the
+    /// reader gave one is not replaced by the agent's.
+    #[test]
+    fn a_listing_keeps_the_readers_conversation_and_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let seed = antigravity_seed(directory.path());
+        let saved = |id: &str, title: &str| {
+            let mut entry = SavedConversation {
+                card: CardId::new(),
+                title: title.into(),
+                session: seed.clone(),
+                open: false,
+                updated_at_unix_ms: 1,
+            };
+            entry.session.launch.session_id = Some(id.into());
+            entry
+        };
+        let here = saved(KNOWN, "Here");
+        let renamed = saved(KEPT, "My name for it");
+        app.chrome_ui
+            .user_titles
+            .insert(renamed.card, renamed.title.clone());
+        let generation = reopen(&mut app);
+        app.resume_ui.asked_from = Some(here.card);
+        let _ = app.update_resume(Action::Indexed(
+            generation,
+            Progress::saved(vec![here, renamed], vec![seed]),
+        ));
+        listened(
+            &mut app,
+            Some(vec![
+                conversation(KNOWN, directory.path(), "The agent's name", 3),
+                conversation(KEPT, directory.path(), "The agent's other name", 2),
+            ]),
+            &[],
+        );
+        assert_eq!(listed_titles(&app), [("My name for it", false)]);
+    }
+
+    /// An agent that cannot answer says so beside the list, in the reader's
+    /// terms, and keeps what it listed before; one not installed says
+    /// nothing.
     #[test]
     fn an_agent_that_cannot_list_says_why() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.resume_ui.open = true;
-        let generation = app.resume_ui.generation;
-        let seed = chat::fresh_session(
-            Provider::Antigravity,
-            TerminalId::new(),
-            directory.path().into(),
-            &crate::account::Account::system(Provider::Antigravity),
-        )
-        .unwrap();
+        let generation = reopen(&mut app);
         let _ = app.update_resume(Action::Indexed(
             generation,
-            Progress::saved(Vec::new(), vec![seed]),
+            Progress::saved(Vec::new(), vec![antigravity_seed(directory.path())]),
         ));
+        answered(&mut app, Some(Ok(None)), &[]);
+        assert!(app.resume_unlisted().is_empty());
+        assert!(app.resume_ui.rows.is_empty());
         listened(
             &mut app,
-            generation,
             Some(vec![conversation(KEPT, directory.path(), "Kept", 1)]),
             &[],
         );
-        let account = app.resume_ui.seed_homes[0].0.id();
-        let _ = app.update_resume(Action::Listed(
-            generation,
-            Box::new(Listened {
-                seed: 0,
-                account,
-                listed: Some(Err(
-                    "Antigravity could not list its conversations: sign in first".into(),
-                )),
-                held: HashSet::new(),
-                missing: Vec::new(),
-            }),
-        ));
+        answered(&mut app, Some(Err(Unlisted::Failed)), &[]);
         assert_eq!(app.resume_ui.rows.len(), 1);
         assert_eq!(
             app.resume_unlisted(),
-            [
-                "Antigravity could not list its conversations: sign in first, so its list may be out of date."
-            ]
+            ["Antigravity did not list its conversations, so these are the ones it listed before."]
+        );
+        answered(&mut app, Some(Err(Unlisted::SignedOut)), &[]);
+        assert_eq!(
+            app.resume_unlisted(),
+            ["Sign in to Antigravity to list its conversations here."]
         );
     }
 
