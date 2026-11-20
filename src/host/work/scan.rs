@@ -4,6 +4,8 @@
 //! `node_modules` are never read.
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -14,7 +16,7 @@ use crate::{
     linear::context::LinkedIssue,
     model::{ProjectId, WorktreeId},
     repository::{CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot},
-    work::{Comparison, Dirty, Head},
+    work::{Comparison, Dirty, Head, branch_identity, branch_name},
 };
 
 /// Dirty paths whose modification time is read per scan. A worktree with more
@@ -70,8 +72,8 @@ pub(super) struct Local {
     pub root: Option<PathBuf>,
     pub base: Option<Base>,
     pub worktrees: Vec<Worktree>,
-    /// Every branch checked out in a worktree or named by the user's pull
-    /// requests: the only branches that can earn a card.
+    /// Branches checked out in worktrees, named by the user's pull requests,
+    /// or carrying a non-UTF-8 name: the branches that can earn a card.
     pub branches: BTreeMap<String, Branch>,
     /// Every local branch name, for telling remote-only pull requests apart.
     pub branch_names: BTreeSet<String>,
@@ -138,7 +140,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         .map_err(text)?;
     let base = base_ref.as_ref().and_then(|refname| {
         tips.iter()
-            .find(|tip| &tip.refname == refname)
+            .find(|tip| tip.refname.as_os_str() == OsStr::new(refname))
             .map(|tip| Base {
                 refname: refname.clone(),
                 oid: tip.oid.clone(),
@@ -146,7 +148,13 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     });
     let local_tips = tips
         .iter()
-        .filter_map(|tip| Some((tip.refname.strip_prefix("refs/heads/")?, tip)))
+        .filter_map(|tip| {
+            let name = tip
+                .refname
+                .as_encoded_bytes()
+                .strip_prefix(b"refs/heads/")?;
+            Some((branch_identity(OsStr::from_bytes(name)), tip))
+        })
         .collect::<BTreeMap<_, _>>();
 
     // Earlier facts by worktree, and the Git directory the retained watch
@@ -215,6 +223,22 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 worktree.head = old.head.clone();
             }
         }
+        // Worktree listing and status decode names for display. Resolve an
+        // ambiguous replacement character only after applying status, so an
+        // invalid name never acquires a literal U+FFFD branch's identity.
+        if worktree
+            .branch
+            .as_deref()
+            .is_some_and(|branch| branch.contains('\u{fffd}'))
+        {
+            match git.symbolic_branch(&record.path, cancellation) {
+                Ok(branch) => worktree.branch = branch.as_deref().map(branch_identity),
+                Err(error) => {
+                    worktree.branch = None;
+                    worktree.error = Some(error.to_string());
+                }
+            }
+        }
         worktree.link = planned
             .get(&record.id)
             .map(|git_dir| git_dir.to_path_buf())
@@ -276,8 +300,11 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         .filter_map(|worktree| worktree.branch.as_deref())
         .collect::<BTreeSet<_>>();
     let mut branches = BTreeMap::new();
-    for (&name, tip) in &local_tips {
-        if checked_out.contains(name) || hints.branches.contains(name) {
+    for (name, tip) in &local_tips {
+        if checked_out.contains(name.as_str())
+            || hints.branches.contains(name)
+            || tip.refname.to_str().is_none()
+        {
             branches.insert(
                 name.to_owned(),
                 Branch {
@@ -303,7 +330,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         let unmeasured = branches
             .iter()
             .filter(|(_, branch)| cached(&branch.oid).is_none())
-            .map(|(name, _)| format!("refs/heads/{name}"))
+            .map(|(name, _)| branch_ref(name))
             .collect::<Vec<_>>();
         let measured = if unmeasured.is_empty() {
             BTreeMap::new()
@@ -328,8 +355,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             }
         };
         for (name, branch) in &mut branches {
-            let counts = cached(&branch.oid)
-                .or_else(|| measured.get(&format!("refs/heads/{name}")).copied());
+            let counts = cached(&branch.oid).or_else(|| measured.get(&branch_ref(name)).copied());
             if let Some(counts) = counts {
                 divergence.insert((branch.oid.clone(), base.oid.clone()), counts);
                 branch.comparison = Some(comparison(base, counts));
@@ -457,13 +483,19 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         base,
         worktrees,
         branches,
-        branch_names: local_tips.keys().map(|name| (*name).to_owned()).collect(),
+        branch_names: local_tips.into_keys().collect(),
         ancestry,
         plan,
         plan_error,
         plan_retry,
         divergence,
     })
+}
+
+fn branch_ref(identity: &str) -> OsString {
+    let mut refname = OsString::from("refs/heads/");
+    refname.push(branch_name(identity));
+    refname
 }
 
 fn comparison(base: &Base, counts: Divergence) -> Comparison {

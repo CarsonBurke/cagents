@@ -882,7 +882,13 @@ fn analyze(
         return Ok(blocked(path, blocker));
     }
 
-    let symref = plain.answer(["symbolic-ref", "-q", "HEAD"])?.map(oid);
+    let symref = plain
+        .answer(["symbolic-ref", "-q", "HEAD"])?
+        .map(|bytes| {
+            String::from_utf8(bytes.trim_ascii_end().to_vec())
+                .map_err(|_| ContentError::Git("git printed non-UTF-8 where a name was due".into()))
+        })
+        .transpose()?;
     let Some(head) = plain
         .answer(["rev-parse", "-q", "--verify", "HEAD^{commit}"])?
         .map(oid)

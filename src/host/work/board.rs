@@ -155,18 +155,36 @@ fn project_items(
             // work only while something happens there. An idle shell open in
             // it is not something happening.
             let agent = attached.iter().any(|session| session.provider.is_some());
-            if worktree.primary && !ahead && !dirty && !agent {
+            if worktree.primary
+                && !ahead
+                && !dirty
+                && !agent
+                && worktree
+                    .branch
+                    .as_deref()
+                    .is_none_or(|identity| crate::work::branch_name(identity).to_str().is_some())
+            {
                 continue;
             }
             // `git worktree add --force` can check one branch out twice.
             let key = match &worktree.branch {
                 Some(branch) if !carded.contains(branch) => ItemKey::Branch(branch.clone()),
+                Some(branch) if crate::work::branch_name(branch).to_str().is_none() => {
+                    ItemKey::Branch(format!("{branch}:{}", worktree.id))
+                }
                 _ => ItemKey::Worktree(worktree.path.clone()),
             };
             if let Some(branch) = &worktree.branch {
                 carded.insert(branch.clone());
             }
-            let mut item = new_item(key, worktree.branch.clone());
+            let mut item = new_item(
+                key,
+                worktree.branch.as_deref().map(|name| {
+                    crate::work::branch_name(name)
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            );
             item.worktree = Some(Worktree {
                 path: worktree.path.clone(),
                 primary: worktree.primary,
@@ -231,11 +249,18 @@ fn project_items(
                 pull_request.state == PullRequestState::Open
                     || (pull_request.state == PullRequestState::Closed && pull_request.draft)
             });
-            if !keep {
+            if !keep && crate::work::branch_name(name).to_str().is_some() {
                 continue;
             }
             carded.insert(name.clone());
-            let mut item = new_item(ItemKey::Branch(name.clone()), Some(name.clone()));
+            let mut item = new_item(
+                ItemKey::Branch(name.clone()),
+                Some(
+                    crate::work::branch_name(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
             item.comparison = branch.comparison.clone();
             item.head = Some(head);
             item.pull_request = pull_request;
@@ -271,7 +296,14 @@ fn project_items(
                 continue;
             }
             carded.insert(name.clone());
-            let mut item = new_item(ItemKey::Branch(name.clone()), Some(name.clone()));
+            let mut item = new_item(
+                ItemKey::Branch(name.clone()),
+                Some(
+                    crate::work::branch_name(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            );
             item.pull_request = Some(convert(pull_request, false));
             item.linear = branch_ticket(name, context.tickets);
             item.last_activity = pull_request_activity(item.pull_request.as_ref());
@@ -294,6 +326,8 @@ fn pull_request_for(
     branch: &str,
     head: Option<&Head>,
 ) -> Option<PullRequest> {
+    let name = crate::work::branch_name(branch);
+    let branch = name.to_str()?;
     let oid = head.map(|head| head.oid.as_str());
     let pull_request = project.snapshot?.for_branch(branch, oid)?;
     let contains = oid.is_some_and(|oid| {
@@ -396,7 +430,8 @@ fn linked_ticket(issue_id: &str, tickets: &BTreeMap<String, Ticket>) -> LinearTi
 /// about GitHub issue 1403 could come back as `TEAM-1403`; only an answer
 /// under the same identifier confirms a guess.
 fn branch_ticket(branch: &str, tickets: &BTreeMap<String, Ticket>) -> Option<LinearTicket> {
-    let identifier = crate::work::ticket_from_branch(branch)?;
+    let branch = crate::work::branch_name(branch);
+    let identifier = crate::work::ticket_from_branch(&branch.to_string_lossy())?;
     let ticket = tickets
         .get(&identifier)
         .filter(|ticket| ticket.identifier.eq_ignore_ascii_case(&identifier))?;
@@ -842,5 +877,59 @@ mod tests {
         let converted = convert(&open, true);
         assert_eq!(converted.checks, Some(Checks::default()));
         assert_eq!(converted.review, Some(Review::ChangesRequested));
+    }
+    #[test]
+    fn invalid_byte_branches_keep_plain_cards_and_distinct_duplicate_checkouts() {
+        let mut fixture = fixture();
+        let identity = ":6c65676163792dff";
+        let mut branch = fixture.local.branches["draft"].clone();
+        branch.oid = "raw-oid".into();
+        fixture.local.branches.insert(identity.into(), branch);
+        let board = fixture.board();
+        let plain = board
+            .items
+            .iter()
+            .find(|item| item.key == ItemKey::Branch(identity.into()))
+            .unwrap();
+        assert_eq!(plain.branch.as_deref(), Some("legacy-\u{fffd}"));
+        assert_eq!(plain.label(), "legacy-\u{fffd}");
+        assert_eq!(plain.head.as_ref().unwrap().oid, "raw-oid");
+        assert!(plain.pull_request.is_none());
+        for path in ["/repo/legacy", "/repo/legacy-again"] {
+            fixture
+                .local
+                .worktrees
+                .push(worktree(path, Some(identity), false));
+        }
+        let board = fixture.board();
+        let raw = board
+            .items
+            .iter()
+            .filter(|item| item.branch.as_deref() == Some("legacy-\u{fffd}"))
+            .collect::<Vec<_>>();
+        assert_eq!(raw.len(), 2);
+        assert_ne!(raw[0].key, raw[1].key);
+        for card in raw {
+            let ItemKey::Branch(key) = &card.key else {
+                panic!("missing raw branch identity")
+            };
+            assert!(crate::work::branch_name(key).to_str().is_none());
+        }
+    }
+    #[test]
+    fn idle_primary_invalid_branch_keeps_its_checkout_facts() {
+        let mut fixture = fixture();
+        fixture.local.worktrees[0].branch = Some(":6c65676163792dff".into());
+        let board = fixture.board();
+        let raw = board
+            .items
+            .iter()
+            .find(|item| item.branch.as_deref() == Some("legacy-\u{fffd}"))
+            .unwrap();
+        assert!(raw.worktree.as_ref().unwrap().primary);
+        assert_eq!(raw.worktree.as_ref().unwrap().path, Path::new("/repo"));
+        assert!(raw.dirty.is_some());
+        assert!(raw.head.is_some());
+        assert!(raw.comparison.is_some());
     }
 }

@@ -1078,15 +1078,20 @@ impl State {
                 );
             }
             if let Some(branch) = &item.branch {
-                items.push(
-                    popover_item(
-                        Icon::Copy.handle(),
-                        "Copy branch name",
-                        branch.as_str(),
-                        Action::Copy(branch.clone()),
-                    )
-                    .into(),
-                );
+                let action = copy_branch_action(item);
+                let enabled = action.is_some();
+                let control = popover_item(
+                    Icon::Copy.handle(),
+                    "Copy branch name",
+                    branch.as_str(),
+                    Action::Copy(branch.clone()),
+                )
+                .on_press_maybe(action);
+                items.push(if enabled {
+                    control.into()
+                } else {
+                    crate::interaction::tooltip(control, "Invalid UTF-8")
+                });
             }
             items.push(design::horizontal_rule());
             for column in Column::ALL {
@@ -1135,6 +1140,16 @@ impl State {
             Action::Menu(None),
         )
     }
+}
+
+/// Clipboard text cannot preserve an invalid branch name's raw bytes.
+fn copy_branch_action(item: &Item) -> Option<Action> {
+    if let ItemKey::Branch(identity) = &item.key
+        && crate::work::branch_name(identity).to_str().is_none()
+    {
+        return None;
+    }
+    item.branch.clone().map(Action::Copy)
 }
 
 /// Whether `query`, already lowercase, appears in anything the card shows.
@@ -1566,6 +1581,45 @@ mod tests {
         state.update(Action::Pin(card.clone(), None));
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (shown.derived, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_branch_copy_is_disabled_without_affecting_the_literal_label() {
+        let mut invalid = item("legacy-\u{fffd}", "cagents");
+        invalid.key = ItemKey::Branch(":6c65676163792dff".into());
+        assert!(copy_branch_action(&invalid).is_none());
+
+        let literal = item("legacy-\u{fffd}", "cagents");
+        assert!(matches!(
+            copy_branch_action(&literal),
+            Some(Action::Copy(name)) if name == "legacy-\u{fffd}"
+        ));
+
+        invalid.key = ItemKey::Branch(":6c65676163792dff:second-checkout".into());
+        assert!(copy_branch_action(&invalid).is_none());
+
+        let worktree_path = PathBuf::from("/repos/cagents/.worktrees/legacy-raw");
+        invalid.worktree = Some(crate::work::Worktree {
+            path: worktree_path.clone(),
+            primary: false,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        let mut state = State::default();
+        watched(&mut state, 1, board(vec![invalid.clone(), literal]));
+        let effect = state.update(Action::Pin(CardRef::of(&invalid), Some(Column::Stale)));
+        assert!(matches!(
+            effect,
+            Some(Effect::Pin { item, column: Some(Column::Stale), .. })
+                if item == "branch::6c65676163792dff:second-checkout"
+        ));
+        let effect = state.update(Action::OpenWorktree(CardRef::of(&invalid)));
+        assert!(matches!(
+            effect,
+            Some(Effect::OpenWorktree { project, path })
+                if project == invalid.project && path == worktree_path
+        ));
     }
 
     #[test]

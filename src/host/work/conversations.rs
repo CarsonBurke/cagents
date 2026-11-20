@@ -1051,6 +1051,10 @@ fn resolve(
     let project = facts.project.as_ref();
     let repository = project.and_then(ProjectFacts::repository);
     let branch_in = |head: Option<&GitHubRepoKey>, name: &str| -> Resolved {
+        let name = crate::work::branch_name(name);
+        let Some(name) = name.to_str() else {
+            return Resolved::Nothing;
+        };
         let (Some(project), Some(base)) = (project, repository) else {
             return Resolved::Nothing;
         };
@@ -1354,7 +1358,11 @@ fn edited_worktrees(
         .into_iter()
         .map(|(worktree, edit)| ConversationWorktree {
             path: worktree.path.clone(),
-            branch: worktree.branch.clone(),
+            branch: worktree.branch.as_deref().map(|name| {
+                crate::work::branch_name(name)
+                    .to_string_lossy()
+                    .into_owned()
+            }),
             by_subagent: edit.by_subagent,
             changed_paths: worktree.dirty.as_ref().map(|dirty| dirty.paths),
             // Filled in from what was measured, which the scan does not hold.
