@@ -108,7 +108,9 @@ impl Cagents {
                 .clone()
                 .filter(|_| crate::interaction::is_space_press(event))
         });
-        let button = crate::interaction::tooltip(crate::interaction::hover(button), label);
+        // As tall as the pane, it shows its tooltip beside it, level with the
+        // pointer, rather than above it at the window's top edge.
+        let button = crate::interaction::tooltip_beside(crate::interaction::hover(button), label);
         widget::container(
             widget::row::with_children(vec![
                 design::vertical_rule(),
