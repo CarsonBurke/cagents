@@ -2895,8 +2895,14 @@ mod tests {
         // Normal worker shutdown waits for the holder's post-reap root report
         // before releasing the holder. Raw Held drop only promises a hangup.
         let root_identity = super::super::RootIdentity::capture(root.pid, None).unwrap();
-        super::super::shutdown_child_exit(&held.child, Some(&root_identity), &exited, false)
-            .expect("normal shutdown must confirm the exact root was reaped");
+        super::super::shutdown_child_exit(
+            &held.child,
+            &held.master,
+            Some(&root_identity),
+            &exited,
+            false,
+        )
+        .expect("normal shutdown must confirm the exact root was reaped");
         assert!(!held.child.unreaped());
         assert_eq!(
             reaper.free(),
