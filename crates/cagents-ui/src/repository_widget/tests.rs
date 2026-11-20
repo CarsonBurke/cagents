@@ -9340,6 +9340,33 @@ fn directory_listings_are_one_level_until_a_folder_is_opened() {
 }
 
 #[test]
+fn a_folder_that_is_a_symlink_lists_the_folder_it_names() {
+    // `~/.gemini` opened as a folder, where it links into a dotfiles checkout.
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = fixture.path().join("dotfiles/gemini");
+    std::fs::create_dir_all(physical.join("brain")).unwrap();
+    std::fs::write(physical.join("GEMINI.md"), "a").unwrap();
+    std::fs::write(physical.join("brain/notes.md"), "b").unwrap();
+    let linked = fixture.path().join(".gemini");
+    std::os::unix::fs::symlink(&physical, &linked).unwrap();
+    let names: Vec<_> = load_directory_files(&linked)
+        .unwrap()
+        .iter()
+        .map(|file| (file.path.to_string_lossy().into_owned(), file.directory))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("GEMINI.md".into(), false), ("brain".into(), true)]
+    );
+    let nested: Vec<_> = load_directory_listing(&linked, Path::new("brain"))
+        .unwrap()
+        .iter()
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(nested, vec!["brain/notes.md"]);
+}
+
+#[test]
 fn directory_search_is_on_demand_and_capped_to_visible_rows() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("nested/deeper")).unwrap();
