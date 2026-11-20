@@ -2593,6 +2593,7 @@ class StartupFault(unittest.TestCase):
         spec.loader.exec_module(fault)
         with tempfile.TemporaryDirectory(prefix="ru-fault-", dir="/var/tmp") as temporary:
             root = Path(temporary)
+            (root / ".cagents-fixture-root").touch()
             prefix = root / 'home/.local/share/cagents-install'
             candidate = prefix / 'versions/new'
             (candidate / 'bin').mkdir(parents=True)
@@ -2604,7 +2605,6 @@ class StartupFault(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 fault.fail_start(root, 'new')
             (root / '.rehearse-update').write_text(str(root))
-            (root / ".cagents-fixture-root").touch()
             with self.assertRaises(ValueError):
                 fault.fail_start(root, '../../outside')
             fault.fail_start(root, 'new')
