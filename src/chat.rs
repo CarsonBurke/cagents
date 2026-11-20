@@ -2580,7 +2580,9 @@ impl DeliveryKind {
 }
 
 /// The summary of the notice that marks where the person stopped a turn.
-pub const STOPPED: &str = "Stopped";
+/// It says who stopped it, so it neither repeats the stopped step's own
+/// "Stopped" just above it nor reads as the agent giving up.
+pub const STOPPED_NOTICE: &str = "You stopped this turn";
 
 /// The status detail of a conversation whose last turn was stopped before it
 /// finished, whichever provider ran it.
@@ -2597,7 +2599,7 @@ pub fn stopped_notice(id: String) -> Item {
             kind: DeliveryKind::Notice,
             from: String::new(),
             sender: String::new(),
-            summary: STOPPED.into(),
+            summary: STOPPED_NOTICE.into(),
             body: String::new(),
         },
         started_at: None,
@@ -2610,7 +2612,7 @@ pub fn is_stopped_notice(content: &ItemContent) -> bool {
     matches!(
         content,
         ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body }
-            if summary == STOPPED && body.is_empty() && from.is_empty() && sender.is_empty()
+            if summary == STOPPED_NOTICE && body.is_empty() && from.is_empty() && sender.is_empty()
     )
 }
 

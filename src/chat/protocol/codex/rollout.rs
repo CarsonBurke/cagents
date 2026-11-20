@@ -713,7 +713,7 @@ mod tests {
                 "Replayed request",
                 "tool replayed",
                 "tool replayed again",
-                crate::chat::STOPPED,
+                crate::chat::STOPPED_NOTICE,
                 "Run the old checks",
                 "tool older",
                 "Old checks pass.",
