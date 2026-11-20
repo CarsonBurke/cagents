@@ -605,7 +605,7 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
             state.register_client(2);
             state
                 .install_startup_parent(
-                    1,
+                    Some(1),
                     super::redraw_identity_tests::session(id),
                     stream.handle.clone(),
                     false,

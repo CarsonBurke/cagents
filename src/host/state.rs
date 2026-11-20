@@ -1626,7 +1626,7 @@ impl HostState {
         let id = session.id;
         let instance = handle.execution_instance();
         let descriptor = self.install_startup_parent(
-            client_id,
+            Some(client_id),
             session,
             handle,
             initially_visible,
@@ -1639,9 +1639,11 @@ impl HostState {
         Ok(descriptor)
     }
 
+    /// Installs a starting terminal's worker, attaching `subscriber` hidden
+    /// when the request came from a client that will present it.
     fn install_startup_parent(
         &mut self,
-        client_id: ClientId,
+        subscriber: Option<ClientId>,
         mut session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
@@ -1683,6 +1685,9 @@ impl HostState {
                 working_directory: None,
             },
         );
+        let Some(client_id) = subscriber else {
+            return self.descriptor_as(false, terminal_id);
+        };
         let visibility = if initially_visible {
             TerminalVisibility::Visible
         } else {
@@ -4696,6 +4701,11 @@ fn start_terminal_view_owned_reserved(
     }
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
+    // A native chat starts its terminal from the chat's own connection, which
+    // reads only that chat's frames and ends its presentation on anything
+    // else. The window attaches the terminal on a terminal connection once it
+    // has the handoff, so that requester never subscribes to it here.
+    let subscriber = execution_environment.is_none().then_some(client_id);
     let repair = {
         let state = shared.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -4706,14 +4716,7 @@ fn start_terminal_view_owned_reserved(
     };
     if let Some(handle) = repair {
         let descriptor =
-            publish_installed_terminal(shared, Some(client_id), session.id, &handle, &options)?;
-        if execution_environment.is_some() {
-            shared
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .subscriptions
-                .detach(client_id, session.id);
-        }
+            publish_installed_terminal(shared, subscriber, session.id, &handle, &options)?;
         return Ok((descriptor, handle));
     }
     let recovery = {
@@ -4800,7 +4803,6 @@ fn start_terminal_view_owned_reserved(
         )?;
     }
     let terminal_id = session.id;
-    let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
     // Adoption already inspected this holder's issued source. Keep that exact
     // receipt alias in the independently installed owner, including when the
@@ -4839,13 +4841,8 @@ fn start_terminal_view_owned_reserved(
             let handle = pending.handle.clone();
             drop(state);
             drop(registry);
-            let descriptor = publish_installed_terminal(
-                shared,
-                Some(client_id),
-                terminal_id,
-                &handle,
-                &options,
-            )?;
+            let descriptor =
+                publish_installed_terminal(shared, subscriber, terminal_id, &handle, &options)?;
             return Ok((descriptor, handle));
         }
         if let Some(reservation) = &reservation {
@@ -5056,7 +5053,7 @@ fn start_terminal_view_owned_reserved(
             // exact Handle before its thread may send CommitAdoption.
             state
                 .install_startup_parent(
-                    client_id,
+                    subscriber,
                     install_session,
                     handle.clone(),
                     false,
@@ -5143,7 +5140,7 @@ fn start_terminal_view_owned_reserved(
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
         if !adopting
             && let Err(error) = state.install_startup_parent(
-                client_id,
+                subscriber,
                 registered_session,
                 handle.clone(),
                 false,
@@ -5194,7 +5191,7 @@ fn start_terminal_view_owned_reserved(
 
     let descriptor = match publish_installed_terminal(
         shared,
-        Some(client_id),
+        subscriber,
         terminal_id,
         &handle,
         &options,
@@ -5207,13 +5204,6 @@ fn start_terminal_view_owned_reserved(
             return Err(error);
         }
     };
-    if native_handoff {
-        shared
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .subscriptions
-            .detach(client_id, terminal_id);
-    }
     Ok((descriptor, redraw_handle))
 }
 
