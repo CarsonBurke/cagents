@@ -336,6 +336,7 @@ mod tests {
                         path: format!("/work/tree-{id}/src/lib.rs"),
                         kind: ChangeKind::Updated,
                         diff: String::new(),
+                        lines: crate::chat::LineOrigin::File,
                     }],
                     status,
                 },

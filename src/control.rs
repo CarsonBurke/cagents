@@ -2659,10 +2659,13 @@ impl ControlClient {
 
         loop {
             let envelope = match deadline {
-                Some(deadline) => read_frame(&mut DeadlineReader {
-                    stream: &mut self.stream,
-                    deadline,
-                })
+                Some(deadline) => read_frame_from(
+                    self.protocol,
+                    &mut DeadlineReader {
+                        stream: &mut self.stream,
+                        deadline,
+                    },
+                )
                 .map_err(|error| reply_error(error, Some(reply_timeout)))?
                 .ok_or(ControlError::ConnectionClosed)?,
                 None => self.read_envelope()?,
@@ -2785,7 +2788,7 @@ impl ControlClient {
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {
         let timeout = self.stream.read_timeout().ok().flatten();
-        read_frame(&mut self.stream)
+        read_frame_from(self.protocol, &mut self.stream)
             .map_err(|error| reply_error(error, timeout))?
             .ok_or(ControlError::ConnectionClosed)
     }
@@ -2819,6 +2822,15 @@ impl ControlClient {
             .set_read_timeout(Some(IO_TIMEOUT))
             .map_err(ControlError::Configure)
     }
+}
+
+/// Reads a daemon's message as a daemon of `protocol` encoded it, which is
+/// older than this one when it is an update source.
+fn read_frame_from<T: serde::de::DeserializeOwned>(
+    protocol: u16,
+    reader: &mut impl std::io::Read,
+) -> Result<Option<T>, crate::terminal_ipc::FrameError> {
+    crate::terminal_ipc::decoding_from(protocol, || read_frame(reader))
 }
 
 /// Bound the complete response, including unsolicited notifications and every
@@ -2900,10 +2912,13 @@ impl HandshakeClient {
             &request,
         )?;
         let timeout = deadline.saturating_duration_since(Instant::now());
-        let envelope: ServerEnvelope = read_frame(&mut DeadlineReader {
-            stream: &mut self.stream,
-            deadline,
-        })
+        let envelope: ServerEnvelope = read_frame_from(
+            self.protocol,
+            &mut DeadlineReader {
+                stream: &mut self.stream,
+                deadline,
+            },
+        )
         .map_err(|error| reply_error(error, Some(timeout)))?
         .ok_or(ControlError::ConnectionClosed)?;
         validate_handshake(&envelope, self.protocol, request_id)
@@ -6130,6 +6145,30 @@ fn emit_error(json_output: bool, error: &AppError) {
 #[cfg(test)]
 mod tests {
     use super::ControlError;
+
+    /// A client reads an update source's frames as that source wrote them,
+    /// and leaves its decode scope however the read ends.
+    #[test]
+    fn a_source_frame_is_read_in_its_protocol_and_the_scope_always_ends() {
+        use crate::chat::{ChangeKind, FileChange, LineOrigin};
+        use crate::terminal_ipc::{PATCH_LINE_ORIGIN, decoding_before, write_frame};
+        let older = PATCH_LINE_ORIGIN - 1;
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &("a.rs", ChangeKind::Updated, "+b\n")).unwrap();
+        let read = super::read_frame_from::<FileChange>(older, &mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.lines, LineOrigin::Excerpt);
+        assert!(!decoding_before(PATCH_LINE_ORIGIN));
+        // A frame cut short fails partway through decoding it.
+        let cut = &frame[..frame.len() - 1];
+        assert!(super::read_frame_from::<FileChange>(older, &mut &cut[..]).is_err());
+        assert!(!decoding_before(PATCH_LINE_ORIGIN));
+        let mut garbage = Vec::new();
+        write_frame(&mut garbage, &[0xffu8; 3]).unwrap();
+        assert!(super::read_frame_from::<FileChange>(older, &mut garbage.as_slice()).is_err());
+        assert!(!decoding_before(PATCH_LINE_ORIGIN));
+    }
 
     #[test]
     fn a_reply_timeout_reads_as_the_budget_it_was_given() {

@@ -1216,6 +1216,7 @@ mod tests {
             .collect::<String>();
         let item = ItemContent::Changes {
             changes: vec![chat::FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path: "src/example.rs".into(),
                 kind: chat::ChangeKind::Updated,
                 diff: diff.clone(),

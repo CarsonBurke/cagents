@@ -6189,6 +6189,7 @@ fn file_changes_cache_queries_remain_available_after_provider_exit() {
                     at: None,
                     content: ItemContent::Changes {
                         changes: vec![super::super::FileChange {
+                            lines: crate::chat::LineOrigin::File,
                             path: "a.rs".into(),
                             kind: super::super::ChangeKind::Updated,
                             diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
