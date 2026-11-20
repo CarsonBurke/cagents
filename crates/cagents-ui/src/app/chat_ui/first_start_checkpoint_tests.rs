@@ -1361,7 +1361,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             assert!(app.durable.local_only_cards.contains(&card));
             assert!(
                 runtime(&app, card)
-                    .error
+                    .composer_note
                     .as_deref()
                     .unwrap()
                     .contains("could not be shared")

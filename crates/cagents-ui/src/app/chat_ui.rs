@@ -15651,6 +15651,9 @@ impl Cagents {
                 // folder for any - is written into the draft as its path
                 // instead, with web addresses and dropped text, as they are.
                 let mut staged = None;
+                // Said once the drop's own text is in, which as an edit would
+                // otherwise put it away.
+                let mut note = None;
                 let dropped = match payload.decode() {
                     file_drop::Dropped::Items(items) if runtime.accepts_draft_attachments() => {
                         let rules =
@@ -15677,12 +15680,16 @@ impl Cagents {
                         }
                         if !files.is_empty() {
                             if runtime.pastes_pending >= 2 {
-                                runtime.composer_note = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                note = Some(
+                                    "Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.",
+                                );
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
                             } else if let Some((id, lease)) = attachment_draft::admit() {
                                 staged = Some((id, files, lease));
                             } else {
-                                runtime.composer_note = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                note = Some(
+                                    "Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.",
+                                );
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
                             }
                         }
@@ -15705,6 +15712,11 @@ impl Cagents {
                         ))),
                     ))
                 };
+                if let Some(note) = note
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    runtime.composer_note = Some(note.into());
+                }
                 return Task::batch([
                     edited,
                     staged.map_or_else(Task::none, |(id, files, lease)| {
