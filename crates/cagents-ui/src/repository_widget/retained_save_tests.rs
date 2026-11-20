@@ -1049,3 +1049,63 @@ async fn resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline
     assert!(!runtime.is_dirty());
     assert!(runtime.save_error().is_none());
 }
+
+/// A file link to a note an agent wrote under `~/.gemini`, which is the
+/// user's own symlink into a dotfiles checkout. It opens and saves like any
+/// other file, writing the physical file and leaving the link in place.
+#[tokio::test]
+async fn file_link_under_a_symlinked_directory_opens_and_saves_through_the_link() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::file_link_under_a_symlinked_directory_opens_and_saves_through_the_link",
+    ) {
+        return;
+    }
+    // Take production directory leases, as a running window does.
+    crate::worktree_cleanup::prepare_standalone_editor_protection();
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = fixture.path().join("dotfiles/gemini/brain");
+    std::fs::create_dir_all(&physical).unwrap();
+    std::fs::write(physical.join("notes.md"), "# Concepts\n").unwrap();
+    let home = fixture.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::os::unix::fs::symlink(fixture.path().join("dotfiles/gemini"), home.join(".gemini"))
+        .unwrap();
+    let linked = home.join(".gemini/brain");
+    let card = CardId::new();
+    // The view a transcript file link opens: the file's directory as named.
+    let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+        project: ProjectId::new(),
+        repository: linked.clone(),
+        worktree: linked.clone(),
+        selected_file: Some("notes.md".into()),
+    });
+    runtime.set_auto_save(false);
+    let task = runtime.initial_load(card);
+    finish(&mut runtime, task).await;
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("# Concepts\n"),
+        "{}",
+        load_state(&runtime)
+    );
+    assert!(runtime.original_read_attested);
+    let custody = crate::operation_recovery::Shared::default();
+    assert!(runtime.configure_save_recovery(custody.clone(), vec![linked.clone()]));
+    insert(&mut runtime, card, '!');
+    let submitted = runtime.editor_text().unwrap();
+    let save = runtime.request_save(card, false);
+    finish(&mut runtime, save).await;
+    assert!(runtime.save_error().is_none(), "{:?}", runtime.save_error());
+    assert!(!runtime.is_dirty());
+    assert_eq!(
+        std::fs::read_to_string(physical.join("notes.md")).unwrap(),
+        submitted
+    );
+    assert!(
+        std::fs::symlink_metadata(home.join(".gemini"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!custody.lock().unwrap().is_pending());
+}

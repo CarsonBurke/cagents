@@ -2527,7 +2527,7 @@ impl RepositoryRuntime {
         if self
             .worktree_protection
             .as_ref()
-            .is_some_and(|guard| guard.directory() == directory)
+            .is_some_and(|guard| guard.requested() == directory)
         {
             return Ok(());
         }
