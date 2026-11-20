@@ -304,7 +304,10 @@ fn oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery
         .expect_err("exhausted attachment must fail recovery");
     assert!(reason.starts_with("recovery-incomplete: "));
     assert!(reason.contains("exact terminal refused"));
-    assert!(reason.contains("Open it to see why and retry"), "{reason}");
+    assert!(
+        reason.contains("Open it to see why and what to do next"),
+        "{reason}"
+    );
     assert!(
         reason.contains(&format!("\u{201c}{}\u{201d}", card.title)),
         "named as its tab is: {reason}"

@@ -1065,7 +1065,7 @@ fn notices_name_failed_panes_by_title_and_say_what_to_do() {
     let reason = reported(&app).expect("a failed pane answers the launcher");
     assert_readable(reason);
     assert!(
-        reason.starts_with("1 saved pane could not reconnect: \u{201c}Terminal\u{201d}. Open it to see why and retry"),
+        reason.starts_with("1 saved pane could not reconnect: \u{201c}Terminal\u{201d}. Open it to see why and what to do next"),
         "{reason}"
     );
     assert!(!reason.contains(&cards[0].to_string()), "{reason}");
@@ -1371,7 +1371,7 @@ fn a_report_tells_held_panes_from_failed_ones() {
     let report = app.startup_incomplete(&cards, &[], &[], None);
     assert!(
         report.contains(
-            "1 saved pane could not reconnect: \u{201c}Failed\u{201d}. Open it to see why and retry."
+            "1 saved pane could not reconnect: \u{201c}Failed\u{201d}. Open it to see why and what to do next."
         ),
         "{report}"
     );
@@ -1384,6 +1384,24 @@ fn a_report_tells_held_panes_from_failed_ones() {
 
     let held = app.startup_incomplete(&cards[1..], &[], &[], None);
     assert!(!held.contains("retry"), "{held}");
+}
+
+#[test]
+fn failed_panes_are_told_what_to_do_next_without_a_promised_retry() {
+    let (mut app, cards) = waiting(2);
+    card_with_title(&mut app, cards[0], "A");
+    card_with_title(&mut app, cards[1], "B");
+    app.cards.insert(cards[0], CardRuntime::Completed);
+    app.cards.insert(cards[1], CardRuntime::Completed);
+
+    let report = app.startup_incomplete(&cards, &[], &[], None);
+    assert!(
+        report.contains(
+            "2 saved panes could not reconnect: \u{201c}A\u{201d}, \u{201c}B\u{201d}. Open them to see why and what to do next."
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("retry"), "{report}");
 }
 
 /// A report that runs out of time still says what a held pane waits for, and
@@ -1471,7 +1489,10 @@ fn a_budget_report_also_names_panes_that_failed() {
     let report = app.reconnecting_reason(&pending);
     assert!(report.contains("\u{201c}Waiting\u{201d}"), "{report}");
     assert!(report.contains("\u{201c}Failed\u{201d}"), "{report}");
-    assert!(report.contains("Open it to see why and retry"), "{report}");
+    assert!(
+        report.contains("Open it to see why and what to do next"),
+        "{report}"
+    );
 }
 
 /// A daemon restoring for most of the launcher's own allowance is not failed
@@ -1533,30 +1554,30 @@ fn a_stopped_update_leads_with_its_steps_whichever_build_wrote_it() {
 
 #[test]
 fn a_pane_named_with_the_details_label_keeps_its_whole_name_in_the_message() {
-    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry. Details: refused.";
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and what to do next. Details: refused.";
     let notice = incomplete_notice(report);
     assert_eq!(
         notice.message,
-        "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry."
+        "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and what to do next."
     );
     assert_eq!(notice.details.as_deref(), Some("refused"));
 }
 
 #[test]
 fn an_update_failure_keeps_a_quoted_name_holding_the_details_label() {
-    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry. Details: refused.";
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and what to do next. Details: refused.";
     let failure = update_failure(&format!("primary: {report}; window-2: {report}"));
     assert_eq!(
         failure.notice.message,
-        "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry."
+        "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and what to do next."
     );
     assert_eq!(failure.notice.details.as_deref(), Some("refused"));
 }
 
 #[test]
 fn a_name_without_details_keeps_no_details() {
-    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry.";
-    let message = "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and retry.";
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and what to do next.";
+    let message = "1 saved pane could not reconnect: \u{201c}a Details: b\u{201d}. Open it to see why and what to do next.";
     let notice = incomplete_notice(report);
     assert_eq!(notice.message, message);
     assert_eq!(notice.details, None);
@@ -1578,12 +1599,12 @@ fn pane_titles_cannot_close_their_own_quotes() {
 
 #[test]
 fn a_failed_update_reads_without_window_slots_or_the_handshake_prefix() {
-    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry. Details: refused; try later.";
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and what to do next. Details: refused; try later.";
     let failure = update_failure(&format!("primary: {report}; window-2: {report}"));
     assert!(!failure.retained);
     assert_eq!(
         failure.notice.message,
-        "1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry."
+        "1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and what to do next."
     );
     assert_eq!(
         failure.notice.details.as_deref(),
