@@ -517,6 +517,33 @@ impl Cagents {
                                     .collect::<Vec<_>>(),
                                 &archived,
                             );
+                        } else {
+                            // Local Git still revokes an archived proof when
+                            // GitHub is unavailable. Leave unrelated cached
+                            // recent PR presentation alone.
+                            let old_archived = previous
+                                .archived
+                                .associations
+                                .iter()
+                                .map(|association| association.pull_request.number)
+                                .collect::<HashSet<_>>();
+                            let attached = row
+                                .worktrees
+                                .iter()
+                                .filter(|worktree| {
+                                    worktree
+                                        .pull_request()
+                                        .is_some_and(|pr| old_archived.contains(&pr.number))
+                                })
+                                .map(|worktree| worktree.id)
+                                .collect::<HashSet<_>>();
+                            let worktrees = snapshot
+                                .worktrees
+                                .iter()
+                                .filter(|(record, _)| attached.contains(&record.id))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            apply_attached_worktree_prs(row, &worktrees, &[], &archived);
                         }
                         if let Some(session) = &self.session {
                             let records = catalog_changes(
@@ -2417,6 +2444,79 @@ mod tests {
                 .title,
             "Updated remote title"
         );
+    }
+
+    #[test]
+    fn failed_remote_refresh_keeps_valid_archive_but_local_reset_revokes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, key, archived) = archived_fixture(directory.path());
+        let (mut app, project) = catalog_app(&snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
+        let mut recent = archived.pull_request;
+        recent.number = 8;
+        recent.head_ref_name = "another-feature".into();
+        app.sidebar_model.projects[0].replace_pull_requests(vec![SidebarPullRequest::from_github(
+            project.id,
+            &recent,
+            &[],
+        )]);
+        drop(app.update_git(Action::Remote {
+            project: project.id,
+            generation: 1,
+            result: Err("fixture remote unavailable".into()),
+        }));
+        fs::write(directory.path().join("tracked.txt"), "ordinary edit\n").unwrap();
+        let change = git_watch::Change {
+            worktrees: [snapshot.worktrees[0].0.id].into_iter().collect(),
+            ..Default::default()
+        };
+        let read = read_local(
+            project.id,
+            app.refresh_ui.git.entries[&project.id].snapshot.clone(),
+            change.clone(),
+            CancellationToken::default(),
+        )
+        .unwrap();
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok(read),
+        }));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .pull_request()
+                .map(|pr| pr.number),
+            Some(7)
+        );
+
+        git(directory.path(), &["reset", "--hard", "main"]);
+        let read = read_local(
+            project.id,
+            app.refresh_ui.git.entries[&project.id].snapshot.clone(),
+            change,
+            CancellationToken::default(),
+        )
+        .unwrap();
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok(read),
+        }));
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .pull_request()
+                .is_none()
+        );
+        assert_eq!(
+            app.sidebar_model.projects[0]
+                .display_pull_requests()
+                .iter()
+                .map(|pr| pr.number)
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+        assert!(!app.sidebar_model.projects[0].github_ready);
     }
 
     fn catalog_plan(project: ProjectId, snapshot: &Snapshot) -> git_watch::Project {
