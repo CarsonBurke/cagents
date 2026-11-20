@@ -29,6 +29,16 @@ impl CloseSafetyShell {
         arguments: &[&str],
         proof: Option<&crate::model::HostSessionProof>,
     ) -> Self {
+        Self::spawn_with_reservation(program, arguments, proof, None, None)
+    }
+
+    fn spawn_with_reservation(
+        program: &Path,
+        arguments: &[&str],
+        proof: Option<&crate::model::HostSessionProof>,
+        reservation: Option<crate::daemon::child_reaper::Reservation>,
+        runtime: Option<&Path>,
+    ) -> Self {
         let home = tempdir().unwrap();
         let config_home = home.path().join(".config");
         let cache_home = home.path().join(".cache");
@@ -47,7 +57,7 @@ impl CloseSafetyShell {
             "function fish_prompt\nprintf 'CLOSE_READY> '\nend\n",
         )
         .unwrap();
-        let launch = LaunchRecipe {
+        let mut launch = LaunchRecipe {
             unset_environment: Default::default(),
             program: program.to_string_lossy().into_owned(),
             arguments: arguments
@@ -75,6 +85,12 @@ impl CloseSafetyShell {
                 ),
             ]),
         };
+        if let Some(runtime) = runtime {
+            launch.environment.insert(
+                "XDG_RUNTIME_DIR".into(),
+                runtime.to_string_lossy().into_owned(),
+            );
+        }
         let (wake, wakes) = crossbeam_channel::unbounded();
         let mut session = TerminalSession {
             owned_codex_listener: None,
@@ -105,9 +121,23 @@ impl CloseSafetyShell {
                 execution_recipe: None,
             });
         }
-        let terminal = TerminalHandle::spawn(session, config, move |_| {
-            let _ = wake.send(());
-        })
+        let terminal = TerminalHandle::spawn_with_execution_installed(
+            session,
+            config,
+            None,
+            move |_| {
+                let _ = wake.send(());
+            },
+            move |handle| {
+                *handle
+                    .inner
+                    .published
+                    .test_holder_reservation
+                    .lock()
+                    .unwrap() = reservation;
+                Ok(())
+            },
+        )
         .unwrap();
         Self {
             terminal,
@@ -323,6 +353,82 @@ fn a_background_child_requires_confirmation_and_confirmed_close_terminates_it() 
 }
 
 #[test]
+fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    let child = shutdown_job(
+        &shell,
+        b"trap ':' HUP; bash -c 'trap \"printf hup > stopped-hup; exit 0\" HUP; echo $$ > child.pid; while :; do sleep 0.05; done' &\n",
+        "bash",
+    );
+    shell
+        .terminal
+        .input(b"kill -STOP $(cat child.pid)\n")
+        .unwrap();
+    let pid = fs::read_to_string(shell.home.path().join("child.pid")).unwrap();
+    shell.wait_for("the already-stopped background job", || {
+        fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('T'))
+        })
+    });
+    let outcome = shell.terminal.shutdown();
+    assert!(
+        shell.home.path().join("stopped-hup").exists(),
+        "an already-stopped job must run its HUP handler before shutdown completes: {outcome:?}"
+    );
+    assert!(outcome.is_ok(), "shutdown: {outcome:?}");
+    assert_eq!(
+        fs::read(shell.home.path().join("stopped-hup")).unwrap(),
+        b"hup"
+    );
+    assert!(holder::exits_within(&child.0, Duration::ZERO).unwrap());
+}
+
+#[test]
+fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    shell.terminal.input(b"trap 'sleep 0.1; printf hup > delayed-capture-hup' HUP; printf '%s' \"$$\" > root.pid; printf 'READY_%s\\n' DELAY; read reply\n").unwrap();
+    shell.wait_for_text("READY_DELAY");
+    let root = pin_shutdown_process(
+        fs::read_to_string(shell.home.path().join("root.pid"))
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let (finished, capture_finished) = crossbeam_channel::bounded(1);
+    *shell
+        .terminal
+        .inner
+        .published
+        .shutdown_census_delay
+        .lock()
+        .unwrap() = Some(finished);
+    let terminal = shell.terminal.clone();
+    let shutdown = std::thread::spawn(move || terminal.shutdown());
+    let captured_at = capture_finished.recv_timeout(WORKER_JOIN_TIMEOUT).unwrap();
+    let killed_before_grace = holder::exits_within(
+        &root.0,
+        CHILD_HANGUP_GRACE.saturating_sub(captured_at.elapsed()),
+    )
+    .unwrap();
+    let outcome = shutdown.join().unwrap();
+    assert!(
+        shell.home.path().join("delayed-capture-hup").exists(),
+        "capture must leave time for the shell's HUP handler: {outcome:?}"
+    );
+    assert!(
+        !killed_before_grace,
+        "capture must not consume the shell's existing HUP grace"
+    );
+    assert!(outcome.is_ok(), "shutdown: {outcome:?}");
+    assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
+    assert_eq!(
+        fs::read(shell.home.path().join("delayed-capture-hup")).unwrap(),
+        b"hup"
+    );
+}
+
+#[test]
 fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     let child = shutdown_job(
@@ -363,17 +469,27 @@ fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits()
 
 #[test]
 fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit() {
-    if super::tests::isolated_retirement_worker_case() {
-        return;
-    }
     let proof = crate::model::HostSessionProof {
         host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
         boot_id: crate::daemon::read_boot_id().unwrap(),
         host_incarnation: crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
     };
-    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let runtime = tempfile::Builder::new().prefix("tr-").tempdir().unwrap();
+    let directory = runtime.path().join(crate::instance::runtime_subdirectory());
+    let paths = crate::daemon::RuntimePaths {
+        socket: directory.join(crate::terminal::ipc::SOCKET_FILE_NAME),
+        lock: directory.join("cagentsd.lock"),
+        directory,
+    };
     let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
-    let shell = CloseSafetyShell::spawn_with_proof(Path::new("/bin/bash"), &[], Some(&proof));
+    let reaper = crate::daemon::child_reaper::TestService::new(2);
+    let shell = CloseSafetyShell::spawn_with_reservation(
+        Path::new("/bin/bash"),
+        &[],
+        Some(&proof),
+        Some(reaper.reserve().unwrap()),
+        Some(runtime.path()),
+    );
     shell.wait_for_text("CLOSE_READY>");
     let owner = shell.terminal.holder_identity().unwrap().clone();
     assert!(owner.holder.is_current());
@@ -393,8 +509,8 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
         })
     });
     assert!(!holder::exits_within(&child.0, Duration::ZERO).unwrap());
-    let unpublished = crate::daemon::child_reaper::reserve().unwrap();
-    let drain = crate::daemon::child_reaper::begin_exit_drain();
+    let unpublished = reaper.reserve().unwrap();
+    let drain = reaper.begin_exit_drain();
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_err());
     assert!(started.elapsed() < WORKER_JOIN_TIMEOUT);

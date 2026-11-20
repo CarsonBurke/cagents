@@ -278,13 +278,15 @@ pub(super) fn spawn_recoverable(
     spawn_reserved(command, size, exits, recovery, reservation)
 }
 
-fn spawn_reserved(
+pub(super) fn spawn_reserved(
     command: CommandBuilder,
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
     reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
+    #[cfg(test)]
+    let fixture_runtime = command.get_env("XDG_RUNTIME_DIR").map(PathBuf::from);
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -293,6 +295,10 @@ fn spawn_reserved(
         UnixStream::pair().map_err(|error| format!("create terminal holder socket: {error}"))?;
     let remote_fd = remote.as_raw_fd();
     let mut process = Command::new("/proc/self/exe");
+    #[cfg(test)]
+    if let Some(runtime) = &fixture_runtime {
+        process.env("XDG_RUNTIME_DIR", runtime);
+    }
     process
         .arg0(PROCESS_NAME.to_str().expect("the holder name is ASCII"))
         .arg(ARGUMENT)
@@ -376,7 +382,16 @@ fn spawn_reserved(
     crate::daemon::process_scope::warn_if_shared(owner.pid as u32, pid as u32);
     holder.protocol = PROTOCOL;
     if let Some(id) = registered_id {
-        let record = registry::evidence(&registry::socket(&registry::directory()?, id))?
+        #[cfg(test)]
+        let directory = match fixture_runtime {
+            Some(runtime) => runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join("holders"),
+            None => registry::directory()?,
+        };
+        #[cfg(not(test))]
+        let directory = registry::directory()?;
+        let record = registry::evidence(&registry::socket(&directory, id))?
             .ok_or("New terminal holder has no discovery evidence")?;
         if record.holder != owner || record.root.pid != pid {
             return Err("New terminal holder evidence does not match its exact child".into());

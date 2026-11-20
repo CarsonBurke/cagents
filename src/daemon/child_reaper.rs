@@ -383,27 +383,64 @@ struct State {
 }
 impl State {
     fn can_seal_exit(&self) -> bool {
-        let absent =
-            self.free.len() == self.entries.len() && self.entries.iter().all(Option::is_none);
+        ExitReadiness {
+            capacity: self.entries.len(),
+            free: self.free.len(),
+            failure: self.failure.is_some(),
+            fatal: self.fatal,
+            worker_alive: self.worker_alive,
+            stopping: self.stopping,
+            admission_closed: self.admission_closed,
+            quarantined: self.quarantined.iter().any(Option::is_some),
+        }
+        .can_seal_exit(self.entries.iter().flatten().map(|entry| ExitCustody {
+            recoverable: entry.recoverable,
+            suspended: entry.suspended,
+            has_pidfd: entry.pidfd.is_some(),
+        }))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExitCustody {
+    recoverable: bool,
+    suspended: bool,
+    has_pidfd: bool,
+}
+
+struct ExitReadiness {
+    capacity: usize,
+    free: usize,
+    failure: bool,
+    fatal: bool,
+    worker_alive: bool,
+    stopping: bool,
+    admission_closed: bool,
+    quarantined: bool,
+}
+
+impl ExitReadiness {
+    fn can_seal_exit(self, entries: impl Iterator<Item = ExitCustody>) -> bool {
+        let (retained, all_recoverable) = entries.fold((0, true), |(count, all), entry| {
+            (
+                count + 1,
+                all && entry.recoverable && !entry.suspended && entry.has_pidfd,
+            )
+        });
+        let absent = self.free == self.capacity && retained == 0;
         // A registered terminal holder whose cleanup could not be confirmed
         // remains the recoverable owner after daemon exit. Keep its original
         // Child and pidfd here until then, but do not wait indefinitely for a
         // successor to release it. Every outstanding credit must already have
         // transferred into this explicit category; unpublished, suspended or
         // otherwise faulted ownership cannot authorize exit.
-        let recoverable = self.failure.is_none()
+        let recoverable = !self.failure
             && !self.fatal
             && self.worker_alive
             && !self.stopping
-            && self.free.len() + self.entries.iter().flatten().count() == self.entries.len()
-            && self
-                .entries
-                .iter()
-                .flatten()
-                .all(|entry| entry.recoverable && !entry.suspended && entry.pidfd.is_some());
-        self.admission_closed
-            && (absent || recoverable)
-            && self.quarantined.iter().all(Option::is_none)
+            && self.free + retained == self.capacity
+            && all_recoverable;
+        self.admission_closed && (absent || recoverable) && !self.quarantined
     }
 }
 struct Service {
@@ -828,6 +865,12 @@ mod tests {
         pub(crate) fn reserve(&self) -> io::Result<Reservation> {
             self.service.reserve()
         }
+        pub(crate) fn begin_exit_drain(&self) -> ExitDrain {
+            self.service.close_admission();
+            ExitDrain {
+                service: Some(self.service.clone()),
+            }
+        }
         pub(crate) fn fail_wake(&self, fail: bool) {
             self.service.fail_wake.store(fail, Ordering::Release);
         }
@@ -1050,6 +1093,78 @@ mod tests {
                 let _ = child.wait();
             }
         }
+    }
+
+    fn recoverable_exit_readiness(capacity: usize) -> ExitReadiness {
+        ExitReadiness {
+            capacity,
+            free: 0,
+            failure: false,
+            fatal: false,
+            worker_alive: true,
+            stopping: false,
+            admission_closed: true,
+            quarantined: false,
+        }
+    }
+
+    const RECOVERABLE_CUSTODY: ExitCustody = ExitCustody {
+        recoverable: true,
+        suspended: false,
+        has_pidfd: true,
+    };
+
+    #[test]
+    fn exit_drain_recoverable_custody_still_blocks_with_failed_ownership() {
+        assert!(recoverable_exit_readiness(2).can_seal_exit([RECOVERABLE_CUSTODY; 2].into_iter()));
+        let failed = ExitCustody {
+            recoverable: false,
+            ..RECOVERABLE_CUSTODY
+        };
+        assert!(
+            !recoverable_exit_readiness(2).can_seal_exit([RECOVERABLE_CUSTODY, failed].into_iter())
+        );
+        for fault in 0..4 {
+            let mut state = recoverable_exit_readiness(2);
+            match fault {
+                0 => state.failure = true,
+                1 => state.fatal = true,
+                2 => state.worker_alive = false,
+                3 => state.stopping = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                !state.can_seal_exit([RECOVERABLE_CUSTODY; 2].into_iter()),
+                "recoverable custody must not hide worker fault {fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_drain_recoverable_custody_still_blocks_with_suspended_ownership() {
+        let suspended = ExitCustody {
+            suspended: true,
+            ..RECOVERABLE_CUSTODY
+        };
+        assert!(
+            !recoverable_exit_readiness(2)
+                .can_seal_exit([RECOVERABLE_CUSTODY, suspended].into_iter())
+        );
+        let unvalidated = ExitCustody {
+            has_pidfd: false,
+            ..RECOVERABLE_CUSTODY
+        };
+        assert!(
+            !recoverable_exit_readiness(2)
+                .can_seal_exit([RECOVERABLE_CUSTODY, unvalidated].into_iter())
+        );
+    }
+
+    #[test]
+    fn exit_drain_recoverable_custody_still_blocks_with_quarantined_ownership() {
+        let mut state = recoverable_exit_readiness(2);
+        state.quarantined = true;
+        assert!(!state.can_seal_exit([RECOVERABLE_CUSTODY; 2].into_iter()));
     }
 
     #[test]
