@@ -1325,6 +1325,7 @@ impl State {
                     if self.refreshing || self.load == LoadState::Loading {
                         self.viewed_after_load.insert(path.clone());
                     }
+                    self.pages.revalidate.remove(&path);
                     let file = &mut self.files[index];
                     match outcome {
                         ViewedOutcome::Applied => {
@@ -1848,9 +1849,12 @@ impl State {
                 ..Default::default()
             };
         } else {
-            // The cursor and completed pages still describe this exact revision.
-            // A refresh must not restart pagination merely to recover old marks.
+            // Preserve displayed marks and pagination until another page is
+            // demanded, then reread from this refresh's first later cursor.
             self.pages.loading = false;
+            self.pages.restart = loaded.next_file_cursor.clone();
+            self.pages.revalidate.clear();
+            self.pages.error = None;
         }
         self.files = join_files(&loaded.entries, &loaded.files);
         if loaded.next_file_cursor.is_some() {
@@ -1884,6 +1888,12 @@ impl State {
                     // pagination, including pages completed before the write.
                     verify_later_marks = true;
                 } else {
+                    if file.sync == ViewedSync::Unknown
+                        && *sync == ViewedSync::Settled
+                        && !self.viewed_after_load.contains(&file.entry.path)
+                    {
+                        self.pages.revalidate.insert(file.entry.path.clone());
+                    }
                     file.sync = *sync;
                 }
             }
@@ -2094,6 +2104,7 @@ impl State {
             }
             file.viewed = viewed;
             file.sync = ViewedSync::Pending;
+            self.pages.revalidate.remove(&file.entry.path);
             paths.push(file.entry.path.clone());
         }
         if paths.is_empty() {
