@@ -2806,8 +2806,12 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
             Ok(Step {
                 events: vec![
                     Event::Ready(true),
+                    // A full window, so only the reader asks for the earlier
+                    // page.
                     Event::History {
-                        items: vec![text("current", "current")],
+                        items: (0..super::store::WINDOW_ITEMS)
+                            .map(|index| text(&format!("current-{index}"), "current"))
+                            .collect(),
                         has_earlier: true,
                     },
                 ],
@@ -2893,6 +2897,95 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
         assert!(handle.snapshot(None).unwrap().error.is_none());
         handle.close().unwrap();
     }
+}
+/// A provider hands saved history over in pages of its own records, which
+/// can amount to a few rows: a Claude page is 100 records, and in a working
+/// session most are tool calls and bookkeeping the transcript does not show.
+/// The window fills itself from those pages until its budget is met, once it
+/// has been read and without the reader asking, then asks for nothing more.
+#[test]
+fn a_window_fills_itself_from_short_provider_pages_once_it_is_read() {
+    const PAGE: usize = 10;
+    const TOTAL: usize = 300;
+    struct Pages {
+        next: usize,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Pages {
+        fn page(&mut self) -> Event {
+            let end = self.next;
+            self.next -= PAGE;
+            Event::History {
+                items: (self.next..end)
+                    .map(|index| text(&format!("row-{index:03}"), "row"))
+                    .collect(),
+                has_earlier: self.next > 0,
+            }
+        }
+    }
+    impl Adapter for Pages {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![Event::Ready(true), self.page()],
+                ..Step::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            if command != Command::LoadEarlier {
+                return Err("unexpected fixture command".into());
+            }
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(Step {
+                events: vec![self.page()],
+                ..Step::default()
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut adapter: Box<dyn Adapter> = Box::new(Pages {
+        next: TOTAL,
+        asked: Arc::clone(&asked),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let window = until(&handle, |snapshot| {
+        snapshot.items.len() == super::store::WINDOW_ITEMS
+    });
+    let ids: Vec<&str> = window.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids.first(), Some(&"row-172"));
+    assert_eq!(ids.last(), Some(&"row-299"));
+    assert!(window.has_earlier);
+    assert!(!window.has_later);
+    // Until the cache holds more than the window can show, and no more.
+    let pages = (super::store::WINDOW_ITEMS + 1).div_ceil(PAGE) - 1;
+    assert_eq!(asked.load(Ordering::SeqCst), pages);
+    // Paging back slides the window by half to end at row-236, past the
+    // start of what is cached, so it fills itself again: until rows 100 to
+    // 236 are cached, and it shows the newest 128 of them.
+    handle.command(Command::LoadEarlier).unwrap();
+    let window = until(&handle, |snapshot| {
+        snapshot.items.len() == super::store::WINDOW_ITEMS
+            && snapshot.items.last().unwrap().id == "row-236"
+    });
+    assert_eq!(window.items[0].id, "row-109");
+    assert!(window.has_later);
+    assert_eq!(asked.load(Ordering::SeqCst), pages + 7);
+    handle.close().unwrap();
 }
 impl Adapter for Echo {
     fn initialize(&mut self) -> Result<Step, String> {

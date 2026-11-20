@@ -88,7 +88,7 @@ impl From<StoreError> for crate::chat::protocol::SetupError {
 
 const PART_BYTES: usize = crate::chat::TRANSCRIPT_PART_BYTES;
 const WINDOW_BYTES: usize = crate::chat::TRANSCRIPT_WINDOW_BYTES;
-const WINDOW_ITEMS: usize = 128;
+pub(super) const WINDOW_ITEMS: usize = 128;
 // Leave room between provider items for overlapping history pages to supply
 // missing records without renumbering the whole conversation on every page.
 const ORDINAL_STRIDE: i64 = 1 << 32;
@@ -177,6 +177,13 @@ pub(crate) struct Store {
     pending_earlier: Option<Cursor>,
     /// Where the window will end once the provider's earlier page arrives.
     pending_pivot: Option<Cursor>,
+    /// The last window read back from its end ran out of cached history
+    /// before its item or byte budget, so it holds all of it and has room for
+    /// more: an earlier page grows it instead of sliding it. A full window
+    /// holding all of it still slides, so that the page shows.
+    room: bool,
+    /// An earlier page asked for by [`Store::fill`] is on its way.
+    filling: bool,
     latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
@@ -432,6 +439,8 @@ impl Store {
                 provider_earlier: false,
                 pending_earlier: None,
                 pending_pivot: None,
+                room: false,
+                filling: false,
                 latest_boundary: None,
                 messages: None,
                 dirty: true,
@@ -1036,6 +1045,7 @@ impl Store {
                     self.pending_pivot = None;
                 }
                 self.provider_earlier = has_earlier;
+                self.filling = false;
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
                 let warnings = self.merge_history(items, earlier)?;
@@ -1116,6 +1126,8 @@ impl Store {
                 self.cached_earlier = false;
                 self.pending_earlier = None;
                 self.pending_pivot = None;
+                self.room = false;
+                self.filling = false;
                 self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
@@ -1234,18 +1246,66 @@ impl Store {
     /// from before it. Returns true when earlier history is already cached
     /// (no provider command).
     pub fn earlier(&mut self) -> Result<bool, String> {
+        // A page that arrived since the window was built, as one `fill` asked
+        // for may have, is shown by building the window again: one with room
+        // grows into it.
+        if self.room
+            && self.dirty
+            && let Some((ordinal, _)) = self.first
+            && self
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM items WHERE ordinal<?1)",
+                    [ordinal],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|e| e.to_string())?
+        {
+            return Ok(true);
+        }
         if self.cached_earlier {
             if let Some(first) = self.first {
                 self.slide_earlier(first, self.middle);
             }
             Ok(true)
         } else if self.provider_earlier {
-            self.pending_earlier = self.first;
-            self.pending_pivot = self.middle;
+            // A window with room keeps everything it shows and grows into the
+            // page. Only a full one slides, or the provider's page would push
+            // out the newer half of a window too short to fill the screen.
+            if !self.room {
+                self.pending_earlier = self.first;
+                self.pending_pivot = self.middle;
+            }
             Ok(false)
         } else {
             Err("No earlier transcript is available".into())
         }
+    }
+    /// Whether to ask the provider for an earlier page that nobody asked
+    /// for, and if so record that it is on its way. A provider hands history
+    /// over in pages of its own records, which can amount to only a few
+    /// rows: a run of tool calls, or attachments and bookkeeping records the
+    /// transcript does not show. The window is filled to its budget from such
+    /// pages before a reader has to ask, one page at a time, and only once the
+    /// last window built is current, so that a hidden conversation, whose
+    /// window nobody reads, fetches nothing.
+    ///
+    /// A request that fails leaves this set: nothing retries it until a page
+    /// arrives, as one the reader asks for does.
+    pub(super) fn fill(&mut self) -> bool {
+        if !self.wants_fill() {
+            return false;
+        }
+        self.filling = true;
+        true
+    }
+    /// Whether [`Store::fill`] would ask for a page now.
+    pub(super) fn wants_fill(&self) -> bool {
+        self.room
+            && self.provider_earlier
+            && !self.filling
+            && !self.dirty
+            && self.pending_earlier.is_none()
     }
     /// End the next window at `pivot`, or at `first` when the window has no
     /// distinct middle, so that it starts before `first`.
@@ -1480,6 +1540,8 @@ impl Store {
         // How many parts the newest item has, which says whether the window
         // ends inside it.
         let mut newest_parts = 0;
+        // Whether the budget, rather than the cached history, ended the window.
+        let mut full = false;
         'records: for (id, ordinal, metadata, len0, len1, len2, spans) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let spans: Vec<usize> = postcard::from_bytes(&spans).map_err(|e| e.to_string())?;
@@ -1563,6 +1625,7 @@ impl Store {
                 let size = metadata.len() + shown + 128 + attached;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
+                    full = true;
                     break 'records;
                 }
                 let copy_source = if text_copy::copy_field(&base).is_some() {
@@ -1677,6 +1740,7 @@ impl Store {
                 let size = metadata.len() + shown + 128 + attached;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
+                    full = true;
                     break 'records;
                 }
                 if size > WINDOW_BYTES {
@@ -1749,6 +1813,7 @@ impl Store {
         // The UI measures the kept halves around the item at the same index
         // of the window (`scroll::Pivot`), so the two must agree.
         self.middle = cursors.get(cursors.len() / 2).copied();
+        self.room = !full && items.len() < WINDOW_ITEMS && self.forward.is_none();
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
                 part > 0
@@ -2686,35 +2751,48 @@ mod tests {
         assert!(previous.items.first().unwrap().id < page.items.first().unwrap().id);
     }
 
+    fn rows(start: usize, end: usize) -> Vec<Item> {
+        (start..end)
+            .map(|n| history_item(&format!("row-{n:03}"), "message"))
+            .collect()
+    }
+
+    /// A window with room keeps everything it shows and grows into the
+    /// provider's earlier page. Only a full window slides by half, and the
+    /// live tail survives paging back and forth.
     #[test]
-    fn provider_history_keeps_overlap_and_live_tail_survives_forward_navigation() {
+    fn provider_history_grows_a_window_with_room_and_live_tail_survives_forward_navigation() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
-        let messages = |start, end| {
-            (start..end)
-                .map(|n| history_item(&format!("row-{n:03}"), "message"))
-                .collect()
-        };
         store
             .apply(Event::History {
-                items: messages(200, 250),
+                items: rows(200, 250),
                 has_earlier: true,
             })
             .unwrap();
         let initial = store.window().unwrap();
         assert!(!store.earlier().unwrap());
+        assert!(store.pending_earlier.is_none(), "a window with room grows");
         store
             .apply(Event::History {
-                items: messages(0, 200),
+                items: rows(0, 200),
                 has_earlier: false,
             })
             .unwrap();
+        let grown = store.window().unwrap();
+        assert!(grown.items.ends_with(&initial.items));
+        assert_eq!(grown.items.len(), WINDOW_ITEMS);
+        assert_eq!(grown.items[0].id, "row-122");
+        assert!(grown.has_earlier);
+        assert!(!grown.has_later);
+        // Full now, so the cached history before it slides it by half.
+        assert!(store.earlier().unwrap());
         let older = store.window().unwrap();
         assert!(
             older
                 .items
-                .ends_with(&initial.items[..=initial.items.len() / 2])
+                .ends_with(&grown.items[..=grown.items.len() / 2])
         );
-        assert_eq!(older.items[0].id, "row-098");
+        assert_eq!(older.items[0].id, "row-059");
         store
             .apply(Event::Item(history_item(
                 "row-250",
@@ -2737,6 +2815,85 @@ mod tests {
             .apply(Event::Item(history_item("row-251", "live resumes")))
             .unwrap();
         assert_eq!(store.window().unwrap().items.last().unwrap().id, "row-251");
+    }
+
+    /// A provider's page can amount to a few rows, as when its records are
+    /// mostly tool calls and bookkeeping the transcript does not show. The
+    /// window asks for earlier pages itself until its budget is met: one at a
+    /// time, only once the window has been read, and not again after a
+    /// request fails.
+    #[test]
+    fn a_window_with_room_asks_for_earlier_pages_until_its_budget_is_met() {
+        const PAGE: usize = 10;
+        const TOTAL: usize = 300;
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::History {
+                items: rows(TOTAL - PAGE, TOTAL),
+                has_earlier: true,
+            })
+            .unwrap();
+        assert!(!store.fill(), "nothing is asked before the window is read");
+        assert_eq!(store.window().unwrap().items.len(), PAGE);
+        let mut start = TOTAL - PAGE;
+        let mut pages = 0;
+        while store.fill() {
+            assert!(!store.fill(), "one page at a time");
+            assert!(!store.wants_fill());
+            pages += 1;
+            start -= PAGE;
+            store
+                .apply(Event::History {
+                    items: rows(start, start + PAGE),
+                    has_earlier: start > 0,
+                })
+                .unwrap();
+            assert!(!store.fill(), "a page waits for the window to be read");
+            let window = store.window().unwrap();
+            assert_eq!(window.items.last().unwrap().id, "row-299");
+            assert!(!window.has_later);
+        }
+        // Until the cache holds more than the window can show.
+        assert_eq!(pages, (WINDOW_ITEMS + 1).div_ceil(PAGE) - 1);
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), WINDOW_ITEMS);
+        assert_eq!(
+            window.items[0].id,
+            format!("row-{:03}", TOTAL - WINDOW_ITEMS)
+        );
+        assert!(window.has_earlier);
+        assert!(!store.fill(), "a full window asks for nothing more");
+
+        // A request that fails is not retried until a page arrives.
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        store
+            .apply(Event::History {
+                items: rows(290, 300),
+                has_earlier: true,
+            })
+            .unwrap();
+        store.window().unwrap();
+        assert!(store.fill());
+        store.apply(Event::HistoryLoading(false)).unwrap();
+        store.window().unwrap();
+        assert!(!store.fill());
+        // A page the reader asked for clears it.
+        assert!(!store.earlier().unwrap());
+        store
+            .apply(Event::History {
+                items: rows(280, 290),
+                has_earlier: true,
+            })
+            .unwrap();
+        assert_eq!(store.window().unwrap().items.len(), 20);
+        assert!(store.fill());
+        store
+            .apply(Event::Reset {
+                reason: "replaced".into(),
+            })
+            .unwrap();
+        store.window().unwrap();
+        assert!(!store.fill(), "a reset conversation has no earlier history");
     }
 
     #[test]
@@ -2857,9 +3014,10 @@ mod tests {
     #[test]
     fn latest_history_does_not_satisfy_an_older_cursor_left_after_failure() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
+        // A full window slides to show an earlier page.
         store
             .apply(Event::History {
-                items: vec![history_item("A", "A")],
+                items: rows(0, WINDOW_ITEMS),
                 has_earlier: true,
             })
             .unwrap();
@@ -2874,7 +3032,9 @@ mod tests {
             .unwrap();
         assert!(store.pending_earlier.is_none());
         assert!(!store.window().unwrap().has_later);
-        assert_eq!(ids(&mut store), ["A", "B"]);
+        let ids = ids(&mut store);
+        assert_eq!(ids.len(), WINDOW_ITEMS);
+        assert_eq!(ids[WINDOW_ITEMS - 2..], ["row-127", "B"]);
     }
 
     #[test]
@@ -3049,9 +3209,12 @@ mod tests {
                 started_at: None,
                 at: None,
             };
+            // A full window slides to show an earlier page.
+            let mut items = rows(1, WINDOW_ITEMS);
+            items.push(text("current"));
             store
                 .apply(Event::History {
-                    items: vec![text("current")],
+                    items,
                     has_earlier: true,
                 })
                 .unwrap();
