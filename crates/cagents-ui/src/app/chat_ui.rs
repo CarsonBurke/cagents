@@ -3621,8 +3621,9 @@ impl Runtime {
     }
 
     /// Settles the draft after a name was put in it: the edit moved text
-    /// under any attachment placed by position, and ends the completion and
-    /// history walk it came from.
+    /// under any attachment placed by position, ends the completion and
+    /// history walk it came from, and leaves the tray marking the image the
+    /// caret is now on.
     fn named_in_draft(&mut self) {
         for bookmark in self.attachment_bookmarks.values_mut() {
             bookmark.valid = false;
@@ -3633,6 +3634,8 @@ impl Runtime {
         self.history_cursor = None;
         self.history_stash = None;
         self.history_attachment_stash = None;
+        // The caret moved with the name, onto or off an image's reference.
+        self.follow_caret_reference();
     }
 
     /// Retain exact receipt metadata across take-back, queue edits and retry.

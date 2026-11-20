@@ -426,9 +426,12 @@ fn a_name_put_in_from_the_menu_is_an_edit_like_any_other() {
         // The caret inside "[Image N]": the name splits the reference, and
         // its image leaves with it.
         caret_after(runtime, "[Image");
+        runtime.follow_caret_reference();
+        assert!(runtime.caret_reference.is_some(), "the tile is marked");
         runtime.name_in_draft("notes.md", completion::Kind::File);
         assert!(runtime.composer.text().contains("notes.md"));
         assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.caret_reference, None, "no tile stays marked");
         assert!(sent_attachments(runtime).is_empty());
         // One undo takes the name out and brings the image back.
         assert!(runtime.undo_composer(false));
