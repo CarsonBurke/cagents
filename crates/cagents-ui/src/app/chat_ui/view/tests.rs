@@ -52,7 +52,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
     }
     let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
     let notice = "Codex can attach only images";
-    runtime.attachment_notice = Some(notice.into());
+    runtime.composer_note = Some(notice.into());
     assert!(runtime.attachments.is_empty());
     assert!(runtime.error.is_none());
     let target = runtime.target;
@@ -121,7 +121,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
     drop(element);
     // The full pane also publishes the editor's focus action on a click.
     // Mount the notice itself to pin its button's exact dispatch contract.
-    let mut element = runtime.attachment_notice_view().unwrap();
+    let mut element = runtime.composer_note_view().unwrap();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
@@ -165,7 +165,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
         );
     }
     assert!(
-        matches!(messages.as_slice(), [Message::ChatUi(Action::DismissAttachmentNotice(found))]
+        matches!(messages.as_slice(), [Message::ChatUi(Action::DismissComposerNote(found))]
             if *found == target),
         "dismiss targets this runtime: {messages:?}"
     );
@@ -179,26 +179,30 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
 
     let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
     let notice = "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.";
-    runtime.attachment_notice = Some(notice.into());
+    runtime.composer_note = Some(notice.into());
     let renderer = crate::app::tests::headless_renderer();
-    let mut element = runtime.attachment_notice_view().unwrap();
+    let mut element = runtime.composer_note_view().unwrap();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
         &renderer,
         &layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 800.0)),
     );
-    let row = Layout::new(&node);
+    // The note is a surface around a row of its icon, text and Dismiss.
+    let surface = Layout::new(&node);
+    let row = surface.children().next().unwrap();
     let row_bounds = row.bounds();
-    let text = row.children().next().unwrap().bounds();
-    let paragraph = tree.children[0].state.downcast_ref::<TextState>();
+    let text = row.children().nth(1).unwrap().bounds();
+    let paragraph = tree.children[0].children[1]
+        .state
+        .downcast_ref::<TextState>();
     assert_eq!(paragraph.content(), notice);
     // The text widget's allocated width is clamped even without wrapping;
     // check the shaped content as well to catch text drawn past that width.
     let text_bounds = iced::Rectangle::new(text.position(), paragraph.min_bounds());
     let accessible = element
         .as_widget()
-        .a11y_nodes(row, &tree, mouse::Cursor::Unavailable);
+        .a11y_nodes(surface, &tree, mouse::Cursor::Unavailable);
     let dismiss = accessible
         .root()
         .iter()
@@ -211,7 +215,7 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
         .node()
         .bounds()
         .unwrap();
-    assert!((row_bounds.width - 360.0).abs() < 0.1);
+    assert!((surface.bounds().width - 360.0).abs() < 0.1);
     assert!(
         text_bounds.x >= row_bounds.x
             && text_bounds.x + text_bounds.width <= row_bounds.x + row_bounds.width
@@ -220,16 +224,12 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
         "full refusal stays inside the narrow row: text={text_bounds:?}, row={row_bounds:?}"
     );
     assert!(
-        f64::from(text_bounds.x + text_bounds.width + step::GAP_XS) <= dismiss.x0 + 0.1,
+        f64::from(text_bounds.x + text_bounds.width + step::GAP_S) <= dismiss.x0 + 0.1,
         "full refusal clears Dismiss: text={text_bounds:?}, dismiss={dismiss:?}"
     );
     assert!(
-        (dismiss.x1 - f64::from(row_bounds.x + row_bounds.width - step::GAP_M)).abs() < 0.1,
+        (dismiss.x1 - f64::from(row_bounds.x + row_bounds.width)).abs() < 0.1,
         "Dismiss stays at the row's end: {dismiss:?}"
-    );
-    assert!(
-        (dismiss.y0 - f64::from(row_bounds.y)).abs() < 0.1,
-        "Dismiss stays top-aligned: {dismiss:?}"
     );
     assert!(
         text_bounds.height > (dismiss.y1 - dismiss.y0) as f32,

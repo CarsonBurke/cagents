@@ -4054,6 +4054,7 @@ impl Runtime {
                         self.queue_view()
                             .into_iter()
                             .chain(self.restored_waiting_notice())
+                            .chain(self.composer_note_view())
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
                             .chain(self.stop_confirmation())
@@ -4062,8 +4063,7 @@ impl Runtime {
                                     .spacing(step::GAP_XS)
                                     .padding([0, step::GAP_M as u16])
                                     .into()
-                            }))
-                            .chain(self.attachment_notice_view()),
+                            })),
                     )
                     .spacing(step::GAP_XS)
                     .into(),
@@ -5909,24 +5909,36 @@ impl Runtime {
         }
     }
 
-    fn attachment_notice_view(&self) -> Option<Element<'_, Message>> {
-        let notice = self.attachment_notice.as_deref()?;
+    /// Why something tried in this pane didn't happen, at the composer
+    /// where it was tried. It is a note about that try rather than about the
+    /// conversation, so it leaves the turn's outcome and the timeline alone.
+    fn composer_note_view(&self) -> Option<Element<'_, Message>> {
+        let note = self.composer_note.as_deref()?;
         Some(
-            widget::row::with_children(vec![
-                design::caption(notice)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill)
-                    .into(),
-                small_icon(
-                    Icon::Close,
-                    "Dismiss",
-                    Action::DismissAttachmentNotice(self.target),
-                ),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Start)
-            .padding([0, step::GAP_M as u16])
+            widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+                    design::caption(note)
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .into(),
+                    small_icon(
+                        Icon::Close,
+                        "Dismiss",
+                        Action::DismissComposerNote(self.target),
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
+            ))
             .into(),
         )
     }
