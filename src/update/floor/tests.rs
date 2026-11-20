@@ -2438,7 +2438,7 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
         }
         if ordinary_answer == "\n" {
             for message in [
-                "Waiting for these conversations to finish their turns:",
+                "Waiting for these conversations to finish their current work:",
                 "Ctrl-C cancels the update; nothing has been ended or stopped.",
             ] {
                 assert_eq!(output.matches(message).count(), 1, "{output}");

@@ -240,7 +240,6 @@ fn check_scope(
     if consent.policy != impact::Policy::Interrupt
         || observed.policy != consent.policy
         || consent.capability.proof != observed.capability.proof
-        || consent.capability.inventory_generation != observed.capability.inventory_generation
         || consent.blockers != observed.blockers
         || old.len() != consent.sessions.len()
         || fresh.len() != observed.sessions.len()

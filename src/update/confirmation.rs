@@ -478,10 +478,17 @@ fn interruption_preserves_review(previous: &impact::Preview, current: &impact::P
                 item.kind == session.kind
                     && item.id == session.id
                     && item.identity == session.identity
-                    && matches!(
-                        item.disposition,
-                        impact::Disposition::Interrupted | impact::Disposition::Resumes
-                    )
+                    && match item.disposition {
+                        impact::Disposition::Interrupted
+                        | impact::Disposition::Resumes
+                        | impact::Disposition::Continues => true,
+                        // A conversation still receiving queued messages
+                        // keeps waiting under either policy; interrupting
+                        // would not deliver them. A typed service stop must
+                        // name what it stops, so it reviews this again.
+                        impact::Disposition::WaitsForIdle => !typed_stop,
+                        impact::Disposition::ResumePicker | impact::Disposition::Blocked => false,
+                    }
             }) else {
                 return false;
             };
@@ -767,6 +774,105 @@ mod tests {
         assert!(!output.contains("Update now?"), "{output}");
     }
 
+    /// A renewal the confirmed review still covers, such as a briefly
+    /// changed queue that settled back, carries the person's answer; a
+    /// changed owner asks again.
+    #[test]
+    fn a_stale_confirmation_carries_only_to_a_review_it_still_covers() {
+        struct Terminal {
+            job: UpdateJob,
+            output: Vec<u8>,
+            reads: usize,
+            decisions: Vec<String>,
+            changed_owner: bool,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(self.job.clone()))
+            }
+            fn decide(&mut self, _: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError> {
+                assert!(matches!(choice, Choice::Confirm));
+                self.decisions.push(nonce.into());
+                if self.decisions.len() == 1 {
+                    let confirmation = self.job.confirmation.as_mut().unwrap();
+                    confirmation.nonce = "renewed".into();
+                    let daemon = confirmation.preview.daemon.as_mut().unwrap();
+                    daemon.capability.token = "renewed capability".into();
+                    if self.changed_owner {
+                        daemon.sessions[0].identity = "a replacement owner".into();
+                    }
+                    return Err(invalid("the update preview changed"));
+                }
+                self.job.phase = UpdatePhase::Complete;
+                self.job.confirmation = None;
+                Ok(())
+            }
+            fn cancel(&mut self, _: &str) -> Result<bool, UpdateError> {
+                panic!("a stale review must reload without cancellation")
+            }
+            fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+                self.reads += 1;
+                answer.push('\n');
+                Ok(1)
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn pause(&mut self) {}
+        }
+        for changed_owner in [false, true] {
+            let mut preview = working_preview();
+            preview.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Resumes;
+            let job = UpdateJob {
+                id: "stale-confirmation".into(),
+                version: "9.8.7".into(),
+                phase: UpdatePhase::AwaitingConfirmation,
+                message: String::new(),
+                log_path: "/fake/update.log".into(),
+                confirmation: Some(Confirmation {
+                    nonce: "first".into(),
+                    stop: None,
+                    preview,
+                    expires_at_unix_ms: u64::MAX,
+                }),
+                refusal: None,
+                in_flight: Vec::new(),
+            };
+            let mut terminal = Terminal {
+                job: job.clone(),
+                output: Vec::new(),
+                reads: 0,
+                decisions: Vec::new(),
+                changed_owner,
+            };
+            drive_terminal_review_with(job, false, false, &mut terminal).unwrap();
+            let output = String::from_utf8(terminal.output).unwrap();
+            assert_eq!(terminal.decisions, ["first", "renewed"], "{output}");
+            assert_eq!(
+                terminal.reads,
+                if changed_owner { 2 } else { 1 },
+                "{output}"
+            );
+            assert_eq!(
+                output.contains("Update review changed:"),
+                changed_owner,
+                "{output}"
+            );
+        }
+    }
+
     #[test]
     fn stale_terminal_i_renews_only_the_work_that_changed_before_submission() {
         struct Terminal {
@@ -978,6 +1084,14 @@ mod tests {
             interruption_preserves_review(&previous, &idle),
             "finished work needs no interruption"
         );
+        let mut queued = idle.clone();
+        queued.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::WaitsForIdle;
+        assert!(
+            interruption_preserves_review(&previous, &queued),
+            "a conversation still receiving queued messages keeps waiting"
+        );
+        queued.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Blocked;
+        assert!(!interruption_preserves_review(&previous, &queued));
     }
 
     #[test]

@@ -834,6 +834,9 @@ fn drive_terminal_review_with(
     let mut waiting = None;
     let mut policy_requested = None;
     let mut reviewed = None;
+    // The review the person confirmed. A renewal it still covers, by the same
+    // rule the worker uses to keep an approval, needs no second answer.
+    let mut confirmed: Option<impact::Preview> = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     let mut finishing_message_shown = false;
     loop {
@@ -899,7 +902,7 @@ fn drive_terminal_review_with(
                 if !labels.is_empty() && waiting.as_ref() != Some(&labels) {
                     writeln!(
                         terminal,
-                        "Waiting for these conversations to finish their turns:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
+                        "Waiting for these conversations to finish their current work:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
                         labels.join("\n  ")
                     )?;
                     waiting = Some(labels);
@@ -970,6 +973,20 @@ fn drive_terminal_review_with(
                     submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
+                if confirmed
+                    .as_ref()
+                    .is_some_and(|approved| approved.preserves_consent(&confirmation.preview))
+                {
+                    if submit_current_choice(
+                        terminal,
+                        &job.id,
+                        &confirmation.nonce,
+                        UpdateChoice::Confirm,
+                    )? {
+                        submitted.insert(confirmation.nonce.clone());
+                    }
+                    continue;
+                }
                 write!(
                     terminal,
                     "{}",
@@ -1020,6 +1037,7 @@ fn drive_terminal_review_with(
                         return Err(confirmation::closed(&confirmation.preview));
                     }
                     OrdinaryChoice::InterruptNow => {
+                        confirmed = None;
                         reviewed = Some(confirmation.preview.clone());
                         if !submit_current_choice(
                             terminal,
@@ -1035,6 +1053,7 @@ fn drive_terminal_review_with(
                         submitted.insert(confirmation.nonce.clone());
                     }
                     OrdinaryChoice::Confirm => {
+                        confirmed = Some(confirmation.preview.clone());
                         reviewed = Some(confirmation.preview.clone());
                         if submit_current_choice(
                             terminal,

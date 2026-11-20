@@ -24,6 +24,9 @@ pub enum SessionKind {
 /// confirming its work settled, and asks for it to be closed. Every source
 /// line since the candidate line (128) reports it in exactly these words, so
 /// the updater can recognize the one blocker that closing resolves.
+/// A conversation has messages accepted for it but not yet delivered. They
+/// cannot be carried through an update, so it waits under either policy.
+pub const QUEUED_MESSAGES: &str = "Messages sent to this conversation are still waiting to be delivered. The update waits until it has received them, since queued messages can't be carried through an update.";
 pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +76,9 @@ impl SessionImpact {
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
             Disposition::WaitsForIdle => {
                 let tasks = self.interrupted_subagents.len();
-                if tasks == 0 {
+                if self.reason == QUEUED_MESSAGES {
+                    "Messages sent to it are still waiting to be delivered; the update waits for them.".into()
+                } else if tasks == 0 {
                     "Finishing its turn; the update waits.".into()
                 } else {
                     let noun = if tasks == 1 { "task" } else { "tasks" };
@@ -222,9 +227,14 @@ impl DaemonImpact {
                             .iter()
                             .all(|id| permitted.contains(id.as_str()))
                         && (previous.disposition == current.disposition
-                            || (self.policy == Policy::WhenIdle
-                                && previous.disposition == Disposition::WaitsForIdle
-                                && current.disposition == Disposition::Resumes)
+                            // Waiting authorizes the wait's own end: resuming
+                            // or, for a provider that outlives the update,
+                            // continuing. Never an interruption.
+                            || (previous.disposition == Disposition::WaitsForIdle
+                                && matches!(
+                                    current.disposition,
+                                    Disposition::Resumes | Disposition::Continues
+                                ))
                             || (self.policy == Policy::Interrupt
                                 && previous.disposition == Disposition::Interrupted
                                 && current.disposition == Disposition::Resumes))
@@ -368,6 +378,29 @@ pub(super) mod tests {
         current = confirmed.clone();
         current.capability.proof.host_incarnation = HostIncarnation::new("replacement");
         assert!(!confirmed.preserves_consent(&current));
+    }
+
+    #[test]
+    fn a_reviewed_wait_may_end_by_continuing_under_either_policy_but_never_by_interrupting() {
+        for policy in [Policy::WhenIdle, Policy::Interrupt] {
+            let mut confirmed = waiting();
+            confirmed.policy = policy;
+            for settled in [Disposition::Resumes, Disposition::Continues] {
+                let mut current = confirmed.clone();
+                current.sessions[0].disposition = settled;
+                assert!(
+                    confirmed.preserves_consent(&current),
+                    "{policy:?} {settled:?}"
+                );
+                assert!(
+                    !current.preserves_consent(&confirmed),
+                    "new queued work needs another review"
+                );
+            }
+            let mut current = confirmed.clone();
+            current.sessions[0].disposition = Disposition::Interrupted;
+            assert!(!confirmed.preserves_consent(&current));
+        }
     }
 
     #[test]

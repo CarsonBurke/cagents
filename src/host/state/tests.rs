@@ -3537,6 +3537,29 @@ fn background_task_replacement_invalidates_stop_and_update_consent() {
         waiting.sessions[0].reason
     );
     let now = Instant::now();
+    // Another session opening or closing elsewhere is not a change to this
+    // conversation's owner, so it cannot revoke a review of it.
+    state.inventory_generation += 1;
+    let elsewhere = state.upgrade_impact(Policy::Interrupt).unwrap();
+    assert_eq!(
+        elsewhere.sessions[0].identity,
+        interrupt.sessions[0].identity
+    );
+    assert!(interrupt.preserves_consent(&elsewhere));
+    // Messages accepted for it but not yet delivered cannot survive a restart:
+    // the update waits for them under either policy, attributed to this
+    // conversation rather than to an anonymous blocker.
+    for policy in [Policy::WhenIdle, Policy::Interrupt] {
+        let queued = state
+            .upgrade_impact_with_queued(policy, &BTreeSet::from([interrupt.sessions[0].id]))
+            .unwrap();
+        assert!(queued.blockers.is_empty());
+        assert_eq!(queued.sessions[0].disposition, Disposition::WaitsForIdle);
+        assert!(queued.sessions[0].interrupted_subagents.is_empty());
+        // The review shows why it waits, not that it is finishing a turn.
+        let shown = queued.sessions[0].review().reason;
+        assert!(shown.contains("still waiting to be delivered"), "{shown}");
+    }
     let capability = state.shutdown_preflight(now).unwrap().capability;
     assert_eq!(capability.background_subagents, 1);
     handle.command(Command::Compact).unwrap();

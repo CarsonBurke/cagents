@@ -463,10 +463,36 @@ pub(super) fn render_review_changes(previous: &Preview, current: &Preview) -> St
         )
         .unwrap();
     }
+    let blockers = |preview: &Preview| {
+        preview
+            .daemon
+            .as_ref()
+            .map(|daemon| daemon.blockers.clone())
+            .unwrap_or_default()
+    };
+    if output == "Update review changed:\n" && blockers(previous) != blockers(current) {
+        // Distinct blockers can share one notice; say that what is pending
+        // changed rather than presenting an unchanged review.
+        let count = blockers(current).len();
+        writeln!(
+            output,
+            "  Pending work changed: {count} {} must settle before the update.",
+            if count == 1 { "item" } else { "items" }
+        )
+        .unwrap();
+    }
     if output == "Update review changed:\n" {
-        output.push_str(
-            "  The running terminal service changed; review the update again before continuing.\n",
-        );
+        let proof = |preview: &Preview| {
+            preview
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone())
+        };
+        output.push_str(if proof(previous) != proof(current) {
+            "  The terminal service restarted; review the update again before continuing.\n"
+        } else {
+            "  Running work changed while you reviewed; review the update again before continuing.\n"
+        });
     }
     output
 }
@@ -1303,5 +1329,45 @@ mod tests {
             assert!(!changes.contains("private.socket"), "{changes}");
             assert!(!changes.contains("raw detail"), "{changes}");
         }
+    }
+
+    #[test]
+    fn a_renewed_review_names_hidden_changes_instead_of_blaming_the_service() {
+        let mut previous = preview();
+        previous.daemon.as_mut().unwrap().blockers = vec![
+            "Codex agent first has accepted work or launch ownership awaiting confirmation".into(),
+        ];
+        let mut current = previous.clone();
+        current.daemon.as_mut().unwrap().blockers = vec![
+            "Codex agent first has accepted work or launch ownership awaiting confirmation".into(),
+            "Codex agent second has accepted work or launch ownership awaiting confirmation".into(),
+        ];
+        let output = render_review_changes(&previous, &current);
+        assert!(
+            output.contains("Pending work changed: 2 items must settle"),
+            "{output}"
+        );
+        assert!(!output.contains("second"), "{output}");
+
+        let unchanged = render_review_changes(&previous, &previous.clone());
+        assert!(
+            unchanged.contains("Running work changed while you reviewed"),
+            "{unchanged}"
+        );
+        assert!(!unchanged.contains("terminal service"), "{unchanged}");
+
+        let mut restarted = previous.clone();
+        restarted
+            .daemon
+            .as_mut()
+            .unwrap()
+            .capability
+            .proof
+            .host_incarnation = crate::model::HostIncarnation::new("replacement");
+        let output = render_review_changes(&previous, &restarted);
+        assert!(
+            output.contains("The terminal service restarted"),
+            "{output}"
+        );
     }
 }
