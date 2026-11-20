@@ -15106,7 +15106,7 @@ impl Cagents {
         if generation != self.pull_request_dialog_generation || self.pull_request_dialog.is_some() {
             return Task::none();
         }
-        let covered = self.modal_is_open();
+        let covered = self.workspace_inputs_blocked();
         self.pull_request_dialog = Some(dialog);
         if covered {
             return Task::none();

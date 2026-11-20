@@ -4275,6 +4275,80 @@ fn pull_request_failure_leaves_focus_with_a_dialog_opened_meanwhile() {
 }
 
 #[test]
+fn pull_request_failure_leaves_focus_with_the_command_palette() {
+    for result in [
+        Ok(PullRequestCreationOutcome::NotCreated {
+            failure: pull_request_test_failure(4),
+        }),
+        Err("pull request creator failed".into()),
+    ] {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
+        app.pull_request_dialog = Some(dialog.clone());
+
+        let _ = app.update(Message::SubmitPullRequest);
+        assert!(app.pull_request_dialog.is_none());
+        let _ = app.update(Message::Palette(palette_ui::Action::Open));
+        let _ = app.update(Message::Palette(palette_ui::Action::Query("res".into())));
+        assert!(app.palette.is_open());
+        let _ = app.update(Message::PullRequestCreated {
+            dialog: dialog.clone(),
+            generation: app.pull_request_dialog_generation,
+            result,
+        });
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+        assert!(app.palette.is_open());
+
+        // update batches unrelated tasks, so isolate the restore's focus task.
+        app.pull_request_dialog = None;
+        let task =
+            app.restore_pull_request_dialog(dialog.clone(), app.pull_request_dialog_generation);
+        assert_eq!(task.units(), 0);
+        assert_eq!(app.pull_request_dialog, Some(dialog));
+    }
+}
+
+#[test]
+fn pull_request_failure_leaves_focus_with_an_open_chrome_menu() {
+    for action in [
+        chrome_ui::Action::ToggleNewTab,
+        chrome_ui::Action::ToggleNotices,
+        chrome_ui::Action::ToggleAttention,
+    ] {
+        for result in [
+            Ok(PullRequestCreationOutcome::NotCreated {
+                failure: pull_request_test_failure(4),
+            }),
+            Err("pull request creator failed".into()),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let dialog = pull_request_test_dialog();
+            authorize_pull_request_test(&mut app, &dialog);
+            app.pull_request_dialog = Some(dialog.clone());
+
+            let _ = app.update(Message::SubmitPullRequest);
+            assert!(app.pull_request_dialog.is_none());
+            let _ = app.update(Message::ChromeUi(action.clone()));
+            assert!(app.chrome_ui.is_open(), "{action:?}");
+            let _ = app.update(Message::PullRequestCreated {
+                dialog: dialog.clone(),
+                generation: app.pull_request_dialog_generation,
+                result,
+            });
+            assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+            assert!(app.chrome_ui.is_open(), "{action:?}");
+
+            app.pull_request_dialog = None;
+            let task =
+                app.restore_pull_request_dialog(dialog.clone(), app.pull_request_dialog_generation);
+            assert_eq!(task.units(), 0, "{action:?}");
+            assert_eq!(app.pull_request_dialog, Some(dialog));
+        }
+    }
+}
+
+#[test]
 fn pull_request_failure_refocuses_the_form_when_nothing_covers_it() {
     for result in [
         Ok(PullRequestCreationOutcome::NotCreated {
