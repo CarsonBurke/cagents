@@ -4076,6 +4076,141 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn discovered_repository_casing_loads_a_listed_review_from_its_remote() {
+        use crate::github::{GitHubService, ListPullRequestsRequest, PullRequestStateFilter};
+        use crate::repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
+        use std::{collections::VecDeque, sync::Mutex};
+
+        struct Sequence(Mutex<VecDeque<(&'static str, &'static str, String)>>);
+        impl ProcessExecutor for Sequence {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let (program, argument, stdout) = self.0.lock().unwrap().pop_front().unwrap();
+                assert_eq!(command.program, Path::new(program));
+                assert!(
+                    command.arguments.iter().any(|arg| arg == argument),
+                    "{command:?}"
+                );
+                if argument.starts_with("+refs/") {
+                    assert!(command.arguments.iter().any(|arg| arg == "origin"));
+                }
+                Ok(ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: stdout.into_bytes(),
+                    stderr: vec![],
+                })
+            }
+        }
+
+        let host = "review-remote-casing.invalid";
+        let mut pr = serde_json::to_value(pull_request(1)).unwrap();
+        pr["url"] = format!("https://{host}/carsonburke/cagents/pull/1").into();
+        pr["baseRefOid"] = "b".repeat(40).into();
+        let mut refresh_pr = pr.clone();
+        refresh_pr["viewerDidAuthor"] = false.into();
+        refresh_pr["reviews"] = serde_json::json!({
+            "nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        refresh_pr["files"] = serde_json::json!({
+            "nodes": [{"path": "file.rs", "viewerViewedState": "VIEWED"}],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}
+        });
+        let refresh = serde_json::json!({"data": {
+            "viewer": {"login": "reviewer"}, "repository": {"pullRequest": refresh_pr}
+        }});
+        let remote_config = format!("remote.origin.url\ngit@{host}:carsonburke/cagents.git\0");
+        let executor = Arc::new(Sequence(Mutex::new(VecDeque::from([
+            ("git", "config", remote_config.clone()),
+            (
+                "gh",
+                "repo",
+                serde_json::json!({
+                    "nameWithOwner": "CarsonBurke/Cagents",
+                    "url": format!("https://{host}/CarsonBurke/Cagents")
+                })
+                .to_string(),
+            ),
+            ("gh", "list", serde_json::json!([pr.clone()]).to_string()),
+            ("gh", "graphql", format!("HTTP/2.0 200 OK\r\n\r\n{refresh}")),
+            ("git", "config", remote_config),
+            ("gh", "view", pr.to_string()),
+            (
+                "git",
+                "--git-common-dir",
+                "/fixture/review-remote-casing/.git\n".into(),
+            ),
+            (
+                "git",
+                "+refs/pull/1/head:refs/cagents/pull/1/head",
+                String::new(),
+            ),
+            (
+                "git",
+                "refs/cagents/pull/1/head^{commit}",
+                format!("{}\n", "a".repeat(40)),
+            ),
+            (
+                "git",
+                "+refs/heads/main:refs/cagents/pull/1/base",
+                String::new(),
+            ),
+            (
+                "git",
+                "refs/cagents/pull/1/base^{commit}",
+                format!("{}\n", "b".repeat(40)),
+            ),
+            ("git", "merge-base", format!("{}\n", "c".repeat(40))),
+            ("git", "--name-status", "M\0file.rs\0".into()),
+            ("git", "--numstat", "1\t0\tfile.rs\0".into()),
+        ]))));
+        let git = RepositoryService::new("git", executor.clone());
+        let api = GitHubService::new("gh", executor.clone());
+        let worktree = Path::new("/fixture/review-remote-casing");
+        let cancellation = CancellationToken::new();
+        let remotes = git.remotes(worktree, &cancellation).unwrap();
+        let repository = api
+            .resolve_repository(worktree, &remotes, &cancellation)
+            .unwrap();
+        assert_eq!(repository.owner, "CarsonBurke");
+        assert_eq!(repository.name, "Cagents");
+        let listed = api
+            .list(
+                &ListPullRequestsRequest {
+                    repository: repository.clone(),
+                    state: PullRequestStateFilter::Open,
+                    limit: 10,
+                },
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        let target = ReviewTarget {
+            repository,
+            worktree: worktree.into(),
+            pull_request: Arc::new(listed.into_iter().next().unwrap()),
+        };
+        let loaded = load_review(&api, &git, &target, None, &cancellation)
+            .expect("a listed review must load when only its remote's casing differs");
+        assert_eq!(loaded.context.viewer, "reviewer");
+        assert_eq!(loaded.range.head.as_str(), "a".repeat(40));
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].path, path("file.rs"));
+        assert_eq!(loaded.entries[0].kind, ChangeKind::Modified);
+        assert_eq!(loaded.entries[0].added_lines, Some(1));
+        assert_eq!(loaded.entries[0].removed_lines, Some(0));
+        assert_eq!(
+            loaded.files.files[0].viewer_viewed_state,
+            FileViewedState::Viewed
+        );
+        assert!(executor.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn unchanged_refresh_never_calls_git_or_rewrites_unchanged_cache() {
         struct NoGit;
         impl crate::repository::ProcessExecutor for NoGit {
