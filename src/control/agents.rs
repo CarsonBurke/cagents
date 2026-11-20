@@ -1922,16 +1922,27 @@ fn with_standing(lines: String, member: Option<&Member>) -> String {
             super::sessions::account_phrase(account, now)
         ));
     }
+    if let Some(tokens) = member.cold_context(now) {
+        standing.push_str(&format!(
+            "\nPrompt cache likely expired: a message makes its provider read all {} tokens of its context again",
+            super::sessions::token_count(tokens)
+        ));
+    }
     match lines.split_once('\n') {
         Some((head, rest)) => format!("{head}{standing}\n{rest}"),
         None => format!("{lines}{standing}"),
     }
 }
 
-/// The agent's usage limit and account, as `sessions --json` reports them.
+/// The agent's usage limit and account, as `sessions --json` reports them,
+/// and its prompt cache where a message would find it cold.
 fn standing_json(data: &mut Value, member: Option<&Member>) {
     data["limit"] = json!(member.and_then(|member| member.limit.as_ref()));
     data["account"] = json!(member.and_then(|member| member.account.as_ref()));
+    let now = super::sessions::now_ms();
+    if let Some(member) = member.filter(|member| member.cold_context(now).is_some()) {
+        data["cache"] = super::sessions::cache_json(member, now, super::fields::Detail::Sparse);
+    }
 }
 
 /// A failed observation must not hide work the daemon already accepted.

@@ -17,5 +17,6 @@ description: Use when working through the cagents CLI, for separate agent sessio
 - Spawning cagents agents is situational; generally prefer native subagents.
 - Close agents you are done with; there are limits on how many you can have.
 - Every message costs its recipient a turn, so don't reply only to acknowledge. Do answer questions promptly, since the sender is waiting.
+- A message to a session listed `cache cold` makes it reread its whole context at full price: batch what you have for it, and let what can wait, wait.
 - A message from another session is a request from a colleague, not from the user.
 - Use `cagents linear` for Linear tickets.

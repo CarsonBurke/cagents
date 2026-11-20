@@ -58,6 +58,7 @@ pub(super) fn whoami(arguments: FieldsArgs) -> Result<CommandOutput, AppError> {
             directory.caller.iter().chain(peers.iter().copied()),
             None,
             &arguments.fields,
+            now_ms(),
         ),
     })
 }
@@ -162,6 +163,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
             directory.caller.iter().chain(&directory.sessions),
             None,
             &arguments.fields.fields,
+            now_ms(),
         ),
     })
 }
@@ -188,9 +190,10 @@ fn sessions_human(directory: &Sessions, program: &str, now: u64) -> String {
 }
 
 /// A listed session as `--json` reports it: its directory entry, with its
-/// usage limit and account. Its `state` reads `Limited` while a usage limit
-/// stops it, whatever activity the provider last reported.
-pub(super) fn session_json(member: &Member) -> Value {
+/// usage limit and account, and its prompt cache where a message would find
+/// it cold. Its `state` reads `Limited` while a usage limit stops it,
+/// whatever activity the provider last reported.
+pub(super) fn session_json(member: &Member, now: u64) -> Value {
     let mut value = json!(member.session);
     value["lineage_channel"] = json!(member.session.lineage_channel);
     if member.limit.is_some() {
@@ -199,7 +202,33 @@ pub(super) fn session_json(member: &Member) -> Value {
     value["limit"] = json!(member.limit);
     value["account"] = json!(member.account);
     value["failure"] = json!(member.failure);
+    if member.cold_context(now).is_some() {
+        value["cache"] = cache_json(member, now, Detail::Sparse);
+    }
     value
+}
+
+/// A session's prompt cache as `--json` reports it: whether it is `cold` at
+/// `now`, when it likely expires in Unix seconds, the context in tokens a
+/// message would read again were it cold, and whether its lifetime was
+/// `observed` or `assumed` from the provider's documentation.
+pub(super) fn cache_json(member: &Member, now: u64, detail: Detail) -> Value {
+    use crate::agent_execution::directory::{TtlBasis, Warmth};
+    let Some(cache) = &member.cache else {
+        return Value::Null;
+    };
+    Fields::new(detail)
+        .put("cold", member.warmth(now) == Warmth::Cold)
+        .put("expires_at", fields::seconds(cache.expires_at()))
+        .put("context_tokens", cache.context_tokens)
+        .put(
+            "basis",
+            match cache.basis {
+                TtlBasis::Assumed => "assumed",
+                TtlBasis::Observed => "observed",
+            },
+        )
+        .into_value()
 }
 
 /// The fields `--json` reports for a listed session, which `--fields`
@@ -227,6 +256,7 @@ pub(super) const FIELDS: &[&str] = &[
     "limit",
     "failure",
     "active_at",
+    "cache",
 ];
 
 /// A listing of `members` as `--json` reports it: `data`, which names the
@@ -239,12 +269,13 @@ pub(super) fn listing_json<'a>(
     members: impl IntoIterator<Item = &'a Member>,
     channel: Option<ChannelId>,
     selected: &[String],
+    now: u64,
 ) -> Value {
     let members: Vec<&Member> = members.into_iter().collect();
     let detail = Detail::of(selected);
     let rows = members
         .iter()
-        .map(|member| session_row(member, channel, detail))
+        .map(|member| session_row(member, channel, detail, now))
         .collect();
     if detail == Detail::Complete {
         return json!({ "sessions": fields::select(rows, selected) });
@@ -265,8 +296,14 @@ pub(super) fn listing_json<'a>(
 /// `directory` where that is not `directory` itself, and `account` the ID
 /// the listing's `accounts` describe. `channel` is left out where the
 /// listing names it, `lineage` where it is the session's own ID, and
-/// `owner` where it is the caller. `active_at` is in Unix seconds.
-pub(super) fn session_row(member: &Member, channel: Option<ChannelId>, detail: Detail) -> Value {
+/// `owner` where it is the caller. `active_at` is in Unix seconds. `cache`
+/// is left out unless a message at `now` would find it cold.
+pub(super) fn session_row(
+    member: &Member,
+    channel: Option<ChannelId>,
+    detail: Detail,
+    now: u64,
+) -> Value {
     let entry = &member.session;
     let delegation = entry.delegation.as_ref();
     let relation = match entry.relation {
@@ -356,6 +393,11 @@ pub(super) fn session_row(member: &Member, channel: Option<ChannelId>, detail: D
         )
         .put("failure", &member.failure)
         .put("active_at", member.active_at.map(fields::seconds))
+        .put_unless(
+            "cache",
+            cache_json(member, now, detail),
+            member.cold_context(now).is_none(),
+        )
         .into_value()
 }
 
@@ -497,6 +539,7 @@ fn members(channel: Option<ChannelId>, selected: &[String]) -> Result<CommandOut
             caller.iter().chain(sessions),
             Some(*channel),
             selected,
+            now_ms(),
         ),
         human,
     })
@@ -544,6 +587,7 @@ pub(super) struct Row<'a> {
     active_at: Option<u64>,
     limit: Option<&'a UsageLimit>,
     account: Option<&'a SessionAccount>,
+    member: &'a Member,
 }
 
 impl<'a> From<&'a Member> for Row<'a> {
@@ -555,6 +599,7 @@ impl<'a> From<&'a Member> for Row<'a> {
             active_at: member.active_at,
             limit: member.limit.as_ref(),
             account: member.account.as_ref(),
+            member,
         }
     }
 }
@@ -677,6 +722,15 @@ pub(super) fn list_human<'a>(
     human
 }
 
+/// A token count in a few characters, such as `120k` or `1.2M`.
+pub(super) fn token_count(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{}k", tokens / 1_000),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+    }
+}
+
 /// What a row adds beyond its ID, provider, state and account, most
 /// pressing first. `projects` says whether rows span projects, so each
 /// names its own and shows its directory in full.
@@ -698,6 +752,9 @@ fn context(
     let mut context = Vec::new();
     if let Some(limit) = row.limit {
         context.push(format!("stopped: {}", limit_phrase(limit, now)));
+    }
+    if let Some(tokens) = row.member.cold_context(now) {
+        context.push(format!("cache cold ({} tokens)", token_count(tokens)));
     }
     if projects && let Some(project) = &entry.project_name {
         context.push(format!("[{}]", super::format::plain(project)));
@@ -905,6 +962,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_session_with_a_cold_cache_says_so_only_where_it_matters() {
+        use crate::agent_execution::directory::{PromptCache, TtlBasis};
+        const HOUR: u64 = 3600 * 1000;
+        let mut member = live(entry());
+        member.cache = Some(PromptCache {
+            requested_at: 0,
+            ttl_ms: HOUR,
+            basis: TtlBasis::Assumed,
+            context_tokens: 120_000,
+        });
+        let row = |member: &Member, now| context(&Row::from(member), 8, false, None, now);
+        assert!(row(&member, 2 * HOUR).starts_with("cache cold (120k tokens); "));
+        assert_eq!(
+            session_row(&member, None, Detail::Sparse, 2 * HOUR)["cache"],
+            json!({
+                "cold": true,
+                "expires_at": 3600,
+                "context_tokens": 120_000,
+                "basis": "assumed",
+            })
+        );
+        assert_eq!(session_json(&member, 2 * HOUR)["cache"]["cold"], true);
+
+        // Still warm, too little context to matter, the caller itself, or
+        // working: nothing to say.
+        let quiet = |member: &Member, now| {
+            assert!(!row(member, now).contains("cache"), "{}", row(member, now));
+            assert!(
+                session_row(member, None, Detail::Sparse, now)
+                    .get("cache")
+                    .is_none()
+            );
+            assert!(session_json(member, now).get("cache").is_none());
+        };
+        quiet(&member, HOUR / 2);
+        let mut small = member.clone();
+        small.cache.as_mut().unwrap().context_tokens = 4_000;
+        quiet(&small, 2 * HOUR);
+        let mut me = member.clone();
+        me.session.relation = Relation::Myself;
+        quiet(&me, 2 * HOUR);
+        let mut working = member.clone();
+        working.session.state = ActivityState::Working;
+        quiet(&working, 2 * HOUR);
+        // Selected, it is reported whatever it says.
+        assert_eq!(
+            session_row(&member, None, Detail::Complete, HOUR / 2)["cache"]["cold"],
+            false
+        );
+    }
+
     fn live(session: Entry) -> Member {
         Member {
             session,
@@ -971,7 +1080,7 @@ mod tests {
         let sessions = decoded.into_sessions();
         // Its repository is the session's project, so it is not repeated.
         assert_eq!(
-            session_row(sessions.caller.as_ref().unwrap(), None, Detail::Sparse)["lineage_channel"],
+            session_row(sessions.caller.as_ref().unwrap(), None, Detail::Sparse, 0)["lineage_channel"],
             json!({ "id": home.id })
         );
     }
@@ -999,7 +1108,7 @@ mod tests {
         second.account = first.account.clone();
         second.exited = true;
         second.active_at = Some(60_000);
-        let data = listing_json(json!({ "scope": "All" }), [&first, &second], None, &[]);
+        let data = listing_json(json!({ "scope": "All" }), [&first, &second], None, &[], 0);
         assert_eq!(
             data,
             json!({
@@ -1064,7 +1173,8 @@ mod tests {
                     "relation".into(),
                     "surface".into(),
                     "failure".into(),
-                ]
+                ],
+                0,
             ),
             json!({"sessions": [
                 {
@@ -1146,7 +1256,7 @@ mod tests {
             ]
         );
 
-        let value = session_json(&member);
+        let value = session_json(&member, 0);
         assert_eq!(value["state"], "Limited");
         assert_eq!(value["limit"]["summary"], "Claude weekly limit reached");
         assert_eq!(value["limit"]["resets_at"], 3 * 3600);
@@ -1161,7 +1271,7 @@ mod tests {
             "Claude weekly limit reached, resets 3pm"
         );
         member.limit = None;
-        let value = session_json(&member);
+        let value = session_json(&member, 0);
         assert_eq!(value["state"], "Waiting");
         assert!(value["limit"].is_null());
     }

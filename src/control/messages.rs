@@ -242,7 +242,10 @@ fn delivery_json(handed: &Handed) -> Value {
     json!({
         "message": delivery.sent.message,
         "reach": delivery.sent.reach,
-        "recipient": delivery.recipient.as_ref().map(super::sessions::session_json),
+        "recipient": delivery
+            .recipient
+            .as_ref()
+            .map(|member| super::sessions::session_json(member, super::sessions::now_ms())),
         "notice": notice(handed),
         "agent": handed.agent,
     })
@@ -285,6 +288,7 @@ fn delivery_lines(handed: &Handed) -> String {
     if let Some(notice) = notice(handed) {
         lines.push(format!("But {notice}"));
     }
+    lines.extend(cold_notice(&handed.delivery, super::sessions::now_ms()));
     lines.join("\n")
 }
 
@@ -328,6 +332,16 @@ fn recipient_notice(delivery: &Delivery) -> Option<String> {
             super::sessions::account_phrase(account, now)
         )
     })
+}
+
+/// That the message woke a recipient whose prompt cache had likely expired,
+/// so its provider reads the conversation's whole context again.
+fn cold_notice(delivery: &Delivery, now: u64) -> Option<String> {
+    let tokens = delivery.recipient.as_ref()?.cold_context(now)?;
+    Some(format!(
+        "Its prompt cache had likely expired, so its provider reads all {} tokens of its context again.",
+        super::sessions::token_count(tokens)
+    ))
 }
 
 /// When a sent message reaches its recipient, as a sent line tells it.
@@ -844,6 +858,22 @@ mod tests {
         );
         let value = delivery_json(&handed);
         assert_eq!(value["recipient"]["state"], "Limited");
+        assert_eq!(cold_notice(&handed.delivery, 0), None);
+        handed.delivery.recipient.as_mut().unwrap().cache =
+            Some(crate::agent_execution::directory::PromptCache {
+                requested_at: 0,
+                ttl_ms: 60_000,
+                basis: crate::agent_execution::directory::TtlBasis::Observed,
+                context_tokens: 1_250_000,
+            });
+        assert_eq!(cold_notice(&handed.delivery, 30_000), None, "still warm");
+        assert_eq!(
+            cold_notice(&handed.delivery, 60_000).as_deref(),
+            Some(
+                "Its prompt cache had likely expired, so its provider reads all 1.2M tokens of its context again."
+            )
+        );
+        handed.delivery.recipient.as_mut().unwrap().cache = None;
         assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());
         assert_eq!(
             value["message"]["id"],

@@ -110,7 +110,7 @@ fn page_json(page: &Page, selected: &[String]) -> Value {
         json!({ "entries": fields::select(entries, selected) })
     } else {
         let mut data = json!({
-            "session": sessions::session_row(&page.session, None, Detail::Sparse),
+            "session": sessions::session_row(&page.session, None, Detail::Sparse, sessions::now_ms()),
             "entries": entries,
         });
         let accounts = sessions::accounts_json(vec![&page.session]);
