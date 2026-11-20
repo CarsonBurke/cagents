@@ -172,7 +172,10 @@ pub fn context_menu_popover<'a, Message: Clone + 'static>(
         content,
         position,
         on_close,
-        iced::Padding::ZERO,
+        // The native panel extends one pixel around its rows, its
+        // `background_expand`, so the rows' opaque backgrounds stay inside
+        // its border instead of covering it.
+        iced::Padding::new(NATIVE_MENU_EXPAND),
         cosmic::theme::Container::custom(|theme| {
             use cosmic::widget::menu::StyleSheet;
             let menu = theme.appearance(&Default::default(), true);
@@ -233,10 +236,14 @@ pub fn context_menu_rows<'a, Message: Clone + 'a>(
 /// The native width of a menu row with this label and no shortcut, as COSMIC
 /// measures one in `menu_items`.
 fn native_menu_width(label: &str) -> f32 {
-    (label.chars().count() as f32 * 8.5 + 80.0).clamp(NATIVE_MENU_MIN_WIDTH, 480.0)
+    (label.chars().count() as f32 * 8.5 + 80.0)
+        .clamp(NATIVE_MENU_MIN_WIDTH, 480.0)
+        .floor()
 }
 
 const NATIVE_MENU_MIN_WIDTH: f32 = 240.0;
+/// How far the native menu's panel extends around its rows.
+const NATIVE_MENU_EXPAND: f32 = 1.0;
 /// The icon column of a native menu row, kept empty in a row without one.
 const NATIVE_MENU_ICON_WIDTH: f32 = 14.0;
 
