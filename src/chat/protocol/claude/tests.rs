@@ -14739,3 +14739,46 @@ fn last_status(step: &Step) -> Option<(bool, &str)> {
         _ => None,
     })
 }
+
+#[test]
+fn a_main_request_reports_its_start_and_what_the_cache_served() {
+    use crate::chat::prompt_cache::Evidence;
+    let evidence = |step: Step| {
+        step.events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PromptCache(evidence) => Some(evidence),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut adapter = Claude::default();
+    let step = adapter
+        .receive(stream(
+            json!({"type":"message_start","message":{"id":"m","usage":{
+                "input_tokens": 12,
+                "cache_read_input_tokens": 90_000,
+                "cache_creation_input_tokens": 3_000,
+            }}}),
+        ))
+        .unwrap();
+    assert_eq!(
+        evidence(step),
+        [
+            Evidence::Request,
+            Evidence::Read {
+                prompt: 93_012,
+                cached: 90_000,
+            },
+        ]
+    );
+
+    // A subagent's request uses a cache of its own.
+    let step = adapter
+        .receive(
+            json!({"type":"stream_event", "parent_tool_use_id":"toolu_1",
+            "event":{"type":"message_start","message":{"id":"c","usage":{"input_tokens": 5}}}}),
+        )
+        .unwrap();
+    assert!(evidence(step).is_empty());
+}

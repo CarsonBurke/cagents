@@ -300,6 +300,12 @@ pub(super) fn list(
     let accounts = standing
         .then(|| super::account_info::Accounts::load(now))
         .flatten();
+    let calibration = standing.then(|| {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .prompt_cache
+            .clone()
+    });
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
@@ -389,11 +395,20 @@ pub(super) fn list(
         {
             account.stale = true;
         }
+        let cache = calibration
+            .as_ref()
+            .zip(live.chat.as_ref())
+            .zip(live.provider)
+            .and_then(|((calibration, chat), provider)| {
+                let (activity, context_tokens) = chat.prompt_cache();
+                calibration.estimate(provider, account.as_ref(), activity, context_tokens)
+            });
         let member = Member {
             session: entry,
             exited: live.exited,
             limit,
             account,
+            cache,
             failure: live.failure.map(|failure| {
                 let mut failure = match live.provider {
                     Some(provider) => {

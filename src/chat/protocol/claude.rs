@@ -3385,6 +3385,20 @@ impl Claude {
             .saturating_add(self.cache_write_tokens);
         step.events.push(Event::Usage(self.usage.clone()));
     }
+    /// A live `message_start` of the main conversation: its request started
+    /// about now, and its usage says how much of the prompt the cache served.
+    fn observe_request(&self, usage: &Value, step: &mut Step) {
+        use chat::prompt_cache::Evidence;
+        step.events.push(Event::PromptCache(Evidence::Request));
+        if let Some(input) = usage["input_tokens"].as_u64() {
+            step.events.push(Event::PromptCache(Evidence::Read {
+                prompt: input
+                    .saturating_add(self.cache_read_tokens)
+                    .saturating_add(self.cache_write_tokens),
+                cached: self.cache_read_tokens,
+            }));
+        }
+    }
     fn retract(&mut self, value: &Value, step: &mut Step) -> Result<(), String> {
         let Some(carriers) = value.as_array() else {
             return Ok(());
@@ -6882,6 +6896,7 @@ impl Claude {
                 if parent.is_empty() {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
+                    self.observe_request(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
                 } else {
                     // Only actual new child API activity clears a retryable

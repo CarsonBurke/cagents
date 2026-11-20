@@ -486,6 +486,7 @@ fn create_inner(
     Ok((
         spec,
         Box::new(Codex {
+            cache_reading_total: 0,
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
@@ -647,6 +648,9 @@ enum RequestKind {
 }
 #[derive(Default)]
 struct Codex {
+    /// The total input of the latest usage reading, which tells a new
+    /// request's reading from a repeated one.
+    cache_reading_total: u64,
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
@@ -3473,6 +3477,8 @@ impl Codex {
                     self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
                     step.events.push(Event::TurnStarted);
+                    step.events
+                        .push(Event::PromptCache(chat::prompt_cache::Evidence::Request));
                 }
                 self.materialized = true;
                 if method == "turn/completed" && current {
@@ -3677,6 +3683,26 @@ impl Codex {
                     }
                     step.events.push(Event::Item(item));
                 }
+                // Codex sends a tool's result back in a new request. Hosted
+                // tools run inside the request that called them. Codex reports
+                // a request's usage only after its tools finish, so the reading
+                // that follows may belong to an earlier request.
+                if done
+                    && matches!(
+                        params["item"]["type"].as_str(),
+                        Some(
+                            "commandExecution"
+                                | "fileChange"
+                                | "mcpToolCall"
+                                | "dynamicToolCall"
+                                | "collabAgentToolCall"
+                                | "imageView"
+                        )
+                    )
+                {
+                    step.events
+                        .push(Event::PromptCache(chat::prompt_cache::Evidence::Continued));
+                }
             }
             "item/agentMessage/delta"
             | "item/plan/delta"
@@ -3799,6 +3825,17 @@ impl Codex {
                     tokens(&usage["total"]),
                     tokens(&usage["last"]),
                 );
+                // Codex repeats its latest reading when a request fails, such
+                // as on a usage limit; only a grown total is a new request's.
+                // `inputTokens` includes what the cache served.
+                let total = usage["total"]["inputTokens"].as_u64().unwrap_or(0);
+                if total > std::mem::replace(&mut self.cache_reading_total, total) {
+                    step.events
+                        .push(Event::PromptCache(chat::prompt_cache::Evidence::Read {
+                            prompt: usage["last"]["inputTokens"].as_u64().unwrap_or(0),
+                            cached: usage["last"]["cachedInputTokens"].as_u64().unwrap_or(0),
+                        }));
+                }
                 step.events.push(Event::Usage(Usage {
                     cost_estimate,
                     input_tokens: usage["total"]["inputTokens"].as_u64().unwrap_or(0),

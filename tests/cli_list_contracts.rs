@@ -95,6 +95,7 @@ impl Listing {
                         active_at: None,
                         limit: None,
                         account: None,
+                        cache: None,
                     }]
                 } else {
                     vec![]

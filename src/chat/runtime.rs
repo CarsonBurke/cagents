@@ -243,6 +243,26 @@ pub(crate) enum Update {
     },
 }
 
+/// The conversation's prompt cache activity, which the actor records and
+/// its handle reads. Like the agent addresses, it stays out of the snapshot,
+/// whose layout older peers share.
+#[derive(Clone, Default)]
+struct PromptCache(Arc<Mutex<crate::chat::prompt_cache::Tracker>>);
+
+impl PromptCache {
+    fn observe(&self, evidence: crate::chat::prompt_cache::Evidence) -> bool {
+        let now = observed_at().unwrap_or_default();
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe(evidence, now)
+    }
+
+    fn activity(&self) -> crate::chat::prompt_cache::Activity {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).activity()
+    }
+}
+
 #[derive(Clone)]
 struct LocalHandle(Arc<Inner>);
 
@@ -303,6 +323,7 @@ struct Inner {
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     agent_addresses: AgentAddresses,
+    prompt_cache: PromptCache,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -595,6 +616,7 @@ impl LocalHandle {
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let agent_addresses = AgentAddresses::default();
+        let prompt_cache = PromptCache::default();
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -608,6 +630,7 @@ impl LocalHandle {
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
             agent_addresses: agent_addresses.clone(),
+            prompt_cache: prompt_cache.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -659,6 +682,7 @@ impl LocalHandle {
                     state,
                     confirmed_session,
                     agent_addresses,
+                    prompt_cache,
                     store,
                     visible,
                     observe_next,
@@ -1599,6 +1623,17 @@ impl LocalHandle {
     }
     /// How the provider addresses this conversation's subagents, where that
     /// is not by the IDs its snapshot lists them under.
+    pub(crate) fn prompt_cache(&self) -> crate::chat::prompt_cache::Activity {
+        self.0.prompt_cache.activity()
+    }
+    pub(crate) fn context_tokens(&self) -> u64 {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .usage
+            .context_tokens
+    }
     pub(crate) fn agent_addresses(&self) -> Vec<AgentAddress> {
         self.0.agent_addresses.list()
     }
@@ -2335,6 +2370,7 @@ struct Actor {
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     agent_addresses: AgentAddresses,
+    prompt_cache: PromptCache,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3392,10 +3428,12 @@ impl Actor {
     fn provider_step(&mut self, step: Step) -> Result<(), String> {
         // An account report is not output of this conversation, so it does
         // not mark an offscreen pane as having something new to read.
-        let observed = step
-            .events
-            .iter()
-            .any(|event| !matches!(event, Event::AccountUsage(_) | Event::AgentAddress(_)));
+        let observed = step.events.iter().any(|event| {
+            !matches!(
+                event,
+                Event::AccountUsage(_) | Event::AgentAddress(_) | Event::PromptCache(_)
+            )
+        });
         let identity = step.events.iter().rev().find_map(|event| match event {
             Event::Session { id, .. } => Some(Some(id.clone())),
             Event::Reset { .. } => Some(None),
@@ -3548,6 +3586,13 @@ impl Actor {
                 };
                 if let Some(revision) = changed {
                     (self.notify)(Update::ActiveModel { revision, model });
+                }
+                continue;
+            }
+            if let Event::PromptCache(evidence) = event {
+                // A frame of an earlier turn says nothing about the cache now.
+                if !suppress_current_notification && self.prompt_cache.observe(evidence) {
+                    self.resident_dirty = true;
                 }
                 continue;
             }
@@ -4117,6 +4162,7 @@ fn apply_projected_event(
         // to the surfaces before the store, so it never reaches a snapshot.
         Event::AccountUsage(_)
         | Event::AgentAddress(_)
+        | Event::PromptCache(_)
         | Event::LoginRecovered { .. }
         | Event::LoginVerificationFailed { .. } => {}
         Event::Capabilities(value) => state.capabilities = value,
