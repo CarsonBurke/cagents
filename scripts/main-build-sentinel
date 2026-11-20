@@ -1,6 +1,7 @@
 #!/usr/bin/python3
-"""Check every new first-parent main commit, serially, through the fw16 gate,
-then build the newest one that compiles for native evidence to start from."""
+"""Check main's newest commit through the fw16 gate whenever it moves, find
+which first-parent commit broke it when it fails after passing, then build the
+newest one that compiles for native evidence to start from."""
 import argparse
 import fcntl
 import json
@@ -79,28 +80,95 @@ def check_lane(command, checkout, environment, log_path, warnings_path, packages
     return status, len(warnings.own)
 
 
+def github(directory, state, *args):
+    result = subprocess.run(["gh", *args, "--repo", state["github_repository"]], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        # Do not retry into a shared rate limit. Ask for its actual reset once.
+        if "rate limit" in result.stderr.lower():
+            limits = run("gh", "api", "rate_limit", stdout=subprocess.PIPE)
+            resources = json.loads(limits.stdout)["resources"]
+            resets = [entry["reset"] for entry in resources.values()
+                      if entry.get("remaining") == 0]
+            state["retry_after"] = max([time.time() + 120, *resets])
+            save(directory / "state.json", state)
+        raise RuntimeError(result.stderr.strip())
+    return result.stdout.strip()
+
+
+def failed_lanes(result):
+    warnings = result.get("warnings", {})
+    return [lane for lane, status in result["lanes"].items() if status or warnings.get(lane)]
+
+
+def check_commit(repository, directory, sha, lanes):
+    """Checks out `sha` in the sentinel's worktree and checks each of `lanes`
+    the commit has; returns their exit statuses and warning counts."""
+    checkout = repository / ".worktrees" / "main-build-sentinel"
+    if checkout.exists():
+        if git(checkout, "status", "--porcelain"):
+            raise RuntimeError(f"sentinel checkout is dirty: {checkout}")
+        git(checkout, "checkout", "--detach", sha)
+    else:
+        git(repository, "worktree", "add", "--detach", str(checkout), sha)
+    (directory / "logs").mkdir(exist_ok=True)
+    statuses = {}
+    warnings = {}
+    packages = workspace_packages(checkout)
+    for lane in lanes:
+        if (lane in APPLICATION_LANES
+                and not (checkout / "crates/cagents-ui/Cargo.toml").exists()):
+            continue
+        command = [str(checkout / "scripts/cargo-gate"), "clippy", "--locked",
+                   "--no-default-features", "--all-targets", *LANES[lane]]
+        print(f"main-build-sentinel: {sha} {lane}", flush=True)
+        # No priority bypass, held lease, or local compilation override.
+        environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
+        statuses[lane], warnings[lane] = check_lane(
+            command, checkout, environment, directory / "logs" / f"{sha}-{lane}.log",
+            directory / "logs" / f"{sha}-{lane}-warnings.log", packages)
+    return statuses, warnings
+
+
+def bisect(repository, directory, state):
+    """Narrows the first-parent commits between the last passing one and the
+    failing tip down to the first that fails a lane the tip fails, checking
+    only those lanes, and names it on the issue."""
+    search = state["bisect"]
+    path = directory / "state.json"
+    commits = search["commits"]
+    # commits[good] passes and commits[bad] fails; -1 is the last passing commit.
+    while search["bad"] - search["good"] > 1:
+        middle = (search["good"] + search["bad"]) // 2
+        statuses, warnings = check_commit(repository, directory, commits[middle], search["lanes"])
+        fails = failed_lanes({"lanes": statuses, "warnings": warnings})
+        search["bad" if fails else "good"] = middle
+        save(path, state)
+    first = commits[search["bad"]]
+    if state.get("issue"):
+        subject = git(repository, "show", "-s", "--format=%s", first)
+        # Persisted first, so a failed call retries the comment, not the checks.
+        state["retry_after"] = time.time() + 120
+        save(path, state)
+        github(directory, state, "issue", "comment", str(state["issue"]), "--body",
+               f"First failing commit: `{first}` ({subject}). Bisected the "
+               f"{len(commits)} first-parent commits after `{search['after']}`, the last that "
+               f"passed, in the failing lane{'s' * (len(search['lanes']) != 1)}: "
+               f"{', '.join(search['lanes'])}.")
+        state.pop("retry_after", None)
+    state.pop("bisect")
+    save(path, state)
+
+
 def report(repository, directory, state):
     """Persist each successful report step; a failed API call never loses a result."""
     pending = state["pending"]
-    repo = state["github_repository"]
 
     def gh(*args):
-        result = subprocess.run(["gh", *args, "--repo", repo], text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode:
-            # Do not retry into a shared rate limit. Ask for its actual reset once.
-            if "rate limit" in result.stderr.lower():
-                limits = run("gh", "api", "rate_limit", stdout=subprocess.PIPE)
-                resources = json.loads(limits.stdout)["resources"]
-                resets = [entry["reset"] for entry in resources.values()
-                          if entry.get("remaining") == 0]
-                state["retry_after"] = max([time.time() + 120, *resets])
-                save(directory / "state.json", state)
-            raise RuntimeError(result.stderr.strip())
-        return result.stdout.strip()
+        return github(directory, state, *args)
 
     warnings = pending.get("warnings", {})
-    failed = [lane for lane, status in pending["lanes"].items() if status or warnings.get(lane)]
+    failed = failed_lanes(pending)
     if not failed:
         if state.get("failing"):
             gh("issue", "comment", str(state["issue"]), "--body",
@@ -225,9 +293,10 @@ def tick_locked(repository, directory, github_repository):
         if time.time() < state.get("retry_after", 0):
             return
         # The timestamp also bounds restart/manual invocations and failed Git fetches.
-        if time.time() - state.get("last_fetch", 0) < 120 and not state.get("pending"):
+        busy = state.get("pending") or state.get("bisect")
+        if time.time() - state.get("last_fetch", 0) < 120 and not busy:
             return
-        if not state.get("pending"):
+        if not busy:
             state["last_fetch"] = time.time()
             save(path, state)
             git(repository, "fetch", "--no-tags", "origin", "main")
@@ -241,34 +310,21 @@ def tick_locked(repository, directory, github_repository):
                                f"{previous}..{tip}").splitlines() if ancestor == 0 else [tip])
             else:
                 commits = [tip]
-            state["queue"] = commits
+            # Only the tip is checked: a commit after it would have to fix
+            # what one before it broke for main to pass with a break hidden.
+            # The rest are kept to bisect if the tip fails.
+            state["queue"] = commits[-1:]
+            state["between"] = commits[:-1]
             save(path, state)
         while state.get("pending") or state.get("queue"):
             if not state.get("pending"):
+                # A queue of every commit, as an earlier sentinel saved it.
+                if len(state["queue"]) > 1:
+                    state["between"] = [*state.get("between", []), *state["queue"][:-1]]
+                    state["queue"] = state["queue"][-1:]
+                    save(path, state)
                 sha = state["queue"][0]
-                checkout = repository / ".worktrees" / "main-build-sentinel"
-                if checkout.exists():
-                    if git(checkout, "status", "--porcelain"):
-                        raise RuntimeError(f"sentinel checkout is dirty: {checkout}")
-                    git(checkout, "checkout", "--detach", sha)
-                else:
-                    git(repository, "worktree", "add", "--detach", str(checkout), sha)
-                (directory / "logs").mkdir(exist_ok=True)
-                statuses = {}
-                warnings = {}
-                packages = workspace_packages(checkout)
-                for lane, selection in LANES.items():
-                    if (lane in APPLICATION_LANES
-                            and not (checkout / "crates/cagents-ui/Cargo.toml").exists()):
-                        continue
-                    command = [str(checkout / "scripts/cargo-gate"), "clippy", "--locked",
-                               "--no-default-features", "--all-targets", *selection]
-                    print(f"main-build-sentinel: {sha} {lane}", flush=True)
-                    # No priority bypass, held lease, or local compilation override.
-                    environment = dict(os.environ, CAGENTS_BUILD_REMOTE="fw16")
-                    statuses[lane], warnings[lane] = check_lane(
-                        command, checkout, environment, directory / "logs" / f"{sha}-{lane}.log",
-                        directory / "logs" / f"{sha}-{lane}-warnings.log", packages)
+                statuses, warnings = check_commit(repository, directory, sha, LANES)
                 state["pending"] = {"sha": sha, "lanes": statuses, "warnings": warnings}
                 save(path, state)
             state["retry_after"] = time.time() + 120
@@ -276,6 +332,12 @@ def tick_locked(repository, directory, github_repository):
             report(repository, directory, state)
             state.pop("retry_after", None)
             pending = state.pop("pending")
+            failed = failed_lanes(pending)
+            between = state.pop("between", [])
+            # Only a break since a passing commit has a first failing commit.
+            if failed and between and state.get("checked") and state.get("checked") == state.get("last_good"):
+                state["bisect"] = {"after": state["checked"], "commits": [*between, pending["sha"]],
+                                   "lanes": failed, "good": -1, "bad": len(between)}
             state["checked"] = pending["sha"]
             if not any(pending["lanes"].values()):
                 state["compiled"] = pending["sha"]
@@ -283,7 +345,10 @@ def tick_locked(repository, directory, github_repository):
                     state["last_good"] = pending["sha"]
             state["queue"].pop(0)
             save(path, state)
+        # Before bisecting moves the checkout off the commit it builds.
         keep_main_build(repository, directory, state)
+        if state.get("bisect"):
+            bisect(repository, directory, state)
 
 
 def main():

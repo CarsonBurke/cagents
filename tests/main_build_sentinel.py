@@ -117,17 +117,18 @@ if sys.argv[1:3] == ['issue', 'create']:
     def recorded(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
-    def test_all_three_lanes_and_every_new_commit_without_noop_rebuilds(self):
+    def test_every_lane_of_the_newest_commit_without_noop_rebuilds(self):
         self.tick()
-        second = self.commit("merge one")
+        self.commit("merge one")
         third = self.commit("merge two")
         self.now += 120
         self.tick()
         self.now += 120
         self.tick()
         records = self.recorded()
+        # A passing tip vouches for the commits before it.
         self.assertEqual([(entry[0], entry[1]) for entry in records],
-                         [(sha, lane) for sha in (self.first, second, third) for lane in sentinel.LANES])
+                         [(sha, lane) for sha in (self.first, third) for lane in sentinel.LANES])
         for entry in records:
             self.assertEqual(entry[2][:4], ['clippy', '--locked', '--no-default-features', '--all-targets'])
             self.assertEqual(entry[2][-1], '--message-format=json')
@@ -167,6 +168,86 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.tick()
         self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] and fixed in str(entry)
                             for entry in self.recorded()))
+
+    def test_a_failing_tip_is_bisected_to_the_first_failing_commit_in_its_failing_lanes(self):
+        self.tick()
+        commits = [self.commit("merge one"), self.commit("merge two"),
+                   self.commit("incompatible merge", warning="ui"), self.commit("merge four"),
+                   self.commit("merge five"), self.commit("merge six")]
+        self.now += 120
+        self.tick()
+        records = self.recorded()
+        checks = [(entry[0], entry[1]) for entry in records if len(entry) == 4]
+        # The tip in every lane, then only the lane it fails, halving the range.
+        self.assertEqual(checks[len(sentinel.LANES):2 * len(sentinel.LANES)],
+                         [(commits[-1], lane) for lane in sentinel.LANES])
+        bisected = checks[2 * len(sentinel.LANES):]
+        self.assertEqual({lane for _, lane in bisected}, {"ui"})
+        self.assertLessEqual(len(bisected), 3)
+        comments = [entry for entry in records if entry[:3] == ["issue", "comment", "42"]]
+        self.assertEqual(len(comments), 1)
+        self.assertIn(f"First failing commit: `{commits[2]}` (incompatible merge)", comments[0][4])
+        self.assertIn(f"after `{self.first}`", comments[0][4])
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertNotIn("bisect", state)
+        self.assertEqual(state["checked"], commits[-1])
+        self.assertEqual(state["last_good"], self.first)
+
+    def test_a_tip_failing_since_an_earlier_failure_is_not_bisected(self):
+        self.tick()
+        self.commit("incompatible merge", broken="host")
+        self.now += 120
+        self.tick()
+        before = len(self.recorded())
+        self.commit("merge one")
+        tip = self.commit("merge two")
+        self.now += 120
+        self.tick()
+        checks = [entry[:2] for entry in self.recorded()[before:] if len(entry) == 4]
+        self.assertEqual(checks, [[tip, lane] for lane in sentinel.LANES])
+        self.assertFalse(any(entry[:2] == ["issue", "comment"] for entry in self.recorded()))
+
+    def test_an_interrupted_bisection_resumes_without_checking_again_what_it_checked(self):
+        self.tick()
+        commits = [self.commit("merge one", broken="cli"), self.commit("merge two"),
+                   self.commit("merge three"), self.commit("merge four")]
+        checked = []
+        real = sentinel.check_commit
+
+        def interrupted(repository, directory, sha, lanes):
+            checked.append((sha, tuple(lanes)))
+            if len(checked) == 2:
+                raise KeyboardInterrupt
+            return real(repository, directory, sha, lanes)
+        self.now += 120
+        with patch.object(sentinel, "check_commit", interrupted), self.assertRaises(KeyboardInterrupt):
+            self.tick()
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(state["bisect"]["commits"], commits)
+        self.now += 1
+        self.tick()
+        # The tip, the first middle once more (it was interrupted), then the rest.
+        self.assertEqual(checked[0], (commits[-1], tuple(sentinel.LANES)))
+        comments = [entry for entry in self.recorded() if entry[:3] == ["issue", "comment", "42"]]
+        self.assertIn(f"First failing commit: `{commits[0]}`", comments[0][4])
+        self.assertFalse(any(entry[:2] == ["fetch"] for entry in self.recorded()))
+
+    def test_a_queue_of_every_commit_an_earlier_sentinel_saved_checks_only_its_newest(self):
+        self.tick()
+        commits = [self.commit("merge one"), self.commit("merge two"), self.commit("merge three")]
+        self.command("git", "-C", str(self.repo), "fetch", "-q", "origin", "main")
+        path = self.state / "state.json"
+        state = json.loads(path.read_text())
+        # A fetch rebuilds the queue; one behind a result still to report is kept.
+        passed = {lane: 0 for lane in sentinel.LANES}
+        path.write_text(json.dumps(state | {"queue": commits, "pending": {
+            "sha": commits[0], "lanes": passed, "warnings": {}}}))
+        before = len(self.recorded())
+        self.now += 1
+        self.tick()
+        checks = [entry[:2] for entry in self.recorded()[before:] if len(entry) == 4]
+        self.assertEqual(checks, [[commits[-1], lane] for lane in sentinel.LANES])
+        self.assertEqual(json.loads(path.read_text())["checked"], commits[-1])
 
     def test_workspace_warnings_fail_the_check_but_vendored_ones_do_not(self):
         self.tick()

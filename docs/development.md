@@ -791,8 +791,12 @@ a cold check took 35 s for the CLI, 53 s for the host, 62 s for the UI and
 
 GitHub's script checks do not compile Rust. On fw16,
 `scripts/main-build-sentinel --repository /absolute/path/to/cagents` fetches main
-at most once every two minutes and checks every new first-parent commit in
-order. Its first run checks the current tip. Each commit gets five separate
+at most once every two minutes and checks its newest commit whenever it has
+moved. A passing tip vouches for the commits merged before it: for one of them
+to hide a break, a later one would have to undo it. When the tip fails after a
+passing check, the sentinel bisects the first-parent commits in between, in
+the lanes the tip fails only, and names the first failing commit on the issue.
+It does not fetch again until it has. Each checked commit gets five separate
 `scripts/cargo-gate clippy --locked --no-default-features --all-targets` commands:
 CLI, `--features host`, `--features ui`, `-p cagents-ui`, and
 `-p cagents-ui --features browser-protocol-fixture`, the integrated-browser
