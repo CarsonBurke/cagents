@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="cagents" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="coral" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF8A55"/><stop offset="1" stop-color="#EE5A24"/></linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#74CCBC"/><stop offset="1" stop-color="#46988A"/></linearGradient>
+    <linearGradient id="slate" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7C8FB2"/><stop offset="1" stop-color="#5A6B8C"/></linearGradient>
+    <linearGradient id="ivory" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#ECEAE6"/></linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2A3043"/><stop offset="1" stop-color="#181C28"/></linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".45"/><stop offset=".3" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0B0D14" flood-opacity=".35"/></filter>
+    <linearGradient id="obs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3B4660"/><stop offset=".5" stop-color="#2A3245"/><stop offset="1" stop-color="#222939"/></linearGradient>
+    <linearGradient id="obs-deep" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#262D3E"/><stop offset="1" stop-color="#191E2A"/></linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".34"/><stop offset=".3" stop-color="#fff" stop-opacity=".06"/><stop offset="1" stop-color="#fff" stop-opacity=".1"/></linearGradient>
+    <filter id="sh-r" x="-20%" y="-20%" width="150%" height="150%"><feDropShadow dx="3.5" dy="2" stdDeviation="2.4" flood-color="#05070C" flood-opacity=".6"/></filter>
+    <filter id="sh-l" x="-30%" y="-20%" width="150%" height="150%"><feDropShadow dx="-3.5" dy="2" stdDeviation="2.4" flood-color="#05070C" flood-opacity=".6"/></filter>
+    <linearGradient id="obs-back" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#303A50"/><stop offset="1" stop-color="#1C2230"/></linearGradient>
+  </defs>
+  <clipPath id="pc27"><rect x="62" y="14" width="54" height="92" rx="10"/></clipPath>
+  <g filter="url(#sh)">
+  <rect x="62" y="19" width="54" height="92" rx="10" fill="#11151F"/>
+  <rect x="62" y="14" width="54" height="92" rx="10" fill="url(#obs-back)"/>
+  <rect x="62" y="14" width="54" height="8" fill="#6CC2B3" clip-path="url(#pc27)"/>
+  <rect x="62.8" y="14.8" width="52.4" height="90.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+  <rect x="94" y="32" width="16" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+  <rect x="94" y="41" width="10" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.5"/>
+  <rect x="94" y="50" width="14" height="4.5" rx="2.25" fill="#6CC2B3" opacity="0.85"/>
+  </g>
+  <clipPath id="pc28"><rect x="37" y="14" width="54" height="92" rx="10"/></clipPath>
+  <g filter="url(#sh-r)">
+  <rect x="37" y="19" width="54" height="92" rx="10" fill="#11151F"/>
+  <rect x="37" y="14" width="54" height="92" rx="10" fill="url(#obs-deep)"/>
+  <rect x="37" y="14" width="54" height="8" fill="#8EA4C8" clip-path="url(#pc28)"/>
+  <rect x="37.8" y="14.8" width="52.4" height="90.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+  <rect x="69" y="32" width="16" height="4.5" rx="2.25" fill="#8EA4C8" opacity="0.85"/>
+  <rect x="69" y="41" width="12" height="4.5" rx="2.25" fill="#8EA4C8" opacity="0.5"/>
+  <rect x="69" y="50" width="14" height="4.5" rx="2.25" fill="#8EA4C8" opacity="0.85"/>
+  </g>
+  <clipPath id="pc29"><rect x="12" y="14" width="54" height="92" rx="10"/></clipPath>
+  <g filter="url(#sh-r)">
+  <rect x="12" y="19" width="54" height="92" rx="10" fill="#11151F"/>
+  <rect x="12" y="14" width="54" height="92" rx="10" fill="url(#obs)"/>
+  <rect x="12" y="14" width="54" height="8" fill="#FF7A48" clip-path="url(#pc29)"/>
+  <rect x="12.8" y="14.8" width="52.4" height="90.4" rx="9.2" fill="none" stroke="url(#rim)" stroke-width="1.6"/>
+  <path d="M 23 52 L 31.5 60.5 L 23 69.0" fill="none" stroke="#FF7A48" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="39.0" y="63.0" width="17.0" height="6" rx="3.0" fill="#F2F4F8" opacity="1"/>
+  </g>
+</svg>
