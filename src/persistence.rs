@@ -2672,19 +2672,18 @@ impl StateStore {
         mut owners: TranscriptOwners,
         retention: TranscriptRetention,
     ) -> Result<TranscriptPruneReport> {
-        owners.saved.extend(self.live_terminal_ids()?);
+        owners.saved.extend(self.claimed_transcript_names()?);
         Ok(listing.prune(&owners, retention))
     }
 
-    /// Every terminal id storage still knows about, from both tables that can
-    /// name one: a recipe row can outlive its transcript metadata and vice
-    /// versa, and either is reason enough to keep the file.
-    pub fn live_terminal_ids(&self) -> Result<HashSet<String>> {
+    /// The name of every transcript this store's terminals and conversations
+    /// still claim; see [`read_claimed_transcript_names`].
+    pub fn claimed_transcript_names(&self) -> Result<HashSet<String>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let mut live = HashSet::new();
-        collect_live_terminal_ids(&inner.connection, &mut live)?;
-        Ok(live)
+        let mut claimed = HashSet::new();
+        collect_claimed_transcript_names(&inner.connection, &mut claimed)?;
+        Ok(claimed)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2761,23 +2760,37 @@ fn checkpoint_wal(connection: &Connection) {
 /// Suffix of a terminal transcript file, as written by the terminal host.
 const TRANSCRIPT_SUFFIX: &str = ".log";
 
-/// Terminal ids a window database still knows about, read without opening a
-/// second writable store.
+/// The name pruning knows a transcript by: `<name>` of its `<name>.log` file.
+///
+/// A terminal's transcript is usually named for the terminal, but not always:
+/// a terminal returned from a conversation keeps appending to the transcript
+/// of the terminal the conversation started from. So owners claim the names of
+/// the files they write, as well as their own ids.
+pub fn transcript_name(path: &Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()?
+        .strip_suffix(TRANSCRIPT_SUFFIX)
+        .filter(|name| !name.is_empty())
+}
+
+/// The transcript names a window database still claims, read without opening
+/// a second writable store: every terminal's and conversation's id, and the
+/// name of every transcript path it records.
 ///
 /// Every window has its own database and they all share one transcript
 /// directory, so pruning has to ask every database before it can call a
 /// transcript orphaned. The connection is read-only and `NOFOLLOW`, exactly
 /// like [`StateStore::copy_snapshot`]: it never migrates, reconciles, or
 /// writes to a database another window owns.
-pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
+pub fn read_claimed_transcript_names(path: &Path) -> Result<HashSet<String>> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
-    let mut live = HashSet::new();
-    collect_live_terminal_ids(&connection, &mut live)?;
-    Ok(live)
+    let mut claimed = HashSet::new();
+    collect_claimed_transcript_names(&connection, &mut claimed)?;
+    Ok(claimed)
 }
 
 /// Read navigation identities without migrating or acquiring another window's
@@ -3439,7 +3452,12 @@ pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, Saved
     Ok(owners)
 }
 
-fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>) -> Result<()> {
+/// A recipe row can outlive its transcript metadata and vice versa, and
+/// either is reason enough to keep the file.
+fn collect_claimed_transcript_names(
+    connection: &Connection,
+    claimed: &mut HashSet<String>,
+) -> Result<()> {
     for sql in [
         "SELECT terminal_id FROM terminal_recipes",
         "SELECT terminal_id FROM transcript_metadata",
@@ -3447,15 +3465,52 @@ fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>
         let mut statement = connection.prepare(sql)?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
-            live.insert(row?);
+            claimed.insert(row?);
         }
+    }
+    let mut claim_path = |path: &Path| {
+        if let Some(name) = transcript_name(path) {
+            claimed.insert(name.to_owned());
+        }
+    };
+    let mut statement = connection.prepare("SELECT path_json FROM transcript_metadata")?;
+    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+        let path: PathBuf = from_json("transcript path", &row?)?;
+        claim_path(&path);
     }
     let mut statement = connection.prepare(
         "SELECT content_json FROM cards WHERE kind_tag = 'terminal' AND content_json IS NOT NULL",
     )?;
     for row in statement.query_map([], |row| row.get::<_, String>(0))? {
         let terminal: TerminalSession = from_json("archived terminal", &row?)?;
-        live.insert(terminal.id.to_string());
+        if let Some(path) = &terminal.transcript_path {
+            claim_path(path);
+        }
+        claimed.insert(terminal.id.to_string());
+    }
+    // A conversation started from a terminal keeps that terminal's transcript
+    // path, and a terminal returned from it appends to the same file. Only
+    // that path is read, so a conversation stored by another build still
+    // claims it.
+    #[derive(serde::Deserialize)]
+    struct ConversationTranscript {
+        terminal: Option<TerminalTranscript>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TerminalTranscript {
+        transcript_path: Option<PathBuf>,
+    }
+    let mut statement = connection.prepare(
+        "SELECT content_json FROM cards WHERE kind_tag = 'chat' AND content_json IS NOT NULL",
+    )?;
+    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+        let conversation: ConversationTranscript = from_json("conversation", &row?)?;
+        if let Some(path) = conversation
+            .terminal
+            .and_then(|terminal| terminal.transcript_path)
+        {
+            claim_path(&path);
+        }
     }
     Ok(())
 }
@@ -3483,13 +3538,14 @@ impl Default for TranscriptRetention {
     }
 }
 
-/// Who still needs a transcript, gathered after its directory was listed.
+/// Who still needs a transcript, gathered after its directory was listed, as
+/// [`transcript_name`]s.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranscriptOwners {
-    /// Terminal ids the daemon holds or is starting. Their writers may still
-    /// append, so no rule removes their transcripts.
+    /// What the daemon's terminals and conversations hold or are starting.
+    /// Their writers may still append, so no rule removes these.
     pub resident: HashSet<String>,
-    /// Terminal ids the window databases record.
+    /// What the window databases record.
     pub saved: HashSet<String>,
     /// Whether `saved` covers every window database. Every window keeps its
     /// own database but they all write into one transcript directory, so if
@@ -3528,7 +3584,7 @@ pub struct TranscriptListing {
 
 #[derive(Debug)]
 struct ListedTranscript {
-    id: String,
+    name: String,
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
@@ -3560,11 +3616,7 @@ impl TranscriptListing {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(id) = name
-                .to_str()
-                .and_then(|name| name.strip_suffix(TRANSCRIPT_SUFFIX))
-                .filter(|id| !id.is_empty())
-            else {
+            let Some(transcript) = transcript_name(Path::new(&name)) else {
                 continue;
             };
             // `name` is a single component from this directory's own listing,
@@ -3588,7 +3640,7 @@ impl TranscriptListing {
                 continue;
             }
             listing.candidates.push(ListedTranscript {
-                id: id.to_owned(),
+                name: transcript.to_owned(),
                 path,
                 bytes: metadata.len(),
                 modified: metadata.modified().unwrap_or(UNIX_EPOCH),
@@ -3600,6 +3652,12 @@ impl TranscriptListing {
     /// Whether the scan found no transcript to judge.
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
+    }
+
+    /// Entries the scan refused for being symlinks or otherwise not plain
+    /// files, which no pass removes.
+    pub fn refused(&self) -> usize {
+        self.refused
     }
 
     fn prune(
@@ -3614,12 +3672,12 @@ impl TranscriptListing {
         let mut resident_bytes = 0;
         let mut evictable = Vec::new();
         for transcript in self.candidates {
-            if owners.resident.contains(&transcript.id) {
+            if owners.resident.contains(&transcript.name) {
                 resident_bytes += transcript.bytes;
                 report.retained += 1;
                 continue;
             }
-            if owners.every_window_read && !owners.saved.contains(&transcript.id) {
+            if owners.every_window_read && !owners.saved.contains(&transcript.name) {
                 if remove_transcript(&transcript.path, "its terminal no longer exists") {
                     report.removed_orphaned += 1;
                 } else {
@@ -12699,9 +12757,9 @@ mod tests {
                 .unwrap();
         }
         let inner = store.lock_inner().unwrap();
-        let mut live = HashSet::new();
-        collect_live_terminal_ids(&inner.connection, &mut live).unwrap();
-        assert!(live.contains(&replacement.id.to_string()));
+        let mut claimed = HashSet::new();
+        collect_claimed_transcript_names(&inner.connection, &mut claimed).unwrap();
+        assert!(claimed.contains(&replacement.id.to_string()));
         drop(inner);
         // Save just the closed card: the active card has been deliberately
         // removed from this fixture's snapshot and becomes a tombstone.
@@ -14441,6 +14499,46 @@ mod tests {
         assert_eq!(report.retained, 1);
         assert!(directory.join(format!("{live}.log")).is_file());
         assert!(!directory.join(format!("{orphan}.log")).exists());
+    }
+
+    /// A terminal returned from a conversation keeps appending to the
+    /// transcript of the terminal the conversation started from, and the
+    /// conversation carries that path meanwhile. Both claim the file by name.
+    #[test]
+    fn stored_terminals_and_conversations_claim_the_transcripts_they_inherited() {
+        let store_directory = tempdir().unwrap();
+        let store = StateStore::open(
+            store_directory.path().join("state.sqlite3"),
+            boot("chat-boot"),
+        )
+        .unwrap();
+        let (mut workspace, mut conversation) = agent_workspace(crate::agent::Provider::Claude);
+        let returned_from = TerminalId::new();
+        let CardKind::Terminal(terminal) = &mut workspace.cards[0].kind else {
+            unreachable!("the fixture card is a terminal")
+        };
+        terminal.transcript_path = Some(PathBuf::from(format!("/transcripts/{returned_from}.log")));
+        let carried = TerminalId::new();
+        conversation.id = TerminalId::new();
+        let source = conversation.terminal.as_mut().unwrap();
+        source.id = conversation.id;
+        source.transcript_path = Some(PathBuf::from(format!("/transcripts/{carried}.log")));
+        conversation.launch.recipe = source.launch.clone();
+        let mut chat_card = workspace.cards[0].clone();
+        chat_card.id = CardId::new();
+        chat_card.kind = CardKind::Chat(conversation);
+        workspace.cards.push(chat_card);
+        SaveLane::default().save(&store, &workspace).unwrap();
+
+        let claimed = store.claimed_transcript_names().unwrap();
+
+        assert!(claimed.contains(&returned_from.to_string()));
+        assert!(claimed.contains(&carried.to_string()));
+        assert_eq!(
+            read_claimed_transcript_names(&store_directory.path().join("state.sqlite3")).unwrap(),
+            claimed,
+            "another window reads the same claims"
+        );
     }
 
     /// #3388: a window starts a terminal, whose writer creates its transcript,

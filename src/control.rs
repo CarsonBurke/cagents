@@ -1010,6 +1010,13 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
 /// How long a window waits for the device to answer one device operation.
 pub const DEVICE_OPERATION_DEADLINE: Duration = Duration::from_secs(120);
 
+/// What [`ControlClient::resident_terminals`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentTerminals {
+    pub terminals: Vec<TerminalId>,
+    pub transcripts: Vec<PathBuf>,
+}
+
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
@@ -1235,12 +1242,19 @@ impl ControlClient {
         }
     }
 
-    /// Every terminal the daemon holds or is starting, read at one instant.
-    /// A terminal is among them from before its transcript writer starts
+    /// Every terminal and conversation the daemon holds or is starting, and
+    /// the transcripts they write, read at one instant. A terminal is among
+    /// them, with its transcript, from before its transcript writer starts
     /// until it is closed or retired.
-    pub fn resident_terminals(&mut self) -> Result<Vec<TerminalId>, ControlError> {
+    pub fn resident_terminals(&mut self) -> Result<ResidentTerminals, ControlError> {
         match self.request_strict(ClientRequest::ListResidentTerminals)? {
-            ServerResponse::ResidentTerminals { terminals } => Ok(terminals),
+            ServerResponse::ResidentTerminals {
+                terminals,
+                transcripts,
+            } => Ok(ResidentTerminals {
+                terminals,
+                transcripts,
+            }),
             response => Err(unexpected_response("the resident terminals", &response)),
         }
     }
