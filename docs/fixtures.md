@@ -1132,7 +1132,10 @@ its older `models` and `modes` lists. Run as `muse...` or with
 `-contributor` model beside each ordinary one, a reasoning option only on
 `muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
 soon as a session opens, and usage with no context size. It ignores its
-arguments, so a launch recipe written for the real agent runs it unchanged.
+arguments, so a launch recipe written for the real agent runs it unchanged,
+except Antigravity's `--app-data-dir DIR`: like `agy`, a process started
+with it keeps its conversations apart from the ones it lists otherwise, so
+the account check's own sessions are not listed as the reader's.
 It contacts no model, account or network.
 
 In the Muse shape, three account commands answer the way `muse` does, so the
@@ -1148,9 +1151,19 @@ Signing out is a `signed-out` file under `FAKE_ACP_STATE`, so it lasts
 across processes until `login`.
 
 It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
-replays a conversation from an earlier process and `session/list` finds it.
-Point it at the fixture's own directory; without it, sessions go to a
-directory in the system's temporary directory.
+replays a conversation from an earlier process and `session/list` lists
+it, newest first, with its directory, title and last activity. Point it at
+the fixture's own directory; without it, sessions go to a directory in the
+system's temporary directory.
+
+With `FAKE_ACP_PRESENCE=1`, it locks a conversation while it has one open,
+where the real agent does under `$HOME`: Antigravity's
+`~/.gemini/antigravity-cli/presence/ID.lock`, which stays behind unlocked
+once it closes, and Muse's `.session.lock` in the conversation's dated
+directory under `~/.local/share/muse/sessions`. The Resume conversation
+picker reads these locks to say a conversation is open elsewhere. Set it
+only for a `$HOME` that is the fixture's own; `fixture-acp.sh` sets it when
+that is so.
 
 The first of these words a prompt contains chooses what it does:
 
@@ -1172,7 +1185,8 @@ failures:
 
 | Variable | Effect |
 | --- | --- |
-| `FAKE_ACP_AUTH=initialize`, `new`, `load` or `prompt` | that request answers that sign-in is required |
+| `FAKE_ACP_AUTH=initialize`, `new`, `load`, `list` or `prompt` | that request answers that sign-in is required |
+| `FAKE_ACP_LIST_PAGE=N` | `session/list` answers `N` conversations a page, each with the `nextCursor` of the next |
 | `FAKE_ACP_NO_LOAD=1` | the agent does not offer to load a session |
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
@@ -1190,6 +1204,14 @@ loaded session that sign-in is required, and the app's sign-in, `agy acp
 ```sh
 evidence env touch '{fixture}/acp/agy/signed-out'
 ```
+
+A conversation started outside cagents is one the fake agent saved without
+the app: run the fixture's `agy acp` (or `muse-upstream acp`) and open a
+session with `session/new`, or write an entry into `acp/AGENT/index.json`
+(`{"ID": {"cwd": DIRECTORY, "title": TITLE, "updatedAt": RFC3339}}`), which
+`session/list` lists as it is. `session/load` replays it only once
+`acp/AGENT/sessions/ID.jsonl` holds its session updates, one a line; an
+empty file loads it with no history.
 
 A plain start installs neither, so Antigravity and Muse are not installed.
 
