@@ -832,8 +832,14 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
 /// all - keeps its probed figure. Fable's window is the probe's, whatever
 /// version of the name Claude scoped it to. The binding mark is dropped
 /// because the event does not say which window binds; the fullest window
-/// stands in until the next probe.
+/// stands in until the next probe. A model-only report keeps the account's
+/// status evidence and observation time until account-wide usage arrives.
 pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at: u64) {
+    let account_wide = update.status.is_some()
+        || update
+            .windows
+            .iter()
+            .any(|window| window.kind != WindowKind::Scoped);
     snapshot
         .windows
         .retain(|window| window.key != RETIRED_FABLE);
@@ -854,7 +860,13 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
     for window in &mut snapshot.windows {
         window.binding = false;
     }
-    snapshot.observed_at = snapshot.observed_at.max(observed_at);
+    if !account_wide {
+        if matches!(snapshot.status, UsageStatus::Ok | UsageStatus::Warning) {
+            snapshot.refresh_status(false, snapshot.status == UsageStatus::Warning);
+        }
+        return;
+    }
+    snapshot.observed_at = observed_at;
     snapshot.source = UsageSource::Live;
     snapshot.detail = None;
     match update.status {
@@ -1324,6 +1336,128 @@ mod tests {
         assert!(super::super::routing::needs_alternate(&usage, now));
         assert!(!super::super::routing::available(&usage, now));
         assert_eq!(parse_rate_limit_event(&json!({"status": "allowed"})), None);
+    }
+
+    #[test]
+    fn a_model_only_report_keeps_an_account_wide_rejection() {
+        use super::super::{LiveReport, routing};
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                {"kind": "weekly_all", "percent": 40, "resets_at": "2030-01-07T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        assert_eq!(usage.status, UsageStatus::Ok);
+        assert!(routing::available(&usage, now));
+        let ordinary_windows = usage.windows.clone();
+
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(rejection.windows.is_empty());
+        assert!(LiveReport::Claude(rejection).apply(&mut usage, now + 1, now + 1));
+        assert_eq!(usage.windows, ordinary_windows);
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert!(!routing::available(&usage, now + 1));
+
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "seven_day_overage_included",
+            "utilization": 1.0, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut usage, now + 2, now + 2));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert!(!routing::available(&usage, now + 2));
+        assert!(routing::needs_alternate(&usage, now + 2));
+        assert_eq!(usage.observed_at, now + 1);
+        assert_eq!(&usage.windows[..2], ordinary_windows);
+        assert_eq!(usage.windows[2].key, FABLE);
+        assert_eq!(usage.windows[2].used, 1.0);
+
+        let recovery = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.3,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(recovery).apply(&mut usage, now + 3, now + 3));
+        assert_eq!(usage.status, UsageStatus::Ok);
+        assert_eq!(usage.observed_at, now + 3);
+        assert!(routing::available(&usage, now + 3));
+    }
+
+    #[test]
+    fn a_model_only_report_does_not_renew_account_wide_evidence() {
+        use super::super::{LiveReport, routing, schedule};
+
+        let now = 1_790_000_000_000;
+        let later = now + schedule::DISPLAY_STALE_AFTER + 1;
+        for status in [
+            UsageStatus::Ok,
+            UsageStatus::Warning,
+            UsageStatus::Limited,
+            UsageStatus::NeedsLogin,
+            UsageStatus::Unavailable,
+        ] {
+            let mut usage = parse_usage(
+                &json!({"rate_limits": {"limits": [
+                    {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                ]}}),
+                now,
+            );
+            usage.status = status;
+            usage.detail = Some("existing account detail".into());
+            let previous = usage.clone();
+            let scoped = parse_rate_limit_event(&json!({
+                "status": "allowed", "rateLimitType": "seven_day_overage_included",
+                "utilization": 0.1, "resetsAt": 1_893_456_000_i64,
+            }))
+            .unwrap();
+            assert!(LiveReport::Claude(scoped).apply(&mut usage, later, later));
+            assert_eq!(usage.observed_at, previous.observed_at, "{status:?}");
+            assert_eq!(usage.source, previous.source, "{status:?}");
+            assert_eq!(usage.detail, previous.detail, "{status:?}");
+            assert_eq!(usage.status, previous.status, "{status:?}");
+            assert!(!routing::available(&usage, later), "{status:?}");
+            assert_eq!(usage.windows[1].key, FABLE);
+            assert_eq!(usage.windows[1].used, 0.1);
+        }
+    }
+
+    #[test]
+    fn account_windows_in_a_model_report_can_replace_a_rejection() {
+        use super::super::{LiveReport, routing};
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(rejection).apply(&mut usage, now + 1, now + 1));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        let update = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "seven_day_overage_included",
+            "unifiedWindows": {
+                "five_hour": {"utilization": 0.25, "resetsAt": 1_893_456_000_i64},
+                "seven_day_overage_included": {"utilization": 1.0, "resetsAt": 1_893_456_000_i64},
+            },
+        }))
+        .unwrap();
+        assert_eq!(update.status, None);
+        assert!(LiveReport::Claude(update).apply(&mut usage, now + 2, now + 2));
+        assert_eq!(usage.observed_at, now + 2);
+        assert_eq!(usage.source, UsageSource::Live);
+        assert_eq!(usage.status, UsageStatus::Warning);
+        assert_eq!(usage.windows[0].used, 0.25);
+        assert!(routing::available(&usage, now + 2));
     }
 
     #[test]
