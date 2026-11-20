@@ -1260,6 +1260,7 @@ mod tests {
                 .env_clear()
                 .env(CHILD, "1")
                 .env("HOME", directory.path())
+                .env("TMPDIR", directory.path())
                 .env("PATH", isolated_path)
                 .status()
                 .unwrap();
