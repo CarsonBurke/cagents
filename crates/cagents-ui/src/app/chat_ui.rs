@@ -11514,9 +11514,12 @@ impl Cagents {
         let snapshot = handle.snapshot();
         if snapshot.exited {
             // The error is the last the conversation reported, which is
-            // not always why it stopped.
+            // not always why it stopped. A sign-in failure is why, and kept
+            // in the provider's own words it offers the draft the sign-in
+            // recovery a started conversation gets.
             let stopped = "The conversation stopped before it took the first message.";
             let error = match &snapshot.error {
+                Some(error) if chat::requires_sign_in(provider, error) => error.clone(),
                 Some(error) => format!("{stopped} Its last report: {error}"),
                 None => stopped.to_owned(),
             };
