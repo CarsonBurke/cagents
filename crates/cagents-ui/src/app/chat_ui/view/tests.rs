@@ -5568,7 +5568,7 @@ fn a_stop_marker_is_one_quiet_row_with_nothing_to_open() {
     assert!(
         labels
             .iter()
-            .any(|(_, label)| *label == chat::STOPPED_NOTICE),
+            .any(|(_, label)| *label == "You stopped this turn"),
         "the marker says the turn stopped: {labels:?}"
     );
     assert!(
