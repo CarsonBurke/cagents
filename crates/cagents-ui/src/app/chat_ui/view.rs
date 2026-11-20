@@ -7380,9 +7380,10 @@ fn footer_model_label<'a>(
         }
     };
     // A level the chosen model doesn't offer is not one it will run at: the
-    // conversation drops it when it switches to that model. An ACP agent
-    // lists each model's own levels, so one listing none offers none; other
-    // providers' lists can be missing.
+    // conversation drops it when it switches to that model. An ACP agent's
+    // list names each model's levels as far as the agent has said, so a
+    // model listing none is not known to offer the level; other providers'
+    // lists can be missing.
     let offered = |effort: &&str| {
         selected.is_none_or(|model| {
             if model.reasoning.is_empty() {

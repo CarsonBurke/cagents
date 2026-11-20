@@ -9,6 +9,7 @@
 //! `config_option_update`.
 use crate::chat::{ActiveModel, Event, Model};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// More choices than any picker can usefully show; an agent advertising more
 /// is cut short rather than allowed to grow the conversation's metadata.
@@ -97,6 +98,10 @@ pub(super) struct Config {
     legacy_models: Option<Select>,
     /// `modes` from session setup, for an agent with no mode option.
     legacy_modes: Option<Select>,
+    /// The reasoning levels each model offered while it was the current
+    /// one. A reasoning option lists only the current model's levels, and
+    /// models differ: Muse offers a level for some and none for others.
+    levels_seen: HashMap<String, Vec<String>>,
 }
 
 impl Config {
@@ -145,6 +150,37 @@ impl Config {
             }
         }
         (self.model, self.reasoning, self.mode) = (model, reasoning, mode);
+        if let Some(model) = &self.model {
+            let levels = self.reasoning.as_ref().map(Select::values);
+            self.levels_seen
+                .insert(model.current.clone(), levels.unwrap_or_default());
+        }
+    }
+
+    /// The reasoning levels `model` offers, as far as the agent has said.
+    /// Combined identifiers in the `models` state, such as agy's
+    /// `gemini-4-neon-high`, name every model's own levels. Otherwise only
+    /// the models that have been current are known; another lists none.
+    fn levels_of(&self, model: &str) -> Vec<String> {
+        let combined = self.legacy_models.as_ref().filter(|models| {
+            models
+                .choices
+                .iter()
+                .any(|choice| self.split_model(&choice.value).is_some())
+        });
+        match (&self.reasoning, combined) {
+            (Some(reasoning), Some(combined)) => reasoning
+                .choices
+                .iter()
+                .filter(|level| {
+                    combined.choices.iter().any(|choice| {
+                        choice.value.rsplit_once('-') == Some((model, level.value.as_str()))
+                    })
+                })
+                .map(|level| level.value.clone())
+                .collect(),
+            _ => self.levels_seen.get(model).cloned().unwrap_or_default(),
+        }
     }
 
     /// Drops the models cagents does not offer from every list of them.
@@ -246,9 +282,7 @@ impl Config {
     /// The events that publish the model choice, the active model and the
     /// mode as they now stand.
     pub fn events(&self) -> Vec<Event> {
-        let reasoning = self.reasoning.as_ref();
-        let levels = reasoning.map(Select::values).unwrap_or_default();
-        let current_reasoning = reasoning.map(|select| select.current.clone());
+        let current_reasoning = self.reasoning.as_ref().map(|select| select.current.clone());
         let mut events = Vec::with_capacity(3);
         if let Some(models) = self.models() {
             events.push(Event::Models {
@@ -258,7 +292,7 @@ impl Config {
                     .map(|choice| Model {
                         id: choice.value.clone(),
                         label: choice.name.clone(),
-                        reasoning: levels.clone(),
+                        reasoning: self.levels_of(&choice.value),
                     })
                     .collect(),
                 selected: Some(models.current.clone()),

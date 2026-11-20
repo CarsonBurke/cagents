@@ -15,9 +15,16 @@ fn agy_initialize() -> Value {
 /// lists shortened and its account tier replaced.
 fn agy_new() -> Value {
     json!({"sessionId": "98608bab-5eb6-4cf5-8f9b-46019bf29df7",
+        // agy lists a combined identifier for each level a model offers:
+        // Gemini 3.8 Flash has no extra-high level.
         "models": {"availableModels": [
             {"modelId": "gemini-4-neon-high", "name": "Gemini 4 Neon (High)"},
-            {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"}],
+            {"modelId": "gemini-4-neon-xhigh", "name": "Gemini 4 Neon (XHigh)"},
+            {"modelId": "gemini-4-neon-medium", "name": "Gemini 4 Neon (Medium)"},
+            {"modelId": "gemini-4-neon-low", "name": "Gemini 4 Neon (Low)"},
+            {"modelId": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
+            {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"},
+            {"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)"}],
             "currentModelId": "gemini-4-neon-high"},
         "modes": {"currentModeId": "default", "availableModes": [
             {"id": "default", "name": "Default", "description": "Ask before edits and commands, per your permission settings."},
@@ -188,7 +195,7 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
     assert!(step.events.iter().any(|event| matches!(event,
         Event::Session { id, .. } if id == "98608bab-5eb6-4cf5-8f9b-46019bf29df7")));
     // Config options win over the unstable `models` list: two base models,
-    // each with the thinking levels, not eight combined identifiers.
+    // each with its own thinking levels, not seven combined identifiers.
     let models = step
         .events
         .iter()
@@ -203,7 +210,8 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
         .unwrap();
     assert_eq!(models.0.len(), 2);
     assert_eq!(models.0[1].id, "gemini-3.8-flash");
-    assert_eq!(models.0[1].reasoning, ["low", "medium", "high", "xhigh"]);
+    assert_eq!(models.0[0].reasoning, ["low", "medium", "high", "xhigh"]);
+    assert_eq!(models.0[1].reasoning, ["low", "medium", "high"]);
     assert_eq!(models.1.as_deref(), Some("gemini-4-neon"));
     assert_eq!(models.2.as_deref(), Some("high"));
     assert!(
@@ -307,6 +315,65 @@ fn muse_offers_models_and_modes_without_reasoning_levels() {
             .iter()
             .any(|event| matches!(event, Event::Ready(true)))
     );
+}
+
+/// The reasoning levels each `Event::Models` entry offers, by model.
+fn levels(step: &Step) -> Vec<(String, Vec<String>)> {
+    step.events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Models { models, .. } => Some(
+                models
+                    .iter()
+                    .map(|model| (model.id.clone(), model.reasoning.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_muse_model_offers_only_the_levels_it_listed_while_current() {
+    let mut acp = adapter(&[], None);
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), muse_initialize()))
+        .unwrap();
+    let mut options = muse_new()["configOptions"].clone();
+    options[1]["currentValue"] = json!("muse-spark-1.2");
+    options.as_array_mut().unwrap().push(json!(
+        {"category": "thought_level", "currentValue": "xhigh", "id": "thought_level",
+         "name": "Reasoning effort", "type": "select",
+         "options": [{"name": "Use this for deepest analysis and complex fixes.", "value": "xhigh"}]}));
+    let mut new = muse_new();
+    new["configOptions"] = options.clone();
+    let step = acp.receive(reply(only_write(&opened), new)).unwrap();
+    // Spark's level is not wonder's: the option lists only the current
+    // model's levels, and wonder has not said what it offers.
+    let expect = |spark: &[&str]| {
+        vec![
+            (
+                "muse-spark-1.2".to_owned(),
+                spark.iter().map(|level| (*level).to_owned()).collect(),
+            ),
+            ("muse-wonder-full-1.0".to_owned(), Vec::new()),
+        ]
+    };
+    assert_eq!(levels(&step), expect(&["xhigh"]));
+
+    // Wonder, once current, lists no option; spark keeps the level it had.
+    options.as_array_mut().unwrap().pop();
+    options[1]["currentValue"] = json!("muse-wonder-full-1.0");
+    let step = acp
+        .receive(
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "01a1f155-1f9e-7081-b35f-88ead0a9187d",
+            "update": {"sessionUpdate": "config_option_update", "configOptions": options}}}),
+        )
+        .unwrap();
+    assert_eq!(levels(&step), expect(&["xhigh"]));
 }
 
 #[test]
