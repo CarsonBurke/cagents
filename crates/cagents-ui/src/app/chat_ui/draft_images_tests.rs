@@ -439,3 +439,77 @@ fn a_name_put_in_from_the_menu_is_an_edit_like_any_other() {
         assert_eq!(runtime.attachments, [image]);
     });
 }
+
+#[test]
+fn a_draft_image_still_loading_stays_closed_once_another_image_opens() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "See ", std::slice::from_ref(&image));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let content = ItemContent::Image {
+            path: "/fixture/image.png".into(),
+            description: "Generated image".into(),
+            reference: None,
+        };
+        let mut cached = CachedItem::new(&content, runtime.syntax_theme);
+        cached.image = Some(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![0, 0, 0, 255],
+        ));
+        runtime.cache.insert("image".into(), cached);
+        Arc::make_mut(&mut runtime.snapshot).items = vec![
+            chat::Item {
+                id: "image".into(),
+                role: chat::Role::Assistant,
+                content,
+                started_at: None,
+                at: None,
+            }
+            .into(),
+        ];
+        // The tile is asked for, then a transcript image is opened and
+        // closed before the tile's image has loaded.
+        drop(app.update(Message::ChatUi(Action::OpenAttachment(target, 0))));
+        drop(app.update(Message::ChatUi(Action::OpenImage(target, "image".into()))));
+        let pane = images::ViewerHost::Pane(target);
+        assert!(app.image_viewer(pane).is_some());
+        drop(app.update(Message::ChatUi(Action::CloseImage(pane))));
+        let loaded = images::attachment_preview(&image);
+        assert!(matches!(loaded, images::Loaded::Ready(_)));
+        drop(app.update(Message::ChatUi(Action::AttachmentOpened(
+            target, image, loaded,
+        ))));
+        assert!(app.image_viewer(pane).is_none());
+    });
+}
+
+#[test]
+fn a_tile_opens_in_its_own_pane_beside_another_panes_image() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|first| {
+        let second = chat::attachment_assets::test_image("second.png");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let left = draft_with_images(&mut app, "Compare ", std::slice::from_ref(&first));
+        let right = draft_with_images(&mut app, "With ", std::slice::from_ref(&second));
+        assert_ne!(left.card, right.card);
+        drop(app.update(Message::ChatUi(Action::OpenAttachment(left, 0))));
+        drop(app.update(Message::ChatUi(Action::OpenAttachment(right, 0))));
+        // Each pane has its own viewer, so neither load is superseded by
+        // the other's, whichever finishes first, and no dialog covers the
+        // workspace.
+        for (target, image) in [(right, &second), (left, &first)] {
+            let loaded = images::attachment_preview(image);
+            assert!(matches!(loaded, images::Loaded::Ready(_)));
+            drop(app.update(Message::ChatUi(Action::AttachmentOpened(
+                target,
+                image.clone(),
+                loaded,
+            ))));
+            assert!(app.image_viewer(images::ViewerHost::Pane(target)).is_some());
+        }
+        assert!(app.image_viewer(images::ViewerHost::Dialog).is_none());
+        assert!(!app.modal_is_open());
+    });
+}
