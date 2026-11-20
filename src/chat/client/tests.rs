@@ -596,6 +596,76 @@ fn a_switch_handshake_that_times_out_or_closes_is_typed_by_how_it_ended() {
 }
 
 #[test]
+fn a_connected_reply_whose_body_proof_differs_from_its_envelope_is_refused() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    let a = HostSessionProof {
+        host_session_id: HostSessionId::new("session"),
+        boot_id: BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("previous"),
+    };
+    let b = HostSessionProof {
+        host_incarnation: HostIncarnation::new("replacement"),
+        ..a.clone()
+    };
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+    codec
+        .write(
+            &mut server,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(1),
+                proof: a,
+                message: ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: b,
+                        resumed: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        receive_handshake(&mut client, &mut codec, 1, None),
+        Err(HandshakeError::ProofChanged(None))
+    ));
+}
+
+#[test]
+fn a_connected_reply_with_matching_proofs_is_accepted() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    let a = HostSessionProof {
+        host_session_id: HostSessionId::new("session"),
+        boot_id: BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("incarnation"),
+    };
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+    codec
+        .write(
+            &mut server,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(1),
+                proof: a.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: a,
+                        resumed: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        receive_handshake(&mut client, &mut codec, 1, None),
+        Ok(ServerResponse::Connected { .. })
+    ));
+}
+
+#[test]
 fn only_the_daemons_whole_unproven_owner_refusal_waits_for_a_restart() {
     use super::super::{Recovery, UNPROVEN_OWNER_REFUSAL};
     use ipc::ProtocolErrorCode;

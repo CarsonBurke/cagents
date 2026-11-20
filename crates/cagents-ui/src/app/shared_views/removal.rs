@@ -291,9 +291,7 @@ impl Cagents {
     }
 
     fn shared_removal_refused(&mut self) {
-        self.status = Some(TransientNotice::warning(
-            "This pane couldn't be removed right now, so it was kept. Close it again.",
-        ));
+        self.status = Some(TransientNotice::warning(PANE_KEPT));
     }
 
     pub(in crate::app) fn prepare_shared_removal(&mut self, card: CardId) -> bool {

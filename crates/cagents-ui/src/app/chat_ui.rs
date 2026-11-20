@@ -1326,6 +1326,15 @@ pub(super) struct State {
     capacity_offers: HashSet<CardId>,
     /// Starts refused as nonretryable before a runtime exists.
     blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
+    /// A message to resume a conversation's stopped work, held for a card
+    /// reopening without a chat runtime until its conversation attaches.
+    held_for_start: HashMap<CardId, String>,
+    /// Cards given a message to resume stopped work that are on their way
+    /// to taking it, with how many more of their pane's ways back they may
+    /// still take for it. Once attached, one whose provider is still stopped
+    /// takes the way back to send it, as a reconnect that comes back as saved
+    /// history then starts a provider.
+    resuming_on_attach: HashMap<CardId, u8>,
     /// What the daemon last said about its update restore, for the panes
     /// that wait on it.
     update_recovery: update_recovery::Watch,
@@ -1367,6 +1376,8 @@ impl Default for State {
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
             blocked_starts: HashMap::new(),
+            held_for_start: HashMap::new(),
+            resuming_on_attach: HashMap::new(),
             update_recovery: update_recovery::Watch::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
@@ -3106,7 +3117,15 @@ impl RestoredWaiting {
 
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
+struct FileCompletionMemo {
+    files: Arc<Vec<String>>,
+    query: String,
+    indices: Vec<usize>,
+}
+
 pub(super) struct Runtime {
+    /// The permission mode this draft's launch recipe previews.
+    draft_permission: DraftPermissionPreview,
     preparation: preparation::State,
     find: Option<String>,
     /// The groups Find matched, in transcript order. Every turn asks whether
@@ -3122,6 +3141,7 @@ pub(super) struct Runtime {
     pub(super) interrupt_armed: Option<Instant>,
     drop_hover: bool,
     files: Option<Arc<Vec<String>>>,
+    file_completion: std::cell::RefCell<Option<FileCompletionMemo>>,
     pub(super) target: Target,
     pub(super) session: chat::Session,
     connection: Connection,
@@ -3496,10 +3516,21 @@ impl Runtime {
             return None;
         }
         let rows = if token.sigil == '@' {
-            completion::files(
-                self.files.as_deref().map_or(&[][..], Vec::as_slice),
-                &token.query,
-            )
+            if let Some(files) = &self.files {
+                let mut memo = self.file_completion.borrow_mut();
+                if !memo.as_ref().is_some_and(|memo| {
+                    Arc::ptr_eq(&memo.files, files) && memo.query == token.query
+                }) {
+                    *memo = Some(FileCompletionMemo {
+                        files: Arc::clone(files),
+                        query: token.query.clone(),
+                        indices: completion::file_matches(files, &token.query),
+                    });
+                }
+                completion::file_candidates(files, &memo.as_ref().unwrap().indices)
+            } else {
+                Vec::new()
+            }
         } else {
             completion::candidates(&self.snapshot, &token)
         };
@@ -3906,6 +3937,20 @@ impl Runtime {
             count: messages.len(),
             whole,
         });
+    }
+
+    /// Holds `text` for the turn after the running one, as a message written
+    /// in the composer and queued would be.
+    fn hold_followup(&mut self, text: String) {
+        let id = self.next_written;
+        self.next_written += 1;
+        self.followups.push(Followup {
+            id,
+            preview: prompt::queue_preview(&text),
+            text,
+            attachments: Vec::new(),
+        });
+        let _ = self.present();
     }
 
     /// Returns every held follow-up to the composer, in the order written.
@@ -4326,10 +4371,11 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let mut draft_permission = DraftPermissionPreview::default();
+        let permission_mode = draft_permission.get(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
             preparation: preparation::State::default(),
+            draft_permission,
             target,
             session,
             snapshot: Arc::new(Snapshot {
@@ -4362,6 +4408,7 @@ impl Runtime {
             fork_requested: false,
             fork_seen: None,
             files: None,
+            file_completion: Default::default(),
             find: None,
             find_matches: indexmap::IndexSet::new(),
             find_disclosure: find::Disclosure::default(),
@@ -4597,6 +4644,13 @@ impl Runtime {
         self.merge_attachments(written);
         Some(queued.draft)
     }
+    /// The permission mode this draft's launch recipe previews, read from
+    /// provider config only when the recipe changed since the last read.
+    fn draft_permission_mode(&mut self) -> Option<String> {
+        self.draft_permission
+            .get(&self.session.launch.recipe, self.session.launch.provider)
+    }
+
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
         target: Target,
@@ -5825,7 +5879,8 @@ impl Runtime {
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
             Arc::make_mut(&mut snapshot).permission_mode =
                 self.snapshot.permission_mode.clone().or_else(|| {
-                    draft_permission_mode(&self.session.launch.recipe, self.session.launch.provider)
+                    self.draft_permission
+                        .get(&self.session.launch.recipe, self.session.launch.provider)
                 });
         }
         if !self.parent_scroll().at_bottom()
@@ -6200,35 +6255,42 @@ impl Runtime {
 
     fn restore_find_disclosures(&mut self) {
         self.restore_failure_find();
-        self.find_disclosure
-            .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        let collapsed =
+            self.find_disclosure
+                .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         // Restoring reads a child's disclosures before it writes them; an
         // absent child has nothing to restore, so give it no entry.
         let mut no_items = Revised::default();
+        let mut child_collapsed = Vec::new();
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
-            disclosure.restore(
+            let restored = disclosure.restore(
                 self.child_expanded.get_mut(&child).unwrap_or(&mut no_items),
-                self.child_unfolded.entry(child).or_default(),
+                self.child_unfolded.entry(child.clone()).or_default(),
                 &mut Revised::default(),
             );
+            if self.selected_subagent.as_ref() == Some(&child) {
+                child_collapsed = restored;
+            }
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
-        // again when search restores a collapsed report; manual disclosures
-        // retain both their state and their prepared body.
+        // again for each report this restore collapsed; manual disclosures
+        // retain both their state and their prepared body. Only those reports
+        // are visited, so a keystroke costs what it revealed, not the cache.
         fn collapse_reports(
             cache: &mut HashMap<String, CachedItem>,
-            expanded: &HashSet<String>,
+            collapsed: Vec<String>,
             theme: crate::settings::EditorSyntaxTheme,
         ) {
-            let closed: Vec<_> = cache
-                .iter()
-                .filter_map(|(id, cached)| {
-                    (cached.report_expanded == Some(true) && !expanded.contains(id))
-                        .then(|| cached.item.as_ref().map(|item| (id.clone(), item.clone())))
-                        .flatten()
-                })
-                .collect();
-            for (id, item) in closed {
+            for id in collapsed {
+                #[cfg(test)]
+                REPORT_COLLAPSE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                let Some(item) = cache
+                    .get(&id)
+                    .filter(|cached| cached.report_expanded == Some(true))
+                    .and_then(|cached| cached.item.clone())
+                else {
+                    continue;
+                };
                 let previous = cache.remove(&id);
                 let mut cached =
                     CachedItem::updated(&item.content, theme, previous, false, false, None);
@@ -6236,16 +6298,8 @@ impl Runtime {
                 cache.insert(id, cached);
             }
         }
-        collapse_reports(&mut self.cache, &self.expanded, self.syntax_theme);
-        if let Some(child) = &self.selected_subagent {
-            collapse_reports(
-                &mut self.child_cache,
-                self.child_expanded
-                    .get(child)
-                    .map_or(&HashSet::new(), |set| &**set),
-                self.syntax_theme,
-            );
-        }
+        collapse_reports(&mut self.cache, collapsed, self.syntax_theme);
+        collapse_reports(&mut self.child_cache, child_collapsed, self.syntax_theme);
     }
 
     fn find_anchor(&self, key: &str) -> iced::advanced::widget::Id {
@@ -7073,6 +7127,27 @@ fn draft_snapshot(
     }
 }
 
+/// The permission mode a draft's launch recipe previews. Reading it touches
+/// provider config files, so it is computed once per (provider, recipe).
+#[derive(Default)]
+struct DraftPermissionPreview {
+    resolved: Option<(Provider, LaunchRecipe, Option<String>)>,
+}
+
+impl DraftPermissionPreview {
+    fn get(&mut self, recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+        if let Some((cached_provider, cached_recipe, mode)) = &self.resolved
+            && *cached_provider == provider
+            && cached_recipe == recipe
+        {
+            return mode.clone();
+        }
+        let mode = draft_permission_mode(recipe, provider);
+        self.resolved = Some((provider, recipe.clone(), mode.clone()));
+        mode
+    }
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -7299,6 +7374,12 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 /// the conversation to list the model it was meant to be sent to, before
 /// going to the provider's default instead.
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How many of its pane's ways back a conversation may take, one after
+/// another, to send a message resuming stopped work: a reconnect that comes
+/// back as saved history, and then the provider that history starts.
+/// Bounded, so a way back that keeps failing is not taken without end.
+const RESUME_RECOVERIES: u8 = 2;
 
 /// What a chat's pull request labels were built from: the generations of
 /// the window's pull request and worktree indexes, the conversation, and
@@ -7628,10 +7709,17 @@ impl Cagents {
     }
 
     fn chat_find_next(&mut self, target: Target, forward: bool) -> Task<Message> {
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.refresh_find();
+        }
+        self.chat_find_step(target, forward)
+    }
+
+    /// Moves to the next or previous of the matches Find last refreshed.
+    fn chat_find_step(&mut self, target: Target, forward: bool) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.refresh_find();
         if runtime.find_matches.is_empty() {
             if runtime.find.as_ref().is_some_and(|query| !query.is_empty()) {
                 return self.begin_find_navigation(target, None);
@@ -7749,7 +7837,7 @@ impl Cagents {
             .map_or(&runtime.session.launch.recipe, |session| {
                 &session.launch.recipe
             });
-        snapshot.permission_mode = draft_permission_mode(recipe, provider);
+        snapshot.permission_mode = runtime.draft_permission.get(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
@@ -7868,8 +7956,9 @@ impl Cagents {
         runtime.session = session.clone();
         runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, account.provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
         self.load_draft_skills(target)
@@ -8433,8 +8522,9 @@ impl Cagents {
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
         }
-        Arc::make_mut(&mut runtime.snapshot).permission_mode =
-            draft_permission_mode(&session.launch.recipe, provider);
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
+            .draft_permission
+            .get(&session.launch.recipe, provider);
         if rehomed {
             // A failed start's reason belongs to the account it failed on.
             runtime.error = None;
@@ -8831,6 +8921,19 @@ impl Cagents {
                 } else {
                     chat_drafts.insert(*card, draft);
                 }
+            }
+        }
+        // A message to resume stopped work, held until the conversation
+        // attaches, is kept like a held follow-up: ahead of the draft, and
+        // never sent automatically once restored.
+        for (card, held) in &self.chat_ui.held_for_start {
+            if open_cards.contains(card) {
+                let draft = chat_drafts.entry(*card).or_default();
+                *draft = if draft.is_empty() {
+                    held.clone()
+                } else {
+                    format!("{held}\n{draft}")
+                };
             }
         }
         let chat_waiting_messages = self
@@ -9307,9 +9410,7 @@ impl Cagents {
         self.chat_ui.capacity_offers.remove(&card);
         self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.blocked_details.remove(&card);
-        let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
-        snapshot.permission_mode =
-            draft_permission_mode(&session.launch.recipe, session.launch.provider);
+        let snapshot = self.chat_draft_snapshot(session.launch.provider);
         let target = self.chat_ui.next_target(card);
         let visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible);
         let mut runtime = Runtime::draft(
@@ -9319,6 +9420,8 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
+        // The runtime already read its recipe's preview; this is that answer.
+        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
@@ -9691,6 +9794,8 @@ impl Cagents {
         }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.held_for_start.remove(&card);
+        self.chat_ui.resuming_on_attach.remove(&card);
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.waiting.remove(&card);
         self.chat_ui.confirmed_losses.remove(&card);
@@ -11210,6 +11315,95 @@ impl Cagents {
         )
     }
 
+    /// Asks the conversation in `card` to pick up the work an update stopped,
+    /// with `text`. The message is held like a queued follow-up, which the
+    /// reader can see, change or take back, and goes out once the provider
+    /// is ready and idle. A conversation whose provider stopped first takes
+    /// the way back its pane offers, as pressing it would. `None` when the
+    /// card cannot take a message.
+    pub(super) fn resume_lost_work(&mut self, card: CardId, text: String) -> Option<Task<Message>> {
+        if !self.chat_takes_resume(card) {
+            return None;
+        }
+        let starting = self.chat_start_pending(card);
+        let fresh = self.chat_offers_fresh_conversation(card);
+        match self.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) if starting => {
+                // What it attaches to says whether it takes the message.
+                runtime.hold_followup(text);
+                self.chat_ui
+                    .resuming_on_attach
+                    .insert(card, RESUME_RECOVERIES);
+                self.persist();
+                Some(Task::none())
+            }
+            Some(CardRuntime::Chat(runtime)) => {
+                let readiness = runtime.readiness(false, fresh);
+                runtime.hold_followup(text);
+                let target = runtime.target;
+                self.persist();
+                Some(match readiness {
+                    stopped::Readiness::Recovers(press) => {
+                        self.chat_ui
+                            .resuming_on_attach
+                            .insert(card, RESUME_RECOVERIES - 1);
+                        self.take_chat_recovery(target, press)
+                    }
+                    _ => self.dispatch_queued(target),
+                })
+            }
+            _ => {
+                self.chat_ui.held_for_start.insert(card, text);
+                self.chat_ui
+                    .resuming_on_attach
+                    .insert(card, RESUME_RECOVERIES);
+                self.persist();
+                Some(if starting {
+                    Task::none()
+                } else {
+                    self.reopen_stopped(card)
+                })
+            }
+        }
+    }
+
+    /// Whether [`Self::resume_lost_work`] would take a message for `card`.
+    pub(super) fn chat_takes_resume(&self, card: CardId) -> bool {
+        // A pane still reopening a conversation is not saved until it starts
+        // (see `persistent_workspace`), so a message held there would not
+        // outlive the window closing first.
+        if self.chat_closed_elsewhere(card) || self.reopen_pending(card) {
+            return false;
+        }
+        let starting = self.chat_start_pending(card);
+        match self.cards.get(&card) {
+            // A draft has no conversation to resume.
+            Some(CardRuntime::Chat(runtime)) if starting => !runtime.is_draft(),
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.readiness(false, self.chat_offers_fresh_conversation(card))
+                    != stopped::Readiness::Cannot
+            }
+            _ => {
+                starting
+                    || self
+                        .blocked_failure(card)
+                        .is_some_and(|blocked| blocked.reopen.reopens())
+            }
+        }
+    }
+
+    /// Takes a stopped card's way back, as its pane's button would.
+    fn take_chat_recovery(&mut self, target: Target, press: stopped::Press) -> Task<Message> {
+        match press {
+            stopped::Press::Reconnect => self.handle_chat_ui(Action::Reconnect(target)),
+            stopped::Press::ResumeSaved => self.handle_chat_ui(Action::ResumeSaved(target)),
+            stopped::Press::Reopen => self.reopen_stopped(target.card),
+            stopped::Press::StartFresh | stopped::Press::SendAgain | stopped::Press::Close => {
+                Task::none()
+            }
+        }
+    }
+
     /// Takes the next step of sending a started draft's first message: its
     /// model, where one was chosen, and then the message.
     ///
@@ -11220,6 +11414,47 @@ impl Cagents {
     /// waited for past [`MODEL_PATIENCE`]; the message is sent on the default
     /// instead, and the transcript says so.
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
+        let held = self.chat_ui.held_for_start.remove(&target.card);
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            if let Some(text) = held {
+                self.chat_ui.held_for_start.insert(target.card, text);
+            }
+            return Task::none();
+        };
+        if let Some(text) = held {
+            runtime.hold_followup(text);
+        }
+        // A message to resume stopped work, held while its conversation
+        // reopened, may find it reopened stopped: saved history read without
+        // a provider, say. It then takes the pane's way back first. While
+        // nothing can bring one back yet (its history still loading, say),
+        // it waits for the change that can, as the message does.
+        if !self.chat_start_pending(target.card)
+            && self.chat_ui.resuming_on_attach.contains_key(&target.card)
+        {
+            let fresh = self.chat_offers_fresh_conversation(target.card);
+            let readiness = self
+                .chat_card_runtime_mut(target)
+                .filter(|runtime| !runtime.followups.is_empty())
+                .map(|runtime| runtime.readiness(false, fresh));
+            match readiness {
+                Some(stopped::Readiness::Cannot) => {}
+                Some(stopped::Readiness::Recovers(press)) => {
+                    if let Some(left) = self.chat_ui.resuming_on_attach.remove(&target.card)
+                        && left > 1
+                    {
+                        self.chat_ui
+                            .resuming_on_attach
+                            .insert(target.card, left - 1);
+                    }
+                    return self.take_chat_recovery(target, press);
+                }
+                // Taken back, or it takes the message as it is.
+                Some(stopped::Readiness::Takes) | None => {
+                    self.chat_ui.resuming_on_attach.remove(&target.card);
+                }
+            }
+        }
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
@@ -11455,7 +11690,7 @@ impl Cagents {
         let Some(draft) = runtime.unqueue() else {
             return Task::none();
         };
-        snapshot.permission_mode = draft_permission_mode(&draft.launch.recipe, provider);
+        snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
@@ -13960,11 +14195,16 @@ impl Cagents {
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
-                    return if runtime.turn_under_way() {
-                        Task::none()
-                    } else {
-                        self.dispatch_queued(target)
-                    };
+                    let busy = runtime.turn_under_way();
+                    let continued = self.update_resume_continued(target.card);
+                    return Task::batch([
+                        continued,
+                        if busy {
+                            Task::none()
+                        } else {
+                            self.dispatch_queued(target)
+                        },
+                    ]);
                 }
                 if (mode == PromptMode::Steer && !runtime.snapshot.capabilities.steer)
                     || (mode == PromptMode::Queue && !runtime.snapshot.capabilities.queue)
@@ -13981,7 +14221,8 @@ impl Cagents {
                         return Task::none();
                     }
                 };
-                return self.chat_send(target, command, true);
+                let continued = self.update_resume_continued(target.card);
+                return Task::batch([continued, self.chat_send(target, command, true)]);
             }
             Action::TakeBackQueued(target, entry) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -14155,7 +14396,8 @@ impl Cagents {
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
                 }
-                return self.chat_find_next(target, true);
+                // Just refreshed: stepping must not search the transcript again.
+                return self.chat_find_step(target, true);
             }
             // Pressing the Previous or Next button blurs the search field;
             // the keyboard goes back to it, so Enter keeps stepping through
@@ -15304,27 +15546,68 @@ impl Cagents {
                 });
             }
             Action::Attached(target, id, result) => {
+                // The draft takes up what another window chose while its
+                // chooser was open only once the choice has ended, so the
+                // files are judged by the provider it is about to adopt.
+                let provider = self
+                    .card_state(target.card)
+                    .and_then(|state| match &state.kind {
+                        CardKind::Chat(session) => Some(session.launch.provider),
+                        _ => None,
+                    });
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if runtime.attachment_chooser_pending != Some(id.id) {
                         return Task::none();
                     }
                     runtime.attachment_chooser_pending = None;
+                    // Why the choice attached nothing, told once the draft
+                    // has caught up below.
+                    let mut failure = None;
                     let staged = if !runtime.attachment_bookmarks.contains_key(&id.id) {
                         Task::none()
                     } else {
                         match result {
-                            Ok(Some(paths)) => self.stage_chat_attachments(target, id, paths),
+                            Ok(Some(paths)) => {
+                                let rules = chat::AttachmentRules::for_provider(
+                                    provider.unwrap_or(runtime.session.launch.provider),
+                                );
+                                if rules.images_only
+                                    && paths.iter().any(|path| !chat::is_image_path(path))
+                                {
+                                    runtime.cancel_attachment_insert(id.id, None);
+                                    failure = Some(
+                                        "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.".to_owned(),
+                                    );
+                                    Task::none()
+                                } else {
+                                    self.stage_chat_attachments(target, id, paths)
+                                }
+                            }
                             Ok(None) => {
                                 runtime.cancel_attachment_insert(id.id, None);
                                 Task::none()
                             }
                             Err(error) => {
-                                runtime.cancel_attachment_insert(id.id, Some(error));
+                                runtime.cancel_attachment_insert(id.id, None);
+                                failure = Some(error);
                                 Task::none()
                             }
                         }
                     };
-                    return Task::batch([staged, self.adopt_stored_draft_session(target.card)]);
+                    // With the choice settled the draft can catch up, which
+                    // may attach it to a conversation another window started.
+                    let adopted = self.adopt_stored_draft_session(target.card);
+                    // Adopting another account clears its failed start's
+                    // reason, but this one is about the files just chosen.
+                    // A draft that gave way to the conversation another
+                    // window started has no composer here to say it in.
+                    if let Some(failure) = failure {
+                        match self.chat_runtime_mut(target) {
+                            Some(runtime) => runtime.error = Some(failure),
+                            None => self.status = Some(TransientNotice::warning(failure)),
+                        }
+                    }
+                    return Task::batch([staged, adopted]);
                 }
             }
             Action::Dropped(target, payload) => {
@@ -16150,3 +16433,12 @@ mod peer_draft_tests;
 #[cfg(test)]
 #[path = "chat_ui/startup_restore_tests.rs"]
 mod startup_restore_tests;
+
+#[cfg(test)]
+thread_local! { static REPORT_COLLAPSE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+/// How many cached items restoring Find's disclosures has examined to drop a
+/// report body it revealed.
+#[cfg(test)]
+pub(super) fn report_collapse_visits() -> usize {
+    REPORT_COLLAPSE_VISITS.with(std::cell::Cell::get)
+}

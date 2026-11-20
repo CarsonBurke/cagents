@@ -536,7 +536,10 @@ impl Cagents {
 
     /// The open tab in this window that shows a daemon session, and the
     /// channel it belongs to.
-    fn session_card(&self, id: crate::model::TerminalId) -> Option<(CardId, Option<ChannelId>)> {
+    pub(super) fn session_card(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Option<(CardId, Option<ChannelId>)> {
         let card = self
             .durable
             .cards
@@ -1092,7 +1095,9 @@ impl Cagents {
                                     && self.update_ui.set_aside.is_none()
                                     && !self.other_modal_is_open()
                             });
+                        let offer = self.offer_update_resume(&job);
                         self.update_ui.job = Some(job);
+                        return offer;
                     }
                     Ok(None) => {
                         self.update_ui.poll_retry = self.update_ui.updating();

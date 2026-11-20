@@ -2319,6 +2319,40 @@ mod tests {
     }
 
     #[test]
+    fn watched_edits_do_not_postpone_an_unwatched_worktrees_poll() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let start = Instant::now();
+        let watched = polled_worktree("/repo/watched", start, Some(now_unix_ms()));
+        let unwatched = polled_worktree("/repo/unwatched", start, None);
+        track_polled(&mut shared, vec![watched.clone(), unwatched.clone()], start).covered = false;
+
+        for k in 1..=(IDLE_POLL.as_secs() / SCAN_SPACING.as_secs()) {
+            let published = start + SCAN_SPACING * u32::try_from(k).unwrap();
+            let tracked = shared.projects.get_mut(Path::new("/repo")).unwrap();
+            tracked.last_scan = Some(published);
+            let mut local = (**tracked.local.as_ref().unwrap()).clone();
+            local
+                .worktrees
+                .iter_mut()
+                .find(|worktree| worktree.id == watched.id)
+                .unwrap()
+                .status_read_at = Some(published);
+            tracked.local = Some(Arc::new(local));
+
+            let tracked = &shared.projects[Path::new("/repo")];
+            assert!(
+                shared
+                    .due_polls(tracked, start + IDLE_POLL)
+                    .unwrap()
+                    .contains(&unwatched.id),
+                "selective publish {k} must retain the unwatched worktree's deadline"
+            );
+            assert!(shared.next_poll(tracked) <= Some(start + IDLE_POLL));
+        }
+    }
+
+    #[test]
     fn a_watched_project_polls_every_worktree_rarely() {
         let handle = polling_handle();
         let mut shared = handle.shared();

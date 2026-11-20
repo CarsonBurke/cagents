@@ -6,6 +6,8 @@ dependency graph is the same; only the workspace lints are left out. Assets used
 only by documentation are omitted. Root Cargo.toml selects this copy through the
 existing libcosmic `[patch]`.
 
+Build script adds the standard compile-time CAGENTS_CHECKOUT_ROOT identity anchor and runtime environment watch, paired with the build-hook entry in scripts/qualify-checkout-cache.py.
+
 Local change: text cursors stop blinking (src/text_editor.rs, src/text_input.rs)
 
 TextEditor and TextInput take their blink from `iced_core::text::Blink`, which

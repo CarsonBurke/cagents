@@ -40,9 +40,10 @@ file.
 
 The union retains PR1316's complete eight upstream integration-test targets,
 two benchmarks, development dependencies, test profile, source/fonts and
-rendering fixtures, then adds the peer wrapped_ellipsis target with its three
-regressions. The peer standalone normalized-manifest omission of those tests
-and development targets is NOT applied. Existing LayoutSnapshot contracts
+rendering fixtures, then adds the peer wrapped_ellipsis target with five
+regressions, the last two being the height-limited bidi boundary test and the
+partial reversed-word test. The peer standalone normalized-manifest omission of
+those tests and development targets is NOT applied. Existing LayoutSnapshot contracts
 and UI source/copy/Find/native-reading controls are preserved.
 
 The focused regression uses existing bundled Open Sans plus the peer's
@@ -56,7 +57,8 @@ requirement. Library dependencies are unchanged by this union, while the
 additive snapshot public API is deliberately preserved.
 
 Prior peer focused/causal receipts and PR1316 source/native/test receipts
-retain their original heads. This external source union is unbuilt/unrun.
+retain their original heads. The wrapped_ellipsis target now runs through
+crates/cosmic-text-contracts while the other vendored targets remain unrun.
 Final composed isolated UI/integrated boundaries, retained upstream geometry
 and snapshot oracles, cache identity, actual native title/reader behavior
 and scoped performance evidence require independent qualification. The

@@ -48,6 +48,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
+| `test:contracts` | Test the focused vendored-crate contract packages |
 | `test` | The three lane test suites, one after another |
 | `test:lib` | Build one lane's library tests once and run the named ones ([`scripts/test-lib`](#testing)) |
 | `test:scripts` | Verify and run every script contract suite CI runs, or one `JOB [SHARD]` |
@@ -364,6 +365,11 @@ How the runner works:
   database, transcripts, application lease, and
   `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it runs beside an installed
   production instance.
+- A development daemon stops by itself once it has had nothing to do for 30
+  minutes: no connected UI or CLI, no terminal (attached or detached), no chat
+  or agent work, no scheduled automation and no terminal holders or cleanup
+  left. `CAGENTS_DEVELOPMENT_IDLE_TIMEOUT_SECS` changes the 30 minutes. A
+  production daemon never stops this way.
 - Browserless and integrated development sessions share that state; do not run
   them at the same time. Use [parallel instances](#parallel-instances) instead.
 
@@ -1703,6 +1709,10 @@ changing the tree contract or UI integration:
 scripts/cargo-gate test --locked --no-default-features --features ui --test iced_tree_reconciliation
 ```
 
+The vendored cosmic-text `wrapped_ellipsis` regressions run through the workspace
+member package `cagents-cosmic-text-contracts` (`mise run test:contracts`). Cargo
+refuses to test a crate under the workspace that is not a member.
+
 Explicitly selecting a target with required features absent, including through a
 `--test '*'` glob, reports the missing feature instead of succeeding with zero
 tests. Use `--all-targets` to select all targets available in a feature lane.
@@ -2165,7 +2175,14 @@ harness, it provides:
   `--projection-oracle` to check every narrowed update projection against the
   full one; such a session repairs what it finds and so behaves like one that
   projects everything, and its log is the evidence. See "Busy terminals and
-  the update tail" in `docs/performance.md`.
+  the update tail" in `docs/performance.md`. Add `--launch-handshake` to
+  start the app as `cagents ui` does, so its startup gate checks the restored
+  panes and shows the startup recovery notice for any that did not reconnect.
+  A saved terminal its fresh daemon confirms is gone settles as a saved pane
+  and is not reported. To show the notice, save a seed with an open chat pane,
+  then write a delay longer than the gate's budget, such as `120`, to
+  `fixture-seed/home/.claude/fixture-slow-start` in the task: the restored
+  chat's provider does not start in time, so the pane is reported by name.
   These flags apply to the requested session and its relaunches; ordinary
   sessions keep their default logging. Recreate the same workload on each revision when comparing
   startup; a saved descriptor whose provider was killed is not a live chat.

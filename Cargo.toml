@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/cagents-ui", "crates/ceditor", "crates/browser-import", "crates/iced-contracts"]
+members = [".", "crates/cagents-ui", "crates/ceditor", "crates/browser-import", "crates/iced-contracts", "crates/cosmic-text-contracts"]
 # Existing root build lanes keep their isolated feature graphs.
 default-members = ["."]
 resolver = "3"
