@@ -2900,9 +2900,9 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
     assert!(
         session.claim_owned_codex_listener(&std::env::temp_dir(), host.lock().unwrap().proof())
     );
-    {
+    let delivery = {
         let mut state = host.lock().unwrap();
-        state.register_client(1);
+        let delivery = state.register_client(1);
         state.chats.insert(
             chat_id,
             Record {
@@ -2918,7 +2918,8 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
                 returning_terminal: false,
             },
         );
-    }
+        delivery
+    };
     host.lock().unwrap().codex_listeners = CodexListenerRoots::at("/another-root".into());
     assert_eq!(
         client_session(&host, session.clone()).owned_codex_listener,
@@ -2944,6 +2945,16 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
     };
     assert!(!snapshot.exited);
     assert!(!handle.is_completed());
+    // The chat's connection stays open beside its CLI view, so it must never
+    // become one of the view's subscribers.
+    assert!(
+        !host
+            .lock()
+            .unwrap()
+            .descriptor(1, terminal.id)
+            .unwrap()
+            .attached
+    );
     let worker = host.lock().unwrap().terminals[&terminal.id].handle.clone();
     let second = view(1, session.clone(), recipe.clone()).unwrap();
     assert!(matches!(second, ServerResponse::ChatTerminal { snapshot, .. } if !snapshot.exited));
@@ -2966,6 +2977,9 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
         assert!(Instant::now() < deadline, "terminal exit was not published");
         thread::sleep(Duration::from_millis(10));
     }
+    // Nothing about the view, from its start, its replay or its exit, reached
+    // the chat's connection, where it would have ended the chat.
+    assert_eq!(terminal_frames(&delivery), Vec::new());
     let mut retained = {
         let mut state = host.lock().unwrap();
         state.register_client(2);
@@ -3072,6 +3086,29 @@ fn a_control_client_waits_for_slow_provider_interruption_before_closing() {
 #[test]
 fn returning_to_terminal_waits_for_provider_interruption() {
     control_client_closes_chat(true, true);
+}
+
+/// The terminal frames queued on a native chat's connection, after closing it.
+///
+/// A chat client reads only its own chat's frames and ends its presentation
+/// on anything else, so a terminal a chat request starts must never treat
+/// that connection as one of its subscribers.
+fn terminal_frames(delivery: &crate::host::delivery::DeliveryQueue) -> Vec<ServerMessage> {
+    delivery.close_after_drain();
+    std::iter::from_fn(|| delivery.pop())
+        .map(|outbound| outbound.message)
+        .filter(|message| {
+            matches!(
+                message,
+                ServerMessage::Redraw { .. }
+                    | ServerMessage::Snapshot { .. }
+                    | ServerMessage::Event { .. }
+                    | ServerMessage::Synchronized { .. }
+                    | ServerMessage::TerminalObserved { .. }
+                    | ServerMessage::TerminalWorker { .. }
+            )
+        })
+        .collect()
 }
 
 fn control_client_closes_chat(slow: bool, return_terminal: bool) {
@@ -3239,13 +3276,22 @@ fn control_client_closes_chat(slow: bool, return_terminal: bool) {
         host.lock().unwrap().install_model(
             super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap(),
         );
-        host.lock().unwrap().register_client(1);
+        let delivery = host.lock().unwrap().register_client(1);
         let ServerResponse::ChatTerminal {
             session: terminal, ..
         } = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id }).unwrap()
         else {
             panic!("chat did not return to terminal")
         };
+        assert!(
+            !host
+                .lock()
+                .unwrap()
+                .descriptor(1, terminal.id)
+                .unwrap()
+                .attached
+        );
+        assert_eq!(terminal_frames(&delivery), Vec::new());
         // The terminal takes over the chat's lineage and its agents.
         assert_eq!(
             super::super::agent_execution::registry(&host)
