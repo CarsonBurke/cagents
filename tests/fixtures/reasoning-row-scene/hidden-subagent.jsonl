@@ -1,0 +1,5 @@
+{"type":"assistant","uuid":"hidden-scout-@TURN@-call","message":{"id":"hidden-scout-@TURN@-call","role":"assistant","content":[{"type":"tool_use","id":"hidden-scout-@TURN@","name":"Agent","input":{"name":"Fixture scout","subagent_type":"Explore","description":"Map the fixture worktree"}}]}}
+{"type":"assistant","uuid":"hidden-scout-@TURN@-thought","parent_tool_use_id":"hidden-scout-@TURN@","message":{"id":"hidden-scout-@TURN@-thought","role":"assistant","content":[{"type":"thinking","thinking":"","signature":"EqQBCkgIBhABGAIiQFixtureSignatureOnly"}]}}
+{"_sleep":600}
+{"type":"user","uuid":"hidden-scout-@TURN@-result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"hidden-scout-@TURN@","is_error":false,"content":"The fixture worktree is mapped."}]}}
+{"type":"result","uuid":"hidden-scout-result-@TURN@","subtype":"success","is_error":false}

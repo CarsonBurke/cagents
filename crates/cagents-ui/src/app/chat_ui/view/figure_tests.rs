@@ -29,7 +29,7 @@ fn document() -> chat::Item {
     answer(text)
 }
 
-fn view(runtime: &Runtime) -> Element<'_, Message> {
+pub(super) fn view(runtime: &Runtime) -> Element<'_, Message> {
     runtime.view(
         None,
         false,
@@ -89,7 +89,7 @@ fn an_answer_on_screen_asks_for_its_local_image() {
 }
 
 /// The text the transcript shows, read from a tree kept across frames.
-fn texts(runtime: &Runtime, tree: &mut Option<Tree>) -> Vec<String> {
+pub(super) fn texts(runtime: &Runtime, tree: &mut Option<Tree>) -> Vec<String> {
     use iced::advanced::widget::Operation;
     struct Texts(Vec<String>);
     impl Operation for Texts {
