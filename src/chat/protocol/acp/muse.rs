@@ -23,13 +23,15 @@ pub static PROFILE: Profile = Profile {
     max_image_bytes: crate::chat::ACP_MAX_IMAGE_BYTES,
     // By what each does, in Muse's words: "Ask for approval when no
     // permission rule covers the action", "Ask for approval only when the
-    // action requires it", "Run every action without asking for approval"
-    // and "Refuse any action no permission rule covers".
+    // action requires it", "Refuse any action no permission rule covers" and
+    // "Run every action without asking for approval". Offered in the order
+    // of the Claude modes they roughly correspond to, rather than Muse's
+    // own, which leads with running everything unasked.
     modes: &[
         (PROMPT_UNMATCHED, "manual"),
         (ON_REQUEST, "auto"),
-        (ALLOW_ALL, "bypassPermissions"),
         (DENY_UNMATCHED, "dontAsk"),
+        (ALLOW_ALL, "bypassPermissions"),
     ],
     offers_model: crate::agent::muse_offers_model,
     sign_in_required: auth_required,

@@ -32,6 +32,9 @@ mod rpc;
 mod tests;
 mod tools;
 
+/// What an agent calls a conversation it has not named yet, as Muse's own
+/// session list does.
+const PLACEHOLDER_TITLES: &[&str] = &["New session"];
 /// The ACP version this client speaks.
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_COMMANDS: usize = 256;
@@ -307,15 +310,27 @@ impl Acp {
             compact: self.compacts(),
             model_selection: self.config.model_selection(),
             reasoning_selection: self.config.reasoning_selection(),
-            permission_modes: self
-                .config
-                .mode_ids()
-                .iter()
-                .map(|mode| self.profile.mode_meaning(mode).to_owned())
-                .collect(),
+            permission_modes: self.permission_modes(),
             skill_reach: SkillReach::Leading,
             ..Capabilities::default()
         })
+    }
+
+    /// The modes the session offers, by what each means, in the profile's
+    /// order; a mode the profile does not know follows in the agent's own.
+    fn permission_modes(&self) -> Vec<String> {
+        let mut modes = self.config.mode_ids();
+        modes.sort_by_key(|mode| {
+            self.profile
+                .modes
+                .iter()
+                .position(|(own, _)| own == mode)
+                .unwrap_or(usize::MAX)
+        });
+        modes
+            .iter()
+            .map(|mode| self.profile.mode_meaning(mode).to_owned())
+            .collect()
     }
 
     fn compacts(&self) -> bool {
@@ -908,10 +923,12 @@ impl Acp {
                 }
             }
             "session_info_update" => {
+                // A placeholder names no conversation; the reader's first
+                // prompt names it better until the agent gives it a name.
                 if let Some(title) = update["title"]
                     .as_str()
                     .map(str::trim)
-                    .filter(|title| !title.is_empty())
+                    .filter(|title| !title.is_empty() && !PLACEHOLDER_TITLES.contains(title))
                 {
                     events.push(Event::Session {
                         id: self.session_id().to_owned(),
@@ -1439,7 +1456,12 @@ pub(crate) static TEST_PROFILE: Profile = Profile {
     label: "Fake ACP agent",
     launch: test_launch,
     max_image_bytes: 1024 * 1024,
-    modes: &[("accept-edits", "acceptEdits")],
+    modes: &[
+        ("default", "default"),
+        ("accept-edits", "acceptEdits"),
+        ("auto", "auto"),
+        ("plan", "plan"),
+    ],
     offers_model: |model| !model.ends_with("-contributor"),
     sign_in_required: auth_required,
 };

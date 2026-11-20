@@ -4082,7 +4082,7 @@ impl Runtime {
         let cost = usage
             .cost_microusd
             .map(|cost| {
-                let cost = format!("${:.2}", cost as f64 / 1_000_000.0);
+                let cost = dollars(cost);
                 (cost.clone(), cost)
             })
             .or_else(|| usage.cost_estimate.map(cost_estimate_label));
@@ -4547,7 +4547,14 @@ impl Runtime {
                                     (
                                         Icon::List,
                                         "Leave plan mode".into(),
-                                        format!("Return to {}", permission_mode_label(back)).into(),
+                                        format!(
+                                            "Return to {}",
+                                            permission_mode_label(
+                                                self.session.launch.provider,
+                                                back,
+                                            )
+                                        )
+                                        .into(),
                                         None,
                                     )
                                 }
@@ -4716,10 +4723,9 @@ impl Runtime {
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
                 controls.push(
-                    design::caption(
-                        selected
-                            .map_or("Permissions", |index| permission_mode_label(&modes[index])),
-                    )
+                    design::caption(selected.map_or("Permissions", |index| {
+                        permission_mode_label(self.session.launch.provider, &modes[index])
+                    }))
                     .into(),
                 );
             } else {
@@ -4729,11 +4735,12 @@ impl Runtime {
                     // the leading group little room; the chevron that says
                     // this is a picker keeps its place either way.
                     crate::ui_controls::trailing(
-                        crate::ui_controls::FadeText::caption(
-                            selected.map_or("Permissions", |index| {
-                                permission_mode_label(&modes[index])
-                            }),
-                        ),
+                        crate::ui_controls::FadeText::caption(selected.map_or(
+                            "Permissions",
+                            |index| {
+                                permission_mode_label(self.session.launch.provider, &modes[index])
+                            },
+                        )),
                         widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
                         step::GAP_XS,
                     ),
@@ -6834,7 +6841,20 @@ impl Runtime {
     }
 }
 
-pub(super) fn permission_mode_label(mode: &str) -> &str {
+/// The name of `provider`'s permission mode `mode`, which cagents knows by
+/// what it means. Muse's modes correspond only roughly to Claude's: they
+/// work by Muse's permission rules, so they keep Muse's own names, shortened.
+pub(super) fn permission_mode_label(provider: Provider, mode: &str) -> &str {
+    match (provider, mode) {
+        (Provider::Muse, "manual") => "Ask before unmatched",
+        (Provider::Muse, "auto") => "Ask on request",
+        (Provider::Muse, "dontAsk") => "Deny unmatched",
+        (Provider::Muse, "bypassPermissions") => "Allow all",
+        _ => generic_permission_mode_label(mode),
+    }
+}
+
+fn generic_permission_mode_label(mode: &str) -> &str {
     match mode {
         "default" | "manual" => "Ask before edits",
         "readOnly" => "Read only",
@@ -7149,12 +7169,18 @@ fn fast_mode_tooltip(mode: &crate::chat::FastMode) -> String {
     }
 }
 
-fn cost_estimate_label(estimate: crate::chat::pricing::CostEstimate) -> (String, String) {
-    let amount = if estimate.microusd > 0 && estimate.microusd < 10_000 {
+/// An amount in whole cents. A spend too small to round to one cent is
+/// still a spend, so it never reads as `$0.00`.
+fn dollars(microusd: u64) -> String {
+    if microusd > 0 && microusd < 10_000 {
         "<$0.01".to_owned()
     } else {
-        format!("${:.2}", estimate.microusd as f64 / 1_000_000.0)
-    };
+        format!("${:.2}", microusd as f64 / 1_000_000.0)
+    }
+}
+
+fn cost_estimate_label(estimate: crate::chat::pricing::CostEstimate) -> (String, String) {
+    let amount = dollars(estimate.microusd);
     let label = format!(
         "{amount} est.{}",
         if estimate.partial { " · observed" } else { "" }
@@ -7360,9 +7386,24 @@ fn footer_model_label<'a>(
             },
         }
     };
+    // A level the chosen model doesn't offer is not one it will run at: the
+    // conversation drops it when it switches to that model. An ACP agent's
+    // list names each model's levels as far as the agent has said, so a
+    // model listing none is not known to offer the level; other providers'
+    // lists can be missing.
+    let offered = |effort: &&str| {
+        selected.is_none_or(|model| {
+            if model.reasoning.is_empty() {
+                provider.acp().is_none()
+            } else {
+                model.reasoning.iter().any(|level| level == effort)
+            }
+        })
+    };
     let chosen = (active.is_none() || provider == Provider::Omp)
         .then_some(chosen.reasoning)
         .flatten()
+        .filter(offered)
         .filter(|effort| Some(*effort) != draft_default_effort);
     let effort = active.map_or(chosen, |active| {
         active

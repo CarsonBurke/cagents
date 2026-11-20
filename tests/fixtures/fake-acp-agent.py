@@ -101,8 +101,17 @@ AGY_MODES = [
 AGY_MODELS = [
     ("gemini-3.8-flash", "Gemini 3.8 Flash"),
     ("gemini-4-neon", "Gemini 4 Neon"),
+    ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)"),
+    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
 ]
 AGY_LEVELS = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "Extra")]
+# As agy 1.x lists them: its thinking option names every level, but each
+# model offers its own, which its `models` state spells as combined
+# identifiers. Flash has no Extra, and some models take no level at all.
+AGY_MODEL_LEVELS = {
+    "gemini-3.8-flash": ["low", "medium", "high"],
+    "gemini-4-neon": ["low", "medium", "high", "xhigh"],
+}
 MUSE_MODES = [
     ("allowAll", "Allow all", "Run every action without asking for approval"),
     ("promptUnmatched", "Ask before unmatched actions",
@@ -232,6 +241,17 @@ class Session:
                  "options": [{"value": v, "name": n} for v, n in AGY_LEVELS]}
         return [model, level, mode]
 
+    def agy_combined_models(self):
+        names = dict(AGY_LEVELS)
+        combined = []
+        for v, n in AGY_MODELS:
+            levels = AGY_MODEL_LEVELS.get(v)
+            if not levels:
+                combined.append({"modelId": v, "name": n})
+            combined.extend({"modelId": f"{v}-{level}", "name": f"{n} ({names[level]})"}
+                            for level in levels or [])
+        return combined
+
     def setup(self, session_id=True):
         result = {
             "modes": {"currentModeId": self.mode,
@@ -241,9 +261,10 @@ class Session:
         }
         if SHAPE == "agy":
             result["models"] = {
-                "availableModels": [{"modelId": f"{v}-{level}", "name": f"{n} ({ln})"}
-                                    for v, n in AGY_MODELS for level, ln in AGY_LEVELS],
-                "currentModelId": f"{self.model}-{self.level}",
+                "availableModels": self.agy_combined_models(),
+                "currentModelId": (f"{self.model}-{self.level}"
+                                   if self.level in AGY_MODEL_LEVELS.get(self.model, [])
+                                   else self.model),
             }
             result["_meta"] = {"antigravity": {"tier": {"name": "Fixture tier", "id": "fixture"}}}
         if session_id:
@@ -509,8 +530,9 @@ class Agent:
             session.update({"sessionUpdate": "usage_update", "used": 0, "size": 0,
                             "_meta": {"dev.muse": {"contextSizeUnknown": True}}}, record=False)
         else:
-            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000,
-                            "cost": {"amount": 0.0012, "currency": "USD"}}, record=False)
+            # Antigravity reports its context window, never a cost.
+            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000},
+                           record=False)
         if session.id in self.cancelled:
             stop = "cancelled"
         result = {"stopReason": stop}

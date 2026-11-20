@@ -19783,11 +19783,31 @@ fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
     assert_eq!(recovery.account, system);
     assert!(recovery.draft);
     assert!(app.chat_auth_recovery_enabled(target));
-    assert!(app.chat_auth_resume_enabled(target));
+    // A draft has no conversation to resume.
+    assert!(!app.chat_auth_resume_enabled(target));
+    // The composer's Send is the one way to send it again: the card adds no
+    // second control doing the same (#3438).
+    let buttons = super::blocked_recovery_tests::buttons(&app, card);
+    assert!(
+        buttons
+            .iter()
+            .any(|(label, enabled)| label == "Sign in" && *enabled),
+        "{buttons:?}"
+    );
+    assert!(
+        buttons.iter().all(|(label, _)| label != "Send again"),
+        "{buttons:?}"
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|(label, enabled)| label.starts_with("Send message") && *enabled),
+        "{buttons:?}"
+    );
 
-    // Sending again is the draft's own first message, not a resume of a
-    // conversation it never had.
-    start_with(&mut app, target, Action::ResumeAfterSignIn(target));
+    // Sending again is the composer's own Send of the draft's first
+    // message, not a resume of a conversation it never had.
+    start_with(&mut app, target, Action::Submit(target, PromptMode::Send));
     let attempt = app
         .chat_ui
         .attempt(card)

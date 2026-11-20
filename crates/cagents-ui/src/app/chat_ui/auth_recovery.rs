@@ -6,8 +6,8 @@ pub(super) struct Recovery {
     label: String,
     signing_in: bool,
     login_change: Option<String>,
-    /// Whether the conversation never started: its first message went
-    /// back to the composer, and resuming sends it again.
+    /// Whether the conversation never started: there is nothing to resume,
+    /// and the composer's Send starts it once the account is signed in.
     pub(super) draft: bool,
 }
 impl Runtime {
@@ -115,7 +115,7 @@ impl Cagents {
     pub(super) fn chat_auth_resume_enabled(&self, target: Target) -> bool {
         self.chat_auth_recovery_enabled(target)
             && matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
-                if (!runtime.is_draft() || runtime.has_unsent_draft())
+                if !runtime.is_draft()
                     && self.auth_account(runtime).is_some_and(|account| self.account_login_change(&account).is_none()))
     }
     pub(super) fn resume_after_sign_in(&mut self, target: Target) -> Task<Message> {
@@ -125,13 +125,6 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) else {
             return Task::none();
         };
-        // A draft has no conversation to resume: its start failed before it
-        // took the first message, which went back to the composer. Sending
-        // that again starts the conversation anew, on the account just
-        // signed in.
-        if runtime.is_draft() {
-            return self.handle_chat_ui(Action::Submit(target, PromptMode::Send));
-        }
         if runtime.disconnected || runtime.snapshot.exited {
             return self.handle_chat_ui(Action::Reconnect(target));
         }
@@ -173,11 +166,11 @@ pub(super) fn view<'a>(
     let known = recovery.is_some();
     let mut login_change = None;
     let mut draft = false;
+    let unsent = runtime.has_unsent_draft();
     let label = if let Some(recovery) = recovery {
         let enabled = enabled && runtime.recovery_available() && !recovery.signing_in;
         draft = recovery.draft;
-        let resume_enabled =
-            enabled && recovery.login_change.is_none() && (!draft || runtime.has_unsent_draft());
+        let resume_enabled = enabled && recovery.login_change.is_none();
         login_change = recovery.login_change;
         controls.push(
             crate::ui_controls::button::primary("Sign in")
@@ -185,11 +178,17 @@ pub(super) fn view<'a>(
                 .on_press_maybe(enabled.then_some(action(Action::SignIn(target, recovery.account))))
                 .into(),
         );
-        controls.push(
-            crate::ui_controls::button::secondary(if draft { "Send again" } else { "Resume chat" })
-                .on_press_maybe(resume_enabled.then_some(action(Action::ResumeAfterSignIn(target))))
-                .into(),
-        );
+        // A draft's message is back in the composer, whose Send starts the
+        // conversation again; a second control here would do the same.
+        if !draft {
+            controls.push(
+                crate::ui_controls::button::secondary("Resume chat")
+                    .on_press_maybe(
+                        resume_enabled.then_some(action(Action::ResumeAfterSignIn(target))),
+                    )
+                    .into(),
+            );
+        }
         controls.push(
             crate::ui_controls::button::secondary("Open accounts")
                 .on_press(Message::AccountUi(account_ui::Action::OpenPane))
@@ -216,7 +215,7 @@ pub(super) fn view<'a>(
     };
     let mut rows = vec![
         design::body(label).into(),
-        design::caption(if draft { "Sign in, then send your message again. It is still in the composer." } else if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
+        design::caption(if draft && unsent { "Sign in, then send your message again. It is still in the composer." } else if draft { "Sign in, then send a message to start this chat." } else if known { "Sign in, then resume this conversation. Your draft is retained." } else { "Open accounts to add or link this session’s account, then return here to sign in and resume. Your draft is retained." }).into(),
         widget::flex_row(controls)
             .spacing(step::GAP_S as u16)
             .into(),
