@@ -631,6 +631,18 @@ impl std::fmt::Debug for Action {
     }
 }
 
+/// Why the daemon does not host a pane's conversation yet; see
+/// [`Cagents::chat_unhosted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum Unhosted {
+    /// A draft: nothing has run it, and nothing will until its first
+    /// message is sent, so it has done no work.
+    Unstarted,
+    /// This window is starting the conversation, or attaching to it, and
+    /// the daemon has not answered with it yet.
+    Starting,
+}
+
 /// What an action may confine itself to: one conversation, or the
 /// background work of every visible one.
 #[derive(Debug, Clone, Copy)]
@@ -9866,6 +9878,46 @@ impl Cagents {
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         // A reopened conversation still being prepared starts once that ends.
         self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
+    }
+    /// Why the daemon cannot host `card`'s `conversation` yet, when this
+    /// window knows it cannot: nothing has run the conversation, or this
+    /// window is still starting or attaching it. A pane exists from the
+    /// moment it is opened, but the daemon registers its chat only once the
+    /// provider has started, so asking it about the conversation before then
+    /// is refused as a conversation it does not host. `None` once the daemon
+    /// has answered this window's start or attachment with the conversation,
+    /// and whenever this window cannot tell, as for a chat whose start
+    /// failed.
+    pub(in crate::app) fn chat_unhosted(
+        &self,
+        card: CardId,
+        conversation: TerminalId,
+    ) -> Option<Unhosted> {
+        let starting = self.chat_start_pending(card);
+        match self.cards.get(&card) {
+            // A connection that was lost and is being made again may reach a
+            // daemon that has not restored the chat yet.
+            Some(CardRuntime::Chat(runtime))
+                if runtime.session.id == conversation
+                    && runtime.handle().is_some()
+                    && !(starting && runtime.disconnected) =>
+            {
+                None
+            }
+            Some(CardRuntime::Chat(runtime))
+                if runtime.is_draft() && runtime.queued.is_none() && !starting =>
+            {
+                Some(Unhosted::Unstarted)
+            }
+            Some(CardRuntime::Chat(runtime)) if runtime.handle().is_none() => {
+                Some(Unhosted::Starting)
+            }
+            // A start for a conversation other than the one the runtime is
+            // connected to, a reconnection, or a start with no chat runtime
+            // yet, as a saved conversation's while it reopens.
+            _ if starting => Some(Unhosted::Starting),
+            _ => None,
+        }
     }
     /// Whether `card` has begun starting its conversation, as opposed to
     /// waiting for that start to be allowed.

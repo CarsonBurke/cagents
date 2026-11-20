@@ -223,14 +223,24 @@ impl Cagents {
         })
     }
 
+    /// The conversations of the mounted inspectors that the daemon can be
+    /// asked about: a draft, or a chat this window is still starting or
+    /// attaching to, is not one the daemon hosts yet, and is watched once it
+    /// answers with it.
+    fn watched_conversations(&self) -> impl Iterator<Item = TerminalId> + '_ {
+        self.mounted_inspectors().filter_map(|card| {
+            let conversation = self.pane_conversation(card)?;
+            self.chat_unhosted(card, conversation)
+                .is_none()
+                .then_some(conversation)
+        })
+    }
+
     /// The mounted inspectors' conversations' pull requests and edited
     /// worktrees, pushed by the daemon. A closed inspector watches nothing,
     /// and two panes showing one conversation share its watch.
     pub(super) fn conversation_pull_request_subscription(&self) -> Subscription<Message> {
-        let mut conversations: Vec<TerminalId> = self
-            .mounted_inspectors()
-            .filter_map(|card| self.pane_conversation(card))
-            .collect();
+        let mut conversations: Vec<TerminalId> = self.watched_conversations().collect();
         conversations.sort_unstable();
         conversations.dedup();
         Subscription::batch(conversations.into_iter().map(conversation::subscription))
@@ -239,8 +249,8 @@ impl Cagents {
 
     /// Whether a mounted inspector watches `conversation`'s pull requests.
     pub(super) fn inspector_watches(&self, conversation: TerminalId) -> bool {
-        self.mounted_inspectors()
-            .any(|card| self.pane_conversation(card) == Some(conversation))
+        self.watched_conversations()
+            .any(|watched| watched == conversation)
     }
 
     /// Conversations with a current list in a mounted inspector. Compute this
@@ -253,8 +263,7 @@ impl Cagents {
             .filter_map(conversation::State::latest_list)
             .map(|(conversation, _, _)| conversation)
             .collect();
-        self.mounted_inspectors()
-            .filter_map(|card| self.pane_conversation(card))
+        self.watched_conversations()
             .filter(|conversation| listed.contains(conversation))
             .collect()
     }
@@ -331,8 +340,14 @@ impl Cagents {
     }
 
     /// Where `card`'s conversation's list is: a pane whose inspector has not
-    /// followed its conversation yet is still reading it.
+    /// followed its conversation yet is still reading it, as is one whose
+    /// chat is still starting, and a draft has done nothing.
     pub(super) fn work_phase(&self, card: CardId) -> conversation::Phase {
+        if let Some(conversation) = self.pane_conversation(card)
+            && self.chat_unhosted(card, conversation) == Some(chat_ui::Unhosted::Unstarted)
+        {
+            return conversation::Phase::Unstarted;
+        }
         self.pull_request_inspector
             .conversation(card)
             .map_or(conversation::Phase::Reading, conversation::State::phase)

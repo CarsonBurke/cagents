@@ -508,7 +508,9 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if work.lists_work => {
                     self.work_section(card, work)
                 }
-                pull_request_ui::WorkPhase::Listed => self.empty_notice(card, Section::Work),
+                pull_request_ui::WorkPhase::Listed | pull_request_ui::WorkPhase::Unstarted => {
+                    self.empty_notice(card, Section::Work)
+                }
                 pull_request_ui::WorkPhase::Reading => list_notice(
                     "Reading this chat's work…",
                     "Its pull requests and worktrees show here.",
@@ -569,7 +571,9 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if count > 0 => {
                     self.mentioned_section(card, work)
                 }
-                pull_request_ui::WorkPhase::Listed => self.empty_notice(card, Section::Mentioned),
+                pull_request_ui::WorkPhase::Listed | pull_request_ui::WorkPhase::Unstarted => {
+                    self.empty_notice(card, Section::Mentioned)
+                }
                 pull_request_ui::WorkPhase::Reading => {
                     list_notice("Reading this chat's mentions…", "")
                 }

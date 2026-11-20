@@ -200,6 +200,8 @@ pub(crate) enum Phase {
     /// Could not be asked for; asked again shortly.
     Unavailable,
     Listed,
+    /// Nothing has run the conversation yet, so it has no work to list.
+    Unstarted,
 }
 
 /// The work the user chose to show in each conversation they chose any in,
