@@ -3986,6 +3986,7 @@ impl Runtime {
                         self.queue_view()
                             .into_iter()
                             .chain(self.restored_waiting_notice())
+                            .chain(self.composer_note_view())
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
                             .chain(self.stop_confirmation())
@@ -5819,6 +5820,39 @@ impl Runtime {
 
     /// Says, where the queue was, that what a provider which did not come
     /// back was holding is now the reader's draft, and was not sent again.
+    /// Why something tried in this pane didn't happen, at the composer
+    /// where it was tried. It is a note about that try rather than about the
+    /// conversation, so it leaves the turn's outcome and the timeline alone.
+    fn composer_note_view(&self) -> Option<Element<'_, Message>> {
+        let note = self.composer_note.as_deref()?;
+        Some(
+            widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+                    design::caption(note)
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .width(Length::Fill)
+                        .into(),
+                    small_icon(
+                        Icon::Close,
+                        "Dismiss",
+                        Action::DismissComposerNote(self.target),
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
+            ))
+            .into(),
+        )
+    }
+
     fn restored_waiting_notice(&self) -> Option<Element<'_, Message>> {
         let restored = self.restored_waiting?;
         let text = restored.caption();
