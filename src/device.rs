@@ -1525,45 +1525,75 @@ mod tests {
 
     #[test]
     fn a_stopped_bridge_is_rebuilt_rather_than_reused() {
-        let directory = tempfile::tempdir().unwrap();
-        let transport = fixture_transport(
-            Device {
+        const CHILD: &str = "CAGENTS_TEST_STOPPED_BRIDGE_REBUILT";
+        if std::env::var_os(CHILD).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let context = ConnectionContext::new(Device {
                 name: "fixture".into(),
                 host: "must-not-connect".into(),
                 executable: "cagents".into(),
-            },
-            directory.path().to_path_buf(),
-        );
-        let listener = UnixListener::bind(directory.path().join("daemon.sock")).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let owned = transport.clone();
-        let worker = thread::spawn(move || {
-            run_bridge_with(listener, owned, |_| {
-                Err(io::Error::from_raw_os_error(libc::EBADF))
-            })
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !worker.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
+            });
+            let transport = fixture_transport(context.device.clone(), root.path().to_path_buf());
+            let stopped = root.path().join("daemon.sock");
+            let listener = UnixListener::bind(&stopped).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let owned = transport.clone();
+            let worker = thread::spawn(move || {
+                run_bridge_with(listener, owned, |_| {
+                    Err(io::Error::from_raw_os_error(libc::EBADF))
+                })
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(transport.cancelled.is_cancelled());
+            assert!(transport.last_error.lock().unwrap().is_some());
+            context.bridges.lock().unwrap()[0] = Some(Bridge {
+                transport,
+                worker: Some(worker),
+            });
+
+            let rebuilt = context.socket_path_with_policy(false).unwrap();
+            assert_ne!(rebuilt, stopped);
+            // Something listens there now; a connection is no longer refused.
+            UnixStream::connect(&rebuilt).unwrap();
+            assert_eq!(context.socket_path_with_policy(false).unwrap(), rebuilt);
+            context.close();
+            return;
         }
-        assert!(transport.cancelled.is_cancelled());
-        assert!(transport.last_error.lock().unwrap().is_some());
-
-        let mut stopped = Some(Bridge {
-            transport: transport.clone(),
-            worker: Some(worker),
-        });
-        evict_stopped(&mut stopped);
-        assert!(stopped.is_none());
-
-        // A bridge still running stays.
-        let live = fixture_transport(transport.device.clone(), directory.path().join("live"));
-        let mut running = Some(Bridge {
-            transport: live,
-            worker: None,
-        });
-        evict_stopped(&mut running);
-        assert!(running.is_some());
+        let root = tempfile::tempdir().unwrap();
+        for leaf in ["home", "runtime", "config", "data", "cache", "bin"] {
+            let path = root.path().join(leaf);
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // The rebuilt bridge forwards the test's connection; this SSH fails it.
+        let ssh = root.path().join("bin/ssh");
+        fs::write(&ssh, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let name = std::thread::current().name().unwrap().to_owned();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.path().join("bin").display()),
+            )
+            .env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
