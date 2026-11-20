@@ -6255,35 +6255,42 @@ impl Runtime {
 
     fn restore_find_disclosures(&mut self) {
         self.restore_failure_find();
-        self.find_disclosure
-            .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        let collapsed =
+            self.find_disclosure
+                .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         // Restoring reads a child's disclosures before it writes them; an
         // absent child has nothing to restore, so give it no entry.
         let mut no_items = Revised::default();
+        let mut child_collapsed = Vec::new();
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
-            disclosure.restore(
+            let restored = disclosure.restore(
                 self.child_expanded.get_mut(&child).unwrap_or(&mut no_items),
-                self.child_unfolded.entry(child).or_default(),
+                self.child_unfolded.entry(child.clone()).or_default(),
                 &mut Revised::default(),
             );
+            if self.selected_subagent.as_ref() == Some(&child) {
+                child_collapsed = restored;
+            }
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
-        // again when search restores a collapsed report; manual disclosures
-        // retain both their state and their prepared body.
+        // again for each report this restore collapsed; manual disclosures
+        // retain both their state and their prepared body. Only those reports
+        // are visited, so a keystroke costs what it revealed, not the cache.
         fn collapse_reports(
             cache: &mut HashMap<String, CachedItem>,
-            expanded: &HashSet<String>,
+            collapsed: Vec<String>,
             theme: crate::settings::EditorSyntaxTheme,
         ) {
-            let closed: Vec<_> = cache
-                .iter()
-                .filter_map(|(id, cached)| {
-                    (cached.report_expanded == Some(true) && !expanded.contains(id))
-                        .then(|| cached.item.as_ref().map(|item| (id.clone(), item.clone())))
-                        .flatten()
-                })
-                .collect();
-            for (id, item) in closed {
+            for id in collapsed {
+                #[cfg(test)]
+                REPORT_COLLAPSE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                let Some(item) = cache
+                    .get(&id)
+                    .filter(|cached| cached.report_expanded == Some(true))
+                    .and_then(|cached| cached.item.clone())
+                else {
+                    continue;
+                };
                 let previous = cache.remove(&id);
                 let mut cached =
                     CachedItem::updated(&item.content, theme, previous, false, false, None);
@@ -6291,16 +6298,8 @@ impl Runtime {
                 cache.insert(id, cached);
             }
         }
-        collapse_reports(&mut self.cache, &self.expanded, self.syntax_theme);
-        if let Some(child) = &self.selected_subagent {
-            collapse_reports(
-                &mut self.child_cache,
-                self.child_expanded
-                    .get(child)
-                    .map_or(&HashSet::new(), |set| &**set),
-                self.syntax_theme,
-            );
-        }
+        collapse_reports(&mut self.cache, collapsed, self.syntax_theme);
+        collapse_reports(&mut self.child_cache, child_collapsed, self.syntax_theme);
     }
 
     fn find_anchor(&self, key: &str) -> iced::advanced::widget::Id {
@@ -7710,10 +7709,17 @@ impl Cagents {
     }
 
     fn chat_find_next(&mut self, target: Target, forward: bool) -> Task<Message> {
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.refresh_find();
+        }
+        self.chat_find_step(target, forward)
+    }
+
+    /// Moves to the next or previous of the matches Find last refreshed.
+    fn chat_find_step(&mut self, target: Target, forward: bool) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.refresh_find();
         if runtime.find_matches.is_empty() {
             if runtime.find.as_ref().is_some_and(|query| !query.is_empty()) {
                 return self.begin_find_navigation(target, None);
@@ -14390,7 +14396,8 @@ impl Cagents {
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
                 }
-                return self.chat_find_next(target, true);
+                // Just refreshed: stepping must not search the transcript again.
+                return self.chat_find_step(target, true);
             }
             // Pressing the Previous or Next button blurs the search field;
             // the keyboard goes back to it, so Enter keeps stepping through
@@ -16426,3 +16433,12 @@ mod peer_draft_tests;
 #[cfg(test)]
 #[path = "chat_ui/startup_restore_tests.rs"]
 mod startup_restore_tests;
+
+#[cfg(test)]
+thread_local! { static REPORT_COLLAPSE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+/// How many cached items restoring Find's disclosures has examined to drop a
+/// report body it revealed.
+#[cfg(test)]
+pub(super) fn report_collapse_visits() -> usize {
+    REPORT_COLLAPSE_VISITS.with(std::cell::Cell::get)
+}

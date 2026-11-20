@@ -892,7 +892,16 @@ fn reader_proofs(cached: Option<&CachedItem>) -> Vec<(u64, SourceProof<str>)> {
     }
     proofs
 }
+#[cfg(test)]
+thread_local! { static RAW_STAMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+/// How many times Find has proven its sources, a pass over every searched item.
+#[cfg(test)]
+pub(super) fn raw_stamps() -> usize {
+    RAW_STAMPS.with(std::cell::Cell::get)
+}
 fn raw_stamp(runtime: &Runtime) -> RawStamp {
+    #[cfg(test)]
+    RAW_STAMPS.with(|count| count.set(count.get() + 1));
     let items = raw_items(runtime);
     RawStamp {
         context: runtime.selected_subagent.clone(),

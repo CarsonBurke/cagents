@@ -298,15 +298,23 @@ impl Disclosure {
     pub(super) fn owned_count(&self) -> usize {
         self.items.len() + self.parts.len() + self.turns.len()
     }
+    /// Gives back every disclosure this search opened, and returns the items
+    /// it collapsed, whose temporarily prepared bodies the caller may drop.
     pub(super) fn restore(
         &mut self,
         expanded: &mut Revised<HashSet<String>>,
         unfolded: &mut HashSet<String>,
         opened: &mut Revised<HashMap<String, bool>>,
-    ) {
-        for id in self.items.drain() {
-            if expanded.contains(&id) {
-                expanded.edit().remove(&id);
+    ) -> Vec<String> {
+        let collapsed: Vec<String> = self
+            .items
+            .drain()
+            .filter(|id| expanded.contains(id))
+            .collect();
+        if !collapsed.is_empty() {
+            let expanded = expanded.edit();
+            for id in &collapsed {
+                expanded.remove(id);
             }
         }
         for key in self.parts.drain() {
@@ -321,6 +329,7 @@ impl Disclosure {
                 None => opened.edit().remove(&key),
             };
         }
+        collapsed
     }
 }
 
