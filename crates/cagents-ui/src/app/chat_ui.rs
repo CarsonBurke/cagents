@@ -4106,8 +4106,8 @@ impl Runtime {
     }
 
     /// Records a message the provider accepted. The same message sent twice
-    /// in a row is one entry, as a shell keeps it, and the walk restarts
-    /// from the newest.
+    /// in a row is one entry, as a shell keeps it. An active history walk
+    /// keeps its position and unsent draft.
     #[cfg(test)]
     fn remember(&mut self, sent: String) {
         self.remember_with_attachments(sent, Vec::new());
@@ -4119,9 +4119,6 @@ impl Runtime {
             self.history.push(sent);
             self.history_images.push(attachments);
         }
-        self.history_cursor = None;
-        self.history_stash = None;
-        self.history_attachment_stash = None;
     }
 
     /// Walks the history one message older or newer, showing it in the

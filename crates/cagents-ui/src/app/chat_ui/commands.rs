@@ -998,6 +998,137 @@ mod tests {
         })
     }
 
+    mod history_ack {
+        use super::*;
+
+        #[test]
+        fn accepted_prompt_keeps_the_newer_draft_while_browsing_history() {
+            for echoed in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                let target = sending(&mut app, card, "outgoing message");
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.history = vec!["earlier prompt".into()];
+                runtime.replace_draft(text_editor::Content::with_text("newer unsent draft"));
+                if echoed {
+                    let mut snapshot = (*runtime.snapshot).clone();
+                    snapshot.generation += 1;
+                    snapshot.items = vec![
+                        user_text("earlier", "earlier prompt"),
+                        user_text("outgoing", "outgoing message"),
+                    ];
+                    show_chat_snapshot_for_test(&mut app, card, snapshot);
+                }
+                drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+                let recalled = if echoed {
+                    "outgoing message"
+                } else {
+                    "earlier prompt"
+                };
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.composer.text(), recalled);
+                assert_eq!(runtime.unsent_text(), "newer unsent draft");
+                assert!(runtime.composer_available(false));
+                assert!(runtime.commands.in_flight().is_some());
+
+                settle(&mut app, card, Ok(()));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.unsent_text(), "newer unsent draft");
+                assert_eq!(runtime.composer.text(), recalled);
+                assert_eq!(
+                    app.persistent_workspace().chat_drafts[&card],
+                    "newer unsent draft"
+                );
+                if !echoed {
+                    drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+                    assert_eq!(chat_runtime(&app, card).composer.text(), "outgoing message");
+                }
+                drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+                assert_eq!(
+                    chat_runtime(&app, card).composer.text(),
+                    "newer unsent draft"
+                );
+            }
+        }
+
+        #[test]
+        fn duplicate_acceptance_keeps_the_history_draft() {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = sending(&mut app, card, "earlier prompt");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.history = vec!["earlier prompt".into()];
+            runtime.replace_draft(text_editor::Content::with_text("newer unsent draft"));
+            drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+            settle(&mut app, card, Ok(()));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.unsent_text(), "newer unsent draft");
+            assert_eq!(runtime.history, ["earlier prompt"]);
+            drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "newer unsent draft"
+            );
+        }
+
+        #[test]
+        fn accepted_prompt_and_held_followup_keep_the_stashed_image_draft() {
+            chat::attachment_assets::with_test_image(|image| {
+                for held in [false, true] {
+                    let mut app = crate::app::tests::context_inspector_test_app(false);
+                    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                    let target = chat_runtime(&app, card).target;
+                    if held {
+                        let runtime = app.chat_runtime_mut(target).unwrap();
+                        runtime.hold_followup("outgoing message".into());
+                        drop(app.dispatch_queued(target));
+                        assert!(
+                            !chat_runtime(&app, card)
+                                .commands
+                                .in_flight()
+                                .unwrap()
+                                .followups
+                                .is_empty()
+                        );
+                    } else {
+                        sending(&mut app, card, "outgoing message");
+                    }
+                    let draft = format!(
+                        "newer unsent draft {}",
+                        image.reference.as_ref().unwrap().token()
+                    );
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    runtime.history = vec!["earlier prompt".into()];
+                    runtime.replace_draft(text_editor::Content::with_text(&draft));
+                    runtime.replace_attachments(vec![image.clone()]);
+                    let cursor = runtime.composer.cursor();
+                    drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+                    assert!(chat_runtime(&app, card).attachments.is_empty());
+                    assert_eq!(
+                        chat_runtime(&app, card).unsent_attachments(),
+                        [image.clone()]
+                    );
+
+                    settle(&mut app, card, Ok(()));
+                    let runtime = chat_runtime(&app, card);
+                    assert_eq!(runtime.unsent_attachments(), [image.clone()]);
+                    assert_eq!(runtime.unsent_text(), draft);
+                    assert!(runtime.followups.is_empty());
+                    let saved = app.persistent_workspace();
+                    assert_eq!(saved.chat_drafts[&card], draft);
+                    assert_eq!(saved.chat_draft_attachments[&card], [image.clone()]);
+                    drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+                    assert_eq!(chat_runtime(&app, card).composer.text(), "outgoing message");
+                    drop(app.update(Message::ChatUi(Action::HistoryNewer(target))));
+                    let runtime = chat_runtime(&app, card);
+                    assert_eq!(runtime.composer.text(), draft);
+                    assert_eq!(runtime.composer.cursor(), cursor);
+                    assert_eq!(runtime.attachments, [image.clone()]);
+                }
+            });
+        }
+    }
+
     /// The message leaves the composer and shows in the transcript the
     /// moment it is sent, while the provider has yet to answer, and the
     /// composer stays open for the next one.
