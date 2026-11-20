@@ -330,10 +330,17 @@ icon, and the branch's tooltip names the pull request, its state and its
 checks. Entries that match no worktree still answer `gh pr list`, but nothing
 in the sidebar shows them.
 
-Seeds cannot support evidence of the review flow. The pull request browser
-lists none of them, and opening a seeded pull request's review asks for its
-conversation, which the forge answers as not found. Like any failed GitHub
-read, that pauses the app's GitHub refreshes for a while.
+The pull request browser lists the open seeds in file order, fifty a page, so
+53 seeds give it a second page. An entry may also set `fixtureReviewRequests`,
+the number of times the reader was asked to review it (0 if absent). One or
+more makes it a review request for the reader: the browser leaves it out of its
+loaded list and shows it as a request row, **Needs your review**. Two or more
+make that row read **Review re-requested**.
+
+Seeds still cannot support evidence of the review itself. Opening a seeded
+pull request's review asks for its conversation, which the forge answers as
+not found. Like any failed GitHub read, that pauses the app's GitHub refreshes
+for a while.
 
 A steps file for a sidebar with an avatar and the fixture worktree's pull
 request. The avatar step needs ImageMagick's `magick` on the build host. It
