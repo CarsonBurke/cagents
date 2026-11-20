@@ -33,17 +33,19 @@ impl DocumentLanguage {
 /// A dotfile with no further extension (`.env`, `.gitignore`, `.bashrc`)
 /// has none as far as [`Path::extension`] is concerned, but its name is its
 /// type. One that has one, such as `.notes.md`, is typed by it.
+///
+/// A name need not be UTF-8 for its extension to decide.
 pub fn markdown_by_name(path: &Path) -> Option<bool> {
-    let name = path.file_name()?.to_str()?;
+    let name = path.file_name()?;
     if name.eq_ignore_ascii_case("README") {
         return Some(true);
     }
     if let Some(extension) = path.extension() {
-        return Some(extension.to_str().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
-        }));
+        return Some(
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown"),
+        );
     }
-    name.starts_with('.').then_some(false)
+    name.as_encoded_bytes().starts_with(b".").then_some(false)
 }
 
 /// How much of a buffer inference reads: enough for any reply or note to
@@ -236,6 +238,24 @@ See [the workflow](https://example.com/ci.yml) for details.
             ("Makefile", None),
         ] {
             assert_eq!(markdown_by_name(Path::new(name)), markdown, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_still_decides_by_its_extension() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        for (name, markdown) in [
+            (&b"note\xff.md"[..], Some(true)),
+            (b"note\xff.txt", Some(false)),
+            (b".\xffrc", Some(false)),
+            (b"note\xff", None),
+        ] {
+            assert_eq!(
+                markdown_by_name(Path::new(OsStr::from_bytes(name))),
+                markdown,
+                "{name:?}"
+            );
         }
     }
 

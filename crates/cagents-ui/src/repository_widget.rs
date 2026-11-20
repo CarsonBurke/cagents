@@ -2640,9 +2640,10 @@ pub struct RepositoryRuntime {
     lsp_edits_exact: bool,
     markdown_debounce: MarkdownDebounce,
     /// Languages the reader chose for buffers their names do not type, by
-    /// worktree-relative source. Kept here rather than on the buffer so the
-    /// choice outlives a reload or reopening the file, and a shell can keep
-    /// it across sessions.
+    /// the source's path under its worktree, since a reused file pane can
+    /// move to another worktree that has a file of the same name. Kept here
+    /// rather than on the buffer so the choice outlives a reload or
+    /// reopening the file, and a shell can keep it across sessions.
     language_choices: BTreeMap<PathBuf, DocumentLanguage>,
 }
 
@@ -5170,13 +5171,28 @@ impl RepositoryRuntime {
     /// The language the reader chose for the buffer at worktree-relative
     /// `source`, for a shell that keeps the choice across sessions.
     pub fn language_choice(&self, source: &Path) -> Option<DocumentLanguage> {
-        self.language_choices.get(source).copied()
+        self.language_choices
+            .get(&self.descriptor.worktree.join(source))
+            .copied()
+    }
+
+    /// The language the reader chose for the file this pane shows, or is
+    /// opening: the open buffer's own choice, which follows a symbolic link
+    /// to the file it names, or else the choice kept for the selected path.
+    pub fn shown_language_choice(&self) -> Option<DocumentLanguage> {
+        match &self.document {
+            DocumentState::Editable(document) => document.chosen_language(),
+            _ => self
+                .selected_path()
+                .and_then(|path| self.language_choice(path)),
+        }
     }
 
     /// Restores a language chosen in an earlier session, before the buffer
-    /// at `source` is opened.
-    pub fn restore_language_choice(&mut self, source: PathBuf, language: DocumentLanguage) {
-        self.language_choices.insert(source, language);
+    /// at worktree-relative `source` is opened.
+    pub fn restore_language_choice(&mut self, source: &Path, language: DocumentLanguage) {
+        self.language_choices
+            .insert(self.descriptor.worktree.join(source), language);
     }
 
     /// The open buffer's language as the toolbar offers it: whether it reads
@@ -6800,7 +6816,7 @@ impl RepositoryRuntime {
                             content_hash,
                             markdown,
                         );
-                        if let Some(&language) = self.language_choices.get(&document.source) {
+                        if let Some(language) = self.language_choice(&document.source) {
                             document.choose_language(Some(language));
                         }
                         DocumentState::Editable(document)
@@ -7506,13 +7522,13 @@ impl RepositoryRuntime {
                 if !document.choose_language(language) {
                     return Task::none();
                 }
+                let key = self.descriptor.worktree.join(&document.source);
                 match language {
                     Some(language) => {
-                        self.language_choices
-                            .insert(document.source.clone(), language);
+                        self.language_choices.insert(key, language);
                     }
                     None => {
-                        self.language_choices.remove(&document.source);
+                        self.language_choices.remove(&key);
                     }
                 }
                 if self.markdown_mode != MarkdownMode::Preview {

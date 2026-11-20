@@ -11867,3 +11867,81 @@ fn a_named_buffer_offers_no_language_and_highlights_by_its_name() {
     assert_eq!(runtime.language_offer(), None);
     assert_eq!(highlight_token(&runtime), "md");
 }
+
+/// Loads `view`'s selected file from disk into `runtime`, as the shell would.
+fn load_selected_file(runtime: &mut RepositoryRuntime, card: CardId, view: &RepositoryView) {
+    let path = view.selected_file.clone().unwrap();
+    drop(runtime.update(RepositoryAction::FileLoaded {
+        identity: runtime.current_identity(card, path.clone()),
+        result: crate::editor::load_file(&view.worktree, &path, crate::editor::PdfTone::Original),
+    }));
+}
+
+#[test]
+fn a_language_choice_stays_with_its_worktree_when_the_pane_moves_to_another() {
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for directory in [&first, &second] {
+        std::fs::write(directory.path().join("NOTES"), AGENT_REPLY).unwrap();
+    }
+    let view = |directory: &tempfile::TempDir| RepositoryView {
+        project: crate::model::ProjectId::new(),
+        repository: directory.path().to_path_buf(),
+        worktree: directory.path().to_path_buf(),
+        selected_file: Some("NOTES".into()),
+    };
+    let (first, second) = (view(&first), view(&second));
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(first.clone());
+    drop(runtime.initial_load(card));
+    load_selected_file(&mut runtime, card, &first);
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::PlainText),
+    }));
+
+    // Another worktree's NOTES is a different file, read from its content.
+    drop(runtime.retarget_file(card, second.clone()));
+    load_selected_file(&mut runtime, card, &second);
+    assert_eq!(runtime.language_offer(), Some((true, None)));
+
+    // Back in the first worktree, its choice still holds.
+    drop(runtime.retarget_file(card, first.clone()));
+    load_selected_file(&mut runtime, card, &first);
+    assert_eq!(
+        runtime.language_offer(),
+        Some((false, Some(DocumentLanguage::PlainText)))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_language_chosen_through_a_link_is_the_shown_files_choice() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("NOTES"), AGENT_REPLY).unwrap();
+    std::os::unix::fs::symlink("NOTES", directory.path().join("alias")).unwrap();
+    let view = RepositoryView {
+        project: crate::model::ProjectId::new(),
+        repository: directory.path().to_path_buf(),
+        worktree: directory.path().to_path_buf(),
+        selected_file: Some("alias".into()),
+    };
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(view.clone());
+    drop(runtime.initial_load(card));
+    load_selected_file(&mut runtime, card, &view);
+    assert_eq!(runtime.linked_source(), Some(Path::new("NOTES")));
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::PlainText),
+    }));
+    // The choice belongs to the file the link names, and the pane reports it
+    // for the selection that reached it.
+    assert_eq!(
+        runtime.language_choice(Path::new("NOTES")),
+        Some(DocumentLanguage::PlainText)
+    );
+    assert_eq!(
+        runtime.shown_language_choice(),
+        Some(DocumentLanguage::PlainText)
+    );
+}

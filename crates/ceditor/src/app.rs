@@ -1439,14 +1439,13 @@ impl Editor {
     /// file the session reopens it on. Files the tab showed before carry
     /// nothing forward: only what is on screen can be seen to be chosen.
     fn tab_language(tab: &Tab) -> Option<DocumentLanguage> {
-        let source = match &tab.pending_file {
-            Some(pending) => pending.path.as_path(),
+        match &tab.pending_file {
+            Some(pending) => tab.runtime.language_choice(&pending.path),
             None => tab
                 .owned_file
                 .as_ref()
-                .and_then(|_| tab.runtime.selected_path())?,
-        };
-        tab.runtime.language_choice(source)
+                .and_then(|_| tab.runtime.shown_language_choice()),
+        }
     }
 
     fn sidebar_width(&self) -> f32 {
@@ -1572,7 +1571,7 @@ impl Editor {
         // Only the file this tab opens: an untitled tab shares its root with
         // every other note, and a note's choice must not reach its siblings.
         if let (Some(file), Some(language)) = (&opened.file, opened.language) {
-            runtime.restore_language_choice(file.clone(), language);
+            runtime.restore_language_choice(file, language);
         }
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
