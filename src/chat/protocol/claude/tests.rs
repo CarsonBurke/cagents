@@ -4913,6 +4913,7 @@ fn injected_context_is_classified_by_what_it_says() {
         json!(SCALED),
         json!(format!("{SCALED}\n{SCALED}")),
         json!([{"type":"text","text":"[Image: source: /var/tmp/claude/images/1.png]"}]),
+        json!("[Image: source: /var/tmp/claude/images/mock[dark].png]"),
         json!(
             "<system-reminder>\nThe session's working directory has changed.\n</system-reminder>"
         ),
@@ -4937,6 +4938,7 @@ fn injected_context_is_classified_by_what_it_says() {
         // when it ends in a bracket of its own.
         json!(format!("{SCALED}\nAlso read README [required]")),
         json!([{"type":"text","text":format!("{SCALED} Also read README [required]")}]),
+        json!("[Image: source: /var/tmp/claude/images/1.png] Also read README [required]"),
     ];
     let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
     let step = |items: &[Item], name: &str, text: &str| {

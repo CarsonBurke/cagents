@@ -5276,17 +5276,20 @@ fn model_only_note(text: &str) -> bool {
 /// coordinates by 1.13 to map to original image.]`, or where it saved one the
 /// reader attached, as `[Image: source: /path/1.png]`. Every line must be one
 /// whole note, so a note followed by anything else still shows, even when
-/// that ends in a bracket of its own.
+/// that ends in a bracket of its own. A saved path may hold brackets, but a
+/// closing one before more words ends its note.
 fn image_note(text: &str) -> bool {
     let note = |line: &str| {
         line.strip_prefix("[Image: ")
             .and_then(|rest| rest.strip_suffix(']'))
-            .filter(|rest| !rest.contains(['[', ']']))
-            .is_some_and(|rest| {
-                rest.starts_with("source: ")
-                    || rest
-                        .strip_prefix("original ")
-                        .is_some_and(|rest| rest.contains(", displayed at "))
+            .is_some_and(|rest| match rest.strip_prefix("source: ") {
+                Some(path) => !path.contains("] "),
+                None => {
+                    !rest.contains(['[', ']'])
+                        && rest
+                            .strip_prefix("original ")
+                            .is_some_and(|rest| rest.contains(", displayed at "))
+                }
             })
     };
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
