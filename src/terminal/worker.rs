@@ -3696,15 +3696,39 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        if shutting_down && !exited && !self.carried {
-            let result = shutdown_child_exit(
-                &self.child,
-                self.child_identity.as_ref(),
-                &self.child_exit_rx,
-                self.checked_shutdown,
-            );
-            self.handle_child_exit(&mut exited, result);
-        }
+        let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+            if exited {
+                let cleanup = if self.checked_shutdown {
+                    Ok(())
+                } else {
+                    confirm_exited_family(
+                        &self.child,
+                        &self.master,
+                        Instant::now() + CHILD_SHUTDOWN_DEADLINE,
+                    )
+                };
+                match cleanup {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.error("wait for child", error);
+                        false
+                    }
+                }
+            } else {
+                let result = shutdown_child_exit(
+                    &self.child,
+                    &self.master,
+                    self.child_identity.as_ref(),
+                    &self.child_exit_rx,
+                    self.checked_shutdown,
+                );
+                let confirmed = result.is_ok();
+                self.handle_child_exit(&mut exited, result);
+                confirmed
+            }
+        } else {
+            true
+        };
         if let Some(transcript) = self.transcript.take() {
             transcript.finish();
         }
@@ -3729,7 +3753,8 @@ impl Worker {
         // A failed destructive close retains its original family obligation.
         // Later root exit and EOF cannot substitute for successful family kill.
         // The shared input seal alone is insufficient: carry also uses it.
-        let family_cleanup_confirmed = !self.checked_close_started || self.checked_shutdown;
+        let family_cleanup_confirmed =
+            shutdown_cleanup_confirmed && (!self.checked_close_started || self.checked_shutdown);
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
@@ -5955,51 +5980,62 @@ fn wait_for_worker_event(
     }
 }
 
-/// Sending HUP successfully does not mean the process exited. Preserve its
-/// graceful handler first, then escalate through pinned identities and bound
-/// how long a stalled holder can keep a daemon waiting for its exit report.
+/// A root exit alone cannot release the terminal family. Capture its exact
+/// jobs before HUP, preserve the shell's graceful exit, and require cleanup
+/// before accepting the holder's report.
 fn shutdown_child_exit(
     child: &holder::HeldChild,
+    master: &holder::PtyMaster,
     identity: Option<&RootIdentity>,
     exits: &Receiver<ChildExit>,
     checked: bool,
 ) -> ChildExit {
     let deadline = std::time::Instant::now() + CHILD_SHUTDOWN_DEADLINE;
-    match exits.try_recv() {
-        Ok(result) => return result,
-        // A lost report channel does not mean this pinned root stopped.
-        Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
-    }
+    let mut report = exits.try_recv().ok();
     if !checked {
-        if let Err(error) = child.kill() {
-            return exits
-                .try_recv()
-                .unwrap_or_else(|_| Err(format!("hang up child: {error}")));
-        }
-        match exits.recv_timeout(CHILD_HANGUP_GRACE) {
-            Ok(result) => return result,
-            Err(RecvTimeoutError::Disconnected) => {
+        let captured = identity
+            .ok_or_else(|| "Child identity unavailable".to_owned())
+            .and_then(|root| FrozenFamily::capture(root, deadline));
+        match captured {
+            Ok(mut family) => {
+                family.hangup(child, deadline)?;
+                if report.is_none() {
+                    report = match exits.recv_timeout(
+                        CHILD_HANGUP_GRACE.min(deadline.saturating_duration_since(Instant::now())),
+                    ) {
+                        Ok(result) => Some(result),
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err("child reaper closed".into());
+                        }
+                        Err(RecvTimeoutError::Timeout) => None,
+                    };
+                }
                 if child
-                    .exited_within(CHILD_HANGUP_GRACE)
+                    .exited_within(Duration::ZERO)
                     .map_err(|error| format!("observe child exit: {error}"))?
                 {
-                    return Err("child reaper closed".into());
+                    confirm_exited_family(child, master, deadline)?;
+                } else {
+                    // Only the root ran during its grace period. Re-freeze
+                    // its current family, including any jobs its HUP handler
+                    // started, before escalating through exact pidfds.
+                    FrozenFamily::capture(identity.expect("captured root identity"), deadline)?
+                        .kill(deadline)?;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(error) => {
+                if !child
+                    .exited_within(Duration::ZERO)
+                    .map_err(|error| format!("observe child exit: {error}"))?
+                {
+                    return Err(error);
+                }
+                confirm_exited_family(child, master, deadline)?;
+            }
         }
-        let stopped = identity
-            .ok_or_else(|| "Child identity unavailable".to_owned())
-            .and_then(|root| FrozenFamily::capture(root, deadline))
-            .and_then(|mut family| family.kill(deadline));
-        if let Err(error) = stopped {
-            // Census failure cannot grant authority over guessed descendants.
-            // This root remains pinned independently by its holder's pidfd.
-            tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
-            child
-                .force_kill()
-                .map_err(|error| format!("terminate child: {error}"))?;
-        }
+    }
+    if let Some(report) = report {
+        return report;
     }
     exits
         .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -6010,6 +6046,36 @@ fn shutdown_child_exit(
                     .to_owned()
             }
         })?
+}
+
+fn confirm_exited_family(
+    child: &holder::HeldChild,
+    master: &holder::PtyMaster,
+    deadline: Instant,
+) -> Result<(), String> {
+    // Reconcile natural completion if the shell is already gone. A process
+    // census can miss fork/exit churn, so also require the kernel's proof
+    // that no descendant still holds the PTY slave open.
+    let master = master.duplicate().map_err(|error| error.to_string())?;
+    let mut target = libc::pollfd {
+        fd: master.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: one live, owned descriptor; this only observes readiness.
+    if unsafe { libc::poll(&mut target, 1, 0) } < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if child
+        .exited_within(Duration::ZERO)
+        .map_err(|error| format!("observe child exit: {error}"))?
+        && target.revents & libc::POLLHUP != 0
+        && close_processes::session_is_empty(child.pid(), deadline)?
+    {
+        Ok(())
+    } else {
+        Err("Terminal process cleanup remains unconfirmed".into())
+    }
 }
 
 fn child_exit_event(

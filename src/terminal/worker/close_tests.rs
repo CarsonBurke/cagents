@@ -302,6 +302,74 @@ fn a_background_child_requires_confirmation_and_confirmed_close_terminates_it() 
 }
 
 #[test]
+fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    let child = shutdown_background_job(&shell);
+    assert!(shell.terminal.shutdown().is_ok());
+    assert!(
+        holder::exits_within(&child.0, Duration::from_secs(1)).unwrap(),
+        "ordinary shutdown reported success but left its HUP-ignoring background job running"
+    );
+}
+
+#[test]
+fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    let child = shutdown_background_job(&shell);
+    shell.terminal.input(b"exit 3\n").unwrap();
+    shell.wait_for("the worker's actual shell exit report", || {
+        shell.terminal.events().try_iter().any(|event| {
+            matches!(
+                event,
+                TerminalEvent::Exited {
+                    exit_code: 3,
+                    signal: None,
+                    ..
+                }
+            )
+        })
+    });
+    assert!(!holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(shell.terminal.shutdown().is_err());
+    assert!(!shell.terminal.is_completed());
+}
+
+struct ShutdownJob(File);
+
+impl Drop for ShutdownJob {
+    fn drop(&mut self) {
+        let _ = close_processes::signal(&self.0, libc::SIGKILL);
+        let _ = holder::exits_within(&self.0, Duration::from_secs(1));
+    }
+}
+
+fn shutdown_background_job(shell: &CloseSafetyShell) -> ShutdownJob {
+    shell
+        .terminal
+        .input(b"trap 'exit 3' HUP; sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60' &\n")
+        .unwrap();
+    let mut child = None;
+    shell.wait_for("HUP-ignoring background job", || {
+        let Some(pid) = fs::read_to_string(shell.home.path().join("child.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+        else {
+            return false;
+        };
+        if !fs::read_link(format!("/proc/{pid}/exe"))
+            .is_ok_and(|path| path.file_name() == Some(OsStr::new("sleep")))
+        {
+            return false;
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(fd >= 0, "pin the fixture's exact background job");
+        child = Some(unsafe { File::from_raw_fd(fd as libc::c_int) });
+        true
+    });
+    ShutdownJob(child.unwrap())
+}
+
+#[test]
 fn a_non_shell_root_command_requires_confirmation() {
     let command = CloseSafetyShell::spawn(Path::new("/bin/sleep"), &["120"]);
     assert_eq!(
