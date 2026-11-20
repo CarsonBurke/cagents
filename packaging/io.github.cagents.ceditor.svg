@@ -1,95 +1,69 @@
 <svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="ceditor" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <!-- Brushed warm-titanium outer chassis (exact match to cagents GNOME Deck) -->
-    <linearGradient id="deck-side" x1="64" y1="84" x2="64" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#8A847D"/>
-      <stop offset="55%" stop-color="#6E6963"/>
-      <stop offset="100%" stop-color="#58544F"/>
+    <linearGradient id="dark-side" x1="64" y1="88" x2="64" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#141923"/>
+      <stop offset="100%" stop-color="#090C12"/>
     </linearGradient>
-    <linearGradient id="deck-face" x1="64" y1="10" x2="64" y2="112" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#DCD8D2"/>
-      <stop offset="18%" stop-color="#C8C3BC"/>
-      <stop offset="82%" stop-color="#A39D95"/>
-      <stop offset="100%" stop-color="#918B83"/>
+    <linearGradient id="dark-face" x1="64" y1="10" x2="64" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#272F3F"/>
+      <stop offset="35%" stop-color="#191F2C"/>
+      <stop offset="100%" stop-color="#11151F"/>
     </linearGradient>
-    <linearGradient id="deck-rim" x1="64" y1="10" x2="64" y2="112" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.75"/>
-      <stop offset="25%" stop-color="#FFFFFF" stop-opacity="0.15"/>
-      <stop offset="100%" stop-color="#000000" stop-opacity="0.12"/>
+    <linearGradient id="dark-rim" x1="64" y1="10" x2="64" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.34"/>
+      <stop offset="28%" stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.25"/>
     </linearGradient>
-    <linearGradient id="bay-bg" x1="64" y1="20" x2="64" y2="100" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#111722"/>
-      <stop offset="100%" stop-color="#1D2534"/>
+    <linearGradient id="teal-side" x1="0" y1="88" x2="0" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#347A70"/>
+      <stop offset="100%" stop-color="#255E56"/>
     </linearGradient>
-    <linearGradient id="slate-side" x1="0" y1="84" x2="0" y2="96" gradientUnits="userSpaceOnUse">
+    <linearGradient id="teal-top" x1="0" y1="16" x2="0" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#64B8AA"/>
+      <stop offset="100%" stop-color="#459689"/>
+    </linearGradient>
+    <linearGradient id="slate-side" x1="0" y1="88" x2="0" y2="108" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#222C3E"/>
-      <stop offset="100%" stop-color="#1A2232"/>
+      <stop offset="100%" stop-color="#171F2E"/>
     </linearGradient>
-    <linearGradient id="slate-top" x1="0" y1="24" x2="0" y2="90" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#3C4B66"/>
-      <stop offset="100%" stop-color="#2A364B"/>
-    </linearGradient>
-    <linearGradient id="teal-side" x1="0" y1="84" x2="0" y2="96" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#357A70"/>
-      <stop offset="100%" stop-color="#28635A"/>
-    </linearGradient>
-    <linearGradient id="teal-top" x1="0" y1="24" x2="0" y2="90" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#60B2A4"/>
-      <stop offset="100%" stop-color="#469689"/>
-    </linearGradient>
-    <linearGradient id="coral-side" x1="0" y1="84" x2="0" y2="96" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#C84418"/>
-      <stop offset="100%" stop-color="#A83510"/>
-    </linearGradient>
-    <linearGradient id="coral-top" x1="0" y1="24" x2="0" y2="90" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FF7847"/>
-      <stop offset="45%" stop-color="#F85F2A"/>
-      <stop offset="100%" stop-color="#E64F1E"/>
-    </linearGradient>
-    <linearGradient id="ivory-side" x1="0" y1="84" x2="0" y2="96" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#C8C4BC"/>
-      <stop offset="100%" stop-color="#AEA9A0"/>
-    </linearGradient>
-    <linearGradient id="ivory-top" x1="0" y1="24" x2="0" y2="90" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FAF8F4"/>
-      <stop offset="100%" stop-color="#EAE6DE"/>
+    <linearGradient id="slate-top" x1="0" y1="16" x2="0" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3F4F6B"/>
+      <stop offset="100%" stop-color="#2B374D"/>
     </linearGradient>
     <filter id="key-sh" x="-15%" y="-10%" width="130%" height="125%">
-      <feDropShadow dx="0" dy="1.6" stdDeviation="1.4" flood-color="#05080F" flood-opacity="0.55"/>
+      <feDropShadow dx="0" dy="2.0" stdDeviation="1.6" flood-color="#05080F" flood-opacity="0.45"/>
     </filter>
-</defs>
-  
-  <!-- 2.5D Orthographic bottom extrusion lip -->
-  <rect x="10" y="18" width="108" height="101" rx="18" fill="url(#deck-side)"/>
-  <!-- Main anodized titanium top face -->
-  <rect x="10" y="10" width="108" height="101" rx="18" fill="url(#deck-face)"/>
-  <rect x="11" y="11" width="106" height="99" rx="17" fill="none" stroke="url(#deck-rim)" stroke-width="2"/>
-  <!-- Recessed obsidian bay -->
-  <rect x="19" y="19" width="90" height="83" rx="11" fill="url(#bay-bg)"/>
-  <rect x="19.75" y="19.75" width="88.5" height="81.5" rx="10.25" fill="none" stroke="#000000" stroke-opacity="0.45" stroke-width="1.5"/>
+  </defs>
 
-  <!-- Left slim tactile gutter rail (Deep Slate-Navy) -->
+  <!-- Single-wrap dark machined obsidian 2.5D chassis -->
+  <rect x="10" y="18" width="108" height="101" rx="18" fill="url(#dark-side)"/>
+  <rect x="10" y="10" width="108" height="101" rx="18" fill="url(#dark-face)"/>
+  <rect x="11" y="11" width="106" height="99" rx="17" fill="none" stroke="url(#dark-rim)" stroke-width="2"/>
+
+  <!-- Left slim tactile gutter rail (Cool Teal-Mint) -->
   <g filter="url(#key-sh)">
-    <rect x="24" y="29" width="18" height="68" rx="5.5" fill="url(#slate-side)"/>
-    <rect x="24" y="24" width="18" height="66" rx="5.5" fill="url(#slate-top)"/>
-    <rect x="24.6" y="24.6" width="16.8" height="64.8" rx="4.9" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.2"/>
-    <rect x="30" y="35" width="6" height="3.6" rx="1.8" fill="#8FA6CB" opacity="0.65"/>
-    <rect x="30" y="46" width="6" height="3.6" rx="1.8" fill="#8FA6CB" opacity="0.65"/>
-    <rect x="30" y="57" width="6" height="3.6" rx="1.8" fill="#FF7847"/>
-    <rect x="30" y="68" width="6" height="3.6" rx="1.8" fill="#8FA6CB" opacity="0.65"/>
+    <rect x="18" y="24" width="21" height="80" rx="7.5" fill="url(#teal-side)"/>
+    <rect x="18" y="18" width="21" height="78" rx="7.5" fill="url(#teal-top)"/>
+    <rect x="18.7" y="18.7" width="19.6" height="76.6" rx="6.8" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="1.3"/>
+    <rect x="25" y="30.5" width="7" height="4.2" rx="2.1" fill="#D5F7F0" opacity="0.65"/>
+    <rect x="25" y="43.5" width="7" height="4.2" rx="2.1" fill="#D5F7F0" opacity="0.65"/>
+    <rect x="25" y="56.5" width="7" height="4.2" rx="2.1" fill="#FFFFFF" opacity="0.98"/>
+    <rect x="25" y="69.5" width="7" height="4.2" rx="2.1" fill="#D5F7F0" opacity="0.65"/>
+    <rect x="25" y="82.5" width="7" height="4.2" rx="2.1" fill="#D5F7F0" opacity="0.42"/>
   </g>
 
-  <!-- Right wide tactile editor page (Warm Ivory — pure GNOME Circle contrast!) -->
+  <!-- Right wide tactile editor plate (Deep Slate-Navy) -->
   <g filter="url(#key-sh)">
-    <rect x="46" y="29" width="58" height="68" rx="6" fill="url(#ivory-side)"/>
-    <rect x="46" y="24" width="58" height="66" rx="6" fill="url(#ivory-top)"/>
-    <rect x="46.6" y="24.6" width="56.8" height="64.8" rx="5.4" fill="none" stroke="#FFFFFF" stroke-opacity="0.85" stroke-width="1.2"/>
-    <!-- Chunky iconic editorial lines + bold coral-orange caret -->
-    <rect x="53" y="34.5" width="24" height="4.6" rx="2.3" fill="#469689"/>
-    <rect x="53" y="45.5" width="38" height="4.6" rx="2.3" fill="#3B4963" opacity="0.72"/>
-    <rect x="53" y="56.5" width="26" height="4.6" rx="2.3" fill="#1F2937"/>
-    <rect x="83" y="52.0" width="6.2" height="13.5" rx="2.5" fill="#F85F2A"/>
-    <rect x="53" y="67.5" width="32" height="4.6" rx="2.3" fill="#3B4963" opacity="0.52"/>
-    <rect x="53" y="78.5" width="18" height="4.6" rx="2.3" fill="#3B4963" opacity="0.35"/>
+    <rect x="43" y="24" width="67" height="80" rx="8" fill="url(#slate-side)"/>
+    <rect x="43" y="18" width="67" height="78" rx="8" fill="url(#slate-top)"/>
+    <rect x="43.7" y="18.7" width="65.6" height="76.6" rx="7.3" fill="none" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.3"/>
+    <!-- Chunky iconic syntax bars -->
+    <rect x="51" y="30.5" width="28" height="5.2" rx="2.6" fill="#93AACF" opacity="0.86"/>
+    <rect x="51" y="43.5" width="44" height="5.2" rx="2.6" fill="#6EC4B6" opacity="0.94"/>
+    <!-- Active edited line + focal coral-orange caret block -->
+    <rect x="51" y="56.5" width="30" height="5.2" rx="2.6" fill="#F8FAFC"/>
+    <rect x="86" y="51.2" width="7.0" height="15.6" rx="2.8" fill="#FF6F3C"/>
+    <rect x="51" y="69.5" width="37" height="5.2" rx="2.6" fill="#93AACF" opacity="0.72"/>
+    <rect x="51" y="82.5" width="21" height="5.2" rx="2.6" fill="#93AACF" opacity="0.46"/>
   </g>
 </svg>

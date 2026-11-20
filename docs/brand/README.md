@@ -6,31 +6,31 @@
 | :-: | :-: |
 | <img src="../../packaging/dev.cagents.Cagents.svg" width="128" alt="cagents icon"> | <img src="../../packaging/io.github.cagents.ceditor.svg" width="128" alt="ceditor icon"> |
 
-Both icons share the same tactile 2.5D brushed-titanium switchboard chassis
-and recessed obsidian bay, following GNOME Circle / Libadwaita orthographic
-proportions.
+Both icons share the same tactile 2.5D machined obsidian switchboard chassis
+following GNOME Circle / Libadwaita orthographic proportions, with modules
+seated directly on the deck body.
 
 - **cagents** houses three chunky vertical workspace modules — deep slate-navy,
   cool teal-mint, and a focal coral-orange active lane etched with a crisp `>`
   prompt chevron — communicating parallel coding agents with one workspace in
   focus.
-- **ceditor** uses the same titanium chassis with a slim slate-navy gutter rail
-  beside a warm-ivory tactile editorial page, chunky syntax bars, and a focal
-  coral-orange caret so the two icons are unmistakable at a glance on a dock.
+- **ceditor** uses the same obsidian chassis with a slim cool teal-mint gutter
+  rail beside a wide deep slate-navy editor pane, chunky syntax bars, a bright
+  active line, and a focal coral-orange caret.
 
 At tray and task bar sizes (16-22 px) both marks remain crisp and distinct:
-three coloured vertical lanes vs. a light editorial page with a dark gutter.
+three equal coloured vertical lanes vs. a slim teal gutter beside a dark editor
+pane with an active line and coral caret.
 
 ## Construction
 
 - Chassis: 108 × 101 px rounded rectangle (`rx = 18`) with an 8 px orthographic
-  bottom lip (`#8A847D` → `#58544F`) and brushed warm-titanium face
-  (`#DCD8D2` → `#918B83`) over a recessed obsidian bay (`#111722` → `#1D2534`).
-- Modules: 2.5D tactile keycaps (`rx = 5.5–6`) with subtle top rim highlights
-  and grounded bottom edges.
-- Palette: deep slate-navy (`#3C4B66` → `#2A364B`), cool teal-mint
-  (`#60B2A4` → `#469689`), warm ivory (`#FAF8F4` → `#EAE6DE`), and focal
-  coral-orange (`#FF7847` → `#E64F1E`).
+  bottom lip (`#141923` → `#090C12`) and satin obsidian face
+  (`#272F3F` → `#11151F`) framed by a subtle top rim light.
+- Modules: 2.5D tactile keycaps (`rx = 7.5–8`) seated directly on the chassis
+  with subtle top rim highlights and grounded bottom edges.
+- Palette: deep slate-navy (`#3F4F6B` → `#2B374D`), cool teal-mint
+  (`#64B8AA` → `#459689`), and focal coral-orange (`#FF7A48` → `#E34C1A`).
 
 ## Files
 
