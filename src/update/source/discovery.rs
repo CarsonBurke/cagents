@@ -517,6 +517,7 @@ mod tests {
     fn source_deadline_covers_trickled_prefix_and_payload_without_resetting() {
         for prefix_trickle in [true, false] {
             let (mut client, mut server) = UnixStream::pair().unwrap();
+            let deadline = Instant::now() + Duration::from_millis(55);
             let worker = std::thread::spawn(move || {
                 let frame = if prefix_trickle {
                     [4u32.to_be_bytes().as_slice(), b"body"].concat()
@@ -531,7 +532,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(35));
                 }
             });
-            let result = read(&mut client, Instant::now() + Duration::from_millis(55));
+            let result = read(&mut client, deadline);
             assert!(
                 result.is_err(),
                 "partial frame progress must not reset the absolute deadline"
