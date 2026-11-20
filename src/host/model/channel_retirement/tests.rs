@@ -38,13 +38,13 @@ fn fixture() -> (Registry, tempfile::TempDir, ChannelIncarnation, PathBuf) {
 #[test]
 fn retirement_rejects_a_reused_channel_identity_and_another_registry() {
     let (mut registry, _directory, home, repository) = fixture();
-    registry
-        .apply(&ModelEdit::DeleteChannel { id: home.channel })
-        .unwrap();
     let retire = ModelEdit::RetireEmptyChannel {
         home,
         expected_view_revision: 0,
     };
+    let retired = registry.apply(&retire).unwrap();
+    assert!(retired.changed);
+    assert!(retired.model.channel(home.channel).is_none());
     assert!(registry.apply(&retire).is_err(), "the channel is gone");
     registry
         .apply(&ModelEdit::CreateChannel {
