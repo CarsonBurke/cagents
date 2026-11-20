@@ -13018,6 +13018,14 @@ impl Cagents {
                         let opening_name =
                             self.request_opening_name(target).unwrap_or_else(Task::none);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        // An early limit wake may have been discarded while
+                        // attaching. Reconcile it after the activity entry exists.
+                        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.usage_limit =
+                                runtime.handle().and_then(|handle| handle.limit());
+                            self.sidebar_state
+                                .set_card_limited(target.card, runtime.usage_limit.is_some());
+                        }
                         // A new request can reject before its first Changed
                         // wake reaches this window. Historical reopen alone
                         // does not manufacture a fresh limit occurrence.

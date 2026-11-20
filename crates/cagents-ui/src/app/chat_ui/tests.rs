@@ -1945,6 +1945,91 @@ fn a_usage_limit_the_daemon_judges_reads_limited_until_it_lifts_even_unseen() {
     );
 }
 
+mod initial_attachment_limits {
+    use super::*;
+    use crate::agent_execution::directory::UsageLimit;
+
+    fn restore_hidden_chat(limit_wake_before_ready: bool, keep_runtime: bool) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace.resize_viewport(1_600.0);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let old_target = chat_runtime(&app, card).target;
+        let old_handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let limit = UsageLimit {
+            summary: "Codex usage limit reached".into(),
+            reset: None,
+            resets_at: None,
+        };
+        let mut snapshot = (*old_handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.error = Some("Usage limit reached for this plan".into());
+        old_handle.publish_snapshot_for_test(snapshot.clone());
+        old_handle.judge_limit_for_test(Some(limit.clone()));
+        drop(app.update(Message::ChatUi(Action::Wake(old_target, Wake::Changed))));
+        assert_eq!(app.sidebar_state.card_attention(card).limited, 1);
+        assert!(!app.sidebar_state.has_card_update(card));
+        let session = chat_runtime(&app, card).session.clone();
+
+        // Another pane stays selected while this already-hosted chat restores.
+        drop(app.select_worktree("/workspace/elsewhere".into(), true));
+        let focused = app.workspace.focused().expect("another pane is selected");
+        assert_ne!(focused, card);
+        assert_ne!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        app.chat_forget(card);
+        if !keep_runtime {
+            app.cards.insert(card, CardRuntime::Loading);
+        }
+        drop(app.open_chat(card, session.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        assert_eq!(
+            app.chat_ui.attempt(card).unwrap().intent,
+            chat::Intent::Restore
+        );
+        assert_eq!(app.sidebar_state.card_attention(card).limited, 0);
+
+        // The transport can cache the limit before ChatAttached without a wake,
+        // or deliver its wake after attachment while Ready is still queued.
+        let handle = Arc::new(ClientHandle::fixture(session, snapshot));
+        handle.set_visible(false).unwrap();
+        handle.judge_limit_for_test(Some(limit.clone()));
+        if limit_wake_before_ready {
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Limit))));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(app.sidebar_state.card_attention(card).limited, 0);
+        }
+        answer_start(&mut app, target, Ok(handle.clone()));
+
+        // No Changed or Limit follows Ready, and the conversation stays hidden.
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(app.workspace.focused(), Some(focused));
+        assert!(!handle.is_visible_for_test());
+        assert!(!chat_runtime(&app, card).presents());
+        assert_eq!(
+            app.sidebar_state.card_attention(card).state(),
+            Some(crate::sidebar::AttentionState::Limited)
+        );
+        assert_eq!(chat_runtime(&app, card).usage_limit, Some(limit));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn hidden_restore_installs_a_limit_cached_before_attachment() {
+        for keep_runtime in [false, true] {
+            restore_hidden_chat(false, keep_runtime);
+        }
+    }
+
+    #[test]
+    fn hidden_restore_reconciles_a_limit_wake_handled_before_ready() {
+        for keep_runtime in [false, true] {
+            restore_hidden_chat(true, keep_runtime);
+        }
+    }
+}
+
 #[test]
 fn tail_only_history_cannot_replace_a_channels_first_task() {
     use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
