@@ -1132,7 +1132,10 @@ its older `models` and `modes` lists. Run as `muse...` or with
 `-contributor` model beside each ordinary one, a reasoning option only on
 `muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
 soon as a session opens, and usage with no context size. It ignores its
-arguments, so a launch recipe written for the real agent runs it unchanged.
+arguments, so a launch recipe written for the real agent runs it unchanged,
+except Antigravity's `--app-data-dir DIR`: like `agy`, a process started
+with it keeps its conversations apart from the ones it lists otherwise, so
+the account check's own sessions are not listed as the reader's.
 It contacts no model, account or network.
 
 In the Muse shape, three account commands answer the way `muse` does, so the

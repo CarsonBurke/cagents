@@ -6,7 +6,10 @@ credentials or a model, and never touches the real agents' data. Its replies
 copy the shapes of Antigravity 1.5.12's and Muse 1.4.23's `initialize` and
 `session/new` answers: by default Antigravity's, Muse's when it is run as
 `muse` or `muse-upstream` or with FAKE_ACP_SHAPE=muse. Any command-line
-arguments, such as `acp --disable-telemetry`, are accepted and ignored.
+arguments, such as `acp --disable-telemetry`, are accepted and ignored,
+but for Antigravity's `--app-data-dir DIR`, which keeps that process's
+conversations apart from the ones it lists otherwise, as `agy` keeps them
+in ~/.gemini/DIR rather than ~/.gemini/antigravity-cli.
 
 Each conversation is saved under FAKE_ACP_STATE (default: a directory in
 the system's temporary directory) as the session updates it sent, so
@@ -74,6 +77,18 @@ SHAPE = os.environ.get("FAKE_ACP_SHAPE") or (
 STATE = os.environ.get("FAKE_ACP_STATE") or os.path.join(
     tempfile.gettempdir(), f"fake-acp-agent-{os.getuid()}"
 )
+# Antigravity's own data directory, relative to ~/.gemini, for the
+# conversations a process started with `--app-data-dir` keeps apart.
+APP_DATA = "antigravity-cli"
+for _index, _argument in enumerate(sys.argv[1:]):
+    if SHAPE != "agy":
+        break
+    if _argument == "--app-data-dir" and _index + 2 < len(sys.argv):
+        APP_DATA = sys.argv[_index + 2]
+    elif _argument.startswith("--app-data-dir="):
+        APP_DATA = _argument.split("=", 1)[1]
+if APP_DATA != "antigravity-cli":
+    STATE = os.path.join(STATE, "app-data", APP_DATA.replace("/", "_"))
 AUTH = os.environ.get("FAKE_ACP_AUTH", "")
 LOG = os.environ.get("FAKE_ACP_LOG")
 
@@ -168,8 +183,7 @@ class Session:
             path = os.path.join(data, "muse", "sessions", time.strftime("%Y/%m/%d"),
                                 self.id, ".session.lock")
         else:
-            path = os.path.join(home, ".gemini", "antigravity-cli", "presence",
-                                self.id + ".lock")
+            path = os.path.join(home, ".gemini", APP_DATA, "presence", self.id + ".lock")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.lock = open(path, "a")
         fcntl.flock(self.lock, fcntl.LOCK_EX)
