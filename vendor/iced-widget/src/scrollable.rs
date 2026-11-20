@@ -2436,12 +2436,13 @@ impl Scrollbars {
             let scroller = if ratio >= 1.0 {
                 None
             } else {
-                // min height for easier grabbing with super tall content
                 let scroller_height =
-                    (scrollbar_bounds.height * ratio).max(2.0);
-                let scroller_offset =
-                    translation.y * ratio * scrollbar_bounds.height
-                        / bounds.height;
+                    scroller_length(scrollbar_bounds.height, ratio);
+                let scroller_offset = scroller_offset(
+                    translation.y,
+                    content_bounds.height - bounds.height,
+                    scrollbar_bounds.height - scroller_height,
+                );
 
                 let scroller_bounds = Rectangle {
                     x: bounds.x + bounds.width
@@ -2510,11 +2511,13 @@ impl Scrollbars {
             let scroller = if ratio >= 1.0 {
                 None
             } else {
-                // min width for easier grabbing with extra wide content
-                let scroller_length = (scrollbar_bounds.width * ratio).max(2.0);
-                let scroller_offset =
-                    translation.x * ratio * scrollbar_bounds.width
-                        / bounds.width;
+                let scroller_length =
+                    scroller_length(scrollbar_bounds.width, ratio);
+                let scroller_offset = scroller_offset(
+                    translation.x,
+                    content_bounds.width - bounds.width,
+                    scrollbar_bounds.width - scroller_length,
+                );
 
                 let scroller_bounds = Rectangle {
                     x: (scrollbar_bounds.x + scroller_offset).max(0.0),
@@ -2604,6 +2607,31 @@ impl Scrollbars {
 
     fn active(&self) -> bool {
         self.y.is_some() || self.x.is_some()
+    }
+}
+
+/// The shortest a scroller gets, so it stays visible and easy to grab on
+/// content many times taller than its viewport.
+const MIN_SCROLLER_LENGTH: f32 = 32.0;
+
+/// The length of a scroller showing `ratio` of its content on a track.
+///
+/// It is proportional to the visible share, but no shorter than
+/// [`MIN_SCROLLER_LENGTH`] and no longer than the track.
+fn scroller_length(track: f32, ratio: f32) -> f32 {
+    (track * ratio).max(MIN_SCROLLER_LENGTH.min(track))
+}
+
+/// Where a scroller sits along its track: the share of `scrollable` content
+/// travelled, across the `travel` the track leaves the scroller. A
+/// proportional scroller lands where upstream put it; one held at the minimum
+/// still reaches both ends, and matches how a drag reads it back
+/// (`Scrollbar::scroll_percentage_y`).
+fn scroller_offset(translation: f32, scrollable: f32, travel: f32) -> f32 {
+    if scrollable > 0.0 {
+        (translation / scrollable).clamp(0.0, 1.0) * travel.max(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -2879,5 +2907,41 @@ pub fn default(theme: &Theme, status: Status) -> Style {
                 auto_scroll,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_SCROLLER_LENGTH, scroller_length, scroller_offset};
+
+    #[test]
+    fn a_scroller_on_very_tall_content_keeps_a_grabbable_length() {
+        assert_eq!(scroller_length(800.0, 0.001), MIN_SCROLLER_LENGTH);
+        assert_eq!(scroller_length(800.0, 0.5), 400.0);
+        // A track shorter than the minimum is filled, not overflowed.
+        assert_eq!(scroller_length(20.0, 0.001), 20.0);
+    }
+
+    #[test]
+    fn a_scroller_reaches_both_ends_of_its_track() {
+        let (track, content, viewport) = (800.0, 800_000.0, 800.0);
+        let length = scroller_length(track, viewport / content);
+        let travel = track - length;
+        let scrollable = content - viewport;
+
+        assert_eq!(scroller_offset(0.0, scrollable, travel), 0.0);
+        assert_eq!(scroller_offset(scrollable, scrollable, travel), travel);
+        assert_eq!(scroller_offset(scrollable / 2.0, scrollable, travel), travel / 2.0);
+    }
+
+    #[test]
+    fn a_proportional_scroller_sits_where_upstream_put_it() {
+        let (track, content, viewport, translation) = (600.0, 1_800.0, 600.0, 450.0);
+        let ratio = viewport / content;
+        let length = scroller_length(track, ratio);
+        let upstream = translation * ratio * track / viewport;
+
+        let offset = scroller_offset(translation, content - viewport, track - length);
+        assert!((offset - upstream).abs() < 1e-3, "{offset} != {upstream}");
     }
 }

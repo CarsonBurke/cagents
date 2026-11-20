@@ -61,3 +61,9 @@ crates/cagents-ui/src/app/chat_ui/selectable_prose.rs and flow_layout.rs.
 Why: a scrolled composer draft was sliced at the padding's inner edge (#2824). Remove this when upstream editors can draw into their padding.
 
 Dragging a selection into a band selects the line drawn there, and cursor reveal then scrolls it into view. The drag therefore scrolls one line for each pointer move inside the band, and stops while the pointer is still. iced still reports drags only within the widget's bounds.
+
+## Scroller minimum length (cagents #3102)
+
+A scrollable's scroller is proportional to the visible share of its content, but no shorter than 32 logical pixels (`MIN_SCROLLER_LENGTH` in src/scrollable.rs), and no longer than its track. Its position is the share of the scrollable content travelled, across the track left after the scroller, so it still reaches both ends. That is the mapping a drag already reads back through `Scrollbar::scroll_percentage_y`. Where the proportional length is above the minimum, the scroller is drawn where upstream drew it.
+
+Why: upstream's minimum is 2 pixels. A transcript sized for its whole conversation, not just its loaded window, can be thousands of viewports tall, so its scroller shrank to a dot that was hard to see and to grab (cagents #3102). A track click centres the scroller on the pointer, so a click within half the scroller of either end lands on that end. Coverage: the `scrollable::tests` in this crate (`scripts/cargo-gate test --locked -p iced_widget --lib scrollable::`). Remove this when upstream's minimum is usable on very tall content.
