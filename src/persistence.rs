@@ -3452,6 +3452,12 @@ pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, Saved
     Ok(owners)
 }
 
+fn claim_transcript(claimed: &mut HashSet<String>, path: &Path) {
+    if let Some(name) = transcript_name(path) {
+        claimed.insert(name.to_owned());
+    }
+}
+
 /// A recipe row can outlive its transcript metadata and vice versa, and
 /// either is reason enough to keep the file.
 fn collect_claimed_transcript_names(
@@ -3468,15 +3474,10 @@ fn collect_claimed_transcript_names(
             claimed.insert(row?);
         }
     }
-    let mut claim_path = |path: &Path| {
-        if let Some(name) = transcript_name(path) {
-            claimed.insert(name.to_owned());
-        }
-    };
     let mut statement = connection.prepare("SELECT path_json FROM transcript_metadata")?;
     for row in statement.query_map([], |row| row.get::<_, String>(0))? {
         let path: PathBuf = from_json("transcript path", &row?)?;
-        claim_path(&path);
+        claim_transcript(claimed, &path);
     }
     let mut statement = connection.prepare(
         "SELECT content_json FROM cards WHERE kind_tag = 'terminal' AND content_json IS NOT NULL",
@@ -3484,7 +3485,7 @@ fn collect_claimed_transcript_names(
     for row in statement.query_map([], |row| row.get::<_, String>(0))? {
         let terminal: TerminalSession = from_json("archived terminal", &row?)?;
         if let Some(path) = &terminal.transcript_path {
-            claim_path(path);
+            claim_transcript(claimed, path);
         }
         claimed.insert(terminal.id.to_string());
     }
@@ -3509,7 +3510,7 @@ fn collect_claimed_transcript_names(
             .terminal
             .and_then(|terminal| terminal.transcript_path)
         {
-            claim_path(&path);
+            claim_transcript(claimed, &path);
         }
     }
     Ok(())

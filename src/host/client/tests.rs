@@ -3690,8 +3690,14 @@ fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
         }),
     ));
     host.lock().unwrap().register_client(1);
+    // A spawn still reserved, whose worker is about to open a transcript
+    // named for another terminal.
     let spawning = TerminalId::new();
-    host.lock().unwrap().reserve_spawn(spawning).unwrap();
+    let opening = directory.path().join(format!("{}.log", TerminalId::new()));
+    host.lock()
+        .unwrap()
+        .reserve_spawn_writing(spawning, &opening)
+        .unwrap();
     let inherited = directory.path().join(format!("{}.log", TerminalId::new()));
     let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
     let returned = crate::model::TerminalSession {
@@ -3722,11 +3728,13 @@ fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
 
     let mut terminals = vec![spawning, returned.id];
     terminals.sort();
+    let mut transcripts = vec![opening, inherited];
+    transcripts.sort();
     assert_eq!(
         response,
         ServerResponse::ResidentTerminals {
             terminals,
-            transcripts: vec![inherited],
+            transcripts,
         }
     );
     let listed: Vec<_> = host

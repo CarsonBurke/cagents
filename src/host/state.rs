@@ -1499,14 +1499,28 @@ impl HostState {
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal_id, paired, None)
+        self.reserve_spawn_for_view_reserved(terminal_id, paired, None, None)
     }
 
+    /// A reservation for a spawn whose worker will open `transcript`.
+    #[cfg(test)]
+    pub(crate) fn reserve_spawn_writing(
+        &mut self,
+        terminal_id: TerminalId,
+        transcript: &std::path::Path,
+    ) -> Result<(), ProtocolError> {
+        self.reserve_spawn_for_view_reserved(terminal_id, None, None, Some(transcript))
+    }
+
+    /// Reserves `terminal_id` for a spawn whose worker will open `transcript`.
+    /// The transcript is held with the reservation, so the resident census
+    /// names it before the worker creates the file.
     fn reserve_spawn_for_view_reserved(
         &mut self,
         terminal_id: TerminalId,
         paired: Option<&TerminalSession>,
         transition: Option<&super::chat::TerminalViewReservation<'_>>,
+        transcript: Option<&std::path::Path>,
     ) -> Result<(), ProtocolError> {
         let owns_transition = transition.is_some_and(|transition| {
             paired.is_some_and(|source| source.id == terminal_id)
@@ -1555,6 +1569,10 @@ impl HostState {
                 format!("terminal {terminal_id} already exists"),
                 false,
             ));
+        }
+        if let Some(transcript) = transcript {
+            self.spawning_transcripts
+                .insert(terminal_id, transcript.to_owned());
         }
         self.inventory_generation += 1;
         Ok(())
@@ -4954,12 +4972,8 @@ fn start_terminal_view_owned_reserved(
             terminal_id,
             paired.then_some(&session),
             transition,
+            session.transcript_path.as_deref(),
         )?;
-        if let Some(transcript) = &session.transcript_path {
-            state
-                .spawning_transcripts
-                .insert(terminal_id, transcript.clone());
-        }
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {
                 // An adopted process already owns its callback listener.
