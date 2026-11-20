@@ -1913,7 +1913,7 @@ mod tests {
         assert!(ended.copy_text().contains("Exit status: 17"));
         assert!(ended.copy_text().contains("Unix milliseconds): 42"));
 
-        let relaunched = fresh_terminal_relaunch(&previous);
+        let relaunched = fresh_terminal_relaunch(&previous).unwrap();
         assert_ne!(relaunched.id, previous.id);
         app.set_residency(
             card,
