@@ -28,7 +28,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{Identity, UsageSnapshot, schedule::CLOCK_SLACK};
+use super::{Identity, UsageMerge, UsageSnapshot, schedule::CLOCK_SLACK};
 use crate::{agent::Provider, chat::Model};
 
 const FILE_NAME: &str = "account-usage.json";
@@ -307,9 +307,12 @@ impl Cache {
             // Account::cache_key prefixes the canonical home with the
             // provider executable. Non-Claude entries keep the legacy rule.
             let independent_scopes = key.starts_with("claude:");
-            let merged = existing
-                .snapshot
-                .merged(&entry.snapshot, now, independent_scopes);
+            let mode = if independent_scopes {
+                UsageMerge::IndependentScopes
+            } else {
+                UsageMerge::OrderedSnapshot
+            };
+            let merged = existing.snapshot.merged(&entry.snapshot, now, mode);
             if merged.observed_at != entry.snapshot.observed_at
                 || (independent_scopes && merged.observed_at == existing.snapshot.observed_at)
             {

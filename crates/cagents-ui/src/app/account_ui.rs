@@ -39,8 +39,8 @@ pub(super) fn install_url(provider: Provider) -> Option<&'static str> {
     }
 }
 use crate::account::{
-    self, Account, AccountId, Identity, LiveReport, UsageSnapshot, UsageSource, UsageStatus,
-    UsageWindow,
+    self, Account, AccountId, Identity, LiveReport, UsageMerge, UsageSnapshot, UsageSource,
+    UsageStatus, UsageWindow,
     cache::{Cache, Catalog, Entry},
     home::Homes,
     omp::{self, History},
@@ -4524,10 +4524,14 @@ impl Cagents {
         let mut learned = None;
         let mut merged_inventory = false;
         let merged_snapshot = match &outcome {
-            Outcome::Answered { snapshot, .. } => state
-                .snapshot
-                .as_ref()
-                .map(|current| current.merged(snapshot, now, provider == Provider::Claude)),
+            Outcome::Answered { snapshot, .. } => state.snapshot.as_ref().map(|current| {
+                let mode = if provider == Provider::Claude {
+                    UsageMerge::IndependentScopes
+                } else {
+                    UsageMerge::OrderedSnapshot
+                };
+                current.merged(snapshot, now, mode)
+            }),
             _ => None,
         };
         let retained_account = match (&outcome, &merged_snapshot) {
@@ -5867,7 +5871,12 @@ impl Cagents {
                         state.snapshot = Some(state.snapshot.as_ref().map_or_else(
                             || UsageSnapshot::clone(&snapshot),
                             |current| {
-                                current.merged(&snapshot, now, login.provider == Provider::Claude)
+                                let mode = if login.provider == Provider::Claude {
+                                    UsageMerge::IndependentScopes
+                                } else {
+                                    UsageMerge::IncomingSnapshot
+                                };
+                                current.merged(&snapshot, now, mode)
                             },
                         ));
                     }

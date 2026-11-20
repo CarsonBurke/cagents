@@ -1145,6 +1145,19 @@ pub struct UsageSnapshot {
 /// its reset: providers round it, and report it at different moments.
 pub const RESET_TOLERANCE: u64 = 3_600;
 
+/// How incoming evidence replaces an existing usage snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageMerge {
+    /// Merge Claude's account and model parts by their own credible stamps.
+    IndependentScopes,
+    /// Preserve whole-snapshot ordering, allowing replacement after clock rollback.
+    OrderedSnapshot,
+    /// Preserve whole-snapshot ordering without a clock-rollback exception.
+    OrderedSnapshotWithoutRollback,
+    /// Accept a registration result regardless of its observation stamp.
+    IncomingSnapshot,
+}
+
 impl UsageSnapshot {
     /// Merge independent Claude account and model evidence. Complete probes
     /// stamp both parts with `observed_at`; a model-only report supplies its
@@ -1153,26 +1166,31 @@ impl UsageSnapshot {
     ///
     /// Only scoped windows and their stamp belong to the model part. All
     /// other fields (including reset inventory and eligibility) belong to
-    /// the account part. Other providers retain whole-snapshot replacement,
-    /// including their existing tie and clock-rollback behavior.
-    pub fn merged(&self, incoming: &Self, now: u64, independent_scopes: bool) -> Self {
-        if !independent_scopes {
-            return if self.observed_at > incoming.observed_at
-                && Self::stamp_is_credible(self.observed_at, now)
-            {
-                self.clone()
-            } else {
+    /// the account part. Other merge modes preserve each caller's previous
+    /// whole-snapshot replacement, tie and clock-rollback behavior.
+    pub fn merged(&self, incoming: &Self, now: u64, mode: UsageMerge) -> Self {
+        let newer = |existing: u64, incoming: u64| match mode {
+            UsageMerge::IndependentScopes => match (
+                Self::stamp_is_credible(existing, now),
+                Self::stamp_is_credible(incoming, now),
+            ) {
+                (true, false) => false,
+                (false, true) => true,
+                _ => incoming > existing,
+            },
+            UsageMerge::OrderedSnapshot => {
+                incoming >= existing || !Self::stamp_is_credible(existing, now)
+            }
+            UsageMerge::OrderedSnapshotWithoutRollback => incoming >= existing,
+            UsageMerge::IncomingSnapshot => true,
+        };
+        if mode != UsageMerge::IndependentScopes {
+            return if newer(self.observed_at, incoming.observed_at) {
                 incoming.clone()
+            } else {
+                self.clone()
             };
         }
-        let newer = |existing: u64, incoming: u64| match (
-            Self::stamp_is_credible(existing, now),
-            Self::stamp_is_credible(incoming, now),
-        ) {
-            (true, false) => false,
-            (false, true) => true,
-            _ => incoming > existing,
-        };
         let account = if newer(self.observed_at, incoming.observed_at) {
             incoming
         } else {
@@ -1330,7 +1348,7 @@ impl LiveReport {
                     // clock rollback is cleared by merge_live as before.
                     incoming.scoped_observed_at = Some(scoped_stamp);
                 }
-                let merged = current.merged(&incoming, now, true);
+                let merged = current.merged(&incoming, now, UsageMerge::IndependentScopes);
                 if merged == *current {
                     return false;
                 }

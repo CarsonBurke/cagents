@@ -883,6 +883,7 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
 
 #[cfg(test)]
 mod tests {
+    use super::super::UsageMerge;
     use super::*;
     use serde_json::json;
 
@@ -970,16 +971,42 @@ mod tests {
         let now = 1_790_000_000_000;
         let existing = UsageSnapshot::state(UsageStatus::Limited, "existing", now);
         let tied = UsageSnapshot::state(UsageStatus::Ok, "same timestamp", now);
-        assert_eq!(existing.merged(&tied, now, false), tied);
+        assert_eq!(
+            existing.merged(&tied, now, UsageMerge::OrderedSnapshot),
+            tied
+        );
         let older = UsageSnapshot::state(UsageStatus::Ok, "delayed", now - 1_000);
-        assert_eq!(existing.merged(&older, now, false), existing);
+        assert_eq!(
+            existing.merged(&older, now, UsageMerge::OrderedSnapshot),
+            existing
+        );
         let future = UsageSnapshot::state(
             UsageStatus::Ok,
             "future",
             now + 10 * super::super::schedule::CLOCK_SLACK,
         );
-        assert_eq!(existing.merged(&future, now, false), future);
-        assert_eq!(future.merged(&existing, now, false), existing);
+        assert_eq!(
+            existing.merged(&future, now, UsageMerge::OrderedSnapshot),
+            future
+        );
+        assert_eq!(
+            future.merged(&existing, now, UsageMerge::OrderedSnapshot),
+            existing
+        );
+        assert_eq!(
+            future.merged(&existing, now, UsageMerge::OrderedSnapshotWithoutRollback),
+            future,
+            "reset completion preserves a newer whole snapshot after clock rollback",
+        );
+        assert_eq!(
+            existing.merged(&tied, now, UsageMerge::OrderedSnapshotWithoutRollback),
+            tied,
+        );
+        assert_eq!(
+            existing.merged(&older, now, UsageMerge::IncomingSnapshot),
+            older,
+            "registration accepts the incoming whole snapshot unconditionally",
+        );
     }
 
     #[test]
@@ -1027,17 +1054,26 @@ mod tests {
             now + 3_000,
         );
         for (left, right) in [(&rejected, &model_figures), (&rollback, &refreshed)] {
-            let merged = left.merged(right, now + 4_000, true);
-            assert_eq!(merged, right.merged(left, now + 4_000, true));
+            let merged = left.merged(right, now + 4_000, UsageMerge::IndependentScopes);
+            assert_eq!(
+                merged,
+                right.merged(left, now + 4_000, UsageMerge::IndependentScopes)
+            );
             for snapshot in [left, right, &merged] {
-                assert_eq!(*snapshot, snapshot.merged(snapshot, now + 4_000, true));
+                assert_eq!(
+                    *snapshot,
+                    snapshot.merged(snapshot, now + 4_000, UsageMerge::IndependentScopes)
+                );
             }
         }
-        let combined = rejected.merged(&model_figures, now + 4_000, true);
+        let combined = rejected.merged(&model_figures, now + 4_000, UsageMerge::IndependentScopes);
         assert_eq!(combined.status, UsageStatus::Limited);
         assert_eq!(combined.observed_at, now + 2_000);
         assert_eq!(combined.scoped_observed_at, Some(now + 3_000));
-        assert_eq!(rollback.merged(&refreshed, now + 4_000, true), refreshed);
+        assert_eq!(
+            rollback.merged(&refreshed, now + 4_000, UsageMerge::IndependentScopes),
+            refreshed
+        );
     }
 
     #[test]

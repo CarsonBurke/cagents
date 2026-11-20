@@ -962,7 +962,14 @@ impl Cagents {
             let provider = state.account.provider;
             let mut merged = state.snapshot.as_ref().map_or_else(
                 || snapshot.clone(),
-                |current| current.merged(&snapshot, now, provider == Provider::Claude),
+                |current| {
+                    let mode = if provider == Provider::Claude {
+                        UsageMerge::IndependentScopes
+                    } else {
+                        UsageMerge::OrderedSnapshotWithoutRollback
+                    };
+                    current.merged(&snapshot, now, mode)
+                },
             );
             let mut merged_inventory = false;
             if status == ConsumeStatus::Reset
