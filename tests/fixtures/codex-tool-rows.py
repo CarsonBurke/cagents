@@ -139,6 +139,12 @@ def items(child):
           "failure": {"type": "usageLimitExceeded", "limitId": "images"}}),
         ({"id": "compact", "type": "contextCompaction"},
          {"id": "compact", "type": "contextCompaction"}),
+        # A file moved and edited in one patch: Codex keys it by the path it
+        # read and names where it went.
+        (None,
+         {"id": "rename", "type": "fileChange", "status": "completed", "changes": [
+             {"path": "src/load.rs", "kind": {"type": "update", "move_path": "src/settings/load.rs"},
+              "diff": "@@ -1,3 +1,3 @@\n use super::Settings;\n-use crate::load::parse;\n+use crate::settings::parse;\n \n"}]}),
     ]
 
 
