@@ -1,5 +1,5 @@
 //! Explicit, account-bound reset attempts. No path here retries a consume.
-use super::super::resets::{ConsumeOutcome, ConsumeStatus};
+use super::super::resets::{ConsumeOutcome, ConsumeStatus, same_login};
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -20,13 +20,9 @@ pub async fn consume(
             "Use a reset idempotency key of 1–64 letters, digits, hyphens or underscores",
         );
     }
-    let Some(expected) = expected_identity.filter(|identity| {
-        identity.disputed_by.is_none()
-            && identity
-                .email
-                .as_ref()
-                .is_some_and(|email| !email.trim().is_empty())
-    }) else {
+    let Some(expected) =
+        expected_identity.filter(|identity| same_login(Some(identity), Some(identity)))
+    else {
         return ConsumeOutcome::unavailable("Refresh this account before confirming a reset");
     };
     let binding = binding(&account, &reset_id, &idempotency_key, &expected);
@@ -59,7 +55,7 @@ pub async fn consume(
             identity: Some(identity),
             snapshot,
             ..
-        } if same_identity(&identity, &expected) => *snapshot,
+        } if same_login(Some(&identity), Some(&expected)) => *snapshot,
         Outcome::Answered { .. } => {
             return unsent(
                 prior,
@@ -164,7 +160,7 @@ pub async fn consume(
             identity: Some(identity),
             snapshot,
             ..
-        } if same_identity(&identity, &expected) => Some(*snapshot),
+        } if same_login(Some(&identity), Some(&expected)) => Some(*snapshot),
         _ => None,
     };
     let message = match (status, snapshot.is_some()) {
@@ -206,28 +202,6 @@ fn unsent(
     }
 }
 
-pub(super) fn same_identity(actual: &Identity, expected: &Identity) -> bool {
-    let same = |actual: &str, expected: &str| {
-        !actual.trim().is_empty() && actual.trim().eq_ignore_ascii_case(expected.trim())
-    };
-    actual.disputed_by.is_none()
-        && actual
-            .email
-            .as_deref()
-            .zip(expected.email.as_deref())
-            .is_some_and(|(actual, expected)| same(actual, expected))
-        && expected
-            .organization
-            .as_deref()
-            .filter(|org| !org.trim().is_empty())
-            .is_none_or(|expected| {
-                actual
-                    .organization
-                    .as_deref()
-                    .is_some_and(|actual| same(actual, expected))
-            })
-}
-
 pub(super) fn claude_status(body: &Value) -> ConsumeStatus {
     if matches!(
         body["reason"].as_str(),
@@ -266,7 +240,7 @@ pub(super) async fn codex_consume(
         session.send(&json!({"id":2,"method":"account/read","params":{}})).await?;
         let identity = codex_response(&mut session, 2).await?.map_err(|_| "Codex could not read this login")?;
         let identity = super::super::codex::parse_account(&identity).map_err(|_| "Codex's login is unavailable")?;
-        if !same_identity(&identity, expected) { return Ok(ConsumeStatus::Unavailable); }
+        if !same_login(Some(&identity), Some(expected)) { return Ok(ConsumeStatus::Unavailable); }
         let mut params = json!({"idempotencyKey":key});
         if reset_id != "codex/next" { params["creditId"] = reset_id.into(); }
         session.send(&json!({"id":3,"method":"account/rateLimitResetCredit/consume","params":params})).await?;

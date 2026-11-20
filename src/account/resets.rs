@@ -1,7 +1,36 @@
 //! Reset inventory and explicit reset attempts, shared by the CLI and UI.
 use serde::{Deserialize, Serialize};
 
-use super::{AccountId, UsageSnapshot, UsageWindow, WindowKind};
+use super::{AccountId, Identity, UsageSnapshot, UsageWindow, WindowKind};
+
+/// Whether a current login can act on a reset observed for `expected`.
+/// Plan metadata may change, but both identities must be undisputed and name
+/// the same email. A previously known organization must still match.
+pub fn same_login(actual: Option<&Identity>, expected: Option<&Identity>) -> bool {
+    let Some((actual, expected)) = actual.zip(expected) else {
+        return false;
+    };
+    let same = |actual: &str, expected: &str| {
+        !actual.trim().is_empty() && actual.trim().eq_ignore_ascii_case(expected.trim())
+    };
+    actual.disputed_by.is_none()
+        && expected.disputed_by.is_none()
+        && actual
+            .email
+            .as_deref()
+            .zip(expected.email.as_deref())
+            .is_some_and(|(actual, expected)| same(actual, expected))
+        && expected
+            .organization
+            .as_deref()
+            .filter(|org| !org.trim().is_empty())
+            .is_none_or(|expected| {
+                actual
+                    .organization
+                    .as_deref()
+                    .is_some_and(|actual| same(actual, expected))
+            })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResetKind {
@@ -295,6 +324,109 @@ impl ConsumeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_login_eligibility_preserves_backend_identity_rules() {
+        for (actual_email, expected_email, actual_org, expected_org, eligible) in [
+            (
+                Some(" ME@EXAMPLE.TEST "),
+                Some("me@example.test"),
+                Some(" ACME "),
+                Some("acme"),
+                true,
+            ),
+            (
+                Some("me@example.test"),
+                Some("other@example.test"),
+                None,
+                None,
+                false,
+            ),
+            (
+                Some("me@example.test"),
+                Some("me@example.test"),
+                Some("Acme"),
+                Some("Other"),
+                false,
+            ),
+            (
+                Some("me@example.test"),
+                Some("me@example.test"),
+                None,
+                Some("Acme"),
+                false,
+            ),
+            (
+                Some("me@example.test"),
+                Some("me@example.test"),
+                Some(" "),
+                Some("Acme"),
+                false,
+            ),
+            (
+                Some("me@example.test"),
+                Some("me@example.test"),
+                Some("Acme"),
+                None,
+                true,
+            ),
+            (
+                Some("me@example.test"),
+                Some("me@example.test"),
+                Some("Acme"),
+                Some(" "),
+                true,
+            ),
+            (
+                Some("me@example.test"),
+                Some("me@example.test"),
+                None,
+                None,
+                true,
+            ),
+            (None, Some("me@example.test"), None, None, false),
+            (Some("me@example.test"), None, None, None, false),
+            (Some(" "), Some(" "), None, None, false),
+            (
+                Some("ME@ÉXAMPLE.TEST"),
+                Some("me@éxample.test"),
+                None,
+                None,
+                false,
+            ),
+        ] {
+            let actual = Identity {
+                email: actual_email.map(str::to_owned),
+                organization: actual_org.map(str::to_owned),
+                plan: Some("Max".into()),
+                disputed_by: None,
+            };
+            let expected = Identity {
+                email: expected_email.map(str::to_owned),
+                organization: expected_org.map(str::to_owned),
+                plan: Some("Pro".into()),
+                disputed_by: None,
+            };
+            assert_eq!(
+                same_login(Some(&actual), Some(&expected)),
+                eligible,
+                "actual: {actual:?}; expected: {expected:?}"
+            );
+        }
+        let known = Identity {
+            email: Some("me@example.test".into()),
+            ..Identity::default()
+        };
+        let disputed = Identity {
+            disputed_by: Some("other@example.test".into()),
+            ..known.clone()
+        };
+        assert!(!same_login(Some(&disputed), Some(&known)));
+        assert!(!same_login(Some(&known), Some(&disputed)));
+        assert!(!same_login(None, Some(&known)));
+        assert!(!same_login(Some(&known), None));
+        assert!(!same_login(None, None));
+    }
 
     fn window(key: &str, kind: WindowKind) -> UsageWindow {
         UsageWindow {
