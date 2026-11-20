@@ -167,7 +167,7 @@ file is removed first, so pressing it resumes normally.
 Claude Code 2.1 reports `session_state_changed` `idle` once a turn has
 settled. Create `fixture-session-idle` to send that frame after each main
 turn's result, including a stopped one. A turn stopped with **Stop** must
-still read Interrupted once the idle frame arrives.
+still read **Stopped** once the idle frame arrives.
 
 A resumed transcript may be damaged, as a crash leaves one. The provider
 skips each line that isn't a JSON record, as Claude Code does. It then
