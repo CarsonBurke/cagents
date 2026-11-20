@@ -105,6 +105,17 @@ EXTRA_PRESSURE = 1.0
 # run.
 BUILD_SLICE = "background-cagents.slice"
 TEST_SLICE = "app-cagents-test.slice"
+# Builds' outputs fill the page cache, which counts toward the build slice's
+# MemoryHigh. Reclaim at that cap takes anonymous memory as well as cache: on
+# fw16, with 13 GiB still available, builds' 25 GiB of anonymous memory and
+# 7 GiB of cache pushed 10 GiB to swap, past zram onto disk. So while builds
+# run in scopes, one build-host at a time asks the kernel, once a second, to
+# drop cache alone (memory.reclaim with swappiness=0, Linux 6.13 on) whenever
+# the slice comes within RECLAIM_HEADROOM of its cap, down to RECLAIM_SLACK
+# further below it.
+RECLAIM_HEADROOM = 2 * 2**30
+RECLAIM_SLACK = 2**30
+RECLAIM_TICK = 1.0
 # How often build-host restocks its build's tokens from the pool, and how
 # often it counts the builds sharing it.
 TOKEN_TICK = 0.02
@@ -178,6 +189,91 @@ def build_slice_memory():
     uid = os.getuid()
     return (f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/"
             f"background.slice/{BUILD_SLICE}/memory.stat")
+
+
+def slice_directory():
+    """The build slice's cgroup directory, or None where builds run in place."""
+    memory = build_slice_memory()
+    return memory and os.path.dirname(memory)
+
+
+def cache_to_drop(current, cache, high):
+    """How much of the build slice's `cache`, of its `current` memory, to
+    reclaim under a MemoryHigh of `high` bytes (None for none): none while the
+    slice is not near its cap, and not more than its cache."""
+    if high is None or current <= high - RECLAIM_HEADROOM:
+        return 0
+    return min(cache, current - (high - RECLAIM_HEADROOM - RECLAIM_SLACK))
+
+
+class CacheTrimmer:
+    """Keeps the build slice's page cache from making the kernel swap builds
+    out at its cap, while this build runs: one build-host at a time, the
+    one holding `lock`, drops cache that would take the slice near its cap."""
+
+    def __init__(self, directory, lock):
+        self.directory, self.lock = directory, lock
+        self.stopped = threading.Event()
+        self.leading = None
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+        self.thread.start()
+
+    def lead(self):
+        """Whether this build-host is the one that trims, taking that on if
+        no other is."""
+        if self.leading is None:
+            try:
+                file = open(self.lock, "a")
+            except OSError:
+                return False
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                file.close()
+                return False
+            self.leading = file
+        return True
+
+    def read(self, name):
+        with open(os.path.join(self.directory, name)) as file:
+            return file.read().strip()
+
+    def trim(self):
+        """Drops what cache_to_drop says; False once this kernel or slice
+        cannot drop cache alone, or does not say what it holds."""
+        try:
+            high = self.read("memory.high")
+            cache = next(int(line.split()[1]) for line in self.read("memory.stat").splitlines()
+                         if line.startswith("file "))
+            amount = cache_to_drop(int(self.read("memory.current")), cache,
+                                   None if high == "max" else int(high))
+        except FileNotFoundError:
+            return True  # The slice comes and goes with its builds.
+        except (OSError, ValueError, StopIteration, IndexError):
+            return False
+        if amount:
+            try:
+                with open(os.path.join(self.directory, "memory.reclaim"), "w") as file:
+                    file.write(f"{amount} swappiness=0")
+            except BlockingIOError:
+                pass  # Less cache was left to drop than asked for.
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False  # EINVAL: a kernel whose reclaim takes no swappiness.
+        return True
+
+    def watch(self):
+        while not self.stopped.wait(RECLAIM_TICK):
+            if self.lead() and not self.trim():
+                return
+
+    def close(self):
+        self.stopped.set()
+        # A reclaim under way finishes on its own.
+        self.thread.join(RECLAIM_TICK)
+        if self.leading:
+            self.leading.close()
 
 
 def memory_allows(reserved, slice_memory):
@@ -936,6 +1032,8 @@ class Build:
                 self.nested = within_build()
                 self.scoped = not self.nested and prepare_slice()
                 self.jobserver = None
+                trimmer = CacheTrimmer(slice_directory(), jobserver_directory() + ".reclaim") \
+                    if self.scoped and slice_directory() else None
                 if self.scoped or self.nested and lost_jobserver():
                     try:
                         self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
@@ -944,6 +1042,8 @@ class Build:
                 try:
                     yield self
                 finally:
+                    if trimmer:
+                        trimmer.close()
                     if self.jobserver:
                         self.jobserver.close()
         except Expired:

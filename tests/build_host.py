@@ -1055,6 +1055,101 @@ class Slice(unittest.TestCase):
                          (False, []))
 
 
+class CacheTrimming(unittest.TestCase):
+    """Near its cap, the build slice drops page cache rather than letting the
+    kernel swap builds out."""
+
+    GiB = 2**30
+
+    def setUp(self):
+        self.scope = FixtureDirectory(prefix="cagents-cache-trim-")
+        self.addCleanup(self.scope.close)
+        self.slice = Path(self.scope.name) / "background-cagents.slice"
+        self.slice.mkdir()
+        self.lock = str(Path(self.scope.name) / "reclaim.lock")
+        tick = unittest.mock.patch.object(build_host, "RECLAIM_TICK", 0.005)
+        tick.start()
+        self.addCleanup(tick.stop)
+
+    def memory(self, current, cache, high):
+        for name, value in (("memory.high", str(high)), ("memory.current", str(current)),
+                            ("memory.stat", f"anon {max(0, current - cache)}\nfile {cache}\nfile_dirty 0\n")):
+            (self.slice / f".{name}").write_text(value + "\n")
+            (self.slice / f".{name}").replace(self.slice / name)
+
+    def trimmer(self):
+        trimmer = build_host.CacheTrimmer(str(self.slice), self.lock)
+        self.addCleanup(trimmer.close)
+        return trimmer
+
+    def asked(self):
+        reclaim = self.slice / "memory.reclaim"
+        return reclaim.read_text() if reclaim.exists() else None
+
+    def wait_for(self, predicate, label):
+        deadline = time.monotonic() + HANG_GUARD
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
+            time.sleep(0.002)
+
+    def test_cache_is_dropped_only_near_the_cap_and_no_more_than_there_is(self):
+        G, high = self.GiB, 32 * self.GiB
+        self.assertEqual(build_host.cache_to_drop(30 * G, 8 * G, high), 0)
+        self.assertEqual(build_host.cache_to_drop(30 * G + 1, 8 * G, high), G + 1)
+        self.assertEqual(build_host.cache_to_drop(31 * G, 8 * G, high), 2 * G)
+        self.assertEqual(build_host.cache_to_drop(33 * G, G // 2, high), G // 2)
+        self.assertEqual(build_host.cache_to_drop(40 * G, 8 * G, None), 0)
+
+    def test_near_its_cap_the_slice_is_asked_to_drop_cache_alone(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        trimmer = self.trimmer()
+        self.wait_for(lambda: self.asked() == f"{2 * self.GiB} swappiness=0", "a reclaim of cache alone")
+        self.assertTrue(trimmer.thread.is_alive())
+
+    def test_far_from_its_cap_or_without_one_nothing_is_reclaimed(self):
+        for high in (32 * self.GiB, "max"):
+            with self.subTest(high=high):
+                self.memory(20 * self.GiB, 8 * self.GiB, high)
+                trimmer = self.trimmer()
+                self.wait_for(lambda: trimmer.leading is not None, "the trimmer to start")
+                time.sleep(0.05)
+                trimmer.close()
+                self.assertIsNone(self.asked())
+
+    def test_a_slice_that_is_not_there_yet_is_watched_for(self):
+        trimmer = self.trimmer()
+        self.wait_for(lambda: trimmer.leading is not None, "the trimmer to start")
+        time.sleep(0.05)
+        self.assertTrue(trimmer.thread.is_alive())
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        self.wait_for(lambda: self.asked() is not None, "a reclaim once the slice is there")
+
+    def test_one_build_host_trims_at_a_time_and_another_takes_over(self):
+        first = build_host.CacheTrimmer(str(self.slice), self.lock)
+        self.wait_for(lambda: first.leading is not None, "the first to lead")
+        second = self.trimmer()
+        time.sleep(0.05)
+        self.assertIsNone(second.leading)
+        first.close()
+        self.wait_for(lambda: second.leading is not None, "the second to take over")
+
+    def test_a_kernel_that_cannot_drop_cache_alone_ends_the_trimming(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        # Writing it fails as a kernel without swappiness= refuses it.
+        (self.slice / "memory.reclaim").mkdir()
+        trimmer = self.trimmer()
+        trimmer.thread.join(HANG_GUARD)
+        self.assertFalse(trimmer.thread.is_alive())
+
+    def test_unreadable_memory_ends_the_trimming(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        (self.slice / "memory.current").write_text("lots\n")
+        trimmer = self.trimmer()
+        trimmer.thread.join(HANG_GUARD)
+        self.assertFalse(trimmer.thread.is_alive())
+        self.assertIsNone(self.asked())
+
+
 def waiting(descriptor):
     count = array.array("i", [0])
     fcntl.ioctl(descriptor, termios.FIONREAD, count)

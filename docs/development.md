@@ -718,7 +718,14 @@ systemd gives that a `CPUWeight` of 30, below the 100 of `app.slice`, where
 agent sessions, the desktop's applications and tests run, so builds yield the
 CPU to them. The build slice's `MemoryHigh` is the three quarters of memory
 set aside for builds, so the kernel throttles builds as a whole before they
-push everything else into swap.
+push everything else into swap. Builds' outputs fill the page cache, which
+counts toward that cap, and reclaim at the cap swaps builds' own memory out
+as well as dropping cache: on fw16 it once pushed 10 GiB to swap, past zram
+onto disk, with 13 GiB still available. So while builds run, one
+`scripts/build-host` at a time checks the slice each second and, once it is
+within 2 GiB of its cap, asks the kernel to drop cache alone down to 3 GiB
+below it (`memory.reclaim` with `swappiness=0`, Linux 6.13 and later). On a
+kernel that cannot, it stops asking and the cap works as before.
 
 Every build draws from one pool of GNU make jobserver tokens, one for each
 CPU, kept in a named pipe under `/run/user/UID/cagents-jobserver`. Cargo,
