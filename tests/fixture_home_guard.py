@@ -376,6 +376,20 @@ source "$fixture_contract_script" "$@"
         self.scene("nested-agents-scene.sh", True,
                    refused_variable="CLAUDE_CONFIG_DIR", refused_path=self.account)
 
+    def test_account_switch_scene_refuses_unmarked_notes_before_creating_directory(self):
+        self.marked()
+        (self.task / MARKER).touch(mode=0o600)
+        notes = self.account / "scene-notes"
+        self.env["CAGENTS_EVIDENCE_NOTES"] = str(notes)
+        # The actual wide scene reaches its notes guard before any native
+        # command. Keep its command channel inert even if that ordering breaks.
+        self.env["CAGENTS_EVIDENCE_COMMAND"] = "/usr/bin/false"
+        before = snapshot(self.base)
+        result = self.run_command(["bash", str(FIXTURES / "account-switch-busy-scene.sh"), "wide"])
+        self.assert_refusal(result, "CAGENTS_EVIDENCE_NOTES", notes)
+        self.assertEqual(snapshot(self.base), before)
+        self.assertFalse(notes.exists())
+
 
 for _scene in SCENES:
     for _kind in ("unmarked", "unset", "marked"):

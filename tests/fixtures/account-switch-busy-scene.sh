@@ -55,6 +55,7 @@ fi
 # Each step leaves the located text beside the shots, so a failed run says
 # where it stopped.
 notes=${CAGENTS_EVIDENCE_NOTES:-$CAGENTS_EVIDENCE_TASK/scene-${SIDE:-side}-$scene${VARIANT:+-$VARIANT}}
+require_fixture_home CAGENTS_EVIDENCE_NOTES "$notes"
 mkdir -p "$notes"
 step() {
     echo "== $1" >&2
