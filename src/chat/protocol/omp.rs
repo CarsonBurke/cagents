@@ -111,7 +111,7 @@ struct Omp {
     started: bool,
     busy: bool,
     turn_outcome: Option<crate::notifications::Kind>,
-    turn_error: Option<String>,
+    turn_error: TurnError,
     agent_turn_active: bool,
     expected_session: Option<String>,
     session_id: Option<String>,
@@ -143,6 +143,34 @@ struct Omp {
     configured_reasoning: Option<String>,
     active_model: Option<chat::ActiveModel>,
 }
+#[derive(Default)]
+struct TurnError {
+    message: Option<String>,
+    reported: bool,
+}
+impl TurnError {
+    fn report(
+        &mut self,
+        outcome: crate::notifications::Kind,
+        fallback: Option<&str>,
+        step: &mut Step,
+    ) {
+        if self.reported {
+            return;
+        }
+        let message = (outcome == crate::notifications::Kind::Failed)
+            .then_some(self.message.as_deref())
+            .flatten()
+            .or(fallback);
+        if let Some(message) = message {
+            self.reported = true;
+            step.events.push(Event::Error {
+                message: message.into(),
+                fatal: false,
+            });
+        }
+    }
+}
 struct Execution {
     run: crate::model::RunId,
     request: String,
@@ -156,6 +184,9 @@ struct Execution {
     /// Confirm its known outcome with the idle state requested after that end.
     completion_probe: Option<(String, crate::notifications::Kind)>,
     completion_outcome: Option<crate::notifications::Kind>,
+    /// Keep the settled turn's report record until its correlated result, even
+    /// if a newer autonomous turn starts before that result arrives.
+    turn_error: Option<TurnError>,
 }
 struct Chunk {
     next: usize,
@@ -781,6 +812,7 @@ impl Adapter for Omp {
             .and_then(|frame| frame["id"].as_str())
             .ok_or("OMP did not create the prompt request")?
             .to_owned();
+        self.turn_error = TurnError::default();
         self.execution = Some(Execution {
             run,
             request: request.clone(),
@@ -792,6 +824,7 @@ impl Adapter for Omp {
             session: self.session_id.clone(),
             completion_probe: None,
             completion_outcome: None,
+            turn_error: None,
         });
         step.events.insert(
             0,
@@ -1132,7 +1165,7 @@ impl Adapter for Omp {
                             self.ready = false;
                             self.history_request = None;
                             self.history_error = None;
-                            self.turn_error = None;
+                            self.turn_error = TurnError::default();
                             self.requests.clear();
                             self.calls.clear();
                             self.call_order.clear();
@@ -1403,7 +1436,7 @@ impl Adapter for Omp {
                         "stop" | "length" => Some(Kind::Succeeded),
                         _ => None,
                     };
-                    self.turn_error = assistant_error(&frame["message"]);
+                    self.turn_error.message = assistant_error(&frame["message"]);
                 }
                 step.events.extend(
                     self.message_items(&frame["message"])
@@ -1542,7 +1575,7 @@ impl Adapter for Omp {
                 if text(&frame, "type") == "agent_start" {
                     step.events.push(Event::TurnStarted);
                     self.turn_outcome = None;
-                    self.turn_error = None;
+                    self.turn_error = TurnError::default();
                     self.history_error = None;
                     self.agent_turn_active = true;
                     if let Some(execution) = &mut self.execution {
@@ -1595,14 +1628,9 @@ impl Adapter for Omp {
                 step = self.refresh();
                 // A failed assistant reply may be retried within the turn.
                 // Show its reason only once the final outcome is known.
-                if finished
-                    && let Some(message) = self.turn_error.take()
-                    && outcome == Some(crate::notifications::Kind::Failed)
-                {
-                    step.events.push(Event::Error {
-                        message,
-                        fatal: false,
-                    });
+                if finished && outcome == Some(crate::notifications::Kind::Failed) {
+                    self.turn_error
+                        .report(crate::notifications::Kind::Failed, None, &mut step);
                 }
                 if finished
                     && let Some(execution) = self
@@ -1632,6 +1660,7 @@ impl Adapter for Omp {
                         .as_mut()
                         .filter(|execution| execution.observing && !execution.settled)
                 {
+                    execution.turn_error = Some(std::mem::take(&mut self.turn_error));
                     execution.settled = true;
                     execution.observing = false;
                     if execution.acknowledged_start
@@ -1678,12 +1707,12 @@ impl Adapter for Omp {
                             );
                         }
                     };
-                    if let Some(message) = frame["error"]["message"].as_str() {
-                        step.events.push(Event::Error {
-                            message: message.into(),
-                            fatal: false,
-                        });
-                    }
+                    let error = self
+                        .execution
+                        .as_mut()
+                        .and_then(|execution| execution.turn_error.as_mut())
+                        .unwrap_or(&mut self.turn_error);
+                    error.report(outcome, frame["error"]["message"].as_str(), &mut step);
                     self.finish_execution(text(&frame, "id"), outcome, &mut step);
                 }
                 if frame["agentInvoked"].as_bool() == Some(false) {
@@ -2968,6 +2997,225 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::Error { .. }))
         );
+    }
+
+    fn correlated_failure_events(
+        adapter: &mut Omp,
+        reason: Option<&str>,
+        result_before_end: bool,
+    ) -> Vec<Event> {
+        let prompt = adapter
+            .command_for_run(
+                crate::model::RunId::new(),
+                Command::Prompt {
+                    text: "Hello".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = prompt.writes[0]["id"].clone();
+        let mut message = json!({
+            "role":"assistant","timestamp":1,"content":[],"stopReason":"error"
+        });
+        if let Some(reason) = reason {
+            message["errorMessage"] = reason.into();
+        }
+        let mut events = prompt.events;
+        for frame in [
+            json!({"type":"response","command":"prompt","id":request,"success":true}),
+            json!({"type":"agent_start"}),
+            json!({"type":"message_end","message":message}),
+        ] {
+            let step = adapter.receive(frame).unwrap();
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. })),
+                "an intermediate reply must not report an error: {step:#?}"
+            );
+            events.extend(step.events);
+        }
+        let end = json!({"type":"agent_end","isTerminal":true,"messages":[message]});
+        let result = json!({
+            "type":"prompt_result","id":request,"status":"error",
+            "error":{"message":"Different prompt result reason"}
+        });
+        let terminal_frames = if result_before_end {
+            [result, end]
+        } else {
+            [end, result]
+        };
+        for frame in terminal_frames {
+            if frame["type"] == "prompt_result" {
+                assert!(
+                    adapter.execution.is_some(),
+                    "the correlated result path must be live"
+                );
+            }
+            events.extend(adapter.receive(frame).unwrap().events);
+        }
+        assert!(adapter.execution.is_none());
+        events
+    }
+
+    #[test]
+    fn correlated_terminal_error_preserves_the_assistant_reason_once() {
+        for result_before_end in [false, true] {
+            let mut adapter = Omp {
+                ready: true,
+                started: true,
+                ..Omp::default()
+            };
+            // Reusing the adapter also verifies that the report record resets
+            // for a later turn rather than suppressing its provider error.
+            for reason in ["API quota exhausted", "Next turn provider reason"] {
+                let events =
+                    correlated_failure_events(&mut adapter, Some(reason), result_before_end);
+                let errors = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Error { message, .. } => Some(message.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    errors,
+                    vec![reason],
+                    "the provider reason must be reported exactly once"
+                );
+                let mut snapshot = chat::Snapshot {
+                    ready: true,
+                    ..Default::default()
+                };
+                chat::runtime::project_events_for_test(&mut snapshot, events);
+                assert_eq!(snapshot.error.as_deref(), Some(reason));
+                assert!(!snapshot.busy);
+            }
+        }
+    }
+
+    #[test]
+    fn correlated_failure_without_assistant_reason_keeps_prompt_result_error() {
+        let mut adapter = Omp {
+            ready: true,
+            started: true,
+            ..Omp::default()
+        };
+        // Start with a reported assistant error to check that its text cannot
+        // leak into later turns whose explanation is only in prompt_result.
+        correlated_failure_events(&mut adapter, Some("Previous turn reason"), false);
+        for result_before_end in [false, true] {
+            for reason in [None, Some(""), Some(" \n ")] {
+                let events = correlated_failure_events(&mut adapter, reason, result_before_end);
+                let errors = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Error { message, .. } => Some(message.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(errors, vec!["Different prompt result reason"]);
+                let mut snapshot = chat::Snapshot {
+                    ready: true,
+                    ..Default::default()
+                };
+                chat::runtime::project_events_for_test(&mut snapshot, events);
+                assert_eq!(
+                    snapshot.error.as_deref(),
+                    Some("Different prompt result reason")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn correlated_error_record_stays_with_its_turn_after_a_newer_start() {
+        let (mut adapter, _, _) = captured_legacy_run(true, "error");
+        let request = adapter.execution.as_ref().unwrap().request.clone();
+        let mut events = adapter.receive(json!({"type":"message_end","message":{
+            "role":"assistant","content":[],"stopReason":"error","errorMessage":"Original provider reason"
+        }})).unwrap().events;
+        events.extend(
+            adapter
+                .receive(json!({"type":"agent_end","isTerminal":true}))
+                .unwrap()
+                .events,
+        );
+        events.extend(
+            adapter
+                .receive(json!({"type":"agent_start"}))
+                .unwrap()
+                .events,
+        );
+        events.extend(adapter.receive(json!({"type":"message_end","message":{
+            "role":"assistant","content":[],"stopReason":"error","errorMessage":"New turn provider reason"
+        }})).unwrap().events);
+        let old_result = adapter
+            .receive(json!({
+                "type":"prompt_result","id":request,"status":"error",
+                "error":{"message":"Different prompt result reason"}
+            }))
+            .unwrap();
+        assert!(
+            !old_result
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        events.extend(old_result.events);
+        events.extend(
+            adapter
+                .receive(json!({"type":"agent_end","isTerminal":true}))
+                .unwrap()
+                .events,
+        );
+        let errors = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Error { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            errors,
+            vec!["Original provider reason", "New turn provider reason"]
+        );
+        let mut snapshot = chat::Snapshot {
+            ready: true,
+            ..Default::default()
+        };
+        chat::runtime::project_events_for_test(&mut snapshot, events);
+        assert_eq!(snapshot.error.as_deref(), Some("New turn provider reason"));
+
+        // A local-only result can complete a later correlated prompt without
+        // agent_start, so submission must reset the active report record too.
+        let prompt = adapter
+            .command_for_run(
+                crate::model::RunId::new(),
+                Command::Prompt {
+                    text: "Hello".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let result = adapter
+            .receive(json!({
+                "type":"prompt_result","id":prompt.writes[0]["id"],"status":"error",
+                "error":{"message":"Local prompt result reason"}
+            }))
+            .unwrap();
+        let errors = result
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Error { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors, vec!["Local prompt result reason"]);
     }
 
     #[test]
