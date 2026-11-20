@@ -527,6 +527,115 @@ class UsageResetFixture(unittest.TestCase):
             FIXTURE.configure_plan(self.root, "ultra")
         self.assertEqual(self.read(self.claude), before)
 
+    def test_login_command_refreshes_profile_and_auth_without_changing_reset_state(self):
+        self.assertEqual(self.claim()[1]["result"], "reset")
+        FIXTURE.configure_plan(self.root, "max20x")
+        server = FIXTURE.server(self.root)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        before = self.read(self.claude)
+        before_codex = self.read(self.codex)
+        unchanged_paths = [self.claude / name for name in (
+            "fixture-reset-api.json", "fixture-usage.json", "fixture-frames.jsonl")]
+        unchanged = [path.read_bytes() for path in unchanged_paths]
+        process = subprocess.run(["/usr/bin/python3", "-I", "-B", str(SOURCE), "login",
+                                  str(self.root), "new-login@example.test"],
+                                 capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        expected = json.loads(json.dumps(before))
+        expected["profile"]["account"]["email"] = "new-login@example.test"
+        self.assertEqual(self.read(self.claude), expected)
+        self.assertEqual(self.read(self.codex), before_codex)
+        self.assertEqual([path.read_bytes() for path in unchanged_paths], unchanged)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
+        self.addCleanup(connection.close)
+        connection.request("GET", "/api/oauth/profile",
+                           headers={"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}"})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.read()), expected["profile"])
+        process = subprocess.run(["/bin/sh", str(SOURCE.with_name("chat-composer-claude.sh")),
+                                  "auth", "status", "--json"],
+                                 env={"HOME": str(self.root / "home"), "CLAUDE_CONFIG_DIR": str(self.claude),
+                                      "PATH": "/usr/bin:/bin"},
+                                 capture_output=True, text=True, timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(json.loads(process.stdout), {
+            "loggedIn": True, "email": "new-login@example.test", "subscriptionType": "pro"})
+
+    def test_login_selected_before_serving_preserves_other_auth_and_marker_fields(self):
+        auth_path = self.claude / "fixture-auth-status.json"
+        auth = {"loggedIn": True, "email": "fixture@example.test", "subscriptionType": "max",
+                "organizationId": FIXTURE.ORGANIZATION}
+        FIXTURE.write_json(auth_path, auth)
+        FIXTURE.configure_login(self.root, "before-serve@example.test")
+        self.assertFalse((self.claude / "fixture-reset-api.json").exists())
+        server = FIXTURE.server(self.root)
+        self.addCleanup(server.server_close)
+        marker_path = self.claude / "fixture-reset-api.json"
+        marker = json.loads(marker_path.read_text())
+        marker["email"] = "before-serve@example.test"
+        FIXTURE.write_json(marker_path, marker)
+        before = self.read(self.claude)
+        FIXTURE.configure_login(self.root, "another-login@example.test")
+        before["profile"]["account"]["email"] = "another-login@example.test"
+        auth["email"] = "another-login@example.test"
+        marker["email"] = "another-login@example.test"
+        self.assertEqual(self.read(self.claude), before)
+        self.assertEqual(json.loads(auth_path.read_text()), auth)
+        self.assertEqual(json.loads(marker_path.read_text()), marker)
+
+    def test_login_switch_requires_valid_email_and_private_fixture_marker(self):
+        before = self.read(self.claude)
+        for email in (None, "", "missing-at-sign"):
+            with self.subTest(email=email), self.assertRaisesRegex(ValueError, "non-empty email containing @"):
+                FIXTURE.configure_login(self.root, email)
+            self.assertEqual(self.read(self.claude), before)
+        root_marker = self.root / ".cagents-reset-fixture"
+        root_marker.unlink()
+        with self.assertRaisesRegex(ValueError, "private fixture marker"):
+            FIXTURE.configure_login(self.root, "new-login@example.test")
+        self.assertEqual(self.read(self.claude), before)
+        target = self.root / "unrelated-marker"
+        target.touch()
+        root_marker.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "private fixture marker"):
+            FIXTURE.configure_login(self.root, "new-login@example.test")
+        self.assertEqual(self.read(self.claude), before)
+        self.assertFalse((self.claude / "fixture-auth-status.json").exists())
+
+    def test_login_switch_refuses_invalid_or_symlinked_service_marker_and_auth_status(self):
+        before = self.read(self.claude)
+        marker_path = self.claude / "fixture-reset-api.json"
+        for marker in ({"fixture": False}, []):
+            with self.subTest(marker=marker):
+                FIXTURE.write_json(marker_path, marker)
+                with self.assertRaisesRegex(ValueError, "invalid fake service marker"):
+                    FIXTURE.configure_login(self.root, "new-login@example.test")
+                self.assertEqual(self.read(self.claude), before)
+                self.assertFalse((self.claude / "fixture-auth-status.json").exists())
+        marker_path.unlink()
+        target = self.root / "unrelated-marker.json"
+        FIXTURE.write_json(target, {"fixture": True})
+        marker_path.symlink_to(target)
+        with self.assertRaises(OSError):
+            FIXTURE.configure_login(self.root, "new-login@example.test")
+        self.assertEqual(self.read(self.claude), before)
+        self.assertEqual(json.loads(target.read_text()), {"fixture": True})
+        marker_path.unlink()
+        auth_path = self.claude / "fixture-auth-status.json"
+        FIXTURE.write_json(auth_path, [])
+        with self.assertRaisesRegex(ValueError, "invalid fake auth status"):
+            FIXTURE.configure_login(self.root, "new-login@example.test")
+        self.assertEqual(self.read(self.claude), before)
+        auth_path.unlink()
+        auth_path.symlink_to(target)
+        with self.assertRaises(OSError):
+            FIXTURE.configure_login(self.root, "new-login@example.test")
+        self.assertEqual(self.read(self.claude), before)
+        self.assertEqual(json.loads(target.read_text()), {"fixture": True})
+
     def test_seed_never_overwrites_a_previous_inventory(self):
         before = self.read(self.claude)
         with self.assertRaisesRegex(ValueError, "already exists"):
