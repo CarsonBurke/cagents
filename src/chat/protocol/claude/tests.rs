@@ -4898,6 +4898,9 @@ fn a_typed_skill_command_shows_only_its_prompt_live_and_in_history() {
     ] if text == "/release-notes a typo fix"));
 }
 
+/// Claude Code's note on how it scaled a picture a tool returned.
+const SCALED: &str = "[Image: original 2600x1800, displayed at 2306x1596. Multiply coordinates by 1.13 to map to original image.]";
+
 /// Everything else Claude Code puts in front of the model is read by what it
 /// says. Notes for the model alone leave no row, live or reopened. What a
 /// hook said back streams as it is saved, so both show it as the same compact
@@ -4907,9 +4910,8 @@ fn a_typed_skill_command_shows_only_its_prompt_live_and_in_history() {
 #[test]
 fn injected_context_is_classified_by_what_it_says() {
     let hidden = [
-        json!(
-            "[Image: original 2600x1800, displayed at 2306x1596. Multiply coordinates by 1.13 to map to original image.]"
-        ),
+        json!(SCALED),
+        json!(format!("{SCALED}\n{SCALED}")),
         json!([{"type":"text","text":"[Image: source: /var/tmp/claude/images/1.png]"}]),
         json!(
             "<system-reminder>\nThe session's working directory has changed.\n</system-reminder>"
@@ -4931,6 +4933,10 @@ fn injected_context_is_classified_by_what_it_says() {
         json!("[Image: a diagram the reader described]"),
         json!("Base directory for nothing in particular"),
         json!("A reminder about Stop hook feedback: none"),
+        // A note is withheld only whole: what follows it still shows, even
+        // when it ends in a bracket of its own.
+        json!(format!("{SCALED}\nAlso read README [required]")),
+        json!([{"type":"text","text":format!("{SCALED} Also read README [required]")}]),
     ];
     let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
     let step = |items: &[Item], name: &str, text: &str| {
@@ -14517,4 +14523,73 @@ fn an_acknowledged_stop_ends_its_turn_stopped_though_it_succeeded() {
             .events,
     );
     assert_stopped_turn(&events, "an acknowledged stop of a turn that succeeded");
+}
+
+/// Claude Code's own stream for two Reads of large PNGs, recorded from the
+/// real provider: each image comes back in its tool result, followed by a
+/// synthetic note on how Claude scaled it for the model.
+#[test]
+fn read_images_are_named_for_their_files_and_their_scaling_notes_are_not_shown() {
+    let mut adapter = Claude::default();
+    let mut shown = Vec::new();
+    for line in include_str!("../../../../tests/fixtures/claude-read-images-live.jsonl").lines() {
+        let step = adapter
+            .receive(serde_json::from_str(line).unwrap())
+            .unwrap();
+        for event in step.events {
+            if let Event::Item(item) = event {
+                shown.retain(|(id, _): &(String, ItemContent)| *id != item.id);
+                shown.push((item.id, item.content));
+            }
+        }
+    }
+    assert!(
+        !shown.iter().any(|(_, content)| matches!(
+            content,
+            ItemContent::Tool { name, .. } if name == CONTEXT_STEP
+        ) || matches!(content, ItemContent::Delivery { .. })),
+        "the scaling notes are the Reads' own, not context rows: {shown:?}"
+    );
+    let images = shown
+        .iter()
+        .filter_map(|(id, content)| match content {
+            ItemContent::Image {
+                path, description, ..
+            } => Some((
+                id.as_str(),
+                description.as_str(),
+                path.starts_with("data:image/png;base64,"),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        images,
+        vec![
+            (
+                "toolu_012NGrjPMVQA8G3HDzif6xrL:image:0",
+                "big-red.png",
+                true
+            ),
+            (
+                "toolu_019xArHb7CgX2tuV8vGFNnpC:image:0",
+                "big-blue.png",
+                true
+            ),
+        ]
+    );
+    let reads = shown
+        .iter()
+        .filter(|(_, content)| {
+            matches!(
+                content,
+                ItemContent::Command {
+                    action: CommandAction::Read,
+                    status: ToolStatus::Succeeded,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(reads, 2);
 }
