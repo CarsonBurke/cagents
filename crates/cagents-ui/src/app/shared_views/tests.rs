@@ -7,6 +7,7 @@ mod repository_loads;
 mod seed_refusal;
 mod startup_admission;
 mod startup_terminals;
+mod unadmitted_first_send;
 mod window_selection;
 mod window_startup;
 
