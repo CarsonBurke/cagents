@@ -11475,6 +11475,10 @@ impl<'a> DiffReviewContext<'a> {
 
     fn line_action(self, old: Option<u32>, new: Option<u32>) -> Option<RepositoryAction> {
         use crate::github::ReviewDiffSide;
+        // A cached review read offline is read-only until GitHub verifies it.
+        if !self.review.has_discussion_authority() {
+            return None;
+        }
         let (side, line) = if let Some(line) = new {
             (ReviewDiffSide::Right, line)
         } else {
