@@ -2298,8 +2298,10 @@ stops the session even when a step fails, and brings back the shots.
 `drive` passes its arguments to the host's `niri-harness`, so a steps file
 uses that harness's commands: `drive hover X,Y` moves the pointer (there is no
 `move`). `drive wait TEXT` and `drive click TEXT` match one target that
-`drive observe` reads off the screen, and a title of several words can read as
-one target per word. So wait for and click one distinctive word of it, such as
+`drive observe` reads off the screen. When the harness reads the screen by
+OCR, as it does when the app's accessibility tree is unreachable, a title of
+several words, such as a chat's in the sidebar, can read as one target per
+word. So wait for and click one distinctive word of it, such as
 `Long` for a chat titled "Long chat", or click the coordinates `drive --json
 observe` gives. When a wait might fail, save `drive observe` and a `shot`
 before the step exits, so the failed run shows what was on screen.
