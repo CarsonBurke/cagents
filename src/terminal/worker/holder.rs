@@ -1021,6 +1021,7 @@ impl HeldChild {
 
     /// Escalates only this pinned root after a graceful hangup was ignored.
     /// The pidfd cannot acquire authority over a reused numeric process ID.
+    #[cfg(test)]
     pub(super) fn force_kill(&self) -> io::Result<()> {
         match signal(&self.pidfd, libc::SIGKILL) {
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
@@ -1089,7 +1090,7 @@ fn open_pidfd(pid: libc::pid_t) -> io::Result<File> {
 
 /// Whether a pidfd's process exits within `grace`: a pidfd becomes readable
 /// when it does.
-fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
+pub(super) fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + grace;
     let mut target = libc::pollfd {
         fd: pidfd.as_raw_fd(),

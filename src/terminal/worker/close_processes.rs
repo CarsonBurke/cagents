@@ -281,10 +281,49 @@ impl FrozenFamily {
     }
 
     pub(super) fn kill(&mut self, deadline: Instant) -> Result<(), String> {
+        self.kill_from(0, deadline)
+    }
+
+    /// Stop jobs before allowing the shell to handle HUP. Retaining their
+    /// frozen pidfds prevents shell exit from erasing the cleanup obligation,
+    /// and ending a foreground job lets a deferred shell HUP trap run.
+    pub(super) fn hangup(
+        &mut self,
+        child: &super::holder::HeldChild,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        self.kill_from(1, deadline)?;
+        for target in self.targets.iter().skip(1) {
+            if !super::holder::exits_within(
+                &target.pidfd,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return Err("Terminal process cleanup remains unconfirmed".into());
+            }
+        }
+        check_deadline(deadline)?;
+        child
+            .kill()
+            .map_err(|error| format!("hang up child: {error}"))?;
+        let root = &mut self.targets[0];
+        if root.resume {
+            match signal(&root.pidfd, libc::SIGCONT) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        root.resume = false;
+        Ok(())
+    }
+
+    fn kill_from(&mut self, first: usize, deadline: Instant) -> Result<(), String> {
         check_deadline(deadline)?;
         // All targets remain stopped until every signal has been issued. No
         // numeric PID is ever signaled, even after a job exits or is reparented.
-        for (index, target) in self.targets.iter_mut().enumerate() {
+        for (index, target) in self.targets.iter_mut().enumerate().skip(first) {
             // The root is always first. Serialize receipt publication with
             // exit observation, including upgrades which kill off-worker.
             let mut receipt = (index == 0).then(|| {
@@ -407,6 +446,14 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
 }
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
     census_with(deadline, read_process)
+}
+
+/// After the pinned root exits, a numeric session can only refuse cleanup;
+/// it never grants authority to signal a process discovered after that exit.
+pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Result<bool, String> {
+    Ok(census(deadline)?
+        .iter()
+        .all(|process| process.session != session || matches!(process.state, b'Z' | b'X')))
 }
 
 fn census_with(
