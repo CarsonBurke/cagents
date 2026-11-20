@@ -15980,6 +15980,7 @@ impl Cagents {
                     CardRuntime::PullRequests(pane) => &mut pane.runtime,
                     CardRuntime::Chat(runtime) => {
                         runtime.set_syntax_theme(syntax_theme);
+                        tasks.push(runtime.recolour_changes());
                         continue;
                     }
                     _ => continue,
@@ -15990,7 +15991,7 @@ impl Cagents {
                 // again rather than left empty until the next refresh.
                 tasks.push(repository_task(runtime.refresh_diff_presentation(card)));
             }
-            self.chat_ui.set_parked_syntax_theme(syntax_theme);
+            tasks.push(self.chat_ui.set_parked_syntax_theme(syntax_theme));
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {

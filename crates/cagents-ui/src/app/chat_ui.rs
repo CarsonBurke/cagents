@@ -111,6 +111,7 @@ mod markdown;
 mod markdown_source;
 mod monospace;
 mod opening_name;
+mod patch_view;
 mod pending_admission;
 mod permissions;
 mod preparation;
@@ -514,7 +515,17 @@ pub enum Action {
     ChangeListScrolled(Target, u64, u64, bool, f32),
     ChangePatches(Target, Option<chat::FilePatchCursor>),
     ChangePatch(Target, usize),
-    ChangesLoaded(Target, u64, Result<chat::FileChangeReply, String>),
+    /// A fold opened, or the whole patch asked for, in the selected patch.
+    ChangePatchView(Target, patch_view::Event),
+    /// A reply, with a page's patches read for drawing.
+    ChangesLoaded(
+        Target,
+        u64,
+        Result<chat::FileChangeReply, String>,
+        Arc<[patch_view::PatchModel]>,
+    ),
+    /// The shown page's patches, coloured again in a changed syntax theme.
+    ChangesRecoloured(Target, u64, Arc<[patch_view::PatchModel]>),
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
@@ -951,7 +962,9 @@ impl Action {
             Self::ChangeListScrolled(..) => "ChangeListScrolled",
             Self::ChangePatches(..) => "ChangePatches",
             Self::ChangePatch(..) => "ChangePatch",
+            Self::ChangePatchView(..) => "ChangePatchView",
             Self::ChangesLoaded(..) => "ChangesLoaded",
+            Self::ChangesRecoloured(..) => "ChangesRecoloured",
             Self::Files(..) => "Files",
             Self::Find(..) => "Find",
             Self::FindNext(..) => "FindNext",
@@ -1031,6 +1044,7 @@ impl Action {
                 | Self::CommandFinished(..)
                 | Self::CommandsDue(..)
                 | Self::ChangesLoaded(..)
+                | Self::ChangesRecoloured(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
                 | Self::LogicalProseRead(..)
@@ -1479,10 +1493,14 @@ impl State {
 impl State {
     /// Give parked chats a changed syntax theme: one can still be warm, and is
     /// shown again as it is.
-    pub(super) fn set_parked_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
-        for runtime in self.parked.values_mut() {
+    pub(super) fn set_parked_syntax_theme(
+        &mut self,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Task<Message> {
+        Task::batch(self.parked.values_mut().map(|runtime| {
             runtime.set_syntax_theme(theme);
-        }
+            runtime.recolour_changes()
+        }))
     }
 
     pub(super) fn transition_pending(&self) -> bool {
@@ -15060,10 +15078,20 @@ impl Cagents {
                     runtime.changes.sync();
                 }
             }
-            Action::ChangesLoaded(target, id, result) => {
+            Action::ChangePatchView(target, event) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.changes.patch_view.apply(event);
+                }
+            }
+            Action::ChangesRecoloured(target, id, models) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.changes.recoloured(id, models);
+                }
+            }
+            Action::ChangesLoaded(target, id, result, models) => {
                 let files = matches!(&result, Ok(chat::FileChangeReply::Files(_)));
                 if let Some(runtime) = self.chat_runtime_mut(target)
-                    && runtime.changes.complete(id, result)
+                    && runtime.changes.complete(id, result, models)
                 {
                     return iced::widget::scrollable::scroll_to(
                         card_control_id(
