@@ -9514,6 +9514,23 @@ mod app_tests {
         card
     }
 
+    /// Ends an update whose handler returns before owing a projection, so
+    /// only what every update runs at its end can bring the index up.
+    fn end_bare_update(app: &mut Cagents) {
+        assert!(app.transient_work_close.is_none());
+        let _ = app.update(Message::ReturnToDeviceBeforeClose);
+    }
+
+    /// Asks after `account`'s sign-in before the update that changed what it
+    /// reads has ended, which passes over the cards rather than trust the
+    /// index.
+    fn running_mid_update(app: &Cagents, account: &Account) -> bool {
+        let scans = sign_in_scans();
+        let running = app.account_sign_in_running(account);
+        assert_eq!(sign_in_scans(), scans + 1, "the stale index was not read");
+        running
+    }
+
     /// A frame asks after an account's sign-in on every draw. Once the update
     /// that opened it ends, the answer is looked up: no pass over the cards
     /// and no account's home resolved, for the account signing in or another.
@@ -9563,7 +9580,7 @@ mod app_tests {
             assert_eq!(sign_in_scans(), scans, "the index was current");
             running
         };
-        let _ = app.update(Message::CancelDialog);
+        end_bare_update(&mut app);
         assert!(!running(&app));
 
         let card = sign_in_through_update(&mut app, &id);
@@ -9574,11 +9591,13 @@ mod app_tests {
             _ => unreachable!(),
         };
         app.retire_ended_terminal(card, 1, None, false);
-        let _ = app.update(Message::CancelDialog);
+        assert!(!running_mid_update(&app, &account));
+        end_bare_update(&mut app);
         assert!(!running(&app), "its process ending");
 
         app.card_state_mut(card).unwrap().kind = CardKind::Terminal(fresh);
-        let _ = app.update(Message::CancelDialog);
+        assert!(running_mid_update(&app, &account));
+        end_bare_update(&mut app);
         assert!(running(&app), "a relaunch that started");
 
         let runtime = app.cards.remove(&card);
@@ -9593,12 +9612,13 @@ mod app_tests {
         // Closing a running terminal waits on the daemon, so until it confirms
         // the sign-in runs on.
         let _ = app.close_card_unasked(card);
-        let _ = app.update(Message::CancelDialog);
+        end_bare_update(&mut app);
         assert!(running(&app), "a close the daemon has not confirmed");
         // Every close that lands retires the durable card.
         app.card_state_mut(card).unwrap().existence =
             super::super::project_ui::removed_existence("closed by user");
-        let _ = app.update(Message::CancelDialog);
+        assert!(!running_mid_update(&app, &account));
+        end_bare_update(&mut app);
         assert!(!running(&app), "closing the terminal");
     }
 
@@ -9623,9 +9643,11 @@ mod app_tests {
             .link(Provider::Codex, key, elsewhere, None, None, 2)
             .unwrap();
         app.account_ui.set_registry(registry);
-        let _ = app.update(Message::CancelDialog);
         let moved = app.account_ui.account(&id).unwrap().account.clone();
         assert_ne!(moved, original);
+        assert!(!running_mid_update(&app, &moved));
+        assert!(running_mid_update(&app, &original));
+        end_bare_update(&mut app);
         let scans = sign_in_scans();
         assert!(
             !app.account_sign_in_running(&moved),
