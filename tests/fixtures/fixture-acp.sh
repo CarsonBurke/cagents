@@ -26,6 +26,8 @@ export FAKE_ACP_LOG="${FAKE_ACP_LOG:-$FAKE_ACP_STATE/frames.log}"
 case ${HOME:-} in
     "$fixture"/*) export FAKE_ACP_PRESENCE=1 ;;
 esac
+# The turn tests/fixtures/conversation-work.py prepares, for a `work` prompt.
+export FAKE_ACP_WORK="${FAKE_ACP_WORK:-$fixture/home/.claude/fixture-frames.jsonl}"
 mkdir -p -- "$FAKE_ACP_STATE"
 if [ "$shape" = agy ]; then
     for argument in "$@"; do
