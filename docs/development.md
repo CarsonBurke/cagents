@@ -999,7 +999,7 @@ earlier command of the slot's is still running, it first moves out each
 crate's superseded sessions. Rustc starts a compile from the crate's newest
 finished session and removes the older ones only when the crate next
 compiles, so a crate compiled twice keeps a session nothing reads again; on
-fw16 these were about 43% of the slots' incremental state. It then keeps the
+fw16 removing them freed about 39% of the slots' incremental state. It then keeps the
 incremental state of the crates the slot compiled most recently until they
 fill `CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses
 it included, and moves the rest out of the target; with `0` it keeps none. Every

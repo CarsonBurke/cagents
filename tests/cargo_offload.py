@@ -2448,8 +2448,11 @@ class Trim(unittest.TestCase):
             session = directory / f"{stem}-1svh"
             session.mkdir()
             (session / "query-cache.bin").write_bytes(os.urandom(size))
-            (directory / f"{stem}.lock").touch()
-            os.utime(session, (when, when))
+            lock = directory / f"{stem}.lock"
+            lock.touch()
+            # Trim orders crates by the newest entry, lock files included.
+            for path in (session, lock):
+                os.utime(path, (when, when))
             made.append(session)
         return made
 
