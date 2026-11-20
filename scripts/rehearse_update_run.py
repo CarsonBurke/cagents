@@ -24,6 +24,7 @@ import time
 import tomllib
 import uuid
 
+sys.dont_write_bytecode = True
 from fixture_home import require_fixture_home
 
 

@@ -17,6 +17,7 @@ import socket
 import sys
 import time
 
+sys.dont_write_bytecode = True
 import rehearse_update_pty as pty
 import rehearse_update_records as records
 import rehearse_update_restart as restart

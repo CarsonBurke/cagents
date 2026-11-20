@@ -499,7 +499,7 @@ class Comparison(unittest.TestCase):
     def test_recovery_capture_keeps_raw_digest_and_requires_fresh_verifier(self):
         before, after = self.paused_replacement()
         evidence = after["recovery"]
-        with tempfile.TemporaryDirectory(prefix="rehearse-receipt-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-receipt-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             state = root / "home/.local/share/cagents-install/.update"
             out = root / "records/after"
@@ -541,7 +541,7 @@ class Comparison(unittest.TestCase):
                 records.prepare_recovery(root, out)
 
     def test_recovery_evidence_rejects_public_oversized_and_linked_inputs(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-private-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-private-", dir="/var/tmp") as temporary:
             path = Path(temporary) / "receipt.json"
             path.write_text("{}")
             path.chmod(0o644)
@@ -585,7 +585,7 @@ class Comparison(unittest.TestCase):
                            "before was recorded without a desktop and after with one")
                 self.assertEqual(records.compare(before, after), [
                     {"kind": "evidence", "id": "desktop", "change": message, "regression": True}])
-        with tempfile.TemporaryDirectory(prefix="rehearse-old-snapshot-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-old-snapshot-", dir="/var/tmp") as temporary:
             path = Path(temporary) / "snapshot.json"
             path.write_text(records.dump(snapshot()))
             old = records.load_snapshot(path)
@@ -601,7 +601,7 @@ class Comparison(unittest.TestCase):
         return out
 
     def test_a_no_desktop_record_expects_no_windows_or_stores(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-no-desktop-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-no-desktop-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             out = self.empty_record_directory(root)
             captured = records.record(root, out, None, desktop=False)
@@ -615,7 +615,7 @@ class Comparison(unittest.TestCase):
                 records.record(root, out, out / "windows.json", desktop=False)
 
     def test_a_desktop_record_still_reports_missing_windows_and_stores(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-desktop-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-desktop-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             out = self.empty_record_directory(root)
             windows = out / "windows.json"
@@ -626,7 +626,7 @@ class Comparison(unittest.TestCase):
             self.assertIs(captured["desktop"], True)
 
     def test_a_no_desktop_record_still_reads_an_existing_store(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-no-desktop-store-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-no-desktop-store-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             out = self.empty_record_directory(root)
             database = root / "home/.local/share/cagents/sessions.sqlite3"
@@ -643,7 +643,7 @@ class Comparison(unittest.TestCase):
 
     def test_a_no_desktop_record_still_reports_store_errors(self):
         for corrupt in (False, True):
-            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory(prefix="rehearse-bad-store-") as temporary:
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory(prefix="rehearse-bad-store-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
                 out = self.empty_record_directory(root)
                 database = root / "home/.local/share/cagents/sessions.sqlite3"
@@ -659,7 +659,7 @@ class Comparison(unittest.TestCase):
                 self.assertEqual(captured["errors"], [message])
 
     def test_record_cli_refuses_windows_with_no_desktop(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-record-arguments-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-record-arguments-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             command = [sys.executable, "-I", "-B", str(REPOSITORY / "scripts/rehearse_update_records.py"),
                        "record", str(root), str(root / "records/before"),
@@ -670,7 +670,7 @@ class Comparison(unittest.TestCase):
             self.assertFalse((root / "records/before").exists())
 
     def test_record_reads_old_cli_envelopes_and_main_window_database(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-old-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-old-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             out = root / "records/before"
             out.mkdir(parents=True)
@@ -707,7 +707,7 @@ class Comparison(unittest.TestCase):
                   "running": [{"id": record["id"], "name": "codex-alpha", "state": "running", "run": "r"}]}
         captured = {}
         for shape, rows in listed.items():
-            with self.subTest(shape=shape), tempfile.TemporaryDirectory(prefix="rehearse-compact-") as temporary:
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory(prefix="rehearse-compact-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
                 out = root / "records/before"
                 out.mkdir(parents=True)
@@ -728,7 +728,7 @@ class Comparison(unittest.TestCase):
         self.assertEqual(captured["Running"]["agents"], captured["running"]["agents"])
         self.assertFalse([change for change in records.compare(captured["Running"], captured["running"])
                           if change["kind"] == "agents"])
-        with tempfile.TemporaryDirectory(prefix="rehearse-compact-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-compact-", dir="/var/tmp") as temporary:
             out = Path(temporary)
             (out / "agents.json").write_text(records.dump({"ok": True, "data": {"agents": listed["running"]}}))
             (out / "agents").mkdir()
@@ -741,7 +741,7 @@ class Comparison(unittest.TestCase):
             self.assertIn("no such agent", errors[0])
 
     def test_child_pid_file_tracks_identity_without_terminal_environment(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-process-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-process-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             peer = subprocess.Popen(["sleep", "86400"], env={**os.environ, "HOME": str(root / "home")})
             try:
@@ -762,7 +762,7 @@ class Comparison(unittest.TestCase):
                 peer.wait()
 
     def test_process_executable_is_kernel_image_even_when_argv_claims_other_daemon(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-exe-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-exe-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             sleep_image = str(Path(shutil.which("sleep")).resolve())
             peer = subprocess.Popen(["bash", "-c", 'exec -a /fake/old-version/bin/cagentsd sleep ' + HELPER_LIFETIME],
@@ -783,7 +783,7 @@ class Comparison(unittest.TestCase):
                 peer.wait(timeout=HANG_GUARD)
 
     def test_cli_accepts_record_directories_and_returns_failure(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-record-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-record-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             for name in ("before", "after"):
                 (root / name).mkdir()
@@ -799,7 +799,7 @@ class Comparison(unittest.TestCase):
             self.assertIn("terminals terminal: disappeared", result.stdout)
 
     def test_database_capture_reads_wal_and_does_not_mutate_database(self):
-        with tempfile.TemporaryDirectory(prefix="rehearse-store-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="rehearse-store-", dir="/var/tmp") as temporary:
             home = Path(temporary)
             path = home / ".local/share/cagents/windows/main/sessions.sqlite3"
             path.parent.mkdir(parents=True)
@@ -874,8 +874,9 @@ class ScaleSeed(unittest.TestCase):
 
     def scale_seed(self, row):
         scenario = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-scale-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-scale-', dir="/var/tmp") as temporary:
             root = Path(temporary)
+            (root / ".cagents-fixture-root").touch()
             claude = root/'home/.claude'
             claude.mkdir(parents=True)
             original = json.dumps({'pause': 6}, sort_keys=True)+'\n'
@@ -967,7 +968,7 @@ class ChatViews(unittest.TestCase):
 
     def test_paused_capture_requires_connected_history_and_only_clicks_reconnect(self):
         scenario = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-history-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ru-history-', dir="/var/tmp") as directory:
             root = Path(directory)
             (root/'logs').mkdir()
             rehearsal = scenario.Rehearsal(root,str(SCRIPT))
@@ -996,7 +997,7 @@ class ChatViews(unittest.TestCase):
 
     def test_expected_refusal_requires_bound_old_processes_install_and_inventory(self):
         scenario = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-refusal-') as directory:
+        with tempfile.TemporaryDirectory(prefix='ru-refusal-', dir="/var/tmp") as directory:
             root = Path(directory)
             prefix = root/'home/.local/share/cagents-install'
             (prefix/'versions/old').mkdir(parents=True)
@@ -1092,7 +1093,7 @@ class ChatViews(unittest.TestCase):
 
     def test_selection_requires_exact_card_channel_provider_and_thread(self):
         scenario = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-selection-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-selection-', dir="/var/tmp") as temporary:
             root = Path(temporary)
             path = root/'home/.local/share/cagents/sessions.sqlite3'
             path.parent.mkdir(parents=True)
@@ -1150,7 +1151,7 @@ class ChatViews(unittest.TestCase):
 
     def test_capture_uses_seed_ids_and_labels_only_to_navigate(self):
         scenario = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-chat-view-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-chat-view-', dir="/var/tmp") as temporary:
             root = Path(temporary)
             seed = {'id':'seed-agent','name':'old-name','placement':{'Channel':'seed-channel'},
                     'spec':{'provider':'Claude','target':{'repository':'/private/alpha/.git'}}}
@@ -1249,7 +1250,7 @@ class CandidateNamespace(unittest.TestCase):
 
     def test_probe_extracts_only_a_verified_regular_cli_inside_the_private_root(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-namespace-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-namespace-', dir="/var/tmp") as temporary:
             base=Path(temporary)
             root,shared=base/'private',base/'shared'
             root.mkdir();shared.mkdir()
@@ -1278,7 +1279,7 @@ class CandidateNamespace(unittest.TestCase):
 
     def test_probe_refuses_a_linked_archive_cli(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-namespace-link-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-namespace-link-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
             (root / ".cagents-fixture-root").touch()
@@ -1293,7 +1294,7 @@ class CandidateNamespace(unittest.TestCase):
                 scenario.candidate_namespace_cli(root,root,'new')
 
     def test_headless_namespace_capture_does_not_claim_full_window_or_store_evidence(self):
-        with tempfile.TemporaryDirectory(prefix='ru-namespace-headless-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-namespace-headless-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
             (root / ".cagents-fixture-root").touch()
@@ -1859,7 +1860,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
 
     def test_shortcut_is_read_from_the_actual_private_settings_without_a_default(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-action-key-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-action-key-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             path=root/'home/.config/cagents/settings.toml';path.parent.mkdir(parents=True)
             path.write_text('[keyboard_shortcuts]\nnew_terminal=["Ctrl+Shift+N"]\n')
@@ -1882,7 +1883,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
 
     def test_native_probe_submits_the_same_command_with_a_separate_return(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-input-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-input-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             rehearsal=scenario.Rehearsal(root,str(SCRIPT))
             receipt=root/'typed-output.txt'
@@ -1924,7 +1925,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
 
     def test_native_probe_failure_preserves_command_and_exact_terminal_evidence(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-input-failure-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-input-failure-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             rehearsal=scenario.Rehearsal(root,str(SCRIPT))
             receipt=root/'typed-output.txt'
@@ -1951,7 +1952,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
 
     def test_successful_native_input_without_shell_output_still_fails_with_evidence(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-input-no-output-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-input-no-output-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             rehearsal=scenario.Rehearsal(root,str(SCRIPT))
             receipt=root/'typed-output.txt'
@@ -1970,7 +1971,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
 
     def test_terminal_card_is_bound_through_normalized_recipe_and_live_proof(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-action-card-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-action-card-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             database=root/'home/.local/share/cagents/sessions.sqlite3'
             database.parent.mkdir(parents=True)
@@ -2000,7 +2001,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
                 self.assertEqual(error.exception.code,2)
 
     def test_ended_original_child_is_allowed_only_after_the_deliberate_stop(self):
-        with tempfile.TemporaryDirectory(prefix='ru-action-ended-child-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-action-ended-child-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
             (root / ".cagents-fixture-root").touch()
@@ -2073,7 +2074,7 @@ class ExistingOnlyReopen(unittest.TestCase):
 
     def test_launch_counters_distinguish_probes_from_conversation_resume(self):
         scenario=self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-provider-counts-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-provider-counts-', dir="/var/tmp") as temporary:
             root=Path(temporary)
             (root/'home/.claude').mkdir(parents=True);(root/'logs').mkdir()
             (root/'home/.claude/fixture-launches').write_text('new\nresumed-thread\n')
@@ -2107,7 +2108,7 @@ class ExistingOnlyReopen(unittest.TestCase):
             self.assertEqual(scenario.provider_activity(root)['claude_user_prompts'],3)
 
     def test_option_refuses_failure_or_missing_codex_before_actions(self):
-        with tempfile.TemporaryDirectory(prefix='ru-policy-args-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-policy-args-', dir="/var/tmp") as temporary:
             root=Path(temporary)/'absent'
             command=[sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),'run',
                      '--old-dir','/unused','--old-version','old','--old-installer','/unused/install.sh',
@@ -2185,7 +2186,7 @@ class Pty(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
 
     def test_timeout_allows_peer_to_finish_sigterm_handler_before_pty_closes(self):
-        with tempfile.TemporaryDirectory(prefix="ru-pty-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="ru-pty-", dir="/var/tmp") as temporary:
             marker = Path(temporary) / "terminated"
             # The peer starts with SIGTERM blocked and unblocks it once its
             # handler exists, so a slow interpreter start cannot let the .3 s
@@ -2321,6 +2322,7 @@ else:sys.exit(2)
         self.assertEqual(result.returncode, 0, result.stderr)
         marker = self.root / ".rehearse-update"
         self.assertEqual(marker.read_text(), str(self.root)+"\n")
+        self.assertTrue((self.root / ".cagents-fixture-root").is_file())
         for kind in ("mismatch", "symlink"):
             with self.subTest(kind=kind):
                 marker.unlink()
@@ -2483,7 +2485,7 @@ class RefusalIdentity(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
         scenario = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(scenario)
-        with tempfile.TemporaryDirectory(prefix="ru-refusal-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="ru-refusal-", dir="/var/tmp") as temporary:
             records = Path(temporary)
             proof = {'host_session_id':'original','host_incarnation':'first','boot_id':'boot'}
             processes = [{'pid':42,'start_ticks':100,'argv':['/private/bin/cagents-ui']},
@@ -2512,7 +2514,7 @@ class StartupFault(unittest.TestCase):
 
     def test_fault_archive_is_verified_before_staging_without_changing_shared_build(self):
         fault = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-fault-archive-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-fault-archive-', dir="/var/tmp") as temporary:
             base = Path(temporary)
             root, shared = base/'private', base/'shared'
             root.mkdir()
@@ -2561,7 +2563,7 @@ class StartupFault(unittest.TestCase):
 
     def test_fault_archive_refuses_unverified_or_escaping_members(self):
         fault = self.module()
-        with tempfile.TemporaryDirectory(prefix='ru-fault-escape-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='ru-fault-escape-', dir="/var/tmp") as temporary:
             base = Path(temporary)
             root, shared = base/'private', base/'shared'
             root.mkdir()
@@ -2589,7 +2591,7 @@ class StartupFault(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("rehearsal_fault", REPOSITORY / "scripts/rehearse_update_fault.py")
         fault = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fault)
-        with tempfile.TemporaryDirectory(prefix="ru-fault-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="ru-fault-", dir="/var/tmp") as temporary:
             root = Path(temporary)
             prefix = root / 'home/.local/share/cagents-install'
             candidate = prefix / 'versions/new'
@@ -2625,7 +2627,7 @@ class FailedInitialization(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
         scenario = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(scenario)
-        with tempfile.TemporaryDirectory(prefix="ru-run-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="ru-run-", dir="/var/tmp") as temporary:
             root = Path(temporary) / "fresh"
             rehearsal = scenario.Rehearsal(root, str(SCRIPT))
             commands = []

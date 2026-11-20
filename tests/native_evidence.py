@@ -244,11 +244,9 @@ def live_lock_held(path: Path) -> bool:
 
 class Evidence(unittest.TestCase):
     def setUp(self) -> None:
-        # Not /tmp, /var/tmp or ~/.cache: sandboxes leave empty .git stubs there,
-        # which the script rightly refuses, and this suite does not test that.
-        state = Path.home() / ".local" / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix="ne-", dir=state))
+        # Keep fixture paths short even when the caller's isolated HOME is long;
+        # the native runner's socket path limit remains part of the contract.
+        self.root = Path(tempfile.mkdtemp(prefix="ne-", dir="/var/tmp"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.task = self.root / "task"
         self.logs = self.root / "logs"
@@ -2513,9 +2511,8 @@ REMOTE_TOOL = """
 
 class RemoteEvidence(unittest.TestCase):
     def setUp(self) -> None:
-        state = Path.home() / ".local" / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        self.root = Path(tempfile.mkdtemp(prefix="ner-", dir=state))
+        # Remote task names also obey the native runner's socket path limit.
+        self.root = Path(tempfile.mkdtemp(prefix="ner-", dir="/var/tmp"))
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.logs = self.root / "logs"
         self.logs.mkdir()

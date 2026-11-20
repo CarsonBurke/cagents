@@ -106,7 +106,7 @@ class RetryAdmission(unittest.TestCase):
 
 class RawJobs(unittest.TestCase):
     def test_first_raw_job_survives_second_status_and_receipt(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             root = Path(temporary)
             state = root / 'home/.local/share/cagents-install/.update'
             state.mkdir(parents=True)
@@ -123,7 +123,7 @@ class RawJobs(unittest.TestCase):
             self.assertEqual(json.loads((root / second / 'status.json').read_text())['phase'], 'Complete')
 
     def test_wrong_phase_or_external_log_cannot_qualify_an_attempt(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             root = Path(temporary)
             state = root / 'home/.local/share/cagents-install/.update'
             state.mkdir(parents=True)
@@ -204,7 +204,7 @@ class ReviewEvidence(unittest.TestCase):
         close.assert_called_once_with(99)
 
     def test_second_native_capture_reads_the_restored_baseline(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             root = Path(temporary)
             agent = {'id': 'a', 'placement': {'Channel': 'c'},
                      'spec': {'provider': 'Claude', 'target': {'repository': '/private/project'}},
@@ -224,7 +224,7 @@ class ReviewEvidence(unittest.TestCase):
             self.assertFalse((root / 'ui-chats-before.json').exists())
 
     def test_real_confirmation_is_copied_verbatim_before_consent(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             root = Path(temporary)
             (root / '.rehearse-update').write_text(str(root))
             (root / ".cagents-fixture-root").touch()
@@ -242,7 +242,7 @@ class ReviewEvidence(unittest.TestCase):
                 retry.pty.capture_review(root, root / 'retry/first/previews', 2)
 
     def test_truncated_wrong_target_or_missing_workload_review_cannot_pass(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             folder = Path(temporary)
             baseline = {'terminals': {'t': {}}, 'sessions': {'chat': {'id': 'c'}}}
             preview = {'from_version': 'old', 'candidate': {'version': 'new'}, 'windows': 2,
@@ -264,7 +264,7 @@ class ReviewEvidence(unittest.TestCase):
                 retry.reviewed_inventory(body, folder, baseline, 'old', 'new')
 
     def test_capture_failure_terminates_the_prompt_child_instead_of_waiting_for_answer(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             root = Path(temporary)
             (root / '.rehearse-update').write_text(str(root))
             (root / ".cagents-fixture-root").touch()
@@ -281,7 +281,7 @@ class ReviewEvidence(unittest.TestCase):
 
 class FaultRelease(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(dir="/var/tmp")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         (self.root / ".cagents-fixture-root").touch()
