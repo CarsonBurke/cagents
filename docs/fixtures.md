@@ -398,13 +398,13 @@ milliseconds a read takes, so development builds under `native-evidence`
 refuse every such read as changed while
 `home/.config/fixture-text-copy-changed` exists in `CAGENTS_EVIDENCE_FIXTURE`.
 The store's sources stay as they are, so the app has nothing newer to read
-and shows the refusal in the chat's error line. Remove the file and the same
+and says so beside the Copy that was clicked. Remove the file and the same
 Copy succeeds. Only the conversation's own items are refused; a subagent's
 copies are unaffected.
 
 ```sh
 scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-changed'
-# Click a finished reply's Copy, and capture the error line.
+# Click a finished reply's Copy, and capture what it says.
 scripts/native-evidence env rm '{fixture}/home/.config/fixture-text-copy-changed'
 ```
 
@@ -412,6 +412,18 @@ This covers the store noticing the change first. When the app's snapshot sees
 it first, the app reads the item again before the store answers; the unit
 tests in `text_copy::tests` cover that order. The fault is absent from builds
 without the `development` feature, and contacts no provider.
+
+## A copy whose text is unavailable
+
+While `home/.config/fixture-text-copy-unavailable` exists, the same store
+refuses every conversation copy as though its cache no longer held the text,
+as after the item was trimmed from it. Removing the file lets the same Copy
+succeed again.
+
+```sh
+scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-unavailable'
+scripts/native-evidence env rm '{fixture}/home/.config/fixture-text-copy-unavailable'
+```
 
 ## An offline Codex
 
