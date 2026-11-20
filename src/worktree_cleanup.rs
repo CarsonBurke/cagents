@@ -410,7 +410,11 @@ pub(crate) fn remove_fenced(
 }
 
 pub struct Protection {
+    /// The physical directory the lease holds, after following links.
     directory: PathBuf,
+    /// The path the caller asked to protect, which names `directory` through
+    /// any symbolic links it contains.
+    requested: PathBuf,
     _locks: Vec<crate::instance::OwnedLock>,
     _directories: Vec<std::fs::File>,
 }
@@ -476,6 +480,11 @@ impl Protection {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+
+    /// The path this lease was requested for, before following links.
+    pub fn requested(&self) -> &Path {
+        &self.requested
+    }
 }
 
 fn lock_path(runtime: &Path, directory: &Path) -> io::Result<PathBuf> {
@@ -504,7 +513,18 @@ fn acquire_with_directory_pin(
     pin: impl Fn(&Path) -> io::Result<std::fs::File>,
 ) -> io::Result<Protection> {
     use std::os::unix::fs::MetadataExt;
-    crate::secure_file::reject_symlink_components(directory)?;
+    // A removal names the checkout by the physical path Git registered, and
+    // its exclusive lease must not be redirected through a link to some other
+    // directory. A shared lease only keeps cleanup away from a directory a
+    // reader shows or edits, which is often reached through the user's own
+    // links (a dotfiles checkout behind `~/.config`, say). It follows them to
+    // the physical directory the read reaches, as the read itself does; a
+    // link can then only point the lease at a directory that cleanup must
+    // leave alone anyway.
+    if exclusive {
+        crate::secure_file::reject_symlink_components(directory)?;
+    }
+    let requested = directory.to_owned();
     let directory = directory.canonicalize()?;
     // A nested folder or submodule editor also protects containing Git worktrees.
     // Ordinary folder ancestors do not consume a descriptor each.
@@ -562,6 +582,7 @@ fn acquire_with_directory_pin(
     }
     Ok(Protection {
         directory,
+        requested,
         _locks: locks,
         _directories: directories,
     })
@@ -608,7 +629,6 @@ fn initial_editor_protections(runtime: &Path, paths: &[PathBuf]) -> io::Result<V
                 .parent()
                 .ok_or_else(|| io::Error::other("editor path has no parent"))?
         };
-        crate::secure_file::reject_symlink_components(directory)?;
         directories.insert(directory.canonicalize()?);
         if let Ok(target) = absolute.canonicalize()
             && target != absolute
@@ -874,7 +894,7 @@ mod tests {
 
     fn fixture_directory() -> tempfile::TempDir {
         // Positive fixtures need physical paths even when TMPDIR names a symlink.
-        // Keep the TempDir guard; the lease API still rejects symlink components.
+        // Keep the TempDir guard; an exclusive lease rejects symlink components.
         let parent = std::env::temp_dir().canonicalize().unwrap();
         tempfile::tempdir_in(parent).unwrap()
     }
@@ -1717,5 +1737,56 @@ mod tests {
             inode,
             std::os::unix::fs::MetadataExt::ino(&before.metadata().unwrap())
         );
+    }
+
+    /// A dotfiles checkout reached through `~/.gemini` or `~/.config`.
+    fn linked_directory() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let fixture = fixture_directory();
+        let physical = fixture.path().join("dotfiles/gemini/brain");
+        std::fs::create_dir_all(&physical).unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(fixture.path().join("dotfiles/gemini"), home.join(".gemini"))
+            .unwrap();
+        (fixture, home.join(".gemini/brain"), physical)
+    }
+
+    #[test]
+    fn shared_lease_follows_a_symlinked_ancestor_to_the_physical_directory() {
+        let runtime = fixture_directory();
+        let (_fixture, linked, physical) = linked_directory();
+        let reader = acquire(runtime.path(), &linked, false).unwrap();
+        assert_eq!(reader.directory(), physical);
+        assert_eq!(reader.requested(), linked);
+        // Removal of the physical directory waits for the reader.
+        assert_eq!(
+            acquire(runtime.path(), &physical, true).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(reader);
+        acquire(runtime.path(), &physical, true).unwrap();
+    }
+
+    #[test]
+    fn exclusive_lease_still_refuses_a_symlinked_ancestor() {
+        let runtime = fixture_directory();
+        let (_fixture, linked, _physical) = linked_directory();
+        let error = acquire(runtime.path(), &linked, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("symbolic links are not allowed"));
+    }
+
+    #[test]
+    fn independent_editor_startup_protects_a_file_under_a_symlinked_directory() {
+        let runtime = fixture_directory();
+        let (_fixture, linked, physical) = linked_directory();
+        std::fs::write(physical.join("notes.md"), "# Notes").unwrap();
+        let guards =
+            initial_editor_protections(runtime.path(), &[linked.join("notes.md")]).unwrap();
+        assert_eq!(
+            acquire(runtime.path(), &physical, true).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(guards);
     }
 }
