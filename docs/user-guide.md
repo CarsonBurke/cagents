@@ -445,9 +445,10 @@ cagents reads them from what the conversation and its subagents did, such as
 `gh pr create` output, pushed branches, checkouts, reviews, and PR links or
 `#123` references. The list updates on its own; there is nothing to refresh.
 For Claude and Codex it reads the provider's own transcript. For OMP,
-Antigravity and Muse it reads cagents' own record of the chat as the chat
-shows it, so a resumed chat longer than the part it shows lists only the
-work in that latest part, and the section says so.
+Antigravity and Muse it reads cagents' own record of the chat, from the
+moment the daemon starts the chat, whether or not the chat is on screen.
+A chat resumed with a long history is read from its latest part, and the
+section says the list may leave out older work.
 
 A row's glyph is the PR's state: open, draft, merged or closed. An open PR's
 row ends with a glyph for its checks, the worst of them, and one for its

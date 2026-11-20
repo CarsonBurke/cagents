@@ -3,120 +3,115 @@
 //! read: Antigravity and Muse, whose conversations are databases and logs
 //! of their own, and OMP. cagents is the client of each of them, so the
 //! commands they ran, the files they edited and what was said already sit in
-//! the conversation's items, newest last.
+//! the conversation's items.
 //!
-//! The record is read through the conversation's snapshot, its newest
-//! window of items, as the agent console reads it: whatever owns the
-//! conversation, a local actor or a retained one, serves it the same way.
-//! Each item is read once it has settled, so a command is read with its
-//! output and a message once it is no longer being written. What scrolled
-//! out of the window before it was read makes the reading partial, and says
-//! so.
+//! The record is followed through its store, which serves each item whose
+//! content changed since the last read, whole, without touching what any
+//! window presents. An item is read once it has settled, so a command is
+//! read with its output and a message once it is no longer being written,
+//! and read again if it changes after that. A first read, or one after more
+//! changed between reads than the store remembers, starts from the newest
+//! items; what came before them and was never read makes the reading
+//! partial, and says so.
 
 use super::transcript::{self, Found};
 use crate::{
-    chat::{CommandAction, DeliveryKind, Item, ItemContent, Role, Snapshot, ToolStatus},
+    chat::{CommandAction, DeliveryKind, Item, ItemContent, Role, ToolStatus, runtime::Unread},
     pull_request_signals::{self, Signal},
     work::TranscriptCoverage,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
-/// Items remembered as seen, about thirty windows' worth: enough to tell an
-/// item already read from a new one as the window moves, and to notice when
-/// it moved past something unread.
+/// Items remembered as read, so a restarted read can tell whether it
+/// reached back to what was read before.
 const REMEMBERED: usize = 4096;
+/// Unsettled items asked for again on each read.
+const HELD: usize = 1024;
 
-/// One conversation's reading state between snapshots.
+/// One conversation's reading state between reads.
 #[derive(Debug, Default)]
 pub(super) struct Items {
-    /// The actor that serves the record. Another one, after the
-    /// conversation restarts, counts its generations afresh.
-    owner: Option<uuid::Uuid>,
-    /// The snapshot generation last read; a snapshot no newer is not served.
-    generation: Option<u64>,
-    /// Whether each item seen has been read: one still running or being
-    /// written is seen but read later.
-    seen: HashMap<String, bool>,
-    /// The order items were first seen in, oldest first, to forget them by.
+    started: bool,
+    /// Items read, in the order they were first read, to forget them by.
+    seen: HashSet<String>,
     order: VecDeque<String>,
-    /// Something before the window was never read.
+    /// Items served before they settled. Settling changes most of them, but
+    /// not a message whose turn ended, so each read asks for them again.
+    held: BTreeSet<String>,
+    /// Something before what was read was never read.
     partial: bool,
-    /// The window last read was an earlier page someone scrolled back to,
-    /// not the newest one.
-    behind: bool,
+    /// Why the last read failed.
+    error: Option<String>,
 }
 
 impl Items {
-    /// Notes which actor serves the record now. What was read stays read:
-    /// a restarted conversation keeps its items' IDs.
-    pub fn owned_by(&mut self, owner: uuid::Uuid) {
-        if self.owner != Some(owner) {
-            self.owner = Some(owner);
-            self.generation = None;
-        }
+    /// The items to serve again with the next read.
+    pub fn again(&self) -> Vec<String> {
+        self.held.iter().cloned().collect()
     }
 
-    /// The generation a newer snapshot must exceed to be worth serving.
-    pub fn generation(&self) -> Option<u64> {
-        self.generation
-    }
-
-    /// Reads what `snapshot` holds that settled since it was last read.
-    pub fn read(&mut self, snapshot: &Snapshot, out: &mut Vec<Found>) {
-        self.generation = Some(snapshot.generation);
-        self.behind = snapshot.has_later;
-        // Earlier items exist, and the window does not begin with one seen
-        // before: the first window of a long conversation, or a window that
-        // moved on further than one pass between reads.
-        if snapshot.has_earlier
-            && snapshot
+    /// Reads what settled in `unread`, served while the conversation was
+    /// `busy` or not.
+    pub fn read(&mut self, unread: Unread, busy: bool, out: &mut Vec<Found>) {
+        self.error = None;
+        // Earlier items exist, and the read does not reach back to one read
+        // before: the first read of a long conversation, or one that missed
+        // more changes than were remembered.
+        if unread.restarted
+            && unread.has_earlier
+            && unread
                 .items
                 .first()
-                .is_none_or(|item| !self.seen.contains_key(&item.id))
+                .is_none_or(|item| !self.seen.contains(&item.id))
         {
             self.partial = true;
         }
-        let newest = snapshot.items.len().checked_sub(1);
-        for (index, item) in snapshot.items.iter().enumerate() {
-            if self.seen.get(&item.id) == Some(&true) {
-                continue;
-            }
+        for item in &unread.items {
             // Only the newest message can still be written to, and only
             // while the conversation works.
-            let writing = snapshot.busy && Some(index) == newest;
-            let settled = match signals(item, writing) {
+            let writing = busy && unread.newest.as_ref() == Some(&item.id);
+            match signals(item, writing) {
                 Some(signals) => {
+                    self.held.remove(&item.id);
                     out.extend(signals.into_iter().map(|signal| Found {
                         signal,
                         by_subagent: false,
                     }));
-                    true
                 }
-                None => false,
-            };
-            self.remember(&item.id, settled);
+                None => {
+                    self.held.insert(item.id.clone());
+                    while self.held.len() > HELD {
+                        self.held.pop_first();
+                    }
+                }
+            }
+            self.remember(&item.id);
         }
+        self.started = true;
+    }
+
+    /// Records that the record could not be read.
+    pub fn failed(&mut self, error: String) {
+        self.error = Some(error);
     }
 
     pub fn coverage(&self) -> TranscriptCoverage {
-        match self.generation {
-            None => TranscriptCoverage::Pending,
-            Some(_) if self.behind => TranscriptCoverage::Pending,
-            Some(_) if self.partial => TranscriptCoverage::Partial,
-            Some(_) => TranscriptCoverage::Complete,
+        match &self.error {
+            Some(reason) => TranscriptCoverage::Unavailable {
+                reason: format!("This chat's record cannot be read: {reason}"),
+            },
+            None if !self.started => TranscriptCoverage::Pending,
+            None if self.partial => TranscriptCoverage::Partial,
+            None => TranscriptCoverage::Complete,
         }
     }
 
-    fn remember(&mut self, id: &str, read: bool) {
-        match self.seen.get_mut(id) {
-            Some(known) => *known = read,
-            None => {
-                self.seen.insert(id.to_owned(), read);
-                self.order.push_back(id.to_owned());
-                while self.order.len() > REMEMBERED {
-                    if let Some(oldest) = self.order.pop_front() {
-                        self.seen.remove(&oldest);
-                    }
+    fn remember(&mut self, id: &str) {
+        if self.seen.insert(id.to_owned()) {
+            self.order.push_back(id.to_owned());
+            while self.order.len() > REMEMBERED {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.seen.remove(&oldest);
                 }
             }
         }
@@ -210,19 +205,18 @@ mod tests {
         pull_request_signals::{PullRequestKeyOrd, Reference, RepoKeyOrd},
         work::Relation,
     };
-    use std::sync::Arc;
 
-    fn item(id: &str, role: Role, content: ItemContent) -> Arc<Item> {
-        Arc::new(Item {
+    fn item(id: &str, role: Role, content: ItemContent) -> Item {
+        Item {
             started_at: None,
             id: id.into(),
             role,
             content,
             at: None,
-        })
+        }
     }
 
-    fn text(id: &str, role: Role, text: &str) -> Arc<Item> {
+    fn text(id: &str, role: Role, text: &str) -> Item {
         item(
             id,
             role,
@@ -234,7 +228,7 @@ mod tests {
         )
     }
 
-    fn command(id: &str, script: &str, status: ToolStatus, output: &str) -> Arc<Item> {
+    fn command(id: &str, script: &str, status: ToolStatus, output: &str) -> Item {
         item(
             id,
             Role::Assistant,
@@ -251,26 +245,34 @@ mod tests {
         )
     }
 
-    fn snapshot(generation: u64, items: Vec<Arc<Item>>, busy: bool, earlier: bool) -> Snapshot {
-        Snapshot {
-            generation,
+    /// What changed, the last of it the newest item.
+    fn changed(items: Vec<Item>) -> Unread {
+        Unread {
+            newest: items.last().map(|item| item.id.clone()),
             items,
-            busy,
-            has_earlier: earlier,
-            ..Snapshot::default()
+            ..Unread::default()
         }
     }
 
-    fn read(items: &mut Items, snapshot: &Snapshot) -> Vec<(Reference, Relation)> {
+    /// A read that started again from the newest items.
+    fn restarted(items: Vec<Item>, earlier: bool) -> Unread {
+        Unread {
+            restarted: true,
+            has_earlier: earlier,
+            ..changed(items)
+        }
+    }
+
+    fn read(items: &mut Items, unread: Unread, busy: bool) -> Vec<(Reference, Relation)> {
         let mut found = Vec::new();
-        items.read(snapshot, &mut found);
+        items.read(unread, busy, &mut found);
         found
             .into_iter()
             .map(|found| (found.signal.reference, found.signal.relation))
             .collect()
     }
 
-    fn created(number: u64) -> Reference {
+    fn pull(number: u64) -> Reference {
         Reference::PullRequest(PullRequestKeyOrd {
             repository: RepoKeyOrd {
                 host: "github.com".into(),
@@ -283,24 +285,25 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_read_once_it_finishes_with_what_it_printed() {
+    fn a_command_is_read_when_it_finishes_and_again_when_it_changes_after() {
         let mut items = Items::default();
         assert_eq!(items.coverage(), TranscriptCoverage::Pending);
         let running = command("c", "gh pr create --fill", ToolStatus::Running, "");
-        assert!(read(&mut items, &snapshot(1, vec![running], true, false)).is_empty());
-        let done = command(
+        assert!(read(&mut items, restarted(vec![running], false), true).is_empty());
+        assert_eq!(items.again(), ["c"]);
+        // Finished before its output arrived: what it printed is read when
+        // the output changes it.
+        let finished = command("c", "gh pr create --fill", ToolStatus::Succeeded, "");
+        assert!(read(&mut items, changed(vec![finished]), false).is_empty());
+        assert!(items.again().is_empty());
+        let printed = command(
             "c",
             "gh pr create --fill",
             ToolStatus::Succeeded,
             "https://github.com/owner/repo/pull/7\n",
         );
-        let found = read(&mut items, &snapshot(2, vec![done.clone()], false, false));
-        assert!(
-            found.contains(&(created(7), Relation::Created)),
-            "{found:?}"
-        );
-        // Read once, however often it is served again.
-        assert!(read(&mut items, &snapshot(3, vec![done], false, false)).is_empty());
+        let found = read(&mut items, changed(vec![printed]), false);
+        assert!(found.contains(&(pull(7), Relation::Created)), "{found:?}");
         assert_eq!(items.coverage(), TranscriptCoverage::Complete);
     }
 
@@ -312,23 +315,29 @@ mod tests {
             Role::Assistant,
             "Opened https://github.com/owner/repo/pull/1",
         );
-        assert!(read(&mut items, &snapshot(1, vec![partial], true, false)).is_empty());
+        assert!(read(&mut items, restarted(vec![partial], false), true).is_empty());
+        assert_eq!(items.again(), ["m"]);
         let whole = text(
             "m",
             Role::Assistant,
             "Opened https://github.com/owner/repo/pull/12",
         );
-        // Once the turn ends, or once something follows it.
+        // The turn ended without changing it: it is served again, as held.
+        let found = read(&mut items, changed(vec![whole.clone()]), false);
+        assert_eq!(found, vec![(pull(12), Relation::Mentioned)]);
+        assert!(items.again().is_empty());
+
+        // Or something came after it while the turn went on.
+        let mut items = Items::default();
         let found = read(
             &mut items,
-            &snapshot(
-                2,
+            restarted(
                 vec![whole, command("n", "ls", ToolStatus::Running, "")],
-                true,
                 false,
             ),
+            true,
         );
-        assert_eq!(found, vec![(created(12), Relation::Mentioned)]);
+        assert_eq!(found, vec![(pull(12), Relation::Mentioned)]);
     }
 
     #[test]
@@ -350,16 +359,15 @@ mod tests {
         };
         let found = read(
             &mut items,
-            &snapshot(
-                1,
+            restarted(
                 vec![
                     edit("a", ToolStatus::Succeeded),
                     edit("b", ToolStatus::Denied),
                     edit("c", ToolStatus::Running),
                 ],
-                true,
                 false,
             ),
+            true,
         );
         assert_eq!(
             found,
@@ -370,6 +378,7 @@ mod tests {
                 Relation::Edited
             )]
         );
+        assert_eq!(items.again(), ["c"]);
     }
 
     #[test]
@@ -377,8 +386,7 @@ mod tests {
         let mut items = Items::default();
         let found = read(
             &mut items,
-            &snapshot(
-                1,
+            restarted(
                 vec![
                     item(
                         "t",
@@ -402,53 +410,68 @@ mod tests {
                     ),
                 ],
                 false,
-                false,
             ),
+            false,
         );
         assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
-    fn a_long_conversation_or_a_window_that_moved_past_unread_items_is_partial() {
+    fn a_read_that_does_not_reach_back_to_what_was_read_is_partial() {
         let mut items = Items::default();
         read(
             &mut items,
-            &snapshot(1, vec![text("a", Role::User, "hi")], false, false),
+            restarted(vec![text("a", Role::User, "hi")], false),
+            false,
         );
         assert_eq!(items.coverage(), TranscriptCoverage::Complete);
-        // The window moved on by one: its first item was seen.
+        // Restarted, after more changed than the store remembers, but
+        // reaching back to an item read before.
         read(
             &mut items,
-            &snapshot(
-                2,
+            restarted(
                 vec![text("a", Role::User, "hi"), text("b", Role::User, "more")],
-                false,
                 true,
             ),
+            false,
         );
         assert_eq!(items.coverage(), TranscriptCoverage::Complete);
-        // It moved past items never read.
+        // Restarted past items never read.
         read(
             &mut items,
-            &snapshot(3, vec![text("z", Role::User, "later")], false, true),
+            restarted(vec![text("z", Role::User, "later")], true),
+            false,
         );
         assert_eq!(items.coverage(), TranscriptCoverage::Partial);
 
         let mut resumed = Items::default();
         read(
             &mut resumed,
-            &snapshot(1, vec![text("y", Role::User, "newest")], false, true),
+            restarted(vec![text("y", Role::User, "newest")], true),
+            false,
         );
         assert_eq!(resumed.coverage(), TranscriptCoverage::Partial);
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_says_so_until_it_can() {
+        let mut items = Items::default();
+        items.failed("disk I/O error".into());
+        assert!(matches!(
+            items.coverage(),
+            TranscriptCoverage::Unavailable { reason } if reason.contains("disk I/O error")
+        ));
+        read(&mut items, restarted(Vec::new(), false), false);
+        assert_eq!(items.coverage(), TranscriptCoverage::Complete);
     }
 
     #[test]
     fn what_is_remembered_is_bounded() {
         let mut items = Items::default();
         for index in 0..REMEMBERED + 10 {
-            items.remember(&index.to_string(), true);
+            items.remember(&index.to_string());
         }
         assert_eq!(items.seen.len(), REMEMBERED);
-        assert!(!items.seen.contains_key("0"));
+        assert!(!items.seen.contains("0"));
     }
 }

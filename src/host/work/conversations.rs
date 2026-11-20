@@ -32,7 +32,7 @@ use crate::{
     },
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io,
     os::unix::fs::{FileExt as _, MetadataExt as _},
@@ -212,8 +212,9 @@ enum Source {
     Pending,
     Located(Located),
     /// No transcript file is read; cagents' own record of the conversation
-    /// with this provider ID is.
-    Recorded(String),
+    /// is, whatever its provider calls the conversation, from before it
+    /// names it.
+    Recorded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,32 +593,54 @@ impl Handle {
     /// Reads, resolves and publishes every watched conversation once, and
     /// reports whether any is watched.
     fn conversation_pass(&self, host: &SharedHost) -> bool {
-        let conversations = {
+        // A conversation whose record is read is followed whether or not
+        // anything shows it: the record serves only what changed since the
+        // last read, so an idle one costs nothing, and what a busy one did
+        // early is read before it is long past.
+        let followed = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .iter()
+            .filter(|(_, record)| recorded_provider(record.session.launch.provider))
+            .map(|(conversation, _)| *conversation)
+            .collect::<BTreeSet<_>>();
+        let (conversations, read) = {
             let mut state = self.conversations();
-            state.watched.retain(|_, watched| {
+            state.watched.retain(|conversation, watched| {
                 watched
                     .watchers
                     .retain(|_, delivery| delivery.strong_count() > 0);
                 if watched.watchers.is_empty() {
                     let since = *watched.unwatched_since.get_or_insert_with(Instant::now);
-                    since.elapsed() < KEPT_UNWATCHED
+                    followed.contains(conversation) || since.elapsed() < KEPT_UNWATCHED
                 } else {
                     watched.unwatched_since = None;
                     true
                 }
             });
-            state
+            for conversation in &followed {
+                state
+                    .watched
+                    .entry(*conversation)
+                    .or_insert_with(Watched::new);
+            }
+            let conversations = state
                 .watched
                 .iter()
                 .filter(|(_, watched)| !watched.watchers.is_empty())
                 .map(|(conversation, _)| *conversation)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let mut read = conversations.iter().copied().collect::<BTreeSet<_>>();
+            read.extend(&followed);
+            (conversations, read)
         };
-        if conversations.is_empty() {
+        if read.is_empty() {
             return false;
         }
         let mut facts = BTreeMap::new();
-        for conversation in &conversations {
+        for conversation in &read {
+            let watched = conversations.contains(conversation);
             let (known, search_due) = self
                 .conversations()
                 .watched
@@ -632,7 +655,11 @@ impl Handle {
                 })
                 .unwrap_or_default();
             let located = locate(host, *conversation, known.as_deref(), search_due);
-            facts.insert(*conversation, self.facts(host, *conversation));
+            // Finding a conversation's project starts tracking it on the
+            // board, so one nobody shows asks only when its read needs it.
+            if watched {
+                facts.insert(*conversation, self.facts(host, *conversation));
+            }
             let (source, mut cursors, mut items) = {
                 let mut state = self.conversations();
                 let Some(watched) = state.watched.get_mut(conversation) else {
@@ -667,9 +694,19 @@ impl Handle {
             // the record are read without it. Only this thread moves the
             // cursors.
             let scanned = match &source {
-                Source::Recorded(_) => recorded(host, *conversation, &mut items),
+                Source::Recorded => recorded(host, *conversation, &mut items),
                 _ => scan(&source, &mut cursors),
             };
+            // Work on "the current branch" is pinned to the branch checked
+            // out as it is read.
+            if !watched
+                && scanned
+                    .found
+                    .iter()
+                    .any(|found| matches!(found.signal.reference, Reference::CurrentBranch { .. }))
+            {
+                facts.insert(*conversation, self.facts(host, *conversation));
+            }
             let mut state = self.conversations();
             if let Some(watched) = state.watched.get_mut(conversation)
                 && watched.source == source
@@ -1472,15 +1509,12 @@ fn locate(
     };
     // cagents is the client of these providers, so its own record of the
     // conversation is read, from before the provider names its ID.
-    if matches!(
-        provider,
-        Provider::Omp | Provider::Antigravity | Provider::Muse
-    ) {
+    if recorded_provider(provider) {
         let id = session_id.unwrap_or_default();
         return if known == Some(id.as_str()) {
             Location::Unchanged
         } else {
-            Location::Found(id.clone(), Source::Recorded(id))
+            Location::Found(id, Source::Recorded)
         };
     }
     let Some(id) = session_id.filter(|id| known != Some(id.as_str())) else {
@@ -1572,24 +1606,32 @@ fn read(watched: &mut Watched) {
 /// pass. Only the conversation's handle is taken under the host's lock; the
 /// record is read without it.
 fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> Scanned {
-    let owner = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .chats
-            .get(&conversation)
-            .map(|record| (record.execution_instance, record.handle.clone()))
-    };
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&conversation)
+        .map(|record| record.handle.clone());
     let mut found = Vec::new();
-    if let Some((instance, handle)) = owner {
-        items.owned_by(instance);
-        if let Some(snapshot) = handle.snapshot(items.generation()) {
-            items.read(&snapshot, &mut found);
-        }
+    match handle.map(|handle| handle.unread(&items.again())) {
+        Some(Ok((unread, busy))) => items.read(unread, busy, &mut found),
+        Some(Err(error)) => items.failed(error),
+        // Gone: what was read stays as it was.
+        None => {}
     }
     Scanned {
         found,
         coverage: items.coverage(),
     }
+}
+
+/// Whether cagents' own record of `provider`'s conversations is read for
+/// their work, rather than a transcript file of the provider's.
+fn recorded_provider(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Omp | Provider::Antigravity | Provider::Muse
+    )
 }
 
 /// What one read of a conversation's transcripts found.
@@ -1613,7 +1655,7 @@ fn scan(source: &Source, cursors: &mut BTreeMap<PathBuf, Cursor>) -> Scanned {
             };
         }
         // Read from the conversation's record by `recorded`, not here.
-        Source::Recorded(_) => {
+        Source::Recorded => {
             return Scanned {
                 found: Vec::new(),
                 coverage: TranscriptCoverage::Pending,

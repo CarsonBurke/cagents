@@ -46,6 +46,7 @@ mod retained_actor;
 #[cfg(test)]
 pub(crate) use retained_actor::receipt_fixture as retained_receipt_fixture;
 mod store;
+pub use store::Unread;
 mod websocket;
 pub(crate) use store::Store;
 
@@ -1243,6 +1244,15 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .notification_content(kind)
+    }
+    /// The items changed since the last call, whole, for a reader that
+    /// follows the conversation without presenting it; `again` names items
+    /// to serve once more. See [`store::Unread`].
+    pub fn unread(&self, again: &[String]) -> Result<(store::Unread, bool), String> {
+        let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        let unread = store.unread(again)?;
+        let busy = self.0.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+        Ok((unread, busy))
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());

@@ -998,19 +998,17 @@ fn a_conversation_with_no_transcript_yet_reads_as_complete_once_looked_for() {
 #[test]
 fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_opened() {
     use crate::chat::{
-        ChangeKind, CommandAction, FileChange, Item, ItemContent, Role, Snapshot, ToolStatus,
+        ChangeKind, CommandAction, FileChange, Item, ItemContent, Role, ToolStatus, runtime::Unread,
     };
-    let item = |id: &str, content| {
-        Arc::new(Item {
-            started_at: None,
-            id: id.into(),
-            role: Role::Assistant,
-            content,
-            at: None,
-        })
+    let item = |id: &str, content| Item {
+        started_at: None,
+        id: id.into(),
+        role: Role::Assistant,
+        content,
+        at: None,
     };
-    let snapshot = Snapshot {
-        generation: 4,
+    let unread = Unread {
+        restarted: true,
         items: vec![
             item(
                 "edit",
@@ -1037,14 +1035,14 @@ fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_
                 },
             ),
         ],
-        ..Snapshot::default()
+        ..Unread::default()
     };
     let mut items = Items::default();
     let mut found = Vec::new();
-    items.read(&snapshot, &mut found);
+    items.read(unread, false, &mut found);
     let facts = facts("/w/app");
     let mut watched = Watched::new();
-    watched.source = Source::Recorded("session".into());
+    watched.source = Source::Recorded;
     watched.apply(
         Scanned {
             found,
