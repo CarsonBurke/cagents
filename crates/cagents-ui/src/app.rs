@@ -2410,6 +2410,32 @@ static WORKTREE_PR_CACHE: LazyLock<
 static WORKTREE_PR_LOOKUP_LOCK: Mutex<()> = Mutex::new(());
 const WORKTREE_PR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// A historical association is authoritative only for the local commit whose
+/// ancestry was checked. A reused branch name does not preserve that proof.
+#[derive(Debug, Clone)]
+pub struct ArchivedWorktreePr {
+    pull_request: crate::github::PullRequest,
+    validated_head: String,
+}
+
+impl ArchivedWorktreePr {
+    fn matches(&self, record: &WorktreeRecord, head_repository: &GitHubRepoKey) -> bool {
+        !record.detached
+            && !record.bare
+            && record
+                .branch
+                .as_deref()
+                .and_then(|branch| branch.strip_prefix("refs/heads/"))
+                == Some(self.pull_request.head_ref_name.as_str())
+            && self.pull_request.belongs_to_head(head_repository)
+    }
+
+    fn is_valid_for(&self, record: &WorktreeRecord, head_repository: &GitHubRepoKey) -> bool {
+        self.matches(record, head_repository)
+            && record.head_oid.as_deref() == Some(self.validated_head.as_str())
+    }
+}
+
 /// Resolve branches missing from the recent PR page within their source
 /// repository. Historical results must name this head or an ancestor of it;
 /// branch names alone are shared by forks and can be reused after closure.
@@ -2420,7 +2446,7 @@ fn attached_worktree_pull_requests(
     recent: &[crate::github::PullRequest],
     head_repositories: &HashMap<crate::model::WorktreeId, GitHubRepoKey>,
     cancellation: &CancellationToken,
-) -> Vec<crate::github::PullRequest> {
+) -> Vec<ArchivedWorktreePr> {
     // One repository lookup wave at a time keeps a global refresh from
     // multiplying the eight gh subprocesses by the number of projects.
     let _lookup_guard = WORKTREE_PR_LOOKUP_LOCK
@@ -2515,15 +2541,22 @@ fn attached_worktree_pull_requests(
                         },
                     };
                     if let Some(pr) = resolved {
-                        found.lock().unwrap_or_else(|p| p.into_inner()).push(pr);
+                        found
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(ArchivedWorktreePr {
+                                pull_request: pr,
+                                validated_head: oid.clone(),
+                            });
                     }
                 }
             });
         }
     });
     let mut result = found.into_inner().unwrap_or_else(|p| p.into_inner());
-    result.sort_by_key(|pr| pr.number);
-    result.dedup_by_key(|pr| pr.number);
+    result.sort_by(|a, b| {
+        (a.pull_request.number, &a.validated_head).cmp(&(b.pull_request.number, &b.validated_head))
+    });
     result
 }
 
@@ -2564,7 +2597,7 @@ fn apply_attached_worktree_prs(
     project: &mut SidebarProject,
     worktrees: &[(WorktreeRecord, Option<StatusSnapshot>)],
     recent: &[crate::github::PullRequest],
-    archived: &[crate::github::PullRequest],
+    archived: &[ArchivedWorktreePr],
 ) {
     let records = worktrees
         .iter()
@@ -2582,7 +2615,13 @@ fn apply_attached_worktree_prs(
             row.clear_pull_request();
             continue;
         };
-        let mut exact = recent.iter().chain(archived).filter(|pr| {
+        let valid_archived = || {
+            archived
+                .iter()
+                .filter(|association| association.is_valid_for(record, head_repository))
+                .map(|association| &association.pull_request)
+        };
+        let mut exact = recent.iter().chain(valid_archived()).filter(|pr| {
             record
                 .branch
                 .as_deref()
@@ -2605,13 +2644,10 @@ fn apply_attached_worktree_prs(
             .branch
             .as_deref()
             .and_then(|branch| branch.strip_prefix("refs/heads/"))
-            && let Some(pr) = archived
-                .iter()
-                .find(|pr| pr.head_ref_name == branch && pr.belongs_to_head(head_repository))
+            && let Some(pr) = valid_archived().find(|pr| pr.head_ref_name == branch)
         {
-            // This fallback was already checked by resolve_branch_head: it is
-            // the sole PR for a branch in this same source repository. Its old head
-            // may differ from the checkout after later local commits.
+            // The proof still names this checkout's current HEAD, even when
+            // later local commits put it ahead of the historical PR head.
             row.set_pull_request(SidebarPullRequest::from_github(
                 project.id,
                 pr,
@@ -4867,7 +4903,7 @@ pub enum Message {
         generation: u64,
         worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
         recent: Vec<crate::github::PullRequest>,
-        archived: Vec<crate::github::PullRequest>,
+        archived: Vec<ArchivedWorktreePr>,
         expected: HashMap<crate::model::WorktreeId, Option<SidebarPullRequest>>,
     },
     /// One shared sidebar model update, from the daemon observer or publisher.
@@ -17746,6 +17782,20 @@ impl Cagents {
                 archived,
                 expected,
             } => {
+                let current = self.refresh_ui.git.worktrees(project_id).unwrap_or(&[])
+                    .iter()
+                    .map(|(record, _)| (record.id, record))
+                    .collect::<HashMap<_, _>>();
+                let worktrees = worktrees.into_iter()
+                    .filter(|(record, _)| {
+                        current.get(&record.id).is_some_and(|now| {
+                            now.path == record.path
+                                && now.branch == record.branch
+                                && now.head_oid == record.head_oid
+                                && now.detached == record.detached
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 if self.repository_generations.get(&project_id) == Some(&generation)
                     && let Some(project) = self
                         .sidebar_model
@@ -17778,8 +17828,19 @@ impl Cagents {
                     self.refresh_ui
                         .git
                         .remember_archived(project_id, generation, &archived);
-                    let merged = recent.into_iter().chain(archived).collect::<Vec<_>>();
-                    return self.cleanup_merged_worktree_task(project_id, &worktrees, &merged);
+                    // Separate local HEADs can prove the same PR. Cleanup
+                    // continues to receive each historical PR only once.
+                    let mut archived_prs = archived.into_iter()
+                        .map(|association| association.pull_request)
+                        .collect::<Vec<_>>();
+                    archived_prs.dedup_by_key(|pr| pr.number);
+                    let merged = recent.into_iter()
+                        .chain(archived_prs)
+                        .collect::<Vec<_>>();
+                    return Task::batch([
+                        self.cleanup_merged_worktree_task(project_id, &worktrees, &merged),
+                        self.start_git_reads(),
+                    ]);
                 }
                 Task::none()
             }
