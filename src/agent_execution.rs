@@ -939,7 +939,11 @@ mod tests {
             idempotency_key: "key".into(),
         };
         for provider in Provider::ALL {
-            for mode in provider.permission_modes() {
+            for mode in provider
+                .permission_modes()
+                .iter()
+                .chain(provider.permission_mode_aliases())
+            {
                 assert_eq!(
                     request(provider, mode).validate(),
                     Ok(()),
@@ -959,11 +963,35 @@ mod tests {
                 );
             }
         }
+        // Muse's aliases are its terminal's names for its modes.
+        assert!(
+            Provider::Muse
+                .acp()
+                .unwrap()
+                .modes
+                .iter()
+                .map(|(own, _)| *own)
+                .eq(Provider::Muse.permission_mode_aliases().iter().copied())
+        );
+        // Antigravity's terminal names every mode its sessions have, so its
+        // list is exactly its mode table's.
+        assert!(
+            Provider::Antigravity
+                .acp()
+                .unwrap()
+                .mode_meanings()
+                .eq(Provider::Antigravity.permission_modes().iter().copied())
+        );
+        // Muse's terminal spells approval its own way; main accepted those
+        // names, and saved automations may still use them.
+        for alias in ["never", "on-request", "untrusted"] {
+            assert_eq!(request(Provider::Muse, alias).validate(), Ok(()));
+        }
         for (provider, foreign) in [
             (Provider::Antigravity, "bypassPermissions"),
             (Provider::Antigravity, "never"),
             (Provider::Muse, "plan"),
-            (Provider::Muse, "on-request"),
+            (Provider::Muse, "acceptEdits"),
             (Provider::Claude, "never"),
             (Provider::Codex, "plan"),
             (Provider::Omp, "acceptEdits"),
@@ -980,6 +1008,10 @@ mod tests {
         // Muse's "Deny unmatched actions" has no terminal option, but is a
         // mode of its native conversation.
         assert_eq!(request(Provider::Muse, "dontAsk").validate(), Ok(()));
+        assert_eq!(
+            request(Provider::Muse, "plan").validate(),
+            Err("Muse has no permission mode \"plan\"; choose manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never".into())
+        );
     }
 
     #[test]

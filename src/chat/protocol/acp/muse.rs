@@ -225,6 +225,29 @@ mod tests {
     }
 
     #[test]
+    fn every_permission_mode_cagents_accepts_is_one_of_its_sessions() {
+        use crate::agent::Provider;
+        // Both ways: each session mode has a name `agent spawn` takes, and
+        // each name it takes, or terminal alias, selects one.
+        let mut meanings: Vec<_> = PROFILE.modes.iter().map(|(_, meaning)| *meaning).collect();
+        let mut accepted = Provider::Muse.permission_modes().to_vec();
+        meanings.sort_unstable();
+        accepted.sort_unstable();
+        assert_eq!(meanings, accepted);
+        for name in Provider::Muse.permission_modes() {
+            assert_eq!(mode(name).unwrap(), PROFILE.own_mode(name));
+        }
+        let terminal = Provider::Muse.acp().unwrap();
+        for alias in Provider::Muse.permission_mode_aliases() {
+            assert_eq!(
+                mode(alias).unwrap(),
+                PROFILE.own_mode(terminal.mode_meaning(alias)),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
     fn serves_acp_first_with_contributor_mode_off() {
         let startup = startup(&[]).unwrap();
         assert_eq!(startup.arguments, ["acp", "--contributor-mode", "off"]);

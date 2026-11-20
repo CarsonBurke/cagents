@@ -71,6 +71,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     latest_selectors: &["--last"],
     native_chat: true,
     permission_modes: &["untrusted", "on-failure", "on-request", "never"],
+    permission_mode_aliases: &[],
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: true,

@@ -1185,8 +1185,8 @@ fixture as `bin/agy` and `bin/muse-upstream`, through
 wrapper might. Each keeps its sessions in the fixture's `acp/agy` or
 `acp/muse`, and logs the frames it receives to `frames.log` there, so a check
 can read which settings and prompts cagents sent. While `acp/agy/signed-out`
-exists, `agy` answers every new or loaded session that sign-in is required, and the app's sign-in, `agy acp
---login`, removes it:
+exists, `agy` answers every new or loaded session that sign-in is required,
+and the app's sign-in, `agy acp --login`, removes it:
 
 ```sh
 evidence env touch '{fixture}/acp/agy/signed-out'

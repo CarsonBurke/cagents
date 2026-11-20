@@ -166,6 +166,9 @@ struct ProviderAdapter {
     /// provider's own for Claude, Codex and OMP, and for an ACP agent the
     /// cagents name of each of its session modes.
     permission_modes: &'static [&'static str],
+    /// Other names the provider's own terminal gives the same modes, which a
+    /// launch or a saved automation may use instead.
+    permission_mode_aliases: &'static [&'static str],
     /// What cagents knows of a provider whose native chat is the Agent
     /// Client Protocol, for one that serves it.
     acp: Option<Acp>,
@@ -364,21 +367,45 @@ impl Provider {
         self.adapter().permission_modes
     }
 
+    /// Other names its terminal gives the same modes, also accepted.
+    pub fn permission_mode_aliases(self) -> &'static [&'static str] {
+        self.adapter().permission_mode_aliases
+    }
+
+    /// The permission modes this provider takes, as its help and errors name
+    /// them: "a, b or c", then any terminal aliases.
+    pub fn permission_mode_choices(self) -> String {
+        fn list(names: &[&str]) -> String {
+            match names {
+                [] => String::new(),
+                [only] => (*only).to_owned(),
+                [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+            }
+        }
+        match self.permission_mode_aliases() {
+            [] => list(self.permission_modes()),
+            aliases => format!(
+                "{}, or its terminal's {}",
+                list(self.permission_modes()),
+                list(aliases)
+            ),
+        }
+    }
+
     /// Refuses a permission mode this provider has no such mode for, such as
     /// another provider's, naming the ones it has.
     pub fn check_permission_mode(self, mode: &str) -> Result<(), String> {
-        let modes = self.permission_modes();
-        if modes.contains(&mode) {
+        if self.permission_modes().contains(&mode) || self.permission_mode_aliases().contains(&mode)
+        {
             return Ok(());
         }
-        let choices = match modes {
-            [] => return Err(format!("{} takes no permission mode", self.label())),
-            [only] => (*only).to_owned(),
-            [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
-        };
+        if self.permission_modes().is_empty() {
+            return Err(format!("{} takes no permission mode", self.label()));
+        }
         Err(format!(
-            "{} has no permission mode {mode:?}; choose {choices}",
-            self.label()
+            "{} has no permission mode {mode:?}; choose {}",
+            self.label(),
+            self.permission_mode_choices()
         ))
     }
 

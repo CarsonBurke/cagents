@@ -62,11 +62,11 @@ pub enum AgentCommand {
         surface: String,
         #[arg(long)]
         #[arg(
-            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. Antigravity: a model ID such as gemini-3.8-flash. Muse: a model ID such as muse-spark-1.2. OMP: provider/model. The native chat model picker lists available IDs"
+            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. Antigravity: a model ID such as gemini-3.8-flash. Muse: a model ID such as muse-spark-1.2. Oh My Pi: provider/model. The native chat model picker lists available IDs"
         )]
         model: Option<String>,
         #[arg(long, value_name = "MODE")]
-        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions. OMP: always-ask, write or yolo",
+        #[arg(help = "Permission policy. Claude Code: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never. Oh My Pi: always-ask, write or yolo",
             hide_possible_values = true,
             value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
@@ -2286,6 +2286,52 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_help_names_each_provider_s_own_permission_modes() {
+        use clap::CommandFactory;
+        let mut command = crate::control::Cli::command();
+        command.build();
+        let spawn = command
+            .find_subcommand("agent")
+            .and_then(|agent| agent.find_subcommand("spawn"))
+            .unwrap();
+        let argument = spawn
+            .get_arguments()
+            .find(|argument| argument.get_id() == "permission_mode")
+            .unwrap();
+        let mut parsed: Vec<_> = argument
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        let mut accepted: Vec<_> = Provider::ALL
+            .into_iter()
+            .flat_map(|provider| {
+                provider
+                    .permission_modes()
+                    .iter()
+                    .chain(provider.permission_mode_aliases())
+            })
+            .map(|mode| (*mode).to_owned())
+            .collect();
+        parsed.sort_unstable();
+        accepted.sort_unstable();
+        accepted.dedup();
+        assert_eq!(parsed, accepted);
+        let help = argument.get_help().unwrap().to_string();
+        for provider in Provider::ALL {
+            let named = format!(
+                "{}: {}",
+                provider.label(),
+                provider.permission_mode_choices()
+            );
+            assert!(
+                help.contains(&format!("{named}.")) || help.ends_with(&named),
+                "{help} lacks {named}"
+            );
+        }
+    }
 
     #[test]
     fn mailbox_requests_wait_for_store_replies_beyond_the_ordinary_socket_timeout() {
