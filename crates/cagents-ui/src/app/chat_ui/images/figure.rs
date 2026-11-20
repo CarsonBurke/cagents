@@ -437,6 +437,7 @@ impl Figures {
                 Some(clipboard::Resolved {
                     item: None,
                     handle: handle.clone(),
+                    source: None,
                     path: Some(path.to_string_lossy().into_owned()),
                     url: None,
                 })
