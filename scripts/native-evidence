@@ -593,6 +593,9 @@ prepare_fixture() {
     # Both sides get this tool's synthetic provider: the data must not differ
     # because an older before checkout carries an older fixture.
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$fixture/bin/claude"
+    # Its interactive terminal form, which it runs under node in a terminal pane.
+    install -D -m 755 "$tool_root/tests/fixtures/claude-terminal.js" \
+        "$fixture/libexec/claude-terminal/claude"
     # Refuses everything until home/.config/fixture-forge exists; see docs/fixtures.md.
     install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$fixture/bin/gh"
     # Avatars come only from the seeds the forge copies into the app's cache.
