@@ -133,12 +133,13 @@ pushed range in the retry-budget output differs between Before and After.
 the pull requests, branches and edited directories the table names, with
 their relations.
 
-The same conversation runs in an Antigravity or Muse chat: start the session
-with `--acp`, run the script, and send the chat a prompt containing `work`.
-The offline ACP agent then reports each step as Antigravity does, as a shell
-command with its output or an edit with its diff, and the daemon reads them
-from cagents' own record of the chat rather than from a transcript file.
-`host::work::items::tests` checks that reading.
+An Antigravity or Muse chat can replay the same turn. Start the session with
+`--acp`, run the script, then send the chat a prompt that contains the word
+`work`. The offline ACP agent reports each step the way Antigravity does: a
+shell command with its output, or an edit with its diff. The daemon reads
+the chat's work from cagents' own record of the chat, not from a transcript
+file. `host::work::items::tests` and `chat::runtime::store::unread::tests`
+check that reading.
 
 Mentioned pull requests are listed only once **Show mentioned pull requests**
 is on in Settings; it is off by default.
@@ -1177,7 +1178,7 @@ The first of these words a prompt contains chooses what it does:
 | Word | The agent |
 | --- | --- |
 | `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
-| `work` | replays the [conversation work](#conversation-work) turn as its own messages, shell commands and diffs |
+| `work` | replays the [conversation work](#conversation-work) turn: its messages, shell commands with their output, and edits with their diffs |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
@@ -1199,7 +1200,7 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
-| `FAKE_ACP_WORK=PATH` | the Claude Code transcript lines a `work` prompt replays; installed agents default to the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
+| `FAKE_ACP_WORK=PATH` | the Claude Code transcript a `work` prompt replays. The installed `agy` and `muse-upstream` read the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
 
 `native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
 fixture as `bin/agy` and `bin/muse-upstream`, through

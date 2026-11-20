@@ -592,8 +592,9 @@ class Agent:
 
     def work(self, session):
         """The Claude Code turn in FAKE_ACP_WORK, as an ACP agent reports
-        the same work: its text as messages, its `Bash` calls as shell
-        commands with their output, and its `Edit` calls as diffs."""
+        the same work: its text as messages, `Bash` calls as shell commands
+        with their output, `Edit`, `MultiEdit` and `Write` calls as diffs,
+        `Read` calls as reads, and any other tool by its name."""
         try:
             with open(WORK or "") as saved:
                 lines = [json.loads(line) for line in saved if line.strip()]
@@ -604,44 +605,26 @@ class Agent:
         for line in lines:
             if line.get("type") not in ("assistant", "user"):
                 continue
-            for block in line["message"].get("content") or []:
+            content = (line.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
                 kind = block.get("type")
                 if kind == "text" and line["type"] == "assistant":
-                    self.say(session, block["text"])
+                    self.say(session, block.get("text", ""))
                 elif kind == "tool_use":
                     call = "call-" + uuid.uuid4().hex[:8]
-                    calls[block["id"]] = (call, block["name"], block["input"])
-                    if block["name"] == "Edit":
-                        path = block["input"]["file_path"]
-                        session.update({"sessionUpdate": "tool_call", "toolCallId": call,
-                                        "title": "Edit " + os.path.basename(path),
-                                        "kind": "edit", "status": "in_progress",
-                                        "locations": [{"path": path}]})
-                    else:
-                        session.update({"sessionUpdate": "tool_call", "toolCallId": call,
-                                        "title": block["input"].get("description") or "Run",
-                                        "kind": "execute", "status": "in_progress",
-                                        "rawInput": {"command": block["input"]["command"],
-                                                     "cwd": session.cwd}})
+                    calls[block.get("id")] = (call, block.get("name", ""), block.get("input") or {})
+                    session.update(work_call(call, block.get("name", ""),
+                                             block.get("input") or {}, session.cwd))
                 elif kind == "tool_result" and block.get("tool_use_id") in calls:
                     call, name, arguments = calls.pop(block["tool_use_id"])
-                    if name == "Edit":
-                        content = [{"type": "diff", "path": arguments["file_path"],
-                                    "oldText": arguments["old_string"],
-                                    "newText": arguments["new_string"]}]
-                        session.update({"sessionUpdate": "tool_call_update", "toolCallId": call,
-                                        "status": "completed", "content": content})
-                        continue
                     output = block.get("content")
                     if isinstance(output, list):
-                        output = "\n".join(part.get("text", "") for part in output)
-                    failed = bool(block.get("is_error"))
-                    session.update({"sessionUpdate": "tool_call_update", "toolCallId": call,
-                                    "status": "failed" if failed else "completed",
-                                    "rawOutput": {"exitCode": 1 if failed else 0},
-                                    "content": [{"type": "content",
-                                                 "content": {"type": "text",
-                                                             "text": output or ""}}]})
+                        output = "\n".join(part.get("text", "") for part in output
+                                           if isinstance(part, dict))
+                    session.update(work_result(call, name, arguments, output or "",
+                                               bool(block.get("is_error"))))
         return "end_turn"
 
     def permission(self, session):
@@ -706,6 +689,48 @@ class Agent:
         with open(os.path.join(STATE, "index.json.tmp"), "w") as saved:
             json.dump(index, saved)
         os.replace(os.path.join(STATE, "index.json.tmp"), os.path.join(STATE, "index.json"))
+
+
+def work_diffs(name, arguments):
+    """The diffs a Claude Code edit made, as ACP diff content."""
+    path = arguments.get("file_path", "")
+    if name == "Write":
+        return [{"type": "diff", "path": path, "oldText": None,
+                 "newText": arguments.get("content", "")}]
+    edits = arguments.get("edits") if name == "MultiEdit" else [arguments]
+    return [{"type": "diff", "path": path, "oldText": edit.get("old_string", ""),
+             "newText": edit.get("new_string", "")} for edit in edits or []]
+
+
+def work_call(call, name, arguments, cwd):
+    """The ACP `tool_call` for a Claude Code tool call."""
+    update = {"sessionUpdate": "tool_call", "toolCallId": call, "status": "in_progress"}
+    path = arguments.get("file_path")
+    if name in ("Edit", "MultiEdit", "Write"):
+        update.update(title=f"Edit {os.path.basename(path or '')}", kind="edit",
+                      locations=[{"path": path}] if path else [])
+    elif name == "Bash":
+        update.update(title=arguments.get("description") or "Run", kind="execute",
+                      rawInput={"command": arguments.get("command", ""), "cwd": cwd})
+    elif name == "Read":
+        update.update(title=f"Read {os.path.basename(path or '')}", kind="read",
+                      locations=[{"path": path}] if path else [], rawInput=arguments)
+    else:
+        update.update(title=name or "Tool", kind="other", rawInput=arguments)
+    return update
+
+
+def work_result(call, name, arguments, output, failed):
+    """The ACP `tool_call_update` that finishes a Claude Code tool call."""
+    update = {"sessionUpdate": "tool_call_update", "toolCallId": call,
+              "status": "failed" if failed else "completed"}
+    if name in ("Edit", "MultiEdit", "Write") and not failed:
+        update["content"] = work_diffs(name, arguments)
+    else:
+        update["content"] = [{"type": "content", "content": {"type": "text", "text": output}}]
+        if name == "Bash":
+            update["rawOutput"] = {"exitCode": 1 if failed else 0}
+    return update
 
 
 def command_line(arguments):
