@@ -466,6 +466,8 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     turns[at].pauses.extend(thinking.and_then(Thinking::pause));
                 }
                 thinking = None;
+                // The agent is waiting on the reader now, not thinking.
+                thinking_in = None;
             }
             continue;
         }
@@ -1891,6 +1893,22 @@ mod tests {
             assert_eq!(steps(last), [6, 7], "{said}");
             assert_eq!(pauses(last), [(0, 5, 5_000)], "{said}");
         }
+    }
+
+    #[test]
+    fn a_group_waiting_on_a_question_after_its_thinking_stops_counting() {
+        let items = vec![
+            text("prompt", Role::User, Phase::Final, false),
+            timed(command("c1", ToolStatus::Succeeded), 1_000, 2_000),
+            timed(command("c2", ToolStatus::Succeeded), 2_000, 3_000),
+            thought("before", "", 3_000, 6_000),
+        ];
+        let asked = HashSet::from(["before".to_owned()]);
+        let turns = group(&items, &asked, Working);
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].running);
+        assert!(!turns[0].thinking);
+        assert_eq!(pauses(&turns[0]), [(2, 3, 3_000)]);
     }
 
     #[test]
