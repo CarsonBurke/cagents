@@ -176,9 +176,9 @@ evidence cli --json agent spawn --provider claude --model haiku --surface chat \
 # The turn has replayed once its answer is in the transcript.
 evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/projects/*/*.jsonl && exit 0; sleep 1; done; exit 1'
 
-# Open the chat from its sidebar row.
-evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
-evidence drive click 'Locale cache work' >/dev/null
+# Open the chat from its sidebar row, by one word of its title.
+evidence drive wait 'Locale' --timeout 30 >/dev/null
+evidence drive click 'Locale' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
 evidence drive hover 1,1 >/dev/null
 # Open the pane's inspector (Ctrl+Shift+I) unless it already is.
