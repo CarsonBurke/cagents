@@ -60,12 +60,36 @@ impl HostState {
         id: TerminalId,
         after: u64,
     ) {
+        // Replay suppression carries no finite client cursor. Rebase above
+        // both departed views and still-connected views: the replacement
+        // connection can attach before the old socket unregisters.
+        let after = if after == crate::terminal_ipc::SUPPRESS_GRID_REPLAY {
+            let retained = self
+                .terminals
+                .get(&id)
+                .map_or(0, |record| record.presentation_watermark);
+            self.subscriptions
+                .viewports
+                .iter()
+                .filter(|((_, terminal), _)| *terminal == id)
+                .map(|(_, view)| view.revision)
+                .fold(retained, u64::max)
+        } else {
+            after
+        };
         let view = self
             .subscriptions
             .viewports
             .entry((client, id))
             .or_default();
         view.revision = view.revision.max(after.saturating_add(1));
+    }
+    pub(super) fn retain_presentation_watermark(&mut self, client: ClientId, id: TerminalId) {
+        if let Some(view) = self.subscriptions.viewports.get(&(client, id))
+            && let Some(record) = self.terminals.get_mut(&id)
+        {
+            record.presentation_watermark = record.presentation_watermark.max(view.revision);
+        }
     }
     pub(in crate::host) fn scroll_client(
         &mut self,

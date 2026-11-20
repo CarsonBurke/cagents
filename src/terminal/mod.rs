@@ -27,6 +27,8 @@ mod worker;
 pub const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
+#[cfg(all(test, feature = "host"))]
+pub(crate) use hosted::RetainedPresentationFixture;
 pub use hosted::{
     HostedTerminalHandle, HostedTerminalStartError, ReadyDaemon, connect_ready_daemon,
     connect_ready_daemon_for, ensure_daemon_ready, ensure_daemon_ready_for,

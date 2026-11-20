@@ -1,6 +1,378 @@
 use super::*;
 use crate::model::TerminalId;
 
+mod reconnect_output {
+    use super::*;
+    use crate::{
+        model::{LaunchRecipe, TerminalContinuity, TerminalSession},
+        terminal::{
+            CellSnapshot, CellText, RenderSnapshot, RenderStreamFixture,
+            RetainedPresentationFixture, RowSnapshot,
+        },
+    };
+
+    fn publish(stream: &RenderStreamFixture, generation: u64, text: &str) {
+        stream.publish_snapshot(RenderSnapshot {
+            generation,
+            columns: 4,
+            rows: 1,
+            lines: vec![Arc::new(RowSnapshot {
+                cells: text
+                    .chars()
+                    .map(|character| CellSnapshot {
+                        text: CellText::new(&character.to_string()),
+                        ..CellSnapshot::default()
+                    })
+                    .collect(),
+                ..RowSnapshot::default()
+            })]
+            .into(),
+            ..RenderSnapshot::empty()
+        });
+    }
+
+    fn snapshot(host: &SharedHost, id: TerminalId, after_generation: u64) -> TerminalSnapshot {
+        snapshot_for(host, 2, id, after_generation)
+    }
+
+    fn snapshot_for(
+        host: &SharedHost,
+        client: u64,
+        id: TerminalId,
+        after_generation: u64,
+    ) -> TerminalSnapshot {
+        let (response, _, _) = process_request(
+            host,
+            client,
+            ClientRequest::Snapshot {
+                terminal_id: id,
+                after_generation,
+            },
+        )
+        .unwrap();
+        let ServerResponse::Snapshot { snapshot, .. } = response else {
+            panic!("expected the terminal snapshot response");
+        };
+        snapshot.unwrap_or_else(|| {
+            panic!("output after reveal did not advance beyond presentation {after_generation}")
+        })
+    }
+
+    fn terminal() -> (SharedHost, TerminalId, RenderStreamFixture) {
+        let (_, host) = panic_test_host("reconnect-output");
+        let id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "/must-not-execute".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let stream = RenderStreamFixture::new(|_| {});
+        publish(&stream, 1, "init");
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(
+                    1,
+                    TerminalSession {
+                        id,
+                        launch: recipe.clone(),
+                        continuity: TerminalContinuity::RelaunchAvailable {
+                            recipe,
+                            last_exit: None,
+                        },
+                        owned_codex_listener: None,
+                        transcript_path: None,
+                        resume_hint: None,
+                        recovery_origin: None,
+                        predecessor: None,
+                    },
+                    stream.handle.clone(),
+                    true,
+                )
+                .unwrap();
+        }
+        (host, id, stream)
+    }
+
+    fn successive_frames(visibility: TerminalVisibility, reconnect: bool, cursor: u64) {
+        let (host, id, stream) = terminal();
+        process_request(
+            &host,
+            1,
+            ClientRequest::SetVisibility {
+                terminal_id: id,
+                visibility,
+            },
+        )
+        .unwrap();
+        disconnect_client(&host, 1);
+        host.lock().unwrap().register_client(2);
+        let replay = if reconnect {
+            // The real Connect handler delegates its resume handshake here.
+            let (resumed, replay) = prepare_resume(
+                &host,
+                2,
+                vec![ResumeCursor {
+                    terminal_id: id,
+                    generation: cursor,
+                    event_sequence: 0,
+                }],
+            )
+            .unwrap();
+            assert_eq!(resumed.len(), 1);
+            assert_eq!(resumed[0].session.id, id);
+            replay
+        } else {
+            let (response, replay, _) = process_request(
+                &host,
+                2,
+                ClientRequest::Attach {
+                    terminal_id: id,
+                    after_generation: cursor,
+                    after_event_sequence: 0,
+                },
+            )
+            .unwrap();
+            assert!(matches!(response, ServerResponse::Attached { .. }));
+            replay
+        };
+        if cursor == crate::terminal_ipc::SUPPRESS_GRID_REPLAY {
+            assert!(
+                !replay
+                    .iter()
+                    .any(|message| matches!(message, ServerMessage::Snapshot { .. })),
+                "hidden attachment must still suppress grid replay"
+            );
+        }
+        process_request(
+            &host,
+            2,
+            ClientRequest::SetVisibility {
+                terminal_id: id,
+                visibility: TerminalVisibility::Visible,
+            },
+        )
+        .unwrap();
+        // Real worker publication; the fixture supplies grids without a PTY.
+        publish(&stream, 2, "back");
+        let mut screen = snapshot(&host, id, 0).apply(None).unwrap();
+        if cursor != crate::terminal_ipc::SUPPRESS_GRID_REPLAY {
+            assert!(screen.generation > cursor);
+        }
+        for (generation, text) in [(3, "more"), (4, "done")] {
+            publish(&stream, generation, text);
+            let next = snapshot(&host, id, screen.generation);
+            assert!(next.generation > screen.generation);
+            screen = next.apply(Some(&screen)).unwrap();
+            assert_eq!(
+                screen.lines[0]
+                    .cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>(),
+                text
+            );
+        }
+    }
+
+    fn retained_frames(visibility: TerminalVisibility, reconnect: bool, overlapping: bool) {
+        let (host, id, stream) = terminal();
+        let client = RetainedPresentationFixture::new();
+        assert!(client.apply(snapshot_for(&host, 1, id, 0)));
+        // Scrolling changes presentation revisions without advancing the worker.
+        for _ in 0..99 {
+            process_request(
+                &host,
+                1,
+                ClientRequest::Scroll {
+                    terminal_id: id,
+                    scroll: crate::terminal_ipc::TerminalScroll::Bottom,
+                },
+            )
+            .unwrap();
+        }
+        assert!(client.apply(snapshot_for(&host, 1, id, client.cursor())));
+        assert_eq!(stream.handle.generation(), 1);
+        assert_eq!(client.cursor(), 100);
+        client.set_visibility(visibility);
+        process_request(
+            &host,
+            1,
+            ClientRequest::SetVisibility {
+                terminal_id: id,
+                visibility,
+            },
+        )
+        .unwrap();
+        if !overlapping {
+            if reconnect {
+                disconnect_client(&host, 1);
+            } else {
+                process_request(&host, 1, ClientRequest::Detach { terminal_id: id }).unwrap();
+            }
+        }
+        host.lock().unwrap().register_client(2);
+        let replay = if reconnect {
+            prepare_resume(
+                &host,
+                2,
+                vec![ResumeCursor {
+                    terminal_id: id,
+                    generation: client.cursor(),
+                    event_sequence: 0,
+                }],
+            )
+            .unwrap()
+            .1
+        } else {
+            process_request(
+                &host,
+                2,
+                ClientRequest::Attach {
+                    terminal_id: id,
+                    after_generation: client.cursor(),
+                    after_event_sequence: 0,
+                },
+            )
+            .unwrap()
+            .1
+        };
+        assert!(
+            !replay
+                .iter()
+                .any(|message| matches!(message, ServerMessage::Snapshot { .. }))
+        );
+        if overlapping {
+            disconnect_client(&host, 1);
+        }
+        client.set_visibility(TerminalVisibility::Visible);
+        process_request(
+            &host,
+            2,
+            ClientRequest::SetVisibility {
+                terminal_id: id,
+                visibility: TerminalVisibility::Visible,
+            },
+        )
+        .unwrap();
+        let delivery = host.lock().unwrap().clients[&2].clone();
+        let redraw = (0..delivery.queued())
+            .filter_map(|_| match delivery.pop().unwrap().message {
+                ServerMessage::Redraw { generation, .. } => Some(generation),
+                _ => None,
+            })
+            .max()
+            .expect("reveal must announce a redraw");
+        assert!(
+            client.needs_snapshot(redraw),
+            "reveal presentation {redraw} was rejected by the retained client at {}",
+            client.frame().generation
+        );
+        // The client must also accept a full repaint through its publication filter.
+        let reveal = snapshot(&host, id, client.cursor());
+        let revision = reveal.generation;
+        assert!(client.apply(reveal));
+        assert_eq!(client.frame().generation, revision);
+        assert!(revision > 100);
+        process_request(
+            &host,
+            2,
+            ClientRequest::AcknowledgeRedraw {
+                terminal_id: id,
+                generation: revision,
+            },
+        )
+        .unwrap();
+        for (generation, text) in [(2, "more"), (3, "done")] {
+            publish(&stream, generation, text);
+            let next = snapshot(&host, id, client.cursor());
+            assert!(client.needs_snapshot(next.generation));
+            let revision = next.generation;
+            assert!(client.apply(next));
+            let frame = client.frame();
+            assert_eq!(frame.generation, revision);
+            assert_eq!(
+                frame.lines[0]
+                    .cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>(),
+                text
+            );
+            process_request(
+                &host,
+                2,
+                ClientRequest::AcknowledgeRedraw {
+                    terminal_id: id,
+                    generation: revision,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_hidden_reconnect_applies_reveal_and_successive_frames() {
+        retained_frames(TerminalVisibility::Hidden, true, false);
+    }
+
+    #[test]
+    fn retained_hibernated_reconnect_applies_reveal_and_successive_frames() {
+        retained_frames(TerminalVisibility::Hibernated, true, false);
+    }
+
+    #[test]
+    fn retained_hidden_attach_applies_reveal_and_successive_frames() {
+        retained_frames(TerminalVisibility::Hidden, false, false);
+    }
+
+    #[test]
+    fn retained_hibernated_attach_applies_reveal_and_successive_frames() {
+        retained_frames(TerminalVisibility::Hibernated, false, false);
+    }
+
+    #[test]
+    fn retained_hidden_reconnect_before_old_disconnect_applies_frames() {
+        retained_frames(TerminalVisibility::Hidden, true, true);
+    }
+
+    #[test]
+    fn hidden_reconnect_keeps_successive_output_frames_advancing() {
+        successive_frames(
+            TerminalVisibility::Hidden,
+            true,
+            crate::terminal_ipc::SUPPRESS_GRID_REPLAY,
+        );
+    }
+
+    #[test]
+    fn hibernated_reconnect_keeps_successive_output_frames_advancing() {
+        successive_frames(
+            TerminalVisibility::Hibernated,
+            true,
+            crate::terminal_ipc::SUPPRESS_GRID_REPLAY,
+        );
+    }
+
+    #[test]
+    fn hidden_attach_keeps_successive_output_frames_advancing() {
+        successive_frames(
+            TerminalVisibility::Hidden,
+            false,
+            crate::terminal_ipc::SUPPRESS_GRID_REPLAY,
+        );
+    }
+
+    #[test]
+    fn finite_reconnect_cursor_still_advances_past_the_observed_presentation() {
+        successive_frames(TerminalVisibility::Visible, true, 100);
+    }
+}
+
 #[test]
 fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences() {
     for ordinary_exit in [true, false] {
