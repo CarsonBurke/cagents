@@ -1995,6 +1995,17 @@ class StandInHostPython(unittest.TestCase):
         self.assert_interpreter(result, caller=None)
 
 
+def base36(number):
+    """`number` in base 36, as rustc writes a session's start time."""
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    text = ""
+    while True:
+        number, digit = divmod(number, 36)
+        text = digits[digit] + text
+        if not number:
+            return text
+
+
 def incremental_session(slot, crate, *, age, size=64 * 1024, profile="debug"):
     """A crate's incremental directory in the slot's target, as rustc leaves
     it: a finalized session of `size` bytes and its lock file, last written
@@ -2424,6 +2435,59 @@ class Trim(unittest.TestCase):
         self.trim(2 * size - 1)
         self.assertTrue(crate.exists())
         self.assertFalse(older.exists())
+
+    def sessions(self, crate, *started, size=64 * 1024):
+        """Finalized sessions of `crate`, named as rustc names them, each
+        with its lock file: one started at each of `started`, in seconds
+        since the epoch."""
+        directory = self.slot / "src/target/debug/incremental" / crate
+        directory.mkdir(parents=True, exist_ok=True)
+        made = []
+        for when in started:
+            stem = f"s-{base36(int(when * 1e6))}-0abc"
+            session = directory / f"{stem}-1svh"
+            session.mkdir()
+            (session / "query-cache.bin").write_bytes(os.urandom(size))
+            (directory / f"{stem}.lock").touch()
+            os.utime(session, (when, when))
+            made.append(session)
+        return made
+
+    def test_a_session_a_newer_one_supersedes_goes_whatever_the_budget(self):
+        now = time.time()
+        # Rustc started its second compile from the first session and left it.
+        first, second = self.sessions("cagents-1a", now - 600, now - 60)
+        moved = self.trim(2**40)
+        self.assertEqual((first.exists(), second.exists()), (False, True))
+        self.assertGreaterEqual(moved, 64 * 1024)
+        self.assertEqual(sorted(path.name for path in second.parent.iterdir()),
+                         sorted([second.name, second.name.rsplit("-", 1)[0] + ".lock"]))
+
+    def test_the_budget_counts_only_the_sessions_a_compile_starts_from(self):
+        now = time.time()
+        recent = self.sessions("recent-2b", now - 600, now - 60)
+        [earlier] = self.sessions("earlier-3c", now - 3600)
+        size = self.session_size(earlier.parent)
+        # The newer session of each crate fits; counting the superseded one
+        # too would have filled the budget and moved the earlier crate out.
+        self.trim(2 * size)
+        self.assertEqual([path.exists() for path in (*recent, earlier)], [False, True, True])
+
+    def test_a_crate_a_rustc_compiles_keeps_every_session(self):
+        now = time.time()
+        sessions = self.sessions("compiling-4d", now - 600, now - 60)
+        with open(next(sessions[0].parent.glob("s-*.lock")), "rb") as rustc:
+            fcntl.flock(rustc, fcntl.LOCK_EX)
+            self.trim(2**40)
+        self.assertTrue(all(session.exists() for session in sessions))
+
+    def test_a_session_being_written_supersedes_nothing(self):
+        now = time.time()
+        [finalized] = self.sessions("crate-5e", now - 600)
+        working = finalized.parent / f"s-{base36(int(now * 1e6))}-0def-working"
+        working.mkdir()
+        self.trim(2**40)
+        self.assertTrue(finalized.exists() and working.exists())
 
     def test_an_unreadable_record_of_sizes_is_measured_again(self):
         crate = incremental_session(self.slot, "crate-1", age=60)
