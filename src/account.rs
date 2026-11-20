@@ -1105,8 +1105,8 @@ pub struct UsageSnapshot {
     pub ordinary_usage_allowed: Option<bool>,
     /// Unix milliseconds at which these figures were observed.
     pub observed_at: u64,
-    /// Unix milliseconds of the newest model-only live report, used to order
-    /// reports rather than establish account-wide freshness.
+    /// Unix milliseconds of scoped/model figures observed separately from
+    /// the account part. None uses the complete snapshot's `observed_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoped_observed_at: Option<u64>,
     pub source: UsageSource,
@@ -1127,9 +1127,67 @@ pub struct UsageSnapshot {
 pub const RESET_TOLERANCE: u64 = 3_600;
 
 impl UsageSnapshot {
-    /// The stamp that orders readings, never account-wide freshness.
-    pub fn ordering_stamp(&self) -> u64 {
-        self.observed_at.max(self.scoped_observed_at.unwrap_or(0))
+    /// Merge independent Claude account and model evidence. Complete probes
+    /// stamp both parts with `observed_at`; a model-only report supplies its
+    /// own scoped stamp. A credible stamp beats one left beyond CLOCK_SLACK
+    /// by a clock rollback, in either argument order. Ties keep `self`.
+    ///
+    /// Only scoped windows and their stamp belong to the model part. All
+    /// other fields (including reset inventory and eligibility) belong to
+    /// the account part. Other providers retain whole-snapshot replacement,
+    /// including their existing tie and clock-rollback behavior.
+    pub fn merged(&self, incoming: &Self, now: u64, independent_scopes: bool) -> Self {
+        if !independent_scopes {
+            return if self.observed_at > incoming.observed_at
+                && Self::stamp_is_credible(self.observed_at, now)
+            {
+                self.clone()
+            } else {
+                incoming.clone()
+            };
+        }
+        let newer = |existing: u64, incoming: u64| match (
+            Self::stamp_is_credible(existing, now),
+            Self::stamp_is_credible(incoming, now),
+        ) {
+            (true, false) => false,
+            (false, true) => true,
+            _ => incoming > existing,
+        };
+        let account = if newer(self.observed_at, incoming.observed_at) {
+            incoming
+        } else {
+            self
+        };
+        let scoped = if newer(
+            self.scoped_observed_at.unwrap_or(self.observed_at),
+            incoming.scoped_observed_at.unwrap_or(incoming.observed_at),
+        ) {
+            incoming
+        } else {
+            self
+        };
+        let mut merged = account.clone();
+        if !std::ptr::eq(account, scoped) {
+            merged
+                .windows
+                .retain(|window| window.kind != WindowKind::Scoped);
+            merged.windows.extend(
+                scoped
+                    .windows
+                    .iter()
+                    .filter(|window| window.kind == WindowKind::Scoped)
+                    .cloned(),
+            );
+            merged.scoped_observed_at = scoped.scoped_observed_at.or_else(|| {
+                (scoped.observed_at != account.observed_at).then_some(scoped.observed_at)
+            });
+        }
+        merged
+    }
+
+    fn stamp_is_credible(stamp: u64, now: u64) -> bool {
+        stamp <= now.saturating_add(schedule::CLOCK_SLACK)
     }
 
     /// A snapshot that reports a state rather than figures.
@@ -1236,18 +1294,35 @@ impl LiveReport {
     /// stamp from before the clock was set back. A login report carries no
     /// figures and is never taken.
     pub fn apply(self, current: &mut UsageSnapshot, observed_at: u64, now: u64) -> bool {
-        let latest_stamp = match &self {
-            Self::Claude(_) => current.ordering_stamp(),
-            _ => current.observed_at,
-        };
-        if latest_stamp > observed_at && latest_stamp <= now.saturating_add(schedule::CLOCK_SLACK) {
-            return false;
-        }
         match self {
             Self::Claude(update) => {
-                claude::merge_live(current, update, observed_at);
+                let reports_scoped = update
+                    .windows
+                    .iter()
+                    .any(|window| window.kind == WindowKind::Scoped);
+                let scoped_stamp = current.scoped_observed_at.unwrap_or(current.observed_at);
+                let mut incoming = current.clone();
+                claude::merge_live(&mut incoming, update, observed_at);
+                if reports_scoped {
+                    incoming.scoped_observed_at = Some(observed_at);
+                } else if UsageSnapshot::stamp_is_credible(scoped_stamp, now) {
+                    // An account-only report carries no newer model figures.
+                    // Keep their own credible stamp. A stamp from before a
+                    // clock rollback is cleared by merge_live as before.
+                    incoming.scoped_observed_at = Some(scoped_stamp);
+                }
+                let merged = current.merged(&incoming, now, true);
+                if merged == *current {
+                    return false;
+                }
+                *current = merged;
             }
             Self::CodexLimits(update) => {
+                if current.observed_at > observed_at
+                    && current.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
+                {
+                    return false;
+                }
                 if codex::merge_update(current, update, observed_at) {
                     current.observed_at = observed_at;
                 }

@@ -4459,17 +4459,27 @@ impl Cagents {
         let started = state.schedule.started();
         let mut learned = None;
         let mut merged_inventory = false;
+        let merged_snapshot = match &outcome {
+            Outcome::Answered { snapshot, .. } => state
+                .snapshot
+                .as_ref()
+                .map(|current| current.merged(snapshot, now, provider == Provider::Claude)),
+            _ => None,
+        };
+        let retained_account = match (&outcome, &merged_snapshot) {
+            (Outcome::Answered { snapshot, .. }, Some(merged)) => {
+                merged.observed_at != snapshot.observed_at
+            }
+            _ => false,
+        };
         match outcome {
             // A delayed probe or cached answer can predate live figures.
-            // Keep the newer reading unless its future stamp indicates that
-            // the clock was set back, as when accepting live reports.
+            // Accept its independently newer figures while keeping the
+            // current account evidence and identity.
             Outcome::Answered {
                 identity, snapshot, ..
-            } if state.snapshot.as_ref().is_some_and(|current| {
-                snapshot.ordering_stamp() < current.ordering_stamp()
-                    && current.ordering_stamp() <= now.saturating_add(schedule::CLOCK_SLACK)
-            }) =>
-            {
+            } if retained_account => {
+                let mut current = merged_snapshot.expect("retained account has a merged reading");
                 if ticket.force
                     && ticket.usage_generation == state.usage_generation
                     && matches!(provider, Provider::Claude | Provider::Codex)
@@ -4478,15 +4488,15 @@ impl Cagents {
                         snapshot.observed_at >= observed
                             || observed > now.saturating_add(schedule::CLOCK_SLACK)
                     })
-                    && let Some(current) = state.snapshot.as_mut()
                 {
                     // A later partial usage frame cannot erase fresh inventory
                     // returned by this owner/login's forced complete reading.
-                    merge_complete_inventory(current, &snapshot);
+                    merge_complete_inventory(&mut current, &snapshot);
                     state.inventory_observed_at = Some(snapshot.observed_at);
                     state.usage_invalidated = false;
                     merged_inventory = true;
                 }
+                state.snapshot = Some(current);
                 state.schedule.abandon();
             }
             Outcome::Answered {
@@ -4548,7 +4558,7 @@ impl Cagents {
                 {
                     learned = Some((key, identity.clone()));
                 }
-                state.snapshot = Some(*snapshot);
+                state.snapshot = Some(merged_snapshot.unwrap_or(*snapshot));
                 state.failure = None;
             }
             Outcome::Failed(message) => {
@@ -5718,7 +5728,12 @@ impl Cagents {
                     if let Some(snapshot) = snapshot {
                         state.schedule.start(Trigger::Manual, now);
                         state.schedule.succeed(snapshot.observed_at);
-                        state.snapshot = Some(*snapshot);
+                        state.snapshot = Some(state.snapshot.as_ref().map_or_else(
+                            || UsageSnapshot::clone(&snapshot),
+                            |current| {
+                                current.merged(&snapshot, now, login.provider == Provider::Claude)
+                            },
+                        ));
                     }
                     state.identity = identity;
                 }
@@ -10164,6 +10179,90 @@ mod app_tests {
                 true,
             ));
             assert!(app.automatic_account(&current).is_none(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn probe_answers_merge_independently_stamped_account_and_model_evidence() {
+        for source in [UsageSource::Probe, UsageSource::Cache] {
+            for returned_account_rejection in [false, true] {
+                let mut app = context_inspector_test_app(false);
+                let id = app.account_ui.add_managed_fixture(Provider::Claude, 1940);
+                let now = now_ms();
+                let t0 = now - 10_000;
+                let t2 = now - 2_000;
+                let t3 = now - 1_000;
+                let allowed = account::claude::parse_usage(
+                    &serde_json::json!({"rate_limits": {"limits": [
+                        {"kind": "session", "percent": 20},
+                    ]}}),
+                    t0,
+                );
+                let mut rejected = allowed.clone();
+                let rejection = account::claude::parse_rate_limit_event(&serde_json::json!({
+                    "status": "rejected", "rateLimitType": "five_hour",
+                }))
+                .unwrap();
+                assert!(LiveReport::Claude(rejection).apply(&mut rejected, t2, now));
+                let mut model_figures = allowed;
+                let scoped = account::claude::parse_rate_limit_event(&serde_json::json!({
+                    "status": "allowed", "rateLimitType": "seven_day_overage_included",
+                    "utilization": 0.3, "resetsAt": 1_893_456_000_i64,
+                }))
+                .unwrap();
+                assert!(LiveReport::Claude(scoped).apply(&mut model_figures, t3, now));
+                assert_eq!(model_figures.observed_at, t0);
+                assert_eq!(model_figures.scoped_observed_at, Some(t3));
+                let (current, mut returned) = if returned_account_rejection {
+                    (model_figures, rejected)
+                } else {
+                    (rejected, model_figures)
+                };
+                returned.source = source;
+                let (owner, ticket) = {
+                    let state = app.account_ui.account_mut(&id).unwrap();
+                    state.schedule.succeed(current.observed_at);
+                    state.snapshot = Some(current);
+                    let ticket = state.start_probe(Trigger::Focus, t0);
+                    (state.owner, ticket)
+                };
+                let system = Account::system(Provider::Claude);
+                app.account_ui.account_mut(&system.id()).unwrap().snapshot =
+                    Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+
+                drop(app.update(Message::AccountUi(Action::Probed {
+                    owner,
+                    ticket,
+                    id: id.clone(),
+                    outcome: Outcome::Answered {
+                        identity: None,
+                        snapshot: Box::new(returned),
+                        catalog: None,
+                    },
+                })));
+
+                let snapshot = app
+                    .account_ui
+                    .account(&id)
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(snapshot.status, UsageStatus::Limited, "{source:?}");
+                assert_eq!(snapshot.observed_at, t2);
+                assert_eq!(snapshot.scoped_observed_at, Some(t3));
+                assert_eq!(
+                    snapshot
+                        .windows
+                        .iter()
+                        .find(|window| window.kind == WindowKind::Scoped)
+                        .unwrap()
+                        .used,
+                    0.3,
+                );
+                assert!(!account::routing::available(snapshot, now));
+                assert!(app.automatic_account(&system).is_none());
+            }
         }
     }
 

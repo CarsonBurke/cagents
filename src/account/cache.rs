@@ -293,7 +293,7 @@ impl Cache {
     /// newer observation. Background writes may arrive long after observation;
     /// only a stamp ahead of the current clock by more than [`CLOCK_SLACK`]
     /// indicates a clock that has since been set back and is replaced.
-    pub fn store(&self, key: &str, entry: Entry) -> io::Result<()> {
+    pub fn store(&self, key: &str, mut entry: Entry) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
@@ -303,14 +303,19 @@ impl Cache {
         // CLOCK_SLACK, without a clock rollback having occurred.
         let now = crate::chat::now_ms()
             .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
-        if document.entries.get(key).is_some_and(|existing| {
-            supersedes(
-                existing.snapshot.ordering_stamp(),
-                entry.snapshot.ordering_stamp(),
-                now,
-            )
-        }) {
-            return Ok(());
+        if let Some(existing) = document.entries.get(key) {
+            // Account::cache_key prefixes the canonical home with the
+            // provider executable. Non-Claude entries keep the legacy rule.
+            let independent_scopes = key.starts_with("claude:");
+            let merged = existing
+                .snapshot
+                .merged(&entry.snapshot, now, independent_scopes);
+            if merged.observed_at != entry.snapshot.observed_at
+                || (independent_scopes && merged.observed_at == existing.snapshot.observed_at)
+            {
+                entry.identity = existing.identity.clone();
+            }
+            entry.snapshot = merged;
         }
         document.entries.insert(key.to_owned(), entry);
         self.write(&document)
@@ -616,6 +621,59 @@ mod tests {
     }
 
     #[test]
+    fn two_windows_merge_account_rejection_and_newer_model_figures() {
+        use crate::account::{LiveReport, WindowKind, claude, routing};
+
+        let now = crate::chat::now_ms().unwrap() - 10_000;
+        let allowed = claude::parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                {"kind": "weekly_all", "percent": 40, "resets_at": "2030-01-07T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let mut window_a = allowed.clone();
+        let mut window_b = allowed.clone();
+        let rejection = claude::parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(rejection).apply(&mut window_a, now + 2_000, now + 2_000));
+        let scoped = claude::parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.3, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut window_b, now + 3_000, now + 3_000));
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let key = "claude:/two-windows";
+        for snapshot in [allowed, window_a, window_b] {
+            cache
+                .store(
+                    key,
+                    Entry {
+                        identity: None,
+                        snapshot,
+                    },
+                )
+                .unwrap();
+        }
+        let loaded = cache.load(now + 4_000).remove(key).unwrap().snapshot;
+        assert_eq!(loaded.status, UsageStatus::Limited);
+        assert_eq!(loaded.observed_at, now + 2_000);
+        assert_eq!(loaded.scoped_observed_at, Some(now + 3_000));
+        let model = loaded
+            .windows
+            .iter()
+            .find(|window| window.kind == WindowKind::Scoped)
+            .unwrap();
+        assert_eq!(model.used, 0.3);
+        assert_eq!(model.resets_at, Some(1_893_456_000));
+        assert!(!routing::available(&loaded, now + 4_000));
+    }
+
+    #[test]
     fn an_account_rejection_after_clock_rollback_blocks_delayed_allowance() {
         use crate::account::{
             LiveReport,
@@ -670,7 +728,10 @@ mod tests {
         assert_eq!(usage, latest);
         assert_eq!(usage.observed_at, now + 3_000);
         assert_eq!(usage.scoped_observed_at, None);
-        assert_eq!(usage.ordering_stamp(), now + 3_000);
+        assert_eq!(
+            usage.scoped_observed_at.unwrap_or(usage.observed_at),
+            now + 3_000
+        );
         assert_eq!(usage.status, UsageStatus::Limited);
         assert!(!routing::available(&usage, now + 4_000));
     }
@@ -712,7 +773,7 @@ mod tests {
         cache.store(key, older).unwrap();
         let loaded = cache.load(now + 4_000).remove(key).unwrap();
         assert_eq!(loaded.snapshot.scoped_observed_at, Some(now + 3_000));
-        assert_eq!(loaded.snapshot.ordering_stamp(), now + 3_000);
+        assert_eq!(loaded.snapshot.observed_at, now);
         assert_eq!(loaded, newer);
         assert_eq!(
             loaded
