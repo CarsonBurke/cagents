@@ -17,6 +17,7 @@
 //! rows they have. Nothing loads or polls for a section that is collapsed.
 
 use super::*;
+use crate::work::TranscriptCoverage;
 
 /// One of the context inspector's sections, in the order they stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -507,15 +508,7 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if work.lists_work => {
                     self.work_section(card, work)
                 }
-                pull_request_ui::WorkPhase::Listed => {
-                    self.unread_notice(card, "Work isn't tracked for this chat")
-                        .unwrap_or_else(|| {
-                            list_notice(
-                                "No pull requests or worktrees yet",
-                                "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
-                            )
-                        })
-                }
+                pull_request_ui::WorkPhase::Listed => self.empty_notice(card, Section::Work),
                 pull_request_ui::WorkPhase::Reading => list_notice(
                     "Reading this chat's work…",
                     "Its pull requests and worktrees show here.",
@@ -537,31 +530,15 @@ impl Cagents {
         }
     }
 
-    /// Why `card`'s empty Work or Mentioned list may be empty only because
-    /// its conversation was not read, rather than promising rows that will
-    /// never come; `None` when it was read. `untracked` is the section's
-    /// title for a provider whose conversations are never read.
-    fn unread_notice<'a>(
-        &'a self,
-        card: CardId,
-        untracked: &'a str,
-    ) -> Option<Element<'a, Message>> {
-        match self.work_transcript(card)? {
-            crate::work::TranscriptCoverage::Unsupported => Some(list_notice(
-                untracked,
-                "cagents doesn't look through this provider's chats for pull requests or worktrees.",
-            )),
+    /// What `card`'s empty Work or Mentioned list says, for how much of its
+    /// conversation was read.
+    fn empty_notice(&self, card: CardId, section: Section) -> Element<'_, Message> {
+        let text = empty_text(section, self.work_transcript(card));
+        let notice = list_notice(text.title, text.detail);
+        match text.reason {
             // The reason is the system's, so it waits behind a tooltip.
-            crate::work::TranscriptCoverage::Unavailable { reason } => {
-                Some(crate::interaction::tooltip(
-                    list_notice(
-                        "Couldn't read this chat's conversation",
-                        "Its pull requests and worktrees show here once it can be read.",
-                    ),
-                    reason.as_str(),
-                ))
-            }
-            _ => None,
+            Some(reason) => crate::interaction::tooltip(notice, reason),
+            None => notice,
         }
     }
 
@@ -592,14 +569,7 @@ impl Cagents {
                 pull_request_ui::WorkPhase::Listed if count > 0 => {
                     self.mentioned_section(card, work)
                 }
-                pull_request_ui::WorkPhase::Listed => self
-                    .unread_notice(card, "Mentions aren't tracked for this chat")
-                    .unwrap_or_else(|| {
-                        list_notice(
-                            "No mentions",
-                            "Pull requests this chat only names show here.",
-                        )
-                    }),
+                pull_request_ui::WorkPhase::Listed => self.empty_notice(card, Section::Mentioned),
                 pull_request_ui::WorkPhase::Reading => {
                     list_notice("Reading this chat's mentions…", "")
                 }
@@ -958,6 +928,67 @@ impl Cagents {
     }
 }
 
+/// What an empty Work or Mentioned list says in place of rows.
+#[derive(Debug, PartialEq, Eq)]
+struct EmptyText<'a> {
+    title: &'static str,
+    detail: &'static str,
+    /// The system's own words for why the conversation couldn't be read.
+    reason: Option<&'a str>,
+}
+
+/// What `section`, listed with nothing in it, says, given how much of the
+/// conversation it was read from: never that the chat has no work when
+/// only some of it, or none, was read.
+fn empty_text(section: Section, coverage: Option<&TranscriptCoverage>) -> EmptyText<'_> {
+    let work = section == Section::Work;
+    let (title, detail, reason) = match coverage {
+        Some(TranscriptCoverage::Unsupported) => (
+            if work {
+                "Work isn't tracked for this chat"
+            } else {
+                "Mentions aren't tracked for this chat"
+            },
+            "cagents doesn't look through this provider's chats for pull requests or worktrees.",
+            None,
+        ),
+        Some(TranscriptCoverage::Unavailable { reason }) => (
+            "Couldn't read this chat's conversation",
+            "Its pull requests and worktrees show here once it can be read.",
+            Some(reason.as_str()),
+        ),
+        Some(TranscriptCoverage::Partial) => (
+            "Only the latest part of this chat was read",
+            if work {
+                "It's long, and it worked on no pull requests or worktrees in that part."
+            } else {
+                "It's long, and it named no other pull requests in that part."
+            },
+            None,
+        ),
+        Some(TranscriptCoverage::Complete | TranscriptCoverage::Pending) | None => {
+            if work {
+                (
+                    "No pull requests or worktrees yet",
+                    "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
+                    None,
+                )
+            } else {
+                (
+                    "No mentions",
+                    "Pull requests this chat only names show here.",
+                    None,
+                )
+            }
+        }
+    };
+    EmptyText {
+        title,
+        detail,
+        reason,
+    }
+}
+
 /// What a reserved list says in place of rows: a line saying where the list
 /// is, and a caption saying what it will hold. It sits where the first row
 /// would, so the rows replace it without moving.
@@ -994,6 +1025,54 @@ fn list_notice<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_list_says_how_much_of_the_chat_it_was_read_from() {
+        for section in [Section::Work, Section::Mentioned] {
+            let partial = empty_text(section, Some(&TranscriptCoverage::Partial));
+            assert_eq!(partial.title, "Only the latest part of this chat was read");
+            assert!(partial.detail.contains("in that part"), "{partial:?}");
+            // Each says what its own list holds, so neither contradicts the
+            // other's rows.
+            let holds = if section == Section::Work {
+                "worked on"
+            } else {
+                "named no other"
+            };
+            assert!(partial.detail.contains(holds), "{partial:?}");
+            for text in [partial.title, partial.detail] {
+                assert!(
+                    !text.contains("No pull requests"),
+                    "{section:?} claims none: {text}"
+                );
+                assert!(
+                    !text.starts_with("No mentions"),
+                    "{section:?} claims none: {text}"
+                );
+            }
+            let reason = TranscriptCoverage::Unavailable {
+                reason: "Permission denied".into(),
+            };
+            assert_eq!(
+                empty_text(section, Some(&reason)).reason,
+                Some("Permission denied")
+            );
+            assert!(
+                empty_text(section, Some(&TranscriptCoverage::Unsupported))
+                    .title
+                    .contains("tracked")
+            );
+        }
+        // Read through, it may say there is none.
+        assert_eq!(
+            empty_text(Section::Work, Some(&TranscriptCoverage::Complete)).title,
+            "No pull requests or worktrees yet"
+        );
+        assert_eq!(
+            empty_text(Section::Mentioned, Some(&TranscriptCoverage::Complete)).title,
+            "No mentions"
+        );
+    }
 
     #[test]
     fn what_the_conversation_did_leads_and_the_worktree_tree_waits_to_be_asked_for() {

@@ -5098,7 +5098,7 @@ fn tool_rows_carry_readable_names_arguments_results_and_errors() {
 
 /// Codex's own events read as events: an image being generated says
 /// nothing until it has a result, compaction says it is under way until
-/// it is done, a hook's prompt is its text, a pause is a pause, and a
+/// it is done, a hook's prompt is a step holding its text, a pause is a pause, and a
 /// subagent's lifecycle adds no rows of its own.
 #[test]
 fn codex_events_read_as_what_happened() {
@@ -5130,22 +5130,6 @@ fn codex_events_read_as_what_happened() {
     .unwrap();
     assert!(matches!(&viewed[0].content,
         ItemContent::Image { description, .. } if description == "after.png"));
-    let notice = |value: Value, done: bool| match &parse_item(&value, done, "turn").unwrap()[..] {
-        [
-            Item {
-                role: Role::System,
-                content:
-                    ItemContent::Delivery {
-                        kind: chat::DeliveryKind::Notice,
-                        summary,
-                        body,
-                        ..
-                    },
-                ..
-            },
-        ] => format!("{summary}: {body}"),
-        items => panic!("one notice, not {items:?}"),
-    };
     // A pause or a compaction keeps its name; its status says how far it
     // got, so a replayed or abandoned one never reads as still going.
     let compaction = json!({"id":"k","type":"contextCompaction"});
@@ -5164,9 +5148,14 @@ fn codex_events_read_as_what_happened() {
     assert!(parse_item(&empty, true, "turn").unwrap().is_empty());
     let hook = json!({"id":"h","type":"hookPrompt","fragments":[
         {"hookRunId":"run-1","text":"Remember the style guide."},{"hookRunId":"run-2","text":"Run the tests."}]});
+    let added = only_tool(hook, true);
     assert_eq!(
-        notice(hook, true),
-        "Context from a hook: Remember the style guide.\n\nRun the tests."
+        (added.0.as_str(), added.2.as_str(), added.3),
+        (
+            "Hook context",
+            "Remember the style guide.\n\nRun the tests.",
+            ToolStatus::Succeeded
+        )
     );
     let sleep = json!({"id":"s","type":"sleep","durationMs":90_000});
     let running = only_tool(sleep.clone(), false);

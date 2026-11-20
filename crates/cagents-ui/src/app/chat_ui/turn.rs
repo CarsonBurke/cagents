@@ -791,6 +791,8 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     // summary that left it out would hide a step that is still working.
     let mut preparing = 0;
     let mut coordinating = 0;
+    // A skill is read, and context is added, rather than a tool used.
+    let (mut skills, mut context) = (0, 0);
     for placed in steps {
         let item = items.get(placed.index)?.borrow();
         if presented
@@ -816,7 +818,11 @@ fn summarize_steps<'c, T: Borrow<Item>>(
                 chat::CommandAction::List => listed += 1,
             },
             ItemContent::WebSearch { .. } => web += 1,
-            ItemContent::Tool { .. } => used += 1,
+            ItemContent::Tool { name, .. } => match name.as_str() {
+                "Skill" => skills += 1,
+                "Claude context" | "Hook context" => context += 1,
+                _ => used += 1,
+            },
             ItemContent::Image { .. } => viewed += 1,
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {}
         }
@@ -838,8 +844,15 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     if ran > 0 {
         parts.push(format!("ran {}", counted(ran, "command", "commands")));
     }
-    if read > 0 {
-        parts.push(format!("read {}", counted(read, "file", "files")));
+    match (read, skills) {
+        (0, 0) => {}
+        (read, 0) => parts.push(format!("read {}", counted(read, "file", "files"))),
+        (0, skills) => parts.push(format!("read {}", counted(skills, "skill", "skills"))),
+        (read, skills) => parts.push(format!(
+            "read {} and {}",
+            counted(read, "file", "files"),
+            counted(skills, "skill", "skills")
+        )),
     }
     if searched > 0 {
         parts.push(format!("ran {}", counted(searched, "search", "searches")));
@@ -861,6 +874,12 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     }
     if viewed > 0 {
         parts.push(format!("viewed {}", counted(viewed, "image", "images")));
+    }
+    if context > 0 {
+        parts.push(match context {
+            1 => "added context".to_owned(),
+            count => format!("added context {count} times"),
+        });
     }
     if coordinating > 0 {
         parts.push(match coordinating {
@@ -1885,6 +1904,46 @@ mod tests {
         );
     }
 
+    /// A skill is told as read and context as added, not as tools used.
+    #[test]
+    fn a_group_reads_skills_and_adds_context_rather_than_using_tools() {
+        let tool = |id: &str, name: &str| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: name.into(),
+                input: String::new(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        };
+        let summary = |steps: Vec<Item>| {
+            let mut items = vec![text("u1", Role::User, Phase::Final, false)];
+            items.extend(steps);
+            group(&items, &unasked(), plain)[0].summary.clone()
+        };
+        assert_eq!(
+            summary(vec![
+                command("c1", ToolStatus::Succeeded),
+                tool("s1", "Skill"),
+                tool("x1", "Claude context"),
+            ]),
+            "Ran a command, read a skill, added context"
+        );
+        assert_eq!(
+            summary(vec![
+                tool("s1", "Skill"),
+                tool("s2", "Skill"),
+                tool("t1", "mcp__docs__search"),
+                tool("h1", "Hook context"),
+                tool("h2", "Hook context"),
+            ]),
+            "Read 2 skills, used a tool, added context 2 times"
+        );
+    }
+
     /// A group of one step names it on one line, bounded, however long the
     /// script it ran: the strip cuts it to the pane and the open row shows
     /// the whole of it.
@@ -1943,8 +2002,8 @@ mod tests {
         assert_eq!(step_verb(&search("iced")), "Searched the web for");
     }
 
-    /// Tool rows say what each call did, and the group counts them as tools
-    /// it used, so neither repeats "Called" on every line. A group of several
+    /// Tool rows say what each call did, and the group counts them by what
+    /// they did, so neither repeats "Called" on every line. A group of several
     /// files counts them rather than reading "Edited File changes".
     #[test]
     fn tool_rows_say_what_they_did_and_groups_count_them_once() {
@@ -1967,7 +2026,7 @@ mod tests {
             ToolStatus::Succeeded,
         );
         let (verb, label) = step_title(&skill.content, Some(&title));
-        assert_eq!((verb, label.as_ref()), ("Used skill", "writing-copy"));
+        assert_eq!((verb, label.as_ref()), ("Read skill", "writing-copy"));
         // Without its title the row names the tool alone: nothing reads the
         // call's input while drawing it.
         assert_eq!(step_title(&skill.content, None), ("", "Skill".into()));
@@ -1977,7 +2036,7 @@ mod tests {
             tool("t2", "mcp__linear__get_issue", r#"{"id":"ENG-1"}"#),
         ];
         let turns = group(&items, &unasked(), plain);
-        assert_eq!(turns[0].summary, "Used 2 tools");
+        assert_eq!(turns[0].summary, "Read a skill, used a tool");
         let only = vec![
             text("u1", Role::User, Phase::Final, false),
             tool("t1", "mcp__linear__get_issue", "{}"),

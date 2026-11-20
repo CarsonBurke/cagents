@@ -176,9 +176,9 @@ evidence cli --json agent spawn --provider claude --model haiku --surface chat \
 # The turn has replayed once its answer is in the transcript.
 evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/projects/*/*.jsonl && exit 0; sleep 1; done; exit 1'
 
-# Open the chat from its sidebar row.
-evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
-evidence drive click 'Locale cache work' >/dev/null
+# Open the chat from its sidebar row, by one word of its title.
+evidence drive wait 'Locale' --timeout 30 >/dev/null
+evidence drive click 'Locale' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
 evidence drive hover 1,1 >/dev/null
 # Open the pane's inspector (Ctrl+Shift+I) unless it already is.
@@ -1138,6 +1138,21 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+
+`native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
+fixture as `bin/agy` and `bin/muse-upstream`, through
+[`tests/fixtures/fixture-acp.sh`](../tests/fixtures/fixture-acp.sh), with a
+`bin/muse` that runs `muse-upstream` behind root options as a reader's own
+wrapper might. Each keeps its sessions in the fixture's `acp/agy` or
+`acp/muse`. While `acp/agy/signed-out` exists, `agy` answers every new or
+loaded session that sign-in is required, and the app's sign-in, `agy acp
+--login`, removes it:
+
+```sh
+evidence env touch '{fixture}/acp/agy/signed-out'
+```
+
+A plain start installs neither, so Antigravity and Muse are not installed.
 
 The ACP adapter's runtime test in `src/chat/runtime/tests.rs` drives it
 through a real pipe.
