@@ -2029,12 +2029,49 @@ class RemoteRun(unittest.TestCase):
 
     def agent(self, scope, *arguments, env=None, **options):
         """Starts the build host's agent in `scope`, as ssh would there. Its
-        temporary directories go in the scope: by default they would go in
-        the runtime directory, which the host's own builds share."""
+        temporary directories and build shares stay in the scope, apart
+        from the host's own builds."""
         return scope.popen(
             [sys.executable, "-c", offload.REMOTE_AGENT, *arguments],
-            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(scope.name, "cof"))}
+            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(scope.name, "cof")),
+                              "CAGENTS_BUILD_LOCK": str(Path(scope.name, "shares.lock")),
+                              "CAGENTS_BUILD_SLOTS": "4", "CAGENTS_BUILD_SCOPE": "0"}
             | (env or {}), **options)
+
+    def test_the_build_host_uses_the_fixtures_private_gate(self):
+        for override in (False, True):
+            with self.subTest(override=override), FixtureDirectory() as scope:
+                base = Path(scope.name, "slot-0")
+                (base / "src").mkdir(parents=True)
+                lock = Path(scope.name, "override.lock" if override else "shares.lock")
+                slots = 2 if override else 4
+                environment = {"CAGENTS_BUILD_LOCK": str(lock), "CAGENTS_BUILD_SLOTS": str(slots),
+                               "CAGENTS_BUILD_SCOPE": "0"} if override else None
+                probe = textwrap.dedent(f"""\
+                    import json, os, runpy, sys
+                    from pathlib import Path
+                    host = runpy.run_path(str(Path(__file__).with_name("observed-build-host")))
+                    lock = os.path.realpath(host["lock_path"]())
+                    print(json.dumps({{"lock": lock, "environment": os.environ.get("CAGENTS_BUILD_LOCK"),
+                                      "slots": host["share_count"](),
+                                      "scope": os.environ.get("CAGENTS_BUILD_SCOPE")}}), flush=True)
+                    # Refuse a non-fixture path before acquiring any share.
+                    if lock != {str(lock.resolve())!r}:
+                        sys.exit(1)
+                    sys.exit(host["main"](sys.argv[1:]))
+                """)
+                agent = self.agent(scope, "run", str(base), ".", "true", env=environment,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                request = {"environment": {}, "tools": TOOLS | {
+                    "build-host": probe, "observed-build-host": TOOLS["build-host"]}}
+                agent.stdin.write(json.dumps(request).encode() + b"\n")
+                agent.stdin.flush()
+                status = agent.wait(timeout=HANG_GUARD)
+                self.assertEqual(json.loads(agent.stdout.read()), {
+                    "lock": str(lock.resolve()), "environment": str(lock), "slots": slots, "scope": "0"})
+                self.assertEqual(status, 0)
+                self.assertTrue(lock.is_file())
+                self.assertTrue(Path(f"{lock}.queue").is_file())
 
     def test_the_remote_launch_runs_the_build_host_it_was_sent(self):
         with FixtureDirectory() as scope:
