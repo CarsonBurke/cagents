@@ -185,7 +185,7 @@ def memory_allows(reserved, slice_memory):
     build slice's cap leaves them above its anonymous memory (where
     `slice_memory` names its memory.stat), and the host is not stalling on
     memory; not when any of these cannot be read. A slice that does not exist
-    yet holds nothing."""
+    yet, under a user manager that does, holds nothing."""
     proc = os.environ.get("CAGENTS_BUILD_PROC") or "/proc"
     try:
         with open(os.path.join(proc, "meminfo")) as file:
@@ -200,7 +200,11 @@ def memory_allows(reserved, slice_memory):
                 with open(slice_memory) as file:
                     anonymous = next(int(line.split()[1]) for line in file if line.startswith("anon "))
             except FileNotFoundError:
-                pass
+                # Not started yet, under a user manager whose cgroup is where
+                # it is looked for; elsewhere the slice is not known.
+                manager = os.path.dirname(os.path.dirname(os.path.dirname(slice_memory)))
+                if not os.path.isdir(manager):
+                    return False
     except (OSError, StopIteration, ValueError, IndexError):
         return False
     return (available >= reserved + EXTRA_FLOOR and anonymous + reserved <= budget()

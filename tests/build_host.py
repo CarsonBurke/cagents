@@ -566,8 +566,13 @@ class ExtraShares(BuildHostFixture):
                     with unittest.mock.patch.dict(os.environ, {"CAGENTS_BUILD_PROC": str(self.proc)}):
                         self.assertEqual(build_host.memory_allows(8 * self.GiB, str(stat)), allowed)
             with unittest.mock.patch.dict(os.environ, {"CAGENTS_BUILD_PROC": str(self.proc)}):
-                # A slice no build has started holds nothing; an unreadable one bars them.
-                self.assertTrue(build_host.memory_allows(8 * self.GiB, str(self.root / "none")))
+                # A slice no build has started holds nothing; one where no
+                # user manager is, or an unreadable one, bars them.
+                (self.root / "manager/background.slice").mkdir(parents=True)
+                self.assertTrue(build_host.memory_allows(
+                    8 * self.GiB, str(self.root / "manager/background.slice/builds.slice/memory.stat")))
+                self.assertFalse(build_host.memory_allows(
+                    8 * self.GiB, str(self.root / "elsewhere/background.slice/builds.slice/memory.stat")))
                 self.write(stat, "file 1\n")
                 self.assertFalse(build_host.memory_allows(8 * self.GiB, str(stat)))
 
