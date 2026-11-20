@@ -1,6 +1,6 @@
 # Hosted agent execution
 
-`cagents agent` creates daemon-owned Claude, Codex, and Oh My Pi conversations without requiring a window. Each conversation has an agent ID; each accepted prompt has a separate run ID. Opening cagents later adopts the conversation into its specified project/channel without changing the window's current focus.
+`cagents agent` creates daemon-owned Claude, Codex, Antigravity, Muse and Oh My Pi conversations without requiring a window. Each conversation has an agent ID; each accepted prompt has a separate run ID. Opening cagents later adopts the conversation into its specified project/channel without changing the window's current focus.
 
 ```sh
 cagents agent spawn 'Review the current change and report concrete findings'
@@ -14,13 +14,13 @@ Scheduled callers can retain an approved directory descriptor. Provider startup 
 
 `--account PROVIDER/system` selects the system configuration. A managed or linked account uses `PROVIDER/UUID`. Omitting the flag resolves and records the project default at acceptance. Later default changes do not change that accepted request's account. Model, permission, and reasoning-effort options are passed through the existing native launch policy before the first prompt:
 
-| Option | Claude | Codex | Oh My Pi |
-| --- | --- | --- | --- |
-| `--model` | `--model` | New thread `model` | `--model` |
-| `--permission-mode` | `--permission-mode` | New thread `approvalPolicy` (`--ask-for-approval`) | `--approval-mode` |
-| `--reasoning-effort` | `--effort` | New thread `model_reasoning_effort` override (`--config`) | `--thinking` |
+| Option | Claude | Codex | Antigravity | Muse | Oh My Pi |
+| --- | --- | --- | --- | --- | --- |
+| `--model` | `--model` | New thread `model` | Session `model` (`--model`) | Session `model` (`--model`) | `--model` |
+| `--permission-mode` | `--permission-mode` | New thread `approvalPolicy` (`--ask-for-approval`) | Session mode (`--mode`) | Session mode (`--approval-mode`) | `--approval-mode` |
+| `--reasoning-effort` | `--effort` | New thread `model_reasoning_effort` override (`--config`) | Session `thought_level` (`--effort`) | Session reasoning (`--reasoning-effort`) | `--thinking` |
 
-Permission values are provider-specific. A reasoning effort is the provider's own single-word level, such as `low` or `high`, and is passed as given; the automation editor offers only the levels the chosen model advertises. The command does not broaden permissions automatically. If omitted, the selected provider configuration remains authoritative. Follow-up prompts reuse the hosted conversation and preserve its current controls.
+Permission values are provider-specific, as `cagents agent spawn --help` lists them; another provider's value is refused, naming the valid ones. Muse also takes its terminal's `untrusted`, `on-request` and `never`. An automation saved with a value its provider lacks cannot be enabled, and its next run fails and pauses it until its permission mode is edited. An Antigravity model ID with a reasoning suffix, such as `gemini-4-neon-high`, sets both the model and its reasoning. A reasoning effort is the provider's own single-word level, such as `low` or `high`, and is passed as given; the automation editor offers only the levels the chosen model advertises. The command does not broaden permissions automatically. If omitted, the selected provider configuration remains authoritative. Follow-up prompts reuse the hosted conversation and preserve its current controls.
 
 `--name reviewer` gives a new agent a durable handle unique among your open agents. Names start with a lowercase letter and contain up to 64 lowercase letters, digits, hyphens or underscores; whole UUIDs are reserved for IDs. Another owner may use the same name. Closing the agent releases its name for reuse. For example, spawn with `cagents agent spawn --name reviewer 'Review this change'`, then continue with `cagents agent send reviewer 'Check the tests too'`. List and JSON output include the name. The agent's tab combines that name with the first line of its original task, such as `reviewer · Review this change`. It keeps that label before and after the conversation opens; explicit pane and channel names keep their existing precedence. Pressing the parent's spawn row opens the child. Its hover arrow uses the shared compact Open glyph; the context menu copies the prompt or shows launch details.
 

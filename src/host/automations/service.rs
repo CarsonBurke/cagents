@@ -468,6 +468,7 @@ pub(super) fn enabled(
         if !confirmed {
             return Err("Confirm unattended execution before enabling this automation".into());
         }
+        automation.definition.startable()?;
         validate_target(host, &automation.definition, &automation.target_identity)?;
         // Resolving an explicit saved account fails if that account was removed;
         // enabling never silently substitutes a project's new default account.
@@ -573,6 +574,66 @@ mod tests {
                 .contains("does not grant automation management")
         );
         assert!(!error.to_string().contains("private-child-capability"));
+    }
+
+    #[test]
+    fn enabling_refuses_a_saved_permission_mode_its_provider_lacks() {
+        use crate::{model::ProjectKind, workspace_model::ModelEdit};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("registry.sqlite3");
+        let mut registry = crate::host::model::Registry::at(&path).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: root.path().to_owned(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Plan check", "prompt":"Fixture prompt",
+            "agent":{"provider":"Antigravity","account":null,"target":{"repository":root.path(),"directory":root.path(),"channel":null},"surface":"Chat","model":null,"permission_mode":"plan"},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        }))
+        .unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        // Saved before each provider's permission modes were checked.
+        let changed = rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE automations SET record=replace(record, '\"permission_mode\":\"plan\"', '\"permission_mode\":\"never\"') WHERE id=?1",
+                [automation.id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let mut state = HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("automation-mode-fixture"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        });
+        state.install_model(registry);
+        let host = Arc::new(crate::host::state::HostLock::new(state));
+        assert_eq!(
+            enabled(&host, automation.id, automation.revision, true, true).unwrap_err(),
+            "Antigravity has no permission mode \"never\"; choose default, acceptEdits, auto or \
+             plan. Edit the automation's permission mode to run it again."
+        );
+        let saved = agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .automation(automation.id)
+            .unwrap();
+        assert!(!saved.enabled);
     }
 
     #[test]

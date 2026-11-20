@@ -104,6 +104,11 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     resume_picker: true,
     latest_selectors: &["--last"],
     native_chat: true,
+    // What each of its session modes means; "Deny unmatched actions"
+    // (dontAsk) has no terminal option, but a native conversation sets it.
+    permission_modes: &["manual", "auto", "dontAsk", "bypassPermissions"],
+    // Its terminal's `--approval-mode` names, the own names of `acp.modes`.
+    permission_mode_aliases: &["untrusted", "on-request", "never"],
     acp: Some(super::Acp {
         mode_option: "--approval-mode",
         effort_option: "--reasoning-effort",

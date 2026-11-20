@@ -379,7 +379,7 @@ mod tests {
                 surface: Surface::Chat,
                 model: Some("fixture".into()),
                 reasoning_effort: Some("low".into()),
-                permission_mode: Some("readOnly".into()),
+                permission_mode: Some("on-request".into()),
             },
             schedule: Schedule {
                 timezone: "America/Vancouver".into(),
