@@ -668,9 +668,10 @@ On the host that compiles, `scripts/build-host` runs each build. Memory, not
 CPU, is what several builds run out of: a compile of the `cagents` crate peaks
 at 6 to 9 GiB. So the only wait is for memory. Three quarters of the host's
 memory is set aside for builds, in shares of 4 GiB (at least two;
-`CAGENTS_BUILD_SLOTS` overrides the count). A check, or anything in the CLI
-lane, takes one share. A host or UI build takes two, as does an `exec` script
-(`CAGENTS_BUILD_SHARES` overrides either). The lane comes from the selected
+`CAGENTS_BUILD_SLOTS` overrides the count). A UI check or Clippy, or anything
+in the CLI lane, takes one share. A host or UI build takes two, as do a host
+check or Clippy, whose library and test harness together held 5 GiB, and an
+`exec` script (`CAGENTS_BUILD_SHARES` overrides either). The lane comes from the selected
 features, packages (`-p`, `--package`) and executables. A build that finds its
 shares free starts at once. Waiting builds line up behind a queue lock, and
 the one at its head takes shares as they free, so a build that needs two is

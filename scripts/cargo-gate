@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=34
+gate_version=35
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -102,7 +102,8 @@ COMMAND exits: its Cargo commands build in that slot one at a time.
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here through scripts/build-host. A build waits for its share of the memory
 set aside for builds (three quarters of the host's, in shares of 4 GiB; a
-check or CLI build takes one, a host or UI build two), then starts at once.
+UI check or CLI build takes one, a host check or a host or UI build two), then
+starts at once.
 While they are taken, a build that only builds first asks Cargo, in a short
 probe that compiles nothing, whether there is anything to compile; one that
 has nothing to compile then finishes without waiting.
@@ -162,7 +163,8 @@ Environment:
   CAGENTS_BUILD_SLOTS    Memory shares on this host; default three quarters
                          of its memory in shares of 4 GiB, at least 2
   CAGENTS_BUILD_SHARES   Shares this build takes; default by kind, 1 for a
-                         check or the CLI lane, 2 for a host or UI build
+                         UI check or the CLI lane, 2 for a host check or a
+                         host or UI build
   CAGENTS_BUILD_LOCK     First share's lock file; the others add .1, .2, ...
                          (default /var/tmp/cagents-cargo.lock)
   CAGENTS_BUILD_SCOPE=0  Build in place, without the systemd slice and the
@@ -228,7 +230,9 @@ fi
 
 # The memory shares a build takes: two for a build that links the host's
 # Ghostty or the UI's libcosmic, Servo and iced graphs, whose compile peaks at
-# 6 to 9 GiB, and one for a check, which generates no code, or the CLI lane.
+# 6 to 9 GiB, and for a check or Clippy of the host lane, whose library and
+# test harness together held 5 GiB on fw16; one for another check, which
+# generates no code, or the CLI lane.
 # A script of builds, such as the development runner's, may build any lane.
 build_shares() {
     if [ -n "${CAGENTS_BUILD_SHARES:-}" ]; then
@@ -269,6 +273,7 @@ build_shares() {
         esac
     done
     case $1:$lane in
+        check:host|clippy:host) printf 2 ;;
         check:*|clippy:*|doc:*|metadata:*|tree:*|*:cli) printf 1 ;;
         *) printf 2 ;;
     esac
