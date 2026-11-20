@@ -21,12 +21,7 @@ fn removes_resident_chat(
             },
         )
     };
-    if holds(record.session.clone()) {
-        return true;
-    }
-    let mut learned = record.session.clone();
-    learned.launch.session_id = record.handle.session_id();
-    learned.launch.session_id != record.session.launch.session_id && holds(learned)
+    holds(record.session.clone()) || holds(record.current_session())
 }
 
 #[cfg(test)]
