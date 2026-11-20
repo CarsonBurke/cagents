@@ -2614,12 +2614,14 @@ impl Scrollbars {
 /// content many times taller than its viewport.
 const MIN_SCROLLER_LENGTH: f32 = 32.0;
 
-/// The length of a scroller showing `ratio` of its content on a track.
+/// The length of a scroller showing `ratio` (below 1) of its content on a
+/// track.
 ///
 /// It is proportional to the visible share, but no shorter than
-/// [`MIN_SCROLLER_LENGTH`] and no longer than the track.
+/// [`MIN_SCROLLER_LENGTH`], or half a track too short for that, so it always
+/// leaves itself room to travel: a drag is read back across that travel.
 fn scroller_length(track: f32, ratio: f32) -> f32 {
-    (track * ratio).max(MIN_SCROLLER_LENGTH.min(track))
+    (track * ratio).max(MIN_SCROLLER_LENGTH.min(track / 2.0))
 }
 
 /// Where a scroller sits along its track: the share of `scrollable` content
@@ -2912,14 +2914,23 @@ pub fn default(theme: &Theme, status: Status) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_SCROLLER_LENGTH, scroller_length, scroller_offset};
+    use super::{
+        Anchor, Direction, MIN_SCROLLER_LENGTH, Scrollbar, Scrollbars, State,
+        scroller_length, scroller_offset,
+    };
+    use crate::core::{Point, Rectangle, Size};
+
+    fn area(height: f32) -> Rectangle {
+        Rectangle::new(Point::ORIGIN, Size::new(400.0, height))
+    }
 
     #[test]
     fn a_scroller_on_very_tall_content_keeps_a_grabbable_length() {
         assert_eq!(scroller_length(800.0, 0.001), MIN_SCROLLER_LENGTH);
         assert_eq!(scroller_length(800.0, 0.5), 400.0);
-        // A track shorter than the minimum is filled, not overflowed.
-        assert_eq!(scroller_length(20.0, 0.001), 20.0);
+        // A track too short for the minimum keeps half of itself to travel.
+        assert_eq!(scroller_length(20.0, 0.001), 10.0);
+        assert_eq!(scroller_length(20.0, 0.8), 16.0);
     }
 
     #[test]
@@ -2931,17 +2942,80 @@ mod tests {
 
         assert_eq!(scroller_offset(0.0, scrollable, travel), 0.0);
         assert_eq!(scroller_offset(scrollable, scrollable, travel), travel);
-        assert_eq!(scroller_offset(scrollable / 2.0, scrollable, travel), travel / 2.0);
+        assert_eq!(
+            scroller_offset(scrollable / 2.0, scrollable, travel),
+            travel / 2.0
+        );
     }
 
     #[test]
     fn a_proportional_scroller_sits_where_upstream_put_it() {
-        let (track, content, viewport, translation) = (600.0, 1_800.0, 600.0, 450.0);
+        let (track, content, viewport, translation) =
+            (600.0, 1_800.0, 600.0, 450.0);
         let ratio = viewport / content;
         let length = scroller_length(track, ratio);
         let upstream = translation * ratio * track / viewport;
 
-        let offset = scroller_offset(translation, content - viewport, track - length);
+        let offset =
+            scroller_offset(translation, content - viewport, track - length);
         assert!((offset - upstream).abs() < 1e-3, "{offset} != {upstream}");
+    }
+
+    /// Grabbing a scroller where it is drawn leaves the content where it
+    /// was, and an empty or full track puts it at that end, on tracks long
+    /// and short, either way up.
+    #[test]
+    fn a_grabbed_scroller_reads_back_the_position_it_shows() {
+        for (viewport, content) in
+            [(900.0, 900_000.0), (900.0, 1_800.0), (20.0, 100.0), (8.0, 9.0)]
+        {
+            for anchor in [Anchor::Start, Anchor::End] {
+                let direction =
+                    Direction::Vertical(Scrollbar::new().anchor(anchor));
+                let (bounds, content_bounds) = (area(viewport), area(content));
+                let case = format!("{viewport}/{content} {anchor:?}");
+
+                for share in [0.0, 0.4, 1.0] {
+                    let mut state = State::default();
+                    state.scroll_y_to(share, bounds, content_bounds);
+                    let shown =
+                        state.translation(direction, bounds, content_bounds).y;
+                    let bars = Scrollbars::new(
+                        &state,
+                        direction,
+                        bounds,
+                        content_bounds,
+                    );
+                    let bar = bars.y.expect("a vertical scrollbar");
+                    let scroller = bar.scroller.expect("a scroller").bounds;
+                    assert!(scroller.height < bar.bounds.height, "{case}");
+
+                    let at = scroller.center();
+                    let grabbed = bars.grab_y_scroller(at).expect("grabbed");
+                    let read = bar.scroll_percentage_y(grabbed, at);
+                    assert!(read.is_finite(), "{case}: {read}");
+                    state.scroll_y_to(read, bounds, content_bounds);
+                    let kept =
+                        state.translation(direction, bounds, content_bounds).y;
+                    assert!(
+                        (kept - shown).abs() <= 1.0,
+                        "{case} at {share}: grabbing moved {shown} to {kept}"
+                    );
+
+                    let top = (scroller.y - bar.bounds.y).abs() < 1e-3;
+                    let bottom = (scroller.y + scroller.height
+                        - bar.bounds.y
+                        - bar.bounds.height)
+                        .abs()
+                        < 1e-3;
+                    if shown == 0.0 {
+                        assert!(top, "{case} at {share}: {scroller:?}");
+                    }
+                    if shown == content - viewport {
+                        assert!(bottom, "{case} at {share}: {scroller:?}");
+                    }
+                }
+            }
+        }
     }
 }
