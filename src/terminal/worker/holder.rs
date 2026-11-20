@@ -635,13 +635,22 @@ fn spawn_original(
 
 impl OriginalChild {
     fn retain(self, pidfd: Option<File>, reason: &str) {
+        self.retain_with_recovery(pidfd, reason, false);
+    }
+
+    fn retain_with_recovery(self, pidfd: Option<File>, reason: &str, recoverable: bool) {
         let Self { child, reservation } = self;
         reservation.quarantine();
         let Some(pidfd) = pidfd else {
             reservation.preserve_suspended(child, None, reason);
             return;
         };
-        if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
+        let retained = if recoverable {
+            reservation.retain_recoverable(child, pidfd)
+        } else {
+            reservation.retain(child, pidfd)
+        };
+        if let Err((error, child, pidfd, reservation)) = retained {
             // retain returns every original operand intact on validation,
             // wakeup or service failure. No second reaper or PID lookup.
             reservation.preserve_suspended(child, Some(pidfd), &format!("{reason}: {error}"));
@@ -698,6 +707,7 @@ pub(super) struct Holder {
     /// The holder's typed answers, relayed by the original control watch.
     acknowledged: Option<Receiver<Result<Acknowledgement, String>>>,
     detached: bool,
+    recoverable_shutdown: bool,
     adoption_pending: bool,
     registered: bool,
     screen_lost: bool,
@@ -750,6 +760,12 @@ impl Holder {
     pub(super) fn leave_for_successor(&mut self) {
         self.detached = true;
         let _ = self.control.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(super) fn leave_after_unconfirmed_shutdown(&mut self) {
+        debug_assert!(self.registered);
+        self.recoverable_shutdown = true;
+        self.leave_for_successor();
     }
 
     pub(super) fn cache_screen(&mut self, screen: &[u8]) -> Result<(), String> {
@@ -807,6 +823,7 @@ impl Holder {
             release: None,
             acknowledged: None,
             detached: false,
+            recoverable_shutdown: false,
             adoption_pending: false,
             registered: false,
             screen_lost: false,
@@ -917,9 +934,10 @@ impl Drop for Holder {
             }
             // Successful exact wait drops its reservation normally.
         } else if let Some(process) = self.process.take() {
-            process.retain(
+            process.retain_with_recovery(
                 self.pidfd.take(),
                 "Detached terminal child custody transfer",
+                self.recoverable_shutdown,
             );
         }
         // Ending a watch does not end original child custody. A detached
@@ -1021,7 +1039,6 @@ impl HeldChild {
 
     /// Escalates only this pinned root after a graceful hangup was ignored.
     /// The pidfd cannot acquire authority over a reused numeric process ID.
-    #[cfg(test)]
     pub(super) fn force_kill(&self) -> io::Result<()> {
         match signal(&self.pidfd, libc::SIGKILL) {
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
@@ -1100,7 +1117,16 @@ pub(super) fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         // SAFETY: one live pollfd for the duration of the call.
-        match unsafe { libc::poll(&mut target, 1, remaining.as_millis() as libc::c_int) } {
+        match unsafe {
+            libc::poll(
+                &mut target,
+                1,
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as libc::c_int,
+            )
+        } {
             -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
             -1 => return Err(io::Error::last_os_error()),
             ready => return Ok(ready > 0),

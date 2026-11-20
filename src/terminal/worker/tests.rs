@@ -13,7 +13,7 @@ use tempfile::tempdir;
 
 use super::*;
 
-fn isolated_retirement_worker_case() -> bool {
+pub(super) fn isolated_retirement_worker_case() -> bool {
     use std::os::unix::ffi::OsStringExt;
     const CHILD: &str = "CAGENTS_TERMINAL_RETIREMENT_TEST_CHILD";
     let name = thread::current().name().unwrap().to_owned();
