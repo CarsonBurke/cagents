@@ -268,6 +268,8 @@ impl RawTurn {
         // own IDs without a parent link. Only a unique preceding candidate
         // can account for that work. Keep all wrappers as candidates, even
         // after an output: a yielded cell can still finish a child later.
+        // A yielded cell whose later child completes after the wrapper's
+        // output is a known limitation: that child is not attributed here.
         let mut candidates = self.calls.iter_mut().filter(|call| {
             call.matches(recorded, item) && (call.call_id.is_none() || call.opaque_exec)
         });
@@ -284,7 +286,10 @@ impl RawTurn {
         kept.extend(
             std::mem::take(&mut self.calls)
                 .into_iter()
-                .filter(|call| !call.represented)
+                // A child can finish while its opaque wrapper is still
+                // running more work. Only the wrapper's own output lets
+                // its attributed children replace it.
+                .filter(|call| !call.represented || (call.opaque_exec && !call.finished))
                 .map(|call| (call.at, call.item)),
         );
     }
@@ -596,10 +601,11 @@ mod tests {
             ),
             json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"text":"secret plan"}]}}),
             completed(json!({"type":"Reasoning","id":"r1","summary_text":["secret plan"]})),
-            json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"text(await tools.exec_command({cmd:`cargo test`}))"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper-checks","name":"exec","input":"text(await tools.exec_command({cmd:`cargo test`}))"}}),
             completed(
                 json!({"type":"CommandExecution","id":"c1","command":["/usr/bin/bash","-lc","cargo test login"],"cwd":"file:///repo","status":"completed","exit_code":1,"aggregated_output":"1 failed"}),
             ),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-checks","output":"1 failed"}}),
             completed(
                 json!({"type":"FileChange","id":"f1","changes":{"/repo/src/auth.rs":{"type":"update","unified_diff":"-a\n+b"}},"status":"completed"}),
             ),
@@ -620,8 +626,8 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "line-4", "msg_r", "line-7", "c1", "f1", "msg_c", "amsg_1", "line-18", "line-19",
-                "line-20", "line-21"
+                "line-4", "msg_r", "line-7", "c1", "f1", "msg_c", "amsg_1", "line-19", "line-20",
+                "line-21", "line-22"
             ]
         );
         let text = |index: usize| match &items[index].content {
@@ -700,7 +706,7 @@ mod tests {
             completed(
                 json!({"type":"UserMessage","id":"u1","content":[{"type":"Text","text":"Run the new checks"}]}),
             ),
-            raw("exec"),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper-checks","name":"exec","input":"run both checks"}}),
             raw("update_plan"),
             completed(
                 json!({"type":"CommandExecution","id":"c1","command":"cargo test","status":"completed","exit_code":0}),
@@ -708,6 +714,7 @@ mod tests {
             completed(
                 json!({"type":"CommandExecution","id":"c2","command":"cargo clippy","status":"completed","exit_code":0}),
             ),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"wrapper-checks","output":"checks passed"}}),
             raw("exec"),
             raw("spawn_agent"),
             message("assistant", "New checks pass."),
@@ -815,6 +822,53 @@ mod tests {
             let items = parse(lines(&[raw("second"), completed(item)]).as_bytes());
             assert_eq!(items.len(), 2, "{name}: different IDs cannot supersede");
         }
+    }
+
+    #[test]
+    fn code_mode_wrapper_stays_visible_until_its_output_arrives() {
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper","name":"exec","input":"run check, then migration"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-a","command":"cargo test","status":"completed"}),
+            ),
+        ]);
+        assert_eq!(tool_summary(&rollout), ["tool exec", "command cargo test"]);
+    }
+
+    #[test]
+    fn code_mode_wrapper_with_output_is_replaced_by_its_completed_children() {
+        for output_type in ["function_call_output", "custom_tool_call_output"] {
+            let rollout = lines(&[
+                json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"wrapper","name":"exec","input":"run both checks"}}),
+                completed(
+                    json!({"type":"CommandExecution","id":"exec-a","command":"cargo test","status":"completed"}),
+                ),
+                completed(
+                    json!({"type":"CommandExecution","id":"exec-b","command":"cargo clippy","status":"completed"}),
+                ),
+                json!({"type":"response_item","payload":{"type":output_type,"call_id":"wrapper","output":"checks passed"}}),
+            ]);
+            assert_eq!(
+                tool_summary(&rollout),
+                ["command cargo test", "command cargo clippy"],
+                "{output_type}",
+            );
+        }
+    }
+
+    #[test]
+    fn two_idless_calls_of_one_kind_keep_both_beside_a_completed_item() {
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"first\"}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"second\"}"}}),
+            completed(
+                json!({"type":"CommandExecution","id":"exec-a","command":"first","status":"completed"}),
+            ),
+        ]);
+        assert_eq!(
+            tool_summary(&rollout),
+            ["tool exec_command", "tool exec_command", "command first"]
+        );
     }
 
     #[test]
