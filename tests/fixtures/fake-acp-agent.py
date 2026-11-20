@@ -16,6 +16,8 @@ The prompt chooses the turn, by the first of these words it contains as a
 word:
 
   tools       a plan, a shell command, a file edit with its diff, then an answer
+  edits       one edit across several files (a two-hunk change, a new file and
+              a deleted one), then a long rewrite of a single file
   permission  an edit that asks for approval first; refusing fails the edit,
               stopping the turn cancels it
   hold        thinks until the turn is stopped (at most 60 seconds)
@@ -370,6 +372,8 @@ class Agent:
             self.say(session, "Compacted the conversation.")
         elif "tools" in words:
             stop = self.tools(session)
+        elif "edits" in words:
+            stop = self.edits(session)
         elif "permission" in words:
             stop = self.permission(session)
         elif "hold" in words:
@@ -451,6 +455,43 @@ class Agent:
         plan[1]["status"] = "completed"
         session.update({"sessionUpdate": "plan", "entries": plan})
         self.say(session, "Listed the files and updated notes.md.")
+        return "end_turn"
+
+    def edits(self, session):
+        """Edits shaped like a real change: several files in one call, then a
+        long one, so a transcript shows multi-file, added, deleted and
+        oversized patches."""
+        def edit(title, diffs):
+            call = "call-" + uuid.uuid4().hex[:8]
+            session.update({"sessionUpdate": "tool_call", "toolCallId": call, "title": title,
+                            "kind": "edit", "status": "in_progress",
+                            "locations": [{"path": diffs[0]["path"], "line": 1}]})
+            session.update({"sessionUpdate": "tool_call_update", "toolCallId": call,
+                            "status": "completed", "content": diffs})
+        here = lambda *parts: os.path.join(session.cwd, *parts)
+        context = "".join(f"    let step_{n} = config.step({n});\n" for n in range(1, 13))
+        before = ("use std::path::Path;\n\npub fn load(path: &Path) -> Config {\n"
+                  "    let text = std::fs::read_to_string(path).unwrap();\n"
+                  + context + "    Config::parse(&text)\n}\n")
+        after = ("use std::path::Path;\n\npub fn load(path: &Path) -> Result<Config, Error> {\n"
+                 "    let text = std::fs::read_to_string(path)?;\n"
+                 + context + "    Config::parse(&text).map_err(Error::Parse)\n}\n")
+        edit("Edit 3 files", [
+            {"type": "diff", "path": here("src", "config.rs"), "oldText": before, "newText": after},
+            {"type": "diff", "path": here("src", "error.rs"), "oldText": None,
+             "newText": "#[derive(Debug)]\npub enum Error {\n    Io(std::io::Error),\n"
+                        "    Parse(String),\n}\n"},
+            {"type": "diff", "path": here("docs", "legacy-config.md"),
+             "oldText": "# Legacy config\n\nThis format is no longer read.\n", "newText": ""},
+        ])
+        old = "".join(f"fn handler_{n}(request: &Request) -> Response {{\n    Response::ok()\n}}\n\n"
+                      for n in range(40))
+        new = "".join(f"fn handler_{n}(request: &Request) -> Response {{\n"
+                      f"    tracing::debug!(id = {n}, \"handled\");\n    Response::ok()\n}}\n\n"
+                      for n in range(40))
+        edit("Edit handlers.rs", [{"type": "diff", "path": here("src", "handlers.rs"),
+                                   "oldText": old, "newText": new}])
+        self.say(session, "Made loading fallible and traced every handler.")
         return "end_turn"
 
     def permission(self, session):
