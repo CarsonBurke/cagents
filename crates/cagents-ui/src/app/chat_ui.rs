@@ -9909,7 +9909,11 @@ impl Cagents {
             {
                 Some(Unhosted::Unstarted)
             }
-            Some(CardRuntime::Chat(runtime)) if runtime.handle().is_none() => {
+            // A pane awaiting admission may wait there until the reader acts,
+            // and the daemon often hosts its conversation meanwhile.
+            Some(CardRuntime::Chat(runtime))
+                if runtime.handle().is_none() && !runtime.awaiting_admission() =>
+            {
                 Some(Unhosted::Starting)
             }
             // A start for a conversation other than the one the runtime is

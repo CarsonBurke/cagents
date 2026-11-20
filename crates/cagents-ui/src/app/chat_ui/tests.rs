@@ -8840,6 +8840,21 @@ fn a_new_chat_reads_its_work_once_the_daemon_hosts_it() {
     assert_eq!(app.work_phase(card), WorkPhase::Listed);
 }
 
+/// A pane awaiting admission can wait there until the reader acts, and the
+/// daemon often hosts its conversation meanwhile, so it is still watched
+/// rather than reading forever.
+#[test]
+fn a_chat_awaiting_admission_still_reads_its_work() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1600.0);
+    let card = live_chat(&mut app, Some("session"));
+    app.open_pane_inspector_now(card);
+    let conversation = chat_runtime(&app, card).session.id;
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().connection = Connection::AwaitingAdmission;
+    assert!(app.inspector_watches(conversation));
+}
+
 #[test]
 fn a_chat_labels_its_links_from_the_projects_and_the_inspector() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
