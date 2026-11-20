@@ -306,7 +306,7 @@ impl<'a> Failure<'a> {
             ),
             FailureKind::NoAllowance => (
                 format!("{name} has no usage allowance on this login"),
-                "Check the login's subscription in Accounts, then send your message again.",
+                "Add a subscription to this login, or sign in with one that has it, then send your message again.",
             ),
             FailureKind::Capacity => (
                 format!("{name} is temporarily at capacity"),

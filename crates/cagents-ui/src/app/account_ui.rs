@@ -1870,6 +1870,15 @@ fn chip_with_window(
 ) -> Chip {
     let Some(snapshot) = &account.snapshot else {
         return match &account.failure {
+            // Whether an ACP agent is signed in is not known, which its
+            // popover offers to settle with Sign in.
+            Some(failure) if !account::reports_usage_limits(account.account.provider) => Chip {
+                text: "Check failed".into(),
+                usage_fraction: None,
+                tone: ChipTone::Stale,
+                essential: false,
+                tooltip: format!("cagents could not check {name}: {failure}"),
+            },
             Some(failure) => Chip {
                 text: "Unavailable".into(),
                 usage_fraction: None,
@@ -1911,7 +1920,14 @@ fn chip_with_window(
                 || (snapshot.status == UsageStatus::Limited && window_of(snapshot).is_none()) =>
         {
             Chip {
-                text: "Limited".into(),
+                // A provider that reports no limits is limited only by a
+                // login with no allowance at all, not one that will reset.
+                text: if account::reports_usage_limits(account.account.provider) {
+                    "Limited"
+                } else {
+                    "No allowance"
+                }
+                .into(),
                 usage_fraction: None,
                 tone: if is_stale(snapshot, now) || account.failure.is_some() {
                     ChipTone::Stale
@@ -8245,6 +8261,25 @@ mod tests {
             AccountUsageDisplay::Left,
         );
         assert_eq!(unlimited.text, "No limits");
+
+        // As Muse's own account shows it: a login with no allowance at all,
+        // not a limit that will reset, and a check that failed before any
+        // answer, which its popover offers Sign in for.
+        let mut muse = AccountState::new(Account::system(Provider::Muse));
+        muse.present = true;
+        let mut limited = snapshot(Vec::new(), NOW);
+        limited.status = UsageStatus::Limited;
+        muse.snapshot = Some(limited);
+        assert_eq!(
+            chip(&muse, "Muse", NOW, AccountUsageDisplay::Left).text,
+            "No allowance"
+        );
+        muse.snapshot = None;
+        muse.failure = Some("Muse did not answer within 30 seconds".into());
+        assert_eq!(
+            chip(&muse, "Muse", NOW, AccountUsageDisplay::Left).text,
+            "Check failed"
+        );
     }
 
     #[test]

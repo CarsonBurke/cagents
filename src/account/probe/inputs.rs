@@ -51,16 +51,19 @@ pub(super) fn fingerprint(
             // Its sign-in, then the catalog its models are read from.
             paths.push(account.home_directory(environment)?.join("auth.json"));
             let catalog = super::muse::data_home(environment)?.join("model-catalog");
+            // Sorted before it is cut short, so a long catalog is read as
+            // the same entries each time.
             let mut entries = std::fs::read_dir(&catalog)
                 .map(|entries| {
                     entries
                         .filter_map(Result::ok)
                         .map(|entry| entry.path())
-                        .take(256)
+                        .take(4096)
                         .collect::<Vec<PathBuf>>()
                 })
                 .unwrap_or_default();
             entries.sort();
+            entries.truncate(256);
             paths.push(catalog);
             paths.extend(entries);
         }

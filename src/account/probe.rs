@@ -336,8 +336,10 @@ fn prepare(
     };
     // An ACP agent writes that home the first time it runs, so one
     // installed without it has never been signed in, which is what the
-    // reader needs to do; there is nothing to start it for.
-    if !set_up {
+    // reader needs to do; there is nothing to start it for. A refresh the
+    // reader asked for, or the check after a sign-in, asks the agent all
+    // the same, in case it signed in without writing there.
+    if !set_up && !force {
         return Prepared::Done(answered(
             None,
             UsageSnapshot::state(
@@ -2889,6 +2891,11 @@ cat >/dev/null
             }
             _ => panic!("an Antigravity that never ran was started"),
         }
+        // The reader asking, or a sign-in's check, asks the agent anyway.
+        assert!(matches!(
+            prepare(&agy, Some(&cache), true, now, path),
+            Prepared::Probe { .. }
+        ));
     }
 
     /// The system Claude login's two records, as the probe reads them: the
