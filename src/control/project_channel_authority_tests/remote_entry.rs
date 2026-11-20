@@ -25,7 +25,7 @@ fn scoped_remote_write_reaches_the_device_without_forwarding_its_capability() {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
             }
             let ssh = private.path().join("bin/ssh");
-            fs::write(&ssh, b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; env; } >> \"$CAGENTS_TEST_PROJECT_CHANNEL_SSH_MARKER\"\nexit 1\n").unwrap();
+            fs::write(&ssh, b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; export -p; } >> \"$CAGENTS_TEST_PROJECT_CHANNEL_SSH_MARKER\"\nexit 1\n").unwrap();
             fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
             let marker = private.path().join("ssh-called");
             let stdout = private.path().join("stdout");
@@ -71,7 +71,11 @@ fn scoped_remote_write_reaches_the_device_without_forwarding_its_capability() {
             };
             let ssh = fs::read_to_string(&marker).expect("a hosted session reaches the device");
             assert!(
-                !ssh.contains(TOKEN) && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
+                // `export -p` is the shell's own, so it lists the environment
+                // even though PATH holds only this fixture's ssh.
+                ssh.contains("XDG_STATE_HOME")
+                    && !ssh.contains(TOKEN)
+                    && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
                 "SSH must never carry the session's capability: {ssh}"
             );
             assert!(fs::metadata(&stdout).unwrap().len() <= 1024 * 1024);

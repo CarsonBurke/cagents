@@ -439,7 +439,7 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
     let ssh = base.join("bin/ssh");
     fs::write(
         &ssh,
-        b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; env; } >> \"$CAGENTS_TEST_TERMINAL_START_SSH\"\nexit 1\n",
+        b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; export -p; } >> \"$CAGENTS_TEST_TERMINAL_START_SSH\"\nexit 1\n",
     )
     .unwrap();
     fs::set_permissions(ssh, fs::Permissions::from_mode(0o700)).unwrap();
@@ -515,7 +515,11 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
         // a connection failure, and SSH never carries its capability.
         let ssh = fs::read_to_string(&marker).expect("a hosted session reaches the device");
         assert!(
-            !ssh.contains(TOKEN) && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
+            // `export -p` is the shell's own, so it lists the environment
+            // even though PATH holds only this fixture's ssh.
+            ssh.contains("XDG_STATE_HOME")
+                && !ssh.contains(TOKEN)
+                && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
             "SSH must never carry the session's capability: {ssh}"
         );
         assert_eq!(errors.len(), 1);

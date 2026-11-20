@@ -359,7 +359,7 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
         }
         let marker = private_root.join("ssh-called");
         let ssh = private_root.join("bin/ssh");
-        fs::write(&ssh, b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; env; } >> \"$CAGENTS_TEST_AUTOMATION_WORK_SSH_MARKER\"\nexit 1\n").unwrap();
+        fs::write(&ssh, b"#!/bin/sh\n{ printf '%s\\n' \"$@\"; export -p; } >> \"$CAGENTS_TEST_AUTOMATION_WORK_SSH_MARKER\"\nexit 1\n").unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
         let stdout = private_root.join("stdout");
         let stderr = private_root.join("stderr");
@@ -466,7 +466,11 @@ fn public_automation_and_work_keep_captured_scope_before_routing_and_readiness()
         if role.starts_with("remote-") {
             let ssh = fs::read_to_string(&marker).expect("a hosted session reaches the device");
             assert!(
-                !ssh.contains(TOKEN) && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
+                // `export -p` is the shell's own, so it lists the environment
+                // even though PATH holds only this fixture's ssh.
+                ssh.contains("XDG_STATE_HOME")
+                    && !ssh.contains(TOKEN)
+                    && !ssh.contains(crate::agent_execution::AUTHORITY_ENV),
                 "SSH must never carry the session's capability: {ssh}"
             );
         } else {
