@@ -12345,7 +12345,7 @@ impl Cagents {
                         && !self.pane_content_inputs_blocked(id),
                     move |payload| Message::TerminalDropped { card: id, payload },
                 );
-                let terminal = crate::ui_controls::popover(
+                let terminal = crate::ui_controls::context_menu_popover(
                     terminal,
                     self.terminal_menu(id),
                     widget::popover::Position::Point(

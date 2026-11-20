@@ -464,6 +464,36 @@ mod tests {
         }
     }
 
+    /// Every row of the context menu spans the menu, so its hover highlight
+    /// is the whole row's, as in the native context menus, rather than a
+    /// pill around its label.
+    #[test]
+    fn context_menu_rows_span_the_menu() {
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let card = CardId::new();
+        app.terminal_context = Some(Context {
+            card,
+            selection: None,
+            link: Some(Url::parse("https://example.com/a/long/enough/path").unwrap()),
+            point: iced::Point::ORIGIN,
+        });
+        let mut menu = app.terminal_menu(card).expect("an open context menu");
+        let mut tree = Tree::new(&menu);
+        let node = menu.as_widget_mut().layout(
+            &mut tree,
+            &super::super::tests::headless_renderer(),
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1200.0, 800.0)),
+        );
+        let width = node.bounds().width;
+        assert!(width >= 240.0, "as wide as a native menu, not {width}");
+        let rows = node.children();
+        assert_eq!(rows.len(), 7);
+        for row in rows {
+            assert_eq!(row.bounds().width, width, "a row narrower than its menu");
+        }
+    }
+
     #[test]
     fn paste_confirmation_dismisses_after_its_runtime_has_retired() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -918,49 +948,38 @@ impl Cagents {
             .terminal_context
             .as_ref()
             .filter(|context| context.card == card)?;
-        let command = |label, action| {
-            widget::button::text(label)
-                .width(Length::Fill)
-                .on_press(Message::TerminalFind(action))
-                .into()
-        };
-        let mut items = Vec::new();
-        let mut copy = widget::button::text("Copy").width(Length::Fill);
-        if let Some(selection) = context.selection {
-            copy = copy.on_press(Message::TerminalFind(Action::CopySelection(
-                card, selection,
-            )));
-        }
-        items.push(copy.into());
-        items.push(command("Paste", Action::PasteClipboard(card)));
-        items.push(command("Select all", Action::SelectAll(card)));
-        items.push(command("Clear scrollback", Action::Clear(card)));
-        items.push(command("Find…", Action::Open(card)));
+        let find = |action| Some(Message::TerminalFind(action));
+        let mut entries = vec![
+            (
+                "Copy",
+                context
+                    .selection
+                    .and_then(|selection| find(Action::CopySelection(card, selection))),
+            ),
+            ("Paste", find(Action::PasteClipboard(card))),
+            ("Select all", find(Action::SelectAll(card))),
+            ("Clear scrollback", find(Action::Clear(card))),
+            ("Find…", find(Action::Open(card))),
+        ];
         if let Some(link) = &context.link {
-            items.push(
-                widget::button::text(if link.scheme() == "file" {
+            entries.push((
+                if link.scheme() == "file" {
                     "Open file · Ctrl+click"
                 } else {
                     "Open link · Ctrl+click"
-                })
-                .width(Length::Fill)
-                .on_press(Message::OpenLink(
+                },
+                Some(Message::OpenLink(
                     card,
                     link.clone(),
                     settings::LinkOpenGesture::ControlClick,
-                ))
-                .into(),
-            );
-            items.push(command(
+                )),
+            ));
+            entries.push((
                 "Copy link",
-                Action::Copy(card, link.as_str().to_owned()),
+                find(Action::Copy(card, link.as_str().to_owned())),
             ));
         }
-        Some(
-            widget::column::with_children(items)
-                .width(Length::Fixed(200.0))
-                .into(),
-        )
+        Some(crate::ui_controls::context_menu_rows(entries))
     }
 
     pub(super) fn terminal_paste_dialog(&self) -> Option<Element<'_, Message>> {

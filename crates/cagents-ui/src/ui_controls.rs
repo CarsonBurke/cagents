@@ -52,7 +52,8 @@ pub use list_row::{ListRow, list_row, row_label};
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
 pub use popover::{
-    SCROLLING_FRAME, popover, popover_item, popover_scroll, scrolling_popover, scrolling_width,
+    SCROLLING_FRAME, context_menu_popover, context_menu_rows, popover, popover_item,
+    popover_scroll, scrolling_popover, scrolling_width,
 };
 pub use pull_request_state::{
     ChecksSummary, WorktreePullRequestState, check_state_glyph, check_state_label,

@@ -25,6 +25,7 @@ pub fn popover<'a, Message: Clone + 'static>(
         position,
         on_close,
         iced::Padding::new(space::XS),
+        design::elevated(),
     )
 }
 
@@ -51,6 +52,7 @@ pub fn scrolling_popover<'a, Message: Clone + 'static>(
             left: SCROLLING_FRAME,
             right: SCROLLING_FRAME,
         },
+        design::elevated(),
     )
 }
 
@@ -107,6 +109,7 @@ fn framed<'a, Message: Clone + 'static>(
     position: widget::popover::Position,
     on_close: Message,
     padding: iced::Padding,
+    class: cosmic::theme::Container<'static>,
 ) -> Element<'a, Message> {
     let mut popup = widget::popover(anchor)
         .position(position)
@@ -116,9 +119,7 @@ fn framed<'a, Message: Clone + 'static>(
         // reports a mouse interaction. Include the frame's padding and inert
         // content, which otherwise report None and expose controls beneath.
         popup = popup.popup(crate::interaction::opaque(
-            widget::container(content)
-                .padding(padding)
-                .class(design::elevated()),
+            widget::container(content).padding(padding).class(class),
         ));
     }
     popup.into()
@@ -154,6 +155,117 @@ pub fn popover_item<'a, Message: Clone + 'a>(
     .padding([space::XS + space::XXS, space::S])
     .width(Length::Fill)
     .on_press(on_press)
+}
+
+/// A context menu the application opens itself, for a surface that decides
+/// when a right click is its own, such as a terminal whose program may take
+/// the mouse. It looks as COSMIC draws the native context menus elsewhere:
+/// their panel, and [`context_menu_rows`] for its content.
+pub fn context_menu_popover<'a, Message: Clone + 'static>(
+    anchor: impl Into<Element<'a, Message>>,
+    content: Option<Element<'a, Message>>,
+    position: widget::popover::Position,
+    on_close: Message,
+) -> Element<'a, Message> {
+    framed(
+        anchor,
+        content,
+        position,
+        on_close,
+        iced::Padding::ZERO,
+        cosmic::theme::Container::custom(|theme| {
+            use cosmic::widget::menu::StyleSheet;
+            let menu = theme.appearance(&Default::default(), true);
+            widget::container::Style {
+                background: Some(iced::Background::Color(menu.background)),
+                border: iced::Border {
+                    color: menu.border_color,
+                    width: menu.border_width,
+                    radius: menu.menu_border_radius.into(),
+                },
+                ..Default::default()
+            }
+        }),
+    )
+}
+
+/// The rows of a [`context_menu_popover`], one per label, each pressing its
+/// message or dimmed without one, as wide as a native menu of these labels.
+///
+/// Each row is COSMIC's own menu button, so it takes the native rows'
+/// height, padding, text colour and empty icon column. Its highlight fills
+/// the row and rounds only where the row meets the panel's corners, as the
+/// native menu's does.
+pub fn context_menu_rows<'a, Message: Clone + 'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<Message>)>,
+) -> Element<'a, Message> {
+    let rows: Vec<_> = rows.into_iter().collect();
+    let width = rows
+        .iter()
+        .map(|(label, _)| native_menu_width(label))
+        .fold(NATIVE_MENU_MIN_WIDTH, f32::max);
+    let last = rows.len().saturating_sub(1);
+    widget::column::with_children(
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, (label, message))| {
+                widget::menu::menu_button(vec![
+                    iced::widget::Space::new()
+                        .width(NATIVE_MENU_ICON_WIDTH)
+                        .into(),
+                    iced::widget::Space::new()
+                        .width(cosmic::theme::spacing().space_xxs)
+                        .into(),
+                    widget::text(label)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                ])
+                .name(label)
+                .class(menu_row_class(index == 0, index == last))
+                .on_press_maybe(message)
+                .into()
+            }),
+    )
+    .width(Length::Fixed(width))
+    .into()
+}
+
+/// The native width of a menu row with this label and no shortcut, as COSMIC
+/// measures one in `menu_items`.
+fn native_menu_width(label: &str) -> f32 {
+    (label.chars().count() as f32 * 8.5 + 80.0).clamp(NATIVE_MENU_MIN_WIDTH, 480.0)
+}
+
+const NATIVE_MENU_MIN_WIDTH: f32 = 240.0;
+/// The icon column of a native menu row, kept empty in a row without one.
+const NATIVE_MENU_ICON_WIDTH: f32 = 14.0;
+
+/// COSMIC's menu item style, rounded only at the panel's own corners.
+fn menu_row_class(first: bool, last: bool) -> cosmic::theme::Button {
+    use cosmic::widget::button::Catalog;
+    const CLASS: cosmic::theme::Button = cosmic::theme::Button::MenuItem;
+    let corners = move |mut style: widget::button::Style, theme: &cosmic::Theme| {
+        let [top_left, top_right, bottom_right, bottom_left] = theme.cosmic().radius_s();
+        style.border_radius = iced::border::Radius {
+            top_left: if first { top_left } else { 0.0 },
+            top_right: if first { top_right } else { 0.0 },
+            bottom_right: if last { bottom_right } else { 0.0 },
+            bottom_left: if last { bottom_left } else { 0.0 },
+        };
+        style
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |focused, theme| {
+            corners(theme.active(focused, false, &CLASS), theme)
+        }),
+        disabled: Box::new(move |theme| corners(theme.disabled(&CLASS), theme)),
+        hovered: Box::new(move |focused, theme| {
+            corners(theme.hovered(focused, false, &CLASS), theme)
+        }),
+        pressed: Box::new(move |focused, theme| {
+            corners(theme.pressed(focused, false, &CLASS), theme)
+        }),
+    }
 }
 
 #[cfg(test)]
