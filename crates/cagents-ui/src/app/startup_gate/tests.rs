@@ -1355,8 +1355,9 @@ fn card_with_title(app: &mut Cagents, card: CardId, title: &str) {
     app.card_state_mut(card).unwrap().title = title.to_owned();
 }
 
-/// Opening a failed pane offers a retry, and opening a held one only says what
-/// it waits for, so a report that names both says so of each.
+/// Opening a failed pane says why it failed and what can be done, and opening
+/// a held one only says what it waits for, so a report that names both says
+/// so of each.
 #[test]
 fn a_report_tells_held_panes_from_failed_ones() {
     let (mut app, cards) = waiting(2);
