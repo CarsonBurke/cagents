@@ -25,8 +25,8 @@ pane with an active line and coral caret.
 ## Construction
 
 - Chassis: 108 × 101 px rounded rectangle (`rx = 18`) with an 8 px machined
-  gunmetal 2.5D bottom lip (`#222B3B` → `#4B5870` → `#222B3B`) and satin
-  obsidian face (`#343F54` → `#181E2B`) framed by a subtle top and chamfer rim
+  gunmetal 2.5D bottom lip (`#1A212E` → `#2D384D` → `#1A212E`) and satin
+  obsidian face (`#384358` → `#222A3B`) framed by a subtle top and chamfer rim
   light.
 - Modules: 2.5D tactile keycaps (`rx = 7.5–8`) seated directly on the chassis
   with subtle top rim highlights and grounded bottom edges.
