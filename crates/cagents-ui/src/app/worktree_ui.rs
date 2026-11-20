@@ -905,6 +905,18 @@ impl Cagents {
         selected.map(resolve)
     }
 
+    /// Rebuilds the index of the paths Projects lists, and places each
+    /// inspected conversation's Work rows again when it changed, since
+    /// which rows there are depends on it.
+    fn refresh_worktree_paths(&mut self) {
+        let generation = self.worktree_paths.generation();
+        self.worktree_paths
+            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        if self.worktree_paths.generation() != generation {
+            self.place_inspected_work();
+        }
+    }
+
     /// Refresh which worktree rows hold an open pane after state changes,
     /// never during rendering.
     ///
@@ -918,18 +930,6 @@ impl Cagents {
     /// Structural updates also rebind existing activity and unread ownership.
     /// Root discovery is shared for this pass, and unchanged grid output skips
     /// it entirely.
-    /// Rebuilds the index of the paths Projects lists, and places each
-    /// inspected conversation's Work rows again when it changed, since
-    /// which rows there are depends on it.
-    fn refresh_worktree_paths(&mut self) {
-        let generation = self.worktree_paths.generation();
-        self.worktree_paths
-            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
-        if self.worktree_paths.generation() != generation {
-            self.place_inspected_work();
-        }
-    }
-
     pub(super) fn refresh_sidebar_worktree_panes(&mut self) {
         // A passive Folder load has no worktree row and need not select its
         // scope. Admit its root before deriving ownership, including cached
