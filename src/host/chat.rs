@@ -105,6 +105,18 @@ impl Record {
         session
     }
 
+    /// `source` as its provider has named it since: this conversation's
+    /// current session when `source` is the one it started from. Any other
+    /// source, such as an alias an upgrade left, names an older identity
+    /// and keeps its own.
+    pub(in crate::host) fn names(&self, source: &Session) -> Session {
+        if self.session == *source {
+            self.current_session()
+        } else {
+            source.clone()
+        }
+    }
+
     /// The private recipe is installed only by the execution service after
     /// accepting this actor. A CLI basename or user-supplied argv is no proof.
     pub(super) fn owns_execution_console(&self) -> bool {

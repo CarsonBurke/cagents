@@ -106,6 +106,17 @@ mod tests {
 
         handle.fixture_publish_session("conversation".into());
         assert!(state.validate_view_removal(&close(&named)).is_ok());
+        // Its native cleanup records the name too, so that a pending
+        // cleanup does not refuse this Close. A source an upgrade left
+        // under the same ID names an older identity and keeps its own.
+        let record = &state.chats[&started.id];
+        assert_eq!(
+            record.names(&started).launch.session_id.as_deref(),
+            Some("conversation")
+        );
+        let mut alias = started.clone();
+        alias.launch.recipe.program = "/bin/false".into();
+        assert_eq!(record.names(&alias), alias);
         // A Close the window sent before it learned the name still holds.
         assert!(state.validate_view_removal(&close(&started)).is_ok());
         // Another conversation is not this chat.

@@ -181,7 +181,7 @@ fn close_retained_inner(
         let named = state
             .chats
             .get(&source.id)
-            .map_or_else(|| source.clone(), super::Record::current_session);
+            .map_or_else(|| source.clone(), |record| record.names(source));
         let pending = state.native_closing.get(&source.id).cloned();
         if pending
             .as_ref()
