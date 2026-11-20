@@ -2634,7 +2634,7 @@ impl StateStore {
         Ok(true)
     }
 
-    /// Reclaims terminal transcript files the store can no longer account for.
+    /// Reclaims terminal transcript files nothing can account for any more.
     ///
     /// Transcripts are write-only diagnostics living beside the database, and
     /// nothing ever deleted them: a transcript whose terminal is gone stayed on
@@ -2642,36 +2642,38 @@ impl StateStore {
     /// was never reclaimed either. Measured on a normal installation this had
     /// reached 1.7 GB.
     ///
-    /// The policy, in order:
-    /// 1. a transcript whose terminal id is in neither `terminal_recipes` nor
-    ///    `transcript_metadata` is orphaned and removed;
-    /// 2. a transcript larger than [`TranscriptRetention::max_file_bytes`] is
-    ///    removed — the writer refuses to append to an over-cap file, so its
-    ///    bytes are dead weight;
-    /// 3. if the survivors still exceed
-    ///    [`TranscriptRetention::max_total_bytes`], the oldest go until they
-    ///    fit.
+    /// `listing` must have been taken before `owners` was gathered. A
+    /// transcript is created by its terminal's writer only after the daemon
+    /// has reserved the terminal, and a window records the terminal some time
+    /// after that, so owners read after the listing account for every file in
+    /// it, where owners read first miss a terminal that started in between.
+    /// This store's own terminals are read here, after the listing too.
     ///
-    /// Nothing outside `directory` can be touched: entries come from one
-    /// `read_dir` of it, each candidate is a single path component joined onto
+    /// The policy, for each listed transcript:
+    /// 1. one the daemon holds or is starting
+    ///    ([`TranscriptOwners::resident`]) is never removed: its writer may
+    ///    still append, and it never reopens a file that was unlinked under it;
+    /// 2. one that neither the daemon nor any window database claims is
+    ///    orphaned and removed, but only when every window database was read
+    ///    ([`TranscriptOwners::every_window_read`]);
+    /// 3. one larger than [`TranscriptRetention::max_file_bytes`] is removed;
+    /// 4. if what remains still exceeds
+    ///    [`TranscriptRetention::max_total_bytes`], the oldest go until they
+    ///    fit or only resident ones are left.
+    ///
+    /// Nothing outside the listed directory can be touched: candidates come
+    /// from one `read_dir` of it, each is a single path component joined onto
     /// it, and a symlink — for the directory itself or for any entry — is
     /// refused rather than followed. Files that are not `<terminal-id>.log` are
     /// left alone; this directory is not assumed to be exclusively ours.
-    ///
-    /// `also_live` names terminal ids owned by databases other than this one.
-    /// Every window has its own database but they all share one transcript
-    /// directory, so an id this store does not know is not necessarily
-    /// orphaned; see [`read_live_terminal_ids`] and
-    /// [`TranscriptRetention::remove_orphans`].
     pub fn prune_transcripts(
         &self,
-        directory: &Path,
-        also_live: HashSet<String>,
+        listing: TranscriptListing,
+        mut owners: TranscriptOwners,
         retention: TranscriptRetention,
     ) -> Result<TranscriptPruneReport> {
-        let mut live = also_live;
-        live.extend(self.live_terminal_ids()?);
-        prune_transcript_directory(directory, &live, retention)
+        owners.saved.extend(self.live_terminal_ids()?);
+        Ok(listing.prune(&owners, retention))
     }
 
     /// Every terminal id storage still knows about, from both tables that can
@@ -3470,13 +3472,6 @@ pub struct TranscriptRetention {
     /// for terminals the user still has open, so the budget is generous enough
     /// to hold a hundred capped transcripts and no more.
     pub max_total_bytes: u64,
-    /// Whether an id nobody claims may be deleted.
-    ///
-    /// Set this only when the live id set is known to be complete. Every
-    /// window keeps its own database but they all write into one transcript
-    /// directory, so if one window's database could not be read, an unclaimed
-    /// transcript may still belong to a terminal that window owns.
-    pub remove_orphans: bool,
 }
 
 impl Default for TranscriptRetention {
@@ -3484,9 +3479,23 @@ impl Default for TranscriptRetention {
         Self {
             max_file_bytes: 1 << 20,
             max_total_bytes: 128 << 20,
-            remove_orphans: true,
         }
     }
+}
+
+/// Who still needs a transcript, gathered after its directory was listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptOwners {
+    /// Terminal ids the daemon holds or is starting. Their writers may still
+    /// append, so no rule removes their transcripts.
+    pub resident: HashSet<String>,
+    /// Terminal ids the window databases record.
+    pub saved: HashSet<String>,
+    /// Whether `saved` covers every window database. Every window keeps its
+    /// own database but they all write into one transcript directory, so if
+    /// one could not be read, a transcript nobody else claims may still belong
+    /// to a terminal that window owns, and none is removed as orphaned.
+    pub every_window_read: bool,
 }
 
 /// What one pruning pass did.
@@ -3508,113 +3517,147 @@ impl TranscriptPruneReport {
     }
 }
 
-/// A transcript that survived the per-file rules, and what the total budget
-/// needs to know about it.
-struct RetainedTranscript {
+/// The transcripts one scan of their directory found, before anyone was asked
+/// who owns them; see [`StateStore::prune_transcripts`].
+#[derive(Debug, Default)]
+pub struct TranscriptListing {
+    candidates: Vec<ListedTranscript>,
+    /// Entries refused for being symlinks or otherwise not plain files.
+    refused: usize,
+}
+
+#[derive(Debug)]
+struct ListedTranscript {
+    id: String,
     path: PathBuf,
     bytes: u64,
     modified: SystemTime,
 }
 
-fn prune_transcript_directory(
-    directory: &Path,
-    live: &HashSet<String>,
-    retention: TranscriptRetention,
-) -> Result<TranscriptPruneReport> {
-    let mut report = TranscriptPruneReport::default();
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(invalid_state!(
-                "transcript directory {} is a symbolic link",
-                directory.display()
-            ));
+impl TranscriptListing {
+    /// Lists the `<terminal-id>.log` files in `directory`. A missing directory
+    /// lists nothing: no transcript has been written there yet.
+    pub fn scan(directory: &Path) -> Result<Self> {
+        let mut listing = Self::default();
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_state!(
+                    "transcript directory {} is a symbolic link",
+                    directory.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(invalid_state!(
+                    "transcript path {} is not a directory",
+                    directory.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(listing),
+            Err(error) => return Err(error.into()),
         }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(invalid_state!(
-                "transcript path {} is not a directory",
-                directory.display()
-            ));
-        }
-        Ok(_) => {}
-        // Nothing has ever written a transcript here. Not an error.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
-        Err(error) => return Err(error.into()),
-    }
 
-    let mut retained: Vec<RetainedTranscript> = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(id) = name
-            .to_str()
-            .and_then(|name| name.strip_suffix(TRANSCRIPT_SUFFIX))
-            .filter(|id| !id.is_empty())
-        else {
-            continue;
-        };
-        // `name` is a single component from this directory's own listing, so
-        // joining it cannot escape the directory.
-        let path = directory.join(&name);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "could not inspect transcript");
-                report.refused += 1;
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(TRANSCRIPT_SUFFIX))
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            // `name` is a single component from this directory's own listing,
+            // so joining it cannot escape the directory.
+            let path = directory.join(&name);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "could not inspect transcript");
+                    listing.refused += 1;
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "refusing to prune a transcript entry that is not a plain file"
+                );
+                listing.refused += 1;
                 continue;
             }
+            listing.candidates.push(ListedTranscript {
+                id: id.to_owned(),
+                path,
+                bytes: metadata.len(),
+                modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+            });
+        }
+        Ok(listing)
+    }
+
+    /// Whether the scan found no transcript to judge.
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    fn prune(
+        self,
+        owners: &TranscriptOwners,
+        retention: TranscriptRetention,
+    ) -> TranscriptPruneReport {
+        let mut report = TranscriptPruneReport {
+            refused: self.refused,
+            ..TranscriptPruneReport::default()
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "refusing to prune a transcript entry that is not a plain file"
-            );
-            report.refused += 1;
-            continue;
+        let mut resident_bytes = 0;
+        let mut evictable = Vec::new();
+        for transcript in self.candidates {
+            if owners.resident.contains(&transcript.id) {
+                resident_bytes += transcript.bytes;
+                report.retained += 1;
+                continue;
+            }
+            if owners.every_window_read && !owners.saved.contains(&transcript.id) {
+                if remove_transcript(&transcript.path, "its terminal no longer exists") {
+                    report.removed_orphaned += 1;
+                } else {
+                    report.refused += 1;
+                }
+                continue;
+            }
+            if transcript.bytes > retention.max_file_bytes {
+                if remove_transcript(&transcript.path, "it exceeds the per-transcript cap") {
+                    report.removed_oversized += 1;
+                } else {
+                    report.refused += 1;
+                }
+                continue;
+            }
+            evictable.push(transcript);
         }
 
-        if retention.remove_orphans && !live.contains(id) {
-            if remove_transcript(&path, "its terminal no longer exists") {
-                report.removed_orphaned += 1;
-            } else {
-                report.refused += 1;
+        let mut total = resident_bytes + evictable.iter().map(|entry| entry.bytes).sum::<u64>();
+        if total > retention.max_total_bytes {
+            evictable.sort_by_key(|entry| entry.modified);
+            let mut index = 0;
+            while total > retention.max_total_bytes && index < evictable.len() {
+                let entry = &evictable[index];
+                if remove_transcript(&entry.path, "the transcript directory is over budget") {
+                    total -= entry.bytes;
+                    report.removed_for_budget += 1;
+                } else {
+                    report.refused += 1;
+                }
+                index += 1;
             }
-            continue;
+            evictable.drain(..index);
         }
-        if metadata.len() > retention.max_file_bytes {
-            if remove_transcript(&path, "it exceeds the per-transcript cap") {
-                report.removed_oversized += 1;
-            } else {
-                report.refused += 1;
-            }
-            continue;
-        }
-        retained.push(RetainedTranscript {
-            path,
-            bytes: metadata.len(),
-            modified: metadata.modified().unwrap_or(UNIX_EPOCH),
-        });
+        report.retained += evictable.len();
+        report.retained_bytes = total;
+        report
     }
-
-    let mut total: u64 = retained.iter().map(|entry| entry.bytes).sum();
-    if total > retention.max_total_bytes {
-        retained.sort_by_key(|entry| entry.modified);
-        let mut index = 0;
-        while total > retention.max_total_bytes && index < retained.len() {
-            let entry = &retained[index];
-            if remove_transcript(&entry.path, "the transcript directory is over budget") {
-                total -= entry.bytes;
-                report.removed_for_budget += 1;
-            } else {
-                report.refused += 1;
-            }
-            index += 1;
-        }
-        retained.drain(..index);
-    }
-    report.retained = retained.len();
-    report.retained_bytes = total;
-    Ok(report)
 }
 
 /// Unlinks one transcript, reporting whether it is gone.
@@ -14254,6 +14297,24 @@ mod tests {
         (root, directory)
     }
 
+    fn prune_directory(
+        directory: &Path,
+        owners: TranscriptOwners,
+        retention: TranscriptRetention,
+    ) -> TranscriptPruneReport {
+        TranscriptListing::scan(directory)
+            .unwrap()
+            .prune(&owners, retention)
+    }
+
+    fn saved_by_every_window(ids: impl IntoIterator<Item = String>) -> TranscriptOwners {
+        TranscriptOwners {
+            saved: ids.into_iter().collect(),
+            every_window_read: true,
+            ..TranscriptOwners::default()
+        }
+    }
+
     #[test]
     fn pruning_reclaims_orphans_and_oversized_files_and_never_follows_a_symlink() {
         let (root, directory) = transcript_directory();
@@ -14268,17 +14329,14 @@ mod tests {
         fs::write(&victim, b"unchanged").unwrap();
         symlink(&victim, directory.join(format!("{disguised}.log"))).unwrap();
 
-        let claimed = HashSet::from([live.clone(), oversized.clone()]);
-        let report = prune_transcript_directory(
+        let report = prune_directory(
             &directory,
-            &claimed,
+            saved_by_every_window([live.clone(), oversized.clone()]),
             TranscriptRetention {
                 max_file_bytes: 1024,
                 max_total_bytes: 1 << 20,
-                remove_orphans: true,
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(report.removed_orphaned, 1);
         assert_eq!(report.removed_oversized, 1);
@@ -14308,15 +14366,11 @@ mod tests {
         )
         .unwrap();
 
-        let report = prune_transcript_directory(
+        let report = prune_directory(
             &directory,
-            &HashSet::new(),
-            TranscriptRetention {
-                remove_orphans: false,
-                ..TranscriptRetention::default()
-            },
-        )
-        .unwrap();
+            TranscriptOwners::default(),
+            TranscriptRetention::default(),
+        );
 
         assert_eq!(report.removed_orphaned, 0);
         assert_eq!(report.retained, 1);
@@ -14339,17 +14393,14 @@ mod tests {
                 .unwrap();
         }
 
-        let claimed = HashSet::from([older.clone(), newer.clone()]);
-        let report = prune_transcript_directory(
+        let report = prune_directory(
             &directory,
-            &claimed,
+            saved_by_every_window([older.clone(), newer.clone()]),
             TranscriptRetention {
                 max_file_bytes: 1024,
                 max_total_bytes: 512,
-                remove_orphans: true,
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(report.removed_for_budget, 1);
         assert_eq!(report.retained, 1);
@@ -14379,7 +14430,11 @@ mod tests {
         fs::write(directory.join(format!("{orphan}.log")), b"orphan").unwrap();
 
         let report = store
-            .prune_transcripts(&directory, HashSet::new(), TranscriptRetention::default())
+            .prune_transcripts(
+                TranscriptListing::scan(&directory).unwrap(),
+                saved_by_every_window([]),
+                TranscriptRetention::default(),
+            )
             .unwrap();
 
         assert_eq!(report.removed_orphaned, 1);
@@ -14387,6 +14442,91 @@ mod tests {
         assert!(directory.join(format!("{live}.log")).is_file());
         assert!(!directory.join(format!("{orphan}.log")).exists());
     }
+
+    /// #3388: a window starts a terminal, whose writer creates its transcript,
+    /// and another window prunes before the first has saved the terminal. The
+    /// daemon holds it, so its writer keeps appending to the same file.
+    #[test]
+    fn a_transcript_the_daemon_holds_survives_every_rule_before_any_window_saves_it() {
+        use std::io::Write as _;
+        let (_root, directory) = transcript_directory();
+        let store_directory = tempdir().unwrap();
+        let store =
+            StateStore::open(store_directory.path().join("state.sqlite3"), boot("boot-a")).unwrap();
+        let running = TerminalId::new().to_string();
+        let path = directory.join(format!("{running}.log"));
+        let mut writer = File::create(&path).unwrap();
+        writer.write_all(&[b'x'; 2048]).unwrap();
+
+        let report = store
+            .prune_transcripts(
+                TranscriptListing::scan(&directory).unwrap(),
+                TranscriptOwners {
+                    resident: HashSet::from([running]),
+                    every_window_read: true,
+                    ..TranscriptOwners::default()
+                },
+                TranscriptRetention {
+                    max_file_bytes: 1024,
+                    max_total_bytes: 1024,
+                },
+            )
+            .unwrap();
+        writer.write_all(b" and after").unwrap();
+
+        assert_eq!(report.removed(), 0);
+        assert_eq!(report.retained, 1);
+        assert!(fs::read(&path).unwrap().ends_with(b"x and after"));
+    }
+
+    #[test]
+    fn a_transcript_created_after_the_listing_is_not_judged() {
+        let (_root, directory) = transcript_directory();
+        let listing = TranscriptListing::scan(&directory).unwrap();
+        let started = directory.join(format!("{}.log", TerminalId::new()));
+        fs::write(&started, b"first output").unwrap();
+
+        let report = listing.prune(&saved_by_every_window([]), TranscriptRetention::default());
+
+        assert_eq!(report, TranscriptPruneReport::default());
+        assert!(started.is_file());
+    }
+
+    #[test]
+    fn the_directory_budget_never_evicts_a_resident_transcript() {
+        let (_root, directory) = transcript_directory();
+        let resident = TerminalId::new().to_string();
+        let saved = TerminalId::new().to_string();
+        for (id, age) in [(&resident, 1_000_u64), (&saved, 2_000)] {
+            let path = directory.join(format!("{id}.log"));
+            fs::write(&path, vec![b'y'; 512]).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(age))
+                .unwrap();
+        }
+
+        let report = prune_directory(
+            &directory,
+            TranscriptOwners {
+                resident: HashSet::from([resident.clone()]),
+                ..saved_by_every_window([resident.clone(), saved.clone()])
+            },
+            TranscriptRetention {
+                max_file_bytes: 1024,
+                max_total_bytes: 512,
+            },
+        );
+
+        assert_eq!(report.removed_for_budget, 1);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.retained_bytes, 512);
+        assert!(directory.join(format!("{resident}.log")).is_file());
+        assert!(!directory.join(format!("{saved}.log")).exists());
+    }
+
     #[test]
     fn retained_live_reset_keeps_same_host_snapshot_contract_and_rejects_downgrade() {
         let directory = tempdir().unwrap();

@@ -34,6 +34,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::StartupState
         | R::List
         | R::ListPage { .. }
+        | R::ListResidentTerminals
         | R::WatchTerminals
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel

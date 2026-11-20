@@ -6106,19 +6106,28 @@ impl Cagents {
                 Ok((mut session, restored)) => {
                     let (projects, worktrees) = session.take_catalog();
                     let save_health = SaveHealthState::new(session.database_path().to_owned());
-                    // A single directory scan plus one read-only query per
-                    // other open window, so it belongs on the path that has
-                    // just opened the database rather than in a background task
-                    // that would race the first terminal into the same
-                    // directory. Failure is diagnostic only: transcripts are a
-                    // convenience, and refusing to start because stale ones
-                    // could not be reclaimed would be absurd.
-                    match session.prune_transcripts() {
-                        Ok(_) => {}
-                        Err(error) => tracing::warn!(
+                    // It asks the daemon, so it runs beside startup. A
+                    // terminal this window starts meanwhile is the daemon's
+                    // before its transcript exists. Failure is diagnostic
+                    // only: transcripts are a convenience, and refusing to
+                    // start because stale ones could not be reclaimed would be
+                    // absurd.
+                    let pruner = session.transcript_pruner();
+                    let pruning = std::thread::Builder::new()
+                        .name("cagents-transcript-prune".into())
+                        .spawn(move || {
+                            if let Err(error) = pruner.run() {
+                                tracing::warn!(
+                                    %error,
+                                    "could not reclaim unowned terminal transcripts"
+                                );
+                            }
+                        });
+                    if let Err(error) = pruning {
+                        tracing::warn!(
                             %error,
-                            "could not reclaim unowned terminal transcripts"
-                        ),
+                            "could not start reclaiming unowned terminal transcripts"
+                        );
                     }
                     let warnings = session.restore_warnings().to_vec();
                     (

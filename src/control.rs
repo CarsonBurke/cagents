@@ -1235,6 +1235,16 @@ impl ControlClient {
         }
     }
 
+    /// Every terminal the daemon holds or is starting, read at one instant.
+    /// A terminal is among them from before its transcript writer starts
+    /// until it is closed or retired.
+    pub fn resident_terminals(&mut self) -> Result<Vec<TerminalId>, ControlError> {
+        match self.request_strict(ClientRequest::ListResidentTerminals)? {
+            ServerResponse::ResidentTerminals { terminals } => Ok(terminals),
+            response => Err(unexpected_response("the resident terminals", &response)),
+        }
+    }
+
     /// Subscribes this connection to terminals created by other clients.
     ///
     /// Subscribe before listing: an edge that arrives between the two is
@@ -3030,6 +3040,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",
         ServerResponse::ListedPage { .. } => "listed_page",
+        ServerResponse::ResidentTerminals { .. } => "resident_terminals",
         ServerResponse::Spawned { .. } => "spawned",
         ServerResponse::Attached { .. } => "attached",
         ServerResponse::Detached => "detached",

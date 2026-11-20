@@ -4494,3 +4494,84 @@ fn a_quarantine_change_never_repeats_a_recovery() {
         "an unchanged quarantine publishes nothing"
     );
 }
+
+fn transcript_pruner_fixture() -> (tempfile::TempDir, SessionRuntime, PathBuf) {
+    let root = tempdir().unwrap();
+    let (runtime, _) = SessionRuntime::open(
+        &root.path().join("state.sqlite3"),
+        BootId::new("boot-prune"),
+    )
+    .unwrap();
+    let transcripts = root.path().join("transcripts");
+    std::fs::create_dir(&transcripts).unwrap();
+    (root, runtime, transcripts)
+}
+
+fn transcript(directory: &Path, id: TerminalId) -> PathBuf {
+    let path = directory.join(format!("{id}.log"));
+    std::fs::write(&path, b"output").unwrap();
+    path
+}
+
+#[test]
+fn pruning_keeps_a_transcript_the_daemon_holds_before_any_window_saves_it() {
+    let (_root, runtime, transcripts) = transcript_pruner_fixture();
+    let running = TerminalId::new();
+    let unsaved = transcript(&transcripts, running);
+    let orphan = transcript(&transcripts, TerminalId::new());
+
+    let report = runtime
+        .transcript_pruner()
+        .prune(
+            &transcripts,
+            || Ok(HashSet::from([running.to_string()])),
+            || Ok::<_, std::io::Error>(Vec::new()),
+        )
+        .unwrap();
+
+    assert_eq!(report.removed_orphaned, 1);
+    assert!(unsaved.is_file());
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn pruning_leaves_a_terminal_started_while_the_daemon_is_asked() {
+    let (_root, runtime, transcripts) = transcript_pruner_fixture();
+    let orphan = transcript(&transcripts, TerminalId::new());
+    let mut started = None;
+
+    runtime
+        .transcript_pruner()
+        .prune(
+            &transcripts,
+            || {
+                // Started after the listing, and missing from a census that
+                // was answered before it reached the daemon.
+                started = Some(transcript(&transcripts, TerminalId::new()));
+                Ok(HashSet::new())
+            },
+            || Ok::<_, std::io::Error>(Vec::new()),
+        )
+        .unwrap();
+
+    assert!(!orphan.exists());
+    assert!(started.unwrap().is_file());
+}
+
+#[test]
+fn pruning_removes_nothing_when_the_daemon_cannot_name_its_terminals() {
+    let (_root, runtime, transcripts) = transcript_pruner_fixture();
+    let unclaimed = transcript(&transcripts, TerminalId::new());
+
+    let error = runtime
+        .transcript_pruner()
+        .prune(
+            &transcripts,
+            || Err("no daemon is running".into()),
+            || Ok::<_, std::io::Error>(Vec::new()),
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, SessionError::ResidentTerminalsUnknown(_)));
+    assert!(unclaimed.is_file());
+}

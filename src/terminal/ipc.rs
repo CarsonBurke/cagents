@@ -279,7 +279,12 @@ use crate::{
 /// as terminals. An older client has no encoding for either: an optional value
 /// naming one reaches it as absent, and any other message naming one is
 /// refused or withheld.
-pub const PROTOCOL_VERSION: u16 = 191;
+///
+/// Version 193 appends `ListResidentTerminals` and its `ResidentTerminals`
+/// reply, which name every terminal the daemon holds or is starting so a
+/// window never prunes a transcript whose writer may still append. An older
+/// client never sends it.
+pub const PROTOCOL_VERSION: u16 = 193;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -752,6 +757,10 @@ pub enum ClientRequest {
     ListPage {
         after: Option<TerminalId>,
     },
+    /// Every terminal this daemon holds or is starting, read at one instant.
+    /// Unlike the inventory it includes terminals still being spawned, whose
+    /// transcript writers may already have created their files.
+    ListResidentTerminals,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1214,6 +1223,10 @@ pub enum ServerResponse {
     ListedPage {
         terminals: Vec<TerminalDescriptor>,
         complete: bool,
+    },
+    /// The reply to `ListResidentTerminals`, in identity order.
+    ResidentTerminals {
+        terminals: Vec<TerminalId>,
     },
 }
 
