@@ -60,6 +60,11 @@ impl HostState {
         id: TerminalId,
         after: u64,
     ) {
+        // Hidden attachments use MAX to suppress grid replay, not to report
+        // an observed presentation. Seeding from it would saturate the revision.
+        if after == u64::MAX {
+            return;
+        }
         let view = self
             .subscriptions
             .viewports
