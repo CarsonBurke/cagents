@@ -15,9 +15,11 @@
 # inserts its [Image N] reference at the caret. `paste N` without TEXT
 # continues at the caret, leaving focus where the last paste left it, since
 # a click into wrapped text would move the caret. Each image shows its own
-# number, counted across the session, so the tiles can be told apart. `composer` prints the composer input's centre as
-# X,Y. The images are synthetic gradients made with ImageMagick on the
-# session's host; no model, network or host clipboard is used.
+# number, counted across the session, so the tiles can be told apart.
+# COMPOSER_SCENE_SIZE sets their size in pixels, WIDTHxHEIGHT, 960x600 by
+# default. `composer` prints the composer input's centre as X,Y. The images
+# are synthetic gradients made with ImageMagick on the session's host; no
+# model, network or host clipboard is used.
 set -euo pipefail
 mode=${1:?usage: composer-attachments-scene.sh open|paste N [TEXT]|composer}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -60,6 +62,8 @@ open)
 paste)
     count=${2:?paste needs a count}
     text=${3:-}
+    size=${COMPOSER_SCENE_SIZE:-960x600}
+    [[ $size =~ ^[0-9]+x[0-9]+$ ]] || { echo "COMPOSER_SCENE_SIZE is WIDTHxHEIGHT, not $size" >&2; exit 2; }
     if [ -n "$text" ]; then
         at=$(composer)
         [ -n "$at" ] || { echo 'Could not locate the native chat composer.' >&2; exit 1; }
@@ -69,17 +73,18 @@ paste)
     fi
     for _ in $(seq 1 "$count"); do
         "$ne" nested sh -c '
+            size=$1
             counter=$XDG_RUNTIME_DIR/composer-scene-count
             number=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
             echo "$number" >"$counter"
             hue=$(( (number * 47) % 360 ))
             image=$XDG_RUNTIME_DIR/composer-scene-$number.png
-            magick -size 960x600 "gradient:hsl($hue,70%,35%)-hsl($(( (hue + 60) % 360 )),70%,60%)" \
+            magick -size "$size" "gradient:hsl($hue,70%,35%)-hsl($(( (hue + 60) % 360 )),70%,60%)" \
                 -fill white -pointsize 220 -gravity center -annotate +0+0 "$number" "$image"
             # wl-copy stays behind to serve the clipboard; it must not keep
             # the output of this command open, or the paste never returns.
             wl-copy --type image/png <"$image" >/dev/null 2>&1
-        '
+        ' scene "$size"
         "$ne" drive key ctrl+v >/dev/null
         sleep 1
         "$ne" drive type ' ' >/dev/null
