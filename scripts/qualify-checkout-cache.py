@@ -27,6 +27,7 @@ OLD_TIME = 946684800
 VENDOR_BUILD_HOOKS = (
     "vendor/iced-core", "vendor/iced-runtime", "vendor/iced-winit",
     "vendor/libcosmic", "vendor/libsqlite3-sys", "vendor/iced-wgpu",
+    "vendor/iced-widget",
 )
 VENDOR_SOURCE_HOOKS = (
     "vendor/winit-wayland", "vendor/iced-accessibility", "vendor/accesskit-unix",
@@ -464,6 +465,7 @@ def main():
         "build.rs", "src/modules.rs", "crates/cagents-ui/build.rs", "crates/cagents-ui/src/modules.rs",
         "crates/browser-import/src/lib.rs", "crates/ceditor/src/main.rs",
         "crates/iced-contracts/src/lib.rs",
+        "crates/cosmic-text-contracts/src/lib.rs",
     ):
         assert ANCHOR.strip() in (ROOT / source).read_text(), source
     guard_vendor_hooks()

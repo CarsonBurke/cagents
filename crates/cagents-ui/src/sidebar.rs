@@ -2241,7 +2241,7 @@ pub struct SourceControlModel {
     pub error: Option<String>,
     pub staged_count: usize,
     pub files: Vec<FileRow>,
-    pub ignored_directory_errors: BTreeMap<RepoPath, String>,
+    ignored_directory_errors: BTreeMap<RepoPath, String>,
     groups: Vec<ChangeGroup>,
     /// How many distinct paths the change groups hold, as the Changes tab
     /// states it; `None` for a clean worktree. A path both staged and
@@ -2269,6 +2269,12 @@ pub struct SourceControlModel {
     reloading: bool,
     chrome: SourceControlChrome,
     pub file_search: FileSearch,
+    /// The snapshot these rows were built from, while they still show
+    /// exactly what it builds. A reload that reads an equal snapshot then
+    /// keeps the model instead of rebuilding it; anything that edits
+    /// snapshot-derived state afterwards must drop it, so the next read is
+    /// applied rather than skipped.
+    source_snapshot: Option<Arc<RepositorySnapshot>>,
 }
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
@@ -2402,6 +2408,7 @@ impl SourceControlModel {
             reloading: false,
             chrome,
             file_search: FileSearch::Inactive,
+            source_snapshot: None,
         }
     }
 
@@ -2524,7 +2531,42 @@ impl SourceControlModel {
             key,
             chrome,
             file_search: FileSearch::Inactive,
+            source_snapshot: None,
         }
+    }
+
+    /// Records that this model is exactly what [`Self::ready`] builds from
+    /// `snapshot`, so an identical read can leave it in place.
+    pub fn built_from(mut self, snapshot: Arc<RepositorySnapshot>) -> Self {
+        self.source_snapshot = Some(snapshot);
+        self
+    }
+
+    /// The snapshot these rows still match, if any; see
+    /// [`Self::built_from`].
+    pub fn source_snapshot(&self) -> Option<&Arc<RepositorySnapshot>> {
+        self.source_snapshot.as_ref()
+    }
+
+    /// The expanded ignored folders whose listing failed, with the reason.
+    pub fn ignored_directory_errors(&self) -> &BTreeMap<RepoPath, String> {
+        &self.ignored_directory_errors
+    }
+
+    /// Forgets the failed read of one expanded ignored folder so the next
+    /// reload lists it again. The error came from the snapshot, so the
+    /// model no longer matches it, and that reload must be applied even if
+    /// it fails the same way.
+    pub fn retry_ignored_directory(&mut self, path: &RepoPath) {
+        self.ignored_directory_errors.remove(path);
+        self.source_snapshot = None;
+    }
+
+    /// Forgets every failed ignored-folder read; see
+    /// [`Self::retry_ignored_directory`].
+    pub fn retry_ignored_directories(&mut self) {
+        self.ignored_directory_errors.clear();
+        self.source_snapshot = None;
     }
 
     /// Appends one loaded history page. A short page is the last one.
@@ -2661,7 +2703,7 @@ impl SourceControlModel {
 
     /// What the panel says is happening, beside a spinner: the mutation it is
     /// running, or the reload it is waiting on.
-    fn progress_label(&self) -> Option<&'static str> {
+    pub(crate) fn progress_label(&self) -> Option<&'static str> {
         self.mutation
             .map(MutationKind::progress_label)
             .or_else(|| self.reloading.then_some("Refreshing…"))

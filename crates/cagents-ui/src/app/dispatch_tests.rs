@@ -377,6 +377,7 @@ fn owed_projections_merge_to_what_both_need() {
         camera_only,
         reconcile_row_selection,
         model_update: false,
+        save_view: false,
     };
     let scoped = |card| Projection::ScopedChrome(vec![card]);
     for (first, second, merged) in [

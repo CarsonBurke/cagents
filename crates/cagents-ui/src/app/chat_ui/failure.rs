@@ -268,6 +268,10 @@ pub(super) struct State {
     item_metadata: HashMap<Source, (Arc<chat::Item>, String, Metadata)>,
 }
 
+/// The failure an item reports to the reader as a notice, rather than as a
+/// step of the turn. A failed call is a step: it fails at its own place and
+/// the turn goes on, so only a known provider failure carried by a failed
+/// agent call, such as the account limit its agent hit, becomes a notice.
 fn provider_item_text(provider: Provider, item: &chat::Item) -> Option<&str> {
     match &item.content {
         _ if chat::failure::provider_error_text(provider, item).is_some() => {
@@ -282,7 +286,7 @@ fn provider_item_text(provider: Provider, item: &chat::Item) -> Option<&str> {
             Provider::Claude => matches!(name.as_str(), "Agent" | "Task"),
             Provider::Codex => matches!(name.as_str(), "spawnAgent" | "spawn_agent"),
             Provider::Omp | Provider::Antigravity | Provider::Muse => false,
-        } =>
+        } && Failure::parse(provider, output).is_some() =>
         {
             Some(output)
         }
@@ -2527,6 +2531,80 @@ mod tests {
             ])];
         });
         assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    }
+
+    /// A call that fails is a step of its turn, which goes on: an agent call
+    /// Claude refuses, as it does past its limit of agents running at once,
+    /// is shown failed where it was made, not as the turn failing after the
+    /// answer that followed it.
+    #[test]
+    fn a_failed_agent_call_the_turn_carried_on_from_is_not_a_failed_turn() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let message = "66666666-6666-4666-8666-666666666666";
+            let mut call = text("agent-refused", chat::Role::Assistant, "");
+            call.content = ItemContent::Tool {
+                name: match provider {
+                    Provider::Codex => "spawnAgent",
+                    _ => "Agent",
+                }
+                .into(),
+                input: "Review the change".into(),
+                output: "Concurrent subagent limit reached. You can run 20 subagents at once. \
+                         Do not retry. If the user wants more concurrent subagents, ask them to \
+                         increase CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS."
+                    .into(),
+                status: chat::ToolStatus::Failed,
+            };
+            let (mut runtime, handle) = live_fixture(
+                provider,
+                vec![
+                    text(&part(provider, message, 0), chat::Role::User, "Review it"),
+                    call.clone(),
+                    text(
+                        "answer",
+                        chat::Role::Assistant,
+                        "I reviewed it myself instead.",
+                    ),
+                ],
+            );
+            // The refused call also names an agent that never ran, failed
+            // with the refusal, as the session records it.
+            let ItemContent::Tool { output, .. } = &call.content else {
+                unreachable!()
+            };
+            let detail = output.clone();
+            publish(&mut runtime, &handle, |next| {
+                next.subagents = vec![chat::Subagent {
+                    id: "agent-refused".into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    model: None,
+                    status: chat::ToolStatus::Failed,
+                    waiting: false,
+                    detail,
+                    background: false,
+                    items: Vec::new(),
+                }];
+            });
+            assert!(
+                runtime
+                    .failure_ui
+                    .incidents
+                    .iter()
+                    .all(|incident| incident.child_scope.is_some()),
+                "{provider:?}: {:?}",
+                runtime
+                    .failure_ui
+                    .incidents
+                    .iter()
+                    .map(|incident| &incident.summary)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !diagnostic_item(provider, &call),
+                "{provider:?}: drawn as its step"
+            );
+        }
     }
 
     /// Claude reports one weekly limit three ways when a foreground subagent

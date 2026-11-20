@@ -23,6 +23,7 @@ person.
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
 | An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
+| The offer, after an update, to resume conversations whose work it stopped | [`tests/fixtures/update-resume-scene.sh`](#an-update-that-stopped-work-in-progress), which records an ended update over four offline agents and reopens the window |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -649,6 +650,16 @@ does not sandbox the real executable's network access.
 | --- | --- |
 | A populated saved Claude conversation before starting a provider | [`tests/fixtures/claude-resume-history.py`](#saved-claude-history) |
 | A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
+| A pane Close the registry refuses and keeps the pane through | [`.cagents-fixture-refuse-close`](#a-refused-pane-close) |
+
+### A refused pane close
+
+A debug daemon refuses the next pane Close as it refuses one whose pane
+changed while closing, when its `HOME` lies inside a native-evidence task and
+holds `.cagents-fixture-refuse-close`. The marker is removed, so the Close
+after it goes through. Create it between steps, for example with
+`scripts/native-evidence env sh -c 'touch "$HOME/.cagents-fixture-refuse-close"'`,
+then close a pane to see the window keep it and say so.
 
 ### Close a hosted legacy Codex actor without removing its pane
 
@@ -1128,6 +1139,21 @@ failures:
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
 
+`native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
+fixture as `bin/agy` and `bin/muse-upstream`, through
+[`tests/fixtures/fixture-acp.sh`](../tests/fixtures/fixture-acp.sh), with a
+`bin/muse` that runs `muse-upstream` behind root options as a reader's own
+wrapper might. Each keeps its sessions in the fixture's `acp/agy` or
+`acp/muse`. While `acp/agy/signed-out` exists, `agy` answers every new or
+loaded session that sign-in is required, and the app's sign-in, `agy acp
+--login`, removes it:
+
+```sh
+evidence env touch '{fixture}/acp/agy/signed-out'
+```
+
+A plain start installs neither, so Antigravity and Muse are not installed.
+
 The ACP adapter's runtime test in `src/chat/runtime/tests.rs` drives it
 through a real pipe.
 
@@ -1264,6 +1290,27 @@ details. It does not run providers, inspect a live update inventory, perform an
 update, or exercise cancellation/recovery. The grouped Paused heading belongs
 to the CLI review. The native dialog currently omits saved stopped panes, so
 the fixture's paused terminal does not appear in that dialog.
+
+## An update that stopped work in progress
+
+An ended update job in `home/.config/fixture-update-review.json` can carry
+the census's `in_flight` outcomes, which the window reads at startup to offer
+resuming the conversations whose work didn't survive.
+[`update-resume-scene.sh`](../tests/fixtures/update-resume-scene.sh) builds
+one over real offline conversations. Run it as a steps file: `prepare` in a
+running session opens the fixture project and starts four Claude agents in a
+"Release checks" channel; then `stop` and `save-seed`. `shots`, in each side's
+session, records a completed update in which one conversation was restarted
+without its subagent and background command, one had its turn interrupted,
+one was ended with a queued message, and one kept running. It then restarts
+only the app window, which reads the update as a window opened after one
+does, and captures the offer. Where the offer exists, it resumes one
+conversation, shows the message that conversation received, and dismisses
+the rest. A session's start reopens the seeded conversations under new ids,
+which is why the update is recorded inside the session that shows it. The
+offer is made once per update: what was resumed or dismissed is kept in the
+record every window shares, `update-resume.sqlite3` in the data directory,
+until the next `start` restores the seed.
 
 ## A refused shared-view seed
 

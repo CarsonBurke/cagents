@@ -42,6 +42,7 @@ const THREAD_RAIL_OFFSET: f32 =
 /// reading any text.
 fn kind_glyph(content: &ItemContent) -> Icon {
     match content {
+        _ if chat::is_stopped_notice(content) => Icon::Ended,
         ItemContent::Text { .. } => Icon::Private,
         ItemContent::Command { action, .. } => match action {
             chat::CommandAction::Read => Icon::TextFile,
@@ -467,6 +468,19 @@ impl Runtime {
         settings: markdown::Settings,
         status: Option<ToolStatus>,
     ) -> Element<'static, Message> {
+        // Where the turn was stopped: a marker with nothing to disclose and
+        // no time of its own.
+        if chat::is_stopped_notice(&item.content) {
+            return disclosure::row(
+                chat::STOPPED.to_string(),
+                chat::STOPPED.to_string(),
+                Icon::Ended,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
         let open = self.item_expanded(&item.id);
         let mut rows = vec![self.step_button(item, cached, open, status)];
         if open {

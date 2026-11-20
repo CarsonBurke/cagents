@@ -20,6 +20,8 @@ pub(crate) use codex::archived_rollout as codex_archived_rollout;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use codex::rollout as codex_rollout;
 mod antigravity;
+#[cfg(feature = "host")]
+pub(crate) use antigravity::MODES as ANTIGRAVITY_MODES;
 mod muse;
 mod omp;
 

@@ -205,11 +205,37 @@ fn timeout_milliseconds(deadline: Option<Instant>, now: Instant) -> i32 {
     })
 }
 
+/// A just-written executable may be held open for writing by another thread's
+/// fork until its child execs. Retry with the same bounded policy as
+/// `account::probe::Group::spawn` while that executable is briefly busy.
+fn spawn_unless_busy(spec: &CommandSpec, cancellation: &CancellationToken) -> io::Result<Child> {
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match spec.to_command().spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy
+                    && delay <= Duration::from_millis(160) =>
+            {
+                if cancellation.is_cancelled() {
+                    return Err(error);
+                }
+                thread::sleep(delay);
+                if cancellation.is_cancelled() {
+                    return Err(error);
+                }
+                delay *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(super) fn execute(
     spec: &CommandSpec,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessFailure> {
-    let mut child = spec.to_command().spawn().map_err(|error| {
+    let mut child = spawn_unless_busy(spec, cancellation).map_err(|error| {
         process_failure(spec, ProcessFailureKind::Spawn, &error.to_string(), false)
     })?;
     let identity = child_identity(&child);
@@ -419,16 +445,14 @@ pub(super) fn execute(
             },
             _ => unreachable!(),
         };
-        return Err(ProcessFailure {
+        return Err(started_failure(
+            spec,
             kind,
-            program: spec.program.clone(),
-            exit_code: status.as_ref().and_then(ExitStatus::code),
-            signal: status.as_ref().and_then(exit_signal),
-            stdout: failure_excerpt(stdout_read.output),
-            stderr: failure_excerpt(stderr_read.output),
+            status.as_ref(),
+            stdout_read.output,
+            stderr_read.output,
             message,
-            started: true,
-        });
+        ));
     }
     let status = status.ok_or_else(|| {
         process_failure(
@@ -438,22 +462,20 @@ pub(super) fn execute(
             true,
         )
     })?;
-    // A command that exits closes its stdin before its exit can be observed, so
-    // its failure explains a broken pipe. A clean exit still lost input it never read.
+    // A command may exit without reading all its input; its exit status, not the
+    // broken pipe, says whether it succeeded.
     let stdin_error = stdin_error
-        .filter(|error| error.kind() != io::ErrorKind::BrokenPipe || status.success())
+        .filter(|error| error.kind() != io::ErrorKind::BrokenPipe)
         .map(|error| format!("stdin: {error}"));
     if let Some(message) = stdin_error.or(pipe_error) {
-        return Err(ProcessFailure {
-            kind: ProcessFailureKind::Io,
-            program: spec.program.clone(),
-            exit_code: status.code(),
-            signal: exit_signal(&status),
-            stdout: failure_excerpt(stdout_read.output),
-            stderr: failure_excerpt(stderr_read.output),
+        return Err(started_failure(
+            spec,
+            ProcessFailureKind::Io,
+            Some(&status),
+            stdout_read.output,
+            stderr_read.output,
             message,
-            started: true,
-        });
+        ));
     }
     Ok(ProcessOutput::from_parts(
         status,
@@ -462,10 +484,90 @@ pub(super) fn execute(
     ))
 }
 
+fn started_failure(
+    spec: &CommandSpec,
+    kind: ProcessFailureKind,
+    status: Option<&ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    message: String,
+) -> ProcessFailure {
+    ProcessFailure {
+        kind,
+        program: spec.program.clone(),
+        exit_code: status.and_then(ExitStatus::code),
+        signal: status.and_then(exit_signal),
+        stdout: failure_excerpt(stdout),
+        stderr: failure_excerpt(stderr),
+        message,
+        started: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn hold_executable_open_for_writing(path: &Path) -> Child {
+        fs::write(path, b"#!/bin/sh\nprintf started\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "exec 3>>\"$1\"; echo ready; read _", "writer"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(writer.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        writer
+    }
+
+    #[test]
+    fn a_briefly_busy_executable_starts_once_its_writer_closes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("run");
+        let mut writer = hold_executable_open_for_writing(&path);
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(writer.stdin.take());
+            writer.wait().unwrap();
+        });
+        let result = SystemProcessExecutor.execute(
+            &CommandSpec::new(&path).timeout(Duration::from_secs(5)),
+            &CancellationToken::new(),
+        );
+        release.join().unwrap();
+        let output = result.unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout, b"started");
+    }
+
+    #[test]
+    fn an_executable_held_open_for_writing_fails_to_start_after_bounded_retries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("run");
+        let mut writer = hold_executable_open_for_writing(&path);
+        let start = Instant::now();
+        let result = SystemProcessExecutor.execute(
+            &CommandSpec::new(&path).timeout(Duration::from_secs(5)),
+            &CancellationToken::new(),
+        );
+        let elapsed = start.elapsed();
+        drop(writer.stdin.take());
+        writer.wait().unwrap();
+        let failure = result.unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::Spawn);
+        assert!(!failure.started);
+        assert!(elapsed < Duration::from_secs(2));
+    }
 
     #[test]
     fn readiness_wait_uses_the_deadline_instead_of_a_polling_interval() {
@@ -779,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_stdin_keeps_both_io_failure_excerpts_bounded() {
+    fn a_clean_exit_that_closes_its_input_succeeds_with_its_full_output() {
         let command = CommandSpec::new("/bin/sh")
             .args([
                 "-c",
@@ -788,12 +890,34 @@ mod tests {
             .stdin(vec![b'x'; 2 * 1024 * 1024])
             .output_limits(512 * 1024, 512 * 1024)
             .timeout(Duration::from_secs(5));
-        let failure = SystemProcessExecutor
+        let output = SystemProcessExecutor
             .execute(&command, &CancellationToken::new())
-            .unwrap_err();
+            .unwrap();
+        assert!(output.success);
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout.len(), 262144);
+        assert_eq!(output.stderr.len(), 262144);
+        assert!(output.stdout.iter().all(|byte| *byte == 0));
+        assert!(output.stderr.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn started_io_failure_keeps_both_excerpts_bounded() {
+        let command = CommandSpec::new("/bin/sh");
+        let status = ExitStatus::from_raw(0);
+        let failure = started_failure(
+            &command,
+            ProcessFailureKind::Io,
+            Some(&status),
+            vec![0; 262144],
+            vec![0; 262144],
+            "stdin: failed to write whole input".into(),
+        );
         assert_eq!(failure.kind, ProcessFailureKind::Io);
         assert_eq!(failure.exit_code, Some(0));
-        assert!(failure.message.starts_with("stdin:"));
+        assert_eq!(failure.signal, None);
+        assert!(failure.started);
+        assert_eq!(failure.message, "stdin: failed to write whole input");
         assert_eq!(failure.stdout.len(), FAILURE_EXCERPT_LIMIT);
         assert_eq!(failure.stderr.len(), FAILURE_EXCERPT_LIMIT);
         assert!(failure.stdout.iter().all(|byte| *byte == 0));

@@ -1249,6 +1249,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cagents-cosmic-text-contracts"
+version = "0.1.0"
+dependencies = [
+ "cosmic-text",
+]
+
+[[package]]
 name = "cagents-iced-contracts"
 version = "0.1.0"
 dependencies = [

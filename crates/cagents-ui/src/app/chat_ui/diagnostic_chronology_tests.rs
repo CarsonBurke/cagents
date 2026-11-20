@@ -8,7 +8,7 @@ fn part(provider: Provider, message: &str, index: usize) -> String {
     match provider {
         Provider::Codex => format!("{message}/input/{index}"),
         Provider::Claude | Provider::Omp => format!("{message}:{index}"),
-        Provider::Antigravity | Provider::Muse => unreachable!("no native chat"),
+        Provider::Antigravity | Provider::Muse => unreachable!("not exercised"),
     }
 }
 

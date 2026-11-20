@@ -24,6 +24,11 @@ thread_local! {
     static CHROME_SYNCS: Cell<usize> = const { Cell::new(0) };
     static CARD_INDEXES: Cell<usize> = const { Cell::new(0) };
     static PERSISTS: Cell<usize> = const { Cell::new(0) };
+    static SOURCE_CONTROL_REBINDS: Cell<usize> = const { Cell::new(0) };
+    static SETTINGS_CAPTURES: Cell<usize> = const { Cell::new(0) };
+    static CAPTURED_SIDEBAR: std::cell::RefCell<Option<crate::sidebar::SidebarView>> =
+        const { std::cell::RefCell::new(None) };
+    static SIDEBAR_REFRESHES: Cell<usize> = const { Cell::new(0) };
 }
 pub(super) fn record_projection() {
     if super::projection_oracle::verifying() {
@@ -67,6 +72,47 @@ pub(super) fn record_persist() {
     }
     PERSISTS.set(PERSISTS.get() + 1);
 }
+pub(super) fn record_source_control_rebind() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    SOURCE_CONTROL_REBINDS.set(SOURCE_CONTROL_REBINDS.get() + 1);
+}
+pub(super) fn record_settings_capture() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    SETTINGS_CAPTURES.set(SETTINGS_CAPTURES.get() + 1);
+}
+pub(super) fn record_captured_view(sidebar: &crate::sidebar::SidebarView) {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    CAPTURED_SIDEBAR.set(Some(sidebar.clone()));
+}
+/// The sidebar view the last settings save this thread could write held.
+pub(super) fn captured_sidebar_view() -> Option<crate::sidebar::SidebarView> {
+    CAPTURED_SIDEBAR.take()
+}
+/// How many times this thread has rebound source control to the focus.
+pub(super) fn source_control_rebinds() -> usize {
+    SOURCE_CONTROL_REBINDS.get()
+}
+/// How many settings saves this thread has captured, whether or not the
+/// window could write them.
+pub(super) fn settings_captures() -> usize {
+    SETTINGS_CAPTURES.get()
+}
+pub(super) fn record_sidebar_refresh() {
+    if super::projection_oracle::verifying() {
+        return;
+    }
+    SIDEBAR_REFRESHES.set(SIDEBAR_REFRESHES.get() + 1);
+}
+/// How many times this thread has rebuilt the sidebar's channel rows.
+pub(super) fn sidebar_refreshes() -> usize {
+    SIDEBAR_REFRESHES.get()
+}
 /// How many times this thread has handed the workspace to the writer.
 pub(super) fn persists() -> usize {
     PERSISTS.get()
@@ -85,6 +131,7 @@ fn reset() {
     CHROME_SYNCS.set(0);
     CARD_INDEXES.set(0);
     PERSISTS.set(0);
+    SIDEBAR_REFRESHES.set(0);
 }
 
 #[derive(Debug)]

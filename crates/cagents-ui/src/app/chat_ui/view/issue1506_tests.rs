@@ -2034,6 +2034,69 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
 }
 
 #[test]
+fn a_find_keystroke_searches_once_and_revisits_only_the_reports_it_revealed() {
+    let needle = "ONE_REPORT_NEEDLE";
+    let reports: Vec<_> = (0..24)
+        .map(|index| {
+            let body = if index == 7 {
+                format!("Report {index} body.\n\n{needle}\n")
+            } else {
+                format!("Report {index} body.\n")
+            };
+            task_report(&format!("report-{index}"), format!("Report {index}"), body)
+        })
+        .collect();
+    let (runtime, _handle) = frame_cost::live_runtime(&reports);
+    let target = runtime.target;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.cards
+        .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+    drop(find_navigation::find_for_test(
+        &mut app,
+        target,
+        needle.into(),
+    ));
+    let live = app.chat_runtime_mut(target).unwrap();
+    preparation::drain_fixture(live);
+    assert!(live.item_expanded("report-7"), "Find reveals its match");
+    assert!(
+        live.presentation_cache().len() > 1,
+        "the cache holds more reports than the one Find revealed"
+    );
+    assert!(
+        !live.presentation_cache()["report-7"]
+            .markdown
+            .items()
+            .is_empty()
+    );
+
+    let (stamps, visits) = (
+        find_navigation::raw_stamps(),
+        crate::app::chat_ui::report_collapse_visits(),
+    );
+    drop(app.handle_chat_ui(Action::Find(target, format!("{needle}Z"))));
+    assert_eq!(
+        find_navigation::raw_stamps() - stamps,
+        1,
+        "a keystroke proves Find's sources once, not again to step"
+    );
+    assert_eq!(
+        crate::app::chat_ui::report_collapse_visits() - visits,
+        1,
+        "restoring visits only the report Find revealed, not every cached item"
+    );
+    let live = app.chat_runtime_mut(target).unwrap();
+    assert!(!live.item_expanded("report-7"));
+    assert!(
+        live.presentation_cache()["report-7"]
+            .markdown
+            .items()
+            .is_empty(),
+        "the revealed report's parsed body is dropped again"
+    );
+}
+
+#[test]
 fn expanded_report_and_peer_sender_metadata_aligns_with_body_and_stays_findable() {
     use iced::advanced::{
         Layout, layout,

@@ -54,8 +54,9 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
-        [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
+        [--acp] [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
         [--projection-oracle] [--wayland-debug] [--restore-existing-only]
+        [--launch-handshake]
                   Take one of the host's native slots and start a headless
                   session at the requested logical width and height (default
                   1500x900). The slot is released by stop, or after --limit
@@ -68,6 +69,10 @@ both use the same fixture data and selected providers.
                   as the fixture's codex. --codex-executable ABSOLUTE_PATH copies a
                   real ELF into the isolated fixture, without its config or
                   credentials. With neither option, Codex is not installed.
+                  --acp installs the offline ACP agent as the fixture's agy
+                  and muse-upstream, with a muse wrapper that runs it as the
+                  reader's does; tests/fixtures/fixture-acp.sh says how to sign
+                  either out. Without it, neither is installed.
                   --ui-trace has the UI log a summary of its UI-thread work
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
@@ -90,6 +95,10 @@ both use the same fixture data and selected providers.
                   --restore-existing-only opens the session's first window as
                   relaunch --restore-existing-only does; later relaunches
                   choose again.
+                  --launch-handshake runs the app as `cagents ui` launches it,
+                  with CAGENTS_UI_LAUNCH_HANDSHAKE=1, so its startup gate checks
+                  every restored pane and shows the notice for any that did not
+                  reconnect; it persists like the traces.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -592,6 +601,7 @@ prepare_fixture() {
     # Links the app opens are recorded in state/opened-urls, not shown in a browser.
     install -m 755 "$tool_root/tests/fixtures/fixture-xdg-open.sh" "$fixture/bin/xdg-open"
     install_codex
+    install_acp
     if [ ! -e "$fixture/project/.git" ]; then
         (
             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -715,6 +725,25 @@ install_codex() {
     install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors,codex-usage-resets,usage-reset-fixture}.py
     printf '%s\n' "$peer" >"$peers/peer"
     install -m 755 "$tool_root/tests/fixtures/fixture-codex.sh" "$fixture/bin/codex"
+}
+
+# An agy or muse on PATH makes the app list Antigravity or Muse as
+# installed, so the offline ACP agent is installed only when --acp asks.
+install_acp() {
+    rm -rf -- "$fixture/libexec/acp"
+    rm -f -- "$fixture/bin/agy" "$fixture/bin/muse-upstream" "$fixture/bin/muse"
+    [ "$(cat -- "$state/acp" 2>/dev/null)" = 1 ] || return 0
+    # Antigravity's sign-in lives in ~/.gemini; an account whose home is
+    # missing was never set up.
+    # Muse keeps its sign-in in $XDG_CONFIG_HOME/muse.
+    mkdir -p -- "$fixture/libexec/acp" "$fixture/home/.gemini" "$fixture/config/muse" "$fixture/acp/agy" "$fixture/acp/muse"
+    install -m 644 -t "$fixture/libexec/acp" -- "$tool_root/tests/fixtures/fake-acp-agent.py"
+    install -m 755 "$tool_root/tests/fixtures/fixture-acp.sh" "$fixture/bin/agy"
+    install -m 755 "$tool_root/tests/fixtures/fixture-acp.sh" "$fixture/bin/muse-upstream"
+    # The shape of the reader's own wrapper, whose root options must not
+    # reach `muse-upstream acp`.
+    printf '#!/bin/sh\nexec muse-upstream --approval-mode never --disable-sandbox "$@"\n' >"$fixture/bin/muse"
+    chmod 755 -- "$fixture/bin/muse"
 }
 
 # The fixture's runtime directory and HOME are the proof of ownership: nothing else
@@ -1109,6 +1138,7 @@ run_app() {
     [ "$(cat "$state/ui-trace" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_TRACE=1)
     [ "$(cat "$state/projection-oracle" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_PROJECTION_ORACLE=1)
     [ "$(cat "$state/wayland-debug" 2>/dev/null)" != 1 ] || stage_environment+=(WAYLAND_DEBUG=client)
+    [ "$(cat "$state/launch-handshake" 2>/dev/null)" != 1 ] || stage_environment+=(CAGENTS_UI_LAUNCH_HANDSHAKE=1)
     local scoped_ui=
     [ "$(cat "$state/ui-scoped-fixture" 2>/dev/null)" != 1 ] || scoped_ui=1
     # A recovery window only attaches, so it never starts the daemon it needs.
@@ -1303,7 +1333,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug= restore_existing_only=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= acp= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug= restore_existing_only= launch_handshake=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1320,12 +1350,14 @@ cmd_start() {
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors, terminal-escape or usage-resets}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
+            --acp) acp=1; shift ;;
             --ui-trace) ui_trace=1; shift ;;
             --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
             --projection-oracle) projection_oracle=1; shift ;;
             --wayland-debug) wayland_debug=1; shift ;;
             --restore-existing-only) restore_existing_only=1; shift ;;
+            --launch-handshake) launch_handshake=1; shift ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -1374,11 +1406,13 @@ cmd_start() {
     printf '%s\n' "$startup_timeout" >"$state/startup-timeout"
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
+    printf '%s\n' "$acp" >"$state/acp"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
     printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
     printf '%s\n' "$projection_oracle" >"$state/projection-oracle"
     printf '%s\n' "$wayland_debug" >"$state/wayland-debug"
+    printf '%s\n' "$launch_handshake" >"$state/launch-handshake"
     printf '%s\n' "$restore_existing_only" >"$state/start-restore-existing-only"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.

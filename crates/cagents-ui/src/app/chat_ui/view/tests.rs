@@ -2003,6 +2003,49 @@ fn native_child_identity_uses_its_reported_model_and_waiting_state() {
     assert_eq!(runtime.native_child_status(&child), "Finished");
 }
 
+/// A Claude agent stopped by its account's usage limit says so on its own
+/// row, while the conversation reads as working, not as waiting for input.
+#[test]
+fn a_child_on_a_usage_limit_says_so_without_the_conversation_waiting_on_the_reader() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let limit = "Claude: rate_limit\nYou've hit your weekly limit · resets Nov 23, 9am";
+    let mut error = chat::Item {
+        id: "claude-limit:0".into(),
+        role: chat::Role::Assistant,
+        at: None,
+        started_at: None,
+        content: ItemContent::Text {
+            text: limit.into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        },
+    };
+    assert!(chat::failure::mark_provider_error(
+        runtime.session.launch.provider,
+        &mut error
+    ));
+    let mut child = native_child_fixture();
+    child.detail = limit.into();
+    child.items.push(Arc::new(error));
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(child.clone());
+    let summary = chat::failure::summary(runtime.session.launch.provider, limit).into_owned();
+    assert!(summary.contains("weekly limit reached"), "{summary}");
+    assert_eq!(
+        runtime.timeline_activity(false, Some(&child)),
+        Some((Icon::AgentWorking, summary.clone()))
+    );
+    assert!(runtime.native_child_identity(&child).contains(&summary));
+    assert_eq!(
+        runtime.snapshot.activity(),
+        crate::agent::ActivityState::Working
+    );
+    let (glyph, label) = runtime.conversation_status(false);
+    assert_eq!(glyph, Some(Icon::AgentWorking), "{label}");
+    assert!(!label.contains("waiting"), "{label}");
+}
+
 #[test]
 fn cold_child_find_acceptance_changes_retained_revision_without_another_query_edit() {
     use iced::advanced::{layout, widget::Tree};
@@ -5539,6 +5582,49 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
 }
 
 #[test]
+fn a_stop_marker_is_one_quiet_row_with_nothing_to_open() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    use iced_accessibility::accesskit::Role;
+    let item = chat::Item {
+        at: Some(10),
+        ..chat::stopped_notice("turn:stopped".into())
+    };
+    let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
+    let mut element = runtime.step_view(
+        &item,
+        &runtime.cache[&item.id],
+        design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE),
+    );
+    let renderer = crate::app::tests::headless_renderer();
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(520.0, 1000.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let labels: Vec<_> = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .filter_map(|node| node.node().label().map(|label| (node.node().role(), label)))
+        .collect();
+    assert!(
+        labels.iter().any(|(_, label)| *label == chat::STOPPED),
+        "the marker says the turn stopped: {labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .all(|(role, label)| *role != Role::Button && !label.contains("0s")),
+        "a stop has nothing to disclose and no time of its own: {labels:?}"
+    );
+}
+
+#[test]
 fn transcript_viewport_reaches_pane_edges_with_inset_inside_content() {
     use iced::advanced::{
         Layout, layout,
@@ -7783,7 +7869,7 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     let heading = "Agent \"Review restart safety\" finished\nThe check is still running.";
     let first = heading.lines().next().unwrap();
     let read = |runtime: &Runtime, kind, sender: &str| {
-        runtime.delivery_outcome(kind, false, "", sender, first, heading)
+        runtime.delivery_outcome(kind, false, false, "", sender, first, heading)
     };
     for kind in [chat::DeliveryKind::Notice, chat::DeliveryKind::Report] {
         let waiting = read(&runtime, kind, "a-review");
@@ -7826,6 +7912,7 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     let resumed = runtime.delivery_outcome(
         chat::DeliveryKind::Report,
         false,
+        false,
         "",
         "a-review",
         failure,
@@ -7842,6 +7929,7 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     let stopped = runtime.delivery_outcome(
         chat::DeliveryKind::Notice,
         false,
+        false,
         "",
         "a-review",
         stop,
@@ -7855,6 +7943,7 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     let resumed = runtime.delivery_outcome(
         chat::DeliveryKind::Notice,
         false,
+        false,
         "",
         "a-review",
         stop,
@@ -7866,9 +7955,28 @@ fn an_agents_report_says_how_the_agent_stands_now() {
         "Agent \"Review restart safety\" was stopped · now working"
     );
     // A monitor's event is not the agent's report, whatever it says.
-    let event =
-        runtime.delivery_outcome(chat::DeliveryKind::Notice, true, "", "a-review", stop, stop);
+    let event = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        true,
+        false,
+        "",
+        "a-review",
+        stop,
+        stop,
+    );
     assert_eq!(event.outcome, None);
+    // Where a turn was stopped is marked as other stopped work is, not with
+    // the Stop control's glyph.
+    let marker = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        true,
+        "",
+        "",
+        chat::STOPPED,
+        chat::STOPPED,
+    );
+    assert_eq!(marker.glyph, Icon::Ended);
     assert_eq!(event.heading, stop);
     // An agent this conversation doesn't list keeps the heading's own word.
     let unknown = read(&runtime, chat::DeliveryKind::Report, "a-other");
@@ -7878,6 +7986,7 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     let command = "Run the restart check · failed (exit 1)";
     let notice = runtime.delivery_outcome(
         chat::DeliveryKind::Notice,
+        false,
         false,
         "",
         "brestart",

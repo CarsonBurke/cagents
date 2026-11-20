@@ -1,6 +1,17 @@
-//! Antigravity (`agy`), Google's terminal coding agent. It runs only in a
-//! terminal until cagents speaks its Agent Client Protocol server.
+//! Antigravity (`agy`), Google's terminal coding agent. Its native chat is
+//! its Agent Client Protocol server, `agy acp`.
 use super::{Provider, ProviderAdapter};
+
+/// Antigravity's permission modes beside the cagents mode each means. In its
+/// own words: "Ask before edits and commands", "Approve file edits in the
+/// workspace without asking", "Approve edits and safe commands; ask before
+/// irreversible actions" and "Plan carefully before executing a task".
+pub(crate) const MODES: &[(&str, &str)] = &[
+    ("default", "default"),
+    ("accept-edits", "acceptEdits"),
+    ("auto", "auto"),
+    ("plan", "plan"),
+];
 
 pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     provider: Provider::Antigravity,
@@ -70,25 +81,21 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     // `--conversation` requires an ID.
     resume_picker: false,
     latest_selectors: &["--continue", "-c"],
-    native_chat: false,
+    native_chat: true,
     acp: Some(super::Acp {
         mode_option: "--mode",
         effort_option: "--effort",
-        // Its own words for them: "Ask before edits and commands", "Approve
-        // file edits in the workspace without asking", "Approve edits and
-        // safe commands; ask before irreversible actions" and "Plan
-        // carefully before executing a task".
-        modes: &[
-            ("default", "default"),
-            ("accept-edits", "acceptEdits"),
-            ("auto", "auto"),
-            ("plan", "plan"),
-        ],
+        modes: MODES,
         // `--mode` takes only the other three.
         default_mode: "default",
     }),
     #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]
-    create_chat: |_| Err(Provider::Antigravity.native_chat_refusal()),
+    create_chat: |launch| {
+        crate::chat::protocol::acp::create(
+            &crate::chat::protocol::acp::antigravity::PROFILE,
+            launch,
+        )
+    },
 };

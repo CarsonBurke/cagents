@@ -6806,7 +6806,7 @@ fn local_return(app: &Cagents) -> (Target, &LocalReturn) {
 }
 
 /// Types `text` into the composer of `card`.
-pub(super) fn write(app: &mut Cagents, card: CardId, text: &str) {
+pub(in crate::app) fn write(app: &mut Cagents, card: CardId, text: &str) {
     let target = chat_runtime(app, card).target;
     let _ = app.update(Message::ChatUi(Action::Composer(
         target,
@@ -7187,7 +7187,7 @@ fn prompt_history_keeps_multiline_draft_navigation_and_saved_text() {
 }
 
 /// Sends what the composer of `card` holds.
-pub(super) fn submit(app: &mut Cagents, card: CardId) {
+pub(in crate::app) fn submit(app: &mut Cagents, card: CardId) {
     let target = chat_runtime(app, card).target;
     submit_target(app, target);
 }
@@ -7207,6 +7207,11 @@ fn settle_first_start_checkpoint(app: &mut Cagents, card: CardId, task: Task<Mes
 }
 
 fn submit_target(app: &mut Cagents, target: Target) {
+    start_with(app, target, Action::Submit(target, PromptMode::Send));
+}
+
+/// Takes `action`, which may start `target`'s draft for its first message.
+fn start_with(app: &mut Cagents, target: Target, action: Action) {
     // Existing start/Ready tests exercise the provider boundary, not a
     // fabricated save receipt. Supply and drive the real writer barrier
     // first, while never polling the returned provider-start Task.
@@ -7219,7 +7224,7 @@ fn submit_target(app: &mut Cagents, target: Target) {
         .unwrap();
         app.session = Some(writer);
     }
-    let task = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+    let task = app.update(Message::ChatUi(action));
     settle_first_start_checkpoint(app, target.card, task);
     if directory.is_some() {
         drop(app.session.take());
@@ -7976,6 +7981,207 @@ fn empty_paste_callbacks_resume_explicit_submit_once_after_the_last_job() {
         );
         assert!(runtime.attachments.is_empty());
     }
+}
+
+#[test]
+fn attach_files_refuses_a_non_image_for_an_images_only_provider() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let directory = tempfile::tempdir().unwrap();
+        let notes = directory.path().join("notes.txt");
+        let shot = directory.path().join("shot.png");
+        std::fs::write(&notes, "Meeting notes").unwrap();
+        std::fs::copy(&image.path, &shot).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = true;
+        assert!(runtime.accepts_draft_attachments());
+        let ticket = runtime.try_attachment_insert().unwrap();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+
+        let task = app.handle_chat_ui(Action::Attached(
+            target,
+            ticket.clone(),
+            Ok(Some(vec![notes, shot])),
+        ));
+
+        assert_eq!(task.units(), 0, "refused selection must stage no files");
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(!runtime.attachment_bookmarks.contains_key(&ticket.id));
+        assert!(runtime.attachment_jobs.is_empty());
+        assert!(runtime.attachment_order.is_empty());
+        assert!(runtime.attachment_chooser_pending.is_none());
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(
+                "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+            )
+        );
+    });
+}
+
+#[test]
+fn a_chooser_refusal_survives_a_deferred_account_change() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.accepts_draft_attachments());
+    let original = runtime.session.clone();
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+
+    let mut chosen = original.clone();
+    chosen.launch.recipe.environment.insert(
+        "CODEX_HOME".into(),
+        directory.path().join("other-account").display().to_string(),
+    );
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(chosen.clone());
+    drop(app.adopt_stored_draft_session(card));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(
+        runtime.session, original,
+        "the open chooser defers adoption"
+    );
+    assert!(ticket.active());
+    assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session, chosen);
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+        )
+    );
+    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.pastes_pending, 0);
+    assert!(!ticket.active());
+    assert!(!runtime.attachment_bookmarks.contains_key(&ticket.id));
+    assert!(runtime.attachment_jobs.is_empty());
+    assert!(runtime.attachment_order.is_empty());
+    assert!(runtime.attachment_chooser_pending.is_none());
+}
+
+/// Another window switching the draft to Codex while the chooser is open
+/// decides which files the choice may attach, not the provider it opened on.
+#[test]
+fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.accepts_draft_attachments());
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+    let mut chosen = runtime.session.clone();
+    chosen.launch.provider = Provider::Codex;
+    app.card_state_mut(card).unwrap().kind = CardKind::Chat(chosen);
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session.launch.provider, Provider::Codex);
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
+        )
+    );
+    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert!(runtime.attachments.is_empty());
+    assert_eq!(runtime.pastes_pending, 0);
+    assert!(!ticket.active());
+    assert!(runtime.attachment_jobs.is_empty());
+}
+
+#[test]
+fn attach_files_still_stages_images_for_an_images_only_provider() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let directory = tempfile::tempdir().unwrap();
+        let shot = directory.path().join("shot.png");
+        std::fs::copy(&image.path, &shot).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = true;
+        assert!(runtime.accepts_draft_attachments());
+        let ticket = runtime.try_attachment_insert().unwrap();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+
+        let task = app.handle_chat_ui(Action::Attached(
+            target,
+            ticket.clone(),
+            Ok(Some(vec![shot])),
+        ));
+
+        assert!(task.units() > 0, "accepted images must schedule staging");
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.pastes_pending, 1);
+        assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+        assert!(runtime.attachment_chooser_pending.is_none());
+    });
+}
+
+#[test]
+fn attach_files_takes_any_file_for_a_provider_that_accepts_files() {
+    let _admission = attachment_draft::test_admission();
+    let directory = tempfile::tempdir().unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "Meeting notes").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    Arc::make_mut(&mut runtime.snapshot)
+        .capabilities
+        .attachments = true;
+    assert!(runtime.accepts_draft_attachments());
+    let ticket = runtime.try_attachment_insert().unwrap();
+    runtime.attachment_chooser_pending = Some(ticket.id);
+
+    let task = app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![notes])),
+    ));
+
+    assert!(task.units() > 0, "accepted files must schedule staging");
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.pastes_pending, 1);
+    assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
+    assert!(runtime.attachment_chooser_pending.is_none());
 }
 
 #[test]
@@ -10257,6 +10463,177 @@ fn saved_history_admits_attachment_chooser_and_completion_without_starting_or_se
         assert!(runtime.commands.is_idle() && runtime.queued.is_none());
         assert!(app.chat_ui.attempt(card).is_none());
     });
+}
+
+/// A tab reading `card`'s conversation as saved history, with no provider:
+/// how a conversation whose provider an update ended can reopen.
+fn reading_saved_history(app: &mut Cagents, card: CardId) -> chat::Session {
+    let mut source = chat_runtime(app, card).session.clone();
+    source.launch.session_id = Some(KNOWN_THREAD.into());
+    source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+    app.replace_chat_conversation(card, source.clone());
+    let target = chat_runtime(app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.session = source.clone();
+    let snapshot = saved_history_snapshot(&source);
+    runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+        source.clone(),
+        snapshot.clone(),
+    )));
+    runtime.snapshot = Arc::new(snapshot);
+    assert!(chat_runtime(app, card).has_connected_saved_history(&chat_runtime(app, card).snapshot));
+    source
+}
+
+fn saved_history_snapshot(source: &chat::Session) -> Snapshot {
+    Snapshot {
+        session_id: source.launch.session_id.clone(),
+        exited: true,
+        read_only_reason: Some("Saved history; no provider was started".into()),
+        ..Default::default()
+    }
+}
+
+/// A provider ready for its first message on `source`'s conversation.
+fn ready_provider(source: &chat::Session) -> Arc<ClientHandle> {
+    Arc::new(ClientHandle::fixture(
+        source.clone(),
+        Snapshot {
+            ready: true,
+            session_id: source.launch.session_id.clone(),
+            ..Default::default()
+        },
+    ))
+}
+
+/// Resuming work an update stopped, in a tab reading saved history, starts
+/// a provider as the tab's own Resume would; reattaching the reader would
+/// leave the message unsent.
+#[test]
+fn resuming_stopped_work_on_saved_history_starts_a_provider_to_send_it() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    assert!(app.chat_takes_resume(card));
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    let attempt = app.chat_ui.attempt(card).expect("a provider starts");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+    assert_eq!(attempt.session, source);
+    let started = attempt.target;
+    assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
+    assert_eq!(sent(&app, card), None);
+
+    answer_start(&mut app, started, Ok(ready_provider(&source)));
+    assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
+}
+
+/// Taken while the tab reopens, the message waits for what it attaches to.
+/// Saved history read without a provider then starts one to send it.
+#[test]
+fn a_resume_held_while_reopening_starts_a_provider_if_it_reopens_as_saved_history() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    // The reader reattaches, as a tab does when it opens.
+    let target = chat_runtime(&app, card).target;
+    drop(app.handle_chat_ui(Action::Reconnect(target)));
+    let attempt = app.chat_ui.attempt(card).expect("the reader reattaches");
+    assert_eq!(attempt.intent, chat::Intent::Restore);
+    let restoring = attempt.target;
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
+
+    answer_start(
+        &mut app,
+        restoring,
+        Ok(Arc::new(ClientHandle::fixture(
+            source.clone(),
+            saved_history_snapshot(&source),
+        ))),
+    );
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("reopened as saved history, it starts a provider");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+    let started = attempt.target;
+    assert_eq!(sent(&app, card), None);
+
+    answer_start(&mut app, started, Ok(ready_provider(&source)));
+    assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
+}
+
+/// A reader that lost its connection reconnects first, as its pane offers.
+/// Reconnected to saved history, it then starts a provider to send the
+/// message.
+#[test]
+fn a_resume_on_a_disconnected_reader_reconnects_then_starts_a_provider() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().disconnected = true;
+    assert!(app.chat_takes_resume(card));
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    let attempt = app.chat_ui.attempt(card).expect("the reader reconnects");
+    assert_eq!(attempt.intent, chat::Intent::Restore);
+    let restoring = attempt.target;
+
+    answer_start(
+        &mut app,
+        restoring,
+        Ok(Arc::new(ClientHandle::fixture(
+            source.clone(),
+            saved_history_snapshot(&source),
+        ))),
+    );
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("reconnected to saved history, it starts a provider");
+    assert_eq!(attempt.intent, chat::Intent::Start);
+    let started = attempt.target;
+
+    answer_start(&mut app, started, Ok(ready_provider(&source)));
+    assert_eq!(sent(&app, card).as_deref(), Some("Carry on"));
+    assert!(!app.chat_ui.resuming_on_attach.contains_key(&card));
+}
+
+/// A reader that attaches still loading its history can't start a provider
+/// yet. The message waits for the history, then starts one.
+#[test]
+fn a_resume_held_while_reopening_waits_for_saved_history_to_load() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+    let source = reading_saved_history(&mut app, card);
+    let target = chat_runtime(&app, card).target;
+    drop(app.handle_chat_ui(Action::Reconnect(target)));
+    let restoring = app.chat_ui.attempt(card).unwrap().target;
+    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    let loading = Snapshot {
+        history_loading: true,
+        ..saved_history_snapshot(&source)
+    };
+    answer_start(
+        &mut app,
+        restoring,
+        Ok(Arc::new(ClientHandle::fixture(source.clone(), loading))),
+    );
+    assert!(app.chat_ui.attempt(card).is_none(), "nothing starts yet");
+    assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
+
+    // Its history arrives.
+    let target = chat_runtime(&app, card).target;
+    let loaded = saved_history_snapshot(&source);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.connection = Connection::Live(Arc::new(ClientHandle::fixture(
+        source.clone(),
+        loaded.clone(),
+    )));
+    runtime.snapshot = Arc::new(loaded);
+    drop(app.dispatch_queued(target));
+    let attempt = app.chat_ui.attempt(card).expect("then a provider starts");
+    assert_eq!(attempt.intent, chat::Intent::Start);
 }
 
 #[test]
@@ -12901,6 +13278,111 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
         draft_permission_mode(&recipe, Provider::Claude).as_deref(),
         Some("auto")
     );
+}
+
+#[test]
+fn draft_permission_preview_reads_config_once_per_recipe() {
+    let home = tempfile::tempdir().unwrap();
+    let account = home.path().join(".codex");
+    std::fs::create_dir_all(&account).unwrap();
+    let config = account.join("config.toml");
+    std::fs::write(
+        &config,
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+    )
+    .unwrap();
+    let mut recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: home.path().to_owned(),
+        environment: [
+            ("HOME".into(), home.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+        ]
+        .into(),
+    };
+    let mut preview = DraftPermissionPreview::default();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("yolo")
+    );
+    std::fs::write(
+        &config,
+        "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
+    )
+    .unwrap();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("yolo"),
+        "an unchanged recipe keeps its preview"
+    );
+    recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
+        .map(String::from)
+        .into();
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("workspaceWrite")
+    );
+    assert_eq!(
+        preview.get(&recipe, Provider::Omp),
+        None,
+        "the provider is part of the key"
+    );
+    assert_eq!(
+        preview.get(&recipe, Provider::Codex).as_deref(),
+        Some("workspaceWrite")
+    );
+}
+
+#[test]
+fn codex_draft_publications_do_not_reread_provider_config() {
+    let home = tempfile::tempdir().unwrap();
+    let account = home.path().join(".codex");
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&account).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let config = account.join("config.toml");
+    std::fs::write(&config, "profile = 'x'\n").unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, &project);
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    // Only a presented draft falls back to its recipe's preview; a hidden
+    // one stores the publication as it came.
+    runtime.visible.store(true, Ordering::Relaxed);
+    // The draft helper selects its own account. Bind this fixture's recipe
+    // before its first publication and discard the earlier account's preview.
+    runtime.session.launch.recipe = LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: project,
+        environment: [
+            ("HOME".into(), home.path().to_string_lossy().into_owned()),
+            ("CODEX_HOME".into(), account.to_string_lossy().into_owned()),
+        ]
+        .into(),
+    };
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = None;
+    let mut snapshot = (*runtime.snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.session_id = None;
+    snapshot.permission_mode = None;
+    runtime.install_snapshot(Arc::new(snapshot), None);
+    assert_eq!(runtime.snapshot.permission_mode, None);
+
+    std::fs::write(
+        config,
+        "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
+    )
+    .unwrap();
+    let mut snapshot = (*runtime.snapshot).clone();
+    snapshot.generation += 1;
+    snapshot.session_id = None;
+    snapshot.permission_mode = None;
+    runtime.install_snapshot(Arc::new(snapshot), None);
+    assert_eq!(runtime.snapshot.permission_mode, None);
 }
 
 #[test]
@@ -19300,6 +19782,114 @@ fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
     );
     assert!(app.chat_ui.attempt(card).is_none());
 }
+/// An ACP provider reports a missing sign-in when its conversation starts,
+/// not during a turn, so the card goes back to its draft. That draft offers
+/// the sign-in a started conversation gets, on the system account a provider
+/// with no home of its own runs on, and sends its message again after.
+#[test]
+fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let handle = fixture_handle(&app, card, None);
+    // The adapter has not yet said it takes commands.
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, target, Ok(handle.clone()));
+    let target = chat_runtime(&app, card).target;
+    let failure = format!(
+        "{}: sign in to Antigravity, then try again. (Authentication required)",
+        chat::ACP_SIGN_IN_PREFIX
+    );
+    handle.replace_snapshot_for_test(Snapshot {
+        error: Some(failure.clone()),
+        exited: true,
+        ..Snapshot::default()
+    });
+    let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+    retired(&mut app, card);
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(runtime.error.as_deref(), Some(failure.as_str()));
+    let target = runtime.target;
+    let system = Account::system(Provider::Antigravity);
+    let recovery = app
+        .chat_auth_recovery(chat_runtime(&app, card))
+        .expect("the draft offers sign-in");
+    assert_eq!(recovery.account, system);
+    assert!(recovery.draft);
+    assert!(app.chat_auth_recovery_enabled(target));
+    assert!(app.chat_auth_resume_enabled(target));
+
+    // Sending again is the draft's own first message, not a resume of a
+    // conversation it never had.
+    start_with(&mut app, target, Action::ResumeAfterSignIn(target));
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("sending again starts the conversation anew");
+    assert_ne!(attempt.target, target);
+    assert!(chat_runtime(&app, card).queued.is_some());
+}
+
+/// Recovery needs the draft's message: with nothing left to send, signing in
+/// is still offered but sending again is not.
+#[test]
+fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(
+        &mut app,
+        Provider::Antigravity,
+        Path::new(FIXTURE_DIRECTORY),
+    );
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().error = Some(format!(
+        "{}: sign in to Antigravity, then try again. (log in first)",
+        chat::ACP_SIGN_IN_PREFIX
+    ));
+    assert!(app.chat_auth_recovery_enabled(target));
+    assert!(!app.chat_auth_resume_enabled(target));
+    drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+    assert!(app.chat_ui.attempt(card).is_none());
+    // Overriding HOME still hides which sign-in the provider would read.
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .environment
+        .insert("HOME".into(), "/unknown/agy-recovery-home".into());
+    assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+}
+
+/// A start that stops for any other reason keeps its plain report.
+#[test]
+fn a_draft_whose_start_fails_otherwise_offers_no_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let handle = fixture_handle(&app, card, None);
+    // The adapter has not yet said it takes commands.
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, target, Ok(handle.clone()));
+    let target = chat_runtime(&app, card).target;
+    handle.replace_snapshot_for_test(Snapshot {
+        error: Some("fixture: adapter crashed".into()),
+        exited: true,
+        ..Snapshot::default()
+    });
+    let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "The conversation stopped before it took the first message. Its last report: fixture: adapter crashed"
+        )
+    );
+    assert!(runtime.auth_error().is_none());
+    assert!(app.chat_auth_recovery(runtime).is_none());
+    assert!(!app.chat_auth_recovery_enabled(runtime.target));
+}
 #[test]
 fn auth_recovery_reconnect_preserves_session_and_draft_and_rejects_resolved_error() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -22516,4 +23106,19 @@ fn late_connection_callbacks_cannot_change_a_reconnected_card() {
         1,
         "an old account wake must not drain the replacement connection's report queue"
     );
+}
+
+/// What the conversation in `card` has sent its provider and awaits.
+pub(in crate::app) fn sent(app: &Cagents, card: CardId) -> Option<String> {
+    chat_runtime(app, card)
+        .commands
+        .iter()
+        .find_map(|pending| pending.sent.clone())
+}
+
+/// What the conversation in `card` holds to send once its provider can
+/// take it.
+pub(in crate::app) fn held(app: &Cagents, card: CardId) -> Option<String> {
+    let runtime = chat_runtime(app, card);
+    (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0)
 }
