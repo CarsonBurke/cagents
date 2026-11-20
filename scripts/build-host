@@ -107,12 +107,14 @@ BUILD_SLICE = "background-cagents.slice"
 TEST_SLICE = "app-cagents-test.slice"
 # Builds' outputs fill the page cache, which counts toward the build slice's
 # MemoryHigh. Reclaim at that cap takes anonymous memory as well as cache: on
-# fw16, with 13 GiB still available, builds' 25 GiB of anonymous memory and
-# 7 GiB of cache pushed 10 GiB to swap, past zram onto disk. So while builds
+# fw16, with 12.5 to 17 GiB still available, builds at about 25 GiB of
+# anonymous memory and 7 GiB of cache pushed swap up by as much as 10 GiB,
+# past zram onto disk. So while builds
 # run in scopes, one build-host at a time asks the kernel, once a second, to
 # drop cache alone (memory.reclaim with swappiness=0, Linux 6.13 on) whenever
 # the slice comes within RECLAIM_HEADROOM of its cap, down to RECLAIM_SLACK
-# further below it.
+# further below it: only cache the kernel counts inactive, and only when that
+# is enough, so builds near the cap on their own keep the cache they use.
 RECLAIM_HEADROOM = 2 * 2**30
 RECLAIM_SLACK = 2**30
 RECLAIM_TICK = 1.0
@@ -197,13 +199,16 @@ def slice_directory():
     return memory and os.path.dirname(memory)
 
 
-def cache_to_drop(current, cache, high):
-    """How much of the build slice's `cache`, of its `current` memory, to
-    reclaim under a MemoryHigh of `high` bytes (None for none): none while the
-    slice is not near its cap, and not more than its cache."""
-    if high is None or current <= high - RECLAIM_HEADROOM:
+def cache_to_drop(current, inactive, high):
+    """How much of the build slice's `inactive` page cache, of its `current`
+    memory, to reclaim under a MemoryHigh of `high` bytes (None for none):
+    none while the slice is not near its cap, nor when dropping all of that
+    cache would not take it to the target, where only builds' own memory
+    could."""
+    target = high - RECLAIM_HEADROOM - RECLAIM_SLACK if high is not None else None
+    if target is None or current <= high - RECLAIM_HEADROOM or current - inactive > target:
         return 0
-    return min(cache, current - (high - RECLAIM_HEADROOM - RECLAIM_SLACK))
+    return current - target
 
 
 class CacheTrimmer:
@@ -216,7 +221,12 @@ class CacheTrimmer:
         self.stopped = threading.Event()
         self.leading = None
         self.thread = threading.Thread(target=self.watch, daemon=True)
-        self.thread.start()
+        # Signals go to the main thread, as for the jobserver's.
+        masked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.thread.start()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, masked)
 
     def lead(self):
         """Whether this build-host is the one that trims, taking that on if
@@ -243,8 +253,10 @@ class CacheTrimmer:
         cannot drop cache alone, or does not say what it holds."""
         try:
             high = self.read("memory.high")
+            # Cache the kernel can drop and that builds have not used of late;
+            # tmpfs, which only swap could free, is not in it.
             cache = next(int(line.split()[1]) for line in self.read("memory.stat").splitlines()
-                         if line.startswith("file "))
+                         if line.startswith("inactive_file "))
             amount = cache_to_drop(int(self.read("memory.current")), cache,
                                    None if high == "max" else int(high))
         except FileNotFoundError:
@@ -1032,14 +1044,16 @@ class Build:
                 self.nested = within_build()
                 self.scoped = not self.nested and prepare_slice()
                 self.jobserver = None
-                trimmer = CacheTrimmer(slice_directory(), jobserver_directory() + ".reclaim") \
-                    if self.scoped and slice_directory() else None
                 if self.scoped or self.nested and lost_jobserver():
                     try:
                         self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
                     except OSError as error:
                         say(f"building without the shared jobserver: {error}")
+                trimmer = None
                 try:
+                    directory = slice_directory() if self.scoped else None
+                    if directory:
+                        trimmer = CacheTrimmer(directory, jobserver_directory() + ".reclaim")
                     yield self
                 finally:
                     if trimmer:

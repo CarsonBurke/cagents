@@ -8,6 +8,7 @@ private directory, in this process.
 
 import array
 import contextlib
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -1071,9 +1072,14 @@ class CacheTrimming(unittest.TestCase):
         tick.start()
         self.addCleanup(tick.stop)
 
-    def memory(self, current, cache, high):
+    def memory(self, current, cache, high, shmem=0):
+        """The slice's memory as cgroup v2 shows it: `cache` inactive page
+        cache, as much again active, and `shmem` of tmpfs counted as file."""
+        stat = (f"anon {max(0, current - 2 * cache - shmem)}\nfile {2 * cache + shmem}\n"
+                f"shmem {shmem}\nfile_dirty 0\ninactive_anon 0\nactive_anon 0\n"
+                f"inactive_file {cache}\nactive_file {cache}\n")
         for name, value in (("memory.high", str(high)), ("memory.current", str(current)),
-                            ("memory.stat", f"anon {max(0, current - cache)}\nfile {cache}\nfile_dirty 0\n")):
+                            ("memory.stat", stat)):
             (self.slice / f".{name}").write_text(value + "\n")
             (self.slice / f".{name}").replace(self.slice / name)
 
@@ -1092,12 +1098,16 @@ class CacheTrimming(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
             time.sleep(0.002)
 
-    def test_cache_is_dropped_only_near_the_cap_and_no_more_than_there_is(self):
+    def test_cache_is_dropped_only_near_the_cap_and_only_when_enough_is_inactive(self):
         G, high = self.GiB, 32 * self.GiB
         self.assertEqual(build_host.cache_to_drop(30 * G, 8 * G, high), 0)
         self.assertEqual(build_host.cache_to_drop(30 * G + 1, 8 * G, high), G + 1)
         self.assertEqual(build_host.cache_to_drop(31 * G, 8 * G, high), 2 * G)
-        self.assertEqual(build_host.cache_to_drop(33 * G, G // 2, high), G // 2)
+        self.assertEqual(build_host.cache_to_drop(31 * G, 2 * G, high), 2 * G)
+        # Builds' own memory near the cap: dropping every inactive page would
+        # not reach the target, so the cache they use is left alone.
+        self.assertEqual(build_host.cache_to_drop(31 * G, 2 * G - 1, high), 0)
+        self.assertEqual(build_host.cache_to_drop(33 * G, G // 2, high), 0)
         self.assertEqual(build_host.cache_to_drop(40 * G, 8 * G, None), 0)
 
     def test_near_its_cap_the_slice_is_asked_to_drop_cache_alone(self):
@@ -1125,13 +1135,69 @@ class CacheTrimming(unittest.TestCase):
         self.wait_for(lambda: self.asked() is not None, "a reclaim once the slice is there")
 
     def test_one_build_host_trims_at_a_time_and_another_takes_over(self):
-        first = build_host.CacheTrimmer(str(self.slice), self.lock)
+        first = self.trimmer()
         self.wait_for(lambda: first.leading is not None, "the first to lead")
         second = self.trimmer()
         time.sleep(0.05)
         self.assertIsNone(second.leading)
         first.close()
         self.wait_for(lambda: second.leading is not None, "the second to take over")
+
+    def test_tmpfs_and_active_cache_are_not_counted_as_droppable(self):
+        # 2.5 GiB over the target, 1 GiB of it inactive cache: not enough.
+        self.memory(31 * self.GiB + self.GiB // 2, self.GiB, 32 * self.GiB, shmem=8 * self.GiB)
+        trimmer = self.trimmer()
+        self.wait_for(lambda: trimmer.leading is not None, "the trimmer to start")
+        time.sleep(0.05)
+        self.assertIsNone(self.asked())
+        self.assertTrue(trimmer.thread.is_alive())
+
+    def test_a_reclaim_the_kernel_could_not_finish_keeps_the_trimming(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        refused = threading.Event()
+        real_open = open
+
+        def partial(path, *arguments, **options):
+            if str(path).endswith("memory.reclaim"):
+                refused.set()
+                raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real_open(path, *arguments, **options)
+
+        with unittest.mock.patch("builtins.open", partial):
+            trimmer = self.trimmer()
+            self.wait_for(refused.is_set, "a reclaim the kernel could not finish")
+            time.sleep(0.05)
+            self.assertTrue(trimmer.thread.is_alive())
+
+    def test_a_build_in_a_scope_trims_while_it_runs_and_one_in_place_does_not(self):
+        made = []
+
+        class Recorder:
+            def __init__(self, directory, lock):
+                self.closed = False
+                made.append(self)
+
+            def close(self):
+                self.closed = True
+
+        class NoJobserver:
+            def __init__(self, *arguments):
+                self.auth = None
+
+            def close(self):
+                pass
+
+        for scoped in (True, False):
+            with self.subTest(scoped=scoped), \
+                    unittest.mock.patch.object(build_host, "CacheTrimmer", Recorder), \
+                    unittest.mock.patch.object(build_host, "Jobserver", NoJobserver), \
+                    unittest.mock.patch.object(build_host, "prepare_slice", lambda: scoped), \
+                    unittest.mock.patch.object(build_host, "within_build", lambda: False), \
+                    unittest.mock.patch.object(build_host, "slice_directory", lambda: str(self.slice)):
+                made.clear()
+                with build_host.Build(0, None).admitted():
+                    self.assertEqual([trimmer.closed for trimmer in made], [False] if scoped else [])
+                self.assertEqual([trimmer.closed for trimmer in made], [True] if scoped else [])
 
     def test_a_kernel_that_cannot_drop_cache_alone_ends_the_trimming(self):
         self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
