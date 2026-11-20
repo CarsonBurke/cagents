@@ -724,7 +724,12 @@ impl State {
             };
             state.schedule.succeed(brokered.snapshot.observed_at);
             state.identity = Some(brokered.identity);
-            state.snapshot = Some(brokered.snapshot);
+            state.snapshot = Some(match state.snapshot.as_ref() {
+                Some(current) => {
+                    current.merged(&brokered.snapshot, now, UsageMerge::IncomingSnapshot)
+                }
+                None => brokered.snapshot,
+            });
             state.failure = None;
         }
     }
