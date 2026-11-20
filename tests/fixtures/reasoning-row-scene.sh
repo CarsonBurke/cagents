@@ -386,12 +386,13 @@ if [ "$scene" = lone-thinking ]; then
     spawn_scene claude haiku 'Fixture: verify the fixture.' \
         "$fixture/state/reasoning-lone-thinking-spawn.json" 'Lone step thinking'
     seen() { rg -q "\"uuid\":\"$1\"" "$config/projects"; }
-    late() { printf 'reasoning-row-scene: %s\n' "$1" >&2; exit 1; }
+    # Keep a picture of the screen a scene gave up on.
+    late() { evidence shot lone-failed >/dev/null 2>&1 || true; printf 'reasoning-row-scene: %s\n' "$1" >&2; exit 1; }
     # Pace by what is on screen, so a slow host shoots each state rather than
     # the one after it. The thought starts ten seconds after the command's
     # row appears and runs twenty; the baseline never draws a strip, so its
     # thinking shot falls back to the middle of that window.
-    evidence drive wait 'Ran printf fixture-verified' --timeout 60 >/dev/null || late 'the command did not run'
+    evidence drive wait 'fixture-verified' --timeout 60 >/dev/null || late 'the command did not run'
     start=$(date +%s)
     shot lone-row
     [ $(($(date +%s) - start)) -lt 9 ] || late 'the lone row was shot after the thinking began'
