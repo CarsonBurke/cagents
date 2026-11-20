@@ -5228,15 +5228,16 @@ impl Runtime {
         } else {
             at_caret
         };
+        let before = self.composer.cursor();
+        let inline = self.inline_references();
         self.composer.move_to(text_editor::Cursor {
             position: at,
             selection: None,
         });
-        self.composer
-            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                Arc::new(named.clone()),
-            )));
-        self.named_in_draft();
+        let edited = attachment_draft::edit(
+            &mut self.composer,
+            text_editor::Edit::Paste(Arc::new(named.clone())),
+        );
         if lead {
             let column = caret.column + if caret.line == 0 { named.len() } else { 0 };
             self.composer.move_to(text_editor::Cursor {
@@ -5244,6 +5245,21 @@ impl Runtime {
                 selection: None,
             });
         }
+        // Like any other edit, the name is one undo step, and a reference it
+        // splits takes its image out with it.
+        match edited {
+            Ok(Some(change)) => self.composer_undo.record(
+                change,
+                crate::editor_history::EditKind::Other,
+                before,
+                self.composer.cursor(),
+                std::time::Instant::now(),
+            ),
+            Ok(None) => {}
+            Err(()) => self.composer_undo.clear(),
+        }
+        self.reconcile_references(inline);
+        self.named_in_draft();
     }
 
     /// `insertion` as it is put in the draft at `at`: set apart by a space

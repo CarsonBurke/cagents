@@ -414,3 +414,25 @@ fn only_the_image_opened_last_shows_when_loads_finish_out_of_order() {
         );
     });
 }
+
+#[test]
+fn a_name_put_in_from_the_menu_is_an_edit_like_any_other() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "See ", std::slice::from_ref(&image));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let full = runtime.composer.text();
+        // The caret inside "[Image N]": the name splits the reference, and
+        // its image leaves with it.
+        caret_after(runtime, "[Image");
+        runtime.name_in_draft("notes.md", completion::Kind::File);
+        assert!(runtime.composer.text().contains("notes.md"));
+        assert!(runtime.attachments.is_empty());
+        assert!(sent_attachments(runtime).is_empty());
+        // One undo takes the name out and brings the image back.
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), full);
+        assert_eq!(runtime.attachments, [image]);
+    });
+}
