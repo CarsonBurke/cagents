@@ -599,6 +599,167 @@ mod action_tests {
         *deadline
     }
 
+    #[cfg(feature = "browser-protocol-fixture")]
+    mod restored_browser_admission {
+        use super::*;
+
+        async fn restored_half_width_browser_admission(focus_before_available: bool) {
+            let spawns = BrowserHandle::record_spawns();
+            let directory = tempfile::tempdir().unwrap();
+            let mut terminal = crate::app::tests::terminal_card_state();
+            terminal.width_fraction = 0.5;
+            let terminal_card = terminal.id;
+            let CardKind::Terminal(session) = terminal.kind.clone() else {
+                unreachable!()
+            };
+            let url = Url::parse("about:blank").unwrap();
+            let browser_card = CardId::new();
+            let browser = CardState {
+                id: browser_card,
+                generation: 0,
+                title: "Browser".into(),
+                width_fraction: 0.5,
+                existence: Existence::Open,
+                kind: CardKind::Browser(BrowserSession {
+                    id: BrowserId::new(),
+                    current_url: url.clone(),
+                    history: vec![url.clone()],
+                    history_index: 0,
+                    scroll_x: 0.0,
+                    scroll_y: 0.0,
+                    fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+                }),
+            };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.settings.max_hot_cards = 1;
+            app.synchronize_lifecycle_budget();
+            app.durable = Arc::new(WorkspaceState {
+                cards: vec![terminal, browser].into(),
+                focused: Some(terminal_card),
+                ..WorkspaceState::default()
+            });
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            let viewport = app.workspace.resize_viewport(1_200.0);
+            drop(app.apply_viewport(viewport, false, DurableChange::None));
+            let visible = app
+                .workspace
+                .mounted_visibility()
+                .collect::<HashMap<_, _>>();
+            assert_eq!(visible.len(), 2);
+            assert!(
+                visible
+                    .iter()
+                    .all(|(_, state)| *state == VisibilityClass::Visible)
+            );
+
+            // Restore through the actual startup and saved-attachment reducers.
+            // Only the external terminal completion is supplied by the fixture.
+            drop(app.initialize_runtimes());
+            saved_terminal::tests::complete_inspection(
+                &mut app,
+                terminal_card,
+                Ok(Some(StartedTerminal {
+                    handle: crate::app::tests::unconnected_surface(directory.path(), session.id),
+                    session,
+                    spawned: false,
+                    save_failure: None,
+                })),
+            );
+            assert!(matches!(
+                app.cards.get(&terminal_card),
+                Some(CardRuntime::Terminal(_))
+            ));
+            assert_eq!(*app.residency(terminal_card), Residency::Hot);
+            assert!(app.browser_factory.is_none());
+
+            let parent = window::Id::unique();
+            app.core.set_main_window_id(Some(parent));
+            let generation = app.browser_backend.begin(parent, Instant::now()).unwrap();
+            if focus_before_available {
+                let task = app.update(Message::FocusCard(browser_card));
+                for message in settle(&mut app, task).await {
+                    if matches!(message, Message::LifecycleSweep) {
+                        drop(app.update(message));
+                    }
+                }
+            }
+            let factory = RawWaylandSubsurfaceFactory::prepared_registry_fixture();
+            drop(app.update(Message::BrowserFactoryReady {
+                generation,
+                result: Ok(BrowserFactoryBinding {
+                    factory,
+                    parent_lifetime: Arc::new(ParentWindowLifetime::new(parent)),
+                }),
+            }));
+            let operation = pend(&mut app, Instant::now());
+            drop(app.update(Message::BrowserFactoryProbed {
+                generation,
+                operation,
+                result: CapabilityProbe::Available,
+            }));
+            if !focus_before_available {
+                assert!(matches!(
+                    app.cards.get(&browser_card),
+                    Some(CardRuntime::Loading)
+                ));
+                assert!(spawns.spawns().is_empty());
+                let task = app.update(Message::FocusCard(browser_card));
+                let messages = settle(&mut app, task).await;
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| matches!(message, Message::LifecycleSweep)),
+                    "focusing an already visible restored browser must reconcile admission"
+                );
+                for message in messages {
+                    if matches!(message, Message::LifecycleSweep) {
+                        drop(app.update(message));
+                    }
+                }
+            }
+            assert_eq!(app.workspace.focused(), Some(browser_card));
+            assert_eq!(
+                app.workspace
+                    .mounted_visibility()
+                    .collect::<HashMap<_, _>>(),
+                visible
+            );
+            assert!(
+                matches!(app.cards.get(&browser_card), Some(CardRuntime::Browser(_))),
+                "the focused restored browser must start even when a visible terminal fills the hot limit"
+            );
+            assert_eq!(*app.residency(browser_card), Residency::Hot);
+            assert_eq!(
+                app.lifecycle
+                    .state(browser_card)
+                    .map(|(_, residency)| residency),
+                Some(&Residency::Hot)
+            );
+            assert_eq!(*app.residency(terminal_card), Residency::Hot);
+            let spawned = spawns.spawns();
+            assert_eq!(spawned.len(), 1);
+            assert_eq!(spawned[0].0.url, url);
+            assert!(spawned[0].1);
+            drop(app.update(Message::LifecycleSweep));
+            assert_eq!(
+                spawns.spawns().len(),
+                1,
+                "a later sweep must reuse the browser"
+            );
+            drop(app);
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn focused_before_factory_obtains_admission() {
+            restored_half_width_browser_admission(true).await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn focused_after_factory_obtains_admission() {
+            restored_half_width_browser_admission(false).await;
+        }
+    }
+
     #[test]
     fn overdue_callbacks_time_out_and_retry_checks_again() {
         let (mut app, card, parent) = app();
@@ -780,6 +941,9 @@ mod action_tests {
             (BrowserUnavailable::NotWayland, false),
         ] {
             let (mut app, card, parent) = app();
+            // Native layout measures the workspace before exposing pane controls.
+            let viewport = app.workspace.resize_viewport(900.0);
+            drop(app.apply_viewport(viewport, false, DurableChange::None));
             let opened = recording(&mut app);
             app.browser_backend.begin(parent, Instant::now()).unwrap();
             // The restored pane was waiting for the check when it gave up.

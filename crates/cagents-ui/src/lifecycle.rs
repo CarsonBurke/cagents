@@ -41,7 +41,7 @@ struct RuntimeCard {
     epoch: u64,
 }
 
-/// Enforces the hot-card budget independently of durable card existence.
+/// Enforces the background hot-card budget independently of durable card existence.
 ///
 /// The manager issues generation-tagged actions. Callers must return the same
 /// epoch when asynchronous hydration or eviction completes; stale completions
@@ -150,6 +150,21 @@ impl LifecycleManager {
         prefetch: &HashSet<CardId>,
         now: Instant,
     ) -> Vec<LifecycleAction> {
+        self.reconcile_focused_in_flight(visible, passing, prefetch, None, now)
+    }
+
+    /// Gives the selected visible pane admission even when other visible
+    /// panes hold the background budget. Existing visible and in-flight
+    /// runtimes keep their resources; hidden hot panes still give up a slot
+    /// before the budget is exceeded.
+    pub fn reconcile_focused_in_flight(
+        &mut self,
+        visible: &HashSet<CardId>,
+        passing: &HashSet<CardId>,
+        prefetch: &HashSet<CardId>,
+        focused: Option<CardId>,
+        now: Instant,
+    ) -> Vec<LifecycleAction> {
         let mut actions = Vec::new();
 
         // Cold offscreen cards cannot change during a viewport sweep. Visit
@@ -206,13 +221,19 @@ impl LifecycleManager {
             }
         }
 
-        // Visible work always wins the budget. Iterating the two bands in
-        // priority order avoids allocating and sorting hydration candidates.
+        // Selection comes first, then the visible and prefetch bands. A pane
+        // only crossed by the camera still waits until it is stopped on.
+        let focused = focused.filter(|card| visible.contains(card) && !passing.contains(card));
         let candidates = || {
-            visible
+            focused
                 .iter()
-                .filter(|card| !passing.contains(*card))
                 .map(|card| (card, true))
+                .chain(
+                    visible
+                        .iter()
+                        .filter(|card| Some(**card) != focused && !passing.contains(*card))
+                        .map(|card| (card, true)),
+                )
                 .chain(prefetch.iter().map(|card| (card, false)))
         };
         let mut preemptible = None;
@@ -227,11 +248,12 @@ impl LifecycleManager {
                 if !on_screen {
                     break;
                 }
-                let Some(evicted) = preemptible.get_or_insert_with(|| self.preemptible()).next()
-                else {
+                if let Some(evicted) = preemptible.get_or_insert_with(|| self.preemptible()).next()
+                {
+                    self.evict(evicted, &mut actions);
+                } else if Some(*card) != focused {
                     break;
-                };
-                self.evict(evicted, &mut actions);
+                }
             }
             self.hydrate(*card, &mut actions);
         }
@@ -377,6 +399,144 @@ impl LifecycleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focused_visible_card_starts_beside_visible_hot_or_hydrating_work() {
+        for residency in [Residency::Hot, Residency::Hydrating { epoch: 7 }] {
+            let now = Instant::now();
+            let neighbour = CardId::new();
+            let focused = CardId::new();
+            let mut manager = LifecycleManager::new(LifecycleBudget {
+                max_hot_cards: 1,
+                offscreen_grace: Duration::from_secs(30),
+            });
+            manager.register(neighbour, Exposure::Visible, residency.clone(), now);
+            manager.register(focused, Exposure::Visible, Residency::Hibernated, now);
+            let visible = HashSet::from([neighbour, focused]);
+            let actions = manager.reconcile_focused_in_flight(
+                &visible,
+                &HashSet::new(),
+                &HashSet::new(),
+                Some(focused),
+                now,
+            );
+            assert_eq!(hydrated(&actions), [focused]);
+            assert!(hibernated(&actions).is_empty());
+            assert_eq!(manager.state(neighbour).unwrap().1, &residency);
+            let epoch = match manager.state(focused).unwrap().1 {
+                Residency::Hydrating { epoch } => *epoch,
+                state => panic!("focused pane was not admitted: {state:?}"),
+            };
+            assert!(manager.hydration_finished(focused, epoch, Ok(())));
+            let actions = manager.reconcile_focused_in_flight(
+                &visible,
+                &HashSet::new(),
+                &HashSet::new(),
+                Some(neighbour),
+                now,
+            );
+            assert!(hydrated(&actions).is_empty());
+            assert!(hibernated(&actions).is_empty());
+            // Once it leaves, the extra foreground slot returns to the budget
+            // without waiting out the background grace.
+            let actions = manager.reconcile_focused_in_flight(
+                &HashSet::from([neighbour]),
+                &HashSet::new(),
+                &HashSet::new(),
+                Some(neighbour),
+                now,
+            );
+            assert_eq!(hibernated(&actions), [focused]);
+        }
+    }
+
+    #[test]
+    fn focused_card_reclaims_a_hidden_slot_before_other_visible_candidates() {
+        let now = Instant::now();
+        let hidden = CardId::new();
+        let focused = CardId::new();
+        let other = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 1,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        manager.register(hidden, Exposure::Offscreen, Residency::Hot, now);
+        for card in [focused, other] {
+            manager.register(card, Exposure::Visible, Residency::Hibernated, now);
+        }
+        let actions = manager.reconcile_focused_in_flight(
+            &HashSet::from([focused, other]),
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(focused),
+            now,
+        );
+        assert_eq!(hibernated(&actions), [hidden]);
+        assert_eq!(hydrated(&actions), [focused]);
+        assert_eq!(manager.state(other).unwrap().1, &Residency::Hibernated);
+    }
+
+    #[test]
+    fn focused_visible_card_does_not_cancel_hidden_hydration() {
+        let now = Instant::now();
+        let hidden = CardId::new();
+        let focused = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 1,
+            offscreen_grace: Duration::ZERO,
+        });
+        manager.register(
+            hidden,
+            Exposure::Offscreen,
+            Residency::Hydrating { epoch: 7 },
+            now,
+        );
+        manager.register(focused, Exposure::Visible, Residency::Hibernated, now);
+        let actions = manager.reconcile_focused_in_flight(
+            &HashSet::from([focused]),
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(focused),
+            now,
+        );
+        assert_eq!(hydrated(&actions), [focused]);
+        assert!(hibernated(&actions).is_empty());
+        assert!(manager.hydration_finished(hidden, 7, Ok(())));
+    }
+
+    #[test]
+    fn focus_outside_the_settled_visible_band_does_not_bypass_the_budget() {
+        for passing in [false, true] {
+            let now = Instant::now();
+            let visible = CardId::new();
+            let focused = CardId::new();
+            let mut manager = LifecycleManager::new(LifecycleBudget {
+                max_hot_cards: 1,
+                offscreen_grace: Duration::from_secs(30),
+            });
+            manager.register(visible, Exposure::Visible, Residency::Hot, now);
+            manager.register(focused, Exposure::Offscreen, Residency::Hibernated, now);
+            let visible = if passing {
+                HashSet::from([visible, focused])
+            } else {
+                HashSet::from([visible])
+            };
+            let passing = if passing {
+                HashSet::from([focused])
+            } else {
+                HashSet::new()
+            };
+            let actions = manager.reconcile_focused_in_flight(
+                &visible,
+                &passing,
+                &HashSet::new(),
+                Some(focused),
+                now,
+            );
+            assert!(hydrated(&actions).is_empty());
+            assert!(hibernated(&actions).is_empty());
+        }
+    }
 
     #[test]
     fn failed_or_removed_hydration_releases_the_hot_budget() {
