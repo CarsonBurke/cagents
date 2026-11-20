@@ -77,13 +77,6 @@ impl CopyState {
         }
     }
 
-    pub(super) fn refusal(&self) -> Option<&Arc<str>> {
-        match self {
-            Self::Refused(refusal) => Some(refusal),
-            _ => None,
-        }
-    }
-
     /// Whether the control has something to say, and so stays in view while
     /// it says it.
     pub(super) fn is_telling(&self) -> bool {
