@@ -13,6 +13,7 @@
 mod board;
 mod conversations;
 mod forge;
+mod items;
 mod removal;
 mod scan;
 mod store;

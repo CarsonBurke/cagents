@@ -14,7 +14,9 @@ use super::{
         delivery::{DeliveryQueue, Outbound},
         state::{ClientId, SharedHost},
     },
-    Handle, Signal, board, forge, now_unix_ms,
+    Handle, Signal, board, forge,
+    items::Items,
+    now_unix_ms,
     transcript::{self, Format, Reader},
 };
 use crate::{
@@ -174,6 +176,9 @@ struct Watched {
     watchers: BTreeMap<ClientId, Weak<DeliveryQueue>>,
     source: Source,
     files: BTreeMap<PathBuf, Cursor>,
+    /// How far cagents' own record of the conversation has been read, for a
+    /// conversation whose transcript files are not.
+    items: Items,
     references: BTreeMap<Reference, Aggregate>,
     /// Absolute directories files were edited in, with when they last were
     /// and whether only subagents edited there.
@@ -206,7 +211,9 @@ enum Source {
     /// Not located yet: the conversation may not have reported its ID.
     Pending,
     Located(Located),
-    Unsupported,
+    /// No transcript file is read; cagents' own record of the conversation
+    /// with this provider ID is.
+    Recorded(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +256,7 @@ impl Watched {
             watchers: BTreeMap::new(),
             source: Source::Pending,
             files: BTreeMap::new(),
+            items: Items::default(),
             references: BTreeMap::new(),
             edited: BTreeMap::new(),
             sequence: 0,
@@ -625,7 +633,7 @@ impl Handle {
                 .unwrap_or_default();
             let located = locate(host, *conversation, known.as_deref(), search_due);
             facts.insert(*conversation, self.facts(host, *conversation));
-            let (source, mut cursors) = {
+            let (source, mut cursors, mut items) = {
                 let mut state = self.conversations();
                 let Some(watched) = state.watched.get_mut(conversation) else {
                     continue;
@@ -644,20 +652,30 @@ impl Handle {
                         // is a new transcript.
                         watched.source = source;
                         watched.files.clear();
+                        watched.items = Items::default();
                         watched.references.clear();
                         watched.edited.clear();
                     }
                 }
-                (watched.source.clone(), std::mem::take(&mut watched.files))
+                (
+                    watched.source.clone(),
+                    std::mem::take(&mut watched.files),
+                    std::mem::take(&mut watched.items),
+                )
             };
-            // Watching and unwatching take the same lock, so the files are
-            // read without it. Only this thread moves the cursors.
-            let scanned = scan(&source, &mut cursors);
+            // Watching and unwatching take the same lock, so the files and
+            // the record are read without it. Only this thread moves the
+            // cursors.
+            let scanned = match &source {
+                Source::Recorded(_) => recorded(host, *conversation, &mut items),
+                _ => scan(&source, &mut cursors),
+            };
             let mut state = self.conversations();
             if let Some(watched) = state.watched.get_mut(conversation)
                 && watched.source == source
             {
                 watched.files = cursors;
+                watched.items = items;
                 watched.apply(scanned, facts.get(conversation).and_then(Option::as_ref));
             }
         }
@@ -1452,6 +1470,19 @@ fn locate(
                 .or_else(|| record.session.launch.session_id.clone()),
         )
     };
+    // cagents is the client of these providers, so its own record of the
+    // conversation is read, from before the provider names its ID.
+    if matches!(
+        provider,
+        Provider::Omp | Provider::Antigravity | Provider::Muse
+    ) {
+        let id = session_id.unwrap_or_default();
+        return if known == Some(id.as_str()) {
+            Location::Unchanged
+        } else {
+            Location::Found(id.clone(), Source::Recorded(id))
+        };
+    }
     let Some(id) = session_id.filter(|id| known != Some(id.as_str())) else {
         return Location::Unchanged;
     };
@@ -1488,9 +1519,7 @@ fn locate(
             ),
             None => Location::Missed,
         },
-        Provider::Omp | Provider::Antigravity | Provider::Muse => {
-            Location::Found(id, Source::Unsupported)
-        }
+        Provider::Omp | Provider::Antigravity | Provider::Muse => Location::Unchanged,
     }
 }
 
@@ -1539,6 +1568,30 @@ fn read(watched: &mut Watched) {
     watched.apply(scanned, None);
 }
 
+/// Reads what cagents' own record of the conversation gained since the last
+/// pass. Only the conversation's handle is taken under the host's lock; the
+/// record is read without it.
+fn recorded(host: &SharedHost, conversation: TerminalId, items: &mut Items) -> Scanned {
+    let owner = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .chats
+            .get(&conversation)
+            .map(|record| (record.execution_instance, record.handle.clone()))
+    };
+    let mut found = Vec::new();
+    if let Some((instance, handle)) = owner {
+        items.owned_by(instance);
+        if let Some(snapshot) = handle.snapshot(items.generation()) {
+            items.read(&snapshot, &mut found);
+        }
+    }
+    Scanned {
+        found,
+        coverage: items.coverage(),
+    }
+}
+
 /// What one read of a conversation's transcripts found.
 struct Scanned {
     found: Vec<transcript::Found>,
@@ -1559,10 +1612,11 @@ fn scan(source: &Source, cursors: &mut BTreeMap<PathBuf, Cursor>) -> Scanned {
                 coverage: TranscriptCoverage::Complete,
             };
         }
-        Source::Unsupported => {
+        // Read from the conversation's record by `recorded`, not here.
+        Source::Recorded(_) => {
             return Scanned {
                 found: Vec::new(),
-                coverage: TranscriptCoverage::Unsupported,
+                coverage: TranscriptCoverage::Pending,
             };
         }
         Source::Located(located) => located.clone(),

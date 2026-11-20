@@ -994,3 +994,78 @@ fn a_conversation_with_no_transcript_yet_reads_as_complete_once_looked_for() {
     assert_eq!(watched.coverage, TranscriptCoverage::Complete);
     assert!(watched.references.is_empty());
 }
+
+#[test]
+fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_opened() {
+    use crate::chat::{
+        ChangeKind, CommandAction, FileChange, Item, ItemContent, Role, Snapshot, ToolStatus,
+    };
+    let item = |id: &str, content| {
+        Arc::new(Item {
+            started_at: None,
+            id: id.into(),
+            role: Role::Assistant,
+            content,
+            at: None,
+        })
+    };
+    let snapshot = Snapshot {
+        generation: 4,
+        items: vec![
+            item(
+                "edit",
+                ItemContent::Changes {
+                    changes: vec![FileChange {
+                        path: "/w/app/.worktrees/feat/src/lib.rs".into(),
+                        kind: ChangeKind::Updated,
+                        diff: String::new(),
+                    }],
+                    status: ToolStatus::Succeeded,
+                },
+            ),
+            item(
+                "create",
+                ItemContent::Command {
+                    label: String::new(),
+                    command: "gh pr create --fill".into(),
+                    working_directory: "/w/app/.worktrees/feat".into(),
+                    action: CommandAction::Run,
+                    status: ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    output: "https://github.com/me/repo/pull/1\n".into(),
+                },
+            ),
+        ],
+        ..Snapshot::default()
+    };
+    let mut items = Items::default();
+    let mut found = Vec::new();
+    items.read(&snapshot, &mut found);
+    let facts = facts("/w/app");
+    let mut watched = Watched::new();
+    watched.source = Source::Recorded("session".into());
+    watched.apply(
+        Scanned {
+            found,
+            coverage: items.coverage(),
+        },
+        Some(&facts),
+    );
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(list.transcript, TranscriptCoverage::Complete);
+    assert_eq!(rows(&list), vec![(1, Relation::Created, false, false)]);
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/feat", Some(1))]
+    );
+}
