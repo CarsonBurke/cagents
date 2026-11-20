@@ -5,6 +5,9 @@ use crate::daemon::holder_registry::{self as registry, Kind};
 #[derive(Clone)]
 pub(in crate::host) struct NativeClose {
     source: Session,
+    /// `source` as its provider has named it since launch, which a closing
+    /// pane may name instead.
+    named: Session,
     owner: chat::native_holder::Detached,
     closed: bool,
     paired: Option<RetainedPair>,
@@ -13,6 +16,10 @@ pub(in crate::host) struct NativeClose {
 impl NativeClose {
     pub(in crate::host) fn source(&self) -> &Session {
         &self.source
+    }
+
+    pub(in crate::host) fn named(&self) -> &Session {
+        &self.named
     }
 
     /// A retained close of `source`'s unpaired owner, as Close records it once
@@ -24,11 +31,19 @@ impl NativeClose {
         closed: bool,
     ) -> Self {
         Self {
+            named: source.clone(),
             source,
             owner,
             closed,
             paired: None,
         }
+    }
+
+    /// This close with its conversation as its provider named it.
+    #[cfg(test)]
+    pub(in crate::host) fn named_as(mut self, named: Session) -> Self {
+        self.named = named;
+        self
     }
 
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
@@ -116,7 +131,7 @@ fn close_retained_inner(
             };
         }
     }
-    let (proof, pending, actor) = {
+    let (proof, pending, actor, named) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
             || if let Some(closing) = closing {
@@ -147,9 +162,7 @@ fn close_retained_inner(
             }
             // Identity/continuity are cached actor metadata; never hydrate a
             // potentially remote transcript while holding HostState.
-            let mut observed = record.session.clone();
-            observed.launch.session_id = record.handle.session_id();
-            observed.native_continuity = record.handle.native_continuity();
+            let observed = record.current_session();
             if record.session != *source
                 && observed != *source
                 && !state
@@ -165,6 +178,10 @@ fn close_retained_inner(
         } else {
             None
         };
+        let named = state
+            .chats
+            .get(&source.id)
+            .map_or_else(|| source.clone(), super::Record::current_session);
         let pending = state.native_closing.get(&source.id).cloned();
         if pending
             .as_ref()
@@ -182,7 +199,7 @@ fn close_retained_inner(
             state.chat_spawning.insert(source.id, source.clone());
             state.inventory_generation += 1;
         }
-        (state.proof().clone(), pending, actor)
+        (state.proof().clone(), pending, actor, named)
     };
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
@@ -217,6 +234,7 @@ fn close_retained_inner(
                 let (record, _) = receipt.unwrap();
                 let pending = NativeClose {
                     source: source.clone(),
+                    named: named.clone(),
                     owner: chat::native_holder::Detached::from_receipt(record, source.clone(), proof.clone())?,
                     closed: true,
                     paired: retained_pair(
@@ -252,6 +270,7 @@ fn close_retained_inner(
                 let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
                 let pending = NativeClose {
                     source: source.clone(),
+                    named: named.clone(),
                     owner: holder.preserve(),
                     closed: false,
                     paired,

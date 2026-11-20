@@ -1999,10 +1999,9 @@ pub(super) fn shared_removal_in_transition(
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state
-            .native_closing
-            .values()
-            .any(|closing| claims(closing.source()) && !same(closing.source()))
+        || state.native_closing.values().any(|closing| {
+            claims(closing.source()) && !(same(closing.source()) || same(closing.named()))
+        })
 }
 
 /// Why a native start that built its provider may no longer publish it.
