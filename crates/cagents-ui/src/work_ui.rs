@@ -1586,7 +1586,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn non_utf8_branch_copy_is_disabled_without_affecting_the_literal_label() {
-        let mut invalid = item("legacy-\u{fffd}", "cagents");
+        let mut invalid = item(r"legacy-\xFF", "cagents");
         invalid.key = ItemKey::Branch(":6c65676163792dff".into());
         assert!(copy_branch_action(&invalid).is_none());
 

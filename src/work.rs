@@ -168,6 +168,19 @@ pub fn branch_name(identity: &str) -> OsString {
     }
 }
 
+/// Shows valid UTF-8 unchanged and escapes each invalid byte as `\xNN`.
+pub fn branch_display(branch: &OsStr) -> String {
+    let mut display = String::with_capacity(branch.as_encoded_bytes().len());
+    for chunk in branch.as_encoded_bytes().utf8_chunks() {
+        display.push_str(chunk.valid());
+        for byte in chunk.invalid() {
+            use std::fmt::Write;
+            write!(&mut display, "\\x{byte:02X}").expect("writing to a String");
+        }
+    }
+    display
+}
+
 impl ItemKey {
     /// The durable text form: `branch:NAME` or `worktree:PATH`.
     pub fn storage_key(&self) -> String {
@@ -439,7 +452,7 @@ impl Item {
     /// The text that names this card on the command line.
     pub fn label(&self) -> String {
         match &self.key {
-            ItemKey::Branch(name) => branch_name(name).to_string_lossy().into_owned(),
+            ItemKey::Branch(name) => branch_display(&branch_name(name)),
             ItemKey::Worktree(path) => path.display().to_string(),
         }
     }
@@ -1254,10 +1267,28 @@ mod tests {
         assert_eq!(branch_name(&identity), raw);
         assert_ne!(identity, branch_identity(OsStr::new("legacy-\u{fffd}")));
         assert_eq!(branch_name(&format!("{identity}:checkout")), raw);
-        assert_eq!(branch_name(&identity).to_string_lossy(), "legacy-\u{fffd}");
+        assert_eq!(branch_display(&branch_name(&identity)), r"legacy-\xFF");
         assert_eq!(
             ItemKey::from_storage_key(&ItemKey::Branch(identity.clone()).storage_key()),
             Some(ItemKey::Branch(identity))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_display_preserves_valid_utf8_and_escapes_each_invalid_byte() {
+        use std::os::unix::ffi::OsStrExt;
+
+        for (bytes, expected) in [
+            (b"legacy-\xff".as_slice(), r"legacy-\xFF"),
+            ("legacy-\u{fffd}".as_bytes(), "legacy-\u{fffd}"),
+            (b"legacy-\xf0\x90\x80", r"legacy-\xF0\x90\x80"),
+            (
+                b"caf\xc3\xa9-\xff-\xe6\x9e\x9d-\xe2\x82",
+                "café-\\xFF-枝-\\xE2\\x82",
+            ),
+        ] {
+            assert_eq!(branch_display(OsStr::from_bytes(bytes)), expected);
+        }
     }
 }

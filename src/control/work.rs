@@ -1867,15 +1867,16 @@ mod tests {
         );
     }
     #[test]
-    fn non_utf8_card_json_preserves_the_action_identifier_and_lossy_label() {
-        let mut invalid = card("legacy-\u{fffd}", Column::InProgress);
+    fn non_utf8_card_json_preserves_the_action_identifier_and_escaped_label() {
+        let mut invalid = card(r"legacy-\xFF", Column::InProgress);
         invalid.key = ItemKey::Branch(":6c65676163792dff".into());
         let literal = card("legacy-\u{fffd}", Column::InProgress);
         let raw = card_json(&invalid, None, Detail::Sparse);
         let text = card_json(&literal, None, Detail::Sparse);
         assert_eq!(raw["card"], "branch::6c65676163792dff");
-        assert_eq!(raw["branch"], "legacy-\u{fffd}");
+        assert_eq!(raw["branch"], r"legacy-\xFF");
         assert_ne!(raw["card"], text["card"]);
-        assert_eq!(row(&invalid, None, 0)[0], "legacy-\u{fffd}");
+        assert_ne!(raw["branch"], text["branch"]);
+        assert_eq!(row(&invalid, None, 0)[0], r"legacy-\xFF");
     }
 }

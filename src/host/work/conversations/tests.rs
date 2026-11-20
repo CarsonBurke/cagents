@@ -996,7 +996,7 @@ fn a_conversation_with_no_transcript_yet_reads_as_complete_once_looked_for() {
 }
 
 #[test]
-fn invalid_branch_identity_is_displayed_lossily_without_a_forge_query() {
+fn invalid_branch_identity_is_displayed_with_escapes_without_a_forge_query() {
     let identity = ":6c65676163792dff";
     let mut facts = facts("/w/app");
     let project = facts.project.as_mut().unwrap();
@@ -1010,6 +1010,6 @@ fn invalid_branch_identity_is_displayed_lossily_without_a_forge_query() {
     let project = facts.project.as_ref().unwrap();
     let worktrees = edited_worktrees(&watched, project, |_| None);
     assert_eq!(worktrees.len(), 1);
-    assert_eq!(worktrees[0].branch.as_deref(), Some("legacy-\u{fffd}"));
+    assert_eq!(worktrees[0].branch.as_deref(), Some(r"legacy-\xFF"));
     assert!(worktrees[0].pull_request.is_none());
 }

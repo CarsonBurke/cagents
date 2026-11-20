@@ -1358,11 +1358,10 @@ fn edited_worktrees(
         .into_iter()
         .map(|(worktree, edit)| ConversationWorktree {
             path: worktree.path.clone(),
-            branch: worktree.branch.as_deref().map(|name| {
-                crate::work::branch_name(name)
-                    .to_string_lossy()
-                    .into_owned()
-            }),
+            branch: worktree
+                .branch
+                .as_deref()
+                .map(|name| crate::work::branch_display(&crate::work::branch_name(name))),
             by_subagent: edit.by_subagent,
             changed_paths: worktree.dirty.as_ref().map(|dirty| dirty.paths),
             // Filled in from what was measured, which the scan does not hold.

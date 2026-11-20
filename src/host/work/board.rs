@@ -171,11 +171,10 @@ fn project_items(
             }
             let mut item = new_item(
                 key,
-                worktree.branch.as_deref().map(|name| {
-                    crate::work::branch_name(name)
-                        .to_string_lossy()
-                        .into_owned()
-                }),
+                worktree
+                    .branch
+                    .as_deref()
+                    .map(|name| crate::work::branch_display(&crate::work::branch_name(name))),
             );
             item.worktree = Some(Worktree {
                 path: worktree.path.clone(),
@@ -247,11 +246,7 @@ fn project_items(
             carded.insert(name.clone());
             let mut item = new_item(
                 ItemKey::Branch(name.clone()),
-                Some(
-                    crate::work::branch_name(name)
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
+                Some(crate::work::branch_display(&crate::work::branch_name(name))),
             );
             item.comparison = branch.comparison.clone();
             item.head = Some(head);
@@ -290,11 +285,7 @@ fn project_items(
             carded.insert(name.clone());
             let mut item = new_item(
                 ItemKey::Branch(name.clone()),
-                Some(
-                    crate::work::branch_name(name)
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
+                Some(crate::work::branch_display(&crate::work::branch_name(name))),
             );
             item.pull_request = Some(convert(pull_request, false));
             item.linear = branch_ticket(name, context.tickets);
@@ -922,13 +913,13 @@ mod tests {
                 if primary.is_some() {
                     fixture.local.worktrees.push(checkout);
                 }
-                let display = crate::work::branch_name(identity)
+                let pr_branch = crate::work::branch_name(identity)
                     .to_string_lossy()
                     .into_owned();
                 // GitHub cannot have an invalid-UTF-8 head branch. A PR under
-                // its lossy display name belongs to a different, valid branch.
+                // its lossy name belongs to a different, valid branch.
                 fixture.snapshot = snapshot(if open_pr {
-                    vec![pull_request(&display, &head.oid, "OPEN", false)]
+                    vec![pull_request(&pr_branch, &head.oid, "OPEN", false)]
                 } else {
                     Vec::new()
                 });
@@ -956,6 +947,7 @@ mod tests {
                     .find(|item| item.key == ItemKey::Branch(identity.into()));
                 present[index] = card.is_some();
                 if let Some(card) = card {
+                    let display = crate::work::branch_display(&crate::work::branch_name(identity));
                     assert_eq!(card.branch.as_deref(), Some(display.as_str()));
                     assert_eq!(card.pull_request.is_some(), open_pr && index == 0);
                 }
@@ -983,12 +975,12 @@ mod tests {
         let raw = board
             .items
             .iter()
-            .filter(|item| item.branch.as_deref() == Some("legacy-\u{fffd}"))
+            .filter(|item| item.branch.as_deref() == Some(r"legacy-\xFF"))
             .collect::<Vec<_>>();
         assert_eq!(raw.len(), 2);
         assert_ne!(raw[0].key, raw[1].key);
         for card in raw {
-            assert_eq!(card.label(), "legacy-\u{fffd}");
+            assert_eq!(card.label(), r"legacy-\xFF");
             assert_eq!(card.head.as_ref().unwrap().oid, "raw-oid");
             assert!(card.pull_request.is_none());
             assert!(!card.worktree.as_ref().unwrap().primary);
@@ -1007,7 +999,7 @@ mod tests {
         let raw = board
             .items
             .iter()
-            .find(|item| item.branch.as_deref() == Some("legacy-\u{fffd}"))
+            .find(|item| item.branch.as_deref() == Some(r"legacy-\xFF"))
             .unwrap();
         assert!(raw.worktree.as_ref().unwrap().primary);
         assert_eq!(raw.worktree.as_ref().unwrap().path, Path::new("/repo"));

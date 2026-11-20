@@ -2145,8 +2145,11 @@ mod tests {
         };
         let raw_card = card_at(&legacy);
         let literal_card = card_at(&literal);
-        assert_eq!(raw_card.branch.as_deref(), Some(literal_name));
+        assert_eq!(raw_card.branch.as_deref(), Some(r"legacy-\xFF"));
         assert_eq!(literal_card.branch.as_deref(), Some(literal_name));
+        assert_eq!(raw_card.label(), r"legacy-\xFF");
+        assert_eq!(literal_card.label(), literal_name);
+        assert_ne!(raw_card.label(), literal_card.label());
         assert_ne!(raw_card.key, literal_card.key);
         assert_eq!(raw_card.head.as_ref().unwrap().oid, legacy_head);
         assert_eq!(literal_card.head.as_ref().unwrap().oid, literal_head);
