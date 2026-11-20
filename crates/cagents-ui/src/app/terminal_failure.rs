@@ -1,6 +1,7 @@
 //! Bounded terminal diagnostics and current, descriptor-authorized folder actions.
 use super::*;
 use crate::{control::ControlClient, model::TranscriptMetadata, transcript_location};
+use std::borrow::Cow;
 use std::ops::Deref;
 
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ pub(super) struct Details {
     cwd: String,
     worktree: Option<crate::model::WorktreeId>,
     exit: Option<crate::model::TerminalExit>,
-    consequence: &'static str,
+    consequence: Cow<'static, str>,
     /// Why the last Retry started nothing, in place of what Retry would do.
     retry_refusal: Option<String>,
 }
@@ -145,77 +146,106 @@ const OUTPUT_GOES_WITH_RETRY: &str = "Retry replaces this terminal. Its saved ou
 const OUTPUT_MAY_GO_WITH_RETRY: &str = "If Retry replaces this terminal, its saved output is deleted the next time Cagents starts, so copy it from the transcript folder first if you need it.";
 const RETRY_FRESH: &str = "Retry runs the saved command again from the beginning in this pane.";
 const RETRY_RESUME: &str = "Retry resumes the saved conversation in this pane.";
-const RETRY_PICKER: &str = "Retry opens the agent's conversation picker in this pane.";
+/// Retry opens the provider's picker, as recovery does for an agent whose
+/// exact conversation cagents couldn't confirm.
+fn retry_picker(provider: &str) -> String {
+    format!(
+        "Retry opens {provider}'s conversation picker. cagents couldn't confirm which conversation this terminal was last in, so it can't resume it directly."
+    )
+}
+fn retry_after_restoring_picker(provider: &str) -> String {
+    format!(
+        "Once restoring has finished, Retry opens {provider}'s conversation picker in this pane. cagents couldn't confirm which conversation this terminal was last in, so it can't resume it directly."
+    )
+}
 const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
-/// What Retry launches for a terminal with no live process to reconcile.
+/// What Retry launches in place of a terminal.
 enum NewTerminal {
     Resume,
+    /// The provider's picker, named by its label.
+    Picker(&'static str),
     Shell,
     Fresh,
 }
+/// What recovery launches once a terminal's daemon is gone.
+fn recovered_terminal(session: &TerminalSession) -> NewTerminal {
+    match crate::upgrade::recovery_plan(session) {
+        Ok((_, crate::upgrade::RecoveryKind::Exact)) => NewTerminal::Resume,
+        Ok((recipe, crate::upgrade::RecoveryKind::Picker)) => NewTerminal::Picker(
+            crate::agent::Provider::recognize_launch(&recipe).map_or("the agent", |p| p.label()),
+        ),
+        Ok((_, crate::upgrade::RecoveryKind::Shell)) => NewTerminal::Shell,
+        Err(_) => NewTerminal::Fresh,
+    }
+}
+/// What Retry launches in place of a terminal with no live process, which
+/// follows the recovery plan only when the agent's current launch was observed.
 fn new_terminal(session: &TerminalSession) -> NewTerminal {
-    if session.agent_resume_recipe().is_some() {
+    if super::relaunch_follows_recovery_plan(session) {
+        recovered_terminal(session)
+    } else if session.agent_resume_recipe().is_some() {
         NewTerminal::Resume
-    } else if matches!(
-        crate::upgrade::recovery_plan(session),
-        Ok((_, crate::upgrade::RecoveryKind::Shell))
-    ) {
+    } else if matches!(recovered_terminal(session), NewTerminal::Shell) {
         NewTerminal::Shell
     } else {
         NewTerminal::Fresh
     }
 }
-fn new_terminal_consequence(session: &TerminalSession) -> &'static str {
+fn new_terminal_consequence(session: &TerminalSession) -> Cow<'static, str> {
     match new_terminal(session) {
-        NewTerminal::Resume => RETRY_RESUME,
-        NewTerminal::Shell => RETRY_SHELL,
-        NewTerminal::Fresh => RETRY_FRESH,
+        NewTerminal::Resume => RETRY_RESUME.into(),
+        NewTerminal::Picker(provider) => retry_picker(provider).into(),
+        NewTerminal::Shell => RETRY_SHELL.into(),
+        NewTerminal::Fresh => RETRY_FRESH.into(),
     }
 }
 /// What Retry will do once the daemon has restored its terminals. A pane with a
 /// live proof can find its terminal among them; one without starts a new one.
-fn restoring_consequence(session: &TerminalSession) -> &'static str {
+fn restoring_consequence(session: &TerminalSession) -> Cow<'static, str> {
     if session.continuity.live_proof().is_some() {
-        return RETRY_AFTER_RESTORING;
+        return RETRY_AFTER_RESTORING.into();
     }
     match new_terminal(session) {
-        NewTerminal::Resume => RETRY_AFTER_RESTORING_RESUME,
-        NewTerminal::Shell => RETRY_AFTER_RESTORING_SHELL,
-        NewTerminal::Fresh => RETRY_AFTER_RESTORING_FRESH,
+        NewTerminal::Resume => RETRY_AFTER_RESTORING_RESUME.into(),
+        NewTerminal::Picker(provider) => retry_after_restoring_picker(provider).into(),
+        NewTerminal::Shell => RETRY_AFTER_RESTORING_SHELL.into(),
+        NewTerminal::Fresh => RETRY_AFTER_RESTORING_FRESH.into(),
     }
 }
 /// What Retry does for a terminal whose daemon is gone: the plan recovery will
 /// actually follow, which is not always the saved command.
-fn replacement_consequence(session: &TerminalSession) -> &'static str {
-    match crate::upgrade::recovery_plan(session) {
-        Ok((_, crate::upgrade::RecoveryKind::Exact)) => RETRY_RESUME,
-        Ok((_, crate::upgrade::RecoveryKind::Picker)) => RETRY_PICKER,
-        Ok((_, crate::upgrade::RecoveryKind::Shell)) => RETRY_SHELL,
-        Err(_) => RETRY_FRESH,
+fn replacement_consequence(session: &TerminalSession) -> Cow<'static, str> {
+    match recovered_terminal(session) {
+        NewTerminal::Resume => RETRY_RESUME.into(),
+        NewTerminal::Picker(provider) => retry_picker(provider).into(),
+        NewTerminal::Shell => RETRY_SHELL.into(),
+        NewTerminal::Fresh => RETRY_FRESH.into(),
     }
 }
 /// The same plan, once Retry has established that the process is gone.
 fn after_check_consequence(session: &TerminalSession) -> &'static str {
-    match replacement_consequence(session) {
-        RETRY_RESUME => {
+    match recovered_terminal(session) {
+        NewTerminal::Resume => {
             "Retry checks that it has stopped, then resumes the saved conversation in this pane."
         }
-        RETRY_PICKER => {
+        NewTerminal::Picker(_) => {
             "Retry checks that it has stopped, then opens the agent's conversation picker in this pane."
         }
-        RETRY_SHELL => "Retry checks that it has stopped, then starts a new shell in this pane.",
-        _ => {
+        NewTerminal::Shell => {
+            "Retry checks that it has stopped, then starts a new shell in this pane."
+        }
+        NewTerminal::Fresh => {
             "Retry checks that it has stopped, then runs the saved command again from the beginning in this pane."
         }
     }
 }
 /// What Retry will do once the terminal holding this work has stopped.
 fn blocked_consequence(session: &TerminalSession) -> &'static str {
-    match replacement_consequence(session) {
-        RETRY_RESUME => RETRY_BLOCKED_RESUME,
-        RETRY_PICKER => RETRY_BLOCKED_PICKER,
-        RETRY_SHELL => RETRY_BLOCKED_SHELL,
-        _ => RETRY_BLOCKED_FRESH,
+    match recovered_terminal(session) {
+        NewTerminal::Resume => RETRY_BLOCKED_RESUME,
+        NewTerminal::Picker(_) => RETRY_BLOCKED_PICKER,
+        NewTerminal::Shell => RETRY_BLOCKED_SHELL,
+        NewTerminal::Fresh => RETRY_BLOCKED_FRESH,
     }
 }
 /// What a pane says once Retry was refused for this missing terminal, when
@@ -270,13 +300,13 @@ fn is_missing_terminal(code: &str) -> bool {
             | "terminal_superseded"
     )
 }
-fn missing_terminal_consequence(code: &str, session: &TerminalSession) -> &'static str {
+fn missing_terminal_consequence(code: &str, session: &TerminalSession) -> Cow<'static, str> {
     match code {
         "terminals_restoring" => restoring_consequence(session),
-        "terminal_moved" => RECONNECT,
-        "terminal_retired" => RETRY_BLOCKED_RETIRED,
-        "terminal_superseded" => blocked_consequence(session),
-        "terminal_daemon_restarted" => after_check_consequence(session),
+        "terminal_moved" => RECONNECT.into(),
+        "terminal_retired" => RETRY_BLOCKED_RETIRED.into(),
+        "terminal_superseded" => blocked_consequence(session).into(),
+        "terminal_daemon_restarted" => after_check_consequence(session).into(),
         _ if session.continuity.live_proof().is_none() => new_terminal_consequence(session),
         _ => replacement_consequence(session),
     }
@@ -329,7 +359,7 @@ impl Details {
     fn expects_no_launch(&self) -> bool {
         self.retry_refusal.is_some()
             || matches!(
-                self.consequence,
+                self.consequence.as_ref(),
                 RETRY_REFUSED
                     | RETRY_BLOCKED_RETIRED
                     | RETRY_BLOCKED_RESUME
@@ -345,14 +375,14 @@ impl Details {
             "Launching terminal…"
         }
     }
-    fn attempt_caption(&self) -> &'static str {
+    fn attempt_caption(&self) -> &str {
         if self.code == "terminals_restoring" {
             // What it will do once restoring has finished isn't known yet.
             "Checking whether restoring has finished."
         } else if self.expects_no_launch() {
             "Trying again."
         } else {
-            self.consequence
+            &self.consequence
         }
     }
     /// A press that replaces the terminal leaves only its next launch's prune
@@ -408,7 +438,7 @@ impl Details {
         let consequence = if pane_explains(code) {
             missing_terminal_consequence(code, session)
         } else if session.continuity.live_proof().is_some() {
-            RECONNECT
+            RECONNECT.into()
         } else {
             new_terminal_consequence(session)
         };
@@ -430,7 +460,7 @@ impl Details {
             self.message,
             self.terminal,
             self.cwd,
-            self.retry_refusal.as_deref().unwrap_or(self.consequence)
+            self.retry_refusal.as_deref().unwrap_or(&self.consequence)
         );
         if let Some(worktree) = self.worktree {
             text.push_str(&format!("\nWorktree: {worktree}"));
@@ -668,9 +698,9 @@ impl Cagents {
         if self.pending_terminal_reservation(card).is_some() {
             // Retry completes the accepted start, reusing its worker when it
             // exists. A pending recipe is not a fresh relaunch instruction.
-            details.consequence = RETRY_PENDING;
+            details.consequence = RETRY_PENDING.into();
         } else if self.completed_terminal_has_native_owner(card) {
-            details.consequence = NATIVE_OWNER;
+            details.consequence = NATIVE_OWNER.into();
         }
         // An explicitly filed card can name its known worktree. A launch
         // directory alone does not invent ownership or a diagnostic identity.
@@ -837,7 +867,7 @@ impl Cagents {
         let next = details
             .retry_refusal
             .clone()
-            .unwrap_or_else(|| details.consequence.to_owned());
+            .unwrap_or_else(|| details.consequence.to_string());
         let mut rows: Vec<Element<'_, Message>> = vec![design::body(next).into()];
         if let Some(warning) = warning {
             rows.push(design::body(warning).into());
@@ -1164,12 +1194,12 @@ impl Cagents {
                         // this terminal, so it keeps saying so.
                         details.code = prior.code;
                         details.message = prior.message;
-                        details.consequence = prior.consequence;
+                        details.consequence = prior.consequence.clone();
                     }
-                    let (code, consequence, message) =
-                        (details.code, details.consequence, details.message);
+                    let (code, message) = (details.code, details.message);
+                    let consequence = details.consequence.clone();
                     details.retry_refusal =
-                        Some(readable.unwrap_or_else(|| refused_text(code, consequence)));
+                        Some(readable.unwrap_or_else(|| refused_text(code, &consequence)));
                     self.status = Some(
                         TransientNotice::error(terminal_notice(
                             pane.as_deref(),
@@ -1181,7 +1211,7 @@ impl Cagents {
                 } else {
                     if details.consequence == RECONNECT {
                         // Having just failed to reattach, it must not suggest doing so.
-                        details.consequence = RETRY_REFUSED;
+                        details.consequence = RETRY_REFUSED.into();
                     }
                     details.retry_refusal = readable;
                 }
@@ -1341,10 +1371,7 @@ mod tests {
                 agent(&["--resume", "12345678-1234-4234-8234-123456789abc"]),
                 RETRY_RESUME,
             ),
-            (
-                agent(&[]),
-                "Retry opens the agent's conversation picker in this pane.",
-            ),
+            (agent(&[]), retry_picker("Claude Code").as_str()),
             (
                 LaunchRecipe::shell(cwd.clone()).unwrap(),
                 "Retry starts a new shell in this pane.",
@@ -1478,9 +1505,9 @@ mod tests {
     fn a_repeated_retry_does_not_show_the_last_refusal_as_its_progress() {
         let (_, _, session) = app_and_session();
         let mut details = Details::capture(&session, None);
-        details.consequence = RETRY_REFUSED;
+        details.consequence = RETRY_REFUSED.into();
         assert_eq!(details.attempt_caption(), "Trying again.");
-        details.consequence = RETRY_RESUME;
+        details.consequence = RETRY_RESUME.into();
         assert_eq!(details.attempt_caption(), RETRY_RESUME);
     }
     #[test]
@@ -1771,7 +1798,7 @@ mod tests {
         let (mut app, card, _) = app_and_session();
         app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
         let mut details = app.terminal_details(card).unwrap();
-        details.consequence = NATIVE_OWNER;
+        details.consequence = NATIVE_OWNER.into();
         assert_eq!(details.output_warning(), None);
     }
     #[test]
@@ -1840,6 +1867,52 @@ mod tests {
         session.launch = LaunchRecipe::shell(session.launch.working_directory.clone()).unwrap();
         assert!(after_check_consequence(&session).contains("starts a new shell"));
         assert_eq!(new_terminal_consequence(&session), RETRY_SHELL);
+    }
+    #[test]
+    fn retry_names_the_picker_it_opens_for_a_conversation_it_cannot_confirm() {
+        let (mut app, card, _) = app_and_session();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.launch.program = "claude".into();
+        session.launch.arguments = vec![
+            "--resume".into(),
+            "a1b2c3d4-1111-4111-8111-123456789abc".into(),
+        ];
+        let exact = crate::model::agent_recovery::resume_recipe(&session.launch).unwrap();
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        // Recognition-only evidence: the agent is still Claude, but which
+        // conversation it was last in is withheld.
+        session.resume_hint =
+            Some(serde_json::json!({"version": 2, "recipe": session.launch}).to_string());
+        let picker = crate::model::agent_recovery::picker_recipe(&session.launch).unwrap();
+        assert!(matches!(
+            super::super::terminal_start_mode(session),
+            Ok(super::super::TerminalStartMode::Spawn(recipe)) if recipe == picker
+        ));
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        assert_eq!(
+            app.terminal_details(card).unwrap().consequence,
+            retry_picker("Claude Code")
+        );
+
+        // With the exact conversation saved, Retry resumes it as before.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.resume_hint = None;
+        assert!(matches!(
+            super::super::terminal_start_mode(session),
+            Ok(super::super::TerminalStartMode::Spawn(recipe)) if recipe == exact
+        ));
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        assert_eq!(
+            app.terminal_details(card).unwrap().consequence,
+            RETRY_RESUME
+        );
     }
     #[test]
     fn a_refused_retry_does_not_suggest_reconnecting() {
