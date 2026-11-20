@@ -72,8 +72,8 @@ pub(super) struct Local {
     pub root: Option<PathBuf>,
     pub base: Option<Base>,
     pub worktrees: Vec<Worktree>,
-    /// Branches checked out in worktrees, named by the user's pull requests,
-    /// or carrying a non-UTF-8 name: the branches that can earn a card.
+    /// Branches checked out in worktrees or named by the user's pull requests:
+    /// the branches that can earn a card.
     pub branches: BTreeMap<String, Branch>,
     /// Every local branch name, for telling remote-only pull requests apart.
     pub branch_names: BTreeSet<String>,
@@ -293,18 +293,16 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         }
     }
 
-    // Which local branches might earn a card. Measuring every branch of a
-    // large repository costs seconds; these are a handful.
+    // Only checked-out branches or those named by pull requests might earn a
+    // card, regardless of name encoding. Measuring every branch of a large
+    // repository costs seconds; these are a handful.
     let checked_out = worktrees
         .iter()
         .filter_map(|worktree| worktree.branch.as_deref())
         .collect::<BTreeSet<_>>();
     let mut branches = BTreeMap::new();
     for (name, tip) in &local_tips {
-        if checked_out.contains(name.as_str())
-            || hints.branches.contains(name)
-            || tip.refname.to_str().is_none()
-        {
+        if checked_out.contains(name.as_str()) || hints.branches.contains(name) {
             branches.insert(
                 name.to_owned(),
                 Branch {
@@ -676,6 +674,54 @@ mod tests {
             cancellation: &CancellationToken::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn unchecked_out_branches_without_pull_requests_are_not_divergence_candidates() {
+        let fixture = fixture();
+        let head = git(
+            &fixture.root,
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "unchecked-out",
+            ],
+        )
+        .trim()
+        .to_owned();
+        git(&fixture.root, &["update-ref", "refs/heads/theirs", &head]);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .arg("update-ref")
+            .arg(OsStr::from_bytes(b"refs/heads/theirs-\xff"))
+            .arg(&head)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git update-ref: {output:?}");
+
+        let local = run(&fixture, None, &git_watch::Change::default());
+        let invalid_name = branch_identity(OsStr::from_bytes(b"theirs-\xff"));
+        for name in ["theirs", invalid_name.as_str()] {
+            assert!(
+                local.branch_names.contains(name),
+                "{name} stays in the census"
+            );
+            assert!(
+                !local.branches.contains_key(name),
+                "{name} has neither a checkout nor a pull request"
+            );
+        }
+        let base = local.base.as_ref().unwrap();
+        assert!(!local.divergence.contains_key(&(head, base.oid.clone())));
     }
 
     #[test]
