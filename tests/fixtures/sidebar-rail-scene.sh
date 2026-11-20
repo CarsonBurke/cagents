@@ -51,6 +51,9 @@
 # the rail mixes avatar images with initials. The avatars are generated
 # identicons: no real account's image is involved.
 set -euo pipefail
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 
 here=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 # The tool may come from another checkout, so this scene can be copied out of
@@ -269,6 +272,8 @@ EOF
 }
 
 cmd_unreachable() {
+    require_fixture_home HOME "$seed/home"
+    require_fixture_home XDG_CONFIG_HOME "$seed/config"
     # A folder moved while a session runs is noticed only at the next load,
     # so this edits the seed every session starts from.
     [ -d "$seed" ] || { echo "save the seed first" >&2; return 1; }
@@ -276,6 +281,8 @@ cmd_unreachable() {
 }
 
 cmd_theme() {
+    require_fixture_home HOME "$seed/home"
+    require_fixture_home XDG_CONFIG_HOME "$seed/config"
     # The seed holds no settings until something is changed in Settings, and
     # a document naming only its schema and the theme leaves the rest at their
     # defaults.

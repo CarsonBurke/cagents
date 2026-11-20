@@ -227,6 +227,7 @@ class ReviewEvidence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / '.rehearse-update').write_text(str(root))
+            (root / ".cagents-fixture-root").touch()
             state = root / 'home/.local/share/cagents-install/.update'
             state.mkdir(parents=True)
             (root / 'retry/first').mkdir(parents=True)
@@ -266,6 +267,7 @@ class ReviewEvidence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / '.rehearse-update').write_text(str(root))
+            (root / ".cagents-fixture-root").touch()
             (root / 'retry/first').mkdir(parents=True)
             # The child outlasts the hang guard, so the helper returning at all
             # shows it ended the child instead of waiting for an answer.
@@ -282,6 +284,7 @@ class FaultRelease(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        (self.root / ".cagents-fixture-root").touch()
         self.candidate = self.root / 'home/.local/share/cagents-install/versions/new'
         (self.root / '.fixture').mkdir()
         (self.root / 'retry/first').mkdir(parents=True)

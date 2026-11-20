@@ -15,13 +15,16 @@ import shutil
 import subprocess
 import time
 
+from fixture_home import require_fixture_home
+
 
 def check(home, cwd, codex="codex", limit=20, log=print):
+    home = str(require_fixture_home("HOME", home))
+    codex_home = str(require_fixture_home("CODEX_HOME", os.path.join(home, ".codex")))
     executable = shutil.which(codex)
     if executable is None:
         log("No codex executable on PATH; skipping the Codex read-back check.")
         return None
-    codex_home = os.path.join(home, ".codex")
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "CODEX_HOME": codex_home,
            "LANG": "C.UTF-8"}
     process = subprocess.Popen([executable, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,

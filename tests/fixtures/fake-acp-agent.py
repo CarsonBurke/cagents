@@ -8,8 +8,8 @@ copy the shapes of Antigravity 1.5.12's and Muse 1.4.23's `initialize` and
 `muse` or `muse-upstream` or with FAKE_ACP_SHAPE=muse. Any command-line
 arguments, such as `acp --disable-telemetry`, are accepted and ignored.
 
-Each conversation is saved under FAKE_ACP_STATE (default: a directory in
-the system's temporary directory) as the session updates it sent, so
+Each conversation is saved under the explicitly supplied FAKE_ACP_STATE
+inside a marked fixture home as the session updates it sent, so
 `session/load` replays it and `session/list` lists it.
 
 The prompt chooses the turn, by the first of these words it contains as a
@@ -46,12 +46,21 @@ In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
 account commands. Signing out lasts, as a file under FAKE_ACP_STATE, until
 `login`.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import json
 import os
 import queue
 import re
-import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -59,11 +68,8 @@ import uuid
 SHAPE = os.environ.get("FAKE_ACP_SHAPE") or (
     "muse" if os.path.basename(sys.argv[0]).startswith("muse") else "agy"
 )
-# Never a real data directory: without FAKE_ACP_STATE, conversations last
-# only as long as the temporary directory does.
-STATE = os.environ.get("FAKE_ACP_STATE") or os.path.join(
-    tempfile.gettempdir(), f"fake-acp-agent-{os.getuid()}"
-)
+# State locations are explicit; no temporary or account-home fallback.
+STATE = os.environ.get("FAKE_ACP_STATE")
 AUTH = os.environ.get("FAKE_ACP_AUTH", "")
 LOG = os.environ.get("FAKE_ACP_LOG")
 
@@ -594,6 +600,10 @@ def command_line(arguments):
 
 
 if __name__ == "__main__":
+    require_fixture_home("HOME")
+    STATE = str(require_fixture_home("FAKE_ACP_STATE"))
+    if LOG:
+        LOG = str(require_fixture_home("FAKE_ACP_LOG", LOG))
     status = command_line(sys.argv[1:])
     if status is not None:
         sys.exit(status)

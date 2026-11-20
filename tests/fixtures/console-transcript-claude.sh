@@ -2,6 +2,8 @@
 # A provider that streams its answer and runs tools with large outputs, the
 # shape a console has to reduce to what the agent said and one line per step.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home CLAUDE_CONFIG_DIR
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 while [ "$#" -gt 0 ]; do
   case "$1" in

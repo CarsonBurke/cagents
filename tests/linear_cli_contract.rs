@@ -43,7 +43,13 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("bin")).unwrap();
+        fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
+        fs::create_dir_all(root.path().join("bin/lib")).unwrap();
+        fs::write(
+            root.path().join("bin/lib/fixture-home.sh"),
+            include_str!("fixtures/lib/fixture-home.sh"),
+        )
+        .unwrap();
         fs::write(
             root.path().join("bin/curl"),
             include_bytes!("fixtures/linear-curl.sh"),

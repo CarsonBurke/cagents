@@ -23,6 +23,13 @@ fn isolated(name: &str) -> Option<PathBuf> {
     }
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
+    fs::write(root.join(".cagents-fixture-root"), "").unwrap();
+    fs::create_dir(root.join("scripts")).unwrap();
+    fs::write(
+        root.join("scripts/fixture_home.py"),
+        include_str!("../../../scripts/fixture_home.py"),
+    )
+    .unwrap();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
     for path in [
         "home/.codex",

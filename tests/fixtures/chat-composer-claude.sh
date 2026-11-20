@@ -6,12 +6,14 @@
 # turn instead finishes by itself that long after it starts, as real work
 # does, unless it is interrupted first.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home CLAUDE_CONFIG_DIR
 
 if [ "${1:-}" = --version ]; then
     printf '%s\n' '2.1.286 (Claude Code fixture)'
     exit 0
 fi
-config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+config=$fixture_home_resolved
 if [ "${1:-}" = auth ]; then
     if [ -f "$config/fixture-auth-status.json" ]; then
         cat "$config/fixture-auth-status.json"

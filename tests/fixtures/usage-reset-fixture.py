@@ -4,6 +4,17 @@
 All state is under an owned private fixture root. No real provider executable,
 credential store or network service is used. Run `seed ROOT`, then `serve ROOT`.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 import contextlib
 import copy
@@ -12,7 +23,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import pwd
-from pathlib import Path
 import socket
 import stat
 import uuid
@@ -74,6 +84,7 @@ def write_json(path, value):
 
 @contextlib.contextmanager
 def state_file(home, *, readonly=False):
+    require_fixture_home("CODEX_HOME" if Path(home).name == ".codex" else "CLAUDE_CONFIG_DIR", home)
     home = private_directory(home)
     lock = os.open(home / "fixture-reset.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
@@ -148,6 +159,8 @@ def owned_fixture_directory(path, make_private=False):
 
 
 def seed(root):
+    require_fixture_home("CLAUDE_CONFIG_DIR", Path(root) / "home/.claude")
+    require_fixture_home("CODEX_HOME", Path(root) / "home/.codex")
     root = private_directory(root)
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     if root == real_home:
@@ -294,6 +307,8 @@ def consume_codex(home, params):
 
 
 def server(root):
+    require_fixture_home("CLAUDE_CONFIG_DIR", Path(root) / "home/.claude")
+    require_fixture_home("CODEX_HOME", Path(root) / "home/.codex")
     root = private_directory(root)
     if not (root / ".cagents-reset-fixture").is_file():
         raise ValueError("reset service requires the fixture root marker")

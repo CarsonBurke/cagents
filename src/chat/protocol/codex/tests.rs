@@ -756,6 +756,8 @@ fn next_prompt_prediction_is_correlated_and_legacy_errors_are_quiet() {
 fn tool_rows_fixture_settles_parent_and_child_without_leaving_update_work() {
     // Use the actual offline peer's frames and RPC responses, including
     // child hydration. No provider executable, account or socket is used.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
     let export = std::process::Command::new("/usr/bin/python3")
         .args([
             "-c",
@@ -779,6 +781,7 @@ print(json.dumps({'frames': frames, 'replies': {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/codex-tool-rows.py"),
         )
+        .env("CODEX_HOME", root.path().join("codex"))
         .output()
         .unwrap();
     assert!(

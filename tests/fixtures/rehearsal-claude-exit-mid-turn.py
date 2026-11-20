@@ -4,10 +4,20 @@
 Account probes complete normally. Real prompts end with exit status 1 while
 work is unconfirmed, exercising upgrade preparation rather than a clean stop.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
+require_fixture_home("CLAUDE_CONFIG_DIR")
 import json
 import os
-from pathlib import Path
-import sys
 import uuid
 
 

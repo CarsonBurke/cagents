@@ -99,7 +99,8 @@ class CodexToolRowsFixture(unittest.TestCase):
         return sent
 
     def test_private_diagnostics_scene_preserves_original_failed_turn_without_child(self):
-        with tempfile.TemporaryDirectory(prefix="codex-row-diagnostics-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-row-diagnostics-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             home = Path(directory)
             (home / "fixture-row-diagnostics").touch()
             # This marker takes precedence even after the web scene ran.
@@ -126,7 +127,8 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertEqual(resumed["initialTurnsPage"]["data"], [scenario.latest])
 
     def test_private_web_scene_publishes_results_without_child_or_diff(self):
-        with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-web-rows-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             home = Path(directory)
             (home / "fixture-web-rows").touch()
             scenario = PEER["Scenario"]()
@@ -156,7 +158,8 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertEqual(resumed[0]["result"]["initialTurnsPage"]["data"], [scenario.latest])
 
     def test_private_plan_has_a_step_in_progress_while_the_turn_works(self):
-        with tempfile.TemporaryDirectory(prefix="codex-plan-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-plan-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             home = Path(directory)
             (home / "fixture-plan").write_text("30\n")
             scenario = PEER["Scenario"]()
@@ -176,7 +179,8 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertEqual(replies[-1]["method"], "turn/completed")
 
     def test_unnamed_child_is_named_only_by_its_own_thread_read(self):
-        with tempfile.TemporaryDirectory(prefix="codex-unnamed-child-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-unnamed-child-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             home = Path(directory)
             (home / "fixture-unnamed-child").touch()
             scenario = PEER["Scenario"]()
@@ -195,7 +199,8 @@ class CodexToolRowsFixture(unittest.TestCase):
             self.assertEqual(read[0]["result"]["thread"]["agentNickname"], "Quinn")
 
     def test_interrupt_private_web_scene_fences_delayed_results(self):
-        with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-web-rows-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             home = Path(directory)
             (home / "fixture-web-rows").touch()
             scenario = PEER["Scenario"]()
@@ -215,7 +220,8 @@ class CodexToolRowsFixture(unittest.TestCase):
         import tempfile
         scenario = PEER["Scenario"]()
         request = {"id": 3, "method": "account/rateLimits/read"}
-        with tempfile.TemporaryDirectory() as home:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             [missing] = scenario.request(request, home)
             self.assertEqual(missing["error"]["code"], -32601)
             limits = {"rateLimits": {"credits": {"hasCredits": True, "balance": "12.5"}}}
@@ -225,6 +231,7 @@ class CodexToolRowsFixture(unittest.TestCase):
     def test_each_account_home_has_its_own_login_and_takes_over_a_switched_thread(self):
         import json
         with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             first, second = Path(directory, "first"), Path(directory, "second")
             for home in (first, second):
                 home.mkdir()
@@ -269,6 +276,7 @@ class CodexToolRowsFixture(unittest.TestCase):
                                                            for effort in ("low", "medium", "high")]}],
                    "nextCursor": None}
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             Path(home, "fixture-models.json").write_text(json.dumps(catalog))
             self.assertEqual(scenario.request({"id": 1, "method": "model/list"}, home),
                              [{"id": 1, "result": catalog}])
@@ -292,6 +300,7 @@ class CodexToolRowsFixture(unittest.TestCase):
 
     def test_unconfirmed_model_preserves_busy_turn_and_reports_when_resumed_after_marker_removal(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             marker = Path(home, "fixture-unconfirmed-model")
             marker.touch()
             scenario = PEER["Scenario"]()
@@ -314,6 +323,7 @@ class CodexToolRowsFixture(unittest.TestCase):
     def test_an_empty_fixture_model_catalog_reports_its_cause(self):
         import tempfile
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             Path(home, "fixture-models.json").write_text('{"data": []}')
             with self.assertRaisesRegex(ValueError, "nonempty model/list result"):
                 PEER["Scenario"]().request({"id": 1, "method": "model/list"}, home)
@@ -321,6 +331,7 @@ class CodexToolRowsFixture(unittest.TestCase):
     def test_opt_in_turn_audit_is_bounded_and_excludes_prompt_input(self):
         import json
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             audit = Path(home, "fixture-turn-audit.json")
             scenario = PEER["Scenario"]()
             request = {"id": 1, "method": "turn/start", "params": {
@@ -353,6 +364,7 @@ class CodexToolRowsFixture(unittest.TestCase):
         import multiprocessing
         context = multiprocessing.get_context("fork")
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             audit = Path(home, "fixture-turn-audit.json")
             audit.write_text("[]")
             barrier = context.Barrier(8)
@@ -383,6 +395,7 @@ class CodexToolRowsFixture(unittest.TestCase):
 
     def test_malformed_turn_audit_does_not_mutate_the_selection_or_turn(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             Path(home, "fixture-turn-audit.json").write_text("{}")
             scenario = PEER["Scenario"]()
             scenario.model, scenario.reasoning = "offline-original", "low"
@@ -396,6 +409,7 @@ class CodexToolRowsFixture(unittest.TestCase):
     def test_native_evidence_can_hold_a_turn_without_environment_forwarding(self):
         import tempfile
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             Path(home, "fixture-turn-pause").write_text("20\n")
             scenario = PEER["Scenario"]()
             responses = scenario.request({"id": 1, "method": "turn/start", "params": {
@@ -410,6 +424,7 @@ class CodexToolRowsFixture(unittest.TestCase):
 
     def test_a_held_turn_start_answers_after_its_delay_and_accepts_a_steer_once_known(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             Path(home, "fixture-turn-start-delay").write_text("5\n")
             scenario = PEER["Scenario"]()
             replies = scenario.request({"id": 1, "method": "turn/start", "params": {
@@ -435,6 +450,7 @@ class CodexToolRowsFixture(unittest.TestCase):
 
     def test_a_home_that_echoes_reports_the_prompt_and_steer_in_the_turn(self):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as home:
+            Path(home, ".cagents-fixture-root").touch()
             Path(home, "fixture-user-items").touch()
             Path(home, "fixture-turn-pause").write_text("0\n")
             scenario = PEER["Scenario"]()

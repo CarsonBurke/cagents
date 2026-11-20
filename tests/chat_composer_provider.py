@@ -22,7 +22,8 @@ def prompt(number):
 
 class Provider(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="chat-provider-contract-"))
+        self.root = Path(tempfile.mkdtemp(prefix="chat-provider-contract-", dir="/var/tmp"))
+        (self.root / ".cagents-fixture-root").touch()
         self.addCleanup(shutil.rmtree, self.root, True)
         self.config = self.root / "home/.claude"
         self.config.mkdir(parents=True)
@@ -47,12 +48,11 @@ class Provider(unittest.TestCase):
         return [block.get("text") for frame in output if frame.get("type") == "assistant"
                 for block in frame["message"]["content"] if block.get("type") == "text"]
 
-    def test_auth_status_uses_each_accounts_config_with_the_existing_default(self):
+    def test_auth_status_uses_each_accounts_explicit_config_with_the_fixture_default(self):
         def status(config=None):
             environment = {"HOME": str(self.root / "home"),
+                           "CLAUDE_CONFIG_DIR": str(self.config if config is None else config),
                            "PATH": "/usr/local/bin:/usr/bin:/bin"}
-            if config is not None:
-                environment["CLAUDE_CONFIG_DIR"] = str(config)
             result = subprocess.run(
                 [str(SCRIPT), "auth", "status", "--json"], cwd=self.project,
                 capture_output=True, text=True, timeout=HANG_GUARD, env=environment)

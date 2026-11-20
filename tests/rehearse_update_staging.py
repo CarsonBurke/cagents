@@ -30,6 +30,7 @@ class CandidateStaging(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root=Path(self.temporary.name)
         (self.root/'.rehearse-update').write_text(str(self.root)+'\n')
+        (self.root / ".cagents-fixture-root").touch()
         self.prefix=self.root/'home/.local/share/cagents-install'
         self.candidate=self.prefix/'versions/new'
         (self.candidate/'bin').mkdir(parents=True)
@@ -263,6 +264,7 @@ class IdlePromptGuard(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-idle-prompt-',dir='/var/tmp') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             status=root/'home/.local/share/cagents-install/.update/status.json'
             status.parent.mkdir(parents=True)
             job,expected=IdleReview().fixture()

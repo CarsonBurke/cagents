@@ -6,8 +6,10 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -22,7 +24,35 @@
 #error RETRY_CANDIDATE must name the exact selected installed daemon
 #endif
 
+/* A compiled-in path is an explicit fixture value, never an account fallback. */
+static void require_fixture_home(const char *variable, const char *value) {
+    char resolved[PATH_MAX], ancestor[PATH_MAX], marker[PATH_MAX];
+    const char *path = realpath(value, resolved);
+    if (path) {
+        strcpy(ancestor, path);
+        for (;;) {
+            int count = snprintf(marker, sizeof(marker), "%s/.cagents-fixture-root", ancestor);
+            struct stat metadata;
+            if (count > 0 && (size_t)count < sizeof(marker)
+                    && !stat(marker, &metadata) && S_ISREG(metadata.st_mode)) return;
+            char *slash = strrchr(ancestor, '/');
+            if (!slash || (slash == ancestor && ancestor[1] == '\0')) break;
+            if (slash == ancestor) ancestor[1] = '\0';
+            else *slash = '\0';
+        }
+    } else {
+        path = value;
+    }
+    char display[PATH_MAX];
+    snprintf(display, sizeof(display), "%s", path);
+    for (char *p = display; *p; p++) if (*p == '\n' || *p == '\r') *p = '?';
+    dprintf(STDERR_FILENO, "fixture-home: refusing %s=%s: not inside a marked fixture home\n", variable, display);
+    _exit(1);
+}
+
 int bind(int descriptor, const struct sockaddr *address, socklen_t length) {
+    require_fixture_home("HOME", RETRY_ROOT);
+    require_fixture_home("HOME", RETRY_ROOT "/logs");
     int (*real_bind)(int, const struct sockaddr *, socklen_t) = dlsym(RTLD_NEXT, "bind");
     char executable[4096] = {0}, path[sizeof(((struct sockaddr_un *)0)->sun_path) + 1] = {0};
     ssize_t size = readlink("/proc/self/exe", executable, sizeof(executable) - 1);

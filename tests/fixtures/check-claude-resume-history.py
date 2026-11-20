@@ -14,7 +14,8 @@ fixture = runpy.run_path(str(Path(__file__).with_name("claude-resume-history.py"
 
 class ClaudeResumeHistory(unittest.TestCase):
     def test_complete_history_and_refused_overwrite(self):
-        with tempfile.TemporaryDirectory(prefix="claude-history-") as directory:
+        with tempfile.TemporaryDirectory(prefix="claude-history-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory) / "fixture"
             metadata = fixture["seed"](root, turns=50)
             transcript = Path(metadata["history"])
@@ -36,7 +37,8 @@ class ClaudeResumeHistory(unittest.TestCase):
             self.assertEqual(transcript.read_bytes(), original)
 
     def test_real_home_alias_and_invalid_size_are_rejected_before_writes(self):
-        with tempfile.TemporaryDirectory(prefix="claude-history-") as directory:
+        with tempfile.TemporaryDirectory(prefix="claude-history-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory) / "fixture"
             root.mkdir()
             account = Path(directory) / "account"

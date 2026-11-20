@@ -6,14 +6,23 @@ Older cagents builds allocate their app-server socket under an owned 0700
 sockets below the private runtime; the shared native-evidence peer stays strict.
 Every launch, request and failure is recorded beneath the rehearsal root.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import socket
 import stat
-import sys
 import threading
 import time
 import uuid
@@ -188,10 +197,16 @@ def serve_stdio(peer, home, record, incoming, outgoing):
 
 
 def main():
+    home = require_fixture_home("CODEX_HOME")
     if "--version" in sys.argv:
         print("codex-cli 0.162.0 (offline update rehearsal fixture)")
         return
     root = private_directory(Path(os.environ["CAGENTS_TOOL_ROWS_FIXTURE_ROOT"]))
+    require_fixture_home("HOME", root)
+    if not home.is_dir() or home.stat().st_uid != os.getuid():
+        raise ValueError("fixture CODEX_HOME must be an owned directory")
+    if not home.is_relative_to(root):
+        raise ValueError("fixture CODEX_HOME must be beneath its private root")
     configure_peer(root)
     logs = root / "logs"
     logs.mkdir(mode=0o700, exist_ok=True)
@@ -211,12 +226,7 @@ def main():
     record("launch", argv=sys.argv[1:], codex_home=os.environ.get("CODEX_HOME"),
            runtime=os.environ.get("XDG_RUNTIME_DIR"))
     try:
-        home = Path(os.environ["CODEX_HOME"]).resolve(strict=True)
-        if not home.is_dir() or home.stat().st_uid != os.getuid():
-            raise ValueError("fixture CODEX_HOME must be an owned directory")
         runtime = private_directory(Path(os.environ["XDG_RUNTIME_DIR"]))
-        if not home.is_relative_to(root):
-            raise ValueError("fixture CODEX_HOME must be beneath its private root")
         source = Path(__file__).with_name("codex-tool-rows.py")
         spec = importlib.util.spec_from_file_location("rehearsal_codex_peer", source)
         peer = importlib.util.module_from_spec(spec)

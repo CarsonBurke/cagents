@@ -23,6 +23,7 @@ pub fn private_cli(root: &Path) -> CommandSpec {
     }
     for (name, leaf) in [
         ("HOME", "home"),
+        ("CLAUDE_CONFIG_DIR", "home/.claude"),
         ("XDG_RUNTIME_DIR", "run"),
         ("XDG_DATA_HOME", "data"),
         ("XDG_CONFIG_HOME", "config"),
@@ -120,8 +121,12 @@ mod tests {
             .lines()
             .map(|line| line.split_once('=').unwrap())
             .collect();
-        assert_eq!(actual.len(), 7, "inherited environment entered private CLI");
+        assert_eq!(actual.len(), 8, "inherited environment entered private CLI");
         assert_eq!(actual["HOME"], root.path().join("home").to_str().unwrap());
+        assert_eq!(
+            actual["CLAUDE_CONFIG_DIR"],
+            root.path().join("home/.claude").to_str().unwrap()
+        );
         assert_eq!(actual["TMPDIR"], root.path().join("tmp").to_str().unwrap());
 
         let spec = private_program(root.path(), "/bin/pwd");

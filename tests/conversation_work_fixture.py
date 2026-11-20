@@ -21,11 +21,13 @@ QUIET_GIT = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
 
 class ConversationWork(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="conversation-work-")
+        self.directory = tempfile.TemporaryDirectory(prefix="conversation-work-", dir="/var/tmp")
         self.fixture = Path(self.directory.name).resolve() / "fixture"
         for name in ("bin", "home/.claude", "home/.config", "project"):
             (self.fixture / name).mkdir(parents=True)
+        (self.fixture / ".cagents-fixture-root").touch()
         shutil.copy(FORGE, self.fixture / "bin" / "gh")
+        shutil.copytree(FORGE.parent / "lib", self.fixture / "bin" / "lib")
         project = self.fixture / "project"
         # As native-evidence makes it: one empty commit on main.
         self.git(project, "init", "--quiet", "--initial-branch=main")
@@ -41,7 +43,8 @@ class ConversationWork(unittest.TestCase):
 
     def environment(self, **extra):
         return {"PATH": f"{self.fixture / 'bin'}:/usr/bin:/bin", "HOME": str(self.fixture / "home"),
-                "CAGENTS_EVIDENCE_FIXTURE": str(self.fixture), **extra}
+                "CAGENTS_EVIDENCE_FIXTURE": str(self.fixture),
+                "CLAUDE_CONFIG_DIR": str(self.fixture / "home/.claude"), **extra}
 
     def helper(self, environment=None, check=True):
         return subprocess.run(["/usr/bin/python3", "-I", str(HELPER)], text=True, capture_output=True,
@@ -57,8 +60,8 @@ class ConversationWork(unittest.TestCase):
         self.assertIn("run it in a native-evidence fixture", missing.stderr)
         # Another HOME would put the provider files outside the fixture.
         elsewhere = self.helper(self.environment(HOME=self.directory.name), check=False)
-        self.assertEqual(elsewhere.returncode, 2)
-        self.assertIn("not a native-evidence fixture", elsewhere.stderr)
+        self.assertNotEqual(elsewhere.returncode, 0)
+        self.assertIn(f"fixture-home: refusing HOME={Path(self.directory.name).resolve()}", elsewhere.stderr)
         self.assertFalse((self.fixture / "home" / ".claude" / "fixture-frames.jsonl").exists())
 
     def test_it_refuses_a_project_it_cannot_prepare(self):

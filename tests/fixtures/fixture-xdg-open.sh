@@ -6,7 +6,11 @@
 # in $FIXTURE/state/opened-urls, one per line, and succeeds as the real one
 # does once it hands the link over.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home HOME
 fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+require_fixture_home HOME "$fixture/home"
+require_fixture_home XDG_STATE_HOME "$fixture/state"
 [ "$#" -eq 1 ] || {
     printf '%s\n' 'Usage: xdg-open { file | URL }' >&2
     exit 1

@@ -9,6 +9,8 @@ import os
 import shutil
 import subprocess
 
+from fixture_home import require_fixture_home
+
 
 AUTHOR = "Fixture Author <fixture@example.invalid>"
 
@@ -28,9 +30,10 @@ COMMIT_MESSAGES = [
 
 
 def environment(root, epoch):
+    home = str(require_fixture_home("HOME", os.path.join(root, "home")))
     return {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": os.path.join(root, "home"),
+        "HOME": home,
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",

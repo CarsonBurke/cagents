@@ -56,6 +56,9 @@
 # A state that does not appear within 30 seconds is logged and the scene goes
 # on, so a missing state is visible in the log and the shot.
 set -u
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 
 scene=${1:?usage: message-card-scene.sh cards|narrow|long|keys}
 here=$(cd "$(dirname "$0")" && pwd)

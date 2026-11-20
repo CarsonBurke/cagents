@@ -97,7 +97,8 @@ class Peer:
 
 class Streaming(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="chat-stream-contract-"))
+        self.root = Path(tempfile.mkdtemp(prefix="chat-stream-contract-", dir="/var/tmp"))
+        (self.root / ".cagents-fixture-root").touch()
         self.addCleanup(shutil.rmtree, self.root, True)
         self.config = self.root / "home/.claude"
         self.config.mkdir(parents=True)

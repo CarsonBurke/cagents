@@ -1254,6 +1254,7 @@ class CandidateNamespace(unittest.TestCase):
             root,shared=base/'private',base/'shared'
             root.mkdir();shared.mkdir()
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             archive=shared/'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
             payload=b'#!/bin/sh\nexit 0\n'
             with tarfile.open(archive,'w:gz') as output:
@@ -1280,6 +1281,7 @@ class CandidateNamespace(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-namespace-link-') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             archive=root/'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
             with tarfile.open(archive,'w:gz') as output:
                 info=tarfile.TarInfo('cagents-new/bin/cagents')
@@ -1294,6 +1296,7 @@ class CandidateNamespace(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-namespace-headless-') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             proof={'host_session_id':'source','boot_id':'boot','host_incarnation':'original'}
             terminals=root/'baseline-terminals.json'
             terminals.write_text(json.dumps({'ok':True,'data':{'proof':proof,'terminals':[]}}))
@@ -1348,6 +1351,7 @@ class NativeLockWaiter(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-native-lock-',dir='/var/tmp') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             (root/'desktop').mkdir()
             path=root/'native.lock'
             with path.open('w') as holder,path.open('w') as inherited,path.open('w') as probe:
@@ -1411,6 +1415,7 @@ class NativeLockWaiter(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-lock-parent-',dir='/var/tmp') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             with (root/'native.lock').open('w') as inherited:
                 result=subprocess.run([sys.executable,str(REPOSITORY/'scripts/rehearse_update_run.py'),str(root),str(SCRIPT),
                     'wait-native-lock','--fd',str(inherited.fileno()),'--parent-pid',str(os.getpid()+10000000)],
@@ -1421,6 +1426,7 @@ class NativeLockWaiter(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-lock-arm-',dir='/var/tmp') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             (root/'desktop').mkdir();(root/'bin').mkdir()
             ready,release=root/'ready',root/'release'
             real_setpriv=shutil.which('setpriv')
@@ -1481,6 +1487,7 @@ class WindowCloseTracing(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-window-trace-',dir='/var/tmp') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             (root/'rt').mkdir()
             executable=root/'home/.local/share/cagents-install/versions/fixture/bin/cagents-ui'
             executable.parent.mkdir(parents=True)
@@ -1996,6 +2003,7 @@ class NativeTerminalAfterRestore(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='ru-action-ended-child-') as temporary:
             root=Path(temporary)
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             (root/'child.pid').write_text(str(int(Path('/proc/sys/kernel/pid_max').read_text())+1))
             strict=records.private_process_snapshot(root)
             self.assertTrue(any('child.pid' in error for error in strict['errors']))
@@ -2225,6 +2233,7 @@ class Arguments(unittest.TestCase):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix="ru-stop-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
                 (root / ".rehearse-update").write_text(str(root)+"\n")
+                (root / ".cagents-fixture-root").touch()
                 saved = root / "rt/cagents/holders.rehearsal-saved"
                 saved.mkdir(parents=True)
                 (saved / "private.json").write_text("private registry bytes")
@@ -2509,6 +2518,7 @@ class StartupFault(unittest.TestCase):
             root.mkdir()
             shared.mkdir()
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             (root/'logs').mkdir()
             candidate = base/'tree/cagents-new'
             (candidate/'bin').mkdir(parents=True)
@@ -2557,6 +2567,7 @@ class StartupFault(unittest.TestCase):
             root.mkdir()
             shared.mkdir()
             (root/'.rehearse-update').write_text(str(root)+'\n')
+            (root / ".cagents-fixture-root").touch()
             (root/'logs').mkdir()
             name = 'cagents-new-x86_64-unknown-linux-gnu.tar.gz'
             archive = shared/name
@@ -2591,6 +2602,7 @@ class StartupFault(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 fault.fail_start(root, 'new')
             (root / '.rehearse-update').write_text(str(root))
+            (root / ".cagents-fixture-root").touch()
             with self.assertRaises(ValueError):
                 fault.fail_start(root, '../../outside')
             fault.fail_start(root, 'new')

@@ -23,6 +23,10 @@
 # pause leaves the turn busy for interaction and capture;
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
+require_fixture_home CODEX_HOME "$CAGENTS_EVIDENCE_TASK/fixture/home/.codex"
 
 scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless}
 case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless) ;; *) exit 2 ;; esac

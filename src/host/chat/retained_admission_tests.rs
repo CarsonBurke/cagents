@@ -19,12 +19,19 @@ fn isolated(name: &str) -> Option<PathBuf> {
     let directory = if named_resume {
         tempfile::Builder::new()
             .prefix("updater1513-")
-            .tempdir_in("/tmp")
+            .tempdir_in("/var/tmp")
             .unwrap()
     } else {
         tempfile::tempdir_in("/var/tmp").unwrap()
     };
     let root = directory.path();
+    fs::write(root.join(".cagents-fixture-root"), "").unwrap();
+    fs::create_dir(root.join("scripts")).unwrap();
+    fs::write(
+        root.join("scripts/fixture_home.py"),
+        include_str!("../../../scripts/fixture_home.py"),
+    )
+    .unwrap();
     // SDK fixtures and private helper authority require a private root;
     // tempfile's directory mode can inherit a broader caller policy.
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();

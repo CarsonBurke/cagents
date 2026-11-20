@@ -18,12 +18,17 @@
 #       modification time, whenever the app resolves a repository. Any PNG,
 #       JPEG, GIF or WebP up to 1 MiB and 1024x1024 pixels.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home HOME
 
 # Installed as $FIXTURE/bin/gh. Its own location is the root: gh runs from
 # the app and from the daemon, and neither promises to pass the fixture's
 # CAGENTS_EVIDENCE_FIXTURE on to what it starts.
 fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 config=$fixture/home/.config
+require_fixture_home XDG_CONFIG_HOME "$config"
+require_fixture_home HOME "$fixture/home"
+require_fixture_home XDG_CACHE_HOME "${XDG_CACHE_HOME:-$HOME/.cache}"
 if [ ! -e "$config/fixture-forge" ]; then
     printf '%s\n' 'gh: the fixture has no forge access' >&2
     exit 1

@@ -4,8 +4,11 @@
 # Derive ROOT from the executable because native launches remove CAGENTS_*
 # environment values.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
 fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-CODEX_HOME=${CODEX_HOME:-$fixture/home/.codex}
+require_fixture_home CODEX_HOME "${CODEX_HOME:-$fixture/home/.codex}"
+CODEX_HOME=$fixture_home_resolved
+export CODEX_HOME
 mkdir -p -- "$CODEX_HOME"
 export CODEX_HOME
 CAGENTS_TOOL_ROWS_FIXTURE_ROOT=$fixture

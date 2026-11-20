@@ -30,6 +30,7 @@ impl Fixture {
         command
             .env_clear()
             .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CONFIG_HOME", root.join("config"))
@@ -86,11 +87,18 @@ impl Fixture {
 
     fn with_soft_limit_and_branch(soft_limit: Option<libc::rlim_t>, branch: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
         for name in [
             "home", "run", "data", "config", "cache", "tmp", "project", "bin",
         ] {
             fs::create_dir(root.path().join(name)).unwrap();
         }
+        fs::create_dir_all(root.path().join("bin/lib")).unwrap();
+        fs::write(
+            root.path().join("bin/lib/fixture-home.sh"),
+            include_str!("fixtures/lib/fixture-home.sh"),
+        )
+        .unwrap();
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
         // Own the repository identity even when TMPDIR has enclosing Git
         // metadata. Plain-folder discovery must not select another checkout.

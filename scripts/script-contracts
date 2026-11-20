@@ -104,6 +104,10 @@ JOBS = (
               sources=("scripts/main-build-sentinel", "scripts/cargo_warnings.py")),
     )),
     Job("tooling", suites=(
+        Suite("fixture home guard", "tests/fixture_home_guard.py",
+              sources=("scripts/fixture_home.py", "tests/fixtures/lib/fixture-home.sh",
+                       "tests/fixtures/lib/fixture-home.js"),
+              syntax=(("sh", "tests/fixtures/lib/fixture-home.sh"),)),
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
         Suite("vendored checkout-cache hooks", "tests/checkout_cache_vendor_hooks.py",
               sources=("scripts/qualify-checkout-cache.py", "Cargo.toml", "vendor/iced-widget/build.rs",

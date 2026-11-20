@@ -6,11 +6,21 @@ Writes ROOT/home/.claude, refusing an existing or real provider home. The
 result names the thread, transcript and project for native evidence. No
 provider executable, credentials or network service is used.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import pwd
 import uuid
 
@@ -23,6 +33,7 @@ def seed(root, turns=50):
     account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     if home.resolve() == (account_home / ".claude").resolve():
         raise ValueError("refusing the account's real Claude home")
+    require_fixture_home("CLAUDE_CONFIG_DIR", home)
     # A rerun cannot overwrite a transcript a running provider may have loaded.
     home.mkdir(parents=True)
     project = root / "project"

@@ -8,6 +8,7 @@ set -euo pipefail
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
+. "$tool_root/tests/fixtures/lib/fixture-home.sh"
 session_name=evidence
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 # A session holds one of the host's few native slots while it runs, so it is
@@ -527,6 +528,13 @@ session_variables=
 session_path=
 fixture_env() {
     local name passed=()
+    require_fixture_home HOME "$fixture/home"
+    require_fixture_home CLAUDE_CONFIG_DIR "$fixture/home/.claude"
+    require_fixture_home CODEX_HOME "$fixture/home/.codex"
+    require_fixture_home XDG_DATA_HOME "$fixture/data"
+    require_fixture_home XDG_CONFIG_HOME "$fixture/config"
+    require_fixture_home XDG_CACHE_HOME "$fixture/cache"
+    require_fixture_home XDG_STATE_HOME "$fixture/state"
     for name in LANG LC_ALL LC_CTYPE TERM $session_variables; do
         if [ "${!name+x}" ]; then
             passed+=("$name=${!name}")
@@ -534,6 +542,7 @@ fixture_env() {
     done
     env -i "${passed[@]}" \
         HOME="$fixture/home" XDG_RUNTIME_DIR="$runtime" \
+        CLAUDE_CONFIG_DIR="$fixture/home/.claude" CODEX_HOME="$fixture/home/.codex" \
         XDG_DATA_HOME="$fixture/data" XDG_CONFIG_HOME="$fixture/config" \
         XDG_CACHE_HOME="$fixture/cache" XDG_STATE_HOME="$fixture/state" \
         CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
@@ -562,6 +571,7 @@ restore_seed_in_place() {
 
 prepare_fixture() {
     local keep_state=$1
+    printf '%s\n' 'Fixture provider and app state stays below this root.' >"$task/.cagents-fixture-root"
     if [ "$keep_state" = false ]; then
         if [ -d "$seed" ] && [ -d "$fixture" ]; then
             # Restore the seed into the fixture rather than replacing it: a
@@ -588,6 +598,10 @@ prepare_fixture() {
     # home/.config holds the forge's switch and avatars its seeds; a steps file
     # writes into both without creating them.
     mkdir -p "$fixture"/{bin,home/.claude,home/.config,avatars,data,config,cache,state,project}
+    printf '%s\n' 'Fixture provider and app state stays below this root.' >"$fixture/.cagents-fixture-root"
+    mkdir -p "$fixture/bin/lib" "$fixture/scripts"
+    install -m 644 "$tool_root/tests/fixtures/lib/fixture-home.sh" "$fixture/bin/lib/fixture-home.sh"
+    install -m 644 "$tool_root/scripts/fixture_home.py" "$fixture/scripts/fixture_home.py"
     # The Codex peers refuse a root others can read; so would a seed's mode.
     chmod 700 -- "$fixture"
     # Both sides get this tool's synthetic provider: the data must not differ
@@ -1469,9 +1483,11 @@ cmd_seed() {
         die "$checkout has no scripts/fixture-workspace; seed through a side built from a checkout that has it: --side before|after"
     # The fixture's own directories hold every store, and nothing from this
     # shell reaches the generator or the executables beyond fixture_env's.
+    printf '%s\n' 'Fixture provider and app state stays below this root.' >"$task/.cagents-fixture-root"
     rm -rf -- "$fixture"
     fixture_env "$generator" generate --profile "$profile" --seed "$number" --root "$fixture" ||
         die "generating the $profile workspace failed; the fixture is incomplete, so seed again"
+    printf '%s\n' 'Fixture provider and app state stays below this root.' >"$fixture/.cagents-fixture-root"
     # A task that selected a named instance starts that instance's stores, so
     # the seed must write them; fixture_env keeps them inside the fixture.
     local seed_instance=()

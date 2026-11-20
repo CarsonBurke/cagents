@@ -30,10 +30,12 @@ seconds=${3:-60}
 }
 command -v jq >/dev/null || { printf '%s\n' 'The fixture provider needs jq' >&2; exit 2; }
 checkout=$(cd "$(dirname "$0")/.." && pwd)
+. "$checkout/tests/fixtures/lib/fixture-home.sh"
 root=$(mktemp -d "$HOME/.local/state/idle-actors.XXXXXX")
 # Unix socket paths are short: keep the runtime beneath the real one.
 runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ia.XXXXXX")
-mkdir -p "$root"/{home/.claude,data,config,cache,bin,project}
+printf '%s\n' 'Fixture provider and app state stays below this root.' >"$root/.cagents-fixture-root"
+mkdir -p "$root"/{home/.claude,data,config,cache,state,bin,project}
 ln -s "$checkout/tests/fixtures/chat-composer-claude.sh" "$root/bin/claude"
 printf '1\n' > "$root/home/.claude/fixture-first-turn-seconds"
 git init -q --initial-branch=main "$root/project"
@@ -41,10 +43,18 @@ git -C "$root/project" -c user.name=fixture -c user.email=fixture@example.test \
     commit -q --allow-empty -m fixture
 
 fixture() {
-    env -u CLAUDE_CONFIG_DIR -u CAGENTS_SESSION_ID \
+    require_fixture_home HOME "$root/home"
+    require_fixture_home CLAUDE_CONFIG_DIR "$root/home/.claude"
+    require_fixture_home CODEX_HOME "$root/home/.codex"
+    require_fixture_home XDG_DATA_HOME "$root/data"
+    require_fixture_home XDG_CONFIG_HOME "$root/config"
+    require_fixture_home XDG_CACHE_HOME "$root/cache"
+    require_fixture_home XDG_STATE_HOME "$root/state"
+    env -u CAGENTS_SESSION_ID \
         HOME="$root/home" XDG_RUNTIME_DIR="$runtime" \
+        CLAUDE_CONFIG_DIR="$root/home/.claude" CODEX_HOME="$root/home/.codex" \
         XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config" \
-        XDG_CACHE_HOME="$root/cache" PATH="$root/bin:$PATH" "$@"
+        XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" PATH="$root/bin:$PATH" "$@"
 }
 # Every process the fixture started carries its runtime directory.
 fixture_processes() {

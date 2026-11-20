@@ -24,6 +24,8 @@ import time
 import tomllib
 import uuid
 
+from fixture_home import require_fixture_home
+
 
 def wait_native_lock(root, descriptors, parent_pid, queue=None):
     """Take one native slot on the caller's descriptors; see native_slots.py.
@@ -723,6 +725,11 @@ class Rehearsal:
         self.shell = shell
         self.steps = []
         self.errors = []
+
+    def require_fixture_state(self):
+        require_fixture_home('HOME', self.root/'home')
+        require_fixture_home('CLAUDE_CONFIG_DIR', self.root/'home/.claude')
+        require_fixture_home('CODEX_HOME', self.root/'home/.codex')
 
     def call(self, *args, timeout=90, check=True):
         start = time.monotonic()
@@ -1429,6 +1436,7 @@ class Rehearsal:
         save()
 
     def seed(self, args):
+        self.require_fixture_state()
         evidence = []
         def seed(name, argv, project=None, provider=None):
             if provider:
@@ -1627,6 +1635,7 @@ class Rehearsal:
         than working agents. The fixture switches apply only to conversations
         started here: they are removed once every scale chat is idle.
         """
+        self.require_fixture_state()
         claude = self.root/'home/.claude'
         switches = {claude/'fixture-long-history': f'{args.scale_entries} {args.scale_bytes}\n',
                     claude/'fixture-first-turn-seconds': '1\n'}
@@ -1695,6 +1704,7 @@ class Rehearsal:
         failure = None
         try:
             self.call('init')
+            self.require_fixture_state()
             settings = {'pause': args.codex_pause,
                         'never_confirm_interrupt': args.codex_never_confirm_interrupt,
                         'never_confirm_close': args.codex_never_confirm_close}

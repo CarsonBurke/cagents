@@ -38,7 +38,8 @@ def control(name):
 
 class PrivateFixture:
     def __init__(self):
-        self.root = Path(tempfile.mkdtemp(prefix="chat-task-receipt-contract-"))
+        self.root = Path(tempfile.mkdtemp(prefix="chat-task-receipt-contract-", dir="/var/tmp"))
+        (self.root / ".cagents-fixture-root").touch()
         self.home = self.root / "home"
         self.config = self.home / ".claude"
         self.project = self.root / "project"

@@ -9,6 +9,8 @@
 # removes it, as a sign-in in the browser would. Muse's sign-in commands are
 # the fake agent's own.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home HOME
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fixture=${here%/bin}
 case ${0##*/} in
@@ -17,6 +19,7 @@ case ${0##*/} in
 esac
 export FAKE_ACP_SHAPE=$shape
 export FAKE_ACP_STATE="${FAKE_ACP_STATE:-$fixture/acp/$shape}"
+require_fixture_home FAKE_ACP_STATE
 mkdir -p -- "$FAKE_ACP_STATE"
 if [ "$shape" = agy ]; then
     for argument in "$@"; do

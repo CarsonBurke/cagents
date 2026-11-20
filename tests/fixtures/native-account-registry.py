@@ -5,6 +5,17 @@ Prepare creates an empty home, not an account registration. Use the real CLI's
 account link/default commands before fault. The caller must verify that its
 ordinary new draft selected this home. No provider, daemon or UI is launched.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 import base64
 from contextlib import contextmanager
@@ -12,10 +23,8 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import pwd
 import stat
-import sys
 import tomllib
 import uuid
 
@@ -46,6 +55,9 @@ def owned(path, directory=False, private=False):
 def fixture_root(operand):
     if any(name in os.environ for name in AUTHORITY):
         raise PermissionError("A genuine native-evidence User environment is required")
+    require_fixture_home("HOME", Path(operand) / "home")
+    require_fixture_home("XDG_DATA_HOME", Path(operand) / "data")
+    require_fixture_home("XDG_CONFIG_HOME", Path(operand) / "config")
     root = Path(operand)
     if not root.is_absolute() or root.resolve() != root or root.name != "fixture":
         raise ValueError("Use the canonical absolute native-evidence fixture path")

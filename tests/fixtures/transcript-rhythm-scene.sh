@@ -36,6 +36,9 @@
 #   theme   KEY: writes the theme into the task's seed, which every later
 #           session starts from
 set -euo pipefail
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 
 scene=${1:?usage: transcript-rhythm-scene.sh wide|narrow [LABEL] | theme dark|light}
 # Names the shots, such as rhythm-dark-working, so each theme keeps its own.
@@ -48,6 +51,8 @@ config=$fixture/home/.claude
 title='Sidebar directions'
 
 if [ "$scene" = theme ]; then
+    require_fixture_home HOME "$CAGENTS_EVIDENCE_TASK/fixture-seed/home"
+    require_fixture_home XDG_CONFIG_HOME "$CAGENTS_EVIDENCE_TASK/fixture-seed/config"
     key=${2:?dark or light}
     case $key in dark|light) ;; *) exit 2 ;; esac
     # A session restores its fixture from the seed, so the theme goes there.

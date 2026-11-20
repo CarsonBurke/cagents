@@ -11,12 +11,21 @@ exceeds the per-original quota. This models protocol/UI behavior only, not
 provider execution or account recovery.
 One fixture process owns one synthetic parent conversation.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import importlib.util
 import json
 import os
-from pathlib import Path
 import socket
-import sys
 import threading
 import uuid
 
@@ -155,6 +164,7 @@ def serve(connection, codex_home, scenario, request_lock):
 
 
 def main():
+    require_fixture_home("CODEX_HOME")
     if "--version" in sys.argv:
         print("codex-cli 0.162.0 (offline child-error fixture)")
         return

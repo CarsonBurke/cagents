@@ -14,15 +14,19 @@
 # Each peer wants a private root (mode 0700, the fixture), CODEX_HOME beneath
 # it and a private XDG_RUNTIME_DIR; this supplies the root and CODEX_HOME.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
 
 # Installed as $FIXTURE/bin/codex: its own location is the root, since neither
 # the app nor the daemon promises to pass the fixture's variables on.
 fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+require_fixture_home CODEX_HOME "${CODEX_HOME:-$fixture/home/.codex}"
+CODEX_HOME=$fixture_home_resolved
+export CODEX_HOME
 peers=$fixture/libexec/codex
 # Hold the real login terminal open for native busy-label recovery checks.
 # Status remains immediate; neither path contacts a provider.
 if [ "${1:-}" = login ]; then
-    fixture_codex_home=$(CDPATH='' cd -- "${CODEX_HOME:-$fixture/home/.codex}" && pwd -P) || exit 2
+    fixture_codex_home=$CODEX_HOME
     case "$fixture_codex_home/" in "$fixture/"*) ;; *) echo 'codex: fixture login home must be beneath its private root' >&2; exit 2 ;; esac
     if [ "${2:-}" != status ] && [ -f "$fixture_codex_home/fixture-sign-in-seconds" ]; then
         delay=$(head -n 1 "$fixture_codex_home/fixture-sign-in-seconds")
@@ -43,8 +47,7 @@ case $peer in
         exit 127
         ;;
 esac
-# The app may name an account's home; otherwise Codex's own default.
-CODEX_HOME=${CODEX_HOME:-$fixture/home/.codex}
+# The guarded account home is explicit or supplied by this installed fixture.
 mkdir -p -- "$CODEX_HOME"
 export CODEX_HOME
 # $root is one of the names above.

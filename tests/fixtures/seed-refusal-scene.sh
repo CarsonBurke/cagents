@@ -6,6 +6,9 @@
 # session `refuse` closes only the UI, arms the real registry's fixture failure,
 # and relaunches. `retry` removes it and exercises the notice action.
 set -euo pipefail
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
     printf '%s\n' 'seed-refusal-scene: run on the native-evidence host through plain SSH; inherited agent authority was not modified' >&2
     exit 77

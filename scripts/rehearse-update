@@ -9,6 +9,7 @@ set -euo pipefail
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
+. "$tool_root/tests/fixtures/lib/fixture-home.sh"
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
 real_home=$HOME
 
@@ -129,6 +130,13 @@ session_name=rehearsal-${root##*/}
 # terminal, and the toolchain locations a later build may want.
 user_env() {
     local name passed=()
+    require_fixture_home HOME "$user_home"
+    require_fixture_home CLAUDE_CONFIG_DIR "$user_home/.claude"
+    require_fixture_home CODEX_HOME "$user_home/.codex"
+    require_fixture_home XDG_DATA_HOME "$user_home/.local/share"
+    require_fixture_home XDG_CONFIG_HOME "$user_home/.config"
+    require_fixture_home XDG_CACHE_HOME "$user_home/.cache"
+    require_fixture_home XDG_STATE_HOME "$user_home/.local/state"
     for name in LANG LC_ALL LC_CTYPE TERM; do
         [ -z "${!name+x}" ] || passed+=("$name=${!name}")
     done
@@ -184,7 +192,11 @@ cmd_init() {
     mkdir -p -- "$root"
     chmod 700 "$root"
     printf '%s\n' "$root" >"$root/.rehearse-update"
+    printf '%s\n' 'Fixture provider and app state stays below this root.' >"$root/.cagents-fixture-root"
     mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
+    mkdir -p -- "$bin/lib" "$root/scripts"
+    install -m 644 "$tool_root/tests/fixtures/lib/fixture-home.sh" "$bin/lib/fixture-home.sh"
+    install -m 644 "$tool_root/scripts/fixture_home.py" "$root/scripts/fixture_home.py"
     mkdir -m 700 -p -- "$runtime"
     # The fixture ignores probes in this counter; real chat starts append once.
     [ ! -L "$user_home/.claude/fixture-launches" ] \

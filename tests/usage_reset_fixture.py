@@ -21,9 +21,10 @@ HANG_GUARD = 60
 
 class UsageResetFixture(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="usage-reset-")
+        self.temporary = tempfile.TemporaryDirectory(prefix="usage-reset-", dir="/var/tmp")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        (self.root / ".cagents-fixture-root").touch()
         FIXTURE.seed(self.root)
         self.claude = self.root / "home/.claude"
         self.codex = self.root / "home/.codex"
@@ -147,7 +148,8 @@ class UsageResetFixture(unittest.TestCase):
             FIXTURE.configure_next_grant(self.root, "account")
         self.assertEqual(self.read(self.claude), before)
         for unavailable in ("missing", "exhausted", "paused", "unusable", "ineligible"):
-            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory(prefix="usage-reset-grant-") as directory:
+            with self.subTest(unavailable=unavailable), tempfile.TemporaryDirectory(prefix="usage-reset-grant-", dir="/var/tmp") as directory:
+                Path(directory, ".cagents-fixture-root").touch()
                 root = Path(directory)
                 FIXTURE.seed(root)
                 home = root / "home/.claude"
@@ -283,7 +285,8 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(self.read(self.codex)["consume_count"], 1)
 
     def test_seed_tightens_native_provider_homes_inside_the_private_root(self):
-        with tempfile.TemporaryDirectory(prefix="usage-reset-native-") as directory:
+        with tempfile.TemporaryDirectory(prefix="usage-reset-native-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory)
             for provider in ("claude", "codex"):
                 home = root / "home" / ("." + provider)
@@ -298,7 +301,8 @@ class UsageResetFixture(unittest.TestCase):
                 self.assertTrue((home / "fixture-reset-state.json").is_file())
 
     def test_seed_refuses_a_symlinked_home_without_writing_through_it(self):
-        with tempfile.TemporaryDirectory(prefix="usage-reset-native-") as directory:
+        with tempfile.TemporaryDirectory(prefix="usage-reset-native-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory)
             target = root / "unrelated"
             target.mkdir()

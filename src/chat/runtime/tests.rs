@@ -4263,10 +4263,21 @@ for line in sys.stdin:
     assert_eq!(outcomes, vec![crate::notifications::Kind::Cancelled]);
 }
 
+fn prepare_python_provider_fixture(root: &std::path::Path) {
+    std::fs::write(root.join(".cagents-fixture-root"), "").unwrap();
+    std::fs::create_dir(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("scripts/fixture_home.py"),
+        include_str!("../../../scripts/fixture_home.py"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
+    prepare_python_provider_fixture(directory.path());
     let provider = directory.path().join("claude");
     std::fs::write(
         &provider,
@@ -4280,7 +4291,14 @@ fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
             program: provider.to_string_lossy().into_owned(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".into(),
+                directory
+                    .path()
+                    .join("claude-config")
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
             unset_environment: Default::default(),
         },
         session_id: None,
@@ -4336,6 +4354,7 @@ fn json_line_noise_and_unknown_claude_frames_finish_through_the_real_pipe() {
 fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
+    prepare_python_provider_fixture(directory.path());
     let agent = directory.path().join("fake-acp-agent");
     std::fs::write(
         &agent,
@@ -4351,6 +4370,10 @@ fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
             arguments: vec!["--model".into(), "gemini-3.8-flash".into()],
             working_directory: directory.path().into(),
             environment: BTreeMap::from([
+                (
+                    "HOME".into(),
+                    directory.path().to_string_lossy().into_owned(),
+                ),
                 (
                     "FAKE_ACP_STATE".into(),
                     directory
@@ -4683,6 +4706,7 @@ fn claude_frame_glued_to_wrapper_text_fails_immediately_with_a_preview() {
 fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
+    prepare_python_provider_fixture(directory.path());
     let provider = directory.path().join("claude");
     std::fs::write(
         &provider,
@@ -4696,7 +4720,14 @@ fn claude_fixture_noise_limit_fails_a_turn_visibly_through_the_real_pipe() {
             program: provider.to_string_lossy().into_owned(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
-            environment: BTreeMap::new(),
+            environment: BTreeMap::from([(
+                "CLAUDE_CONFIG_DIR".into(),
+                directory
+                    .path()
+                    .join("claude-config")
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
             unset_environment: Default::default(),
         },
         session_id: None,

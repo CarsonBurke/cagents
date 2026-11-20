@@ -18,6 +18,17 @@ and its type and UUID after it.
   did, just before a tool result over the 30 MiB a record is read at.
 - A last record still being written, which a reader must leave for later.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 import json
 import os
@@ -30,6 +41,8 @@ parser.add_argument("project")
 parser.add_argument("--home", default=os.environ.get("HOME"))
 parser.add_argument("--hours-ago", type=float, default=2.5)
 args = parser.parse_args()
+args.home = str(require_fixture_home("HOME", args.home))
+config = require_fixture_home("CLAUDE_CONFIG_DIR", Path(args.home) / ".claude")
 
 project = os.path.realpath(args.project)
 session = str(uuid.uuid5(uuid.NAMESPACE_URL, f"claude-damaged-history:{project}"))
@@ -116,7 +129,7 @@ lines[cut + 1] = lines[cut][: len(lines[cut]) // 3] + lines[cut + 1]
 del lines[cut]
 pending = json.dumps({"parentUuid": parent, "isSidechain": False, "type": "user", "message": {"role": "user", "content": "Still being written"}})
 
-directory = os.path.join(args.home, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", project))
+directory = os.path.join(config, "projects", re.sub(r"[^A-Za-z0-9]", "-", project))
 os.makedirs(directory, exist_ok=True)
 path = os.path.join(directory, f"{session}.jsonl")
 with open(path, "w") as transcript:

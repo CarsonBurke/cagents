@@ -168,6 +168,8 @@ impl Fixture {
             .canonicalize()
             .map_err(|error| error.to_string())?;
         require(root_path == root.path(), "fixture root must be canonical")?;
+        fs::write(root.path().join(".cagents-fixture-root"), "")
+            .map_err(|error| error.to_string())?;
         for leaf in [
             "runtime", "config", "data", "state", "cache", "tmp", "claude", "codex", "pi", "bin",
             "project",
@@ -177,6 +179,12 @@ impl Fixture {
                 .create(root.path().join(leaf))
                 .map_err(|error| error.to_string())?;
         }
+        fs::create_dir_all(root.path().join("bin/lib")).map_err(|error| error.to_string())?;
+        fs::write(
+            root.path().join("bin/lib/fixture-home.sh"),
+            include_str!("fixtures/lib/fixture-home.sh"),
+        )
+        .map_err(|error| error.to_string())?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_cagentsd"));
         for (name, leaf) in [
             ("XDG_RUNTIME_DIR", "runtime"),

@@ -859,6 +859,7 @@ class Evidence(unittest.TestCase):
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
+        shutil.copytree(REPOSITORY / "tests/fixtures/lib", checkout / "tests/fixtures/lib")
         # The runner builds the UI as its own package, as this repository lays it out.
         (checkout / "crates" / "cagents-ui").mkdir(parents=True)
         shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
@@ -880,6 +881,7 @@ class Evidence(unittest.TestCase):
     def test_an_integrated_side_builds_and_runs_the_embedded_browser_lane(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
+        shutil.copytree(REPOSITORY / "tests/fixtures/lib", checkout / "tests/fixtures/lib")
         # The runner builds the UI as its own package, as this repository lays it out.
         (checkout / "crates" / "cagents-ui").mkdir(parents=True)
         shutil.copy(REPOSITORY / "crates" / "cagents-ui" / "Cargo.toml", checkout / "crates" / "cagents-ui")
@@ -1629,7 +1631,9 @@ class Evidence(unittest.TestCase):
         fixture = self.task / "fixture"
         self.assertIn(f"HOME={fixture}/home\n", environment)
         self.assertIn(f"XDG_RUNTIME_DIR={self.task}/rt\n", environment)
-        self.assertNotIn("CLAUDE_CONFIG_DIR", environment)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={fixture}/home/.claude\n", environment)
+        self.assertIn(f"CODEX_HOME={fixture}/home/.codex\n", environment)
+        self.assertTrue((fixture / ".cagents-fixture-root").is_file())
         self.assertTrue((fixture / "bin" / "claude").is_file())
         self.assertFalse((fixture / "bin" / "claude").is_symlink())
         self.assertEqual(
@@ -3210,6 +3214,9 @@ class SeedRestore(unittest.TestCase):
                     prefix="native-seed-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
                 seed, fixture = root / "seed", root / "fixture"
+                for parent in (seed, fixture):
+                    parent.mkdir()
+                    (parent / ".cagents-fixture-root").touch()
                 relatives = ("project/.git/objects/4b/object", "home/.claude/session.jsonl")
                 original = {}
                 for relative in relatives:
@@ -3231,6 +3238,7 @@ class SeedRestore(unittest.TestCase):
                     (parent / "external").symlink_to(unrelated)
                 helper = root / "restore.py"
                 shutil.copyfile(REPOSITORY / "scripts/native-evidence-seed.py", helper)
+                shutil.copyfile(REPOSITORY / "scripts/fixture_home.py", root / "fixture_home.py")
                 credentials = {}
                 if os.geteuid() == 0:
                     for directory, subdirs, files in os.walk(root):
@@ -3257,6 +3265,8 @@ class SeedRestore(unittest.TestCase):
             seed, fixture, binaries = root / "seed", root / "fixture", root / "bin"
             for directory in (seed, fixture, binaries):
                 directory.mkdir()
+            for parent in (seed, fixture):
+                (parent / ".cagents-fixture-root").touch()
             (seed / "file").write_text("saved")
             target = fixture / "file"
             target.write_text("changed")

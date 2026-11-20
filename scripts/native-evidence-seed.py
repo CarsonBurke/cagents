@@ -6,8 +6,16 @@ import stat
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fixture_home import require_fixture_home  # noqa: E402
+
 
 def restore(seed: Path, fixture: Path) -> int:
+    require_fixture_home("HOME", seed)
+    require_fixture_home("HOME", fixture)
+    require_fixture_home("HOME", seed / "home")
+    require_fixture_home("HOME", fixture / "home")
     changed_modes = []
     result = None
     try:

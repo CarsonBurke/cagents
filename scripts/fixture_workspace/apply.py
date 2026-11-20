@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import tempfile
 
+from fixture_home import require_fixture_home
+
 from .generate import MARKER
 
 
@@ -42,6 +44,11 @@ def environment(root, instance, runtime=None):
             raise SystemExit("--instance needs 1-24 ASCII letters, digits or hyphens, starting with a letter or "
                              "digit. The unnamed development instance is the login daemon's and is never seeded.")
         env["CAGENTS_DEVELOPMENT_INSTANCE"] = instance
+    home = require_fixture_home("HOME", env.get("HOME"))
+    defaults = {"XDG_DATA_HOME": ".local/share", "XDG_CONFIG_HOME": ".config",
+                "XDG_CACHE_HOME": ".cache", "XDG_STATE_HOME": ".local/state"}
+    for name, suffix in defaults.items():
+        require_fixture_home(name, env.get(name) or os.path.join(home, suffix))
     return env
 
 
@@ -57,6 +64,7 @@ def apply(root, bin_dir, instance=None, log=print):
     if plan[1]["root"] != os.path.realpath(root):
         raise SystemExit(f"{root} holds a plan generated at {plan[1]['root']}, whose repositories and history its "
                          "paths name. Generate it again where it is to be applied.")
+    require_fixture_home("HOME", os.path.join(os.path.realpath(root), "home"))
     if instance is not None:
         return load(plan, bin_dir, instance, None, log)
     # The seed's leases live here only while it runs: a fixture copied to

@@ -25,7 +25,8 @@ HANG_GUARD = 60
 
 class CodexResumeHistory(unittest.TestCase):
     def test_every_user_message_belongs_to_one_complete_turn(self):
-        with tempfile.TemporaryDirectory(prefix="codex-history-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-history-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             result = FIXTURE["seed"](directory, 7)
             rows = [json.loads(line) for line in Path(result["rollout"]).read_text().splitlines()]
             active = None
@@ -60,7 +61,8 @@ class CodexResumeHistory(unittest.TestCase):
             self.assertTrue(Path(result["working_directory"]).is_dir())
 
     def test_rerun_cannot_overwrite_a_provider_home(self):
-        with tempfile.TemporaryDirectory(prefix="codex-history-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-history-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             result = FIXTURE["seed"](directory)
             path = Path(result["rollout"])
             before = path.read_bytes()
@@ -69,7 +71,8 @@ class CodexResumeHistory(unittest.TestCase):
             self.assertEqual(path.read_bytes(), before)
 
     def test_account_home_is_refused_before_any_output(self):
-        with tempfile.TemporaryDirectory(prefix="codex-history-") as directory:
+        with tempfile.TemporaryDirectory(prefix="codex-history-", dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory)
             with mock.patch.object(FIXTURE["pwd"], "getpwuid",
                                    return_value=mock.Mock(pw_dir=str(root / "home"))):
@@ -82,7 +85,8 @@ class CodexResumeHistory(unittest.TestCase):
         binary = Path(os.environ["CAGENTS_TEST_CODEX"])
         self.assertTrue(binary.is_absolute() and binary.is_file(), "name an absolute native Codex executable")
         for framing, expected in [("framed", 3), ("missing-starts", 3), ("old-fixture", 0)]:
-            with self.subTest(framing=framing), tempfile.TemporaryDirectory(prefix="codex-history-") as directory:
+            with self.subTest(framing=framing), tempfile.TemporaryDirectory(prefix="codex-history-", dir="/var/tmp") as directory:
+                Path(directory, ".cagents-fixture-root").touch()
                 result = FIXTURE["seed"](directory)
                 home = Path(result["codex_home"])
                 # An unreachable local-only model endpoint and no credentials:

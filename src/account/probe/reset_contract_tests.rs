@@ -22,6 +22,13 @@ async fn reads_consumes_refreshes_and_reuses_keys_against_fake_providers() {
         let physical = fixture.path().canonicalize().unwrap();
         std::fs::set_permissions(&physical, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = physical.as_path();
+        std::fs::write(root.join(".cagents-fixture-root"), "").unwrap();
+        std::fs::create_dir(root.join("scripts")).unwrap();
+        std::fs::write(
+            root.join("scripts/fixture_home.py"),
+            include_str!("../../../scripts/fixture_home.py"),
+        )
+        .unwrap();
         let helper =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/usage-reset-fixture.py");
         let seed = StdCommand::new("/usr/bin/python3")
@@ -40,7 +47,10 @@ async fn reads_consumes_refreshes_and_reuses_keys_against_fake_providers() {
         let claude = bin.join("claude");
         std::fs::write(&claude, r#"#!/usr/bin/python3
 import json,os,pathlib,sys
-home=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])
+sys.dont_write_bytecode=True
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'scripts'))
+from fixture_home import require_fixture_home
+home=require_fixture_home('CLAUDE_CONFIG_DIR')
 if '--version' in sys.argv:
  print('2.1.296 (fixture)');sys.exit()
 if sys.argv[1:3]==['auth','status']:

@@ -6,14 +6,23 @@ native validator must observe the running command before creating
 ROOT/complete-stream; completed aggregatedOutput cannot establish Stream proof.
 No commercial provider, credentials, network service or daemon is contacted.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import base64
 import hashlib
 import json
 import os
-from pathlib import Path
 import socket
 import struct
-import sys
 import threading
 import time
 import uuid
@@ -208,6 +217,7 @@ def serve(connection, root, payload_bytes, start_lock, stream_started):
 
 
 def main():
+    require_fixture_home("CODEX_HOME")
     if "--version" in sys.argv:
         print("codex-cli 0.162.0 (offline terminal stream fixture)")
         return

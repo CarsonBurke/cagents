@@ -7,13 +7,23 @@ The generated conversation exceeds the retained 128-item paging window.
 --varied gives exchanges the mixed heights of real work: tool calls, code
 blocks, lists and attached screenshots.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 import base64
 import json
 import struct
 import zlib
 import os
-from pathlib import Path
 import re
 import time
 import uuid
@@ -32,6 +42,8 @@ parser.add_argument("--untitled", action="store_true",
 parser.add_argument("--varied", action="store_true",
                     help="mix tool calls, code blocks, lists and images into the exchanges")
 args = parser.parse_args()
+home = require_fixture_home("HOME")
+config = require_fixture_home("CLAUDE_CONFIG_DIR", home / ".claude")
 if args.turns < 129:
     parser.error("use at least 129 turns to exercise history eviction")
 if args.scale < 1:
@@ -107,7 +119,7 @@ def varied(turn, call):
 
 project = os.path.realpath(args.project)
 session = str(uuid.uuid5(uuid.NAMESPACE_URL, f"claude-long-history:{project}"))
-directory = Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", project)
+directory = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", project)
 directory.mkdir(parents=True, exist_ok=True)
 parent = None
 clock = time.time() - (args.turns * (3 if args.varied else 1)

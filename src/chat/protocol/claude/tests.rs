@@ -11967,6 +11967,7 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
 #[test]
 fn composer_fixture_persists_the_provider_history_used_after_restart() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
     let config = root.path().join("config");
     let cwd = root.path().join("project");
     std::fs::create_dir(&cwd).unwrap();

@@ -32,8 +32,9 @@ peer = module("rehearsal_peer", "codex-tool-rows.py")
 
 class ConfigurationTests(unittest.TestCase):
     def test_private_configuration_restores_existing_peer_knobs(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory, mock.patch.dict(os.environ):
             root = Path(directory)
+            (root / ".cagents-fixture-root").touch()
             (root / "codex-fixture.json").write_text(json.dumps({
                 "pause": 90, "never_confirm_interrupt": True, "never_confirm_close": False}))
             adapter.configure_peer(root)
@@ -47,8 +48,9 @@ class ConfigurationTests(unittest.TestCase):
             self.assertIn({'_sleep':90},replies)
 
     def test_history_opens_only_the_first_turn_with_earlier_messages(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory, mock.patch.dict(os.environ):
             root = Path(directory)
+            (root / ".cagents-fixture-root").touch()
             (root / "codex-fixture.json").write_text(json.dumps({"pause": 1, "history": [5, 200]}))
             adapter.configure_peer(root)
             self.assertEqual(os.environ["CAGENTS_TOOL_ROWS_HISTORY"], "5 200")
@@ -69,8 +71,9 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(history("second")[0], [])
 
     def test_rejects_unknown_invalid_and_symlink_configuration(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory, mock.patch.dict(os.environ):
             root = Path(directory)
+            (root / ".cagents-fixture-root").touch()
             path = root / "codex-fixture.json"
             for settings in ({"arbitrary_env": "value"}, {"pause": True}, {"pause": 0},
                              {"pause": 301}, {"never_confirm_close": "1"}, {"history": 5},
@@ -88,7 +91,8 @@ class ConfigurationTests(unittest.TestCase):
 
 class ListenerTests(unittest.TestCase):
     def test_accepts_private_runtime_and_old_build_convention(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             runtime = Path(directory)
             path = runtime / "control.sock"
             self.assertEqual(adapter.listener_path(["--listen", f"unix://{path}"], runtime), path)
@@ -100,7 +104,8 @@ class ListenerTests(unittest.TestCase):
                 self.assertEqual(adapter.listener_path([f"--listen=unix://{path}"], runtime), path)
 
     def test_rejects_public_symlink_existing_and_unrelated_sockets(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory)
             runtime = root / "runtime"
             runtime.mkdir(mode=0o700)
@@ -136,7 +141,8 @@ class PersistenceTests(unittest.TestCase):
         scenario.play(replies, lambda _: None, threading.Lock(), scenario.playback(replies))
 
     def test_resume_restores_exact_thread_and_history_across_listener_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             first.request({"id": 1, "method": "thread/start"}, directory)
@@ -153,7 +159,8 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(successor.child, first.child)
 
     def test_model_and_effort_survive_listener_restart_and_thread_resume(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             first.request({"id": 1, "method": "thread/start"}, directory)
@@ -169,7 +176,8 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(successor.state(), first.state())
 
     def test_invalid_model_effort_and_unknown_state_keys_are_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             scenario = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             scenario.request({"id": 1, "method": "thread/start"}, directory)
@@ -185,7 +193,8 @@ class PersistenceTests(unittest.TestCase):
                 adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
 
     def test_observed_completion_is_saved_without_a_later_request(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             remaining, generations = self.start_paused(first, directory)
@@ -199,7 +208,8 @@ class PersistenceTests(unittest.TestCase):
                 self.assertEqual(resumed["initialTurnsPage"]["data"][0]["status"], "completed")
 
     def test_interrupted_parent_and_running_child_survive_listener_replacement(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             remaining, generations = self.start_paused(first, directory)
@@ -226,8 +236,9 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(states, ["interrupted", "interrupted"])
 
     def test_unconfirmed_interrupt_survives_listener_replacement(self):
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory, mock.patch.dict(os.environ, {
                 "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT": "1"}):
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             remaining, _ = self.start_paused(first, directory)
@@ -241,7 +252,8 @@ class PersistenceTests(unittest.TestCase):
                                  and frame["params"]["threadId"] == first.thread for frame in sent))
 
     def test_loading_named_history_fences_playback_of_the_previous_allocation(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             remaining, generations = self.start_paused(first, directory)
@@ -257,7 +269,8 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(first.state(), other.state())
 
     def test_legacy_state_defaults_model_effort_without_inventing_child_completion(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             first = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
             self.start_paused(first, directory)
@@ -274,7 +287,8 @@ class PersistenceTests(unittest.TestCase):
             self.assertIsNone(restarted.reasoning)
 
     def test_probe_listener_does_not_replace_conversation_state(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             storage = Path(directory) / "state"
             conversation = adapter.scenario_class(peer, storage, Path("/chat/control.sock"))()
             conversation.request({"id": 1, "method": "thread/start"}, directory)
@@ -287,7 +301,8 @@ class PersistenceTests(unittest.TestCase):
 
 class StdioProbeTests(unittest.TestCase):
     def test_account_probe_answers_without_stderr_or_persisted_conversation(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as directory:
+            Path(directory, ".cagents-fixture-root").touch()
             root = Path(directory)
             home, runtime = root / "home", root / "rt"
             home.mkdir(mode=0o700)

@@ -26,6 +26,9 @@
 # Shots: agents-running after launch, agents-settled after settle, each with
 # the side's prefix as native-evidence adds it.
 set -u
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 
 here=$(cd "$(dirname "$0")" && pwd)
 frames=$here/nested-agents-scene

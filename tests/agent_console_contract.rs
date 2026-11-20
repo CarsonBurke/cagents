@@ -32,6 +32,7 @@ impl Fixture {
         command
             .env_clear()
             .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
             .env("XDG_RUNTIME_DIR", root.join("run"))
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CONFIG_HOME", root.join("config"))
@@ -53,6 +54,13 @@ impl Fixture {
 
     fn with_provider(script: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
+        fs::create_dir_all(root.path().join("bin/lib")).unwrap();
+        fs::write(
+            root.path().join("bin/lib/fixture-home.sh"),
+            include_str!("fixtures/lib/fixture-home.sh"),
+        )
+        .unwrap();
         for directory in [
             "home/.claude",
             "run",

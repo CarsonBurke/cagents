@@ -22,11 +22,20 @@ the fixture replays the same frames until fixture-frames.jsonl is removed.
 Running it again rewrites the forge seeds and frames and keeps the worktrees.
 Nothing here reaches the network or a real provider home.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import json
 import os
-from pathlib import Path
 import subprocess
-import sys
 
 HERE = Path(__file__).resolve().parent
 REMOTE = "https://github.com/octo-org/fixture-app"
@@ -200,6 +209,7 @@ def write(path, content):
 
 
 def main():
+    require_fixture_home("HOME")
     if len(sys.argv) > 1:
         fail(f"takes no arguments; run it as: scripts/native-evidence env python3 {sys.argv[0]}")
     fixture = os.environ.get("CAGENTS_EVIDENCE_FIXTURE")
@@ -212,8 +222,9 @@ def main():
     if not ((fixture / "bin").is_dir() and (project / ".git").exists() and (home / ".claude").is_dir()
             and Path.home().resolve() == home):
         fail(f"{fixture} is not a native-evidence fixture whose HOME is this one; start a session first")
+    config = require_fixture_home("XDG_CONFIG_HOME", home / ".config")
+    claude = require_fixture_home("CLAUDE_CONFIG_DIR", home / ".claude")
     oids = prepare_worktrees(project)
-    config = home / ".config"
     config.mkdir(exist_ok=True)
     # The switch goes on before the remote appears: a failed read while the
     # remote is there makes the app wait before asking again.
@@ -221,7 +232,7 @@ def main():
     write(config / "fixture-forge-prs.json", json.dumps(pull_requests(oids), indent=1) + "\n")
     if "origin" not in git(project, "remote").split():
         git(project, "remote", "add", "origin", REMOTE)
-    write(home / ".claude" / "fixture-frames.jsonl", frames(project, oids))
+    write(claude / "fixture-frames.jsonl", frames(project, oids))
     print(json.dumps({"project": str(project),
                       "worktrees": sorted(str(path) for path in (project / ".worktrees").iterdir())}))
 

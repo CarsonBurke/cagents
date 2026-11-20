@@ -7,12 +7,22 @@ Version 6 recognizes schema 22 shared views and schema 23 to 29 normalized
 panes with descriptor format 1. Schemas 24 to 29 only add tables beside them. --restore undoes only this helper's recorded CAS.
 --self-test uses invented in-memory SQLite, never an app or provider home.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 from contextlib import closing
 import hashlib
 import json
 import os
-from pathlib import Path
 import sqlite3
 import stat
 import uuid
@@ -116,6 +126,9 @@ def owned_regular(path, private=False):
 def fixture_root(root):
     if 'CAGENTS_AGENT_AUTHORITY' in os.environ:
         raise ValueError('A genuine native-evidence User environment is required')
+    require_fixture_home("HOME", Path(root) / "home")
+    require_fixture_home("XDG_DATA_HOME", Path(root) / "data")
+    require_fixture_home("XDG_CONFIG_HOME", Path(root) / "config")
     if root.is_symlink():
         raise ValueError('Refusing a symlink fixture')
     root = root.resolve()
