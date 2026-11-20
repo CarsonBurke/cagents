@@ -56,13 +56,7 @@ pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError>
         DeviceCommand::List => list(&trust(Request::Links)?),
         DeviceCommand::Link { name, allow_agents } => {
             let device = saved(&name)?;
-            // Linking again replaces only the key. This computer keeps its
-            // identity on the device, so the agents its sessions started
-            // there stay theirs.
-            let peer = links(trust(Request::Links)?)
-                .into_iter()
-                .find(|link| link.device == name)
-                .map_or_else(uuid::Uuid::new_v4, |link| link.peer);
+            let peer = link_peer(&links(trust(Request::Links)?), &name);
             let key = LinkKey::generate().map_err(|error| AppError::new("device", error))?;
             on_device(&name, |remote| {
                 remote.device_trust(Request::RegisterPeer {
@@ -149,6 +143,16 @@ fn set_allowed(
             )
         },
     })
+}
+
+/// The identity this computer links to `device` with. Linking again
+/// replaces only the key: this computer keeps its identity on the device, so
+/// the agents its sessions started there stay theirs.
+fn link_peer(links: &[LinkStatus], device: &str) -> uuid::Uuid {
+    links
+        .iter()
+        .find(|link| link.device == device)
+        .map_or_else(uuid::Uuid::new_v4, |link| link.peer)
 }
 
 fn links(reply: Reply) -> Vec<LinkStatus> {
@@ -247,4 +251,24 @@ fn list(reply: &Reply) -> Result<CommandOutput, AppError> {
         data: json!({ "devices": rows }),
         human,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linking_again_keeps_this_computers_identity_on_the_device() {
+        let link = |device: &str| LinkStatus {
+            device: device.into(),
+            peer: uuid::Uuid::new_v4(),
+            agents_allowed: true,
+            linked_at: 0,
+        };
+        let links = [link("laptop"), link("fw16")];
+        assert_eq!(link_peer(&links, "fw16"), links[1].peer);
+        let fresh = link_peer(&links, "devx");
+        assert!(links.iter().all(|link| link.peer != fresh));
+        assert_ne!(fresh, link_peer(&links, "devx"));
+    }
 }
