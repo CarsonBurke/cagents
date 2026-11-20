@@ -380,6 +380,7 @@ fi
 # the command's row, the group counting on as its strip while the agent
 # thinks, and the row again once it answers, at one scroll position.
 if [ "$scene" = lone-thinking ]; then
+    rm -f "$config/fixture-release.lone-think" "$config/fixture-release.lone-answer"
     cp "$here/reasoning-row-scene/lone-thinking.jsonl" "$config/fixture-frames.jsonl.next"
     mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
     evidence cli project open "$fixture/project" >/dev/null
@@ -388,23 +389,22 @@ if [ "$scene" = lone-thinking ]; then
     seen() { rg -q "\"uuid\":\"$1\"" "$config/projects"; }
     # Keep a picture of the screen a scene gave up on.
     late() { evidence shot lone-failed >/dev/null 2>&1 || true; printf 'reasoning-row-scene: %s\n' "$1" >&2; exit 1; }
-    # Pace by what is on screen, so a slow host shoots each state rather than
-    # the one after it. The thought starts ten seconds after the command's
-    # row appears and runs twenty; the baseline never draws a strip, so its
-    # thinking shot falls back to the middle of that window.
+    # The turn waits after the command, and again while it thinks, until this
+    # scene has shot the state before; a slow host then still shoots each one.
+    release() { : >"$config/fixture-release.$1"; }
     evidence drive wait 'fixture-verified' --timeout 60 >/dev/null || late 'the command did not run'
-    start=$(date +%s)
+    sleep 1
     shot lone-row
-    [ $(($(date +%s) - start)) -lt 9 ] || late 'the lone row was shot after the thinking began'
-    remaining=$((start + 20 - $(date +%s)))
-    evidence drive wait 'fixture-verified · working' --timeout "$((remaining > 1 ? remaining : 1))" >/dev/null || true
+    release lone-think
+    # The baseline draws no strip, so give the thought a few seconds either way.
+    evidence drive wait 'working' --timeout 10 >/dev/null || true
+    sleep 3
     shot lone-thinking-strip
-    elapsed=$(($(date +%s) - start))
-    [ "$elapsed" -gt 7 ] && [ "$elapsed" -lt 29 ] && ! seen lone-answer-1 \
-        || late "the thinking was shot outside it, ${elapsed}s after the command"
+    seen lone-answer-1 && late 'the answer landed before the thinking was shot'
+    release lone-answer
     for _ in $(seq 40); do seen lone-answer-1 && break; sleep 1; done
     seen lone-answer-1 || late 'the answer did not land'
-    evidence drive wait 'fixture-verified · working' --gone --timeout 15 >/dev/null || late 'the group kept counting after the answer'
+    evidence drive wait 'Finished at' --timeout 15 >/dev/null || late 'the turn did not finish'
     sleep 1
     shot lone-answered
     printf '%s\n' 'Captured a lone step before, during and after the thinking that follows it.'
