@@ -12438,3 +12438,116 @@ fn a_lone_coordinating_step_still_running_says_so() {
         "{texts:?}"
     );
 }
+
+/// Keyboard focus reaches a composer notice's Dismiss: Shift+Tab from the
+/// message field passes the `+` and lands on it, Enter dismisses the notice,
+/// and Tab goes back the same way. The notice's icon button is a Tab stop
+/// like the model picker (#3444).
+#[test]
+fn shift_tab_from_the_composer_reaches_a_notice_dismiss() {
+    use iced::advanced::{
+        clipboard,
+        widget::{Operation, operation},
+    };
+    use iced::runtime::{UserInterface, user_interface::Cache};
+    type Ui<'a> = UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer>;
+
+    fn run(ui: &mut Ui<'_>, renderer: &cosmic::Renderer, mut operation: Box<dyn Operation>) {
+        loop {
+            ui.operate(renderer, operation.as_mut());
+            match operation.finish() {
+                operation::Outcome::Chain(next) => operation = next,
+                _ => break,
+            }
+        }
+    }
+    /// What Enter on the focused control publishes.
+    fn press(ui: &mut Ui<'_>, renderer: &mut cosmic::Renderer) -> Vec<Message> {
+        let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: enter.clone(),
+                modified_key: enter,
+                physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })],
+            iced::mouse::Cursor::Unavailable,
+            renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        messages
+    }
+    let presses_plus = |messages: &[Message]| {
+        messages
+            .iter()
+            .any(|message| matches!(message, Message::ChatUi(Action::ComposerActions(..))))
+    };
+
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = super::super::tests::draft_chat_for_provider(&mut app, Provider::Codex);
+    let target = {
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("draft chat");
+        };
+        runtime.restored_waiting = Some(RestoredWaiting {
+            count: 1,
+            whole: true,
+        });
+        runtime.target
+    };
+    let mut renderer = crate::app::tests::headless_renderer();
+    let mut ui = UserInterface::build(
+        app.card_view(card, true, false),
+        iced::Size::new(720.0, 800.0),
+        Cache::new(),
+        &mut renderer,
+    );
+    run(
+        &mut ui,
+        &renderer,
+        Box::new(operation::focusable::focus::<()>(card_control_id(
+            card,
+            "chat-composer",
+        ))),
+    );
+    run(
+        &mut ui,
+        &renderer,
+        Box::new(operation::focusable::focus_previous::<()>()),
+    );
+    assert!(
+        presses_plus(&press(&mut ui, &mut renderer)),
+        "the first stop before the message field is its +"
+    );
+    run(
+        &mut ui,
+        &renderer,
+        Box::new(operation::focusable::focus_previous::<()>()),
+    );
+    let messages = press(&mut ui, &mut renderer);
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [Message::ChatUi(Action::DismissRestoredWaiting(found))] if *found == target
+        ),
+        "the next is the notice's Dismiss, and Enter dismisses it: {:?}",
+        messages
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<Vec<_>>()
+    );
+    run(
+        &mut ui,
+        &renderer,
+        Box::new(operation::focusable::focus_next::<()>()),
+    );
+    assert!(
+        presses_plus(&press(&mut ui, &mut renderer)),
+        "Tab from Dismiss returns to the +"
+    );
+}
