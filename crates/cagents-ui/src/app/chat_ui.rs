@@ -16560,8 +16560,14 @@ impl Cagents {
                 }
                 match loaded {
                     images::Loaded::Ready(handle) => {
-                        self.chat_ui.image_viewer =
-                            Some(images::Gallery::attachment(attachment.label(), handle));
+                        // Over the pane's transcript, as its own images open,
+                        // so the composer stays usable while it shows.
+                        runtime.show_image(images::Gallery::attachment(
+                            runtime.selected_subagent.clone(),
+                            attachment.label(),
+                            handle,
+                        ));
+                        return self.focus_image_viewer(target);
                     }
                     images::Loaded::Failed(error) => runtime.error = Some(error),
                     images::Loaded::Unavailable => {

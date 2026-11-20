@@ -749,6 +749,16 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
 ///
 /// It also runs whenever the transcript lets pixels go, so the viewer stops
 /// holding them too.
+impl Runtime {
+    /// Opens `gallery` in this pane's viewer. It is what the reader asked
+    /// for last, so a draft image still loading from an earlier press on
+    /// its tile stays closed when it arrives.
+    pub(super) fn show_image(&mut self, gallery: Gallery) {
+        self.opening_attachment = None;
+        self.image_viewer = Some(gallery);
+    }
+}
+
 pub(super) fn sync_viewer(runtime: &mut Runtime) {
     if let Some(mut gallery) = runtime.image_viewer.take()
         && gallery.transcript == runtime.selected_subagent
@@ -1139,9 +1149,14 @@ impl Gallery {
             reading: None,
         }
     }
-    /// An image the draft holds, opened from the composer's tray. Its path
-    /// is the draft's, never handed to another application.
-    pub(in crate::app) fn attachment(label: String, handle: iced::widget::image::Handle) -> Self {
+    /// An image the draft holds, opened from the composer's tray over the
+    /// transcript the pane shows (`transcript`, as [`Self::new`] records it).
+    /// Its path is the draft's, never handed to another application.
+    pub(in crate::app) fn attachment(
+        transcript: Option<String>,
+        label: String,
+        handle: iced::widget::image::Handle,
+    ) -> Self {
         Self {
             entries: vec![Entry {
                 id: "attachment".into(),
@@ -1156,7 +1171,7 @@ impl Gallery {
             selected: 0,
             remote: crate::device::is_remote(),
             reset: 0,
-            transcript: None,
+            transcript,
             from_transcript: false,
             origin: None,
             serial: 0,
@@ -1657,7 +1672,7 @@ impl Cagents {
                     return Some(Task::none());
                 };
                 let read = gallery.read(ViewerHost::Pane(target));
-                runtime.image_viewer = Some(gallery);
+                runtime.show_image(gallery);
                 // The keyboard moves to the viewer, as a press on the image
                 // would leave it, unless the pane doesn't hold it.
                 Some(Task::batch([read, self.focus_image_viewer(target)]))
