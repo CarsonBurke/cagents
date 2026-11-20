@@ -194,6 +194,36 @@ class CodexToolRowsFixture(unittest.TestCase):
                 "threadId": scenario.child}}, str(home))
             self.assertEqual(read[0]["result"]["thread"]["agentNickname"], "Quinn")
 
+    def test_restarted_server_lists_unloaded_children_and_reads_nested_ones_through_parents(self):
+        with tempfile.TemporaryDirectory(prefix="codex-nested-child-") as directory:
+            home = Path(directory)
+            (home / "fixture-nested-child").touch()
+            earlier = PEER["Scenario"]()
+            for reply in earlier.request({"id": 1, "method": "turn/start", "params": {
+                    "threadId": earlier.thread}}, str(home)):
+                if "_sleep" not in reply:
+                    earlier.observe(reply)
+            self.assertEqual(earlier.child_latest["status"], "completed")
+            self.assertEqual(earlier.metadata(earlier.child)["status"]["type"], "idle")
+            # A new server process restores the history but has loaded nothing.
+            scenario = PEER["Scenario"]()
+            scenario.restore(earlier.state())
+            self.assertEqual(scenario.grandchild, earlier.grandchild)
+            scenario.request({"id": 2, "method": "thread/resume", "params": {
+                "threadId": scenario.thread}}, str(home))
+            listed = scenario.request({"id": 3, "method": "thread/list"}, str(home))[0]["result"]["data"]
+            self.assertEqual([(thread["id"], thread["parentThreadId"], thread["status"]["type"])
+                              for thread in listed],
+                             [(scenario.grandchild, scenario.child, "notLoaded"),
+                              (scenario.child, scenario.thread, "notLoaded")])
+            refused = scenario.request({"id": 4, "method": "thread/resume", "params": {
+                "threadId": scenario.grandchild}}, str(home))[0]
+            self.assertIn("resume the parent first", refused["error"]["message"])
+            for identifier, thread in ((5, scenario.child), (6, scenario.grandchild)):
+                read = scenario.request({"id": identifier, "method": "thread/resume", "params": {
+                    "threadId": thread}}, str(home))[0]["result"]
+                self.assertEqual(read["thread"]["status"]["type"], "idle")
+
     def test_interrupt_private_web_scene_fences_delayed_results(self):
         with tempfile.TemporaryDirectory(prefix="codex-web-rows-") as directory:
             home = Path(directory)

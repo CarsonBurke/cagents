@@ -455,6 +455,12 @@ collaboration calls and thread listing report its child without a nickname,
 and only the child's own thread read names it Quinn: a child discovered before
 Codex named it.
 
+With `home/.codex/fixture-nested-child` present, its thread listing also
+reports a subagent the child spawned earlier, Ada, which never runs live. Like
+Codex, the peer lists a child it hasn't loaded since it started as
+`notLoaded`, and refuses to read Ada until the child's own read has loaded it:
+the state a restarted daemon restores nested subagents from.
+
 The `tool-rows` peer also reads an optional `model/list` result from
 `home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
 ID on each entry; `displayName`, `supportedReasoningEfforts`,
