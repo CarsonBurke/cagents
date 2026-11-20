@@ -1644,15 +1644,31 @@ impl Runtime {
             Some(open),
             Some(Action::ToggleFailure(target, incident.key.clone())),
         ));
-        rows.push(
-            crate::ui_controls::button::quiet("Copy details")
-                .name(format!(
-                    "Copy original diagnostics for {}",
-                    incident.summary
-                ))
-                .on_press(action(Action::CopyFailure(target, incident.key.clone())))
+        let copy = crate::ui_controls::button::quiet("Copy details")
+            .name(format!(
+                "Copy original diagnostics for {}",
+                incident.summary
+            ))
+            .on_press(action(Action::CopyFailure(target, incident.key.clone())));
+        // What its last copy said, beside it: a copy is the reader's own
+        // action, not part of the failure it copies.
+        let said = match self.details_copy_state(&incident.key) {
+            super::text_copy::CopyState::Ready => None,
+            super::text_copy::CopyState::Copied => Some(
+                design::caption("Copied").class(cosmic::theme::Text::Custom(design::muted_text)),
+            ),
+            super::text_copy::CopyState::Refused(refusal) => Some(
+                design::caption(refusal.to_string())
+                    .class(cosmic::theme::Text::Custom(design::warning_text)),
+            ),
+        };
+        rows.push(match said {
+            Some(said) => widget::row::with_children(vec![copy.into(), said.into()])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
                 .into(),
-        );
+            None => copy.into(),
+        });
         if open {
             // Full bytes are resolved only on expansion/copy. The collapsed
             // surface never clones or shapes a provider's request dump.

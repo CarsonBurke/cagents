@@ -241,7 +241,7 @@ async fn rebind_receipt(
     .and_then(|result| result)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyPart {
     Text,
     Input,
@@ -3142,7 +3142,8 @@ pub(super) struct Runtime {
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
     find_navigation: find_navigation::State,
-    copied: Option<(String, Instant)>,
+    /// What the last copy said at the control it was made from.
+    copy_feedback: Option<text_copy::CopyFeedback>,
     /// When a cancel that would also stop background subagents was pressed,
     /// until it is pressed again or lapses.
     pub(super) interrupt_armed: Option<Instant>,
@@ -4426,7 +4427,7 @@ impl Runtime {
             child_find_disclosure: HashMap::new(),
             find_index: 0,
             find_navigation: find_navigation::State::default(),
-            copied: None,
+            copy_feedback: None,
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
@@ -15194,6 +15195,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                let key = text_copy::CopyKey::of(id.clone(), Some(&part));
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
                 let text = runtime.active_item(&id).and_then(|item| {
@@ -15212,14 +15214,9 @@ impl Cagents {
                     }
                 });
                 if let Some(text) = text {
-                    let at = Instant::now();
-                    runtime.copied = Some((id, at));
                     return Task::batch([
                         iced::clipboard::write(text).map(cosmic::Action::App),
-                        cosmic::task::future(async move {
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
-                            Message::ChatUi(Action::ClearCopied(target, at))
-                        }),
+                        runtime.tell_copy(key, None),
                     ]);
                 }
             }
@@ -15449,11 +15446,11 @@ impl Cagents {
             Action::ClearCopied(target, at) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && runtime
-                        .copied
+                        .copy_feedback
                         .as_ref()
-                        .is_some_and(|(_, copied)| *copied == at)
+                        .is_some_and(|feedback| feedback.at == at)
                 {
-                    runtime.copied = None;
+                    runtime.copy_feedback = None;
                 }
             }
             Action::Latest(target) => {

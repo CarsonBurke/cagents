@@ -44,6 +44,21 @@ where
     Theme: 'a,
     Renderer: core::Renderer + 'a,
 {
+    over_pinned(base, top, false)
+}
+
+/// [`over`], whose `top` also shows while `pinned`, hovered or not: when it
+/// says something the reader must see, such as why a copy didn't go through.
+pub(super) fn over_pinned<'a, Message, Theme, Renderer>(
+    base: impl Into<Element<'a, Message, Theme, Renderer>>,
+    top: impl Into<Element<'a, Message, Theme, Renderer>>,
+    pinned: bool,
+) -> Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: 'a,
+    Renderer: core::Renderer + 'a,
+{
     use iced::advanced::Shell;
     use iced::advanced::layout::{self, Layout};
     use iced::advanced::mouse;
@@ -54,6 +69,7 @@ where
     struct Hover<'a, Message, Theme, Renderer> {
         base: Element<'a, Message, Theme, Renderer>,
         top: Element<'a, Message, Theme, Renderer>,
+        pinned: bool,
     }
 
     impl<'a, Message, Theme, Renderer> Hover<'a, Message, Theme, Renderer> {
@@ -158,7 +174,8 @@ where
                     viewport,
                 );
 
-                if cursor.is_over(layout.bounds())
+                if self.pinned
+                    || cursor.is_over(layout.bounds())
                     || tree.state.downcast_ref::<State>().is_top_focused
                     || tree.state.downcast_ref::<State>().is_top_overlay_active
                 {
@@ -299,7 +316,8 @@ where
                 shell.request_redraw();
             }
 
-            let is_visible = is_hovered
+            let is_visible = self.pinned
+                || is_hovered
                 || tree.state.downcast_ref::<State>().is_top_focused
                 || tree.state.downcast_ref::<State>().is_top_overlay_active;
 
@@ -418,6 +436,7 @@ where
     Element::new(Hover {
         base: base.into(),
         top: top.into(),
+        pinned,
     })
 }
 

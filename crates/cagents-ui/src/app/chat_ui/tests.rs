@@ -20125,7 +20125,24 @@ fn auth_warning_remains_when_new_work_or_error_prevents_idle_recovery() {
 }
 /// The actual App entry batches even an empty action. Observe its effects
 /// rather than assuming that a no-op task has no stream representation.
-fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
+/// Why the last copy didn't go through, as its control says.
+pub(super) fn copy_refusal(runtime: &Runtime) -> Option<&str> {
+    runtime
+        .copy_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.refusal.as_deref())
+}
+
+/// Whether the last copy's control says it copied.
+pub(super) fn shows_copied(runtime: &Runtime) -> bool {
+    runtime
+        .copy_feedback
+        .as_ref()
+        .is_some_and(|feedback| feedback.refusal.is_none())
+}
+
+/// `task` neither copies nor reads: at most, a refusal's note lapses.
+pub(super) fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
     use iced::futures::StreamExt;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -20145,7 +20162,15 @@ fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
     // The owning process supervisor retains its separate hard deadline.
     runtime.shutdown_timeout(Duration::from_secs(1));
     let effects = result.expect("a rejected copy must settle without asynchronous work");
-    assert!(effects.is_empty(), "{reason}");
+    assert!(
+        effects.iter().all(|effect| matches!(
+            effect,
+            iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::ClearCopied(..)
+            )))
+        )),
+        "{reason}"
+    );
 }
 
 fn assert_chat_copy_task_writes(task: Task<Message>, expected: &str) {
@@ -20249,13 +20274,11 @@ fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() 
         "missing source must never copy the loaded fragment",
     );
     assert!(
-        chat_runtime(&app, card)
-            .error
-            .as_deref()
+        copy_refusal(chat_runtime(&app, card))
             .unwrap()
             .contains("unavailable")
     );
-    assert!(chat_runtime(&app, card).copied.is_none());
+    assert!(!shows_copied(chat_runtime(&app, card)));
 }
 
 /// A long output's row shows only its start and end. Its Copy reads the
@@ -20400,7 +20423,7 @@ fn valid_message_copy_completion(
     ));
     assert_chat_copy_task_writes(control, &body);
     assert_eq!(app.workspace.focused(), Some(card));
-    app.chat_runtime_mut(target).unwrap().copied = None;
+    app.chat_runtime_mut(target).unwrap().copy_feedback = None;
     (card, target, request, body)
 }
 
@@ -20528,18 +20551,20 @@ fn child_failure_copy_refuses_unavailable_original_instead_of_copying_preview() 
         task,
         "an unavailable original must never copy the resident excerpt",
     );
+    let runtime = app.chat_runtime_mut(target).unwrap();
     assert!(
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .error
-            .as_deref()
+        copy_refusal(runtime)
             .unwrap()
             .contains("Original diagnostic unavailable")
+    );
+    assert!(
+        runtime.error.is_none(),
+        "a copy is not the conversation's failure"
     );
 }
 
 #[test]
-fn child_failure_read_error_reports_withdrawal_but_suppresses_replacement_feedback() {
+fn child_failure_read_error_says_why_it_did_not_copy_when_withdrawn_or_replaced() {
     let _context = text_copy::isolated_context();
     for change in ["withdrawn", "replacement"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20570,11 +20595,18 @@ fn child_failure_read_error_reports_withdrawal_but_suppresses_replacement_feedba
             Err("owned backing read failed".into()),
         ));
         assert_chat_copy_task_has_no_clipboard_write(task, "read errors cannot copy a preview");
-        let error = app.chat_runtime_mut(target).unwrap().error.as_deref();
-        assert_eq!(
-            error.is_some_and(|error| error.contains("Original diagnostic unavailable")),
-            change == "withdrawn"
-        );
+        let refusal = copy_refusal(app.chat_runtime_mut(target).unwrap()).unwrap();
+        if change == "withdrawn" {
+            assert!(
+                refusal.contains("Original diagnostic unavailable"),
+                "{refusal}"
+            );
+        } else {
+            assert_eq!(
+                refusal,
+                "These details changed while copying. Copy them again."
+            );
+        }
     }
 }
 
@@ -20600,7 +20632,7 @@ fn logical_message_copy_completion_survives_parent_window_eviction() {
         Ok(body.clone()),
     )));
     assert_chat_copy_task_writes(task, &body);
-    assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
+    assert!(shows_copied(app.chat_runtime_mut(target).unwrap()));
 }
 
 #[test]
@@ -20835,7 +20867,7 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             Ok(body),
         )));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        assert!(runtime.copied.is_none());
+        assert!(!shows_copied(runtime));
         if change == "rewrite" {
             // The rewritten item is read again; only that read reaches the
             // clipboard.
@@ -20869,7 +20901,7 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
         } else {
             assert_chat_copy_task_has_no_effects(task, change);
             assert_eq!(
-                runtime.error.as_deref(),
+                copy_refusal(runtime),
                 Some(text_copy::UNAVAILABLE),
                 "{change}"
             );
@@ -20949,7 +20981,7 @@ fn logical_message_copy_deferred_write_reads_again_after_destructive_publication
             target, id, request, result,
         )));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        assert!(runtime.copied.is_none(), "{change}");
+        assert!(!shows_copied(runtime), "{change}");
         if change == "rewrite" {
             assert!(runtime.error.is_none(), "{change}");
             assert!(
@@ -20958,7 +20990,7 @@ fn logical_message_copy_deferred_write_reads_again_after_destructive_publication
             );
         } else {
             assert_eq!(
-                runtime.error.as_deref(),
+                copy_refusal(runtime),
                 Some(text_copy::UNAVAILABLE),
                 "{change}"
             );
@@ -21087,7 +21119,7 @@ fn logical_message_copy_completion_refuses_scope_handle_focus_and_failed_canonic
             result,
         )));
         assert_chat_copy_task_has_no_effects(task, change);
-        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
         if change == "canonical read" {
             assert!(
                 app.chat_runtime_mut(target)
@@ -21118,7 +21150,7 @@ fn newer_chat_copy_blocks_delayed_full_message_clipboard_write() {
         task,
         "a delayed read must not overwrite the newer clipboard intent",
     );
-    assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+    assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
 }
 
 #[test]
@@ -21149,7 +21181,7 @@ fn captured_builtin_copy_event_on_same_card_supersedes_async_message_copy() {
         task,
         "a builtin copy captured by the same card must supersede the old read",
     );
-    assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+    assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
 }
 
 #[test]
