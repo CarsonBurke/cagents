@@ -2,10 +2,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    ffi::OsString,
     ops::Range,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
@@ -44,7 +42,7 @@ use crate::{
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
-        SaveDurability, SaveOutcome, validate_repo_path,
+        SaveDurability, SaveOutcome,
     },
     editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
@@ -52,9 +50,10 @@ use crate::{
     },
     model::{CardId, RepositoryView},
     repository::{
-        CancellationToken, ChangeKind, ChangedPath, DiffBasis, DiffContent, DiffSide,
-        HistoryRequest, HistoryRevision, MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService,
-        RepositorySnapshot, ValidatedRefName,
+        CancellationToken, ChangeArea, ChangeKind, ChangedPath, ConflictKind, DiffBasis,
+        DiffContent, DiffSide, FileInventoryDigest, FileInventoryRead, HistoryRequest,
+        HistoryRevision, MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService, RepositorySnapshot,
+        StatusSnapshot, ValidatedRefName, WorkingFiles,
     },
     ui_controls::{Icon, icon_button},
 };
@@ -77,15 +76,6 @@ impl OldPath {
         match entry.kind {
             ChangeKind::Renamed => Some(Self::Renamed(path)),
             ChangeKind::Copied => Some(Self::Copied(path)),
-            _ => None,
-        }
-    }
-
-    /// The pairing a porcelain status code reports for one area.
-    fn from_status_code(code: u8, path: &Path) -> Option<Self> {
-        match code {
-            b'R' => Some(Self::Renamed(path.to_owned())),
-            b'C' => Some(Self::Copied(path.to_owned())),
             _ => None,
         }
     }
@@ -2053,6 +2043,15 @@ struct WorkingDiffJob {
     cancellation: CancellationToken,
 }
 
+/// The outstanding file-list read, cancelled when it is dropped.
+struct FileListReadJob(CancellationToken);
+
+impl Drop for FileListReadJob {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 impl Drop for WorkingDiffJob {
     fn drop(&mut self) {
         self.cancellation.cancel();
@@ -2333,12 +2332,15 @@ pub struct RepositoryRuntime {
     /// a refresh tick that finds nothing changed can say so without
     /// rebuilding the list. `None` before the first successful read, and
     /// after any read this card did not install.
-    file_list_digest: Option<blake3::Hash>,
+    file_list_digest: Option<FileInventoryDigest>,
+    /// Cancels the outstanding file-list read when a newer read supersedes
+    /// it, the card is retargeted, or the card is closed.
+    file_list_read: Option<FileListReadJob>,
     /// Where the worker leaves the digest of the read in flight, tagged with
     /// the generation that asked for it. Committed into
     /// [`RepositoryRuntime::file_list_digest`] only once the matching list
     /// has actually been installed.
-    file_list_deposit: Arc<std::sync::Mutex<Option<(u64, blake3::Hash)>>>,
+    file_list_deposit: Arc<std::sync::Mutex<Option<(u64, FileInventoryDigest)>>>,
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
@@ -2560,6 +2562,7 @@ impl RepositoryRuntime {
             file_list_loading: false,
             file_list_started: None,
             file_list_digest: None,
+            file_list_read: None,
             file_list_deposit: Arc::new(std::sync::Mutex::new(None)),
             file_list_refresh_queued: false,
             background_file_refresh: false,
@@ -3551,11 +3554,15 @@ impl RepositoryRuntime {
             path: PathBuf::from("."),
             generation: self.file_list_generation,
         };
+        let cancellation = CancellationToken::new();
+        // Replacing the job cancels the read it supersedes.
+        self.file_list_read = Some(FileListReadJob(cancellation.clone()));
         files_task(
             identity,
             self.directory_only,
             self.file_list_digest,
             Arc::clone(&self.file_list_deposit),
+            cancellation,
         )
     }
 
@@ -8110,6 +8117,7 @@ impl RepositoryRuntime {
         self.file_list_refresh_queued = false;
         self.background_file_refresh = false;
         self.file_list_digest = None;
+        self.file_list_read = None;
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -8682,8 +8690,9 @@ impl RepositoryRuntime {
 fn files_task(
     identity: AsyncIdentity,
     directory_only: bool,
-    previous: Option<blake3::Hash>,
-    deposit: Arc<std::sync::Mutex<Option<(u64, blake3::Hash)>>>,
+    previous: Option<FileInventoryDigest>,
+    deposit: Arc<std::sync::Mutex<Option<(u64, FileInventoryDigest)>>>,
+    cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let generation = identity.generation;
@@ -8692,7 +8701,7 @@ fn files_task(
             if directory_only {
                 load_directory_files(&worktree).map(|files| FileListRead::Listed(None, files))
             } else {
-                read_repository_files(&worktree, previous)
+                read_repository_files(&worktree, previous, &cancellation)
             }
         })
         .await
@@ -9029,7 +9038,7 @@ pub fn search_directory_files_for_quick_open_cancellable(
 /// the worktree. Failed folders are retried only after an explicit user action.
 pub(crate) fn expand_ignored_directories(
     root: &Path,
-    files: &mut crate::repository::WorkingFiles,
+    files: &mut WorkingFiles,
     expanded: &[RepoPath],
     previous_errors: &BTreeMap<RepoPath, String>,
     cancellation: &CancellationToken,
@@ -9176,302 +9185,107 @@ enum FileListRead {
     Unchanged,
     /// A fresh list, with the digest of the read behind it. Folder tabs
     /// carry no digest: they list one level and are merged into the tree.
-    Listed(Option<blake3::Hash>, Vec<RepositoryFile>),
+    Listed(Option<FileInventoryDigest>, Vec<RepositoryFile>),
 }
 
-pub fn load_repository_files(worktree: &Path) -> Result<Vec<RepositoryFile>, String> {
-    match read_repository_files(worktree, None)? {
-        FileListRead::Listed(_, files) => Ok(files),
-        // A read with nothing to compare against always lists.
-        FileListRead::Unchanged => Ok(Vec::new()),
-    }
-}
-
-/// Reads the repository's file list, reporting [`FileListRead::Unchanged`]
-/// when Git's raw output is byte-for-byte what `previous` digested.
-///
-/// The digest is taken over the raw NUL-delimited output rather than over the
-/// assembled list, so an idle card's ten-second refresh tick costs three Git
-/// reads and a hash instead of a `BTreeMap` of every path in the repository,
-/// two `PathBuf` allocations per file, and a view invalidation.
+/// Reads the repository's file list through [`RepositoryService`], reporting
+/// [`FileListRead::Unchanged`] when Git's raw output is byte-for-byte what
+/// `previous` digested, so an idle card's ten-second refresh tick costs two
+/// bounded Git reads and a hash rather than a rebuilt list and a repaint.
 fn read_repository_files(
     worktree: &Path,
-    previous: Option<blake3::Hash>,
+    previous: Option<FileInventoryDigest>,
+    cancellation: &CancellationToken,
 ) -> Result<FileListRead, String> {
-    let tracked = git_output(worktree, ["ls-files", "--cached", "-z"])?;
-    let untracked = git_output(
-        worktree,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
-    )?;
-    let status = git_output(
-        worktree,
-        ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
-    )?;
-    let digest = repository_file_digest(&tracked, &untracked, &status);
-    if previous == Some(digest) {
-        return Ok(FileListRead::Unchanged);
-    }
-    let files = assemble_repository_files(&tracked, &untracked, &status)?;
-    Ok(FileListRead::Listed(Some(digest), files))
-}
-
-/// Digest of one file-list read.
-///
-/// Each part is length-prefixed: the three outputs are concatenated, and
-/// without a length a path moving from the tracked list to the untracked one
-/// could hash the same as the state before it moved.
-fn repository_file_digest(tracked: &[u8], untracked: &[u8], status: &[u8]) -> blake3::Hash {
-    let mut hasher = blake3::Hasher::new();
-    for part in [tracked, untracked, status] {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part);
-    }
-    hasher.finalize()
-}
-
-fn assemble_repository_files(
-    tracked: &[u8],
-    untracked: &[u8],
-    status: &[u8],
-) -> Result<Vec<RepositoryFile>, String> {
-    let statuses = parse_status_paths(status)?;
-    let mut files = BTreeMap::<PathBuf, bool>::new();
-    for path in parse_paths(tracked, "git ls-files")? {
-        files.insert(path, true);
-    }
-    for path in parse_paths(untracked, "git ls-files --others")? {
-        files.entry(path).or_insert(false);
-    }
-    // A rename source no longer exists under that name, so the destination
-    // row stands for it. A copy source is still a file of its own.
-    for status in statuses.values() {
-        for source in [
-            status.staged_old_path.as_ref(),
-            status.unstaged_old_path.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(OldPath::rename_source)
-        {
-            files.remove(source);
-        }
-    }
-    for path in statuses.keys() {
-        files.entry(path.clone()).or_insert(false);
-    }
-    Ok(files
-        .into_keys()
-        .map(|path| {
-            let status = statuses.get(&path);
-            let (staged, unstaged) = status.map_or((false, false), |status| {
-                (status.staged.is_some(), status.unstaged.is_some())
-            });
-            RepositoryFile {
-                staged_old_path: status.and_then(|status| status.staged_old_path.clone()),
-                unstaged_old_path: status.and_then(|status| status.unstaged_old_path.clone()),
-                path,
-                staged,
-                unstaged,
-                status: status.map(ParsedStatus::display_code),
-                directory: false,
-            }
-        })
-        .collect())
-}
-
-/// Git's global options for every invocation this module makes, ahead of
-/// `-C` because Git only accepts global options before the subcommand.
-///
-/// `--literal-pathspecs` stops a file literally named `:(top)x` from being
-/// read as a magic pathspec.
-///
-/// `core.fsmonitor=false` is set for the same reason
-/// [`crate::repository::RepositoryService::git_base`] sets it: it is a trust
-/// boundary, not a latency measure. Configured to anything but a boolean,
-/// `core.fsmonitor` names a program Git runs whenever it refreshes the index,
-/// and `ls-files` and `status` both refresh the index. A repository that
-/// arrived as an archive carries its own `.git/config`, so without this
-/// merely opening a card would run code the repository chose — no click
-/// required, since the card lists its files on creation and every ten
-/// seconds after. `GIT_OPTIONAL_LOCKS=0` only suppresses writing the
-/// refreshed index back; it does not stop the fsmonitor being asked.
-const GIT_GLOBAL_OPTIONS: [&str; 3] = ["--literal-pathspecs", "-c", "core.fsmonitor=false"];
-
-fn git_command(worktree: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .args(GIT_GLOBAL_OPTIONS)
-        .arg("-C")
-        .arg(worktree)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR");
-    command
-}
-
-fn git_output<const N: usize>(worktree: &Path, arguments: [&str; N]) -> Result<Vec<u8>, String> {
-    let output = git_command(worktree)
-        .args(arguments)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(format!(
-            "Git failed while listing repository files: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+    match RepositoryService::system("git")
+        .file_inventory(worktree, previous, cancellation)
+        .map_err(|error| format!("Git failed while listing repository files: {error}"))?
+    {
+        FileInventoryRead::Unchanged => Ok(FileListRead::Unchanged),
+        FileInventoryRead::Changed(inventory) => Ok(FileListRead::Listed(
+            Some(inventory.digest),
+            repository_files(&inventory.files, &inventory.status),
+        )),
     }
 }
 
-fn parse_paths(output: &[u8], format: &str) -> Result<Vec<PathBuf>, String> {
-    if !output.is_empty() && !output.ends_with(&[0]) {
-        return Err(format!("truncated NUL-delimited {format} output"));
-    }
-    output
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .map(|field| {
-            let path = bytes_to_path(field);
-            validate_repo_path(&path).map_err(|error| error.to_string())?;
-            Ok(path)
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedStatus {
+/// One path's porcelain status, gathered from its per-area entries.
+#[derive(Debug, Default)]
+struct FileStatus {
     staged: Option<u8>,
     unstaged: Option<u8>,
     staged_old_path: Option<OldPath>,
     unstaged_old_path: Option<OldPath>,
 }
 
-impl ParsedStatus {
+impl FileStatus {
+    /// The two-letter `XY` code the card shows, `??` for an untracked file.
     fn display_code(&self) -> String {
         match (self.staged, self.unstaged) {
             (None, Some(b'?')) => "??".into(),
-            (staged, unstaged) => {
-                String::from_utf8(vec![staged.unwrap_or(b' '), unstaged.unwrap_or(b' ')])
-                    .expect("porcelain status codes are ASCII")
+            (staged, unstaged) => [staged.unwrap_or(b' '), unstaged.unwrap_or(b' ')]
+                .map(char::from)
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// The card's rows: every indexed and untracked file, plus status-only paths
+/// such as staged deletions, in path order.
+fn repository_files(files: &WorkingFiles, status: &StatusSnapshot) -> Vec<RepositoryFile> {
+    let mut statuses = HashMap::<&Path, FileStatus>::new();
+    for entry in &status.entries {
+        let status = statuses.entry(entry.path.as_path()).or_default();
+        match entry.area {
+            ChangeArea::Staged => {
+                status.staged = Some(entry.kind.code());
+                status.staged_old_path = OldPath::from_changed_path(entry);
+            }
+            ChangeArea::Unstaged => {
+                status.unstaged = Some(entry.kind.code());
+                status.unstaged_old_path = OldPath::from_changed_path(entry);
+            }
+            ChangeArea::Untracked => status.unstaged = Some(b'?'),
+            ChangeArea::Conflict => {
+                let [staged, unstaged] = entry.conflict.map_or([b'U', b'U'], ConflictKind::code);
+                status.staged = Some(staged);
+                status.unstaged = Some(unstaged);
             }
         }
     }
-
-    fn merge(&mut self, other: Self) -> Result<(), String> {
-        merge_status_fact(&mut self.staged, other.staged, "staged")?;
-        merge_status_fact(&mut self.unstaged, other.unstaged, "unstaged")?;
-        merge_status_path(
-            &mut self.staged_old_path,
-            other.staged_old_path,
-            "staged rename",
-        )?;
-        merge_status_path(
-            &mut self.unstaged_old_path,
-            other.unstaged_old_path,
-            "unstaged rename",
-        )
-    }
-}
-
-fn merge_status_fact(
-    target: &mut Option<u8>,
-    incoming: Option<u8>,
-    basis: &str,
-) -> Result<(), String> {
-    if let Some(incoming) = incoming {
-        if target.is_some_and(|existing| existing != incoming) {
-            return Err(format!("conflicting {basis} status records"));
-        }
-        *target = Some(incoming);
-    }
-    Ok(())
-}
-
-fn merge_status_path(
-    target: &mut Option<OldPath>,
-    incoming: Option<OldPath>,
-    basis: &str,
-) -> Result<(), String> {
-    if let Some(incoming) = incoming {
-        if target
-            .as_ref()
-            .is_some_and(|existing| existing != &incoming)
+    let mut paths = files
+        .paths
+        .iter()
+        .map(RepoPath::as_path)
+        .collect::<BTreeSet<_>>();
+    // A rename source no longer exists under that name, so the destination
+    // row stands for it. A copy source is still a file of its own.
+    for status in statuses.values() {
+        for source in [&status.staged_old_path, &status.unstaged_old_path]
+            .into_iter()
+            .flatten()
+            .filter_map(OldPath::rename_source)
         {
-            return Err(format!("conflicting {basis} source paths"));
+            paths.remove(source);
         }
-        *target = Some(incoming);
     }
-    Ok(())
-}
-
-fn parse_status_paths(output: &[u8]) -> Result<HashMap<PathBuf, ParsedStatus>, String> {
-    if !output.is_empty() && !output.ends_with(&[0]) {
-        return Err("truncated NUL-delimited git status output".into());
-    }
-    let fields = output
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    let mut statuses: HashMap<PathBuf, ParsedStatus> = HashMap::new();
-    let mut index = 0;
-    while index < fields.len() {
-        let field = fields[index];
-        if field.len() < 4 || field[2] != b' ' {
-            return Err(format!("malformed git status record {index}"));
-        }
-        let code = &field[..2];
-        let path = bytes_to_path(&field[3..]);
-        validate_repo_path(&path).map_err(|error| error.to_string())?;
-        let mut old_path = None;
-        if matches!(field[0], b'R' | b'C') || matches!(field[1], b'R' | b'C') {
-            index += 1;
-            if index >= fields.len() {
-                return Err("rename source path is missing from git status".into());
+    paths.extend(statuses.keys().copied());
+    paths
+        .into_iter()
+        .map(|path| {
+            let status = statuses.get(path);
+            RepositoryFile {
+                path: path.to_owned(),
+                staged_old_path: status.and_then(|status| status.staged_old_path.clone()),
+                unstaged_old_path: status.and_then(|status| status.unstaged_old_path.clone()),
+                staged: status.is_some_and(|status| status.staged.is_some()),
+                unstaged: status.is_some_and(|status| status.unstaged.is_some()),
+                status: status.map(FileStatus::display_code),
+                directory: false,
             }
-            let source = bytes_to_path(fields[index]);
-            validate_repo_path(&source).map_err(|error| error.to_string())?;
-            old_path = Some(source);
-        }
-        let untracked = code == b"??";
-        let parsed = ParsedStatus {
-            staged: (!untracked && code[0] != b' ').then_some(code[0]),
-            unstaged: if untracked {
-                Some(b'?')
-            } else {
-                (code[1] != b' ').then_some(code[1])
-            },
-            staged_old_path: old_path
-                .as_deref()
-                .and_then(|source| OldPath::from_status_code(code[0], source)),
-            unstaged_old_path: old_path
-                .as_deref()
-                .and_then(|source| OldPath::from_status_code(code[1], source)),
-        };
-        if let Some(existing) = statuses.get_mut(&path) {
-            existing.merge(parsed)?;
-        } else {
-            statuses.insert(path, parsed);
-        }
-        index += 1;
-    }
-    Ok(statuses)
-}
-
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        PathBuf::from(OsString::from_vec(bytes.to_vec()))
-    }
-    #[cfg(not(unix))]
-    {
-        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-    }
+        })
+        .collect()
 }
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {

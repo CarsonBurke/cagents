@@ -92,11 +92,12 @@ const MAX_UNTRACKED_STATUS_FILES: usize = 4096;
 
 /// Stdout budget for each of the two reads in [`RepositoryService::file_inventory`].
 ///
-/// A file inventory can exceed the executor's general-purpose 16 MiB default.
-/// Both the tagged file listing and the v2 status listing have an explicit
-/// 64 MiB budget. Exceeding either aborts the read with
-/// [`ProcessFailureKind::OutputLimit`], never a partial inventory. Validate
-/// this budget on a 100k-file checkout before moving the widget onto this API.
+/// A 100,000-file checkout with 60-byte paths lists in about 6 MiB, and its
+/// v2 status grows by roughly 150 bytes per changed path, so a checkout that
+/// size with every file changed would pass the executor's general-purpose
+/// 16 MiB default. Both reads therefore have an explicit 64 MiB budget.
+/// Exceeding either aborts the read with [`ProcessFailureKind::OutputLimit`],
+/// never a partial inventory.
 pub const MAX_FILE_INVENTORY_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -549,6 +550,40 @@ pub enum ConflictKind {
     BothModified,
 }
 
+impl ChangeKind {
+    /// The status letter Git reports for this kind in one half of an XY code.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Modified => b'M',
+            Self::TypeChanged => b'T',
+            Self::Added => b'A',
+            Self::Deleted => b'D',
+            Self::Renamed => b'R',
+            Self::Copied => b'C',
+            Self::Unmerged => b'U',
+            Self::Untracked => b'?',
+            Self::Ignored => b'!',
+            // `change_kind_from_code` only stores a single byte here.
+            Self::Unknown(code) => u8::try_from(code).unwrap_or(b'?'),
+        }
+    }
+}
+
+impl ConflictKind {
+    /// The XY pair Git reports for this conflict.
+    pub fn code(self) -> [u8; 2] {
+        match self {
+            Self::BothDeleted => *b"DD",
+            Self::AddedByUs => *b"AU",
+            Self::DeletedByThem => *b"UD",
+            Self::AddedByThem => *b"UA",
+            Self::DeletedByUs => *b"DU",
+            Self::BothAdded => *b"AA",
+            Self::BothModified => *b"UU",
+        }
+    }
+}
+
 /// One changed path in one area.
 ///
 /// A path that is modified in the index *and* again in the worktree produces
@@ -917,10 +952,23 @@ pub struct FileInventory {
     /// Status-only paths, such as staged deletions, remain in `status.entries`.
     pub files: WorkingFiles,
     pub status: StatusSnapshot,
-    /// SHA-256 of both length-prefixed, raw NUL-delimited command outputs.
-    /// Equal digests let callers detect an unchanged read without comparing
-    /// lossy display paths or conflating the listing with status records.
-    pub digest: [u8; 32],
+    pub digest: FileInventoryDigest,
+}
+
+/// SHA-256 of both length-prefixed, raw NUL-delimited outputs behind one
+/// [`FileInventory`]. Equal digests let a caller detect an unchanged read
+/// without parsing it, comparing lossy display paths, or conflating the
+/// listing with status records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileInventoryDigest([u8; 32]);
+
+/// What one [`RepositoryService::file_inventory`] read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileInventoryRead {
+    /// Git's raw output is byte-for-byte what the caller's digest describes,
+    /// so nothing was parsed.
+    Unchanged,
+    Changed(Box<FileInventory>),
 }
 
 /// The paths one worktree's index tracks, for watching them.
@@ -2605,7 +2653,7 @@ pub fn parse_working_files(output: &[u8]) -> Result<WorkingFiles, GitParseError>
     })
 }
 
-fn file_inventory_digest(files: &[u8], status: &[u8]) -> [u8; 32] {
+fn file_inventory_digest(files: &[u8], status: &[u8]) -> FileInventoryDigest {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -2613,7 +2661,7 @@ fn file_inventory_digest(files: &[u8], status: &[u8]) -> [u8; 32] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part);
     }
-    hasher.finalize().into()
+    FileInventoryDigest(hasher.finalize().into())
 }
 
 /// Parses `git ls-files -t -z` index records into each path and whether its
@@ -3934,13 +3982,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// It runs only `git ls-files` and `git status` and adds no enrichment of its
     /// own: no file contents, line counts or remote queries. `git status` itself
     /// still reads the branch's upstream for ahead/behind counts and may hash
-    /// changed files to tell whether they were modified. Each Git command uses [`MAX_FILE_INVENTORY_OUTPUT_BYTES`]; a process, output-limit
-    /// or parse failure returns an error rather than an incomplete inventory.
+    /// changed files to tell whether they were modified. Each Git command uses
+    /// [`MAX_FILE_INVENTORY_OUTPUT_BYTES`]; a process, output-limit or parse
+    /// failure returns an error rather than an incomplete inventory.
+    ///
+    /// When both outputs hash to `previous`, nothing is parsed and the read
+    /// reports [`FileInventoryRead::Unchanged`]: a periodic refresh of an idle
+    /// worktree then costs two Git reads and a hash rather than a path
+    /// allocation for every file in it.
     pub fn file_inventory(
         &self,
         worktree: &Path,
+        previous: Option<FileInventoryDigest>,
         cancellation: &CancellationToken,
-    ) -> Result<FileInventory, RepositoryError> {
+    ) -> Result<FileInventoryRead, RepositoryError> {
         let files_output = self.run_checked(
             &self
                 .working_files_command(worktree)
@@ -3954,13 +4009,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let digest = file_inventory_digest(&files_output.stdout, &status_output.stdout);
+        if previous == Some(digest) {
+            return Ok(FileInventoryRead::Unchanged);
+        }
         let files = invalid_output(parse_working_files(&files_output.stdout), files_output)?;
         let status = invalid_output(parse_status(&status_output.stdout), status_output)?;
-        Ok(FileInventory {
+        Ok(FileInventoryRead::Changed(Box::new(FileInventory {
             files,
             status,
             digest,
-        })
+        })))
     }
 
     pub fn status_with_untracked(
@@ -7413,10 +7471,21 @@ mod tests {
     mod file_inventory {
         use super::*;
 
-        fn read(files: &[u8], status: &[u8]) -> FileInventory {
+        fn read_since(
+            files: &[u8],
+            status: &[u8],
+            previous: Option<FileInventoryDigest>,
+        ) -> FileInventoryRead {
             fake_service(vec![success(files), success(status)])
-                .file_inventory(Path::new("/repo"), &CancellationToken::new())
+                .file_inventory(Path::new("/repo"), previous, &CancellationToken::new())
                 .unwrap()
+        }
+
+        fn read(files: &[u8], status: &[u8]) -> FileInventory {
+            match read_since(files, status, None) {
+                FileInventoryRead::Changed(inventory) => *inventory,
+                FileInventoryRead::Unchanged => panic!("a read without a digest always lists"),
+            }
         }
 
         #[test]
@@ -7570,10 +7639,42 @@ mod tests {
         }
 
         #[test]
+        fn status_codes_round_trip_through_their_kinds() {
+            for code in *b"MTADRCU?!X" {
+                assert_eq!(change_kind_from_code(code).code(), code);
+            }
+            for xy in [b"DD", b"AU", b"UD", b"UA", b"DU", b"AA", b"UU"] {
+                assert_eq!(parse_conflict_kind(xy, 0).unwrap().code(), *xy);
+            }
+        }
+
+        #[test]
+        fn skips_parsing_only_when_both_outputs_match_the_previous_digest() {
+            let status = status_headers();
+            let first = read(b"H file\0", &status);
+            assert_eq!(
+                read_since(b"H file\0", &status, Some(first.digest)),
+                FileInventoryRead::Unchanged
+            );
+            assert!(matches!(
+                read_since(b"H file\0? new\0", &status, Some(first.digest)),
+                FileInventoryRead::Changed(inventory) if inventory.files.paths.len() == 2
+            ));
+            let error = fake_service(vec![success(b"H truncated"), success(&status)])
+                .file_inventory(
+                    Path::new("/repo"),
+                    Some(first.digest),
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+            assert!(matches!(error, RepositoryError::InvalidGitOutput { .. }));
+        }
+
+        #[test]
         fn uses_two_read_only_commands_with_explicit_output_budgets() {
             let service = fake_service(vec![success(b""), success(&status_headers())]);
             service
-                .file_inventory(Path::new("/repo"), &CancellationToken::new())
+                .file_inventory(Path::new("/repo"), None, &CancellationToken::new())
                 .unwrap();
             let commands = service.executor.commands.lock().unwrap();
             assert_eq!(commands.len(), 2);
@@ -7653,7 +7754,7 @@ mod tests {
                     outputs.push(Err(failure));
                     let service = fake_service(outputs);
                     let error = service
-                        .file_inventory(Path::new("/repo"), &CancellationToken::new())
+                        .file_inventory(Path::new("/repo"), None, &CancellationToken::new())
                         .unwrap_err();
                     assert!(
                         matches!(error, RepositoryError::Process(failure) if failure.kind == kind)
@@ -7674,7 +7775,7 @@ mod tests {
             ] {
                 let service = fake_service(vec![success(files), success(&status)]);
                 let error = service
-                    .file_inventory(Path::new("/repo"), &CancellationToken::new())
+                    .file_inventory(Path::new("/repo"), None, &CancellationToken::new())
                     .unwrap_err();
                 let RepositoryError::InvalidGitOutput { process, .. } = error else {
                     panic!("expected parse failure, got {error:?}");
