@@ -132,9 +132,12 @@ impl State {
             return None;
         }
         let confirmation = self.confirmation.take()?;
+        // A refresh may learn the plan between question and answer; only
+        // another login changes whose reset the question was about.
         if &confirmation.reset != current
             || confirmation.total_count != total_count
-            || confirmation.identity.as_ref() != identity
+            || (confirmation.identity.as_ref() != identity
+                && !may_act_for(identity, confirmation.identity.as_ref()))
         {
             self.feedback_status = None;
             self.feedback = Some("Resets changed. Review the current count and try again.".into());
@@ -207,12 +210,21 @@ fn requested_as(attempt: &Attempt) -> Option<&str> {
         .filter(|email| !email.is_empty())
 }
 
-/// The next step for an uncertain reset whose login is no longer the
-/// current one: only that login can retry its original request.
-fn sign_in_to_retry(attempt: &Attempt) -> String {
+/// Why an uncertain reset can't be retried by the `current` login, and the
+/// next step when there is one: only the requesting login can retry it.
+fn retry_blocked_by_login(attempt: &Attempt, current: Option<&Identity>) -> String {
+    let current = current
+        .and_then(|identity| identity.email.as_deref())
+        .map(str::trim);
     match requested_as(attempt) {
-        Some(email) => format!("Sign in as {email} again to retry this reset."),
-        None => "Sign in to the account that requested this reset to retry it.".into(),
+        Some(email) if current.is_none_or(|current| !current.eq_ignore_ascii_case(email)) => {
+            format!("Sign in as {email} again to retry this reset.")
+        }
+        // The same address, but another organization or a login whose
+        // records disagree: there is no sign-in to suggest.
+        _ => "This login can't be confirmed as the one that requested this reset, so the reset \
+              can't be retried here."
+            .into(),
     }
 }
 
@@ -377,6 +389,13 @@ fn scope_selector(
 }
 
 impl Controls {
+    /// Whether the account's login is no longer the one `attempt` was
+    /// requested as. Its original request is bound to that login, so a retry
+    /// under another one would be refused.
+    fn login_changed(&self, attempt: &Attempt) -> bool {
+        !may_act_for(self.identity.as_ref(), attempt.identity.as_ref())
+    }
+
     pub(in crate::app) fn on_surface(mut self, surface: impl Into<String>) -> Self {
         self.surface = surface.into();
         self
@@ -635,21 +654,21 @@ impl Controls {
         if self.state.pending.is_none() {
             for attempt in self.state.uncertain.values() {
                 let recurring = attempt.reset.kind == account::resets::ResetKind::WeeklySession;
-                // The original request is bound to the login it was made
-                // as; a retry under another one would be refused anyway.
-                let login_changed =
-                    !recurring && !may_act_for(self.identity.as_ref(), attempt.identity.as_ref());
+                let login_changed = !recurring && self.login_changed(attempt);
                 // The account's name follows its current login, so name the
                 // login the request was made as once that has changed.
-                let requester = login_changed
-                    .then(|| requested_as(attempt))
-                    .flatten()
-                    .unwrap_or(&self.name);
+                let requester = if login_changed {
+                    requested_as(attempt)
+                } else {
+                    Some(self.name.as_str())
+                };
+                let requester = requester
+                    .map(|requester| format!(" for {requester}"))
+                    .unwrap_or_default();
                 rows.push(
                     design::caption(format!(
-                        "Requested {} for {} · {} available when confirmed.",
+                        "Requested {}{requester} · {} available when confirmed.",
                         attempt.reset.reset_phrase(),
-                        requester,
                         attempt.total_count,
                     ))
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
@@ -657,7 +676,7 @@ impl Controls {
                 );
                 if login_changed {
                     rows.push(
-                        design::caption(sign_in_to_retry(attempt))
+                        design::caption(retry_blocked_by_login(attempt, self.identity.as_ref()))
                             .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                             .into(),
                     );
@@ -675,13 +694,12 @@ impl Controls {
                         "Retry same reset"
                     })
                     .name(format!(
-                        "{} for {} · {}",
+                        "{}{requester} · {}",
                         if recurring {
                             "Check usage"
                         } else {
                             "Retry same reset"
                         },
-                        self.name,
                         attempt.reset.label()
                     ))
                     .on_press_maybe((self.recovery_enabled && !login_changed).then(|| {
@@ -695,7 +713,18 @@ impl Controls {
                 );
             }
         }
-        if let Some(feedback) = self.state.feedback {
+        // Advice to retry would contradict a retry only another login can make.
+        let retry_advice_blocked = self.state.feedback_status == Some(ConsumeStatus::Unconfirmed)
+            && self
+                .state
+                .feedback_reset
+                .as_ref()
+                .and_then(|reset| self.state.uncertain.get(&reset.id))
+                .is_some_and(|attempt| {
+                    attempt.reset.kind != account::resets::ResetKind::WeeklySession
+                        && self.login_changed(attempt)
+                });
+        if let Some(feedback) = self.state.feedback.filter(|_| !retry_advice_blocked) {
             rows.push(
                 design::caption(feedback)
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
@@ -1468,6 +1497,78 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
+    fn a_plan_learned_between_question_and_answer_keeps_the_confirmation() {
+        let grant = reset(ResetScope::Account);
+        let asked = reset_identity();
+        for (answered, submits) in [
+            (
+                Identity {
+                    plan: Some("pro".into()),
+                    ..asked.clone()
+                },
+                true,
+            ),
+            (
+                Identity {
+                    email: Some("other@example.com".into()),
+                    ..asked.clone()
+                },
+                false,
+            ),
+        ] {
+            let mut state = State::default();
+            state.prepare(grant.clone(), 2, Some(asked.clone()), "accounts".into());
+            let attempt = state.submit(&grant, 2, Some(&answered));
+            assert_eq!(attempt.is_some(), submits, "{answered:?}");
+            if let Some(attempt) = attempt {
+                assert_eq!(attempt.identity, Some(asked.clone()));
+            } else {
+                assert!(state.feedback.unwrap().starts_with("Resets changed"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_blocked_retry_names_a_next_step_only_when_one_exists() {
+        let original = reset_identity();
+        let grant = reset(ResetScope::Account);
+        let mut state = State::default();
+        state.prepare(grant.clone(), 2, Some(original.clone()), "accounts".into());
+        let attempt = state.submit(&grant, 2, Some(&original)).unwrap();
+        let sign_in = "Sign in as reset@example.com again to retry this reset.";
+        for (current, expected) in [
+            (
+                Some(Identity {
+                    email: Some("other@example.com".into()),
+                    ..original.clone()
+                }),
+                sign_in,
+            ),
+            (None, sign_in),
+            (
+                Some(Identity {
+                    email: Some(" RESET@example.com ".into()),
+                    organization: Some("another-organization".into()),
+                    ..original.clone()
+                }),
+                "This login can't be confirmed as the one that requested this reset, so the \
+                 reset can't be retried here.",
+            ),
+        ] {
+            assert_eq!(
+                retry_blocked_by_login(&attempt, current.as_ref()),
+                expected,
+                "{current:?}"
+            );
+        }
+        let unknown = Attempt {
+            identity: None,
+            ..attempt
+        };
+        assert!(retry_blocked_by_login(&unknown, Some(&original)).starts_with("This login"));
+    }
+
+    #[test]
     fn recovery_rejects_changed_or_unverifiable_logins() {
         let original = Identity {
             email: Some("reset@example.com".into()),
@@ -1578,6 +1679,10 @@ pub(in crate::app) mod tests {
                 .any(|caption| caption.starts_with("Requested")
                     && caption.contains("for reset@example.com ·")),
             "the request names the login it was made as, not the current one: {captions:?}"
+        );
+        assert!(
+            !captions.iter().any(|caption| caption == "Unconfirmed"),
+            "advice to retry is withdrawn with the retry: {captions:?}"
         );
         assert!(
             !captions
