@@ -16,6 +16,22 @@ use std::{
 const MAX_CENSUS_PASSES: usize = 16;
 const MAX_PROCESSES: usize = 65_536;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELAY_NEXT_CENSUS: std::cell::RefCell<Option<crossbeam_channel::Sender<Instant>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_census_for_test() {
+    FAIL_NEXT_CENSUS.set(true);
+}
+
+#[cfg(test)]
+pub(super) fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
+    DELAY_NEXT_CENSUS.set(Some(finished));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CloseProcess {
     pub pid: libc::pid_t,
@@ -111,7 +127,7 @@ struct FrozenProcess {
 }
 
 /// Every successfully issued SIGSTOP immediately gains a resume-on-drop guard.
-/// Already stopped/traced processes are never resumed by this operation.
+/// Drop only releases capture-owned stops; hangup explicitly resumes all jobs.
 impl Drop for FrozenProcess {
     fn drop(&mut self) {
         if self.resume
@@ -282,9 +298,66 @@ impl FrozenFamily {
 
     pub(super) fn kill(&mut self, deadline: Instant) -> Result<(), String> {
         check_deadline(deadline)?;
-        // All targets remain stopped until every signal has been issued. No
-        // numeric PID is ever signaled, even after a job exits or is reparented.
+        self.kill_survivors()
+    }
+
+    /// Retain every exact handle while restoring the captured family's ability
+    /// to handle HUP. Notify jobs explicitly even when the shell traps HUP.
+    pub(super) fn hangup(&mut self, child: &super::holder::HeldChild) -> Result<(), String> {
+        let mut failure = None;
+        for target in self.targets.iter().skip(1).rev() {
+            match signal(&target.pidfd, libc::SIGHUP) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if let Err(error) = child.kill() {
+            failure.get_or_insert_with(|| format!("hang up child: {error}"));
+        }
+        // HUP stays pending on stopped jobs. Like orphaned process-group
+        // hangup, follow it with CONT for every exact tracked process, including
+        // jobs stopped before capture. No numeric PID grants signal authority.
+        for target in self.targets.iter_mut().rev() {
+            match signal(&target.pidfd, libc::SIGCONT) {
+                Ok(()) => target.resume = false,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                    target.resume = false;
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn wait_until(&self, deadline: Instant) -> Result<bool, String> {
+        for target in &self.targets {
+            if !super::holder::exits_within(
+                &target.pidfd,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn kill_survivors(&mut self) -> Result<(), String> {
+        let mut failure = None;
+        // Checked close holds stopped targets; ordinary shutdown retains the
+        // same handles across its graceful wait. Only survivors receive KILL.
+        // Numeric PID reuse and reparenting cannot change that authority.
         for (index, target) in self.targets.iter_mut().enumerate() {
+            if super::holder::exits_within(&target.pidfd, Duration::ZERO).unwrap_or(false) {
+                target.resume = false;
+                continue;
+            }
             // The root is always first. Serialize receipt publication with
             // exit observation, including upgrades which kill off-worker.
             let mut receipt = (index == 0).then(|| {
@@ -295,7 +368,7 @@ impl FrozenFamily {
             let live_root = receipt.is_some()
                 && read_process(target.identity.pid).is_ok_and(|process| {
                     same_identity(&process, &target.identity)
-                        && matches!(process.state, b'T' | b't')
+                        && !matches!(process.state, b'Z' | b'X')
                 });
             match signal(&target.pidfd, libc::SIGKILL) {
                 Ok(()) => {
@@ -305,10 +378,14 @@ impl FrozenFamily {
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => target.resume = false,
-                Err(error) => return Err(format!("Could not close terminal process: {error}")),
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        format!("Could not close terminal process: {error}")
+                    });
+                }
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -406,7 +483,26 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
     })
 }
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
+    #[cfg(test)]
+    if let Some(finished) = DELAY_NEXT_CENSUS.take() {
+        // Exercise capture's deadline without a real uninterruptible process.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        let _ = finished.send(Instant::now());
+        check_deadline(deadline)?;
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_CENSUS.replace(false) {
+        return Err("injected terminal process census failure".into());
+    }
     census_with(deadline, read_process)
+}
+
+/// After the pinned root exits, a numeric session can only refuse cleanup;
+/// it never grants authority to signal a process discovered after that exit.
+pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Result<bool, String> {
+    Ok(census(deadline)?
+        .iter()
+        .all(|process| process.session != session || matches!(process.state, b'Z' | b'X')))
 }
 
 fn census_with(

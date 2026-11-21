@@ -76,6 +76,8 @@ const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
 const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
 /// Total budget for hangup, escalation and an authoritative holder exit report.
 const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// Keep a bounded tail for exact-child exit and PTY/session confirmation.
+const CHILD_SHUTDOWN_CONFIRMATION_RESERVE: Duration = CHILD_HANGUP_GRACE;
 /// Actual OS joins happen off-caller; ordinary shutdown shares this deadline.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for the PTY reader to leave its blocking read
@@ -507,6 +509,12 @@ struct PublishedState {
     #[cfg(test)]
     test_startup_probe: Mutex<Option<Sender<(Vec<u8>, bool, bool)>>>,
     shutdown_requested: AtomicBool,
+    #[cfg(test)]
+    shutdown_census_failure: AtomicBool,
+    #[cfg(test)]
+    shutdown_census_delay: Mutex<Option<Sender<Instant>>>,
+    #[cfg(test)]
+    test_holder_reservation: Mutex<Option<crate::daemon::child_reaper::Reservation>>,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
     command_budget: OnceLock<Arc<admission::Budget>>,
@@ -613,6 +621,12 @@ impl PublishedState {
             #[cfg(test)]
             test_startup_probe: Mutex::new(None),
             shutdown_requested: AtomicBool::new(false),
+            #[cfg(test)]
+            shutdown_census_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            shutdown_census_delay: Mutex::new(None),
+            #[cfg(test)]
+            test_holder_reservation: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
             command_budget: OnceLock::new(),
@@ -3156,15 +3170,33 @@ impl Worker {
                 // Before the holder forks, so nothing this launch starts
                 // predates its record.
                 crate::lineage_birth::record_instance_launch(&session)?;
-                (
+                #[cfg(test)]
+                let reservation = published.test_holder_reservation.lock().unwrap().take();
+                #[cfg(test)]
+                let held = if let Some(reservation) = reservation {
+                    holder::spawn_reserved(
+                        command,
+                        pty_size(current_size),
+                        child_exit_tx,
+                        config.holder_recovery.clone(),
+                        reservation,
+                    )?
+                } else {
                     holder::spawn_recoverable(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
-                    )?,
-                    Vec::new(),
-                )
+                    )?
+                };
+                #[cfg(not(test))]
+                let held = holder::spawn_recoverable(
+                    command,
+                    pty_size(current_size),
+                    child_exit_tx,
+                    config.holder_recovery.clone(),
+                )?;
+                (held, Vec::new())
             }
         };
         // The holder reaps the root, so its pid identifies it only while the
@@ -3696,15 +3728,52 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        if shutting_down && !exited && !self.carried {
-            let result = shutdown_child_exit(
-                &self.child,
-                self.child_identity.as_ref(),
-                &self.child_exit_rx,
-                self.checked_shutdown,
-            );
-            self.handle_child_exit(&mut exited, result);
-        }
+        let shutdown_cleanup_confirmed = if shutting_down && !self.carried {
+            if exited {
+                let cleanup = if self.checked_shutdown {
+                    Ok(())
+                } else {
+                    confirm_exited_family(
+                        &self.child,
+                        &self.master,
+                        Instant::now() + CHILD_SHUTDOWN_DEADLINE,
+                    )
+                };
+                match cleanup {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.error("wait for child", error);
+                        false
+                    }
+                }
+            } else {
+                #[cfg(test)]
+                if self
+                    .published
+                    .shutdown_census_failure
+                    .load(Ordering::Acquire)
+                {
+                    close_processes::fail_next_census_for_test();
+                }
+                #[cfg(test)]
+                if let Some(finished) = self.published.shutdown_census_delay.lock().unwrap().take()
+                {
+                    close_processes::delay_next_census_for_test(finished);
+                }
+                let result = shutdown_child_exit(
+                    &self.child,
+                    &self.master,
+                    self.child_identity.as_ref(),
+                    &self.child_exit_rx,
+                    self.checked_shutdown,
+                );
+                let confirmed = result.is_ok();
+                self.handle_child_exit(&mut exited, result);
+                confirmed
+            }
+        } else {
+            true
+        };
         if let Some(transcript) = self.transcript.take() {
             transcript.finish();
         }
@@ -3729,7 +3798,8 @@ impl Worker {
         // A failed destructive close retains its original family obligation.
         // Later root exit and EOF cannot substitute for successful family kill.
         // The shared input seal alone is insufficient: carry also uses it.
-        let family_cleanup_confirmed = !self.checked_close_started || self.checked_shutdown;
+        let family_cleanup_confirmed =
+            shutdown_cleanup_confirmed && (!self.checked_close_started || self.checked_shutdown);
         let completion = self.root_exit.take().and_then(|event| match event {
             TerminalEvent::Exited {
                 exit_code,
@@ -3798,7 +3868,11 @@ impl Worker {
             {
                 self.error("retain unconfirmed terminal screen", error);
             }
-            self.holder.leave_for_successor();
+            if shutting_down {
+                self.holder.leave_after_unconfirmed_shutdown();
+            } else {
+                self.holder.leave_for_successor();
+            }
             drop(self.holder);
         } else if !shutting_down && completion.is_some() && self.holder.registered() {
             self.holder.prove_cleanup();
@@ -5955,54 +6029,96 @@ fn wait_for_worker_event(
     }
 }
 
-/// Sending HUP successfully does not mean the process exited. Preserve its
-/// graceful handler first, then escalate through pinned identities and bound
-/// how long a stalled holder can keep a daemon waiting for its exit report.
+/// A root exit alone cannot release the terminal family. Capture its exact
+/// jobs before HUP, preserve the shell's graceful exit, and require cleanup
+/// before accepting the holder's report.
 fn shutdown_child_exit(
     child: &holder::HeldChild,
+    master: &holder::PtyMaster,
     identity: Option<&RootIdentity>,
     exits: &Receiver<ChildExit>,
     checked: bool,
 ) -> ChildExit {
-    let deadline = std::time::Instant::now() + CHILD_SHUTDOWN_DEADLINE;
-    match exits.try_recv() {
-        Ok(result) => return result,
-        // A lost report channel does not mean this pinned root stopped.
-        Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
-    }
+    let deadline = Instant::now() + CHILD_SHUTDOWN_DEADLINE;
+    let report = exits.try_recv().ok();
     if !checked {
-        if let Err(error) = child.kill() {
-            return exits
-                .try_recv()
-                .unwrap_or_else(|_| Err(format!("hang up child: {error}")));
-        }
-        match exits.recv_timeout(CHILD_HANGUP_GRACE) {
-            Ok(result) => return result,
-            Err(RecvTimeoutError::Disconnected) => {
-                if child
-                    .exited_within(CHILD_HANGUP_GRACE)
-                    .map_err(|error| format!("observe child exit: {error}"))?
-                {
-                    return Err("child reaper closed".into());
+        // Capture must leave both the full HUP grace and time to confirm KILL.
+        let kill_deadline = deadline - CHILD_SHUTDOWN_CONFIRMATION_RESERVE;
+        let capture_deadline = kill_deadline - CHILD_HANGUP_GRACE;
+        let captured = identity
+            .ok_or_else(|| "Child identity unavailable".to_owned())
+            .and_then(|root| FrozenFamily::capture(root, capture_deadline));
+        match captured {
+            Ok(mut family) => {
+                if let Err(error) = family.hangup(child) {
+                    tracing::warn!(%error, "could not hang up the complete terminal family");
+                }
+                let grace = (Instant::now() + CHILD_HANGUP_GRACE).min(deadline);
+                if !family.wait_until(grace).unwrap_or(false) {
+                    if !child.exited_within(Duration::ZERO).unwrap_or(false) {
+                        // Re-census while the exact root still lives, retaining
+                        // the first set even if the shell exits during capture.
+                        let stopped = FrozenFamily::capture(
+                            identity.expect("captured root identity"),
+                            kill_deadline,
+                        )
+                        .and_then(|mut current| current.kill_survivors());
+                        if let Err(error) = stopped {
+                            tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                            if let Err(error) = child.force_kill() {
+                                tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                            }
+                        }
+                    }
+                    // Retained pidfd authority does not expire with census
+                    // time. Issue the finite survivor signals even if the
+                    // re-census consumed the remaining wait budget.
+                    if let Err(error) = family.kill_survivors() {
+                        tracing::warn!(%error, "could not stop the complete terminal family");
+                    }
+                    if !family.wait_until(deadline)? {
+                        return Err("Terminal process cleanup remains unconfirmed".into());
+                    }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(error) => {
+                // Failed capture resumes its stops on drop. Never let a
+                // process-scan failure discard the independently pinned root.
+                if !child
+                    .exited_within(Duration::ZERO)
+                    .map_err(|error| format!("observe child exit: {error}"))?
+                {
+                    tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                    if let Err(error) = child.kill() {
+                        tracing::warn!(%error, "could not hang up the complete terminal family");
+                    }
+                    if !child
+                        .exited_within(
+                            CHILD_HANGUP_GRACE
+                                .min(deadline.saturating_duration_since(Instant::now())),
+                        )
+                        .map_err(|error| format!("observe child exit: {error}"))?
+                    {
+                        child
+                            .force_kill()
+                            .map_err(|error| format!("terminate child: {error}"))?;
+                    }
+                }
+                if !child
+                    .exited_within(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|error| format!("observe child exit: {error}"))?
+                {
+                    return Err("Terminal process cleanup remains unconfirmed".into());
+                }
+            }
         }
-        let stopped = identity
-            .ok_or_else(|| "Child identity unavailable".to_owned())
-            .and_then(|root| FrozenFamily::capture(root, deadline))
-            .and_then(|mut family| family.kill(deadline));
-        if let Err(error) = stopped {
-            // Census failure cannot grant authority over guessed descendants.
-            // This root remains pinned independently by its holder's pidfd.
-            tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
-            child
-                .force_kill()
-                .map_err(|error| format!("terminate child: {error}"))?;
-        }
+        confirm_exited_family(child, master, deadline)?;
+    }
+    if let Some(report) = report {
+        return report;
     }
     exits
-        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|error| match error {
             RecvTimeoutError::Disconnected => "child reaper closed".to_owned(),
             RecvTimeoutError::Timeout => {
@@ -6010,6 +6126,52 @@ fn shutdown_child_exit(
                     .to_owned()
             }
         })?
+}
+
+fn confirm_exited_family(
+    child: &holder::HeldChild,
+    master: &holder::PtyMaster,
+    deadline: Instant,
+) -> Result<(), String> {
+    // Reconcile natural completion if the shell is already gone. A process
+    // census can miss fork/exit churn, so also require the kernel's proof
+    // that no descendant still holds the PTY slave open.
+    let master = master.duplicate().map_err(|error| error.to_string())?;
+    let mut target = libc::pollfd {
+        fd: master.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A job can fork between thaw and HUP. Give its final PTY descriptors
+        // the same bounded cleanup budget even after the tracked jobs exit.
+        // SAFETY: one live, owned descriptor; this only observes readiness.
+        match unsafe {
+            libc::poll(
+                &mut target,
+                1,
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as libc::c_int,
+            )
+        } {
+            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            -1 => return Err(std::io::Error::last_os_error().to_string()),
+            _ => break,
+        }
+    }
+    if child
+        .exited_within(Duration::ZERO)
+        .map_err(|error| format!("observe child exit: {error}"))?
+        && target.revents & libc::POLLHUP != 0
+        && close_processes::session_is_empty(child.pid(), deadline)?
+    {
+        Ok(())
+    } else {
+        Err("Terminal process cleanup remains unconfirmed".into())
+    }
 }
 
 fn child_exit_event(
