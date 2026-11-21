@@ -8112,6 +8112,7 @@ fn valid_empty_paste_preserves_later_native_selection_and_caret() {
             assert!(runtime.submit_after_paste.is_none());
             assert!(runtime.commands.is_idle());
             assert!(runtime.composer_note.is_none());
+            assert!(runtime.error.is_none());
         }
     }
 }
@@ -8443,7 +8444,7 @@ fn a_paste_refusal_leaves_draft_and_ready_chat_states_unchanged() {
 }
 
 #[test]
-fn dismissing_an_composer_note_preserves_the_draft_and_its_files() {
+fn dismissing_an_attachment_refusal_preserves_the_draft_and_its_files() {
     let _admission = attachment_draft::test_admission();
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
@@ -8470,7 +8471,7 @@ fn dismissing_an_composer_note_preserves_the_draft_and_its_files() {
 /// A refusal answered the chosen model's attachment rules, so choosing
 /// another model or provider puts it away.
 #[test]
-fn choosing_another_model_clears_an_composer_note() {
+fn choosing_another_model_clears_an_attachment_refusal() {
     let _admission = attachment_draft::test_admission();
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
@@ -8498,7 +8499,7 @@ fn choosing_another_model_clears_an_composer_note() {
 }
 
 #[test]
-fn choosing_another_model_in_a_live_chat_clears_an_composer_note() {
+fn choosing_another_model_in_a_live_chat_clears_an_attachment_refusal() {
     let _admission = attachment_draft::test_admission();
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat(&mut app, None);
@@ -8528,7 +8529,7 @@ fn choosing_another_model_in_a_live_chat_clears_an_composer_note() {
 }
 
 #[test]
-fn the_next_successfully_staged_attachment_clears_an_composer_note() {
+fn the_next_successfully_staged_attachment_clears_an_attachment_refusal() {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::with_test_image(|image| {
         for image_saved in [true, false] {
@@ -8562,7 +8563,7 @@ fn the_next_successfully_staged_attachment_clears_an_composer_note() {
 }
 
 #[test]
-fn sending_a_draft_or_live_message_clears_its_composer_note() {
+fn sending_a_draft_or_live_message_clears_its_attachment_refusal() {
     let _admission = attachment_draft::test_admission();
     for draft in [true, false] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -8602,7 +8603,7 @@ fn sending_a_draft_or_live_message_clears_its_composer_note() {
 }
 
 #[test]
-fn an_composer_note_is_not_restored_with_a_saved_draft() {
+fn an_attachment_refusal_is_not_restored_with_a_saved_draft() {
     let _admission = attachment_draft::test_admission();
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
@@ -8747,6 +8748,7 @@ fn attach_files_still_stages_images_for_an_images_only_provider() {
         assert!(task.units() > 0, "accepted images must schedule staging");
         let runtime = chat_runtime(&app, card);
         assert!(runtime.composer_note.is_none());
+        assert!(runtime.error.is_none());
         assert_eq!(runtime.pastes_pending, 1);
         assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
         assert!(runtime.attachment_chooser_pending.is_none());
@@ -8779,6 +8781,7 @@ fn attach_files_takes_any_file_for_a_provider_that_accepts_files() {
     assert!(task.units() > 0, "accepted files must schedule staging");
     let runtime = chat_runtime(&app, card);
     assert!(runtime.composer_note.is_none());
+    assert!(runtime.error.is_none());
     assert_eq!(runtime.pastes_pending, 1);
     assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
     assert!(runtime.attachment_chooser_pending.is_none());
@@ -8906,6 +8909,7 @@ fn a_mixed_drop_replaces_selection_once_and_keeps_its_images_after_its_own_prose
         )));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer_note, None);
+        assert_eq!(runtime.error, None);
         assert_eq!(runtime.attachments, [image.clone()]);
         let text = runtime.composer.text();
         assert!(
@@ -9062,6 +9066,7 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
         runtime.composer_note, None,
         "the clipboard text is read first"
     );
+    assert_eq!(runtime.error, None);
     assert_eq!(runtime.pastes_pending, 1);
     assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
 
@@ -9072,6 +9077,7 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
     )));
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.composer_note, None);
+    assert_eq!(runtime.error, None);
     assert_eq!(runtime.pastes_pending, 0);
     assert!(runtime.attachments.is_empty());
     assert!(
