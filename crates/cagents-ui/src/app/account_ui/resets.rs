@@ -1,6 +1,6 @@
 //! Explicit, account-bound reset confirmation shared by usage and chat cards.
 use super::*;
-use account::resets::{ConsumeOutcome, ConsumeRequest, ConsumeStatus, UsageReset};
+use account::resets::{ConsumeOutcome, ConsumeRequest, ConsumeStatus, UsageReset, may_act_for};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct State {
@@ -160,7 +160,7 @@ impl State {
         }
         let attempt = self.uncertain.get(reset_id)?;
         if attempt.reset.kind == account::resets::ResetKind::WeeklySession
-            || attempt.identity.as_ref() != identity
+            || !may_act_for(identity, attempt.identity.as_ref())
         {
             return None;
         }
@@ -194,6 +194,21 @@ impl State {
         }
         self.feedback = Some(message);
         true
+    }
+}
+
+/// The next step for an uncertain reset whose login is no longer the
+/// current one: only that login can retry its original request.
+fn sign_in_to_retry(attempt: &Attempt) -> String {
+    match attempt
+        .identity
+        .as_ref()
+        .and_then(|identity| identity.email.as_deref())
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    {
+        Some(email) => format!("Sign in as {email} again to retry this reset."),
+        None => "Sign in to the account that requested this reset to retry it.".into(),
     }
 }
 
@@ -393,7 +408,7 @@ impl Controls {
             return false;
         }
         self.state.confirmed.values().any(|confirmed| {
-            confirmed.identity == self.identity
+            may_act_for(self.identity.as_ref(), confirmed.identity.as_ref())
                 && confirmed.observed_at <= self.snapshot.observed_at
                 && windows.iter().all(|window| confirmed.reset.clears(window))
         })
@@ -626,7 +641,17 @@ impl Controls {
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
                 );
-                if !recurring {
+                // The original request is bound to the login it was made
+                // as; a retry under another one would be refused anyway.
+                let login_changed =
+                    !recurring && !may_act_for(self.identity.as_ref(), attempt.identity.as_ref());
+                if login_changed {
+                    rows.push(
+                        design::caption(sign_in_to_retry(attempt))
+                            .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                            .into(),
+                    );
+                } else if !recurring {
                     rows.push(
                         design::caption("Retries reuse the original request.")
                             .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
@@ -649,7 +674,7 @@ impl Controls {
                         self.name,
                         attempt.reset.label()
                     ))
-                    .on_press_maybe(self.recovery_enabled.then(|| {
+                    .on_press_maybe((self.recovery_enabled && !login_changed).then(|| {
                         Message::AccountUi(if recurring {
                             Action::Refresh(self.id.clone())
                         } else {
@@ -1088,6 +1113,45 @@ pub(in crate::app) mod tests {
     use crate::app::tests::context_inspector_test_app;
     use account::resets::{ResetKind, ResetScope};
 
+    /// What the controls announce about Retry same reset: whether it can
+    /// be pressed, and the captions shown with it.
+    fn retry_button(controls: Controls) -> (bool, Vec<String>) {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use iced_accessibility::accesskit::Role;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = controls.view();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(480.0, 900.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let nodes: Vec<_> = nodes.root().iter().chain(nodes.children()).collect();
+        let buttons: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.node().role() == Role::Button
+                    && node
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with("Retry same reset"))
+            })
+            .map(|node| !node.node().is_disabled())
+            .collect();
+        assert_eq!(buttons.len(), 1, "one Retry same reset button");
+        let captions = nodes
+            .iter()
+            .filter(|node| node.node().role() == Role::Paragraph)
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect();
+        (buttons[0], captions)
+    }
+
     fn reset(scope: ResetScope) -> UsageReset {
         UsageReset {
             id: "fixture-grant".into(),
@@ -1096,6 +1160,14 @@ pub(in crate::app) mod tests {
             available_count: 2,
             expires_at: None,
             usable: true,
+        }
+    }
+
+    fn reset_identity() -> Identity {
+        Identity {
+            email: Some("reset@example.com".into()),
+            organization: Some("fixture-organization".into()),
+            ..Identity::default()
         }
     }
 
@@ -1251,16 +1323,362 @@ pub(in crate::app) mod tests {
     fn uncertainty_recovery_reuses_the_original_idempotency_key() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None, "accounts".into());
-        let first = state.submit(&grant, 2, None).unwrap();
+        state.prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
+        let first = state.submit(&grant, 2, Some(&reset_identity())).unwrap();
         assert!(state.finish(&first.key, ConsumeStatus::Unconfirmed, "Check usage".into()));
-        state.prepare(grant.clone(), 2, None, "accounts".into());
+        state.prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
         assert!(state.confirmation.is_none());
-        let second = state.recover(&grant.id, None).unwrap();
+        let second = state.recover(&grant.id, Some(&reset_identity())).unwrap();
         assert_eq!(second.key, first.key);
         assert!(state.finish(&second.key, ConsumeStatus::Reset, "Used".into()));
-        state.prepare(grant, 2, None, "accounts".into());
+        state.prepare(grant, 2, Some(reset_identity()), "accounts".into());
         assert_ne!(state.confirmation.as_ref().unwrap().key, first.key);
+    }
+
+    #[test]
+    fn a_normal_probe_plan_change_preserves_original_key_reset_recovery() {
+        for plan in [None, Some("plus")] {
+            let now = now_ms();
+            let mut app = context_inspector_test_app(false);
+            let id = Account::system(Provider::Codex).id();
+            let identity = Identity {
+                email: Some("reset@example.com".into()),
+                organization: Some("fixture-organization".into()),
+                plan: plan.map(str::to_owned),
+                disputed_by: None,
+            };
+            let mut grant = reset(ResetScope::Account);
+            grant.id = "codex/next".into();
+            grant.available_count = 1;
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+            snapshot.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+            snapshot.resets = vec![grant.clone()];
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.present = true;
+            state.identity = Some(identity.clone());
+            state.snapshot = Some(snapshot.clone());
+
+            drop(app.update(Message::AccountUi(Action::ResetStart(
+                id.clone(),
+                grant.id.clone(),
+                "accounts".into(),
+                false,
+            ))));
+            let key = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .confirmation
+                .as_ref()
+                .expect("the available grant asks for confirmation")
+                .key
+                .clone();
+            drop(app.update(Message::AccountUi(Action::ResetConfirm(id.clone()))));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.reset.pending.as_ref().unwrap().key, key);
+            let owner = state.owner;
+            drop(app.update(Message::AccountUi(Action::ResetFinished {
+                id: id.clone(),
+                owner,
+                key: key.clone(),
+                result: Ok(ConsumeOutcome {
+                    status: ConsumeStatus::Unconfirmed,
+                    message: None,
+                    snapshot: None,
+                }),
+            })));
+            assert!(
+                app.account_ui
+                    .account(&id)
+                    .unwrap()
+                    .reset
+                    .uncertain
+                    .contains_key(&grant.id)
+            );
+
+            let (owner, ticket) =
+                app.account_ui
+                    .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+            let refreshed = Identity {
+                plan: Some("pro".into()),
+                ..identity.clone()
+            };
+            snapshot.observed_at = now_ms();
+            drop(app.update(Message::AccountUi(Action::Probed {
+                id: id.clone(),
+                owner,
+                ticket,
+                outcome: Outcome::Answered {
+                    identity: Some(refreshed.clone()),
+                    snapshot: Box::new(snapshot),
+                    catalog: None,
+                },
+            })));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.identity.as_ref(), Some(&refreshed));
+            let controls = app.usage_reset_controls(state).unwrap();
+            assert!(controls.recovery_enabled);
+            assert!(next_reset(&controls.snapshot, &controls.state, controls.now).is_none());
+            let (enabled, captions) = retry_button(controls.clone());
+            assert!(
+                enabled,
+                "a plan-only change leaves Retry same reset available"
+            );
+            assert!(
+                captions
+                    .iter()
+                    .any(|caption| caption == "Retries reuse the original request."),
+                "{captions:?}"
+            );
+            assert!(
+                !captions
+                    .iter()
+                    .any(|caption| caption.starts_with("Sign in")),
+                "{captions:?}"
+            );
+
+            let retry = app.update(Message::AccountUi(Action::ResetRecover(
+                id.clone(),
+                grant.id.clone(),
+            )));
+            let attempt = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .pending
+                .as_ref()
+                .expect("a plan-only refresh must submit the original reset request");
+            assert_eq!(attempt.key, key);
+            assert_eq!(attempt.reset, grant);
+            assert_eq!(attempt.identity.as_ref(), Some(&identity));
+            assert!(retry.units() > 0, "recovery dispatches the saved request");
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_changed_or_unverifiable_logins() {
+        let original = Identity {
+            email: Some("reset@example.com".into()),
+            organization: Some("fixture-organization".into()),
+            plan: Some("plus".into()),
+            disputed_by: None,
+        };
+        let grant = reset(ResetScope::Account);
+        let mut state = State::default();
+        state.prepare(grant.clone(), 2, Some(original.clone()), "accounts".into());
+        let attempt = state.submit(&grant, 2, Some(&original)).unwrap();
+        assert!(state.finish(
+            &attempt.key,
+            ConsumeStatus::Unconfirmed,
+            "Unconfirmed".into()
+        ));
+        for identity in [
+            Some(Identity {
+                email: Some("other@example.com".into()),
+                ..original.clone()
+            }),
+            Some(Identity {
+                email: None,
+                ..original.clone()
+            }),
+            Some(Identity {
+                email: Some(" ".into()),
+                ..original.clone()
+            }),
+            Some(Identity {
+                organization: Some("another-organization".into()),
+                ..original.clone()
+            }),
+            Some(Identity {
+                organization: None,
+                ..original.clone()
+            }),
+            Some(Identity {
+                disputed_by: Some("other@example.com".into()),
+                ..original.clone()
+            }),
+            None,
+        ] {
+            let mut state = state.clone();
+            assert!(state.recover(&grant.id, identity.as_ref()).is_none());
+            assert!(!state.in_flight());
+            assert_eq!(state.uncertain.get(&grant.id).unwrap().key, attempt.key);
+        }
+    }
+
+    #[test]
+    fn an_external_login_change_disables_recovery_and_dispatches_nothing() {
+        let now = now_ms();
+        let mut app = context_inspector_test_app(false);
+        let id = Account::system(Provider::Codex).id();
+        let identity = Identity {
+            email: Some("reset@example.com".into()),
+            organization: Some("fixture-organization".into()),
+            ..Identity::default()
+        };
+        let grant = reset(ResetScope::Account);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+        snapshot.resets = vec![grant.clone()];
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = true;
+        state.identity = Some(identity.clone());
+        state.snapshot = Some(snapshot.clone());
+        state
+            .reset
+            .prepare(grant.clone(), 2, Some(identity.clone()), "accounts".into());
+        let attempt = state.reset.submit(&grant, 2, Some(&identity)).unwrap();
+        assert!(state.reset.finish(
+            &attempt.key,
+            ConsumeStatus::Unconfirmed,
+            "Unconfirmed".into()
+        ));
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now);
+        drop(app.update(Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            owner,
+            ticket,
+            outcome: Outcome::Answered {
+                identity: Some(Identity {
+                    email: Some("other@example.com".into()),
+                    ..identity
+                }),
+                snapshot: Box::new(snapshot),
+                catalog: None,
+            },
+        })));
+        let controls = app
+            .usage_reset_controls(app.account_ui.account(&id).unwrap())
+            .unwrap();
+        let (pressable, captions) = retry_button(controls);
+        assert!(!pressable, "a changed login must disable Retry same reset");
+        assert!(
+            captions
+                .iter()
+                .any(|caption| caption == "Sign in as reset@example.com again to retry this reset."),
+            "a disabled Retry same reset names the login that can retry it: {captions:?}"
+        );
+        assert!(
+            !captions
+                .iter()
+                .any(|caption| caption == "Retries reuse the original request."),
+            "{captions:?}"
+        );
+        let retry = app.update(Message::AccountUi(Action::ResetRecover(
+            id.clone(),
+            grant.id.clone(),
+        )));
+        assert_eq!(retry.units(), 0, "a changed login dispatches no reset");
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.reset.pending.is_none());
+        assert_eq!(state.reset.uncertain[&grant.id].key, attempt.key);
+    }
+
+    #[test]
+    fn cleared_limits_follow_the_login_across_plan_changes() {
+        let now = now_ms();
+        let identity = Identity {
+            email: Some("reset@example.com".into()),
+            organization: Some("fixture-organization".into()),
+            plan: Some("plus".into()),
+            disputed_by: None,
+        };
+        let grant = reset(ResetScope::Account);
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "", now);
+        snapshot.windows = vec![window(account::WindowKind::Session, "codex:primary", 0.0)];
+        let mut state = State::default();
+        state.confirmed.insert(
+            grant.id.clone(),
+            ConfirmedReset {
+                reset: grant,
+                identity: Some(identity.clone()),
+                observed_at: now,
+                incidents: LimitIncidents::default(),
+            },
+        );
+        let mut controls = Controls {
+            id: Account::system(Provider::Codex).id(),
+            name: "Fixture".into(),
+            snapshot,
+            state,
+            now,
+            enabled: true,
+            recovery_enabled: true,
+            checking: false,
+            limit_context: false,
+            surface: "accounts".into(),
+            identity: Some(identity.clone()),
+        };
+        assert!(controls.limit_cleared("Codex usage limit reached"));
+        controls.identity = Some(Identity {
+            email: Some("other@example.com".into()),
+            ..identity.clone()
+        });
+        assert!(!controls.limit_cleared("Codex usage limit reached"));
+        controls.identity = Some(Identity {
+            plan: Some("pro".into()),
+            ..identity
+        });
+        assert!(
+            controls.limit_cleared("Codex usage limit reached"),
+            "a plan-only refresh must preserve the cleared-limit proof"
+        );
+    }
+
+    #[test]
+    fn recovery_matches_the_backend_login_without_rebinding_the_request() {
+        for organization in [None, Some(" fixture-organization ")] {
+            let original = Identity {
+                email: Some(" Reset@Example.com ".into()),
+                organization: organization.map(str::to_owned),
+                plan: None,
+                disputed_by: None,
+            };
+            let current = Identity {
+                email: Some("reset@example.com".into()),
+                organization: Some("FIXTURE-ORGANIZATION".into()),
+                plan: Some("pro".into()),
+                disputed_by: None,
+            };
+            let grant = reset(ResetScope::Account);
+            let mut state = State::default();
+            state.prepare(grant.clone(), 2, Some(original.clone()), "accounts".into());
+            let attempt = state.submit(&grant, 2, Some(&original)).unwrap();
+            assert!(state.finish(
+                &attempt.key,
+                ConsumeStatus::Unconfirmed,
+                "Unconfirmed".into()
+            ));
+            let retry = state.recover(&grant.id, Some(&current)).unwrap();
+            assert_eq!(retry.key, attempt.key);
+            assert_eq!(retry.identity, Some(original));
+        }
+    }
+
+    #[test]
+    fn recovery_requires_both_saved_and_current_identities() {
+        for (expected, actual) in [
+            (None, None),
+            (None, Some(reset_identity())),
+            (Some(reset_identity()), None),
+        ] {
+            let mut state = State::default();
+            let grant = reset(ResetScope::Account);
+            state.prepare(grant.clone(), 2, expected.clone(), "accounts".into());
+            let attempt = state.submit(&grant, 2, expected.as_ref()).unwrap();
+            assert!(state.finish(
+                &attempt.key,
+                ConsumeStatus::Unconfirmed,
+                "Unconfirmed".into()
+            ));
+            assert!(state.recover(&grant.id, actual.as_ref()).is_none());
+            assert!(state.pending.is_none());
+            assert_eq!(state.uncertain[&grant.id].key, attempt.key);
+        }
     }
 
     #[test]
@@ -1403,8 +1821,13 @@ pub(in crate::app) mod tests {
         let now = now_ms();
         let original = reset(ResetScope::Model("Fable".into()));
         let mut state = State::default();
-        state.prepare(original.clone(), 2, None, "accounts".into());
-        let attempt = state.submit(&original, 2, None).unwrap();
+        state.prepare(
+            original.clone(),
+            2,
+            Some(reset_identity()),
+            "accounts".into(),
+        );
+        let attempt = state.submit(&original, 2, Some(&reset_identity())).unwrap();
         state.finish(
             &attempt.key,
             ConsumeStatus::Unconfirmed,
@@ -1425,11 +1848,15 @@ pub(in crate::app) mod tests {
             next_reset(&snapshot, &State::default(), now).unwrap().id,
             weekly.id
         );
-        let recovery = state.recover(&original.id, None).unwrap();
+        let recovery = state
+            .recover(&original.id, Some(&reset_identity()))
+            .unwrap();
         assert_eq!(recovery.key, attempt.key);
         assert_eq!(recovery.reset.id, original.id);
         assert!(
-            state.recover(&original.id, None).is_none(),
+            state
+                .recover(&original.id, Some(&reset_identity()))
+                .is_none(),
             "no concurrent retry"
         );
         state.finish(
@@ -1437,8 +1864,8 @@ pub(in crate::app) mod tests {
             ConsumeStatus::Unconfirmed,
             "Check again".into(),
         );
-        state.prepare(weekly.clone(), 2, None, "accounts".into());
-        let separate = state.submit(&weekly, 2, None).unwrap();
+        state.prepare(weekly.clone(), 2, Some(reset_identity()), "accounts".into());
+        let separate = state.submit(&weekly, 2, Some(&reset_identity())).unwrap();
         assert_ne!(separate.key, recovery.key);
         assert!(state.uncertain.contains_key(&original.id));
     }
@@ -1448,15 +1875,31 @@ pub(in crate::app) mod tests {
         let mut state = State::default();
         let mut recurring = reset(ResetScope::AccountSession);
         recurring.kind = ResetKind::WeeklySession;
-        state.prepare(recurring.clone(), 1, None, "accounts".into());
-        let attempt = state.submit(&recurring, 1, None).unwrap();
+        state.prepare(
+            recurring.clone(),
+            1,
+            Some(reset_identity()),
+            "accounts".into(),
+        );
+        let attempt = state
+            .submit(&recurring, 1, Some(&reset_identity()))
+            .unwrap();
         state.finish(
             &attempt.key,
             ConsumeStatus::Unconfirmed,
             "Check usage".into(),
         );
-        assert!(state.recover(&recurring.id, None).is_none());
-        state.prepare(recurring.clone(), 1, None, "accounts".into());
+        assert!(
+            state
+                .recover(&recurring.id, Some(&reset_identity()))
+                .is_none()
+        );
+        state.prepare(
+            recurring.clone(),
+            1,
+            Some(reset_identity()),
+            "accounts".into(),
+        );
         assert!(state.confirmation.is_none());
     }
 
@@ -1534,14 +1977,14 @@ pub(in crate::app) mod tests {
     fn unavailable_recovery_preserves_the_original_uncertain_request_key() {
         let mut state = State::default();
         let grant = reset(ResetScope::AccountWeekly);
-        state.prepare(grant.clone(), 2, None, "accounts".into());
-        let original = state.submit(&grant, 2, None).unwrap();
+        state.prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
+        let original = state.submit(&grant, 2, Some(&reset_identity())).unwrap();
         assert!(state.finish(
             &original.key,
             ConsumeStatus::Unconfirmed,
             "Unconfirmed".into()
         ));
-        let retry = state.recover(&grant.id, None).unwrap();
+        let retry = state.recover(&grant.id, Some(&reset_identity())).unwrap();
         assert_eq!(retry.key, original.key);
         assert!(state.finish(
             &retry.key,
@@ -1549,9 +1992,9 @@ pub(in crate::app) mod tests {
             "Provider unavailable".into()
         ));
         assert_eq!(state.uncertain.get(&grant.id).unwrap().key, original.key);
-        state.prepare(grant.clone(), 2, None, "accounts".into());
+        state.prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
         assert!(state.confirmation.is_none());
-        let next_retry = state.recover(&grant.id, None).unwrap();
+        let next_retry = state.recover(&grant.id, Some(&reset_identity())).unwrap();
         assert_eq!(next_retry.key, original.key);
     }
     #[test]
@@ -1636,8 +2079,8 @@ pub(in crate::app) mod tests {
         session.id = "session-fixture".into();
         snapshot.resets = vec![fable.clone(), session.clone()];
         let mut state = State::default();
-        state.prepare(fable.clone(), 2, None, "accounts".into());
-        let attempt = state.submit(&fable, 2, None).unwrap();
+        state.prepare(fable.clone(), 2, Some(reset_identity()), "accounts".into());
+        let attempt = state.submit(&fable, 2, Some(&reset_identity())).unwrap();
         state.finish(
             &attempt.key,
             ConsumeStatus::Unconfirmed,
@@ -1648,7 +2091,13 @@ pub(in crate::app) mod tests {
         let choices = scope_choices(&snapshot, &state, now);
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].reset.id, session.id);
-        assert_eq!(state.recover(&fable.id, None).unwrap().key, attempt.key);
+        assert_eq!(
+            state
+                .recover(&fable.id, Some(&reset_identity()))
+                .unwrap()
+                .key,
+            attempt.key
+        );
     }
 
     #[test]
@@ -2276,11 +2725,15 @@ pub(in crate::app) mod tests {
             snapshot.resets = vec![grant.clone()];
             let state = app.account_ui.account_mut(&id).unwrap();
             state.present = true;
+            state.identity = Some(reset_identity());
             state.snapshot = Some(snapshot.clone());
             state
                 .reset
-                .prepare(grant.clone(), 2, None, "accounts".into());
-            let attempt = state.reset.submit(&grant, 2, None).unwrap();
+                .prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
+            let attempt = state
+                .reset
+                .submit(&grant, 2, Some(&reset_identity()))
+                .unwrap();
             let owner = state.owner;
             for window in &mut snapshot.windows {
                 if grant.clears(window) {
@@ -2377,11 +2830,15 @@ pub(in crate::app) mod tests {
             snapshot.resets = vec![grant.clone()];
             let state = app.account_ui.account_mut(&id).unwrap();
             state.present = true;
+            state.identity = Some(reset_identity());
             state.snapshot = Some(snapshot.clone());
             state
                 .reset
-                .prepare(grant.clone(), 2, None, "accounts".into());
-            let attempt = state.reset.submit(&grant, 2, None).unwrap();
+                .prepare(grant.clone(), 2, Some(reset_identity()), "accounts".into());
+            let attempt = state
+                .reset
+                .submit(&grant, 2, Some(&reset_identity()))
+                .unwrap();
             let owner = state.owner;
             drop(app.finish_usage_reset(
                 id.clone(),
@@ -2428,7 +2885,7 @@ pub(in crate::app) mod tests {
             grant.id.clone(),
             ConfirmedReset {
                 reset: grant,
-                identity: None,
+                identity: Some(reset_identity()),
                 observed_at: now,
                 incidents: old.clone(),
             },
@@ -2444,7 +2901,7 @@ pub(in crate::app) mod tests {
             checking: false,
             limit_context: false,
             surface: "accounts".into(),
-            identity: None,
+            identity: Some(reset_identity()),
         };
         let previous = controls.for_incident(&old);
         assert!(previous.limit_cleared("Claude Fable limit reached"));
@@ -2490,7 +2947,7 @@ pub(in crate::app) mod tests {
             grant.id.clone(),
             ConfirmedReset {
                 reset: grant,
-                identity: None,
+                identity: Some(reset_identity()),
                 observed_at: now,
                 incidents: LimitIncidents::default(),
             },
@@ -2506,7 +2963,7 @@ pub(in crate::app) mod tests {
             checking: false,
             limit_context: false,
             surface: "accounts".into(),
-            identity: None,
+            identity: Some(reset_identity()),
         };
         for allowed in [None, Some(true)] {
             controls.snapshot.ordinary_usage_allowed = allowed;
@@ -2567,7 +3024,7 @@ pub(in crate::app) mod tests {
                 ticket,
                 Outcome::Answered {
                     snapshot: Box::new(snapshot),
-                    identity: None,
+                    identity: Some(reset_identity()),
                     catalog: None,
                 },
             ));
