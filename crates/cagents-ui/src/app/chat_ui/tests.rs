@@ -8399,6 +8399,36 @@ fn dismissing_an_attachment_notice_preserves_the_draft_and_its_files() {
     assert_eq!(runtime.attachments, [kept]);
 }
 
+/// A refusal answered the chosen model's attachment rules, so choosing
+/// another model or provider puts it away.
+#[test]
+fn choosing_another_model_clears_an_attachment_notice() {
+    let _admission = attachment_draft::test_admission();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    write(&mut app, card, "keep this draft");
+    let ticket = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .begin_attachment_insert();
+    drop(app.handle_chat_ui(Action::PasteRefused(
+        target,
+        ticket,
+        "The current model cannot accept images.",
+    )));
+    assert!(chat_runtime(&app, card).attachment_notice.is_some());
+    let _ = app.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Claude,
+        None,
+    )));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session.launch.provider, Provider::Claude);
+    assert!(runtime.attachment_notice.is_none());
+    assert_eq!(runtime.composer.text(), "keep this draft");
+}
+
 #[test]
 fn the_next_successfully_staged_attachment_clears_an_attachment_notice() {
     let _admission = attachment_draft::test_admission();
@@ -8534,6 +8564,9 @@ fn attachment_staging_refusals_are_not_reported_as_io_failures() {
             } else {
                 Action::AttachmentsPrepared(target, ticket, Err(error))
             };
+            // An earlier refusal gives way to whatever this attempt says.
+            app.chat_runtime_mut(target).unwrap().attachment_notice =
+                Some("fixture: earlier refusal".into());
             drop(app.handle_chat_ui(action));
             let runtime = chat_runtime(&app, card);
             assert_eq!(runtime.pastes_pending, 0);

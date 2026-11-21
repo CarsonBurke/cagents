@@ -76,11 +76,7 @@ impl std::fmt::Display for StagingError {
 }
 
 fn storage_error(message: String) -> StagingError {
-    if message.starts_with("Image storage is full (2 GiB or 4096 images).")
-        || message == "Image storage metadata is full."
-        || message == "Image numbering is exhausted; no identity was reused."
-        || message == "Image exceeds this provider's image size limit or has an unsupported type."
-    {
+    if crate::chat::attachment_assets::is_staging_refusal(&message) {
         StagingError::Refused(message)
     } else {
         StagingError::Failed(message)

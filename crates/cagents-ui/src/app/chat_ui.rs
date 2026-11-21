@@ -3831,7 +3831,12 @@ impl Runtime {
     fn report_attachment_error(&mut self, error: clipboard_image::StagingError) {
         match error {
             clipboard_image::StagingError::Refused(notice) => self.attachment_notice = Some(notice),
-            clipboard_image::StagingError::Failed(error) => self.error = Some(error),
+            clipboard_image::StagingError::Failed(error) => {
+                // The failure card now says what went wrong; an earlier
+                // refusal would read as a second, unrelated problem.
+                self.attachment_notice = None;
+                self.error = Some(error);
+            }
         }
     }
 
@@ -7927,6 +7932,8 @@ impl Cagents {
             runtime.error = None;
         }
         if changed {
+            // An attachment refusal answered the previous model's rules.
+            runtime.attachment_notice = None;
             // The refusal answered the previous launch; this one was never tried.
             runtime.release_start_block();
         }
@@ -8605,8 +8612,10 @@ impl Cagents {
             .draft_permission
             .get(&session.launch.recipe, provider);
         if rehomed {
-            // A failed start's reason belongs to the account it failed on.
+            // A failed start's reason belongs to the account it failed on,
+            // and an attachment refusal to the launch that refused it.
             runtime.error = None;
+            runtime.attachment_notice = None;
             runtime.completion.restart(true);
         }
         let target = runtime.target;

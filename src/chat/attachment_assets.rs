@@ -33,6 +33,21 @@ const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
 const STORE_DIRECTORY: &str = "chat-image-assets";
 const REGISTRY: &str = "receipts.json";
 const LOCK: &str = "receipts.lock";
+const REGISTRY_FULL: &str = "Image storage metadata is full.";
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+const STORE_FULL: &str = "Image storage is full (2 GiB or 4096 images). No images were removed. Run cagents chat image-assets list, then explicitly remove an image you no longer need before attaching another.";
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+const NUMBERING_EXHAUSTED: &str = "Image numbering is exhausted; no identity was reused.";
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+const UNSTAGEABLE: &str =
+    "Image exceeds this provider's image size limit or has an unsupported type.";
+
+/// Whether a staging error refused the image for its size, type or the
+/// store's capacity, rather than the store failing to read or write.
+#[cfg(any(feature = "ui", all(test, feature = "host")))]
+pub fn is_staging_refusal(error: &str) -> bool {
+    [STORE_FULL, REGISTRY_FULL, NUMBERING_EXHAUSTED, UNSTAGEABLE].contains(&error)
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +173,7 @@ impl Store {
     fn write_registry(&self, registry: &Registry) -> Result<(), String> {
         let bytes = serde_json::to_vec(registry).map_err(storage_error)?;
         if bytes.len() as u64 > MAX_REGISTRY_BYTES {
-            return Err("Image storage metadata is full.".into());
+            return Err(REGISTRY_FULL.into());
         }
         self.write(REGISTRY, &bytes, true)
     }
@@ -353,9 +368,7 @@ impl Store {
             || bytes.len() as u64 > max_bytes.min(MAX_IMAGE_BYTES)
             || !matches!(extension, "png" | "jpg" | "gif" | "webp")
         {
-            return Err(
-                "Image exceeds this provider's image size limit or has an unsupported type.".into(),
-            );
+            return Err(UNSTAGEABLE.into());
         }
         let _lock = self.lock()?;
         let mut registry = self.initialize()?;
@@ -364,12 +377,10 @@ impl Store {
         let total = registry.images.values().map(|r| r.bytes).sum::<u64>();
         if registry.images.len() >= MAX_STORE_IMAGES || total + bytes.len() as u64 > MAX_STORE_BYTES
         {
-            return Err("Image storage is full (2 GiB or 4096 images). No images were removed. Run cagents chat image-assets list, then explicitly remove an image you no longer need before attaching another.".into());
+            return Err(STORE_FULL.into());
         }
         let number = registry.next_number;
-        registry.next_number = number
-            .checked_add(1)
-            .ok_or("Image numbering is exhausted; no identity was reused.")?;
+        registry.next_number = number.checked_add(1).ok_or(NUMBERING_EXHAUSTED)?;
         let name = name
             .chars()
             .filter(|c| !c.is_control())
