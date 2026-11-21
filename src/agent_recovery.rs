@@ -2722,6 +2722,143 @@ mod tests {
         assert_eq!(runtime_identity(&root, 100, &recipe, 0), None);
     }
 
+    #[cfg(feature = "host")]
+    mod cleared_conversation {
+        use super::*;
+        use crate::model::{
+            BootId, CardId, CardKind, CardState, Existence, HostIncarnation, HostSessionId,
+            TerminalContinuity, TerminalId, TerminalSession, WorkspaceState,
+        };
+        use crate::persistence::{SnapshotBase, StateStore};
+
+        #[test]
+        fn reboot_does_not_reauthorize_the_conversation_cleared_by_claude() {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("home");
+            let config = directory.path().join("claude-config");
+            let work = directory.path().join("work");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(config.join("sessions")).unwrap();
+            fs::create_dir_all(&work).unwrap();
+            let launched = "a1b2c3d4-1111-4111-8111-123456789abc";
+            let current = "a1b2c3d4-2222-4111-8111-123456789abc";
+            let mut recipe = launch("claude", &["--resume", launched]);
+            recipe.working_directory = work.clone();
+            recipe
+                .environment
+                .insert("HOME".into(), home.to_str().unwrap().into());
+            recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into());
+            let proc_root = directory.path().join("proc");
+            process_fixture(&proc_root, 100, &recipe, &[]);
+            let project: String = work
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let history = config.join("projects").join(project);
+            fs::create_dir_all(&history).unwrap();
+            fs::write(history.join(format!("{launched}.jsonl")), "{}\n").unwrap();
+            let write_record = |id: &str| {
+                fs::write(
+                    config.join("sessions/100.json"),
+                    serde_json::json!({
+                        "pid": 100,
+                        "procStart": "0",
+                        "sessionId": id,
+                        "cwd": work,
+                        "kind": "interactive",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            };
+            write_record(launched);
+            let before = inspect_process(&proc_root, 100, 100, &recipe, &mut 64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recipe_from_hint(&before), Some(recipe.clone()));
+
+            // `/clear` changes the process record, but no message in B has
+            // created its transcript. Observe the real recovery decision.
+            write_record(current);
+            assert!(!history.join(format!("{current}.jsonl")).exists());
+            assert_eq!(
+                runtime_identity(&proc_root.join("100"), 100, &recipe, 0),
+                Some(SessionIdentity::Ambiguous)
+            );
+            let hint = inspect_process(&proc_root, 100, 100, &recipe, &mut 64)
+                .unwrap()
+                .unwrap();
+            assert!(recipe_from_hint(&hint).is_none());
+            assert_eq!(observed_launch_from_hint(&hint), Some(recipe.clone()));
+            let boot = BootId::new("before-reboot");
+            let card = CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: "Claude".into(),
+                width_fraction: 0.6,
+                existence: Existence::Open,
+                kind: CardKind::Terminal(TerminalSession {
+                    id: TerminalId::new(),
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    launch: recipe.clone(),
+                    transcript_path: None,
+                    resume_hint: Some(hint.clone()),
+                    continuity: TerminalContinuity::Live {
+                        host_session_id: HostSessionId::new("old-host"),
+                        boot_id: boot.clone(),
+                        host_incarnation: HostIncarnation::new("old-incarnation"),
+                    },
+                }),
+            };
+            let workspace = WorkspaceState {
+                focused: Some(card.id),
+                cards: vec![card].into(),
+                ..WorkspaceState::default()
+            };
+            let path = directory.path().join("state.sqlite3");
+            {
+                let store = StateStore::open(&path, boot).unwrap();
+                store
+                    .save_workspace(
+                        &workspace,
+                        SnapshotBase {
+                            workspace: 0,
+                            cards: &BTreeMap::new(),
+                        },
+                    )
+                    .unwrap();
+                store.shutdown().unwrap();
+            }
+            let store = StateStore::open(&path, BootId::new("after-reboot")).unwrap();
+            assert!(store.recovery_report().boot_changed);
+            let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+            let CardKind::Terminal(session) = &restored.cards[0].kind else {
+                panic!("saved terminal expected");
+            };
+            assert!(matches!(
+                &session.continuity,
+                TerminalContinuity::RelaunchAvailable { recipe: saved, .. } if saved == &recipe
+            ));
+            assert_eq!(session.resume_hint.as_ref(), Some(&hint));
+            assert_eq!(session.agent_resume_recipe(), None);
+            assert_eq!(
+                crate::upgrade::recovery_plan(session).unwrap(),
+                (
+                    picker_recipe(&recipe).unwrap(),
+                    crate::upgrade::RecoveryKind::Picker
+                )
+            );
+        }
+    }
+
     #[test]
     fn codex_recovery_retains_the_exact_remote_endpoint() {
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";

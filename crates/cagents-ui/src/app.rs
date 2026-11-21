@@ -2176,7 +2176,29 @@ fn terminal_continuity(state: Option<&CardState>) -> Option<&TerminalContinuity>
     }
 }
 
-fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
+/// Current observation supersedes the original selector, so a relaunch of an
+/// observed agent follows recovery's plan rather than the saved recipe.
+fn relaunch_follows_recovery_plan(session: &TerminalSession) -> bool {
+    session
+        .resume_hint
+        .as_deref()
+        .and_then(crate::model::agent_recovery::observed_launch_from_hint)
+        .is_some()
+}
+
+fn terminal_relaunch_recipe(
+    session: &TerminalSession,
+    fallback: &LaunchRecipe,
+) -> Result<LaunchRecipe, String> {
+    if relaunch_follows_recovery_plan(session) {
+        return crate::upgrade::recovery_plan(session).map(|(recipe, _)| recipe);
+    }
+    Ok(session
+        .agent_resume_recipe()
+        .unwrap_or_else(|| fallback.clone()))
+}
+
+fn fresh_terminal_relaunch(session: &TerminalSession) -> Result<TerminalSession, String> {
     let (recipe, last_exit) = match &session.continuity {
         TerminalContinuity::RelaunchAvailable { recipe, last_exit } => {
             (recipe.clone(), last_exit.clone())
@@ -2192,9 +2214,9 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
     let resume_hint = resume_recipe
         .as_ref()
         .and_then(|_| session.resume_hint.clone());
-    let recipe = resume_recipe.unwrap_or(recipe);
+    let recipe = terminal_relaunch_recipe(session, &recipe)?;
     let id = TerminalId::new();
-    TerminalSession {
+    Ok(TerminalSession {
         owned_codex_listener: None,
         recovery_origin: Some(session.recovery_origin.unwrap_or(session.id)),
         predecessor: Some(session.id),
@@ -2203,7 +2225,7 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
         transcript_path: transcript_path_for(&recipe, id),
         resume_hint,
         continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit },
-    }
+    })
 }
 
 /// Where a new, relaunched or cloned terminal records its output: nowhere
@@ -10075,7 +10097,13 @@ impl Cagents {
             && session.continuity.live_proof().is_none()
         {
             let expected_terminal_id = session.id;
-            let replacement = fresh_terminal_relaunch(session);
+            let replacement = match fresh_terminal_relaunch(session) {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    self.fail_runtime(card, error);
+                    return Task::none();
+                }
+            };
             *session = replacement.clone();
             Some((expected_terminal_id, replacement))
         } else {
@@ -20291,11 +20319,9 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
                 ))
             }
         }
-        TerminalContinuity::RelaunchAvailable { recipe, .. } => Ok(TerminalStartMode::Spawn(
-            session
-                .agent_resume_recipe()
-                .unwrap_or_else(|| recipe.clone()),
-        )),
+        TerminalContinuity::RelaunchAvailable { recipe, .. } => {
+            terminal_relaunch_recipe(session, recipe).map(TerminalStartMode::Spawn)
+        }
         TerminalContinuity::Exited { .. } => Err(format!(
             "terminal {} has exited; explicit relaunch is required",
             session.id
