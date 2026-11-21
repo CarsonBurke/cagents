@@ -1313,9 +1313,29 @@ impl Drop for Listener {
 
 impl Drop for Residence {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         // No completion receipt or discovery retirement until every owned
         // descendant is reaped. A stuck child leaves this small owner alive.
-        while self.release().is_err() {
+        while !self
+            .child
+            .terminate(Duration::from_secs(2))
+            .unwrap_or(false)
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Only that wait is unbounded. Once the provider is gone, a release
+        // that cannot be recorded (its runtime directory removed, say) would
+        // otherwise retry forever. Without the receipt, a daemon still
+        // settles the close from the ended holder and provider, as for a
+        // holder that was killed.
+        let deadline = Instant::now() + TIMEOUT;
+        while let Err(error) = self.release() {
+            if Instant::now() >= deadline {
+                eprintln!("Native holder could not record its release: {error}");
+                return;
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -2835,6 +2855,81 @@ exec /bin/sleep 60
         assert_eq!(evidence(), None, "its record is retired as discovery would");
         // Nothing is left to release when the Holder is dropped.
         drop(holder);
+    }
+
+    /// A holder whose daemon is lost without a Release still exits once its
+    /// provider is stopped, even when it can no longer record the release:
+    /// a removed runtime directory once kept one retrying for 20 hours.
+    #[test]
+    fn a_lost_holder_exits_when_its_release_cannot_be_recorded() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_UNRECORDED_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::a_lost_holder_exits_when_its_release_cannot_be_recorded", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context.clone()),
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut holder = spawn(spec, source).unwrap();
+        context.installed();
+        assert!(
+            !holder.is_durable(),
+            "an unconfirmed server ends with its daemon"
+        );
+        let record = holder.identity.record.clone();
+        // Where the receipt and record would go is gone, as when a test's
+        // fixture is removed while its holder is still stopping.
+        std::fs::remove_dir_all(registry::directory(Kind::Native).unwrap()).unwrap();
+        // The daemon is lost: its control connection closes without a Release.
+        holder.release_on_drop = false;
+        drop(holder);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while record.holder.is_current() {
+            if Instant::now() >= deadline {
+                // Only processes that are still these exact ones: a reaped
+                // root's pid may already belong to something else.
+                for process in [&record.holder, &record.root] {
+                    if process.is_current() {
+                        unsafe { libc::kill(process.pid, libc::SIGKILL) };
+                    }
+                }
+                panic!("the holder kept retrying a release it cannot record");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(record.root.reaped(), "the holder stopped its provider");
     }
 
     #[test]
