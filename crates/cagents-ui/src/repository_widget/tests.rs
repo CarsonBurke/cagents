@@ -11371,3 +11371,305 @@ fn contrast_correction_retains_syntax_hue_instead_of_replacing_it() {
         assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
     }
 }
+
+const AGENT_REPLY: &str = "\
+## Summary
+
+The build failed because the **cache key** ignored `Cargo.lock`:
+
+1. CI restored a stale target directory.
+2. The linker picked up an old object.
+
+```sh
+cargo clean
+```
+";
+
+fn paste(runtime: &mut RepositoryRuntime, card: CardId, text: &str) {
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(
+            text.into(),
+        ))),
+    }));
+}
+
+/// Lets the edit debounce fire as though typing had stopped long enough ago.
+fn settle(runtime: &mut RepositoryRuntime, card: CardId) {
+    let ticket = runtime
+        .markdown_debounce
+        .timer
+        .expect("an edit to a nameless buffer arms the debounce");
+    runtime.markdown_debounce.deadline = None;
+    drop(runtime.update(RepositoryAction::MarkdownDue { card, ticket }));
+}
+
+fn editable(runtime: &RepositoryRuntime) -> &EditorDocument {
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!("the fixture opens an editable buffer");
+    };
+    document
+}
+
+fn highlight_token(runtime: &RepositoryRuntime) -> String {
+    editable(runtime)
+        .highlighter(crate::settings::EditorSyntaxTheme::Auto, true)
+        .token
+}
+
+#[test]
+fn a_nameless_buffer_reads_as_its_content_once_typing_settles_never_per_frame() {
+    let card = CardId::new();
+    let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "Untitled", "");
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(runtime.language_offer(), Some((false, None)));
+
+    // Pasting a reply in pieces, in the edit surface, reads nothing yet: the
+    // language waits for the debounce, which is armed even though nothing
+    // parsed is on screen.
+    let (head, tail) = AGENT_REPLY.split_at(AGENT_REPLY.len() / 2);
+    paste(&mut runtime, card, head);
+    paste(&mut runtime, card, tail);
+    assert_eq!(runtime.markdown_mode, MarkdownMode::Edit);
+    assert_eq!(editable(&runtime).inferences, 0);
+    assert!(runtime.markdown_debounce.timer.is_some());
+
+    // Drawing, however often, never infers: the view only reads the result.
+    for _ in 0..3 {
+        drop(view(card, &runtime));
+        drop(selected_file_toolbar(card, &runtime));
+        assert_eq!(highlight_token(&runtime), "Untitled");
+    }
+    assert_eq!(editable(&runtime).inferences, 0);
+
+    settle(&mut runtime, card);
+    assert_eq!(editable(&runtime).inferences, 1);
+    assert!(editable(&runtime).markdown);
+    // Edit-mode highlighting follows the same language as the preview.
+    assert_eq!(highlight_token(&runtime), "md");
+    // Edit mode does not pay for the preview's parse.
+    assert!(editable(&runtime).markdown_items.is_empty());
+
+    drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+        card,
+        preview: true,
+    }));
+    assert!(!editable(&runtime).markdown_items.is_empty());
+    for _ in 0..3 {
+        drop(view(card, &runtime));
+    }
+    assert_eq!(
+        editable(&runtime).inferences,
+        1,
+        "nothing changed to re-read"
+    );
+}
+
+#[test]
+fn a_markdown_buffer_holds_while_an_edit_is_half_typed() {
+    let card = CardId::new();
+    let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "Untitled", "");
+    paste(&mut runtime, card, AGENT_REPLY);
+    settle(&mut runtime, card);
+    assert!(editable(&runtime).markdown);
+
+    // Select everything and start a new reply: the unclosed emphasis and
+    // the lone heading would not have made plain text Markdown, but they
+    // keep a Markdown buffer Markdown.
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::SelectAll,
+    }));
+    paste(&mut runtime, card, "# Plan\n\nThe **ca");
+    settle(&mut runtime, card);
+    assert!(editable(&runtime).markdown);
+
+    // Prose with no Markdown left in it is plain text again.
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::SelectAll,
+    }));
+    paste(&mut runtime, card, "Remember to call the dentist.\n");
+    settle(&mut runtime, card);
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(highlight_token(&runtime), "Untitled");
+}
+
+#[test]
+fn a_chosen_language_wins_over_the_content_and_outlives_a_reload() {
+    let card = CardId::new();
+    let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "Untitled", AGENT_REPLY);
+    // The load inferred the language on its worker; the fixture says plain,
+    // so the runtime keeps what the load reported until an edit.
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::PlainText),
+    }));
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(highlight_token(&runtime), "txt");
+    assert_eq!(
+        runtime.language_offer(),
+        Some((false, Some(DocumentLanguage::PlainText)))
+    );
+
+    // Edits no longer arm inference, and the debounce reads nothing.
+    let before = editable(&runtime).inferences;
+    paste(&mut runtime, card, "\n| a | b |\n|---|---|\n");
+    assert!(!editable(&runtime).language_stale());
+    if let Some(ticket) = runtime.markdown_debounce.timer {
+        runtime.markdown_debounce.deadline = None;
+        drop(runtime.update(RepositoryAction::MarkdownDue { card, ticket }));
+    }
+    assert_eq!(editable(&runtime).inferences, before);
+    assert!(!editable(&runtime).markdown);
+
+    // The choice belongs to the file, so the buffer it reloads into keeps it.
+    drop(runtime.update(RepositoryAction::FileLoaded {
+        identity,
+        result: Ok(LoadedFile {
+            source: PathBuf::from("Untitled"),
+            content: FileContent::Editable {
+                text: AGENT_REPLY.into(),
+                content_hash: blake3::hash(AGENT_REPLY.as_bytes()),
+                markdown: true,
+            },
+        }),
+    }));
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(
+        runtime.language_choice(Path::new("Untitled")),
+        Some(DocumentLanguage::PlainText)
+    );
+
+    // Markdown, chosen, previews at once.
+    drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+        card,
+        preview: true,
+    }));
+    assert!(editable(&runtime).markdown_items.is_empty());
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::Markdown),
+    }));
+    assert!(editable(&runtime).markdown);
+    assert!(!editable(&runtime).markdown_items.is_empty());
+
+    // Automatic hands it back to the content, read straight away.
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: None,
+    }));
+    assert_eq!(runtime.language_offer(), Some((true, None)));
+    assert_eq!(runtime.language_choice(Path::new("Untitled")), None);
+}
+
+#[test]
+fn a_named_buffer_offers_no_language_and_highlights_by_its_name() {
+    let card = CardId::new();
+    let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", AGENT_REPLY);
+    assert_eq!(runtime.language_offer(), None);
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::Markdown),
+    }));
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(runtime.language_choice(Path::new("notes.txt")), None);
+    paste(&mut runtime, card, "x");
+    assert!(!editable(&runtime).language_stale());
+    assert_eq!(highlight_token(&runtime), "txt");
+
+    // A README is Markdown by name, and now highlights as Markdown too.
+    let (runtime, identity) = RepositoryRuntime::selection_fixture(card, "README");
+    let mut runtime = runtime;
+    drop(runtime.update(RepositoryAction::FileLoaded {
+        identity,
+        result: Ok(LoadedFile {
+            source: PathBuf::from("README"),
+            content: FileContent::Editable {
+                text: "# Title\n".into(),
+                content_hash: blake3::hash(b"# Title\n"),
+                markdown: true,
+            },
+        }),
+    }));
+    assert_eq!(runtime.language_offer(), None);
+    assert_eq!(highlight_token(&runtime), "md");
+}
+
+/// Loads `view`'s selected file from disk into `runtime`, as the shell would.
+fn load_selected_file(runtime: &mut RepositoryRuntime, card: CardId, view: &RepositoryView) {
+    let path = view.selected_file.clone().unwrap();
+    drop(runtime.update(RepositoryAction::FileLoaded {
+        identity: runtime.current_identity(card, path.clone()),
+        result: crate::editor::load_file(&view.worktree, &path, crate::editor::PdfTone::Original),
+    }));
+}
+
+#[test]
+fn a_language_choice_stays_with_its_worktree_when_the_pane_moves_to_another() {
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for directory in [&first, &second] {
+        std::fs::write(directory.path().join("NOTES"), AGENT_REPLY).unwrap();
+    }
+    let view = |directory: &tempfile::TempDir| RepositoryView {
+        project: crate::model::ProjectId::new(),
+        repository: directory.path().to_path_buf(),
+        worktree: directory.path().to_path_buf(),
+        selected_file: Some("NOTES".into()),
+    };
+    let (first, second) = (view(&first), view(&second));
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(first.clone());
+    drop(runtime.initial_load(card));
+    load_selected_file(&mut runtime, card, &first);
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::PlainText),
+    }));
+
+    // Another worktree's NOTES is a different file, read from its content.
+    drop(runtime.retarget_file(card, second.clone()));
+    load_selected_file(&mut runtime, card, &second);
+    assert_eq!(runtime.language_offer(), Some((true, None)));
+
+    // Back in the first worktree, its choice still holds.
+    drop(runtime.retarget_file(card, first.clone()));
+    load_selected_file(&mut runtime, card, &first);
+    assert_eq!(
+        runtime.language_offer(),
+        Some((false, Some(DocumentLanguage::PlainText)))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_language_chosen_through_a_link_is_the_shown_files_choice() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("NOTES"), AGENT_REPLY).unwrap();
+    std::os::unix::fs::symlink("NOTES", directory.path().join("alias")).unwrap();
+    let view = RepositoryView {
+        project: crate::model::ProjectId::new(),
+        repository: directory.path().to_path_buf(),
+        worktree: directory.path().to_path_buf(),
+        selected_file: Some("alias".into()),
+    };
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(view.clone());
+    drop(runtime.initial_load(card));
+    load_selected_file(&mut runtime, card, &view);
+    assert_eq!(runtime.linked_source(), Some(Path::new("NOTES")));
+    drop(runtime.update(RepositoryAction::ChooseLanguage {
+        card,
+        language: Some(DocumentLanguage::PlainText),
+    }));
+    // The choice belongs to the file the link names, and the pane reports it
+    // for the selection that reached it.
+    assert_eq!(
+        runtime.language_choice(Path::new("NOTES")),
+        Some(DocumentLanguage::PlainText)
+    );
+    assert_eq!(
+        runtime.shown_language_choice(),
+        Some(DocumentLanguage::PlainText)
+    );
+}

@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use cagents_ui::editor::language::DocumentLanguage;
+
 const fn default_sidebar_open() -> bool {
     true
 }
@@ -19,6 +21,20 @@ pub struct Session {
     /// else renders collapsed, so whole project trees stay cheap to load.
     #[serde(default)]
     pub expanded_directories: BTreeMap<String, Vec<String>>,
+    /// The language chosen for each tab's file, in [`Session::paths`] order,
+    /// where its name does not type it: an untitled note read as Markdown,
+    /// say. A tab past the end chose none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<Option<DocumentLanguage>>,
+}
+
+/// A path to open at startup, as [`Session::startup_paths`] lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPath {
+    pub path: PathBuf,
+    pub focus: bool,
+    /// The language the reader chose for this file in the last session.
+    pub language: Option<DocumentLanguage>,
 }
 
 // UTF-8 paths retain the legacy JSON string representation. Unix filenames
@@ -88,18 +104,27 @@ impl Default for Session {
             active: None,
             sidebar_open: default_sidebar_open(),
             expanded_directories: BTreeMap::new(),
+            languages: Vec::new(),
         }
     }
 }
 
 impl Session {
-    pub fn startup_paths(&self, explicit: Vec<PathBuf>) -> Vec<(PathBuf, bool)> {
+    pub fn startup_paths(&self, explicit: Vec<PathBuf>) -> Vec<StartupPath> {
         let restore_focus = explicit.is_empty();
         self.paths
             .iter()
             .enumerate()
-            .map(|(index, path)| (path.clone(), restore_focus && self.active == Some(index)))
-            .chain(explicit.into_iter().map(|path| (path, true)))
+            .map(|(index, path)| StartupPath {
+                path: path.clone(),
+                focus: restore_focus && self.active == Some(index),
+                language: self.languages.get(index).copied().flatten(),
+            })
+            .chain(explicit.into_iter().map(|path| StartupPath {
+                path,
+                focus: true,
+                language: None,
+            }))
             .collect()
     }
 }
@@ -351,6 +376,7 @@ mod tests {
                 "/project".into(),
                 vec!["src".into(), "src/nested".into()],
             )]),
+            languages: vec![None, Some(DocumentLanguage::PlainText)],
         };
         save_session(&settings, &session).unwrap();
         assert_eq!(load_session(&settings).unwrap(), session);
@@ -360,6 +386,7 @@ mod tests {
             active: Some(0),
             sidebar_open: true,
             expanded_directories: BTreeMap::new(),
+            languages: Vec::new(),
         };
         save_session(&settings, &replacement).unwrap();
         assert_eq!(load_session(&settings).unwrap(), replacement);
@@ -387,7 +414,7 @@ mod tests {
             session
                 .startup_paths(Vec::new())
                 .iter()
-                .all(|(_, focus)| !focus)
+                .all(|start| !start.focus)
         );
     }
 
@@ -476,24 +503,30 @@ mod tests {
     #[test]
     fn explicit_files_follow_restored_tabs_and_own_startup_focus() {
         let session = Session {
-            paths: vec!["/project/b.txt".into(), "/project/a.txt".into()],
+            paths: vec!["/project/b".into(), "/project/a.txt".into()],
             active: Some(0),
             sidebar_open: true,
             expanded_directories: BTreeMap::new(),
+            languages: vec![Some(DocumentLanguage::Markdown)],
+        };
+        let start = |path: &str, focus, language| StartupPath {
+            path: path.into(),
+            focus,
+            language,
         };
         assert_eq!(
             session.startup_paths(Vec::new()),
             vec![
-                ("/project/b.txt".into(), true),
-                ("/project/a.txt".into(), false)
+                start("/project/b", true, Some(DocumentLanguage::Markdown)),
+                start("/project/a.txt", false, None),
             ],
         );
         assert_eq!(
             session.startup_paths(vec!["/requested.txt".into()]),
             vec![
-                ("/project/b.txt".into(), false),
-                ("/project/a.txt".into(), false),
-                ("/requested.txt".into(), true),
+                start("/project/b", false, Some(DocumentLanguage::Markdown)),
+                start("/project/a.txt", false, None),
+                start("/requested.txt", true, None),
             ],
         );
     }

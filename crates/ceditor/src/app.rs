@@ -12,6 +12,7 @@ use cagents::{
 };
 use cagents_ui::settings_widgets::{Setting, field as settings_field, group as settings_group};
 use cagents_ui::{
+    editor::language::DocumentLanguage,
     lsp::{
         LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition, LspRequestId, LspStatus,
     },
@@ -61,6 +62,9 @@ pub struct Opened {
     root: PathBuf,
     file: Option<PathBuf>,
     snapshot: Option<RepositorySnapshot>,
+    /// The language the reader already chose for `file`, in an earlier
+    /// session or before saving an untitled note as it.
+    language: Option<DocumentLanguage>,
 }
 
 /// An untitled note whose Save As chooser is open.
@@ -72,6 +76,9 @@ struct PendingSaveAs {
     /// editing, so a note still open in its tab is saved from the live buffer;
     /// this stands in only once the tab has closed it.
     text: String,
+    /// The note's chosen language when the chooser opened, standing in the
+    /// same way.
+    language: Option<DocumentLanguage>,
 }
 
 struct PendingFile {
@@ -1333,27 +1340,46 @@ impl Editor {
             root,
             file,
             snapshot,
+            language: None,
         })
     }
 
     fn open(path: PathBuf, selection_epoch: u64) -> Task<Message> {
+        Self::open_as(path, None, selection_epoch)
+    }
+
+    /// Opens `path` already set to the `language` the reader chose for it.
+    fn open_as(
+        path: PathBuf,
+        language: Option<DocumentLanguage>,
+        selection_epoch: u64,
+    ) -> Task<Message> {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || Self::resolve_open(path))
                 .await
                 .map_err(|error| error.to_string())
-                .and_then(|result| result);
+                .and_then(|result| result)
+                .map(|opened| Opened { language, ..opened });
             Message::Opened(selection_epoch, result)
         })
     }
 
-    fn restore_session(paths: Vec<(PathBuf, bool)>) -> Task<Message> {
+    /// Resolves one file of the last session, set to the language chosen for
+    /// it, with whether it takes focus.
+    fn resolve_startup(
+        start: crate::preferences::StartupPath,
+    ) -> (bool, Result<Opened, String>) {
+        let language = start.language;
+        let opened = Self::resolve_open(start.path).map(|opened| Opened { language, ..opened });
+        (start.focus, opened)
+    }
+
+    fn restore_session(paths: Vec<crate::preferences::StartupPath>) -> Task<Message> {
         cosmic::task::future(async move {
             // Resolve in durable order, not background-task completion order.
             // An unavailable entry never prevents the remaining files opening.
             let opened = tokio::task::spawn_blocking(move || {
-                paths
-                    .into_iter()
-                    .map(|(path, focus)| (focus, Self::resolve_open(path)))
+                paths.into_iter().map(Self::resolve_startup)
                     .collect()
             })
             .await
@@ -1383,6 +1409,12 @@ impl Editor {
                 expanded_directories.insert(root, paths.into_iter().collect());
             }
         }
+        let mut languages: Vec<_> = self.tabs.iter().map(Self::tab_language).collect();
+        // A session that chose nothing records nothing, and compares equal to
+        // one saved before languages could be chosen.
+        while languages.last() == Some(&None) {
+            languages.pop();
+        }
         crate::preferences::Session {
             paths: self
                 .tabs
@@ -1398,6 +1430,20 @@ impl Editor {
             active: self.tabs.iter().position(|tab| Some(tab.id) == self.active),
             sidebar_open: self.sidebar_open,
             expanded_directories,
+            languages,
+        }
+    }
+
+    /// The language the reader chose for the file `tab` holds, which is the
+    /// file the session reopens it on. Files the tab showed before carry
+    /// nothing forward: only what is on screen can be seen to be chosen.
+    fn tab_language(tab: &Tab) -> Option<DocumentLanguage> {
+        match &tab.pending_file {
+            Some(pending) => tab.runtime.language_choice(&pending.path),
+            None => tab
+                .owned_file
+                .as_ref()
+                .and_then(|_| tab.runtime.shown_language_choice()),
         }
     }
 
@@ -1521,6 +1567,11 @@ impl Editor {
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
         );
+        // Only the file this tab opens: an untitled tab shares its root with
+        // every other note, and a note's choice must not reach its siblings.
+        if let (Some(file), Some(language)) = (&opened.file, opened.language) {
+            runtime.restore_language_choice(file, language);
+        }
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -1692,6 +1743,7 @@ impl Editor {
                 root: directory,
                 file: Some(file),
                 snapshot: None,
+                language: None,
             },
             true,
         )
@@ -1753,6 +1805,7 @@ impl Editor {
         let pending = PendingSaveAs {
             scratch: self.untitled_scratch_path(id),
             text: self.untitled_text(id),
+            language: self.tab(id).and_then(Self::tab_language),
         };
         self.pending_save_as.insert(id, pending);
         cosmic::task::future(async move {
@@ -1793,10 +1846,13 @@ impl Editor {
                 (Some(current), Some(chosen)) => paths_equal(&current, chosen),
                 (current, chosen) => current == *chosen,
             };
-        let text = if open {
-            self.untitled_text(id)
+        let (text, language) = if open {
+            (
+                self.untitled_text(id),
+                self.tab(id).and_then(Self::tab_language),
+            )
         } else {
-            pending.text
+            (pending.text, pending.language)
         };
         if let Err(error) = create_new_file(&path, &text) {
             self.notice = Some(error);
@@ -1808,8 +1864,10 @@ impl Editor {
         if self.exiting {
             return self.continue_exit();
         }
+        // The saved note reads as the reader chose, unless its new name now
+        // decides its language.
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
-        Self::open(path, self.selection_epoch)
+        Self::open_as(path, language, self.selection_epoch)
     }
 
     fn remove_tab(&mut self, id: CardId) {
@@ -3101,7 +3159,11 @@ impl Application for Editor {
         let mut startup_paths = saved_session.startup_paths(flags.paths);
         if startup_paths.is_empty() {
             match std::env::current_dir() {
-                Ok(path) => startup_paths.push((path, true)),
+                Ok(path) => startup_paths.push(crate::preferences::StartupPath {
+                    path,
+                    focus: true,
+                    language: None,
+                }),
                 Err(error) => {
                     let error = format!("Could not open the current directory: {error}");
                     notice = Some(match notice {
@@ -3113,7 +3175,7 @@ impl Application for Editor {
         }
         let protection_paths = startup_paths
             .iter()
-            .map(|(path, _)| path.clone())
+            .map(|start| start.path.clone())
             .collect::<Vec<_>>();
         if let Err(error) =
             cagents::worktree_cleanup::complete_standalone_editor_protection(&protection_paths)
@@ -3264,6 +3326,7 @@ impl Application for Editor {
                 | Message::Repository(RepositoryAction::FilesLoaded { .. })
                 | Message::NewTab
                 | Message::SavedAs(..)
+                | Message::Repository(RepositoryAction::ChooseLanguage { .. })
         );
         let task = (|| {
             if self
@@ -6375,6 +6438,7 @@ mod tests {
                 root: root.to_path_buf(),
                 file: file.map(PathBuf::from),
                 snapshot: Some(snapshot),
+                language: None,
             },
             true,
         );
@@ -8782,11 +8846,12 @@ mod tests {
             active: Some(2),
             sidebar_open: true,
             expanded_directories: Default::default(),
+            languages: Default::default(),
         };
         let opened = session
             .startup_paths(Vec::new())
             .into_iter()
-            .map(|(path, focus)| (focus, Editor::resolve_open(path)))
+            .map(Editor::resolve_startup)
             .collect();
         let mut app = editor();
         app.restoring_session = true;
@@ -8798,6 +8863,7 @@ mod tests {
                 active: Some(1),
                 sidebar_open: true,
                 expanded_directories: Default::default(),
+            languages: Default::default(),
             }
         );
     }
@@ -8832,7 +8898,7 @@ mod tests {
         let opened = saved
             .startup_paths(Vec::new())
             .into_iter()
-            .map(|(path, focus)| (focus, Editor::resolve_open(path)))
+            .map(Editor::resolve_startup)
             .collect();
         let mut restored = configured(&directory);
         restored.restoring_session = true;
@@ -8859,6 +8925,7 @@ mod tests {
                 root: "/workspace".into(),
                 file: Some(file.into()),
                 snapshot: None,
+                language: None,
             })
         };
         drop(app.update(Message::SessionOpened(
@@ -8876,6 +8943,7 @@ mod tests {
                 active: Some(0),
                 sidebar_open: true,
                 expanded_directories: Default::default(),
+            languages: Default::default(),
             }
         );
     }
@@ -8997,6 +9065,7 @@ mod tests {
                 root: root.into(),
                 file: file.map(PathBuf::from),
                 snapshot: None,
+                language: None,
             },
             true,
         ));
@@ -9401,6 +9470,7 @@ mod tests {
                     root: "/new".into(),
                     file: Some("b.rs".into()),
                     snapshot: None,
+                    language: None,
                 },
                 true,
             ));
@@ -9453,6 +9523,7 @@ mod tests {
                 root: "/late".into(),
                 file: Some("arrival.rs".into()),
                 snapshot: None,
+                language: None,
             }),
         )));
         assert_eq!(app.active, Some(id));
@@ -9885,6 +9956,108 @@ mod tests {
         assert_eq!(session.paths, vec![scratch]);
     }
 
+    fn choose_language(app: &mut Editor, id: CardId, language: Option<DocumentLanguage>) {
+        drop(app.update(Message::Repository(RepositoryAction::ChooseLanguage {
+            card: id,
+            language,
+        })));
+    }
+
+    fn shown_language(app: &Editor, id: CardId) -> Option<DocumentLanguage> {
+        Editor::tab_language(app.tab(id).unwrap())
+    }
+
+    #[test]
+    fn an_untitled_note_keeps_its_chosen_language_across_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let scratch = app.untitled_scratch_path(id).unwrap();
+        load_selected(&mut app, id);
+        choose_language(&mut app, id, Some(DocumentLanguage::PlainText));
+        let session = app.session();
+        assert_eq!(session.paths, vec![scratch]);
+        assert_eq!(session.languages, vec![Some(DocumentLanguage::PlainText)]);
+
+        // The next session reopens the note with the choice, and a new note
+        // beside it starts without one.
+        let opened = session
+            .startup_paths(Vec::new())
+            .into_iter()
+            .map(Editor::resolve_startup)
+            .collect();
+        let mut restored = configured(&directory);
+        restored.restoring_session = true;
+        drop(restored.update(Message::SessionOpened(0, opened)));
+        let note = restored.active.unwrap();
+        assert_eq!(
+            shown_language(&restored, note),
+            Some(DocumentLanguage::PlainText)
+        );
+        assert_eq!(restored.session(), session);
+        drop(restored.update(Message::NewTab));
+        assert_eq!(shown_language(&restored, restored.active.unwrap()), None);
+
+        // Handing the note back to its content forgets the choice.
+        choose_language(&mut app, id, None);
+        assert!(app.session().languages.is_empty());
+    }
+
+    #[test]
+    fn a_tab_keeps_only_the_language_of_the_note_it_shows() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let first = app.untitled_scratch_path(id).unwrap();
+        load_selected(&mut app, id);
+        choose_language(&mut app, id, Some(DocumentLanguage::Markdown));
+
+        let second = first.with_file_name("Untitled-2");
+        std::fs::write(&second, "second note\n").unwrap();
+        let request = app.tab(id).unwrap().next_open;
+        drop(app.request_file(id, "Untitled-2".into()));
+        drop(app.update(Message::FileResolved(id, request, Ok(second.clone()))));
+        load_selected(&mut app, id);
+        // The note the tab left is not what the session reopens it on, so
+        // its choice does not come back after a restart.
+        assert_eq!(app.session().paths, vec![second]);
+        assert!(app.session().languages.is_empty());
+
+        // Back on the first note, the tab still holds what was chosen there.
+        let request = app.tab(id).unwrap().next_open;
+        drop(app.request_file(id, "Untitled".into()));
+        drop(app.update(Message::FileResolved(id, request, Ok(first))));
+        load_selected(&mut app, id);
+        assert_eq!(
+            app.session().languages,
+            vec![Some(DocumentLanguage::Markdown)]
+        );
+    }
+
+    #[test]
+    fn save_as_keeps_a_chosen_language_its_new_name_does_not_decide() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        load_selected(&mut app, id);
+        // Markdown by its content, but the reader said plain text.
+        paste(&mut app, id, "## Plan\n\n- **ship** it\n");
+        choose_language(&mut app, id, Some(DocumentLanguage::PlainText));
+        drop(app.save_as(id));
+        let destination = directory.path().join("notes");
+        let task = app.finish_save_as(id, Ok(Some(destination)));
+        run_tasks(&mut app, task);
+        let saved = app.active.unwrap();
+        assert_eq!(app.tab(saved).unwrap().title, "notes");
+        assert_eq!(
+            shown_language(&app, saved),
+            Some(DocumentLanguage::PlainText)
+        );
+    }
+
     #[test]
     fn save_as_writes_after_the_untitled_tab_is_closed() {
         let directory = tempfile::tempdir().unwrap();
@@ -9986,6 +10159,7 @@ mod tests {
                 root: root.to_path_buf(),
                 file: file.map(PathBuf::from),
                 snapshot: Some(changes_snapshot(entries)),
+                language: None,
             },
             true,
         ));
