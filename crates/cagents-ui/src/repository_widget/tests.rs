@@ -8749,6 +8749,26 @@ fn headless_renderer() -> cosmic::Renderer {
 }
 
 #[test]
+fn markdown_and_plain_text_buffers_wrap_as_prose() {
+    for (path, markdown, prose) in [
+        ("notes.md", true, true),
+        ("README", true, true),
+        ("notes.txt", false, true),
+        ("NOTES.TEXT", false, true),
+        ("src/main.rs", false, false),
+        ("Makefile", false, false),
+    ] {
+        let document = EditorDocument::unlinked(
+            PathBuf::from(path),
+            String::new(),
+            blake3::hash(b""),
+            markdown,
+        );
+        assert_eq!(document.is_prose(), prose, "{path}");
+    }
+}
+
+#[test]
 fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
     let card = CardId::new();
     let text = format!("{}\nsecond line", "x".repeat(256));
@@ -8769,7 +8789,10 @@ fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
     // Toggling back exercises reflow of an already mounted editor.
     for (wrap, expected_line) in [(false, 1), (true, 0), (false, 1)] {
         let cursor = runtime.cursor_position();
-        runtime.set_wrap_lines(wrap);
+        runtime.set_wrap(crate::settings::EditorWrap {
+            lines: wrap,
+            prose: false,
+        });
         assert_eq!(runtime.cursor_position(), cursor);
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
@@ -9037,7 +9060,7 @@ fn the_editable_buffer_is_highlighted_by_the_grammar_its_name_names() {
 /// Both inputs the highlighter takes, checked where they are decided.
 #[test]
 fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
-    use cosmic::iced::advanced::text::Highlighter as _;
+    use cosmic::iced::{advanced::text::Highlighter as _, highlighter};
 
     /// Whether a token resolves to a grammar that actually colours
     /// `line`, rather than to the plain-text fallback that colours nothing.
@@ -9048,7 +9071,7 @@ fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
         };
         highlighter::Highlighter::new(&settings)
             .highlight_line(line)
-            .any(|(_, highlight)| highlight.color().is_some())
+            .any(|(_, highlight): (_, highlighter::Highlight)| highlight.color().is_some())
     }
 
     for (path, line) in [

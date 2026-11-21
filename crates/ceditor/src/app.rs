@@ -210,6 +210,7 @@ pub enum Message {
     },
     AutoSave(bool),
     WrapLines(bool),
+    WrapProse(bool),
     LineHeightChanged(String),
     SyntaxTheme(cagents::settings::EditorSyntaxTheme),
     LanguageServerAssistance(bool),
@@ -1514,7 +1515,7 @@ impl Editor {
         };
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
-        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_wrap(self.settings.editor_wrap());
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         runtime.set_find_preferences(
@@ -2236,6 +2237,15 @@ impl Editor {
             reaped.await;
             Message::Reaped
         })
+    }
+
+    /// Rewraps every open tab for the wrap settings, and saves them.
+    fn apply_wrap(&mut self) -> Task<Message> {
+        let wrap = self.settings.editor_wrap();
+        for tab in &mut self.tabs {
+            tab.runtime.set_wrap(wrap);
+        }
+        self.save_settings(false)
     }
 
     fn save_settings(&mut self, reset: bool) -> Task<Message> {
@@ -4331,7 +4341,7 @@ impl Application for Editor {
                     self.shortcut_draft = self.shortcuts.clone();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
-                        tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                        tab.runtime.set_wrap(self.settings.editor_wrap());
                         tab.runtime
                             .set_line_height(self.settings.terminal_line_height);
                         tab.runtime
@@ -4497,10 +4507,11 @@ impl Application for Editor {
                 }
                 Message::WrapLines(enabled) => {
                     self.settings.editor_wrap_lines = enabled;
-                    for tab in &mut self.tabs {
-                        tab.runtime.set_wrap_lines(enabled);
-                    }
-                    self.save_settings(false)
+                    self.apply_wrap()
+                }
+                Message::WrapProse(enabled) => {
+                    self.settings.editor_wrap_prose = enabled;
+                    self.apply_wrap()
                 }
                 Message::LineHeightChanged(value) => {
                     self.line_height_draft = value.clone();
@@ -5350,10 +5361,11 @@ impl Editor {
                 SettingsCategory::Editing => {
                     let mut controls = cagents_ui::settings_widgets::editor_options(
                         self.settings.editor_auto_save,
-                        self.settings.editor_wrap_lines,
+                        self.settings.editor_wrap(),
                         self.settings.editor_syntax_theme,
                         Message::AutoSave,
                         Message::WrapLines,
+                        Message::WrapProse,
                         Message::SyntaxTheme,
                     );
                     controls.push(settings_field(

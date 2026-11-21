@@ -666,7 +666,10 @@ fn settings_category_controls<'a>(
             settings_group("Editor", "Shared native editor and diff preferences.", {
                 let mut options = crate::settings_widgets::editor_options(
                     draft.editor_auto_save,
-                    draft.editor_wrap_lines,
+                    crate::settings::EditorWrap {
+                        lines: draft.editor_wrap_lines,
+                        prose: draft.editor_wrap_prose,
+                    },
                     draft.editor_syntax_theme,
                     |enabled| Message::SettingsChanged {
                         field: SettingsField::EditorAutoSave,
@@ -674,6 +677,10 @@ fn settings_category_controls<'a>(
                     },
                     |enabled| Message::SettingsChanged {
                         field: SettingsField::EditorWrapLines,
+                        value: enabled.to_string(),
+                    },
+                    |enabled| Message::SettingsChanged {
+                        field: SettingsField::EditorWrapProse,
                         value: enabled.to_string(),
                     },
                     |theme| Message::SettingsChanged {

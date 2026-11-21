@@ -3458,6 +3458,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    EditorWrapProse,
     DiffHideUnchanged,
     ChatEnterSends,
     ChatExpandToolGroups,
@@ -3596,6 +3597,7 @@ impl SettingsField {
             Self::LinkOpenDestination => "Open links in",
             Self::EditorAutoSave => "Auto-save",
             Self::EditorWrapLines => "Word wrap",
+            Self::EditorWrapProse => "Wrap Markdown and text",
             Self::DiffHideUnchanged => "Hide unchanged diff lines",
             Self::EditorFontFamily => "Editor font family",
             Self::EditorFontSize => "Editor font size",
@@ -3706,6 +3708,7 @@ impl SettingsField {
             | Self::ShowMentionedPullRequests => SettingsCategory::Inspector,
             Self::EditorAutoSave
             | Self::EditorWrapLines
+            | Self::EditorWrapProse
             | Self::EditorSyntaxTheme
             | Self::EditorFontFamily
             | Self::EditorFontSize
@@ -3890,6 +3893,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
+    editor_wrap_prose: bool,
     diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     /// Whether each routine question is asked, as `AppSettings::asks` reads it.
@@ -3959,6 +3963,7 @@ impl SettingsDraft {
             default_channel_pane: settings.default_channel_pane,
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
+            editor_wrap_prose: settings.editor_wrap_prose,
             diff_hide_unchanged: settings.diff_hide_unchanged,
             confirmations: settings::Confirmation::ALL
                 .into_iter()
@@ -4033,6 +4038,7 @@ impl SettingsDraft {
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
+            SettingsField::EditorWrapProse => self.editor_wrap_prose = value == "true",
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::Confirm(kind) => {
                 self.confirmations.insert(kind, value == "true");
@@ -4385,6 +4391,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
             .map_err(|_| "Choose whether long editor lines wrap.".to_owned()),
+        SettingsField::EditorWrapProse => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_wrap_prose = enabled)
+            .map_err(|_| "Choose whether Markdown and text files wrap.".to_owned()),
         SettingsField::EditorFontFamily => {
             next.editor_font_family = (!value.trim().is_empty()).then(|| value.trim().to_owned());
             Ok(())
@@ -7388,7 +7398,7 @@ impl Cagents {
             crate::terminal::monospace_font(self.settings.editor_font_family()),
             self.settings.editor_font_size(),
         );
-        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_wrap(self.settings.editor_wrap());
         runtime.set_find_preferences(
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
@@ -8128,7 +8138,7 @@ impl Cagents {
             crate::terminal::monospace_font(self.settings.editor_font_family()),
             self.settings.editor_font_size(),
         );
-        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_wrap(self.settings.editor_wrap());
         runtime.set_find_preferences(
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
@@ -15791,12 +15801,11 @@ impl Cagents {
         } else if previous.terminal_theme != self.settings.terminal_theme {
             self.synchronize_terminal_theme();
         }
-        let (wrap_lines, syntax_theme) = (
-            self.settings.editor_wrap_lines,
+        let (wrap, syntax_theme) = (
+            self.settings.editor_wrap(),
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
-        {
+        if previous.editor_wrap() != wrap || previous.editor_syntax_theme != syntax_theme {
             for (&card, runtime) in self.cards.iter_mut() {
                 let runtime = match runtime {
                     CardRuntime::Repository(runtime) => runtime,
@@ -15807,7 +15816,7 @@ impl Cagents {
                     }
                     _ => continue,
                 };
-                runtime.set_wrap_lines(wrap_lines);
+                runtime.set_wrap(wrap);
                 runtime.set_syntax_theme(syntax_theme);
                 // A comparison recoloured in the new palette is requested
                 // again rather than left empty until the next refresh.

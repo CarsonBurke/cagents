@@ -316,10 +316,11 @@ pub fn toggle_enabled<'a, Message: Clone + 'static>(
 
 pub fn editor_options<'a, Message: Clone + 'static>(
     auto_save: bool,
-    wrap: bool,
+    wrap: crate::settings::EditorWrap,
     syntax: EditorSyntaxTheme,
     on_save: impl Fn(bool) -> Message + 'a,
     on_wrap: impl Fn(bool) -> Message + 'a,
+    on_wrap_prose: impl Fn(bool) -> Message + 'a,
     on_syntax: impl Fn(EditorSyntaxTheme) -> Message + Send + Sync + 'static,
 ) -> Vec<Setting<'a, Message>> {
     vec![
@@ -333,10 +334,17 @@ pub fn editor_options<'a, Message: Clone + 'static>(
         toggle(
             "Wrap long lines",
             "Wrap long editor lines to the available width.",
-            wrap,
+            wrap.lines,
             on_wrap,
         )
         .keywords("Word wrap word_wrap"),
+        toggle(
+            "Wrap Markdown and text",
+            "Wrap Markdown and plain-text files even when other files keep long lines.",
+            wrap.prose,
+            on_wrap_prose,
+        )
+        .keywords("Word wrap word_wrap prose markdown"),
         field(
             "Syntax theme",
             "Syntax highlighting in editors and diffs. Match app follows the application appearance theme.",
@@ -435,8 +443,9 @@ mod tests {
     fn combined_editor_switches_keep_familiar_search_terms() {
         let settings = editor_options(
             false,
-            false,
+            crate::settings::EditorWrap::default(),
             EditorSyntaxTheme::default(),
+            |_| (),
             |_| (),
             |_| (),
             |_| (),
@@ -444,6 +453,7 @@ mod tests {
         for (index, queries) in [
             (0, ["auto-save", "auto_save", "Save files automatically"]),
             (1, ["word wrap", "word_wrap", "Wrap long lines"]),
+            (2, ["word wrap", "markdown", "Wrap Markdown and text"]),
         ] {
             for query in queries {
                 assert!(settings[index].matches("Editor", query), "{query}");
@@ -568,8 +578,9 @@ mod tests {
     fn search_combines_category_and_setting_terms() {
         let controls = editor_options(
             false,
-            false,
+            crate::settings::EditorWrap::default(),
             EditorSyntaxTheme::default(),
+            |_| (),
             |_| (),
             |_| (),
             |_| (),
@@ -581,8 +592,9 @@ mod tests {
         );
         let controls = editor_options(
             false,
-            false,
+            crate::settings::EditorWrap::default(),
             EditorSyntaxTheme::default(),
+            |_| (),
             |_| (),
             |_| (),
             |_| (),
