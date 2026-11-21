@@ -1325,6 +1325,7 @@ impl State {
                     if self.refreshing || self.load == LoadState::Loading {
                         self.viewed_after_load.insert(path.clone());
                     }
+                    self.pages.revalidate.remove(&path);
                     let file = &mut self.files[index];
                     match outcome {
                         ViewedOutcome::Applied => {
@@ -1848,9 +1849,12 @@ impl State {
                 ..Default::default()
             };
         } else {
-            // The cursor and completed pages still describe this exact revision.
-            // A refresh must not restart pagination merely to recover old marks.
+            // The cursor and completed pages still describe this exact
+            // revision. Later marks keep showing until demanded, then only
+            // their own page is reread.
             self.pages.loading = false;
+            self.pages.revalidate.clear();
+            self.pages.error = None;
         }
         self.files = join_files(&loaded.entries, &loaded.files);
         if loaded.next_file_cursor.is_some() {
@@ -1884,6 +1888,17 @@ impl State {
                     // pagination, including pages completed before the write.
                     verify_later_marks = true;
                 } else {
+                    // Settled later marks came from a page read, which
+                    // recorded the page to reread now that they may be stale.
+                    if file.sync == ViewedSync::Unknown
+                        && *sync == ViewedSync::Settled
+                        && !self.viewed_after_load.contains(&file.entry.path)
+                        && let Some(origin) = self.pages.origin.get(&file.entry.path)
+                    {
+                        self.pages
+                            .revalidate
+                            .insert(file.entry.path.clone(), origin.clone());
+                    }
                     file.sync = *sync;
                 }
             }
@@ -2094,6 +2109,7 @@ impl State {
             }
             file.viewed = viewed;
             file.sync = ViewedSync::Pending;
+            self.pages.revalidate.remove(&file.entry.path);
             paths.push(file.entry.path.clone());
         }
         if paths.is_empty() {
@@ -2498,7 +2514,8 @@ impl State {
         if let Some(error) = &self.pages.error {
             status.push(design::caption(error).into());
         }
-        if self.pages.cursor.is_some() {
+        // A failed reread can follow completed pagination.
+        if self.pages.cursor.is_some() || self.pages.error.is_some() {
             status.push(
                 crate::ui_controls::button::quiet("Load more viewed states")
                     .instead("Loading viewed states…", self.pages.loading)
