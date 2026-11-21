@@ -33,19 +33,30 @@ const _: () = assert!(SPINNER_FRAME.as_millis() >= 50);
 /// An unfocused window is often still in view, on a second monitor or tiled
 /// beside a terminal, and a spinner that stopped there would read as a hung
 /// agent. It keeps moving at a fraction of the focused frame rate instead,
-/// and turns slower by the same factor, [`BACKGROUND_SLOWDOWN`], so each step
-/// is still one focused step rather than a jump of nearly half a turn.
+/// and turns slower, by [`BACKGROUND_SLOWDOWN`], so each frame advances the
+/// arc by [`SPINNER_BACKGROUND_STEP`] rather than a jump of nearly half a
+/// turn.
 const SPINNER_BACKGROUND_FRAME: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How far, in focused time, an unfocused spinner's arc moves each frame:
+/// thirty degrees, two focused steps. A smaller step would make the arc's
+/// edge on a 12 px indicator move barely a pixel and a half per frame, which
+/// reads as stalled.
+const SPINNER_BACKGROUND_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How many times slower an unfocused spinner turns.
 const BACKGROUND_SLOWDOWN: u32 =
-    (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_FRAME.as_millis()) as u32;
+    (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_BACKGROUND_STEP.as_millis()) as u32;
 
-// A whole multiple keeps each background step exactly one focused step.
+// Whole multiples keep each background step a whole number of focused steps,
+// so the arc lands on angles a focused spinner draws too.
 const _: () = assert!(
     SPINNER_BACKGROUND_FRAME
         .as_millis()
-        .is_multiple_of(SPINNER_FRAME.as_millis())
+        .is_multiple_of(SPINNER_BACKGROUND_STEP.as_millis())
+        && SPINNER_BACKGROUND_STEP
+            .as_millis()
+            .is_multiple_of(SPINNER_FRAME.as_millis())
         && BACKGROUND_SLOWDOWN > 1
 );
 
@@ -68,7 +79,7 @@ std::thread_local! {
 /// The application calls this for its main window's focus changes; spinners
 /// are drawn only there. While unfocused, spinners turn slowly and ask for a
 /// frame every [`SPINNER_BACKGROUND_FRAME`]. A background window with agents
-/// working still repaints, but [`BACKGROUND_SLOWDOWN`] times less often. A
+/// working still repaints, but ten times less often than a focused one. A
 /// window that is minimized, on another workspace or behind a lock screen has
 /// lost focus too, and the compositor's frame callbacks may throttle it
 /// further. Regaining focus restores the full cadence on the redraw that
@@ -720,8 +731,8 @@ mod tests {
             );
             assert_eq!(
                 stepped - slow,
-                SPINNER_FRAME,
-                "one background frame should advance the arc by one focused step"
+                SPINNER_BACKGROUND_STEP,
+                "one background frame should advance the arc by one background step"
             );
         }
 
