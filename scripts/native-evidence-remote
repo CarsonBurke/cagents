@@ -348,10 +348,11 @@ tree_of() {
     git -C "$1" rev-parse "$(snapshot "$1")^{tree}"
 }
 
-# What the host's native-evidence, a copy of the tool's, builds: one build's
-# arguments per line, its executable last.
+# What the host's native-evidence, a copy of the tool's, builds from
+# CHECKOUT: one build's arguments per line, its executable last. They depend
+# on the checkout's layout, so they are asked for from within it.
 build_arguments() {
-    "$tool_source/scripts/native-evidence" __build-arguments
+    (cd -- "$1" && "$tool_source/scripts/native-evidence" __build-arguments)
 }
 
 # Builds what native-evidence runs from CHECKOUT's own gate, into its own
@@ -360,7 +361,7 @@ build_arguments() {
 # build must be of TREE, what the host is given.
 build_in_checkout() {
     local checkout=$1 tree=$2 metadata directory
-    evidence_arguments=$(build_arguments) && [ -n "$evidence_arguments" ] ||
+    evidence_arguments=$(build_arguments "$checkout") && [ -n "$evidence_arguments" ] ||
         die "could not ask $tool_source what native-evidence builds"
     [ "$(tree_of "$checkout")" = "$tree" ] || die "$checkout changed while it was copied; build it again"
     # One slot for the three, as scripts/run-development holds it. This

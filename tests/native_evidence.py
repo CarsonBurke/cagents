@@ -2488,6 +2488,8 @@ GATE_STUB = """
 REMOTE_TOOL = """
     #!/bin/bash
     if [ "$1" = __build-arguments ]; then
+        # The real one reads the layout of the checkout it is run in.
+        pwd -P > "$STUB_LOG/build-arguments-from"
         printf -- '--profile dev-runtime --bin %s\\n' cagents cagentsd cagents-ui
         exit 0
     fi
@@ -2892,7 +2894,10 @@ class RemoteEvidence(unittest.TestCase):
     def test_a_checkout_builds_through_its_own_gate_and_sends_what_it_built(self) -> None:
         checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         (checkout / "src.rs").write_text("fn main() { edited(); }\n")
-        self.run_tool("build", "after", str(checkout))
+        # From anywhere: what to build depends on the checkout's layout.
+        self.run_tool("build", "after", str(checkout), cwd=self.root)
+        self.assertEqual((self.logs / "build-arguments-from").read_text().strip(),
+                         str(checkout.resolve()))
         gate = [line.split("\t") for line in (self.logs / "gate").read_text().splitlines()]
         self.assertEqual({directory for directory, _ in gate}, {str(checkout)})
         # In one slot, held for the three, as the tool says to build them.
