@@ -581,13 +581,18 @@ fn a_refused_pane_moved_to_another_channel_loses_the_refusal() {
         window.app.chat_composer_text(window.card).as_deref(),
         Some("first message")
     );
-    // No Retry is left to offer the channel the pane left.
-    drop(
-        window
-            .app
-            .handle_chat_ui(Action::RetryRefusedView(window.target)),
-    );
+    // No Retry is left: pressing it does nothing, neither offering the
+    // channel the pane left nor sending the message.
+    let retry = window
+        .app
+        .handle_chat_ui(Action::RetryRefusedView(window.target));
+    assert_eq!(retry.units(), 0);
     assert!(!window.app.shared_views.seeding.contains(&window.scope));
+    assert!(!window.app.first_send_held(window.card));
+    assert_eq!(
+        window.app.chat_composer_text(window.card).as_deref(),
+        Some("first message")
+    );
 }
 
 #[test]
