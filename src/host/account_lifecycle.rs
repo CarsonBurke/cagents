@@ -1126,7 +1126,24 @@ pub(super) fn restore_pass(
         }
     };
     for (provider, key, _) in homes.unregistered(&registry) {
-        if registry.is_released(key) || sweep.defers((provider, key)) {
+        if sweep.defers((provider, key)) {
+            continue;
+        }
+        if registry.is_released(key) {
+            // Released before releases were marked beside their homes, or its
+            // marker could not be written then. The list never forgets a
+            // release whose home is kept, so record it where it survives the
+            // list's loss. A home whose marker cannot be written is retried
+            // by the next daemon.
+            if let Err(error) = homes.mark_released(provider, key) {
+                sweep.examined.insert((provider, key));
+                tracing::warn!(
+                    provider = provider.executable(),
+                    %key,
+                    %error,
+                    "could not mark a released sign-in's home"
+                );
+            }
             continue;
         }
         let operation = crate::account::remote::Operation::Restore { provider, key };
