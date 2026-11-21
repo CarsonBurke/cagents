@@ -251,6 +251,36 @@ impl HostState {
     }
 }
 
+pub(super) fn accept_pulled_capture(
+    state: &mut HostState,
+    client: ClientId,
+    id: TerminalId,
+    handle: &TerminalHandle,
+    epoch: u64,
+    source: u64,
+) -> Result<Option<u64>, ProtocolError> {
+    if !state.subscriptions.attached(client, id) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PermissionDenied,
+            "client detached during capture",
+            false,
+        ));
+    }
+    if !state
+        .terminals
+        .get(&id)
+        .is_some_and(|record| record.handle.same_worker(handle))
+    {
+        return Ok(None);
+    }
+    let revision = state.presentation_observed(client, id, source);
+    let view = &state.subscriptions.viewports[&(client, id)];
+    if view.epoch != epoch || view.source_generation > source {
+        return Ok(None);
+    }
+    Ok(Some(revision))
+}
+
 /// Worker queries wait outside the host mutex: a worker's publication callback
 /// may itself acquire that mutex. This also keeps unrelated sessions responsive.
 pub(in crate::host) fn snapshot(
@@ -285,19 +315,11 @@ pub(in crate::host) fn snapshot(
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.subscriptions.attached(client, id) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                "client detached during capture",
-                false,
-            ));
-        }
         let source = capture.generation;
-        let revision = state.presentation_observed(client, id, source);
-        let view = &state.subscriptions.viewports[&(client, id)];
-        if view.epoch != epoch || view.source_generation > source {
+        let Some(revision) = accept_pulled_capture(&mut state, client, id, &handle, epoch, source)?
+        else {
             continue;
-        }
+        };
         let mut capture = (*capture).clone();
         capture.generation = revision;
         let (capture, wire) = match state.subscriptions.last_sent(client, id) {
