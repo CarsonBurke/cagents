@@ -693,6 +693,13 @@ Refresh account usage after switching plans. The fake auth status and
 matching the installed client; the extra information comes from the fake
 profile and cached-metadata marker.
 
+For Claude login-change evidence, `usage-reset-scene.sh login EMAIL` accepts
+only an address at a reserved example domain, such as `other@example.com` or
+the seed's `fixture@example.test`, and changes
+only the fake profile and auth-status email, plus the marker's email when
+present. Organization UUID, plan, usage windows, reset counts and prior claims
+stay unchanged; it never submits a consume. Refresh account usage afterwards.
+
 Pro reports `Pro`. Max cases report the label `Max` with the known cached tier
 IDs `default_claude_max_5x` and `default_claude_max_20x`. Ultra reports `Ultra`
 while its legacy subscription remains `max`; its profile uses the confirmed

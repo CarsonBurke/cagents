@@ -456,9 +456,50 @@ def configure_plan(root, name):
             write_json(marker_path, plan_marker(state, marker))
 
 
+def configure_login(root, email):
+    # Only reserved example domains (RFC 2606), so a capture never shows a real account.
+    local, at, domain = email.partition("@") if isinstance(email, str) else ("", "", "")
+    reserved = domain in ("example.com", "example.net", "example.org") or domain.endswith(
+        (".test", ".example", ".invalid"))
+    if not local or not at or not reserved or any(c.isspace() or c == "@" for c in local + domain):
+        raise ValueError("fixture login requires an address at a reserved example domain, "
+                         "such as other@example.com or fixture@example.test")
+    root = private_directory(root)
+    root_marker = root / ".cagents-reset-fixture"
+    if not root_marker.is_file() or root_marker.is_symlink():
+        raise ValueError("login switch requires the private fixture marker")
+    home = private_directory(root / "home/.claude")
+    marker_path = home / "fixture-reset-api.json"
+    marker = None
+    if marker_path.exists() or marker_path.is_symlink():
+        descriptor = os.open(marker_path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor) as stream:
+            marker = json.load(stream)
+        if not isinstance(marker, dict) or marker.get("fixture") is not True:
+            raise ValueError("login switch refuses an invalid fake service marker")
+    with state_file(home) as state:
+        auth_path = home / "fixture-auth-status.json"
+        if auth_path.exists() or auth_path.is_symlink():
+            descriptor = os.open(auth_path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(descriptor) as stream:
+                auth = json.load(stream)
+            if not isinstance(auth, dict):
+                raise ValueError("login switch refuses an invalid fake auth status")
+        else:
+            # Match chat-composer-claude.sh's existing auth-status fallback.
+            auth = {"loggedIn": True, "subscriptionType": "pro"}
+        profile = state.setdefault("profile", profile_seed())
+        profile["account"]["email"] = email
+        auth["email"] = email
+        write_json(auth_path, auth)
+        if marker is not None and "email" in marker:
+            marker["email"] = email
+            write_json(marker_path, marker)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("seed", "serve", "mode", "plan", "next-grant"))
+    parser.add_argument("command", choices=("seed", "serve", "mode", "plan", "login", "next-grant"))
     parser.add_argument("root", type=Path)
     parser.add_argument("provider", nargs="?")
     parser.add_argument("mode", nargs="?")
@@ -469,6 +510,8 @@ def main():
         configure(args.root, args.provider, args.mode)
     elif args.command == "plan":
         configure_plan(args.root, args.provider)
+    elif args.command == "login":
+        configure_login(args.root, args.provider)
     elif args.command == "next-grant":
         configure_next_grant(args.root, args.provider)
     else:
