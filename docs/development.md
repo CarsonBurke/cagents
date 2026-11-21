@@ -2331,16 +2331,29 @@ word. So wait for and click one distinctive word of it, such as
 observe` gives. When a wait might fail, save `drive observe` and a `shot`
 before the step exits, so the failed run shows what was on screen.
 
-To capture a theme, set `app_theme` in the fixture's settings.toml,
-`$CAGENTS_EVIDENCE_FIXTURE/config/cagents-development/settings.toml`
-(`cagents-development-NAME` under `--instance NAME`), with `evidence env`. The
-app reads it only at startup, so close the app window, edit the file, and run
-`relaunch` in the background. The daemon and its terminals keep running. The
-fixture's System theme draws light. In a session started with `--portal gtk`,
+To capture a theme, set `app_theme` in the fixture's settings.toml and
+relaunch the app, which reads it only at startup. The daemon and its terminals
+keep running across `relaunch`. Close the window first, since `relaunch`
+refuses while it is open, and wait for the new window before the next shot:
+
+```sh
+evidence drive click X,Y   # the window's close button, at its top right
+sleep 2
+evidence env sed -i '/^app_theme *=/d; 1i app_theme = "dark"' \
+    '{fixture}/config/cagents-development/settings.toml'
+evidence relaunch &
+evidence drive wait Projects
+evidence shot sidebar-dark
+```
+
+Under `start --instance NAME` the directory is `cagents-development-NAME`.
+`app_theme` takes the values listed in [Configuration](configuration.md);
+`system`, the fixture's default, draws light. Set it back the same way if a
+later step expects the System theme. In a session started with `--portal gtk`,
 `evidence nested gsettings set org.gnome.desktop.interface color-scheme
-prefer-dark`, run while the app is open, also turns System dark, but only from
-the app's next start: the running app does not follow it. Set `app_theme` back afterwards if a later step
-expects the System theme.
+prefer-dark` changed what the portal reports, and the app drew System dark
+after `relaunch`, but the running app stayed light when this was tested, so
+prefer `app_theme`.
 
 The individual commands work too, for a session you drive step by step:
 
