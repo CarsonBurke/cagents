@@ -117,8 +117,9 @@ struct Omp {
     session_id: Option<String>,
     state_request: Option<String>,
     history_request: Option<String>,
-    /// The latest assistant error across history pages. A live turn invalidates
-    /// the outer option so a late page cannot restore an older turn's error.
+    /// The failure that ended the latest exchange across history pages. A live
+    /// turn invalidates the outer option so a late page cannot restore an older
+    /// turn's error.
     history_error: Option<Option<String>>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
@@ -1364,7 +1365,9 @@ impl Adapter for Omp {
                     "get_available_commands" => step.events.extend(commands(data)),
                     "get_messages_page" => {
                         for message in data["messages"].as_array().into_iter().flatten() {
-                            if text(message, "role") == "assistant"
+                            // A later prompt starts a new exchange, so an
+                            // earlier failure no longer explains the last one.
+                            if matches!(text(message, "role"), "assistant" | "user")
                                 && let Some(error) = &mut self.history_error
                             {
                                 *error = assistant_error(message);
@@ -3351,10 +3354,7 @@ mod tests {
     #[test]
     fn history_restores_only_the_latest_assistant_error_after_all_pages() {
         for (later, expected) in [
-            (
-                json!({"role":"user","content":"retry"}),
-                Some("API quota exhausted"),
-            ),
+            (json!({"role":"user","content":"retry"}), None),
             (
                 json!({"role":"assistant","content":[],"stopReason":"stop"}),
                 None,
