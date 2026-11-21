@@ -1313,6 +1313,9 @@ impl Drop for Listener {
 
 impl Drop for Residence {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         // No completion receipt or discovery retirement until every owned
         // descendant is reaped. A stuck child leaves this small owner alive.
         while !self
@@ -1324,8 +1327,9 @@ impl Drop for Residence {
         }
         // Only that wait is unbounded. Once the provider is gone, a release
         // that cannot be recorded (its runtime directory removed, say) would
-        // otherwise retry forever. Without the receipt, a daemon still settles the close from
-        // the ended holder and provider, as for a holder that was killed.
+        // otherwise retry forever. Without the receipt, a daemon still
+        // settles the close from the ended holder and provider, as for a
+        // holder that was killed.
         let deadline = Instant::now() + TIMEOUT;
         while let Err(error) = self.release() {
             if Instant::now() >= deadline {
