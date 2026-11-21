@@ -1193,3 +1193,22 @@ fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_i
     let record = host.lock().unwrap().chats.remove(&id).unwrap();
     let _ = record.handle.close();
 }
+
+#[test]
+fn invalid_branch_identity_is_displayed_with_escapes_without_a_forge_query() {
+    let identity = ":6c65676163792dff";
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    Arc::make_mut(project.local.as_mut().unwrap()).worktrees[0].branch = Some(identity.into());
+    let mut watched = Watched::new();
+    watched.edited_in(PathBuf::from("/w/app/src"), false);
+    assert!(matches!(
+        resolve(&branch(None, identity), &facts, &BTreeMap::new()),
+        Resolved::Nothing
+    ));
+    let project = facts.project.as_ref().unwrap();
+    let worktrees = edited_worktrees(&watched, project, |_| None);
+    assert_eq!(worktrees.len(), 1);
+    assert_eq!(worktrees[0].branch.as_deref(), Some(r"legacy-\xFF"));
+    assert!(worktrees[0].pull_request.is_none());
+}

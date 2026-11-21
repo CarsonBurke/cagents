@@ -4,6 +4,8 @@
 //! `node_modules` are never read.
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -14,7 +16,7 @@ use crate::{
     linear::context::LinkedIssue,
     model::{ProjectId, WorktreeId},
     repository::{CancellationToken, Divergence, HeadState, RepositoryService, StatusSnapshot},
-    work::{Comparison, Dirty, Head},
+    work::{Comparison, Dirty, Head, branch_identity, branch_name},
 };
 
 /// Dirty paths whose modification time is read per scan. A worktree with more
@@ -70,8 +72,8 @@ pub(super) struct Local {
     pub root: Option<PathBuf>,
     pub base: Option<Base>,
     pub worktrees: Vec<Worktree>,
-    /// Every branch checked out in a worktree or named by the user's pull
-    /// requests: the only branches that can earn a card.
+    /// Branches checked out in worktrees or named by the user's pull requests:
+    /// the branches that can earn a card.
     pub branches: BTreeMap<String, Branch>,
     /// Every local branch name, for telling remote-only pull requests apart.
     pub branch_names: BTreeSet<String>,
@@ -138,7 +140,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         .map_err(text)?;
     let base = base_ref.as_ref().and_then(|refname| {
         tips.iter()
-            .find(|tip| &tip.refname == refname)
+            .find(|tip| tip.refname.as_os_str() == OsStr::new(refname))
             .map(|tip| Base {
                 refname: refname.clone(),
                 oid: tip.oid.clone(),
@@ -146,7 +148,13 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
     });
     let local_tips = tips
         .iter()
-        .filter_map(|tip| Some((tip.refname.strip_prefix("refs/heads/")?, tip)))
+        .filter_map(|tip| {
+            let name = tip
+                .refname
+                .as_encoded_bytes()
+                .strip_prefix(b"refs/heads/")?;
+            Some((branch_identity(OsStr::from_bytes(name)), tip))
+        })
         .collect::<BTreeMap<_, _>>();
 
     // Earlier facts by worktree, and the Git directory the retained watch
@@ -215,6 +223,22 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
                 worktree.head = old.head.clone();
             }
         }
+        // Worktree listing and status decode names for display. Resolve an
+        // ambiguous replacement character only after applying status, so an
+        // invalid name never acquires a literal U+FFFD branch's identity.
+        if worktree
+            .branch
+            .as_deref()
+            .is_some_and(|branch| branch.contains('\u{fffd}'))
+        {
+            match git.symbolic_branch(&record.path, cancellation) {
+                Ok(branch) => worktree.branch = branch.as_deref().map(branch_identity),
+                Err(error) => {
+                    worktree.branch = None;
+                    worktree.error = Some(error.to_string());
+                }
+            }
+        }
         worktree.link = planned
             .get(&record.id)
             .map(|git_dir| git_dir.to_path_buf())
@@ -269,15 +293,16 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         }
     }
 
-    // Which local branches might earn a card. Measuring every branch of a
-    // large repository costs seconds; these are a handful.
+    // Only checked-out branches or those named by pull requests might earn a
+    // card, regardless of name encoding. Measuring every branch of a large
+    // repository costs seconds; these are a handful.
     let checked_out = worktrees
         .iter()
         .filter_map(|worktree| worktree.branch.as_deref())
         .collect::<BTreeSet<_>>();
     let mut branches = BTreeMap::new();
-    for (&name, tip) in &local_tips {
-        if checked_out.contains(name) || hints.branches.contains(name) {
+    for (name, tip) in &local_tips {
+        if checked_out.contains(name.as_str()) || hints.branches.contains(name) {
             branches.insert(
                 name.to_owned(),
                 Branch {
@@ -303,7 +328,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         let unmeasured = branches
             .iter()
             .filter(|(_, branch)| cached(&branch.oid).is_none())
-            .map(|(name, _)| format!("refs/heads/{name}"))
+            .map(|(name, _)| branch_ref(name))
             .collect::<Vec<_>>();
         let measured = if unmeasured.is_empty() {
             BTreeMap::new()
@@ -328,8 +353,7 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             }
         };
         for (name, branch) in &mut branches {
-            let counts = cached(&branch.oid)
-                .or_else(|| measured.get(&format!("refs/heads/{name}")).copied());
+            let counts = cached(&branch.oid).or_else(|| measured.get(&branch_ref(name)).copied());
             if let Some(counts) = counts {
                 divergence.insert((branch.oid.clone(), base.oid.clone()), counts);
                 branch.comparison = Some(comparison(base, counts));
@@ -457,13 +481,19 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
         base,
         worktrees,
         branches,
-        branch_names: local_tips.keys().map(|name| (*name).to_owned()).collect(),
+        branch_names: local_tips.into_keys().collect(),
         ancestry,
         plan,
         plan_error,
         plan_retry,
         divergence,
     })
+}
+
+fn branch_ref(identity: &str) -> OsString {
+    let mut refname = OsString::from("refs/heads/");
+    refname.push(branch_name(identity));
+    refname
 }
 
 fn comparison(base: &Base, counts: Divergence) -> Comparison {
@@ -644,6 +674,54 @@ mod tests {
             cancellation: &CancellationToken::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn unchecked_out_branches_without_pull_requests_are_not_divergence_candidates() {
+        let fixture = fixture();
+        let head = git(
+            &fixture.root,
+            &[
+                "commit-tree",
+                "HEAD^{tree}",
+                "-p",
+                "HEAD",
+                "-m",
+                "unchecked-out",
+            ],
+        )
+        .trim()
+        .to_owned();
+        git(&fixture.root, &["update-ref", "refs/heads/theirs", &head]);
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.root)
+            .arg("update-ref")
+            .arg(OsStr::from_bytes(b"refs/heads/theirs-\xff"))
+            .arg(&head)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git update-ref: {output:?}");
+
+        let local = run(&fixture, None, &git_watch::Change::default());
+        let invalid_name = branch_identity(OsStr::from_bytes(b"theirs-\xff"));
+        for name in ["theirs", invalid_name.as_str()] {
+            assert!(
+                local.branch_names.contains(name),
+                "{name} stays in the census"
+            );
+            assert!(
+                !local.branches.contains_key(name),
+                "{name} has neither a checkout nor a pull request"
+            );
+        }
+        let base = local.base.as_ref().unwrap();
+        assert!(!local.divergence.contains_key(&(head, base.oid.clone())));
     }
 
     #[test]

@@ -887,7 +887,12 @@ fn board_json(
 /// head is not in it; its sessions their ID and state. `active_at` is in
 /// Unix seconds.
 fn card_json(item: &Item, project_base: Option<&str>, detail: Detail) -> Value {
-    let card = item.label();
+    let card = match &item.key {
+        ItemKey::Branch(identity) if crate::work::branch_name(identity).to_str().is_none() => {
+            item.key.storage_key()
+        }
+        _ => item.label(),
+    };
     let comparison = item.comparison.as_ref();
     let dirty = item.dirty.as_ref();
     let pull_request = item.pull_request.as_ref().map(|pull| {
@@ -1860,5 +1865,18 @@ mod tests {
             item_in(".worktrees/linked".into(), Some(&home)),
             ".worktrees/linked"
         );
+    }
+    #[test]
+    fn non_utf8_card_json_preserves_the_action_identifier_and_escaped_label() {
+        let mut invalid = card(r"legacy-\xFF", Column::InProgress);
+        invalid.key = ItemKey::Branch(":6c65676163792dff".into());
+        let literal = card("legacy-\u{fffd}", Column::InProgress);
+        let raw = card_json(&invalid, None, Detail::Sparse);
+        let text = card_json(&literal, None, Detail::Sparse);
+        assert_eq!(raw["card"], "branch::6c65676163792dff");
+        assert_eq!(raw["branch"], r"legacy-\xFF");
+        assert_ne!(raw["card"], text["card"]);
+        assert_ne!(raw["branch"], text["branch"]);
+        assert_eq!(row(&invalid, None, 0)[0], r"legacy-\xFF");
     }
 }

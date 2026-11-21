@@ -161,12 +161,21 @@ fn project_items(
             // `git worktree add --force` can check one branch out twice.
             let key = match &worktree.branch {
                 Some(branch) if !carded.contains(branch) => ItemKey::Branch(branch.clone()),
+                Some(branch) if crate::work::branch_name(branch).to_str().is_none() => {
+                    ItemKey::Branch(format!("{branch}:{}", worktree.id))
+                }
                 _ => ItemKey::Worktree(worktree.path.clone()),
             };
             if let Some(branch) = &worktree.branch {
                 carded.insert(branch.clone());
             }
-            let mut item = new_item(key, worktree.branch.clone());
+            let mut item = new_item(
+                key,
+                worktree
+                    .branch
+                    .as_deref()
+                    .map(|name| crate::work::branch_display(&crate::work::branch_name(name))),
+            );
             item.worktree = Some(Worktree {
                 path: worktree.path.clone(),
                 primary: worktree.primary,
@@ -235,7 +244,10 @@ fn project_items(
                 continue;
             }
             carded.insert(name.clone());
-            let mut item = new_item(ItemKey::Branch(name.clone()), Some(name.clone()));
+            let mut item = new_item(
+                ItemKey::Branch(name.clone()),
+                Some(crate::work::branch_display(&crate::work::branch_name(name))),
+            );
             item.comparison = branch.comparison.clone();
             item.head = Some(head);
             item.pull_request = pull_request;
@@ -271,7 +283,10 @@ fn project_items(
                 continue;
             }
             carded.insert(name.clone());
-            let mut item = new_item(ItemKey::Branch(name.clone()), Some(name.clone()));
+            let mut item = new_item(
+                ItemKey::Branch(name.clone()),
+                Some(crate::work::branch_display(&crate::work::branch_name(name))),
+            );
             item.pull_request = Some(convert(pull_request, false));
             item.linear = branch_ticket(name, context.tickets);
             item.last_activity = pull_request_activity(item.pull_request.as_ref());
@@ -294,6 +309,8 @@ fn pull_request_for(
     branch: &str,
     head: Option<&Head>,
 ) -> Option<PullRequest> {
+    let name = crate::work::branch_name(branch);
+    let branch = name.to_str()?;
     let oid = head.map(|head| head.oid.as_str());
     let pull_request = project.snapshot?.for_branch(branch, oid)?;
     let contains = oid.is_some_and(|oid| {
@@ -396,7 +413,8 @@ fn linked_ticket(issue_id: &str, tickets: &BTreeMap<String, Ticket>) -> LinearTi
 /// about GitHub issue 1403 could come back as `TEAM-1403`; only an answer
 /// under the same identifier confirms a guess.
 fn branch_ticket(branch: &str, tickets: &BTreeMap<String, Ticket>) -> Option<LinearTicket> {
-    let identifier = crate::work::ticket_from_branch(branch)?;
+    let branch = crate::work::branch_name(branch);
+    let identifier = crate::work::ticket_from_branch(&branch.to_string_lossy())?;
     let ticket = tickets
         .get(&identifier)
         .filter(|ticket| ticket.identifier.eq_ignore_ascii_case(&identifier))?;
@@ -842,5 +860,155 @@ mod tests {
         let converted = convert(&open, true);
         assert_eq!(converted.checks, Some(Checks::default()));
         assert_eq!(converted.review, Some(Review::ChangesRequested));
+    }
+    #[test]
+    fn branch_card_rules_are_independent_of_name_encoding() {
+        let states = [
+            ("linked checkout", Some(false), 0, 0, false, [true, true]),
+            (
+                "unchecked-out with open PR",
+                None,
+                0,
+                0,
+                true,
+                [true, false],
+            ),
+            (
+                "unchecked-out without PR",
+                None,
+                0,
+                0,
+                false,
+                [false, false],
+            ),
+            ("idle primary", Some(true), 0, 0, false, [false, false]),
+            ("ahead primary", Some(true), 1, 0, false, [true, true]),
+            ("dirty primary", Some(true), 0, 1, false, [true, true]),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (state, primary, ahead, dirty, open_pr, cards) in states {
+            let mut present = [false; 2];
+            for (index, identity) in ["legacy-ordinary", ":6c65676163792dff"]
+                .into_iter()
+                .enumerate()
+            {
+                let mut fixture = fixture();
+                fixture.local = scan::Local::default();
+                fixture.local.branch_names.insert(identity.into());
+                let mut checkout =
+                    worktree("/repo/checkout", Some(identity), primary == Some(true));
+                checkout.comparison.as_mut().unwrap().ahead = ahead;
+                checkout.dirty.as_mut().unwrap().paths = dirty;
+                let head = checkout.head.as_ref().unwrap().clone();
+                fixture.local.branches.insert(
+                    identity.into(),
+                    scan::Branch {
+                        oid: head.oid.clone(),
+                        committed_at_unix_ms: head.committed_at_unix_ms,
+                        worktree: primary.map(|_| checkout.path.clone()),
+                        comparison: checkout.comparison.clone(),
+                    },
+                );
+                if primary.is_some() {
+                    fixture.local.worktrees.push(checkout);
+                }
+                let pr_branch = crate::work::branch_name(identity)
+                    .to_string_lossy()
+                    .into_owned();
+                // GitHub cannot have an invalid-UTF-8 head branch. A PR under
+                // its lossy name belongs to a different, valid branch.
+                fixture.snapshot = snapshot(if open_pr {
+                    vec![pull_request(&pr_branch, &head.oid, "OPEN", false)]
+                } else {
+                    Vec::new()
+                });
+                let forge = Forge::Synced {
+                    at_unix_ms: NOW,
+                    error: None,
+                };
+                let project = ProjectView {
+                    repository: Path::new("/repo/.git"),
+                    name: "repo",
+                    local: Some(&fixture.local),
+                    scan_error: None,
+                    forge: &forge,
+                    snapshot: Some(&fixture.snapshot),
+                };
+                assert_eq!(
+                    pull_request_for(&project, &fixture.local, identity, Some(&head)).is_some(),
+                    open_pr && index == 0,
+                    "{state}: PR association for {identity}"
+                );
+                let board = fixture.board();
+                let card = board
+                    .items
+                    .iter()
+                    .find(|item| item.key == ItemKey::Branch(identity.into()));
+                present[index] = card.is_some();
+                if let Some(card) = card {
+                    let display = crate::work::branch_display(&crate::work::branch_name(identity));
+                    assert_eq!(card.branch.as_deref(), Some(display.as_str()));
+                    assert_eq!(card.pull_request.is_some(), open_pr && index == 0);
+                }
+            }
+            actual.push((state, present));
+            expected.push((state, cards));
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn invalid_byte_branches_keep_distinct_linked_checkout_cards() {
+        let mut fixture = fixture();
+        let identity = ":6c65676163792dff";
+        let mut branch = fixture.local.branches["draft"].clone();
+        branch.oid = "raw-oid".into();
+        fixture.local.branches.insert(identity.into(), branch);
+        fixture.local.branch_names.insert(identity.into());
+        for path in ["/repo/.worktrees/legacy", "/repo/.worktrees/legacy-again"] {
+            let mut checkout = worktree(path, Some(identity), false);
+            checkout.head.as_mut().unwrap().oid = "raw-oid".into();
+            fixture.local.worktrees.push(checkout);
+        }
+        let board = fixture.board();
+        let raw = board
+            .items
+            .iter()
+            .filter(|item| item.branch.as_deref() == Some(r"legacy-\xFF"))
+            .collect::<Vec<_>>();
+        assert_eq!(raw.len(), 2);
+        assert_ne!(raw[0].key, raw[1].key);
+        // As for any branch, the second checkout is named by its worktree.
+        assert_eq!(
+            raw.iter().map(|card| card.label()).collect::<Vec<_>>(),
+            [r"legacy-\xFF", "/repo/.worktrees/legacy-again"]
+        );
+        for card in raw {
+            assert_eq!(card.head.as_ref().unwrap().oid, "raw-oid");
+            assert!(card.pull_request.is_none());
+            assert!(!card.worktree.as_ref().unwrap().primary);
+            let ItemKey::Branch(key) = &card.key else {
+                panic!("missing raw branch identity")
+            };
+            assert!(crate::work::branch_name(key).to_str().is_none());
+        }
+    }
+    #[test]
+    fn active_primary_invalid_branch_keeps_its_checkout_facts() {
+        let mut fixture = fixture();
+        fixture.local.worktrees[0].branch = Some(":6c65676163792dff".into());
+        fixture.local.worktrees[0].dirty.as_mut().unwrap().paths = 1;
+        let board = fixture.board();
+        let raw = board
+            .items
+            .iter()
+            .find(|item| item.branch.as_deref() == Some(r"legacy-\xFF"))
+            .unwrap();
+        assert!(raw.worktree.as_ref().unwrap().primary);
+        assert_eq!(raw.worktree.as_ref().unwrap().path, Path::new("/repo"));
+        assert_eq!(raw.dirty.as_ref().unwrap().paths, 1);
+        assert!(raw.head.is_some());
+        assert!(raw.comparison.is_some());
     }
 }
