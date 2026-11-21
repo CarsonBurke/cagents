@@ -3493,8 +3493,8 @@ impl Cagents {
                 state.failure = None;
             }
             // A report about one model's allowance leaves a signed-out
-            // reading signed out; only one that answers for the account
-            // ends a sign-in watch.
+            // reading signed out, and the sign-in watch continues while the
+            // reading still says the account needs a login.
             if !state.refresh_plan
                 && state
                     .snapshot
