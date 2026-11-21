@@ -1849,10 +1849,10 @@ impl State {
                 ..Default::default()
             };
         } else {
-            // Preserve displayed marks and pagination until another page is
-            // demanded, then reread from this refresh's first later cursor.
+            // The cursor and completed pages still describe this exact
+            // revision. Later marks keep showing until demanded, then only
+            // their own page is reread.
             self.pages.loading = false;
-            self.pages.restart = loaded.next_file_cursor.clone();
             self.pages.revalidate.clear();
             self.pages.error = None;
         }
@@ -1888,11 +1888,16 @@ impl State {
                     // pagination, including pages completed before the write.
                     verify_later_marks = true;
                 } else {
+                    // Settled later marks came from a page read, which
+                    // recorded the page to reread now that they may be stale.
                     if file.sync == ViewedSync::Unknown
                         && *sync == ViewedSync::Settled
                         && !self.viewed_after_load.contains(&file.entry.path)
+                        && let Some(origin) = self.pages.origin.get(&file.entry.path)
                     {
-                        self.pages.revalidate.insert(file.entry.path.clone());
+                        self.pages
+                            .revalidate
+                            .insert(file.entry.path.clone(), origin.clone());
                     }
                     file.sync = *sync;
                 }
@@ -2509,7 +2514,8 @@ impl State {
         if let Some(error) = &self.pages.error {
             status.push(design::caption(error).into());
         }
-        if self.pages.cursor.is_some() {
+        // A failed reread can follow completed pagination.
+        if self.pages.cursor.is_some() || self.pages.error.is_some() {
             status.push(
                 crate::ui_controls::button::quiet("Load more viewed states")
                     .instead("Loading viewed states…", self.pages.loading)

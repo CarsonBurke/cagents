@@ -29,9 +29,16 @@ pub(super) struct Pages {
     pub seek_unviewed: bool,
     pub hydrate_all: bool,
     pub(super) seen: BTreeSet<String>,
-    /// Keep old marks visible, but reread demanded files in this refresh epoch.
-    pub(super) revalidate: BTreeSet<RepoPath>,
-    pub(super) restart: Option<String>,
+    /// Settled later-page marks a refresh could not confirm, with the cursor
+    /// of the page that last delivered each. They stay visible until demanded,
+    /// then only their own page is reread.
+    pub(super) revalidate: BTreeMap<RepoPath, String>,
+    /// The request cursor of the page that last delivered each later mark.
+    /// Cursors stay valid while the head, base and viewer do.
+    pub(super) origin: HashMap<RepoPath, String>,
+    /// While `loading`, the page being reread for revalidation; otherwise the
+    /// in-flight request is the next unread page at `cursor`.
+    pub(super) revalidating: Option<String>,
 }
 
 impl Default for Pages {
@@ -46,8 +53,9 @@ impl Default for Pages {
             seek_unviewed: false,
             hydrate_all: false,
             seen: BTreeSet::new(),
-            revalidate: BTreeSet::new(),
-            restart: None,
+            revalidate: BTreeMap::new(),
+            origin: HashMap::new(),
+            revalidating: None,
         }
     }
 }
@@ -78,14 +86,20 @@ impl State {
                 cursor,
                 result,
             } => {
+                let requested = self
+                    .pages
+                    .revalidating
+                    .as_ref()
+                    .or(self.pages.cursor.as_ref());
                 if generation != self.generation
                     || load != self.load_generation
                     || !self.pages.loading
-                    || self.pages.cursor.as_ref() != Some(&cursor)
+                    || requested != Some(&cursor)
                 {
                     return ActionTask::none();
                 }
                 self.pages.loading = false;
+                let revalidation = self.pages.revalidating.take().is_some();
                 let page = match result {
                     Ok(page) => page,
                     Err(error) => {
@@ -101,35 +115,21 @@ impl State {
                     self.pages.error = Some("The viewer or pull request changed. Refresh to load consistent viewed marks.".into());
                     return ActionTask::none();
                 }
-                if page
-                    .next_cursor
-                    .as_ref()
-                    .is_some_and(|next| next == &cursor || self.pages.seen.contains(next))
-                {
-                    self.pages.error =
-                        Some("GitHub repeated a file cursor. Refresh to retry.".into());
-                    return ActionTask::none();
-                }
-                self.pages.seen.insert(cursor);
-                self.pages.cursor = page.next_cursor.clone();
-                if self.pages.cursor.is_none() {
-                    self.pages.hydrate_all = false;
-                }
-                let marks: HashMap<_, _> = page
-                    .files
-                    .iter()
-                    .map(|file| (file.path.as_str(), file))
-                    .collect();
-                for file in &mut self.files {
-                    // Mutations remove revalidation eligibility, including
-                    // when their ACK arrives before this older page does.
-                    if (file.sync == ViewedSync::Unknown
-                        || self.pages.revalidate.contains(&file.entry.path))
-                        && let Some(remote) = marks.get(file.entry.path.display().as_ref())
+                // A reread page never advances pagination.
+                if !revalidation {
+                    if page
+                        .next_cursor
+                        .as_ref()
+                        .is_some_and(|next| next == &cursor || self.pages.seen.contains(next))
                     {
-                        self.pages.revalidate.remove(&file.entry.path);
-                        file.viewed = remote.viewer_viewed_state == FileViewedState::Viewed;
-                        file.sync = ViewedSync::Settled;
+                        self.pages.error =
+                            Some("GitHub repeated a file cursor. Refresh to retry.".into());
+                        return ActionTask::none();
+                    }
+                    self.pages.seen.insert(cursor.clone());
+                    self.pages.cursor = page.next_cursor.clone();
+                    if self.pages.cursor.is_none() {
+                        self.pages.hydrate_all = false;
                     }
                 }
                 let existing: BTreeSet<String> = self
@@ -153,6 +153,32 @@ impl State {
                     ));
                     self.rebuild_rows();
                 }
+                let marks: HashMap<_, _> = page
+                    .files
+                    .iter()
+                    .map(|file| (file.path.as_str(), file))
+                    .collect();
+                for file in &mut self.files {
+                    let Some(remote) = marks.get(file.entry.path.display().as_ref()) else {
+                        continue;
+                    };
+                    self.pages
+                        .origin
+                        .insert(file.entry.path.clone(), cursor.clone());
+                    // Mutations remove revalidation eligibility, including
+                    // when their ACK arrives before this older page does.
+                    if file.sync == ViewedSync::Unknown
+                        || self.pages.revalidate.remove(&file.entry.path).is_some()
+                    {
+                        file.viewed = remote.viewer_viewed_state == FileViewedState::Viewed;
+                        file.sync = ViewedSync::Settled;
+                    }
+                }
+                if revalidation {
+                    // Settle the page's stale marks even if GitHub no longer
+                    // lists them there, so they cannot demand it again.
+                    self.pages.revalidate.retain(|_, origin| *origin != cursor);
+                }
                 self.cache_dirty = true;
                 if self.pages.seek_unviewed {
                     self.next_unviewed();
@@ -162,30 +188,35 @@ impl State {
         ActionTask::none()
     }
 
-    fn needs_file_page(&self) -> bool {
-        if self.pages.hydrate_all {
-            return true;
-        }
-        let needs_read = |path: &RepoPath| {
-            self.pages.revalidate.contains(path)
-                || self
-                    .file_index(path)
-                    .is_some_and(|index| self.files[index].sync == ViewedSync::Unknown)
-        };
-        if self.pages.wanted.as_ref().is_some_and(needs_read)
-            || self.selected.as_ref().is_some_and(needs_read)
-        {
-            return true;
-        }
-        let displayed = self.displayed_file_rows(&directory_tallies(&self.rows, &self.files));
-        window_rows(&self.rows, &displayed, self.pages.offset, self.pages.height)
+    /// The page to read next with whether it rereads a stale mark: the page
+    /// of a demanded stale mark, otherwise the next unread page when it is
+    /// demanded. Stale marks never restart pagination.
+    fn page_request(&self, force: bool) -> Option<(String, bool)> {
+        let mut demanded: Vec<usize> = [self.pages.wanted.as_ref(), self.selected.as_ref()]
             .into_iter()
-            .any(|position| {
-                self.rows[displayed[position]].file.is_some_and(|file| {
-                    self.files[file].sync == ViewedSync::Unknown
-                        || self.pages.revalidate.contains(&self.files[file].entry.path)
-                })
-            })
+            .flatten()
+            .filter_map(|path| self.file_index(path))
+            .collect();
+        let next_forced = force || self.pages.hydrate_all;
+        if !next_forced || !self.pages.revalidate.is_empty() {
+            let displayed = self.displayed_file_rows(&directory_tallies(&self.rows, &self.files));
+            demanded.extend(
+                window_rows(&self.rows, &displayed, self.pages.offset, self.pages.height)
+                    .into_iter()
+                    .filter_map(|position| self.rows[displayed[position]].file),
+            );
+        }
+        if let Some(origin) = demanded
+            .iter()
+            .find_map(|&index| self.pages.revalidate.get(&self.files[index].entry.path))
+        {
+            return Some((origin.clone(), true));
+        }
+        let next = next_forced
+            || demanded
+                .iter()
+                .any(|&index| self.files[index].sync == ViewedSync::Unknown);
+        Some((self.pages.cursor.clone().filter(|_| next)?, false))
     }
 
     pub(super) fn load_file_page(&mut self, force: bool) -> ActionTask {
@@ -197,27 +228,25 @@ impl State {
             })
             || self.load != LoadState::Ready
             || self.context.is_none()
-            || (!force && !self.needs_file_page())
         {
             return ActionTask::none();
         }
-        if let Some(cursor) = self.pages.restart.take() {
-            self.pages.cursor = Some(cursor);
-            self.pages.seen.clear();
-        }
-        let (Some(cursor), Some(target)) = (self.pages.cursor.clone(), self.target.as_ref()) else {
+        let (Some((cursor, revalidation)), Some(target)) =
+            (self.page_request(force), self.target.as_ref())
+        else {
             return ActionTask::none();
         };
         let Ok(key) = PullRequestKey::new(target.repository.clone(), target.pull_request.number)
         else {
             return ActionTask::none();
         };
-        if self.pages.seen.len() >= 99 {
+        if !revalidation && self.pages.seen.len() >= 99 {
             self.pages.error =
                 Some("Reached the file-page limit. Unloaded viewed states remain unknown.".into());
             return ActionTask::none();
         }
         self.pages.loading = true;
+        self.pages.revalidating = revalidation.then(|| cursor.clone());
         let api = self.api.clone();
         let cancellation = self.cancellation.clone();
         let generation = self.generation;
@@ -276,6 +305,16 @@ mod tests {
         viewer: &str,
         next_cursor: Option<String>,
     ) {
+        answer_at(state, "page-2", files, viewer, next_cursor);
+    }
+
+    fn answer_at(
+        state: &mut State,
+        cursor: &str,
+        files: Vec<crate::github::PullRequestFile>,
+        viewer: &str,
+        next_cursor: Option<String>,
+    ) {
         let context = state.context.as_ref().unwrap();
         let page = PullRequestFilePage {
             files,
@@ -288,7 +327,7 @@ mod tests {
         drop(state.update(Action::FilePage(PageAction::Loaded {
             generation: state.generation,
             load: state.load_generation,
-            cursor: "page-2".into(),
+            cursor: cursor.into(),
             result: Ok(Arc::new(page)),
         })));
     }
@@ -602,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_restarts_before_the_old_cursor_only_when_a_later_mark_is_demanded() {
+    fn refresh_rereads_only_the_page_of_a_demanded_later_mark() {
         let mut state = thousand_files();
         drop(state.update(Action::FilePage(PageAction::More)));
         answer_next(
@@ -611,26 +650,59 @@ mod tests {
             "me",
             Some("page-3".into()),
         );
-        assert_eq!(state.pages.cursor.as_deref(), Some("page-3"));
+        drop(state.update(Action::FilePage(PageAction::More)));
+        answer_at(
+            &mut state,
+            "page-3",
+            vec![remote_file("file-0205.rs", true)],
+            "me",
+            Some("page-4".into()),
+        );
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-4"));
         refresh_later_pages(&mut state);
         assert!(!state.pages.loading);
-        assert_eq!(state.pages.cursor.as_deref(), Some("page-3"));
-        assert!(state.files[105].viewed);
-        assert_eq!(state.files[105].sync, ViewedSync::Settled);
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-4"));
+        assert!(state.files[205].viewed);
+        assert_eq!(state.files[205].sync, ViewedSync::Settled);
 
-        drop(state.update(Action::SelectFile(RepoPath::parse("file-0105.rs").unwrap())));
+        drop(state.update(Action::SelectFile(RepoPath::parse("file-0205.rs").unwrap())));
         assert!(state.pages.loading);
-        assert_eq!(state.pages.cursor.as_deref(), Some("page-2"));
-        assert!(state.pages.seen.is_empty());
-        answer_next(
+        assert_eq!(state.pages.revalidating.as_deref(), Some("page-3"));
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-4"));
+        answer_at(
             &mut state,
-            vec![remote_file("file-0105.rs", false)],
+            "page-3",
+            vec![remote_file("file-0205.rs", false)],
             "me",
-            Some("page-3".into()),
+            Some("page-4".into()),
         );
-        assert!(!state.files[105].viewed);
-        assert!(!state.pages.loading, "offscreen page three remains lazy");
-        assert_eq!(state.pages.cursor.as_deref(), Some("page-3"));
+        assert!(!state.files[205].viewed);
+        assert!(!state.pages.loading, "offscreen pages remain lazy");
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-4"));
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
+        assert!(
+            state
+                .pages
+                .revalidate
+                .contains_key(&RepoPath::parse("file-0105.rs").unwrap()),
+            "page two waits until one of its marks is demanded"
+        );
+
+        drop(state.update(Action::FilePage(PageAction::More)));
+        assert!(state.pages.loading);
+        assert_eq!(
+            state.pages.revalidating, None,
+            "Load more continues past the pages already read"
+        );
+        answer_at(
+            &mut state,
+            "page-4",
+            vec![remote_file("file-0305.rs", true)],
+            "me",
+            Some("page-5".into()),
+        );
+        assert_eq!(state.files[305].sync, ViewedSync::Settled);
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-5"));
     }
 
     #[test]
@@ -644,13 +716,20 @@ mod tests {
             let mut state = thousand_files();
             let path = RepoPath::parse("file-0105.rs").unwrap();
             drop(state.update(Action::FilePage(PageAction::More)));
-            answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+            answer(
+                &mut state,
+                vec![
+                    remote_file("file-0105.rs", true),
+                    remote_file("file-0106.rs", true),
+                ],
+                "me",
+            );
             refresh_later_pages(&mut state);
             drop(state.update(Action::SelectFile(path.clone())));
             assert!(state.pages.loading);
-            assert!(state.pages.revalidate.contains(&path));
+            assert!(state.pages.revalidate.contains_key(&path));
             drop(state.update(Action::ToggleViewed(path.clone())));
-            assert!(!state.pages.revalidate.contains(&path));
+            assert!(!state.pages.revalidate.contains_key(&path));
             if let Some(outcome) = outcome {
                 drop(state.update(Action::ViewedApplied {
                     generation: state.generation,
@@ -659,8 +738,20 @@ mod tests {
                 }));
             }
             let expected = (state.files[105].viewed, state.files[105].sync);
-            answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+            answer(
+                &mut state,
+                vec![
+                    remote_file("file-0105.rs", true),
+                    remote_file("file-0106.rs", false),
+                ],
+                "me",
+            );
             assert_eq!((state.files[105].viewed, state.files[105].sync), expected);
+            assert!(
+                !state.files[106].viewed,
+                "the same page still revalidates its other marks"
+            );
+            assert!(state.pages.revalidate.is_empty());
         }
     }
 
