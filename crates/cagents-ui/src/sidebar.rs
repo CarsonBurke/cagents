@@ -12578,7 +12578,10 @@ fn panel_row<'a>(
 /// It lives here so the copy, the counted paths, and the confirmed request all
 /// come from the surface that raised the intent; `app.rs` only decides where
 /// to put it.
-pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_, SidebarAction> {
+pub fn discard_confirmation_dialog(
+    pending: &DiscardConfirmation,
+    surface_id: Id,
+) -> Element<'_, SidebarAction> {
     let tracked = pending.tracked_count();
     let untracked = pending.untracked_count();
     let mut detail = Vec::with_capacity(2);
@@ -12594,8 +12597,8 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             if untracked == 1 { "file" } else { "files" }
         ));
     }
-    crate::app::dialog_ui::confirmation_surface(
-        crate::app::dialog_ui::Question::DiscardChanges,
+    crate::dialog_ui::confirmation_surface(
+        surface_id,
         widget::column::with_children(vec![
             design::title("Discard changes?").into(),
             design::body(detail.join(". "))
@@ -12604,7 +12607,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::caption("Discarded work is not recoverable from Git.").into(),
         ])
         .spacing(space::M),
-        crate::app::dialog_ui::confirmation_actions(
+        crate::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(discard_cancel_id())
                 .on_press(SidebarAction::CancelDiscard),
