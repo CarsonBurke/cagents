@@ -18,7 +18,7 @@ use cosmic::{
     iced::{Alignment, Length, widget::text_editor},
     widget,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
 const PAGE: usize = 50;
@@ -758,6 +758,8 @@ pub struct State {
     accounts: Vec<AccountChoice>,
     models: Models,
     archived_accounts: Vec<AccountChoice>,
+    /// Providers turned off in the settings, which the editor does not offer.
+    turned_off: BTreeSet<Provider>,
 }
 
 impl State {
@@ -911,6 +913,12 @@ impl State {
         self.targets = targets;
         self.accounts = accounts;
         self.models = models;
+    }
+
+    /// The providers the settings turn off, which the editor no longer
+    /// offers for an automation that does not already run on one.
+    pub fn set_turned_off(&mut self, turned_off: BTreeSet<Provider>) {
+        self.turned_off = turned_off;
     }
 
     fn clear_error(&mut self) {
@@ -2390,7 +2398,13 @@ impl State {
                 .width(Length::Fill),
             ));
         } else if let Some(draft) = &self.draft {
-            content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
+            content = content.push(draft.view(
+                busy,
+                &self.models,
+                &self.turned_off,
+                self.error.as_deref(),
+                width,
+            ));
         } else {
             if self.run.is_none() {
                 if !self.all_history {
@@ -2902,9 +2916,17 @@ impl Draft {
         &'a self,
         busy: bool,
         models: &'a Models,
+        turned_off: &BTreeSet<Provider>,
         error: Option<&'a str>,
         width: f32,
     ) -> Element<'a, Action> {
+        // A provider turned off stays listed only for the automation that
+        // already runs on it, so editing it does not silently change it.
+        let offered: Vec<usize> = (0..AUTOMATION_PROVIDERS.len())
+            .filter(|index| {
+                *index == self.provider || !turned_off.contains(&AUTOMATION_PROVIDERS[*index])
+            })
+            .collect();
         let provider_accounts = self
             .accounts
             .iter()
@@ -2925,9 +2947,12 @@ impl Draft {
             .into(),
             crate::design::caption("Provider").into(),
             crate::ui_controls::field::select(
-                AUTOMATION_PROVIDERS.map(Provider::label).to_vec(),
-                Some(self.provider),
-                Action::Provider,
+                offered
+                    .iter()
+                    .map(|index| AUTOMATION_PROVIDERS[*index].label())
+                    .collect::<Vec<_>>(),
+                offered.iter().position(|index| *index == self.provider),
+                move |choice| Action::Provider(offered[choice]),
             )
             .into(),
             crate::design::caption("Account").into(),

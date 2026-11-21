@@ -8759,8 +8759,17 @@ impl Cagents {
                     .filter(|card| card.existence.is_open()),
             )
             .find_map(|card| match &card.kind {
-                CardKind::Chat(session) => Some(session.launch.provider),
+                CardKind::Chat(session) if self.account_ui.uses(session.launch.provider) => {
+                    Some(session.launch.provider)
+                }
                 _ => None,
+            })
+            // Codex, unless it is turned off: then the first provider in use
+            // that has native chat.
+            .or_else(|| {
+                std::iter::once(Provider::Codex)
+                    .chain(crate::account::Account::REPORTED)
+                    .find(|provider| provider.has_native_chat() && self.account_ui.uses(*provider))
             })
             .unwrap_or(Provider::Codex)
     }

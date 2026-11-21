@@ -157,6 +157,9 @@ pub(super) struct State {
     /// [`State::catalogs_unsaved`] is already due.
     saving_live: bool,
     omp: OmpRecord,
+    /// Providers the settings turn off: their accounts are neither listed
+    /// nor checked, and nothing offers them for new work.
+    turned_off: BTreeSet<Provider>,
 }
 
 /// Omp's usage record, which lists the accounts Omp keeps and is read
@@ -341,6 +344,7 @@ impl State {
             catalogs_unsaved: BTreeSet::new(),
             saving_live: false,
             omp: OmpRecord::default(),
+            turned_off: BTreeSet::new(),
         };
         state.sync_accounts();
         state
@@ -643,10 +647,54 @@ impl State {
 
     /// The accounts of `provider`, in list order.
     fn of(&self, provider: Provider) -> impl Iterator<Item = &AccountState> {
+        let used = self.uses(provider);
         self.accounts
             .iter()
-            .filter(move |account| account.account.provider == provider)
+            .filter(move |account| used && account.account.provider == provider)
             .filter(|account| self.listed(account))
+    }
+
+    /// Whether `provider` is in use, rather than turned off in the settings.
+    pub(super) fn uses(&self, provider: Provider) -> bool {
+        !self.turned_off.contains(&provider)
+    }
+
+    /// The providers turned off in the settings, in the order the app lists
+    /// providers.
+    pub(super) fn turned_off(&self) -> impl Iterator<Item = Provider> + '_ {
+        Account::REPORTED
+            .into_iter()
+            .filter(|provider| self.turned_off.contains(provider))
+    }
+
+    /// Takes the providers `settings` turns off; whether that changed them.
+    pub(super) fn set_turned_off(&mut self, settings: &AppSettings) -> bool {
+        let turned_off: BTreeSet<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|provider| !settings.uses_provider(*provider))
+            .collect();
+        if turned_off == self.turned_off {
+            return false;
+        }
+        self.turned_off = turned_off;
+        if self
+            .popover
+            .as_ref()
+            .and_then(|id| self.account(id))
+            .is_some_and(|account| !self.uses(account.account.provider))
+        {
+            self.popover = None;
+        }
+        self.table.close_popups();
+        if self
+            .table
+            .link
+            .as_ref()
+            .is_some_and(|(provider, _)| !self.uses(*provider))
+        {
+            self.table.link = None;
+        }
+        true
     }
 
     /// Whether `account` is listed, rather than archived.
@@ -737,8 +785,10 @@ impl State {
     /// Whether a new conversation can be started on `provider`: it has
     /// listed its models before, or one of its accounts has a CLI to run.
     pub(super) fn offers(&self, provider: Provider) -> bool {
-        self.catalog(provider)
-            .is_some_and(|catalog| !catalog.models.is_empty())
+        self.uses(provider)
+            && self
+                .catalog(provider)
+                .is_some_and(|catalog| !catalog.models.is_empty())
             || self.of(provider).any(|account| account.present)
     }
 
@@ -2518,12 +2568,14 @@ impl Cagents {
             })
             .collect();
         accounts.push(Account::system(Provider::Omp));
+        accounts.retain(|account| self.account_ui.uses(account.provider));
         accounts
     }
     /// The models, and their efforts, a new conversation's composer offers.
     pub(super) fn automation_models(&self) -> crate::automation_ui::Models {
         Provider::ALL
             .into_iter()
+            .filter(|provider| self.account_ui.uses(*provider))
             .filter_map(|provider| {
                 let catalog = self.account_ui.catalog(provider)?;
                 Some((provider, catalog.models.clone()))
@@ -3076,6 +3128,14 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        // A provider turned off is not checked, not even for a conversation
+        // still open on it.
+        if !self
+            .account_ui
+            .uses(self.account_ui.account(id)?.account.provider)
+        {
+            return None;
+        }
         let trigger = if self.account_ui.account(id)?.queued == Some(Trigger::Limit)
             && trigger != Trigger::Manual
         {
@@ -3360,6 +3420,9 @@ impl Cagents {
     /// Reads Omp's usage record on the blocking pool, unless there is none
     /// or a read is already under way.
     fn start_omp_read(&mut self) -> Option<Task<Message>> {
+        if !self.account_ui.uses(Provider::Omp) {
+            return None;
+        }
         let omp = &mut self.account_ui.omp;
         if omp.reading {
             return None;
@@ -6246,6 +6309,7 @@ impl Cagents {
         let state = &self.account_ui;
         Account::PROVIDERS
             .into_iter()
+            .filter(|provider| state.uses(*provider))
             .map(|provider| {
                 (
                     provider,
@@ -9291,6 +9355,50 @@ mod app_tests {
             app.account_ui.logins.first().map(|login| login.phase),
             Some(LoginPhase::Verifying)
         );
+    }
+
+    #[test]
+    fn a_turned_off_provider_is_neither_listed_offered_nor_checked_until_turned_on() {
+        let mut app = context_inspector_test_app(false);
+        let muse = Account::system(Provider::Muse).id();
+        let state = app.account_ui.account_mut(&muse).unwrap();
+        state.present = true;
+        state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+        assert!(app.account_ui.offers(Provider::Muse));
+        assert!(app.chip_lead(Provider::Muse).is_some());
+        assert!(table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+
+        let _ = app.update(Message::SettingsChanged {
+            field: SettingsField::UseProvider(Provider::Muse),
+            value: "false".into(),
+        });
+        assert!(!app.settings.uses_provider(Provider::Muse));
+        assert_eq!(app.account_ui.of(Provider::Muse).count(), 0);
+        assert!(!app.account_ui.offers(Provider::Muse));
+        assert!(app.chip_lead(Provider::Muse).is_none());
+        assert!(!table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+        assert_eq!(
+            app.account_ui.turned_off().collect::<Vec<_>>(),
+            [Provider::Muse]
+        );
+        assert!(
+            app.probe_account(&muse, Trigger::Manual, NOW).is_none(),
+            "not even a manual check runs"
+        );
+        // What it last reported is kept for when it is turned back on.
+        assert!(app.account_ui.account(&muse).unwrap().snapshot.is_some());
+        // Other providers are untouched.
+        assert!(app.account_ui.of(Provider::Claude).count() > 0);
+
+        let _ = app.update(Message::SettingsChanged {
+            field: SettingsField::UseProvider(Provider::Muse),
+            value: "true".into(),
+        });
+        assert!(app.settings.uses_provider(Provider::Muse));
+        assert!(app.settings.providers.is_empty());
+        assert!(app.account_ui.offers(Provider::Muse));
+        assert!(table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+        assert_eq!(app.account_ui.turned_off().count(), 0);
     }
 
     #[test]

@@ -215,6 +215,8 @@ pub(super) struct SettingsContext<'a> {
     pub invalid: &'a HashMap<SettingsField, String>,
     pub pressed_key: Option<&'a keyboard::Event>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
+    /// Every provider, in the order the app lists them, and how it stands.
+    pub providers: Vec<(crate::agent::Provider, &'static str)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
 }
@@ -393,7 +395,30 @@ fn settings_category_controls<'a>(
                     .into(),
             )
             .label_in_control());
+            let providers = context
+                .providers
+                .iter()
+                .map(|(provider, status)| {
+                    let provider = *provider;
+                    let used = draft.providers.get(&provider).copied().unwrap_or(true);
+                    crate::settings_widgets::toggle(
+                        provider.label(),
+                        if used { *status } else { "Turned off" },
+                        used,
+                        move |used| Message::SettingsChanged {
+                            field: SettingsField::UseProvider(provider),
+                            value: used.to_string(),
+                        },
+                    )
+                    .keywords(format!("provider agent disable enable hide {}", provider.executable()))
+                })
+                .collect();
             vec![
+                settings_group(
+                    "Providers",
+                    "Turn off an agent you don't use. It is no longer offered for new conversations or automations, Accounts and the status bar leave it out, and its accounts are not checked. Conversations already open keep running.",
+                    providers,
+                ),
                 settings_group(
                     "Default accounts",
                     "Choose defaults for new conversations, or use Automatic to choose an account with available usage.",
@@ -1837,6 +1862,10 @@ mod keyboard_table_tests {
             invalid: &invalid,
             pressed_key: None,
             accounts: Vec::new(),
+            providers: crate::account::Account::REPORTED
+                .into_iter()
+                .map(|provider| (provider, "Account available"))
+                .collect(),
             updates: update_ui::UpdateSummary {
                 status: String::new(),
                 failed: false,

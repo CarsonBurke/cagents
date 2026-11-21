@@ -23197,3 +23197,15 @@ pub(in crate::app) fn held(app: &Cagents, card: CardId) -> Option<String> {
     let runtime = chat_runtime(app, card);
     (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0)
 }
+
+#[test]
+fn a_new_thread_skips_a_turned_off_provider() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    assert_eq!(app.preferred_chat_provider(), Provider::Codex);
+    app.settings.set_uses_provider(Provider::Codex, false);
+    app.account_ui.set_turned_off(&app.settings);
+    assert_eq!(app.preferred_chat_provider(), Provider::Claude);
+    app.settings.set_uses_provider(Provider::Claude, false);
+    app.account_ui.set_turned_off(&app.settings);
+    assert_eq!(app.preferred_chat_provider(), Provider::Antigravity);
+}
