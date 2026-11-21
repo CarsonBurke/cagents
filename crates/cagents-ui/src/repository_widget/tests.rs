@@ -11944,4 +11944,18 @@ fn a_language_chosen_through_a_link_is_the_shown_files_choice() {
         runtime.shown_language_choice(),
         Some(DocumentLanguage::PlainText)
     );
+    // While a reload of it is read, the kept buffer still answers: a session
+    // saved then keeps the choice.
+    let DocumentState::Editable(document) =
+        std::mem::replace(&mut runtime.document, DocumentState::None)
+    else {
+        panic!("the linked file is open");
+    };
+    runtime.document = DocumentState::Loading {
+        predecessor: Some(document),
+    };
+    assert_eq!(
+        runtime.shown_language_choice(),
+        Some(DocumentLanguage::PlainText)
+    );
 }

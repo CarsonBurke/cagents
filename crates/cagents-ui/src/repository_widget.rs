@@ -5178,10 +5178,14 @@ impl RepositoryRuntime {
 
     /// The language the reader chose for the file this pane shows, or is
     /// opening: the open buffer's own choice, which follows a symbolic link
-    /// to the file it names, or else the choice kept for the selected path.
+    /// to the file it names, including a buffer kept while a reload of it is
+    /// read, or else the choice kept for the selected path.
     pub fn shown_language_choice(&self) -> Option<DocumentLanguage> {
         match &self.document {
-            DocumentState::Editable(document) => document.chosen_language(),
+            DocumentState::Editable(document)
+            | DocumentState::Loading {
+                predecessor: Some(document),
+            } => document.chosen_language(),
             _ => self
                 .selected_path()
                 .and_then(|path| self.language_choice(path)),
