@@ -106,6 +106,17 @@ impl<'p> LocalPane<'p> {
     }
 }
 
+/// Whether a new chat's first message may start its provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FirstSendAdmission {
+    /// The registry lists the pane, or will before the start reaches it.
+    Admitted,
+    /// The pane's scope is still loading or held back; the message waits.
+    Waiting,
+    /// The registry refused the scope's view, so its panes are not shared.
+    Refused,
+}
+
 /// Which scopes need local presentation projected. A selected pass still
 /// consults the complete canonical ownership set; it never treats a partial
 /// pane map as proof that a resource is unowned.
@@ -2283,6 +2294,35 @@ impl Cagents {
             .any(|view| view.retired.contains(&card))
     }
 
+    /// Whether the first message of `card`, a chat created in `scope`, may
+    /// start its provider. The daemon starts a shared pane's first message
+    /// only once the registry lists that pane, and a scope still loading,
+    /// held back or refused has not published it. Its start waits for the
+    /// reconcile that admits the scope (see `release_admitted_first_sends`).
+    pub(super) fn first_send_admission(&self, card: CardId, scope: &Scope) -> FirstSendAdmission {
+        // Without a registry there is no shared view to wait for.
+        if self.shared_views.registry_unavailable {
+            return FirstSendAdmission::Admitted;
+        }
+        // A retried seed keeps its refusal's reason until its receipt.
+        if self.shared_views.seed_failures.contains_key(scope)
+            && !self.shared_views.seeding.contains(scope)
+        {
+            return FirstSendAdmission::Refused;
+        }
+        let published = self.shared_views.attached.contains(&card) || self.listed_in_registry(card);
+        if self.shared_registry_connecting()
+            || !self.shared_views.initialized.contains(scope)
+            || self.shared_views.seeding.contains(scope)
+            || self.shared_views.blocked.contains(scope)
+            || matches!(scope, Scope::Channel(id) if self.channel_ui.was_deleted(*id) || self.channel_ui.is_deleting(*id))
+            || !published
+        {
+            return FirstSendAdmission::Waiting;
+        }
+        FirstSendAdmission::Admitted
+    }
+
     /// An automatic empty composer has no shared descriptor yet. Once it has
     /// work, establish its one creation intent before an empty snapshot can
     /// mistake that unpublished source for a pane removed by another window.
@@ -3558,10 +3598,12 @@ impl Cagents {
                 _ => app.local_views_for(projection),
             };
             for scope in projected_scopes {
-                app.shared_views.baseline.insert(
-                    scope.clone(),
-                    projected.panes.get(&scope).cloned().unwrap_or_default(),
-                );
+                // The view this pass projected is what the registry holds. A
+                // chat yet to be published is not in it, so the publication
+                // below inserts it rather than taking it as already shared.
+                let mut panes = projected.panes.get(&scope).cloned().unwrap_or_default();
+                panes.retain(|pane| !app.unpublished_chat(pane.id));
+                app.shared_views.baseline.insert(scope.clone(), panes);
             }
             app.publish_projected_view_changes(projected, projection);
         });
@@ -3574,6 +3616,10 @@ impl Cagents {
             self.reproject_notification_unread();
         }
         tasks.push(self.release_held_terminals_with_topology(topology));
+        // Every change to a scope's admission (a seed receipt or refusal, or
+        // the blocked set rebuilt above) is followed by this pass, after the
+        // pane's Insert was queued above.
+        tasks.push(self.release_admitted_first_sends());
         // Restored shared panes queued for an attach wait for the registry.
         tasks.push(self.attach_next_restored_agent());
         phase.mark("selected_postlude");
@@ -3772,6 +3818,30 @@ impl Cagents {
         Task::batch([projection, self.finish_shared_viewport_projection(viewport)])
     }
 
+    /// Whether `id` is a chat this window has yet to share with `view`.
+    ///
+    /// Such a chat is not missing from the view: its Insert has yet to be
+    /// published, as when the previous pass held its scope back and this one
+    /// admits it. It keeps its place here, and the publication that follows
+    /// the projection inserts it. Kept as a local-only pane instead, it would
+    /// never be published, and its first message would start unrecorded
+    /// (#2697).
+    fn awaits_first_publication(&self, id: CardId, view: &View) -> bool {
+        self.unpublished_chat(id) && !view.retired.contains(&id)
+    }
+
+    /// Whether `id` is a chat this window has neither shared nor kept local,
+    /// and will share. An untouched automatic composer is never shared: it
+    /// gives way to what the view holds, as the projection decides.
+    fn unpublished_chat(&self, id: CardId) -> bool {
+        !self.shared_views.attached.contains(&id)
+            && !self.shared_views.retained.contains(&id)
+            && !self.chat_is_unused_default(id)
+            && self
+                .card_state(id)
+                .is_some_and(|card| matches!(&card.kind, CardKind::Chat(_)))
+    }
+
     fn project_shared_view_with_cards(
         &mut self,
         view: &View,
@@ -3835,6 +3905,9 @@ impl Cagents {
                     .card_state(id)
                     .is_some_and(|card| card.kind.is_utility())
             {
+                continue;
+            }
+            if self.awaits_first_publication(id, view) {
                 continue;
             }
             // A refused first publication keeps its chat, started or not,
@@ -4229,6 +4302,7 @@ impl Cagents {
                 (self.shared_views.quarantined.contains(id) && !shared.contains(id))
                     || self.shared_views.retained.contains(id)
                     || self.reopen_pending(*id)
+                    || self.awaits_first_publication(*id, view)
                     || (view.panes.is_empty() && self.chat_is_unused_default(*id))
                     || self
                         .card_state(*id)
@@ -4240,10 +4314,13 @@ impl Cagents {
         for id in retained {
             // A fenced card the view does not place keeps its local place:
             // after the nearest card it followed here. So does a pane still
-            // reopening, which is not shared until it starts, rather than
-            // jumping to the end of the strip meanwhile.
+            // reopening, which is not shared until it starts, and a chat yet
+            // to be published, rather than jumping to the end of the strip
+            // meanwhile.
             if shared.contains(&id)
-                || !(self.shared_views.quarantined.contains(&id) || self.reopen_pending(id))
+                || !(self.shared_views.quarantined.contains(&id)
+                    || self.reopen_pending(id)
+                    || self.awaits_first_publication(id, view))
             {
                 visible.push(id);
                 continue;

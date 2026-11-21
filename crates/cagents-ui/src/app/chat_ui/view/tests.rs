@@ -8154,6 +8154,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
         draft: runtime.session.clone(),
         since: None,
         rechecking: false,
+        admission: None,
     };
     let source = queued.prompt.source.clone();
     runtime.queued = Some(queued);

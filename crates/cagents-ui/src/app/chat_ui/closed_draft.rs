@@ -314,6 +314,7 @@ mod tests {
             draft: sending.session.clone(),
             since: None,
             rechecking: false,
+            admission: None,
         });
 
         retire(&mut app, channel, target.card);

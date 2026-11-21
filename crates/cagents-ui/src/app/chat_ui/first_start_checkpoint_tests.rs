@@ -104,6 +104,37 @@ fn stored(app: &Cagents, card: CardId) -> chat::Session {
     }
 }
 
+/// Shares `channel` with the registry the way a window does: its save sends
+/// the channel's seed, and the registry acknowledges it listing `card`. A
+/// first send there then starts without waiting for the channel to load.
+fn shared_channel(
+    app: &mut Cagents,
+    channel: crate::model::ChannelId,
+    card: CardId,
+) -> crate::app::workspace_model_sync::TestModelRequests {
+    use crate::workspace_model::views::{Pane, Scope, View};
+    let scope = Scope::Channel(channel);
+    let (published, requests) = test_model_channel();
+    app.workspace_model_tx = published;
+    app.persist();
+    let attempt = app.shared_views.seed_attempts[&scope];
+    let mut model = app.workspace_model.clone();
+    model.sequence += 1;
+    let mut view = View::empty(channel);
+    view.revision = 1;
+    view.panes
+        .push(Pane::from_card(app.card_state(card).unwrap(), None).unwrap());
+    model.views.push(view);
+    drop(app.apply_workspace_model_update(
+        crate::app::workspace_model_sync::ModelUpdate::SeedApplied {
+            scope,
+            attempt,
+            model,
+        },
+    ));
+    requests
+}
+
 fn no_starter(app: &Cagents, card: CardId) {
     assert!(!matches!(
         app.chat_ui.phases.get(&card),
@@ -159,7 +190,7 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     let publication = requests
         .try_recv()
         .expect("ordinary persist emits its real SeedView");
-    match publication {
+    let seeded = match publication {
         crate::workspace_model::ModelEdit::SeedView { panes, .. } => {
             let pane = panes
                 .iter()
@@ -169,9 +200,10 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
             assert!(!panes.iter().any(
                 |pane| matches!(&pane.kind, CardKind::Chat(session) if session.id == candidate.id)
             ));
+            panes
         }
         other => panic!("expected real A seed, got {other:?}"),
-    }
+    };
     let (target, attempt, result) = checkpoint(task);
     assert!(result.is_ok(), "{result:?}");
     let saved = stored(&app, card);
@@ -183,9 +215,13 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     assert_eq!(restored.chat_draft_attachments[&card], images);
     assert_eq!(runtime(&app, card).session, source);
     let start = app.draft_start_checkpointed(target, attempt, result);
-    assert!(
-        matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(a)) if a.session.id == candidate.id)
-    );
+    // The channel's seed is still unacknowledged, so the registry does not
+    // list the pane yet: the message waits for it rather than starting.
+    assert!(app.first_send_held(card));
+    assert!(!matches!(
+        app.chat_ui.phases.get(&card),
+        Some(Phase::Starting(_))
+    ));
     assert_eq!(
         runtime(&app, card)
             .queued
@@ -226,6 +262,27 @@ fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_o
     assert_eq!(restored.chat_drafts[&card], "First prompt remains local");
     assert_eq!(restored.chat_draft_attachments[&card], images);
     drop(start);
+    // The registry acknowledges the seed it was sent, which admits the
+    // channel and starts the candidate that waited for it.
+    let scope = crate::workspace_model::views::Scope::Channel(channel);
+    let mut model = app.workspace_model.clone();
+    model.sequence += 1;
+    let mut view = crate::workspace_model::views::View::empty(channel);
+    view.revision = 1;
+    view.panes = seeded;
+    model.views.push(view);
+    let seed = app.shared_views.seed_attempts[&scope];
+    drop(app.apply_workspace_model_update(
+        crate::app::workspace_model_sync::ModelUpdate::SeedApplied {
+            scope,
+            attempt: seed,
+            model,
+        },
+    ));
+    assert!(!app.first_send_held(card));
+    assert!(
+        matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(a)) if a.session.id == candidate.id)
+    );
     drop(app.draft_start_checkpointed(target, attempt, Ok(())));
     assert!(
         matches!(app.chat_ui.phases.get(&card), Some(Phase::Starting(a)) if a.session.id == candidate.id)
@@ -326,6 +383,7 @@ fn failed_first_start_save_retries_with_a_fresh_candidate_after_its_cause_is_rep
             focused: Some(card),
         });
     app.workspace_model.identity = uuid::Uuid::new_v4();
+    let _requests = shared_channel(&mut app, channel, card);
     let registry = app.workspace_model.identity;
     let store = app.session.as_ref().unwrap().operation_store();
     // The same guarded store seam used by the refusal regression makes the

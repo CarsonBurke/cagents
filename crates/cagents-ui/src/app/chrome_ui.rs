@@ -3835,6 +3835,7 @@ impl Cagents {
             _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.reopen_preparing(id) => Some(("Reopening conversation", true)),
+            _ if self.first_send_held(id) => Some(("Waiting to send", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             _ if self.saved_terminal_current(id).is_some() => self.saved_terminal_status(id),
             Some(CardRuntime::Loading) if self.startup_terminal_tab_status(id).is_some() => {

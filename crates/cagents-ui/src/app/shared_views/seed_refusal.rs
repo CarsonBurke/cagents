@@ -67,6 +67,33 @@ impl Cagents {
         }
     }
 
+    /// Offers one refused `scope` again, whatever other scopes' retries are
+    /// still in flight. Like `retry_view_seeds`, it keeps the refusal's
+    /// reason until the new seed's receipt settles it.
+    pub(in crate::app) fn retry_view_seed(&mut self, scope: &Scope) {
+        if self.shared_views.seeding.contains(scope) {
+            return;
+        }
+        let Some(error) = self.shared_views.seed_failures.remove(scope) else {
+            return;
+        };
+        // Other refused scopes stay refused: no seed of theirs goes with it.
+        self.publish_view_changes();
+        self.shared_views
+            .seed_failures
+            .entry(scope.clone())
+            .or_insert(error);
+    }
+
+    /// Whether `scope` has loaded into the shared workspace since a refusal,
+    /// or this window has no shared workspace to load it into.
+    pub(in crate::app) fn view_seed_loaded(&self, scope: &Scope) -> bool {
+        self.shared_views.registry_unavailable
+            || (self.shared_views.initialized.contains(scope)
+                && !self.shared_views.seeding.contains(scope)
+                && !self.shared_views.seed_failures.contains_key(scope))
+    }
+
     fn seed_scope_name(&self, scope: &Scope) -> String {
         match scope {
             Scope::Channel(id) => self

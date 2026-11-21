@@ -1644,9 +1644,18 @@ impl Cagents {
                 self.shared_views.registry_unavailable = true;
                 let attach = self.attach_next_restored_agent();
                 let release = self.release_held_terminals();
+                // A first message that waited for its scope starts as a local
+                // chat would: this daemon has no registry to admit it.
+                let sends = self.release_admitted_first_sends();
                 // No shared panes are coming for a scope that waited on them.
                 let default = self.run_deferred_default_pane();
-                Task::batch([attach, release, self.attach_next_restored_agent(), default])
+                Task::batch([
+                    attach,
+                    release,
+                    sends,
+                    self.attach_next_restored_agent(),
+                    default,
+                ])
             }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
