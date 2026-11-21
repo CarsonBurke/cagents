@@ -86,6 +86,17 @@ impl Cache {
         (hash, self.entries.get_mut(&hash).unwrap())
     }
 
+    /// Keeps the entry with the given [`KeyHash`], as [`Cache::allocate`] does,
+    /// through the next [`Cache::trim`].
+    ///
+    /// cagents: a renderer that draws text again without allocating it, because
+    /// its glyphs are already prepared, keeps the shaped text this way.
+    pub fn keep(&mut self, hash: KeyHash) {
+        if self.entries.contains_key(&hash) {
+            let _ = self.recently_used.insert(hash);
+        }
+    }
+
     /// Trims the [`Cache`].
     ///
     /// This will clear the sections of text that have not been used since the last `trim`.

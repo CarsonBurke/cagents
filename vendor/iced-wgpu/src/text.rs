@@ -320,6 +320,8 @@ struct Prepared {
     bounds: Rectangle,
     transformation: Transformation,
     resolution: cryoglyph::Resolution,
+    /// The shaped cached text it drew, kept while the group is reused.
+    cached: Vec<text_cache::KeyHash>,
 }
 
 impl Prepared {
@@ -334,7 +336,11 @@ impl Prepared {
             && self.transformation == transformation
             && self.resolution == resolution
             && self.text.len() == text.len()
-            && self.text.iter().zip(text).all(|(old, new)| same_text(old, new))
+            && self
+                .text
+                .iter()
+                .zip(text)
+                .all(|(old, new)| same_text(old, new))
     }
 }
 
@@ -396,8 +402,17 @@ fn same_text(old: &Text, new: &Text) -> bool {
         ) => {
             new.buffer.strong_count() > 0
                 && sync::Weak::ptr_eq(&old.buffer, &new.buffer)
-                && (old.position, old.color, old.clip_bounds, old_transformation)
-                    == (new.position, new.color, new.clip_bounds, transformation)
+                && (
+                    old.position,
+                    old.color,
+                    old.clip_bounds,
+                    old_transformation,
+                ) == (
+                    new.position,
+                    new.color,
+                    new.clip_bounds,
+                    transformation,
+                )
         }
         _ => false,
     }
@@ -443,15 +458,26 @@ impl State {
                     let transformation = layer_transformation * *transformation;
                     let resolution = viewport.0.resolution();
 
-                    if prepared.as_ref().is_some_and(|prepared| {
-                        prepared.matches(text, bounds, transformation, resolution)
-                    }) && renderer.reuse(&mut atlas)
+                    if let Some(prepared) =
+                        prepared.as_ref().filter(|prepared| {
+                            prepared.matches(
+                                text,
+                                bounds,
+                                transformation,
+                                resolution,
+                            )
+                        })
+                        && renderer.reuse(&mut atlas)
                     {
+                        for &key in &prepared.cached {
+                            self.cache.keep(key);
+                        }
+
                         self.prepare_layer += 1;
                         continue;
                     }
 
-                    let result = prepare(
+                    match prepare(
                         device,
                         queue,
                         &viewport.0,
@@ -462,20 +488,21 @@ impl State {
                         text,
                         bounds,
                         transformation,
-                    );
+                    ) {
+                        Ok(cached) => {
+                            *prepared = Some(Prepared {
+                                text: text.clone(),
+                                bounds,
+                                transformation,
+                                resolution,
+                                cached,
+                            });
 
-                    *prepared = result.is_ok().then(|| Prepared {
-                        text: text.clone(),
-                        bounds,
-                        transformation,
-                        resolution,
-                    });
-
-                    match result {
-                        Ok(()) => {
                             self.prepare_layer += 1;
                         }
                         Err(cryoglyph::PrepareError::AtlasFull) => {
+                            *prepared = None;
+
                             // If the atlas cannot grow, then all bets are off.
                             // Instead of panicking, we will just pray that the result
                             // will be somewhat readable...
@@ -570,7 +597,7 @@ fn prepare(
     sections: &[Text],
     layer_bounds: Rectangle,
     layer_transformation: Transformation,
-) -> Result<(), cryoglyph::PrepareError> {
+) -> Result<Vec<text_cache::KeyHash>, cryoglyph::PrepareError> {
     let mut font_system = font_system().write().expect("Write font system");
     let font_system = font_system.raw();
 
@@ -619,6 +646,14 @@ fn prepare(
                 Some(Allocation::Cache(key))
             }
             Text::Raw { raw, .. } => raw.buffer.upgrade().map(Allocation::Raw),
+        })
+        .collect();
+
+    let cached = allocations
+        .iter()
+        .filter_map(|allocation| match allocation {
+            Some(Allocation::Cache(key)) => Some(*key),
+            _ => None,
         })
         .collect();
 
@@ -755,14 +790,16 @@ fn prepare(
         },
     );
 
-    renderer.prepare(
-        device,
-        queue,
-        encoder,
-        font_system,
-        atlas,
-        viewport,
-        text_areas,
-        &mut cryoglyph::SwashCache::new(),
-    )
+    renderer
+        .prepare(
+            device,
+            queue,
+            encoder,
+            font_system,
+            atlas,
+            viewport,
+            text_areas,
+            &mut cryoglyph::SwashCache::new(),
+        )
+        .map(|()| cached)
 }
