@@ -10551,6 +10551,33 @@ fn compact_folder_root_badge_survives_a_visible_channel() {
         ]
     );
     assert_eq!(unread_counts(&model, &state), vec![1, 1]);
+
+    // A root pane that is only working is listed under In progress, so the
+    // Attention list's chip must not repeat it as a spinner.
+    let busy = compact_attention_terminal(CardId::new());
+    Arc::make_mut(&mut durable).cards.push(busy.clone());
+    Arc::make_mut(&mut durable)
+        .card_scopes
+        .insert(busy.id, model.projects[0].repository.clone());
+    state.set_card_activity(
+        busy.id,
+        Activity {
+            provider: Provider::Omp,
+            state: ActivityState::Working,
+        },
+    );
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(state.project_attention(channel.project_id).working, 1);
+    assert!(
+        in_progress_rows(&model, &state, true)
+            .iter()
+            .any(|row| matches!(row.item, InProgressItem::Card(card) if card.id == busy.id)),
+        "the working root pane has its own In progress row"
+    );
+    assert!(
+        !draws_work_spinner(&project_section(&model, &state, channel.project_id, true)),
+        "the compact Folder chip must not repeat In progress work"
+    );
 }
 
 #[test]
@@ -10654,6 +10681,24 @@ fn folder_root_attention_does_not_duplicate_children_or_change_git_headers() {
         !rows.iter().any(|(name, _)| name == "2"),
         "the project aggregate is not repeated above its expanded children"
     );
+    // A Folder has no checkouts to hide: hiding them still draws its
+    // channels, so its header keeps the same root-only news.
+    let display = std::mem::replace(
+        &mut sidebar.state.sidebar_worktrees,
+        crate::settings::SidebarWorktrees::Hidden,
+    );
+    let (rows, _) = sidebar.attention_frame();
+    assert!(
+        rows.iter()
+            .any(|(name, _)| name == &format!("{plain}, agent working"))
+    );
+    assert_eq!(
+        rows.iter().filter(|(name, _)| name == "1").count(),
+        2,
+        "with checkouts hidden, the root and channel still render only their own unread count"
+    );
+    assert!(!rows.iter().any(|(name, _)| name == "2"));
+    sidebar.state.sidebar_worktrees = display;
     sidebar
         .state
         .apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
