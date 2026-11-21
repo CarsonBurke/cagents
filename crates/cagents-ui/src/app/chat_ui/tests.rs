@@ -7199,7 +7199,7 @@ fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata
         );
         assert!(
             runtime
-                .error
+                .attachment_notice
                 .as_deref()
                 .unwrap()
                 .contains("Clear it before removing")
@@ -7278,6 +7278,7 @@ fn completing_an_image_selection_cancels_an_overlapping_jobs_lease_before_its_io
                 &b
             )
             .unwrap_err()
+            .to_string()
             .contains("cancelled")
         );
         assert!(!runtime.finish_attachment_insert(b.id, "", vec![second]));
@@ -7912,8 +7913,11 @@ fn attach_files_refuses_a_non_image_for_an_images_only_provider() {
         assert!(runtime.attachment_jobs.is_empty());
         assert!(runtime.attachment_order.is_empty());
         assert!(runtime.attachment_chooser_pending.is_none());
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.reported_errors().count(), 0);
+        assert_eq!(runtime.conversation_status_base(false).1, "Ready");
         assert_eq!(
-            runtime.error.as_deref(),
+            runtime.attachment_notice.as_deref(),
             Some(
                 "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
             )
@@ -7959,8 +7963,11 @@ fn a_chooser_refusal_survives_a_deferred_account_change() {
 
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.session, chosen);
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.reported_errors().count(), 0);
+    assert_eq!(runtime.conversation_status_base(false).1, "Draft");
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.attachment_notice.as_deref(),
         Some(
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
@@ -8002,8 +8009,11 @@ fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
 
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.session.launch.provider, Provider::Codex);
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.reported_errors().count(), 0);
+    assert_eq!(runtime.conversation_status_base(false).1, "Draft");
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.attachment_notice.as_deref(),
         Some(
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
@@ -8013,6 +8023,259 @@ fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
     assert_eq!(runtime.pastes_pending, 0);
     assert!(!ticket.active());
     assert!(runtime.attachment_jobs.is_empty());
+}
+
+#[test]
+fn a_paste_refusal_leaves_draft_and_ready_chat_states_unchanged() {
+    let _admission = attachment_draft::test_admission();
+    for draft in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = if draft {
+            draft_chat(&mut app)
+        } else {
+            live_chat(&mut app, Some(KNOWN_THREAD))
+        };
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "keep this draft");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let transcript_count = runtime.snapshot.items.len();
+        let ticket = runtime.begin_attachment_insert();
+        drop(app.handle_chat_ui(Action::PasteRefused(
+            target,
+            ticket,
+            "The current model cannot accept images.",
+        )));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.attachment_notice.as_deref(),
+            Some("The current model cannot accept images.")
+        );
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.reported_errors().count(), 0);
+        assert_eq!(
+            runtime.conversation_status_base(false).1,
+            if draft { "Draft" } else { "Ready" }
+        );
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert_eq!(runtime.pastes_pending, 0);
+        assert_eq!(runtime.snapshot.items.len(), transcript_count);
+        assert!(runtime.failures.is_empty());
+    }
+}
+
+#[test]
+fn dismissing_an_attachment_notice_preserves_the_draft_and_its_files() {
+    let _admission = attachment_draft::test_admission();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    write(&mut app, card, "keep this draft");
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let kept = Attachment::file("/project/kept.txt");
+    runtime.merge_attachments([kept.clone()]);
+    let ticket = runtime.begin_attachment_insert();
+    drop(app.handle_chat_ui(Action::PasteRefused(
+        target,
+        ticket,
+        "The current model cannot accept images.",
+    )));
+    assert!(chat_runtime(&app, card).attachment_notice.is_some());
+    drop(app.handle_chat_ui(Action::DismissAttachmentNotice(target)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.attachment_notice.is_none());
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.composer.text(), "keep this draft");
+    assert_eq!(runtime.attachments, [kept]);
+}
+
+#[test]
+fn the_next_successfully_staged_attachment_clears_an_attachment_notice() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        for image_saved in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let ticket = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .begin_attachment_insert();
+            drop(app.handle_chat_ui(Action::PasteRefused(
+                target,
+                ticket,
+                "The current model cannot accept images.",
+            )));
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            assert!(runtime.attachment_notice.is_some());
+            let ticket = runtime.begin_attachment_insert();
+            let action = if image_saved {
+                Action::ImageSaved(target, ticket, Ok(image.clone()))
+            } else {
+                Action::AttachmentsPrepared(target, ticket, Ok(vec![image.clone()]))
+            };
+            drop(app.handle_chat_ui(action));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.attachment_notice.is_none());
+            assert!(runtime.error.is_none());
+            assert_eq!(runtime.attachments, [image.clone()]);
+        }
+    });
+}
+
+#[test]
+fn sending_a_draft_or_live_message_clears_its_attachment_notice() {
+    let _admission = attachment_draft::test_admission();
+    for draft in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = if draft {
+            draft_chat(&mut app)
+        } else {
+            live_chat(&mut app, Some(KNOWN_THREAD))
+        };
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "send this message");
+        let ticket = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .begin_attachment_insert();
+        drop(app.handle_chat_ui(Action::PasteRefused(
+            target,
+            ticket,
+            "The current model cannot accept images.",
+        )));
+        assert!(chat_runtime(&app, card).attachment_notice.is_some());
+        submit(&mut app, card);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.attachment_notice.is_none());
+        assert!(runtime.error.is_none());
+        if draft {
+            assert!(
+                runtime.queued.is_some(),
+                "the first message starts the draft"
+            );
+        } else {
+            assert!(
+                runtime.commands.in_flight().is_some(),
+                "the live message is sent"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_attachment_notice_is_not_restored_with_a_saved_draft() {
+    let _admission = attachment_draft::test_admission();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    write(&mut app, card, "saved draft");
+    let ticket = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .begin_attachment_insert();
+    drop(app.handle_chat_ui(Action::PasteRefused(
+        target,
+        ticket,
+        "The current model cannot accept images.",
+    )));
+    assert!(chat_runtime(&app, card).attachment_notice.is_some());
+    let saved = app.persistent_workspace();
+    let CardRuntime::Chat(runtime) = app.cards.remove(&card).unwrap() else {
+        unreachable!()
+    };
+    let session = runtime.session.clone();
+    drop(runtime);
+    app.chat_ui = State::with_draft_attachments(
+        saved.chat_drafts.clone(),
+        saved.chat_draft_attachments.clone(),
+    );
+    drop(app.open_chat_draft(card, session));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.composer.text(), "saved draft");
+    assert!(runtime.attachment_notice.is_none());
+    assert!(runtime.error.is_none());
+}
+
+#[test]
+fn attachment_staging_refusals_are_not_reported_as_io_failures() {
+    let _admission = attachment_draft::test_admission();
+    for image_saved in [true, false] {
+        for failed in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            let ticket = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .begin_attachment_insert();
+            let message = if failed {
+                "fixture: file read failed"
+            } else {
+                "fixture: attachment refused"
+            };
+            let error = if failed {
+                clipboard_image::StagingError::Failed(message.into())
+            } else {
+                clipboard_image::StagingError::Refused(message.into())
+            };
+            let action = if image_saved {
+                Action::ImageSaved(target, ticket, Err(error))
+            } else {
+                Action::AttachmentsPrepared(target, ticket, Err(error))
+            };
+            drop(app.handle_chat_ui(action));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.pastes_pending, 0);
+            assert!(runtime.attachments.is_empty());
+            if failed {
+                assert_eq!(runtime.error.as_deref(), Some(message));
+                assert!(runtime.attachment_notice.is_none());
+                assert_eq!(runtime.reported_errors().collect::<Vec<_>>(), [message]);
+                assert_eq!(runtime.conversation_status_base(false).1, "Error");
+            } else {
+                assert_eq!(runtime.attachment_notice.as_deref(), Some(message));
+                assert!(runtime.error.is_none());
+                assert_eq!(runtime.reported_errors().count(), 0);
+                assert_eq!(runtime.conversation_status_base(false).1, "Draft");
+            }
+        }
+    }
+}
+
+#[test]
+fn attachment_completion_refuses_a_model_change_without_marking_the_chat_failed() {
+    let _admission = attachment_draft::test_admission();
+    for image_saved in [true, false] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let ticket = runtime.begin_attachment_insert();
+        Arc::make_mut(&mut runtime.snapshot)
+            .capabilities
+            .attachments = false;
+        let image = Attachment::file("/fixture/image.png");
+        let action = if image_saved {
+            Action::ImageSaved(target, ticket, Ok(image))
+        } else {
+            Action::AttachmentsPrepared(target, ticket, Ok(vec![image]))
+        };
+        drop(app.handle_chat_ui(action));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.attachment_notice.as_deref(),
+            Some(if image_saved {
+                "The current model cannot accept images."
+            } else {
+                "The model or attachment limit changed while files loaded. Attach them again."
+            })
+        );
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.reported_errors().count(), 0);
+        assert_eq!(runtime.conversation_status_base(false).1, "Ready");
+        assert_eq!(runtime.pastes_pending, 0);
+        assert!(runtime.attachments.is_empty());
+    }
 }
 
 #[test]
@@ -8139,7 +8402,7 @@ fn cancelled_chooser_and_repeated_drops_cannot_queue_unbounded_image_staging() {
         );
         assert!(
             chat_runtime(&app, card)
-                .error
+                .attachment_notice
                 .as_deref()
                 .unwrap()
                 .contains("already loading")
@@ -8263,7 +8526,7 @@ fn conflicting_pending_image_selection_refuses_without_erasing_new_prose() {
         assert!(runtime.attachments.is_empty());
         assert!(
             runtime
-                .error
+                .attachment_notice
                 .as_deref()
                 .unwrap()
                 .contains("insertion point changed")
@@ -8381,7 +8644,7 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.pastes_pending, 0);
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.attachment_notice.as_deref(),
         Some("The current model cannot accept images.")
     );
 }
@@ -15090,6 +15353,12 @@ fn a_draft_whose_start_failed_keeps_its_message_and_can_move() {
         runtime.error.as_deref(),
         Some("fixture: executable unavailable")
     );
+    assert!(runtime.attachment_notice.is_none());
+    assert_eq!(
+        runtime.reported_errors().collect::<Vec<_>>(),
+        ["fixture: executable unavailable"]
+    );
+    assert_eq!(runtime.conversation_status_base(false).1, "Error");
     let retirement = retired(&mut app, card);
     let _ = app.update(Message::ChatUi(Action::Retired(retirement, Ok(()))));
 
