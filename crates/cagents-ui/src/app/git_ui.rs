@@ -515,12 +515,21 @@ impl Cagents {
                         if row.github_ready {
                             row.refresh_worktree_pull_requests();
                         }
+                        // A newer remote proof from before this read's HEAD
+                        // waits for the queued recheck rather than clearing
+                        // a still-valid PR in between.
+                        let settled = snapshot
+                            .worktrees
+                            .iter()
+                            .filter(|(record, _)| !snapshot.awaits_archived_proof(record))
+                            .cloned()
+                            .collect::<Vec<_>>();
                         if let Some(GitHubAvailability::Ready { pull_requests, .. }) =
                             self.github_availability.get(&project)
                         {
                             apply_attached_worktree_prs(
                                 row,
-                                &snapshot.worktrees,
+                                &settled,
                                 &pull_requests
                                     .iter()
                                     .map(|(pr, _)| pr.clone())
@@ -547,11 +556,9 @@ impl Cagents {
                                 })
                                 .map(|worktree| worktree.id)
                                 .collect::<HashSet<_>>();
-                            let worktrees = snapshot
-                                .worktrees
-                                .iter()
+                            let worktrees = settled
+                                .into_iter()
                                 .filter(|(record, _)| attached.contains(&record.id))
-                                .cloned()
                                 .collect::<Vec<_>>();
                             apply_attached_worktree_prs(row, &worktrees, &[], &archived);
                         }
@@ -2413,6 +2420,40 @@ mod tests {
         archived_remote(&mut app, project.id, &key, vec![archived]);
         assert_eq!(attached_number(&app), Some(7));
         let (rechecked, plan) = read_worktree(&app, project.id);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((rechecked, plan)),
+        }));
+        assert_eq!(attached_number(&app), Some(7));
+    }
+
+    #[test]
+    fn older_remote_proof_during_local_read_keeps_pr_until_recheck() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, key, archived) = archived_fixture(directory.path());
+        let (mut app, project) = catalog_app(&snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
+        git(
+            directory.path(),
+            &["commit", "--allow-empty", "-m", "later local work"],
+        );
+        let in_flight = read_worktree(&app, project.id);
+        // A refresh started before the commit finishes before the read.
+        archived_remote(&mut app, project.id, &key, vec![archived]);
+        assert_eq!(attached_number(&app), Some(7));
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok(in_flight),
+        }));
+        assert_eq!(attached_number(&app), Some(7));
+        let (rechecked, plan) = read_worktree(&app, project.id);
+        assert_eq!(
+            rechecked.archived.associations[0].validated_head,
+            rechecked.worktrees[0].0.head_oid.as_deref().unwrap()
+        );
         drop(app.update_git(Action::Read {
             project: project.id,
             generation: 1,
