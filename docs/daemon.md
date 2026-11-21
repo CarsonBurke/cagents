@@ -147,14 +147,16 @@ cagents daemon stop --confirm
 - Stopping the daemon also stops the jobs of each terminal it hosts, not only
   its shell. The shell and every process still in its session or started from
   it, `nohup` and disowned jobs included, get a hangup and half a second to
-  exit before they are killed. That includes another cagents instance started
-  from the terminal, unless it left the session. A process that left the
-  session with `setsid` and whose parent has exited is not the terminal's and
-  keeps running. The stopping daemon never treats itself as a job of a terminal
-  it was started from. If a job outlives a shell that had already exited, or
-  the stop cannot confirm that the terminal's processes ended, its holder stays
-  running for the next daemon to adopt, as after a crash, and the stopping
-  daemon reports the error instead of a clean stop.
+  exit before they are killed. A process started from the terminal keeps
+  running only once it has left the session with `setsid` and the process that
+  launched it has exited. Otherwise it ends with the terminal along with
+  everything it started, so another cagents instance launched from the terminal
+  ends with its own terminals and chats. The stopping daemon never treats
+  itself as a job of a terminal it was started from. If a job outlives a shell
+  that had already exited, or the stop cannot confirm that the terminal's
+  processes ended, its holder stays running for the next daemon to adopt, as
+  after a crash, and the stopping daemon reports the error instead of a clean
+  stop.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
 - Inside a hosted session, `terminal write` and `close` reach only the

@@ -6144,7 +6144,11 @@ fn confirm_exited_family(
     // Usually the family is already gone. A process outside it (one that left
     // the session, such as `setsid -f`) may keep the PTY open indefinitely;
     // cleanup never claims or depends on it, so its PTY is no reason to wait.
-    if ended(deadline)? {
+    // A first census that fails or runs late defers to the final one below.
+    let drained = deadline
+        .checked_sub(CHILD_SHUTDOWN_CENSUS_RESERVE)
+        .unwrap_or(deadline);
+    if ended(drained).unwrap_or(false) {
         return Ok(());
     }
     // A job can fork between thaw and HUP, outside the tracked set. Give the
@@ -6156,9 +6160,6 @@ fn confirm_exited_family(
         events: 0,
         revents: 0,
     };
-    let drained = deadline
-        .checked_sub(CHILD_SHUTDOWN_CENSUS_RESERVE)
-        .unwrap_or(deadline);
     loop {
         let remaining = drained.saturating_duration_since(Instant::now());
         // SAFETY: one live, owned descriptor; this only observes readiness.
