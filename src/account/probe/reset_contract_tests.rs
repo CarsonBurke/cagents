@@ -492,7 +492,12 @@ for line in sys.stdin:
     );
 
     let first = run(codex.clone(), cache.clone(), true).await;
-    let Outcome::Answered { snapshot, .. } = first else {
+    let Outcome::Answered {
+        identity: Some(codex_reported),
+        snapshot,
+        ..
+    } = first
+    else {
         panic!("fake Codex usage read failed: {first:?}")
     };
     assert_eq!(
@@ -564,6 +569,71 @@ for line in sys.stdin:
     .await
     .unwrap();
     assert_eq!(response, ConsumeStatus::NoCredit);
+    // Exercise the production transport's guard against the same shared
+    // eligibility rules used before dispatch. Missing credit cannot spend.
+    for (expected, eligible) in [
+        (
+            Identity {
+                email: Some(" CODEX@FIXTURE.INVALID ".into()),
+                plan: Some("another plan".into()),
+                ..codex_reported.clone()
+            },
+            true,
+        ),
+        (
+            Identity {
+                email: Some("other@fixture.invalid".into()),
+                ..codex_reported.clone()
+            },
+            false,
+        ),
+        (
+            Identity {
+                organization: Some("Previously known organization".into()),
+                ..codex_reported.clone()
+            },
+            false,
+        ),
+        (
+            Identity {
+                disputed_by: Some("other@fixture.invalid".into()),
+                ..codex_reported.clone()
+            },
+            false,
+        ),
+        (
+            Identity {
+                email: None,
+                ..codex_reported.clone()
+            },
+            false,
+        ),
+    ] {
+        assert_eq!(
+            super::super::resets::same_login(Some(&codex_reported), Some(&expected)),
+            eligible
+        );
+        let response = reset_consume::codex_consume(
+            &codex,
+            &root.join("bin/codex"),
+            None,
+            "missing-credit",
+            "codex-no-credit",
+            &expected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response,
+            if eligible {
+                ConsumeStatus::NoCredit
+            } else {
+                ConsumeStatus::Unavailable
+            },
+            "expected identity: {expected:?}"
+        );
+        assert_eq!(state(&root, "codex")["consume_count"], 2);
+    }
     // Reusing a key for another account must fail before another submit.
     let response = consume(
         codex,
