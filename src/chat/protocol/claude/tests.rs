@@ -11910,7 +11910,6 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
         Some(snapshot.detail.as_str())
     );
     assert!(!handle.owns_work());
-    assert_eq!(snapshot.items.len(), 100);
     assert!(snapshot.has_earlier);
     assert!(
         handle
@@ -11946,11 +11945,19 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
         assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
         run
     };
-    assert_eq!(prompts(&snapshot), 120..220, "the newest history first");
+    // A saved page is 100 records, fewer than the window's 128 items, so the
+    // window fills itself from the next page before the reader asks.
+    let snapshot = crate::test_timing::wait_for("the window to fill from saved pages", || {
+        handle
+            .snapshot(None)
+            .filter(|snapshot| snapshot.items.len() == 128)
+    });
+    assert_eq!(prompts(&snapshot), 92..220, "the newest history first");
+    assert!(snapshot.has_earlier);
     // Each earlier page slides the window back by half of it, so the
     // history is read a window at a time until its start, and every prompt
     // is shown on the way.
-    let mut seen = std::collections::BTreeSet::from_iter(120..220);
+    let mut seen = std::collections::BTreeSet::from_iter(92..220);
     let mut snapshot = snapshot;
     let mut pages = 0;
     while snapshot.has_earlier {

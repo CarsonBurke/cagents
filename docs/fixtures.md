@@ -91,6 +91,11 @@ paragraph count enough to exercise provider history paging with prose alone.
 `--untitled` leaves out the conversation's name and `--first-prompt TEXT`
 replaces the first checkpoint, for a channel that only its first prompt can
 name, which lies outside the loaded window.
+`--working 16` gives each exchange 16 commands, each with the hook records
+Claude Code writes around a tool call, and a one-line answer. A saved page of
+100 records then holds about two exchanges, as in an agent's long working
+session, so opening the conversation shows whether the transcript fills its
+window from further pages without the reader asking.
 The generator writes under `HOME/.claude`; always run it through
 `native-evidence env`, which supplies the private fixture HOME. Stop and
 `save-seed` after setup to reuse exactly the same conversation on both sides.
