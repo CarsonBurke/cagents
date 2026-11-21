@@ -78,7 +78,7 @@ fn unfocused_file_editor_cannot_overwrite_a_finished_primary_selection() {
     let editors = [widget::Id::unique(), widget::Id::unique()];
     let viewport = Rectangle::with_size(Size::new(640.0, 200.0));
     let limits = layout::Limits::new(Size::ZERO, viewport.size());
-    let mut tree = Tree::new(&strip(&contents.borrow(), cards, &containers, &editors));
+    let mut tree = Tree::new(strip(&contents.borrow(), cards, &containers, &editors));
     let mut clipboard = PrimaryClipboard::default();
     let mut send = |event: mouse::Event, point: Point| {
         let mut actions = Vec::new();
