@@ -2,9 +2,9 @@
 # Offline GitHub CLI for native-evidence fixtures, installed as the fixture's
 # `gh`. Without the switch it refuses everything, so no forge state appears.
 # With $FIXTURE/home/.config/fixture-forge present it answers as a gh signed in
-# to github.com whose repositories have no pull requests, using the output
-# shapes the app's parsers in src/github.rs expect from the real CLI. Nothing
-# here reaches the network.
+# to github.com whose repositories have only the seeded pull requests below,
+# using the output shapes the app's parsers in src/github.rs expect from the
+# real CLI. Nothing here reaches the network.
 #
 # Optional, with the switch on:
 #   home/.config/fixture-forge-prs.json  An array of pull requests in the shape
@@ -12,7 +12,8 @@
 #       state, headRefName, baseRefName, updatedAt, headRepositoryOwner and
 #       headRepository. Each repository lists
 #       those whose url is under https://github.com/OWNER/NAME/pull/, in file
-#       order.
+#       order. An optional fixtureReviewRequests counts the times the viewer
+#       was asked to review it.
 #   home/.config/fixture-forge-delay  Seconds every answer waits first.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
 #       modification time, whenever the app resolves a repository. Any PNG,
