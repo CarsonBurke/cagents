@@ -2331,14 +2331,16 @@ word. So wait for and click one distinctive word of it, such as
 observe` gives. When a wait might fail, save `drive observe` and a `shot`
 before the step exits, so the failed run shows what was on screen.
 
-To capture a theme, set it in the fixture rather than the desktop. Setting
-`color-scheme` with `gsettings` in the nested session has no effect on the app,
-even with `--portal gtk`, and the fixture's System theme draws light there.
-The app reads `app_theme` from settings.toml only at startup, so close the
-window, edit `$CAGENTS_EVIDENCE_FIXTURE/config/cagents-development/settings.toml`
-with `evidence env`, and run `relaunch` in the background. The daemon and its
-terminals stay running. Put the value back afterwards if a later step depends
-on the seeded theme.
+To capture a theme, set `app_theme` in the fixture's settings.toml,
+`$CAGENTS_EVIDENCE_FIXTURE/config/cagents-development/settings.toml`
+(`cagents-development-NAME` under `--instance NAME`), with `evidence env`. The
+app reads it only at startup, so close the app window, edit the file, and run
+`relaunch` in the background. The daemon and its terminals keep running. The
+fixture's System theme draws light. In a session started with `--portal gtk`,
+`evidence nested gsettings set org.gnome.desktop.interface color-scheme
+prefer-dark`, run while the app is open, also turns System dark, but only from
+the app's next start: the running app does not follow it. Set `app_theme` back afterwards if a later step
+expects the System theme.
 
 The individual commands work too, for a session you drive step by step:
 
