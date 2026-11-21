@@ -306,6 +306,11 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
             .collect(),
         None => keyed_windows(limits),
     };
+    // An explicit empty scoped list observes emptiness; omitted scoped data
+    // carries no evidence about that part.
+    let scoped_observed_at = (limits["model_scoped"].as_array().is_some_and(Vec::is_empty)
+        && limits["limits"].as_array().is_none_or(Vec::is_empty))
+    .then_some(observed_at);
     let credits = credits(limits);
     // An object (or metadata about credits/plan) is not positive quota.
     // Missing or malformed windows must not authorize automatic routing.
@@ -324,6 +329,7 @@ pub fn parse_usage(response: &Value, observed_at: u64) -> UsageSnapshot {
         status,
         ordinary_usage_allowed: None,
         observed_at,
+        scoped_observed_at,
         source: UsageSource::Probe,
         plan,
         plan_display_name: metadata.display_name,
@@ -832,8 +838,14 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
 /// all - keeps its probed figure. Fable's window is the probe's, whatever
 /// version of the name Claude scoped it to. The binding mark is dropped
 /// because the event does not say which window binds; the fullest window
-/// stands in until the next probe.
+/// stands in until the next probe. A model-only report keeps the account's
+/// status evidence and observation time until account-wide usage arrives.
 pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at: u64) {
+    let account_wide = update.status.is_some()
+        || update
+            .windows
+            .iter()
+            .any(|window| window.kind != WindowKind::Scoped);
     snapshot
         .windows
         .retain(|window| window.key != RETIRED_FABLE);
@@ -854,7 +866,15 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
     for window in &mut snapshot.windows {
         window.binding = false;
     }
-    snapshot.observed_at = snapshot.observed_at.max(observed_at);
+    if !account_wide {
+        snapshot.scoped_observed_at = Some(observed_at);
+        if matches!(snapshot.status, UsageStatus::Ok | UsageStatus::Warning) {
+            snapshot.refresh_status(false, snapshot.status == UsageStatus::Warning);
+        }
+        return;
+    }
+    snapshot.observed_at = observed_at;
+    snapshot.scoped_observed_at = None;
     snapshot.source = UsageSource::Live;
     snapshot.detail = None;
     match update.status {
@@ -868,8 +888,407 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
 
 #[cfg(test)]
 mod tests {
+    use super::super::UsageMerge;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_account_report_is_not_hidden_behind_newer_model_evidence() {
+        use super::super::{LiveReport, routing};
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.3, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut usage, now + 3_000, now + 3_000));
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(rejection).apply(&mut usage, now + 2_000, now + 4_000));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert_eq!(usage.observed_at, now + 2_000);
+        assert_eq!(usage.scoped_observed_at, Some(now + 3_000));
+        assert_eq!(
+            usage
+                .windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped)
+                .unwrap()
+                .used,
+            0.3
+        );
+        assert!(!routing::available(&usage, now + 4_000));
+    }
+
+    #[test]
+    fn account_only_reports_keep_the_model_parts_own_stamp() {
+        use super::super::LiveReport;
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20},
+            ]}}),
+            now,
+        );
+        for (stamp, report) in [
+            (
+                now + 3_000,
+                json!({"status": "allowed", "rateLimitType": "seven_day_overage_included",
+                "utilization": 0.3, "resetsAt": 1_893_456_000_i64}),
+            ),
+            (
+                now + 4_000,
+                json!({"status": "rejected", "rateLimitType": "five_hour"}),
+            ),
+            (
+                now + 3_500,
+                json!({"status": "allowed", "rateLimitType": "seven_day_overage_included",
+                "utilization": 0.2, "resetsAt": 1_893_456_000_i64}),
+            ),
+        ] {
+            let update = parse_rate_limit_event(&report).unwrap();
+            assert!(LiveReport::Claude(update).apply(&mut usage, stamp, now + 5_000));
+        }
+        assert_eq!(usage.observed_at, now + 4_000);
+        assert_eq!(usage.scoped_observed_at, Some(now + 3_500));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert_eq!(
+            usage
+                .windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped)
+                .unwrap()
+                .used,
+            0.2
+        );
+    }
+
+    #[test]
+    fn providers_without_independent_scopes_keep_whole_snapshot_replacement() {
+        let now = 1_790_000_000_000;
+        let existing = UsageSnapshot::state(UsageStatus::Limited, "existing", now);
+        let tied = UsageSnapshot::state(UsageStatus::Ok, "same timestamp", now);
+        assert_eq!(
+            existing.merged(&tied, now, UsageMerge::OrderedSnapshot),
+            tied
+        );
+        let older = UsageSnapshot::state(UsageStatus::Ok, "delayed", now - 1_000);
+        assert_eq!(
+            existing.merged(&older, now, UsageMerge::OrderedSnapshot),
+            existing
+        );
+        let future = UsageSnapshot::state(
+            UsageStatus::Ok,
+            "future",
+            now + 10 * super::super::schedule::CLOCK_SLACK,
+        );
+        assert_eq!(
+            existing.merged(&future, now, UsageMerge::OrderedSnapshot),
+            future
+        );
+        assert_eq!(
+            future.merged(&existing, now, UsageMerge::OrderedSnapshot),
+            existing
+        );
+        assert_eq!(
+            future.merged(&existing, now, UsageMerge::OrderedSnapshotWithoutRollback),
+            future,
+            "reset completion preserves a newer whole snapshot after clock rollback",
+        );
+        assert_eq!(
+            existing.merged(&tied, now, UsageMerge::OrderedSnapshotWithoutRollback),
+            tied,
+        );
+        assert_eq!(
+            existing.merged(&older, now, UsageMerge::IncomingSnapshot),
+            older,
+            "registration accepts the incoming whole snapshot unconditionally",
+        );
+    }
+
+    #[test]
+    fn equal_stamp_status_ties_are_restrictive_and_commutative() {
+        let now = 1_790_000_000_000;
+        let statuses = [
+            UsageStatus::Ok,
+            UsageStatus::Warning,
+            UsageStatus::Unavailable,
+            UsageStatus::Limited,
+            UsageStatus::NeedsLogin,
+        ];
+        for (index, &left_status) in statuses.iter().enumerate() {
+            for &right_status in &statuses[index..] {
+                let mut left = UsageSnapshot::state(left_status, "left", now);
+                left.source = UsageSource::Live;
+                left.plan = Some("plan a".into());
+                let mut right = UsageSnapshot::state(right_status, "right", now);
+                right.plan = Some("plan z".into());
+                right.ordinary_usage_allowed = Some(false);
+                let merged = left.merged(&right, now, UsageMerge::IndependentScopes);
+                assert_eq!(merged.status, right_status);
+                assert_eq!(
+                    merged,
+                    right.merged(&left, now, UsageMerge::IndependentScopes)
+                );
+                for snapshot in [&left, &right, &merged] {
+                    assert_eq!(
+                        *snapshot,
+                        snapshot.merged(snapshot, now, UsageMerge::IndependentScopes)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equal_stamp_figures_keep_restrictive_windows_in_both_parts() {
+        let now = 1_790_000_000_000;
+        let mut left = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":90,"resets_at":"2030-01-01T00:00:00Z"},
+                {"kind":"weekly_scoped","percent":80,"scope":{"surface":"Fable"},
+                    "resets_at":"2030-01-01T00:00:00Z"},
+                {"kind":"weekly_all","percent":10}
+            ]}}),
+            now,
+        );
+        let mut right = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":20,"resets_at":"2030-01-02T00:00:00Z"},
+                {"kind":"weekly_scoped","percent":30,"scope":{"surface":"Fable"},
+                    "resets_at":"2030-01-02T00:00:00Z"},
+                {"kind":"weekly_scoped","percent":40,"scope":{"surface":"Opus"}}
+            ]}}),
+            now,
+        );
+        left.scoped_observed_at = Some(now);
+        right.scoped_observed_at = Some(now);
+        left.windows[0].label = "left metadata".into();
+        right.windows[0].label = "right metadata".into();
+        let merged = left.merged(&right, now, UsageMerge::IndependentScopes);
+        assert_eq!(
+            merged,
+            right.merged(&left, now, UsageMerge::IndependentScopes)
+        );
+        assert_eq!(merged.windows.len(), 4);
+        for (key, used) in [("session", 0.9), ("weekly_scoped:Fable", 0.8)] {
+            let window = merged
+                .windows
+                .iter()
+                .find(|window| window.key == key)
+                .unwrap();
+            assert_eq!(window.used, used);
+            assert_eq!(window.resets_at, Some(1_893_542_400));
+        }
+        assert_eq!(
+            merged
+                .windows
+                .iter()
+                .find(|window| window.key == "session")
+                .unwrap()
+                .label,
+            "right metadata"
+        );
+        for snapshot in [&left, &right, &merged] {
+            assert_eq!(
+                *snapshot,
+                snapshot.merged(snapshot, now, UsageMerge::IndependentScopes)
+            );
+        }
+    }
+
+    fn scoped_merge_fixture(now: u64) -> UsageSnapshot {
+        let mut snapshot = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":20},
+                {"kind":"weekly_scoped","percent":80,"scope":{"surface":"Fable"}}
+            ]}}),
+            now,
+        );
+        snapshot.scoped_observed_at = Some(now);
+        snapshot
+    }
+
+    #[test]
+    fn a_newer_snapshot_without_scoped_evidence_keeps_scoped_figures_and_stamp() {
+        let now = 1_790_000_000_000;
+        let old = scoped_merge_fixture(now);
+        let newer = parse_usage(
+            &json!({"rate_limits":{"limits":[
+                {"kind":"session","percent":30}
+            ]}}),
+            now + 1_000,
+        );
+        let merged = old.merged(&newer, now + 1_000, UsageMerge::IndependentScopes);
+        assert_eq!(merged.observed_at, now + 1_000);
+        assert_eq!(merged.scoped_observed_at, Some(now));
+        assert_eq!(
+            merged
+                .windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped),
+            old.windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped)
+        );
+        assert_eq!(
+            merged,
+            newer.merged(&old, now + 1_000, UsageMerge::IndependentScopes)
+        );
+    }
+
+    #[test]
+    fn account_only_reports_preserve_scoped_evidence_across_clock_rollback() {
+        use super::super::{LiveReport, schedule};
+        let now = 1_790_000_000_000;
+        let mut snapshot = scoped_merge_fixture(now);
+        let future = now + 10 * schedule::CLOCK_SLACK;
+        snapshot.scoped_observed_at = Some(future);
+        let scoped = snapshot
+            .windows
+            .iter()
+            .find(|window| window.kind == WindowKind::Scoped)
+            .unwrap()
+            .clone();
+        let update =
+            parse_rate_limit_event(&json!({"status":"rejected","rateLimitType":"five_hour"}))
+                .unwrap();
+        assert!(LiveReport::Claude(update).apply(&mut snapshot, now + 1_000, now + 1_000));
+        assert_eq!(snapshot.observed_at, now + 1_000);
+        assert_eq!(snapshot.status, UsageStatus::Limited);
+        assert_eq!(snapshot.scoped_observed_at, Some(future));
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .find(|window| window.kind == WindowKind::Scoped),
+            Some(&scoped)
+        );
+    }
+
+    #[test]
+    fn equal_effective_scoped_stamps_use_a_deterministic_representation() {
+        let now = 1_790_000_000_000;
+        let explicit = scoped_merge_fixture(now);
+        let mut implicit = explicit.clone();
+        implicit.scoped_observed_at = None;
+        let merged = explicit.merged(&implicit, now, UsageMerge::IndependentScopes);
+        assert_eq!(
+            merged,
+            implicit.merged(&explicit, now, UsageMerge::IndependentScopes)
+        );
+        assert_eq!(merged.scoped_observed_at, Some(now));
+        for snapshot in [&explicit, &implicit] {
+            assert_eq!(
+                *snapshot,
+                snapshot.merged(snapshot, now, UsageMerge::IndependentScopes)
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicitly_empty_scoped_observation_replaces_older_figures() {
+        let now = 1_790_000_000_000;
+        let old = scoped_merge_fixture(now);
+        let empty = parse_usage(
+            &json!({"rate_limits":{
+                "five_hour":{"utilization":30},"model_scoped":[]
+            }}),
+            now + 1_000,
+        );
+        assert_eq!(empty.scoped_observed_at, Some(now + 1_000));
+        let merged = old.merged(&empty, now + 1_000, UsageMerge::IndependentScopes);
+        assert_eq!(merged, empty);
+        assert_eq!(
+            merged,
+            empty.merged(&old, now + 1_000, UsageMerge::IndependentScopes)
+        );
+        assert!(
+            !merged
+                .windows
+                .iter()
+                .any(|window| window.kind == WindowKind::Scoped)
+        );
+        assert_eq!(
+            merged.merged(&old, now + 1_000, UsageMerge::IndependentScopes),
+            merged
+        );
+    }
+
+    #[test]
+    fn independent_parts_merge_commutatively_and_idempotently() {
+        use super::super::{LiveReport, schedule};
+        let now = 1_790_000_000_000;
+        let allowed = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let mut rejected = allowed.clone();
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(rejection).apply(&mut rejected, now + 2_000, now + 2_000));
+        let mut model_figures = allowed;
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.3, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut model_figures, now + 3_000, now + 3_000));
+        let mut rollback = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 100, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let future = now + 10 * schedule::CLOCK_SLACK;
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.9, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut rollback, future, future));
+        let refreshed = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 10, "resets_at": "2030-01-01T00:00:00Z"},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 20,
+                    "scope": {"model": {"display_name": "Fable", "id": null}}},
+            ]}}),
+            now + 3_000,
+        );
+        for (left, right) in [(&rejected, &model_figures), (&rollback, &refreshed)] {
+            let merged = left.merged(right, now + 4_000, UsageMerge::IndependentScopes);
+            assert_eq!(
+                merged,
+                right.merged(left, now + 4_000, UsageMerge::IndependentScopes)
+            );
+            for snapshot in [left, right, &merged] {
+                assert_eq!(
+                    *snapshot,
+                    snapshot.merged(snapshot, now + 4_000, UsageMerge::IndependentScopes)
+                );
+            }
+        }
+        let combined = rejected.merged(&model_figures, now + 4_000, UsageMerge::IndependentScopes);
+        assert_eq!(combined.status, UsageStatus::Limited);
+        assert_eq!(combined.observed_at, now + 2_000);
+        assert_eq!(combined.scoped_observed_at, Some(now + 3_000));
+        assert_eq!(
+            rollback.merged(&refreshed, now + 4_000, UsageMerge::IndependentScopes),
+            refreshed
+        );
+    }
 
     #[test]
     fn a_record_names_the_login_its_status_reports() {
@@ -1324,6 +1743,167 @@ mod tests {
         assert!(super::super::routing::needs_alternate(&usage, now));
         assert!(!super::super::routing::available(&usage, now));
         assert_eq!(parse_rate_limit_event(&json!({"status": "allowed"})), None);
+    }
+
+    #[test]
+    fn a_model_only_report_keeps_an_account_wide_rejection() {
+        use super::super::{LiveReport, routing};
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                {"kind": "weekly_all", "percent": 40, "resets_at": "2030-01-07T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        assert_eq!(usage.status, UsageStatus::Ok);
+        assert!(routing::available(&usage, now));
+        let ordinary_windows = usage.windows.clone();
+
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(rejection.windows.is_empty());
+        assert!(LiveReport::Claude(rejection).apply(&mut usage, now + 1, now + 1));
+        assert_eq!(usage.windows, ordinary_windows);
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert!(!routing::available(&usage, now + 1));
+
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "seven_day_overage_included",
+            "utilization": 1.0, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut usage, now + 2, now + 2));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        assert!(!routing::available(&usage, now + 2));
+        assert!(routing::needs_alternate(&usage, now + 2));
+        assert_eq!(usage.observed_at, now + 1);
+        assert_eq!(&usage.windows[..2], ordinary_windows);
+        assert_eq!(usage.windows[2].key, FABLE);
+        assert_eq!(usage.windows[2].used, 1.0);
+
+        let recovery = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.3,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(recovery).apply(&mut usage, now + 3, now + 3));
+        assert_eq!(usage.status, UsageStatus::Ok);
+        assert_eq!(usage.observed_at, now + 3);
+        assert!(routing::available(&usage, now + 3));
+    }
+
+    #[test]
+    fn a_delayed_model_only_report_cannot_rewind_a_newer_window() {
+        use super::super::{LiveReport, routing};
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                {"kind": "weekly_all", "percent": 40, "resets_at": "2030-01-07T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        assert!(routing::available(&usage, now));
+        let scoped = parse_rate_limit_event(&json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.1, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut usage, now + 3_000, now + 3_000));
+        assert_eq!(usage.observed_at, now);
+        assert!(routing::available(&usage, now + 3_000));
+        let latest = usage.clone();
+        let delayed = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "seven_day_overage_included",
+            "utilization": 1.0, "resetsAt": (now / 1_000 + 1) as i64,
+        }))
+        .unwrap();
+        assert!(!LiveReport::Claude(delayed).apply(&mut usage, now + 2_000, now + 4_000));
+        assert_eq!(usage, latest);
+        let fable = usage
+            .windows
+            .iter()
+            .find(|window| window.key == FABLE)
+            .unwrap();
+        assert_eq!(fable.used, 0.1);
+        assert_eq!(fable.resets_at, Some(1_893_456_000));
+        assert!(routing::available(&usage, now + 4_000));
+    }
+
+    #[test]
+    fn a_model_only_report_does_not_renew_account_wide_evidence() {
+        use super::super::{LiveReport, routing, schedule};
+
+        let now = 1_790_000_000_000;
+        let later = now + schedule::DISPLAY_STALE_AFTER + 1;
+        for status in [
+            UsageStatus::Ok,
+            UsageStatus::Warning,
+            UsageStatus::Limited,
+            UsageStatus::NeedsLogin,
+            UsageStatus::Unavailable,
+        ] {
+            let mut usage = parse_usage(
+                &json!({"rate_limits": {"limits": [
+                    {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+                ]}}),
+                now,
+            );
+            usage.status = status;
+            usage.detail = Some("existing account detail".into());
+            let previous = usage.clone();
+            let scoped = parse_rate_limit_event(&json!({
+                "status": "allowed", "rateLimitType": "seven_day_overage_included",
+                "utilization": 0.1, "resetsAt": 1_893_456_000_i64,
+            }))
+            .unwrap();
+            assert!(LiveReport::Claude(scoped).apply(&mut usage, later, later));
+            assert_eq!(usage.observed_at, previous.observed_at, "{status:?}");
+            assert_eq!(usage.source, previous.source, "{status:?}");
+            assert_eq!(usage.detail, previous.detail, "{status:?}");
+            assert_eq!(usage.status, previous.status, "{status:?}");
+            assert!(!routing::available(&usage, later), "{status:?}");
+            assert_eq!(usage.windows[1].key, FABLE);
+            assert_eq!(usage.windows[1].used, 0.1);
+        }
+    }
+
+    #[test]
+    fn account_windows_in_a_model_report_can_replace_a_rejection() {
+        use super::super::{LiveReport, routing};
+
+        let now = 1_790_000_000_000;
+        let mut usage = parse_usage(
+            &json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 20, "resets_at": "2030-01-01T00:00:00Z"},
+            ]}}),
+            now,
+        );
+        let rejection = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "five_hour",
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(rejection).apply(&mut usage, now + 1, now + 1));
+        assert_eq!(usage.status, UsageStatus::Limited);
+        let update = parse_rate_limit_event(&json!({
+            "status": "rejected", "rateLimitType": "seven_day_overage_included",
+            "unifiedWindows": {
+                "five_hour": {"utilization": 0.25, "resetsAt": 1_893_456_000_i64},
+                "seven_day_overage_included": {"utilization": 1.0, "resetsAt": 1_893_456_000_i64},
+            },
+        }))
+        .unwrap();
+        assert_eq!(update.status, None);
+        assert!(LiveReport::Claude(update).apply(&mut usage, now + 2, now + 2));
+        assert_eq!(usage.observed_at, now + 2);
+        assert_eq!(usage.source, UsageSource::Live);
+        assert_eq!(usage.status, UsageStatus::Warning);
+        assert_eq!(usage.windows[0].used, 0.25);
+        assert!(routing::available(&usage, now + 2));
     }
 
     #[test]

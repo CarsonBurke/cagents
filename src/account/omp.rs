@@ -202,6 +202,7 @@ fn snapshot(reading: &[&Row], observed_at: u64) -> UsageSnapshot {
         windows,
         credits: None,
         observed_at,
+        scoped_observed_at: None,
         source: UsageSource::Recorded,
         plan: None,
         plan_display_name: None,

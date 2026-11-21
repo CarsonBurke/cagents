@@ -958,6 +958,19 @@ impl Cagents {
             return Task::none();
         }
         if let Some(snapshot) = snapshot {
+            let now = now_ms();
+            let provider = state.account.provider;
+            let mut merged = state.snapshot.as_ref().map_or_else(
+                || snapshot.clone(),
+                |current| {
+                    let mode = if provider == Provider::Claude {
+                        UsageMerge::IndependentScopes
+                    } else {
+                        UsageMerge::OrderedSnapshotWithoutRollback
+                    };
+                    current.merged(&snapshot, now, mode)
+                },
+            );
             let mut merged_inventory = false;
             if status == ConsumeStatus::Reset
                 && let Some(attempt) = submitted
@@ -974,27 +987,17 @@ impl Cagents {
             }
             state.schedule.observe(snapshot.observed_at);
             if state.inventory_observed_at.is_none_or(|known| {
-                snapshot.observed_at >= known
-                    || known > now_ms().saturating_add(schedule::CLOCK_SLACK)
+                snapshot.observed_at >= known || known > now.saturating_add(schedule::CLOCK_SLACK)
             }) {
                 state.inventory_observed_at = Some(snapshot.observed_at);
-                if let Some(current) = state.snapshot.as_mut()
-                    && current.observed_at > snapshot.observed_at
-                {
-                    merge_complete_inventory(current, &snapshot);
+                if merged != snapshot {
+                    merge_complete_inventory(&mut merged, &snapshot);
                     merged_inventory = true;
                 }
             }
-            if state
-                .snapshot
-                .as_ref()
-                .is_none_or(|current| current.observed_at <= snapshot.observed_at)
-            {
-                state.snapshot = Some(snapshot);
-            }
+            state.snapshot = Some(merged);
             state.failure = None;
-            let provider = state.account.provider;
-            self.account_ui.now_ms = now_ms();
+            self.account_ui.now_ms = now;
             let publish = if merged_inventory {
                 self.save_live(id)
             } else {
@@ -2289,6 +2292,8 @@ pub(in crate::app) mod tests {
                 }
             }
             snapshot.resets[0].available_count = 0;
+            snapshot.observed_at = now + 1;
+            snapshot.scoped_observed_at = Some(now + 1);
             drop(app.finish_usage_reset(
                 id.clone(),
                 owner,
@@ -2852,6 +2857,91 @@ pub(in crate::app) mod tests {
         assert_eq!(entries[0].1.snapshot.windows, partial.windows);
         assert_eq!(entries[0].1.snapshot.observed_at, now + 2);
         assert_eq!(entries[0].1.snapshot.resets[0].available_count, 1);
+    }
+    #[test]
+    fn reset_completion_replaces_future_model_evidence_without_republishing_old_limits() {
+        let now = now_ms();
+        let t0 = now - 10_000;
+        let t3 = now - 1_000;
+        let future = now + 10 * schedule::CLOCK_SLACK;
+        let mut limited = account::claude::parse_usage(
+            &serde_json::json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 100},
+            ]}}),
+            t0,
+        );
+        let scoped = account::claude::parse_rate_limit_event(&serde_json::json!({
+            "status": "allowed", "rateLimitType": "seven_day_overage_included",
+            "utilization": 0.9, "resetsAt": 1_893_456_000_i64,
+        }))
+        .unwrap();
+        assert!(LiveReport::Claude(scoped).apply(&mut limited, future, future));
+        assert_eq!(limited.status, UsageStatus::Limited);
+        assert_eq!(limited.observed_at, t0);
+        assert_eq!(limited.scoped_observed_at, Some(future));
+        let grant = reset(ResetScope::AccountSession);
+        limited.resets.push(grant.clone());
+        let mut refreshed = account::claude::parse_usage(
+            &serde_json::json!({"rate_limits": {"limits": [
+                {"kind": "session", "percent": 10},
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 20,
+                    "scope": {"model": {"display_name": "Fable", "id": null}}},
+            ]}}),
+            t3,
+        );
+        let mut remaining = grant.clone();
+        remaining.available_count = 1;
+        refreshed.resets.push(remaining);
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.cache = Some(cache.clone());
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 1941);
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.snapshot = Some(limited);
+        state.inventory_observed_at = Some(t0);
+        state
+            .reset
+            .prepare(grant.clone(), 2, None, "accounts".into());
+        let attempt = state.reset.submit(&grant, 2, None).unwrap();
+        let owner = state.owner;
+        let key = state.account.cache_key().unwrap();
+        cache
+            .store(
+                &key,
+                Entry {
+                    identity: None,
+                    snapshot: refreshed.clone(),
+                },
+            )
+            .unwrap();
+
+        drop(app.finish_usage_reset(
+            id.clone(),
+            owner,
+            attempt.key,
+            Ok(ConsumeOutcome {
+                status: ConsumeStatus::Reset,
+                message: None,
+                snapshot: Some(refreshed.clone()),
+            }),
+        ));
+
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.snapshot.as_ref(), Some(&refreshed));
+        assert_eq!(state.inventory_observed_at, Some(t3));
+        assert!(account::routing::available(
+            state.snapshot.as_ref().unwrap(),
+            now
+        ));
+        drop(app.save_live(id));
+        let entries = app.account_ui.take_live_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.snapshot, refreshed);
+        store_live(&cache, entries, Vec::new());
+        let cached = cache.load(now).remove(&key).unwrap();
+        assert_eq!(cached.snapshot, refreshed);
+        assert!(account::routing::available(&cached.snapshot, now));
     }
     #[test]
     fn account_buttons_name_the_selected_grant_while_limit_buttons_keep_the_generic_action() {
