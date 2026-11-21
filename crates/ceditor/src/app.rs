@@ -5136,7 +5136,11 @@ impl Application for Editor {
         }
         if let Some(pending) = self.pending_discard() {
             return Some(dialog_overlay(
-                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                sidebar::discard_confirmation_dialog(
+                    pending,
+                    widget::Id::new("dialog.question.DiscardChanges"),
+                )
+                .map(Message::Sidebar),
                 Message::Sidebar(SidebarAction::CancelDiscard),
             ));
         }

@@ -16795,7 +16795,11 @@ impl Application for Cagents {
         // because it is about to destroy work that exists nowhere else.
         if let Some(pending) = self.sidebar_state.pending_discard() {
             return Some(dialog_ui::overlay(
-                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                sidebar::discard_confirmation_dialog(
+                    pending,
+                    dialog_ui::Question::DiscardChanges.surface_id(),
+                )
+                .map(Message::Sidebar),
                 Some(Message::Sidebar(SidebarAction::CancelDiscard)),
                 1.0,
             ));

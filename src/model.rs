@@ -124,6 +124,12 @@ evidence_type!(BootId);
 evidence_type!(HostSessionId);
 evidence_type!(HostIncarnation);
 
+/// Read the current Linux boot identifier, without imposing a caller's validation policy.
+pub fn current_boot_id() -> std::io::Result<BootId> {
+    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    Ok(BootId::new(value.trim()))
+}
+
 /// Durable card existence. Closing and closed cards remain durable so an
 /// interrupted close cannot resurrect a card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
