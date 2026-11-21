@@ -1134,11 +1134,12 @@ fn stacked_row<'a>(
         widget::container(
             widget::row::with_children(figures.collect::<Vec<_>>()).spacing(COLUMN_SPACING),
         )
+        // In line with the name, as the resets and failures beneath are.
         .padding(Padding {
             top: 0.0,
             right: space::M,
             bottom: space::M,
-            left: space::M,
+            left: NAME_INSET,
         })
         .into(),
     ])

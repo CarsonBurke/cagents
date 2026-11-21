@@ -3565,7 +3565,7 @@ impl SettingsField {
 
     /// The label the settings pane shows for this setting, which is also
     /// the name its messages use for it.
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         use crate::notifications::Field;
         match self {
             Self::Notifications(Field::Enabled) => "System notifications",
@@ -3642,7 +3642,7 @@ impl SettingsField {
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
             Self::Confirm(settings::Confirmation::CloseActiveTerminal) => "Active processes",
-            Self::UseProvider(_) => "Providers",
+            Self::UseProvider(provider) => provider.label(),
             Self::FocusFollowsMouse => "Pane focus",
             Self::LinkOpenGesture => "System browser gesture",
             Self::PullRequestOpenTarget => "Open pull requests in",
