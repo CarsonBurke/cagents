@@ -10048,6 +10048,8 @@ impl Cagents {
             || self.pane_close_owned(card)
             || self.chat_start_pending(card)
             || self.chat_retry_blocked(card)
+            // Its pane says Retry can't start anything, and disables it.
+            || self.terminal_retry_unavailable(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
             || self.terminal_start_in_flight(card)
@@ -12586,7 +12588,24 @@ impl Cagents {
                                     );
                                 }
                                 controls
-                            } else { vec![
+                            } else if self.terminal_retry_unavailable(id) { vec![
+                                // What the pane says to do instead.
+                                crate::ui_controls::button::primary("Open new terminal")
+                                    .id(card_control_id(id, "failure.new_terminal"))
+                                    .on_press_maybe((!self.terminal_close_in_progress(id)).then_some(
+                                        Message::TerminalFailure(terminal_failure::Action::NewTerminal(id)),
+                                    ))
+                                    .into(),
+                                // Disabled rather than hidden, so the pane
+                                // still says why Retry can't help.
+                                crate::interaction::tooltip(
+                                    crate::ui_controls::button::secondary(retry_label)
+                                        .id(card_control_id(id, "retry"))
+                                        .name(format!("{retry_label} {}", labels.type_label))
+                                        .description(terminal_failure::RETRY_UNAVAILABLE),
+                                    terminal_failure::RETRY_UNAVAILABLE,
+                                ),
+                            ] } else { vec![
                                 (if self.terminal_retry_is_blocked(id) {
                                     crate::ui_controls::button::secondary(retry_label)
                                 } else {

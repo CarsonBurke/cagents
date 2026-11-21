@@ -159,6 +159,9 @@ fn retry_after_restoring_picker(provider: &str) -> String {
     )
 }
 const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
+/// Retry would refuse to start anything, so the pane doesn't offer it. The
+/// disabled Retry's tooltip and accessible description repeat this.
+pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent because it won't rerun the options it was launched with. Open a new terminal to keep working.";
 /// What Retry launches in place of a terminal.
 enum NewTerminal {
     Resume,
@@ -166,6 +169,9 @@ enum NewTerminal {
     Picker(&'static str),
     Shell,
     Fresh,
+    /// Retry follows a recovery plan that refuses to replay this launch, so it
+    /// would start nothing.
+    Refused,
 }
 /// What recovery launches once a terminal's daemon is gone.
 fn recovered_terminal(session: &TerminalSession) -> NewTerminal {
@@ -175,6 +181,9 @@ fn recovered_terminal(session: &TerminalSession) -> NewTerminal {
             crate::agent::Provider::recognize_launch(&recipe).map_or("the agent", |p| p.label()),
         ),
         Ok((_, crate::upgrade::RecoveryKind::Shell)) => NewTerminal::Shell,
+        // Retry reruns the saved command unless it follows this plan, in
+        // which case it refuses before starting anything.
+        Err(_) if super::relaunch_follows_recovery_plan(session) => NewTerminal::Refused,
         Err(_) => NewTerminal::Fresh,
     }
 }
@@ -197,6 +206,7 @@ fn new_terminal_consequence(session: &TerminalSession) -> Cow<'static, str> {
         NewTerminal::Picker(provider) => retry_picker(provider).into(),
         NewTerminal::Shell => RETRY_SHELL.into(),
         NewTerminal::Fresh => RETRY_FRESH.into(),
+        NewTerminal::Refused => RETRY_UNAVAILABLE.into(),
     }
 }
 /// What Retry will do once the daemon has restored its terminals. A pane with a
@@ -210,6 +220,7 @@ fn restoring_consequence(session: &TerminalSession) -> Cow<'static, str> {
         NewTerminal::Picker(provider) => retry_after_restoring_picker(provider).into(),
         NewTerminal::Shell => RETRY_AFTER_RESTORING_SHELL.into(),
         NewTerminal::Fresh => RETRY_AFTER_RESTORING_FRESH.into(),
+        NewTerminal::Refused => RETRY_UNAVAILABLE.into(),
     }
 }
 /// What Retry does for a terminal whose daemon is gone: the plan recovery will
@@ -220,6 +231,7 @@ fn replacement_consequence(session: &TerminalSession) -> Cow<'static, str> {
         NewTerminal::Picker(provider) => retry_picker(provider).into(),
         NewTerminal::Shell => RETRY_SHELL.into(),
         NewTerminal::Fresh => RETRY_FRESH.into(),
+        NewTerminal::Refused => RETRY_UNAVAILABLE.into(),
     }
 }
 /// The same plan, once Retry has established that the process is gone.
@@ -237,6 +249,7 @@ fn after_check_consequence(session: &TerminalSession) -> &'static str {
         NewTerminal::Fresh => {
             "Retry checks that it has stopped, then runs the saved command again from the beginning in this pane."
         }
+        NewTerminal::Refused => RETRY_UNAVAILABLE,
     }
 }
 /// What Retry will do once the terminal holding this work has stopped.
@@ -246,6 +259,7 @@ fn blocked_consequence(session: &TerminalSession) -> &'static str {
         NewTerminal::Picker(_) => RETRY_BLOCKED_PICKER,
         NewTerminal::Shell => RETRY_BLOCKED_SHELL,
         NewTerminal::Fresh => RETRY_BLOCKED_FRESH,
+        NewTerminal::Refused => RETRY_UNAVAILABLE,
     }
 }
 /// What a pane says once Retry was refused for this missing terminal, when
@@ -361,6 +375,7 @@ impl Details {
             || matches!(
                 self.consequence.as_ref(),
                 RETRY_REFUSED
+                    | RETRY_UNAVAILABLE
                     | RETRY_BLOCKED_RETIRED
                     | RETRY_BLOCKED_RESUME
                     | RETRY_BLOCKED_PICKER
@@ -573,6 +588,8 @@ impl std::fmt::Debug for Permit {
 #[derive(Debug, Clone)]
 pub enum Action {
     Copy(CardId),
+    /// A new shell beside a pane that can't restart.
+    NewTerminal(CardId),
     Reveal(CardId),
     Probed {
         card: CardId,
@@ -608,7 +625,7 @@ impl Action {
     }
 
     pub(super) fn is_user_action(&self) -> bool {
-        matches!(self, Self::Copy(_) | Self::Reveal(_))
+        matches!(self, Self::Copy(_) | Self::Reveal(_) | Self::NewTerminal(_))
     }
 }
 /// Probes are retried by the update tail, which runs only for messages that
@@ -955,6 +972,14 @@ impl Cagents {
                 if matches!(details.code, "terminal_retired" | "terminal_superseded")
         )
     }
+    /// Retry would start nothing whatever else changes, so the pane disables it.
+    pub(super) fn terminal_retry_unavailable(&self, card: CardId) -> bool {
+        matches!(
+            self.cards.get(&card),
+            Some(CardRuntime::Failed(Failure::Terminal(details)))
+                if details.consequence == RETRY_UNAVAILABLE
+        )
+    }
     pub(super) fn terminal_retry_pending(&self, card: CardId) -> bool {
         self.terminal_failure.attempts.contains_key(&card)
     }
@@ -1020,6 +1045,17 @@ impl Cagents {
                     iced::clipboard::write(details.copy_text()).map(cosmic::Action::App)
                 })
                 .unwrap_or_else(Task::none),
+            Action::NewTerminal(card) => {
+                // The pane's own directory, except on a remote device, where
+                // a new terminal opens where any other would.
+                let directory = (!crate::device::is_remote())
+                    .then(|| self.card_state(card))
+                    .flatten()
+                    .and_then(super::worktree_ui::card_directory)
+                    .map(Path::to_path_buf)
+                    .or_else(|| self.terminal_directory());
+                directory.map_or_else(Task::none, |directory| self.add_terminal(directory))
+            }
             Action::Probed {
                 card,
                 operation,
@@ -1913,6 +1949,125 @@ mod tests {
             app.terminal_details(card).unwrap().consequence,
             RETRY_RESUME
         );
+    }
+    /// The (enabled, description) of the failure pane's button whose name
+    /// starts with `name`, as assistive technology reads it.
+    fn rendered_button(app: &Cagents, card: CardId, name: &str) -> Option<(bool, Option<String>)> {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = app.card_view(card, true, false);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(900.0, 900.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let retries: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|entry| {
+                entry.node().role() == iced_accessibility::accesskit::Role::Button
+                    && entry
+                        .node()
+                        .label()
+                        .is_some_and(|label| label.starts_with(name))
+            })
+            .map(|entry| {
+                (
+                    !entry.node().is_disabled(),
+                    entry.node().description().map(str::to_owned),
+                )
+            })
+            .collect();
+        assert!(retries.len() <= 1, "one {name} button");
+        retries.into_iter().next()
+    }
+    #[test]
+    fn retry_is_disabled_when_recovery_refuses_to_replay_the_observed_launch() {
+        let (mut app, card, _) = app_and_session();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.launch.program = "claude".into();
+        session.launch.arguments = vec!["--unknown-option".into()];
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        // Recognised as Claude, but both the saved and the observed launch
+        // carry an option recovery won't replay.
+        session.resume_hint =
+            Some(serde_json::json!({"version": 2, "recipe": session.launch}).to_string());
+        assert!(super::super::terminal_start_mode(session).is_err());
+        assert!(super::super::fresh_terminal_relaunch(session).is_err());
+        let saved = session.clone();
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.consequence, RETRY_UNAVAILABLE);
+        assert!(details.expects_no_launch());
+        assert!(app.terminal_retry_unavailable(card));
+        assert_eq!(
+            rendered_button(&app, card, "Retry"),
+            Some((false, Some(RETRY_UNAVAILABLE.to_owned())))
+        );
+        assert_eq!(
+            rendered_button(&app, card, "Open new terminal"),
+            Some((true, None))
+        );
+
+        // A Retry message that arrives anyway starts nothing and leaves the
+        // pane as it was.
+        drop(app.retry_card(card));
+        assert!(!app.terminal_retry_pending(card));
+        assert!(!app.terminal_start_in_flight(card));
+        assert!(matches!(
+            &app.card_state(card).unwrap().kind,
+            CardKind::Terminal(session) if *session == saved
+        ));
+        assert_eq!(
+            app.terminal_details(card).unwrap().consequence,
+            RETRY_UNAVAILABLE
+        );
+
+        // Without an observed launch Retry reruns the saved command, and says so.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.resume_hint = None;
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        assert_eq!(app.terminal_details(card).unwrap().consequence, RETRY_FRESH);
+        assert!(!app.terminal_retry_unavailable(card));
+        assert_eq!(rendered_button(&app, card, "Retry"), Some((true, None)));
+        assert_eq!(rendered_button(&app, card, "Open new terminal"), None);
+    }
+    #[test]
+    fn open_new_terminal_starts_a_shell_in_the_failed_panes_directory() {
+        let (mut app, card, session) = app_and_session();
+        let before: Vec<CardId> = app.durable.cards.iter().map(|state| state.id).collect();
+        drop(app.update_terminal_failure(Action::NewTerminal(card)));
+        let added: Vec<_> = app
+            .durable
+            .cards
+            .iter()
+            .filter(|state| !before.contains(&state.id))
+            .collect();
+        let [added] = added.as_slice() else {
+            panic!("exactly one new card, got {}", added.len())
+        };
+        let CardKind::Terminal(shell) = &added.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            shell.launch.working_directory,
+            session.launch.working_directory
+        );
+        assert!(Action::NewTerminal(card).is_user_action());
     }
     #[test]
     fn a_refused_retry_does_not_suggest_reconnecting() {

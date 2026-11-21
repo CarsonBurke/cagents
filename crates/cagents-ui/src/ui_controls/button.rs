@@ -37,6 +37,7 @@ pub struct Button<'a, Message> {
     shown: usize,
     weight: Weight,
     name: Option<Cow<'a, str>>,
+    description: Option<Cow<'a, str>>,
     icon: Option<widget::icon::Handle>,
     on_press: Option<Message>,
     width: Length,
@@ -70,6 +71,7 @@ impl<'a, Message> Button<'a, Message> {
             shown: 0,
             weight,
             name: None,
+            description: None,
             icon: None,
             on_press: None,
             width: Length::Shrink,
@@ -92,6 +94,14 @@ impl<'a, Message> Button<'a, Message> {
     /// the button acts on. Defaults to the label it shows.
     pub fn name(mut self, name: impl Into<Cow<'a, str>>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// The accessible description: what the name alone leaves out, such as
+    /// why a disabled button can't be pressed. Pair it with a tooltip that
+    /// shows the same text on hover.
+    pub fn description(mut self, description: impl Into<Cow<'a, str>>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -149,6 +159,7 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
             shown,
             weight,
             name,
+            description,
             icon,
             on_press,
             width,
@@ -201,6 +212,9 @@ impl<'a, Message: Clone + 'a> From<Button<'a, Message>> for Element<'a, Message>
         .on_press_maybe(on_press);
         if let Some(id) = id {
             button = button.id(id);
+        }
+        if let Some(description) = description {
+            button = button.description(description);
         }
         button.into()
     }
