@@ -207,14 +207,18 @@ fn typing_into(
     terminal: TerminalId,
     control: Control,
 ) -> Result<(), ProtocolError> {
-    let target = match control {
+    // What it types there, and what it may do instead.
+    let (target, instead) = match control {
         Control::Delegated { agent, console } => {
             let name = agent
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("agent {}", agent.id));
             let surface = if console { "console" } else { "session" };
-            format!("{name}'s {surface}")
+            (
+                format!("{name}'s {surface}"),
+                "Use `cagents agent message` instead.",
+            )
         }
         Control::Own => {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -225,13 +229,14 @@ fn typing_into(
             else {
                 return Ok(());
             };
-            if crate::agent_execution::console_agent(launch).is_some() {
+            let target = if crate::agent_execution::console_agent(launch).is_some() {
                 "its own console".to_owned()
             } else if let Some((provider, _)) = crate::agent::Provider::launched(launch) {
-                format!("terminal {terminal}, which runs {}", provider.label())
+                format!("{}'s terminal {terminal}", provider.label())
             } else {
                 return Ok(());
-            }
+            };
+            (target, "A person can type there in cagents.")
         }
     };
     let authority = host
@@ -246,7 +251,7 @@ fn typing_into(
         return Ok(());
     }
     Err(denied(format!(
-        "This agent can't type into {target} because its approvals are limited. Use `cagents agent message` instead."
+        "This agent can't type into {target} because its approvals are limited. {instead}"
     )))
 }
 

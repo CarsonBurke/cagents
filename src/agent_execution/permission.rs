@@ -644,6 +644,10 @@ mod tests {
             (Provider::Antigravity, "plan", ReadOnly),
             (Provider::Antigravity, "default", Ask),
             (Provider::Antigravity, "acceptEdits", AutoEdit),
+            (Provider::Muse, "manual", Ask),
+            (Provider::Muse, "untrusted", Ask),
+            (Provider::Muse, "bypassPermissions", Full),
+            (Provider::Muse, "never", Full),
         ] {
             assert_eq!(
                 Mode::parse(provider, mode).map(Mode::tier),
@@ -668,9 +672,60 @@ mod tests {
             (Provider::Antigravity, "auto"),
             (Provider::Antigravity, "bypassPermissions"),
             (Provider::Muse, "default"),
+            (Provider::Muse, "auto"),
+            (Provider::Muse, "on-request"),
+            (Provider::Muse, "dontAsk"),
+            (Provider::Muse, "plan"),
         ] {
             assert_eq!(Mode::parse(provider, mode), None, "{provider:?} {mode}");
         }
+    }
+
+    /// Every mode this module names is one its provider takes, so a pinned
+    /// or inherited mode always launches.
+    #[test]
+    fn every_named_mode_is_one_its_provider_takes() {
+        for provider in Provider::ALL {
+            for mode in Mode::strictest(provider) {
+                assert_eq!(
+                    provider.check_permission_mode(&mode.name()),
+                    Ok(()),
+                    "{provider:?} {mode:?}"
+                );
+            }
+        }
+        for sandbox in [
+            Sandbox::ReadOnly,
+            Sandbox::WorkspaceWrite,
+            Sandbox::DangerFullAccess,
+        ] {
+            assert!(
+                Provider::Codex
+                    .permission_sandboxes()
+                    .contains(&sandbox.name())
+            );
+        }
+        assert_eq!(Provider::Codex.permission_sandboxes().len(), 3);
+        // A Muse child of a Claude agent that asks is pinned to asking, and
+        // a Muse agent's own mode is inherited by its own name.
+        let claude = Ceiling::confirmed(Provider::Claude, Some("acceptEdits"));
+        assert_eq!(claude.child(Provider::Muse, None).as_deref(), Ok("manual"));
+        assert!(claude.child(Provider::Muse, Some("never")).is_err());
+        assert_eq!(
+            claude.child(Provider::Muse, Some("untrusted")).as_deref(),
+            Ok("untrusted")
+        );
+        assert!(
+            Ceiling::confirmed(Provider::Claude, Some("plan"))
+                .child(Provider::Muse, None)
+                .is_err()
+        );
+        let muse = Ceiling::confirmed(Provider::Muse, Some("bypassPermissions"));
+        assert_eq!(muse.tier(), Tier::Full);
+        assert_eq!(
+            muse.child(Provider::Muse, None).as_deref(),
+            Ok("bypassPermissions")
+        );
     }
 
     #[test]

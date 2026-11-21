@@ -383,18 +383,26 @@ impl Provider {
     /// The permission modes this provider takes, as its help and errors name
     /// them: "a, b or c", then any sandbox suffix or terminal aliases.
     pub fn permission_mode_choices(self) -> String {
-        fn list(names: &[&str]) -> String {
+        fn list<S: AsRef<str>>(names: &[S]) -> String {
             match names {
                 [] => String::new(),
-                [only] => (*only).to_owned(),
-                [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+                [only] => only.as_ref().to_owned(),
+                [rest @ .., last] => {
+                    let rest: Vec<_> = rest.iter().map(AsRef::as_ref).collect();
+                    format!("{} or {}", rest.join(", "), last.as_ref())
+                }
             }
         }
         let mut choices = list(self.permission_modes());
         if let sandboxes @ [_, ..] = self.permission_sandboxes() {
-            let sandboxes: Vec<_> = sandboxes.iter().map(|sandbox| format!("/{sandbox}")).collect();
-            let sandboxes: Vec<_> = sandboxes.iter().map(String::as_str).collect();
-            choices = format!("{choices}, each optionally followed by {}", list(&sandboxes));
+            let sandboxes: Vec<_> = sandboxes
+                .iter()
+                .map(|sandbox| format!("/{sandbox}"))
+                .collect();
+            choices = format!(
+                "{choices}, each optionally followed by {}",
+                list(&sandboxes)
+            );
         }
         if let aliases @ [_, ..] = self.permission_mode_aliases() {
             choices = format!("{choices}, or its terminal's {}", list(aliases));
@@ -405,8 +413,11 @@ impl Provider {
     /// Refuses a permission mode this provider has no such mode for, such as
     /// another provider's, naming the ones it has.
     pub fn check_permission_mode(self, mode: &str) -> Result<(), String> {
-        let (named, sandbox) = mode.split_once('/').map_or((mode, None), |(named, sandbox)| (named, Some(sandbox)));
-        let sandbox_known = sandbox.is_none_or(|sandbox| self.permission_sandboxes().contains(&sandbox));
+        let (named, sandbox) = mode
+            .split_once('/')
+            .map_or((mode, None), |(named, sandbox)| (named, Some(sandbox)));
+        let sandbox_known =
+            sandbox.is_none_or(|sandbox| self.permission_sandboxes().contains(&sandbox));
         if sandbox_known && self.permission_modes().contains(&named)
             || self.permission_mode_aliases().contains(&mode)
         {

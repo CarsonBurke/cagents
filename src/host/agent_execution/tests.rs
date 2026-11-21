@@ -5881,7 +5881,7 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     assert_eq!(
         error.message,
         format!(
-            "This agent can't type into terminal {provider_id}, which runs Claude Code, because its approvals are limited. Use `cagents agent message` instead."
+            "This agent can't type into Claude Code's terminal {provider_id} because its approvals are limited. A person can type there in cagents."
         )
     );
     change(AGENT, started).unwrap();
