@@ -207,7 +207,11 @@ impl Cagents {
         };
         runtime.error = None;
         self.chat_ui.view_refusals.remove(&target.card);
-        self.retry_view_seed(&scope);
+        // A pane moved elsewhere since sends where it is now; the channel it
+        // left is not offered again for it.
+        if self.draft_start_scope(target.card).as_ref() == Some(&scope) {
+            self.retry_view_seed(&scope);
+        }
         self.handle_chat_ui(Action::Submit(target, PromptMode::Send))
     }
 

@@ -528,3 +528,81 @@ fn a_held_message_never_starts_outside_the_channel_it_was_sent_in() {
         Some("first message")
     );
 }
+
+/// A message the registry refused for a channel still seeding.
+fn refused_channel() -> Window {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    let scope = window.scope.clone();
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::SeedRefused {
+                scope: scope.clone(),
+                attempt: window.app.shared_views.seed_attempts[&scope],
+                error: "The registry could not store these panes".into(),
+            }),
+    );
+    assert!(window.app.chat_error(window.card).is_some());
+    window
+}
+
+#[test]
+fn a_refused_pane_moved_to_another_channel_loses_the_refusal() {
+    let mut window = refused_channel();
+    let Scope::Channel(channel) = window.scope.clone() else {
+        unreachable!("the window's scope is its channel")
+    };
+    let other = ChannelId::new();
+    let durable = Arc::make_mut(&mut window.app.durable);
+    let mut moved = durable
+        .channels
+        .iter()
+        .find(|candidate| candidate.id == channel)
+        .unwrap()
+        .clone();
+    for candidate in &mut durable.channels {
+        candidate.cards.retain(|card| *card != window.card);
+    }
+    moved.id = other;
+    moved.cards = vec![window.card];
+    durable.channels.push(moved);
+    window.app.workspace_model.views.push(View::empty(other));
+    window
+        .app
+        .shared_views
+        .initialized
+        .insert(Scope::Channel(other));
+    drop(window.app.reconcile_shared_views());
+
+    assert!(window.app.chat_error(window.card).is_none());
+    assert_eq!(
+        window.app.chat_composer_text(window.card).as_deref(),
+        Some("first message")
+    );
+    // No Retry is left to offer the channel the pane left.
+    drop(
+        window
+            .app
+            .handle_chat_ui(Action::RetryRefusedView(window.target)),
+    );
+    assert!(!window.app.shared_views.seeding.contains(&window.scope));
+}
+
+#[test]
+fn retry_while_its_worktree_is_removed_keeps_the_refusal() {
+    let mut window = refused_channel();
+    let refusal = window.app.chat_error(window.card).unwrap().to_owned();
+    window.app.project_ui.begin_deleting(PathBuf::from("/repo"));
+    let retry = window
+        .app
+        .handle_chat_ui(Action::RetryRefusedView(window.target));
+    assert_eq!(retry.units(), 0);
+    assert!(!window.app.shared_views.seeding.contains(&window.scope));
+    assert_eq!(window.app.chat_error(window.card), Some(refusal.as_str()));
+    assert_eq!(
+        window.app.chat_composer_text(window.card).as_deref(),
+        Some("first message")
+    );
+}
