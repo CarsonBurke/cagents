@@ -105,9 +105,11 @@ fn signals(item: &Item, writing: bool) -> Option<Vec<Signal>> {
     let settled = |status: &ToolStatus| !status.is_live();
     Some(match &item.content {
         ItemContent::Text { text, thinking, .. } => match item.role {
+            // Thinking names nothing however far it has been written.
+            _ if *thinking => Vec::new(),
             // A half-written URL would name another pull request.
             Role::User | Role::Assistant if writing => return None,
-            Role::User | Role::Assistant if !thinking => transcript::prose(text),
+            Role::User | Role::Assistant => transcript::prose(text),
             _ => Vec::new(),
         },
         ItemContent::Command {
@@ -448,6 +450,22 @@ mod tests {
             },
             false,
         );
+        assert!(items.again().is_empty());
+    }
+
+    #[test]
+    fn thinking_being_written_is_not_asked_for_again() {
+        let mut items = Items::default();
+        let thinking = item(
+            "t",
+            Role::Assistant,
+            ItemContent::Text {
+                text: "maybe https://github.com/owner/repo/pull/3".into(),
+                thinking: true,
+                phase: Phase::Final,
+            },
+        );
+        assert!(read(&mut items, changed(vec![thinking]), true).is_empty());
         assert!(items.again().is_empty());
     }
 
