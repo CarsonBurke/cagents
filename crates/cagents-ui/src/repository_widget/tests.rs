@@ -9472,6 +9472,18 @@ fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
 }
 
 #[test]
+fn a_failed_file_list_read_reports_what_git_said() {
+    let root = tempdir().unwrap();
+    let Err(error) = read_repository_files(root.path(), None, &CancellationToken::new()) else {
+        panic!("a directory outside any repository has no file list");
+    };
+    assert!(
+        error.starts_with("Git failed while listing repository files: fatal: not a git repository"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_superseded_or_abandoned_file_list_read_is_cancelled() {
     let card = CardId::new();
     let mut runtime = RepositoryRuntime::new(RepositoryView {

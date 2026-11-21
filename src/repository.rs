@@ -3980,9 +3980,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Reads the file list and v2 status through the bounded, cancellable executor.
     ///
     /// It runs only `git ls-files` and `git status` and adds no enrichment of its
-    /// own: no file contents, line counts or remote queries. `git status` itself
-    /// still reads the branch's upstream for ahead/behind counts and may hash
-    /// changed files to tell whether they were modified. Each Git command uses
+    /// own: no file contents, line counts, remote queries or ahead/behind
+    /// counts. `git status` may still hash changed files to tell whether they
+    /// were modified. Each Git command uses
     /// [`MAX_FILE_INVENTORY_OUTPUT_BYTES`]; a process, output-limit or parse
     /// failure returns an error rather than an incomplete inventory.
     ///
@@ -4002,9 +4002,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .output_limits(MAX_FILE_INVENTORY_OUTPUT_BYTES, DEFAULT_STDERR_LIMIT),
             cancellation,
         )?;
+        // `--no-ahead-behind`: a file list has no use for the walk that
+        // counts commits against the upstream, and a fetch that moved the
+        // upstream must not make an unchanged list look changed.
         let status_output = self.run_checked(
             &self
-                .status_command(worktree)
+                .git_read(
+                    worktree,
+                    [
+                        "status",
+                        "--porcelain=v2",
+                        "--branch",
+                        "--no-ahead-behind",
+                        "--untracked-files=all",
+                        "-z",
+                    ],
+                )
                 .output_limits(MAX_FILE_INVENTORY_OUTPUT_BYTES, DEFAULT_STDERR_LIMIT),
             cancellation,
         )?;
@@ -7693,6 +7706,11 @@ mod tests {
                 commands[1]
                     .arguments
                     .contains(&OsString::from("--untracked-files=all"))
+            );
+            assert!(
+                commands[1]
+                    .arguments
+                    .contains(&OsString::from("--no-ahead-behind"))
             );
             for command in commands.iter() {
                 assert_eq!(command.stdout_limit, MAX_FILE_INVENTORY_OUTPUT_BYTES);

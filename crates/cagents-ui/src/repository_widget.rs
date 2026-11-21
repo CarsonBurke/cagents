@@ -52,8 +52,9 @@ use crate::{
     repository::{
         CancellationToken, ChangeArea, ChangeKind, ChangedPath, ConflictKind, DiffBasis,
         DiffContent, DiffSide, FileInventoryDigest, FileInventoryRead, HistoryRequest,
-        HistoryRevision, MAX_DIFF_SIDE_BYTES, RepoPath, RepositoryService, RepositorySnapshot,
-        StatusSnapshot, ValidatedRefName, WorkingFiles,
+        HistoryRevision, MAX_DIFF_SIDE_BYTES, MAX_FILE_INVENTORY_OUTPUT_BYTES, ProcessFailureKind,
+        RepoPath, RepositoryError, RepositoryService, RepositorySnapshot, StatusSnapshot,
+        ValidatedRefName, WorkingFiles,
     },
     ui_controls::{Icon, icon_button},
 };
@@ -9199,8 +9200,22 @@ fn read_repository_files(
 ) -> Result<FileListRead, String> {
     match RepositoryService::system("git")
         .file_inventory(worktree, previous, cancellation)
-        .map_err(|error| format!("Git failed while listing repository files: {error}"))?
-    {
+        .map_err(|error| {
+            let detail = match error {
+                RepositoryError::Process(failure)
+                    if failure.kind == ProcessFailureKind::OutputLimit =>
+                {
+                    format!(
+                        "the list is larger than {} MiB",
+                        MAX_FILE_INVENTORY_OUTPUT_BYTES / (1024 * 1024)
+                    )
+                }
+                // Git's own `fatal:` line, rather than an exit status.
+                RepositoryError::Process(failure) => failure.reported_detail(),
+                error => error.to_string(),
+            };
+            format!("Git failed while listing repository files: {detail}")
+        })? {
         FileInventoryRead::Unchanged => Ok(FileListRead::Unchanged),
         FileInventoryRead::Changed(inventory) => Ok(FileListRead::Listed(
             Some(inventory.digest),
