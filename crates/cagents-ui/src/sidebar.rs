@@ -7500,8 +7500,8 @@ fn header_selection(
 }
 
 /// A project's news that none of the channel and pane rows drawn under it
-/// shows: news of a pane a search leaves out, or of no pane at all. While
-/// checkouts are hidden its header says this, or nobody would.
+/// shows: news of a pane a search leaves out, or of no pane at all. Folder
+/// roots and hidden checkouts need this on their header, or nobody shows it.
 fn undrawn_attention<'a>(
     state: &SidebarState,
     project: ProjectId,
@@ -7548,20 +7548,20 @@ fn project_view<'a>(
     let has_children =
         worktree_count > 0 || !project.channels.is_empty() || !project.cards.is_empty();
     let attention_list = project.state.filter == SidebarFilter::Attention;
-    // Folder roots are their own destination: there is no child worktree row
-    // to display their activity. Expanded roots show only that root's news;
-    // collapsed headers keep the existing aggregate over all children. The
-    // Attention list gives every pane and channel it counts a row of its own,
-    // so an expanded header there repeats none of it. Hidden checkouts give
-    // their panes rows too, so the header says only what none of the rows
-    // drawn does: news of a pane a search leaves out, or of no pane at all.
+    // Collapsed headers keep the aggregate over all children. The Attention
+    // list gives every pane and channel it counts a row of its own, so an
+    // expanded header there repeats none of it. Otherwise an expanded header
+    // says only what none of the rows drawn under it does: a Folder root,
+    // which is its own destination with no row, whatever the checkout
+    // display, and for hidden checkouts news of a pane a search leaves out
+    // or of no pane at all.
     let header_attention = if !expanded {
         project
             .state
             .shown_attention(project.state.project_attention(project_id))
     } else if attention_list {
         AttentionSummary::default()
-    } else if project.state.lists_panes(entity) {
+    } else if project.state.lists_panes(entity) || entity.kind == ProjectKind::Folder {
         undrawn_attention(
             project.state,
             project_id,
@@ -7571,13 +7571,7 @@ fn project_view<'a>(
     } else if !project.state.shows_checkouts(project_id) {
         project.state.project_attention(project_id)
     } else {
-        entity
-            .folder_key()
-            .map_or_else(AttentionSummary::default, |key| {
-                project
-                    .state
-                    .worktree_attention(project_id, key.worktree_id)
-            })
+        AttentionSummary::default()
     };
     let project_identity = project_identity_row(
         entity,
@@ -8006,14 +8000,17 @@ fn compact_project<'a>(
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
     let has_children = !members.is_empty() || !entity.operations.is_empty();
-    // Every row with news is drawn below the chip with its own badges (see
-    // `compact_rail_shows_channel`), so the chip speaks for the whole
-    // project only while none are: repeating them would count the same news
-    // twice. Hidden checkouts leave news to their panes' rows, and the chip
-    // keeps what no drawn row carries, as the expanded header does.
+    // Drawn children carry their own badges, so only an empty group needs
+    // the full project aggregate. In All, a Folder root has no row of its
+    // own and hidden checkouts leave their panes' rows, so the chip keeps
+    // what no drawn channel or pane carries. The Attention list draws every
+    // row it counts, in its main section or In progress, so its chip
+    // repeats none of them, as the expanded header does not.
     let badge = if members.is_empty() {
         Some(project.state.project_attention(entity.id))
-    } else if project.state.lists_panes(entity) {
+    } else if project.state.lists_panes(entity)
+        || (entity.kind == ProjectKind::Folder && project.state.filter == SidebarFilter::All)
+    {
         Some(undrawn_attention(
             project.state,
             entity.id,
