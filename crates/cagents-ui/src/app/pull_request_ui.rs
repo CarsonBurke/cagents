@@ -213,8 +213,9 @@ impl Cagents {
     }
 
     /// The panes on screen whose inspectors are drawn, docked, over the
-    /// pane or collapsed to its rail. An inspector the strip has scrolled away keeps its state but watches nothing, so many
-    /// panes cost only what is in view.
+    /// pane or collapsed to its rail. An inspector the strip has scrolled
+    /// away keeps its state but watches nothing, so many panes cost only
+    /// what is in view.
     fn mounted_inspectors(&self) -> impl Iterator<Item = CardId> + '_ {
         self.pane_inspectors.watching().filter(|card| {
             self.workspace

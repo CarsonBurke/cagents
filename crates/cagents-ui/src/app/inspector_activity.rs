@@ -329,8 +329,6 @@ fn folders(projects: &[sidebar::SidebarProject]) -> HashMap<PathBuf, Listed> {
     folders
 }
 
-/// A row on the list grid: `mark` in the icon column, `text` on the label
-/// column, then `trailing`.
 /// A status's glyph: a spinner while the agent works.
 pub(super) fn status_mark<'a>(glyph: Icon) -> Element<'a, Message> {
     if glyph == Icon::AgentWorking {
@@ -340,6 +338,8 @@ pub(super) fn status_mark<'a>(glyph: Icon) -> Element<'a, Message> {
     }
 }
 
+/// A row on the list grid: `mark` in the icon column, `text` on the label
+/// column, then `trailing`.
 fn grid_row<'a>(
     mark: Element<'a, Message>,
     text: Element<'a, Message>,

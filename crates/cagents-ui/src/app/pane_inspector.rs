@@ -796,7 +796,6 @@ impl Cagents {
         kind_availability(kind, self.active_workspace.is_some())
     }
 
-    /// Whether the pane has an inspector to open and show now.
     /// Whether the pane floats its inspector's toggle over its content: it
     /// has an inspector, does not draw it, and no rail stands in for it.
     /// Content keeps clear of the toggle only then.
@@ -806,6 +805,7 @@ impl Cagents {
             && !self.pane_inspectors.is_railed(card)
     }
 
+    /// Whether the pane has an inspector to open and show now.
     pub(super) fn pane_has_inspector(&self, card: CardId) -> bool {
         self.inspector_availability(card) == Availability::Available
     }
@@ -935,8 +935,8 @@ impl Cagents {
         // The floating toggle, or the rail of an inspector that stays open,
         // replaces the outgoing panel's toggle once the slide ends. Focus
         // that control, unless the user has moved to another pane or opened
-        // a modal in the meantime.
-        // One that collapses to its rail is no longer shown either.
+        // a modal in the meantime. An overlay collapsing to its rail counts
+        // as closing: it is no longer shown either.
         let closing_overlay = self.workspace.focused().filter(|card| {
             !self.modal_is_open()
                 && !self.pane_inspectors.is_open(*card)
