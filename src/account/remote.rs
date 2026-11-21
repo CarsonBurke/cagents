@@ -446,10 +446,9 @@ fn change(
             // token fences daemon ingress, but an external rename/replacement
             // must not redirect this second provider read to a different home.
             reservation.verify()?;
-            let system_identity = match runtime.block_on(probe::run(
+            let system_identity = match runtime.block_on(probe::login(
                 Account::system(provider),
                 super::cache::Cache::installation(),
-                false,
             )) {
                 Outcome::Answered {
                     identity: Some(identity),
@@ -668,10 +667,9 @@ fn restore_reserved(
         )));
     }
     reservation.verify()?;
-    let system = match runtime.block_on(probe::run(
+    let system = match runtime.block_on(probe::login(
         Account::system(provider),
         Cache::installation(),
-        false,
     )) {
         Outcome::Answered {
             identity: Some(identity),

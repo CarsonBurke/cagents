@@ -682,7 +682,7 @@ impl State {
                 let mut snapshot = entry.snapshot;
                 snapshot.source = UsageSource::Cache;
                 state.schedule.observe(snapshot.observed_at);
-                state.inventory_observed_at = Some(snapshot.observed_at);
+                state.inventory_observed_at = Some(entry.inventory_observed_at.unwrap_or(0));
                 state.identity = entry.identity;
                 state.snapshot = Some(snapshot);
             }
@@ -778,6 +778,7 @@ impl State {
                     Entry {
                         identity: state.identity.clone(),
                         snapshot: state.snapshot.clone()?,
+                        inventory_observed_at: state.inventory_observed_at,
                     },
                 ))
             })
@@ -10532,6 +10533,73 @@ mod app_tests {
         }
     }
 
+    fn assert_restored_inventory_admits_full_probe(inventory_observed_at: Option<Millis>) {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(Registry::default());
+            app.refresh_ui.focused = true;
+            let id = Account::system(provider).id();
+            let now = now_ms();
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now - 1_000),
+                    inventory_observed_at,
+                }),
+            }]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(
+                state.inventory_observed_at,
+                Some(inventory_observed_at.unwrap_or(0))
+            );
+            assert!(!state.schedule.should_probe(Trigger::Focus, now, true));
+            let probe = app.probe_account(&id, Trigger::Focus, now);
+            assert!(probe.is_some(), "{provider:?}");
+            assert!(app.account_ui.pending_probe_is_forced_for_test(&id));
+            drop(probe);
+        }
+    }
+
+    #[test]
+    fn a_live_figure_cached_before_close_does_not_make_inventory_look_fresh() {
+        assert_restored_inventory_admits_full_probe(Some(
+            now_ms() - 2 * schedule::REFRESH_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn restore_without_an_inventory_stamp_probes_in_full_on_first_focus() {
+        assert_restored_inventory_admits_full_probe(None);
+    }
+
+    #[test]
+    fn a_fresh_restored_inventory_waits_for_its_schedule() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(Registry::default());
+            app.refresh_ui.focused = true;
+            let id = Account::system(provider).id();
+            let now = now_ms();
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now - 1_000),
+                    inventory_observed_at: Some(now - 2_000),
+                }),
+            }]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.inventory_observed_at, Some(now - 2_000));
+            assert!(
+                app.probe_account(&id, Trigger::Focus, now).is_none(),
+                "{provider:?}"
+            );
+        }
+    }
+
     #[test]
     fn probes_after_live_usage_accept_newer_readings_and_clock_rollback() {
         for clock_rolled_back in [false, true] {
@@ -12021,6 +12089,10 @@ mod app_tests {
         let cached = cache.load(now_ms()).remove(&key).unwrap();
         assert!((cached.snapshot.windows[0].used - 0.5).abs() < 1e-6);
         assert_eq!(cached.snapshot.observed_at, now + 1);
+        assert_eq!(
+            cached.inventory_observed_at,
+            Some(now - 2 * schedule::REFRESH_INTERVAL)
+        );
     }
 
     /// The startup load does not wait on the shell: an account whose CLI only
@@ -12035,6 +12107,7 @@ mod app_tests {
         let now = now_ms();
         let cached = |used| Entry {
             identity: None,
+            inventory_observed_at: Some(now),
             snapshot: UsageSnapshot {
                 resets: Vec::new(),
                 windows: vec![UsageWindow {
