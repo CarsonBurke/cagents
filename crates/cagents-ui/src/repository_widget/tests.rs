@@ -9474,13 +9474,21 @@ fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
 #[test]
 fn a_failed_file_list_read_reports_what_git_said() {
     let root = tempdir().unwrap();
-    let Err(error) = read_repository_files(root.path(), None, &CancellationToken::new()) else {
-        panic!("a directory outside any repository has no file list");
+    // A directory that does not exist fails wherever the temporary
+    // directory lives, even inside some other checkout.
+    let Err(error) = read_repository_files(
+        &root.path().join("missing"),
+        None,
+        &CancellationToken::new(),
+    ) else {
+        panic!("a missing directory has no file list");
     };
-    assert!(
-        error.starts_with("Git failed while listing repository files: fatal: not a git repository"),
-        "{error}"
-    );
+    let detail = error
+        .strip_prefix("Git failed while listing repository files: ")
+        .unwrap_or_else(|| panic!("{error}"));
+    // Git's own words, in whatever language it speaks, not an exit status.
+    assert!(!detail.is_empty(), "{error}");
+    assert!(!detail.contains("process exited with status"), "{error}");
 }
 
 #[test]
@@ -9508,8 +9516,18 @@ fn a_superseded_or_abandoned_file_list_read_is_cancelled() {
     assert!(first.is_cancelled(), "a newer read supersedes the first");
     assert!(!second.is_cancelled());
 
+    let abandoned = std::io::Error::from(std::io::ErrorKind::NotFound);
+    runtime.fail_file_open(card, PathBuf::from("missing.txt"), &abandoned);
+    assert!(
+        second.is_cancelled(),
+        "a card that gives up on its file abandons its read"
+    );
+    assert!(runtime.file_list_read.is_none());
+
+    drop(runtime.load_files(card));
+    let third = outstanding(&runtime);
     drop(runtime);
-    assert!(second.is_cancelled(), "closing the card abandons its read");
+    assert!(third.is_cancelled(), "closing the card abandons its read");
 }
 
 #[test]
