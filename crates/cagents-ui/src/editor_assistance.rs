@@ -31,12 +31,12 @@ pub(crate) struct AttachmentState {
     /// a count of this side's own: the manager re-opens a document on a
     /// restart, a crash-respawn, or a second buffer opening the same file, and
     /// none of those are edits this side made.
-    pub(crate) diagnostics_version: Option<i32>,
-    pub(crate) completion_request: Option<(LspRequestId, LspPosition)>,
+    diagnostics_version: Option<i32>,
+    completion_request: Option<(LspRequestId, LspPosition)>,
     /// Last observed runtime intent; a request is captured against this value.
-    pub(crate) completion_intent: u64,
-    pub(crate) editor_hover_request: Option<(LspRequestId, LspPosition)>,
-    pub(crate) editor_navigation: Option<LspRequestId>,
+    completion_intent: u64,
+    hover_request: Option<(LspRequestId, LspPosition)>,
+    navigation_request: Option<LspRequestId>,
 }
 
 impl AttachmentState {
@@ -61,8 +61,8 @@ impl AttachmentState {
         self.context.locations = None;
         self.context.completions.clear();
         self.completion_request = None;
-        self.editor_hover_request = None;
-        self.editor_navigation = None;
+        self.hover_request = None;
+        self.navigation_request = None;
     }
 
     /// Rebase only a current standing set through exact edits. An inexact
@@ -103,22 +103,23 @@ impl AttachmentState {
 
     /// Retire the pending hover so the shell can cancel it before asking again.
     pub(crate) fn take_hover_request(&mut self) -> Option<LspRequestId> {
-        self.editor_hover_request.take().map(|(request, _)| request)
+        self.hover_request.take().map(|(request, _)| request)
     }
 
     /// Record the hover request answering the pointer at `at`.
     pub(crate) fn hover_requested(&mut self, request: LspRequestId, at: LspPosition) {
-        self.editor_hover_request = Some((request, at));
+        self.hover_request = Some((request, at));
     }
 
     /// Record the definition request whose answer may move the caret.
     pub(crate) fn navigation_requested(&mut self, request: LspRequestId) {
-        self.editor_navigation = Some(request);
+        self.navigation_request = Some(request);
     }
 
     /// Refuse a delayed publication without erasing a newer standing set.
     /// On acceptance the shell copies the set into native editor marks.
-    pub(crate) fn set_diagnostics(
+    #[must_use]
+    pub(crate) fn accept_diagnostics(
         &mut self,
         items: Vec<LspDiagnostic>,
         version: i32,
@@ -132,12 +133,23 @@ impl AttachmentState {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) const fn diagnostics_version(&self) -> Option<i32> {
+        self.diagnostics_version
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn completion_request(&self) -> Option<(LspRequestId, LspPosition)> {
+        self.completion_request
+    }
+
     pub(crate) const fn diagnostics_are_current(&self, document_version: Option<i32>) -> bool {
         diagnostics_are_current(self.diagnostics_version, document_version)
     }
 
     /// Admit only the pending request at its original caret. The shell then
     /// publishes the candidates through the editor and records its targets.
+    #[must_use]
     pub(crate) fn accept_completion(
         &mut self,
         request: LspRequestId,
@@ -155,17 +167,18 @@ impl AttachmentState {
 
     /// The shell places a matching hover at the request's captured position.
     pub(crate) fn hover_position(&self, request: LspRequestId) -> Option<LspPosition> {
-        self.editor_hover_request
+        self.hover_request
             .filter(|(expected, _)| request == *expected)
             .map(|(_, at)| at)
     }
 
     /// A definition response can trigger navigation only once, for its request.
+    #[must_use]
     pub(crate) fn accept_navigation(&mut self, request: LspRequestId) -> bool {
-        if self.editor_navigation != Some(request) {
+        if self.navigation_request != Some(request) {
             return false;
         }
-        self.editor_navigation = None;
+        self.navigation_request = None;
         true
     }
 }
@@ -176,7 +189,7 @@ impl AttachmentState {
 /// the version its snapshot holds now. Both must be known and equal: an
 /// unknown document has no diagnostics worth jumping into, and an unstamped
 /// list is one this side never received.
-pub(crate) const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) -> bool {
+const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) -> bool {
     match (published, document) {
         (Some(published), Some(document)) => published == document,
         _ => false,

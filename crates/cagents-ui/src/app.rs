@@ -13595,10 +13595,11 @@ impl Cagents {
             LspEvent::Diagnostics { version, items, .. } => {
                 // A delayed publication must not erase the shifted standing
                 // set for a newer buffer revision.
-                if !state
-                    .attachment
-                    .set_diagnostics(items, version, self.lsp.document_version(doc))
-                {
+                if !state.attachment.accept_diagnostics(
+                    items,
+                    version,
+                    self.lsp.document_version(doc),
+                ) {
                     return;
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {

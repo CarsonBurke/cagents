@@ -3293,8 +3293,11 @@ pub(super) fn editing_repository_app() -> (Cagents, CardId) {
     let state = lsp_state(&mut app, card);
     state.attachment.document = Some(LspDocumentId(1));
     state.attachment.context.status = Some(crate::lsp::LspStatus::Ready);
-    state.attachment.context.diagnostics = vec![diagnostic("first"), diagnostic("second")];
-    state.attachment.diagnostics_version = Some(0);
+    assert!(state.attachment.accept_diagnostics(
+        vec![diagnostic("first"), diagnostic("second")],
+        0,
+        Some(0)
+    ));
     app.lsp_documents.insert(LspDocumentId(1), card);
     (app, card)
 }
@@ -8786,7 +8789,9 @@ fn editor_language_results_expand_their_section() {
     let doc = LspDocumentId(1);
     let request = crate::lsp::LspRequestId(1);
     app.lsp_documents.insert(doc, card);
-    lsp_state(&mut app, card).attachment.editor_navigation = Some(request);
+    lsp_state(&mut app, card)
+        .attachment
+        .navigation_requested(request);
     app.context_sections.set_open(Section::Locations, false);
     // A response that cannot jump opens the closed inspector from a handler
     // that returns before its message's projection; the inspector still
@@ -8855,43 +8860,6 @@ fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
     assert!(!app.lsp_pending_jumps.contains_key(&card));
 }
 
-/// Diagnostics are unsolicited and replace each other wholesale, so a list
-/// on screen can outlive the text it describes. Jumping into a stale one
-/// puts the caret on a line the server never named.
-/// The two versions are equal only when both are known. An application
-/// that kept a count of its own would satisfy this predicate while the
-/// manager had silently moved on - a restart, a crash-respawn, or a second
-/// card opening the same file all bump the manager's version without any
-/// edit having been made.
-#[test]
-fn diagnostics_are_current_only_when_both_versions_are_known_and_equal() {
-    assert!(crate::editor_assistance::diagnostics_are_current(
-        Some(4),
-        Some(4)
-    ));
-    assert!(!crate::editor_assistance::diagnostics_are_current(
-        Some(4),
-        Some(5)
-    ));
-    assert!(!crate::editor_assistance::diagnostics_are_current(
-        Some(5),
-        Some(4)
-    ));
-    // No document: nothing published for it can still describe it.
-    assert!(!crate::editor_assistance::diagnostics_are_current(
-        Some(4),
-        None
-    ));
-    // Nothing published: there is no list to jump into.
-    assert!(!crate::editor_assistance::diagnostics_are_current(
-        None,
-        Some(4)
-    ));
-    assert!(!crate::editor_assistance::diagnostics_are_current(
-        None, None
-    ));
-}
-
 #[test]
 fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
     let executor = tokio::runtime::Builder::new_current_thread()
@@ -8923,11 +8891,17 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
         drop(app.update(publish(1)));
         // A manager reopen can advance beyond the standing publication before
         // the next edit. Its old coordinates must not become current again.
-        app.lsp_contexts
-            .get_mut(&card)
-            .unwrap()
-            .attachment
-            .diagnostics_version = Some(published_version);
+        assert!(
+            app.lsp_contexts
+                .get_mut(&card)
+                .unwrap()
+                .attachment
+                .accept_diagnostics(
+                    vec![diagnostic("standing error")],
+                    published_version,
+                    Some(published_version)
+                )
+        );
         let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
             unreachable!()
         };
@@ -8949,7 +8923,7 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
             !preserves
         );
         assert_eq!(
-            app.lsp_contexts[&card].attachment.diagnostics_version,
+            app.lsp_contexts[&card].attachment.diagnostics_version(),
             preserves.then_some(2)
         );
         if preserves {
@@ -8980,7 +8954,7 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
         };
         assert!(runtime.diagnostic_navigation_available());
         assert_eq!(
-            app.lsp_contexts[&card].attachment.diagnostics_version,
+            app.lsp_contexts[&card].attachment.diagnostics_version(),
             Some(2)
         );
     }
@@ -9200,7 +9174,11 @@ fn a_jump_into_stale_diagnostics_is_refused() {
     // A published list, and a document the manager does not hold, which is
     // exactly the shape the predicate refuses.
     lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
-    lsp_state(&mut app, card).attachment.diagnostics_version = Some(6);
+    assert!(
+        lsp_state(&mut app, card)
+            .attachment
+            .accept_diagnostics(Vec::new(), 6, Some(6))
+    );
 
     let _ = app.update_lsp(InspectorAction::JumpToLspDiagnostic {
         card,
@@ -9237,7 +9215,7 @@ fn publish_test_completions(
     );
     let intent = runtime.editor_completion_intent();
     let state = lsp_state(app, card);
-    state.attachment.completion_intent = intent;
+    assert_eq!(state.attachment.reconcile_completion_intent(intent), None);
     state.attachment.context.completions = targets.clone();
     targets
 }
@@ -9279,7 +9257,7 @@ fn request_test_completion(
     drop(app.request_lsp(card, LspRequestKind::Completion));
     app.lsp_contexts[&card]
         .attachment
-        .completion_request
+        .completion_request()
         .unwrap()
 }
 
@@ -9330,7 +9308,7 @@ fn find_navigation_retires_shown_and_pending_completion_across_caret_round_trip(
     assert!(
         app.lsp_contexts[&card]
             .attachment
-            .completion_request
+            .completion_request()
             .is_none()
     );
     assert!(
@@ -9372,7 +9350,7 @@ fn find_navigation_retires_shown_and_pending_completion_across_caret_round_trip(
         items: vec![completion_item("late")],
     });
     assert_eq!(
-        app.lsp_contexts[&card].attachment.completion_request,
+        app.lsp_contexts[&card].attachment.completion_request(),
         Some(fresh)
     );
     app.apply_lsp_event(LspEvent::Completion {
@@ -9438,7 +9416,7 @@ fn same_text_find_replacement_retires_completion_without_advancing_text_version(
         assert!(
             app.lsp_contexts[&card]
                 .attachment
-                .completion_request
+                .completion_request()
                 .is_none()
         );
         assert!(
@@ -9525,7 +9503,7 @@ fn deferred_find_selection_retires_completion_only_for_accepted_visible_callback
         *foreign_card = CardId::new();
         drop(app.update(Message::Repository(foreign)));
         assert_eq!(
-            app.lsp_contexts[&card].attachment.completion_request,
+            app.lsp_contexts[&card].attachment.completion_request(),
             Some(pending)
         );
         assert_eq!(
@@ -9548,7 +9526,7 @@ fn deferred_find_selection_retires_completion_only_for_accepted_visible_callback
         if hidden {
             assert_eq!(runtime.cursor_position(), Some(pending.1));
             assert_eq!(
-                app.lsp_contexts[&card].attachment.completion_request,
+                app.lsp_contexts[&card].attachment.completion_request(),
                 Some(pending)
             );
             assert_eq!(
@@ -9561,7 +9539,7 @@ fn deferred_find_selection_retires_completion_only_for_accepted_visible_callback
             assert!(
                 app.lsp_contexts[&card]
                     .attachment
-                    .completion_request
+                    .completion_request()
                     .is_none()
             );
             assert!(
@@ -9636,7 +9614,7 @@ fn completion_caret_round_trip_retires_old_answer_and_accepts_a_fresh_request() 
     assert!(
         app.lsp_contexts[&card]
             .attachment
-            .completion_request
+            .completion_request()
             .is_none()
     );
     assert!(
@@ -9655,7 +9633,7 @@ fn completion_caret_round_trip_retires_old_answer_and_accepts_a_fresh_request() 
     assert_ne!(pending.0, old);
     app.apply_lsp_event(old_answer());
     assert_eq!(
-        app.lsp_contexts[&card].attachment.completion_request,
+        app.lsp_contexts[&card].attachment.completion_request(),
         Some(pending)
     );
     app.apply_lsp_event(LspEvent::Completion {
@@ -9709,7 +9687,7 @@ fn no_change_editor_intent_retires_shown_inspector_candidates_and_pending_reques
         );
         assert_eq!(app.lsp.document_version(doc), version);
         let state = &app.lsp_contexts[&card];
-        assert!(state.attachment.completion_request.is_none());
+        assert!(state.attachment.completion_request().is_none());
         assert!(state.attachment.context.completions.is_empty());
         assert!(state.attachment.context.locations.is_some());
         assert_eq!(state.attachment.context.diagnostics.len(), 1);
@@ -9755,7 +9733,7 @@ fn scroll_preserves_pending_and_shown_completion_and_inspector_activation() {
     };
     drop(app.update(scroll()));
     assert_eq!(
-        app.lsp_contexts[&card].attachment.completion_request,
+        app.lsp_contexts[&card].attachment.completion_request(),
         Some(pending)
     );
     app.apply_lsp_event(LspEvent::Completion {
@@ -9829,7 +9807,7 @@ fn rejected_hidden_and_foreign_editor_actions_preserve_completion_intents() {
             })),
         );
         assert_eq!(
-            app.lsp_contexts[&card].attachment.completion_request,
+            app.lsp_contexts[&card].attachment.completion_request(),
             Some(pending)
         );
         assert_eq!(
@@ -10024,7 +10002,7 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
         vec![diagnostic("second diagnostic")]
     );
     assert_eq!(
-        app.lsp_contexts[&second].attachment.diagnostics_version,
+        app.lsp_contexts[&second].attachment.diagnostics_version(),
         Some(1)
     );
     assert!(
@@ -10035,7 +10013,7 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
             .is_empty()
     );
     assert_eq!(
-        app.lsp_contexts[&first].attachment.diagnostics_version,
+        app.lsp_contexts[&first].attachment.diagnostics_version(),
         None
     );
     for (card, expected) in [(first, false), (second, true)] {
@@ -10051,7 +10029,7 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
         vec![diagnostic("first diagnostic")]
     );
     assert_eq!(
-        app.lsp_contexts[&first].attachment.diagnostics_version,
+        app.lsp_contexts[&first].attachment.diagnostics_version(),
         Some(1)
     );
     assert_eq!(
@@ -10075,7 +10053,7 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
             .is_empty()
     );
     assert_eq!(
-        app.lsp_contexts[&second].attachment.diagnostics_version,
+        app.lsp_contexts[&second].attachment.diagnostics_version(),
         None
     );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&second) else {
@@ -10114,7 +10092,10 @@ fn diagnostics_for_an_unregistered_document_cannot_install_answers() {
             .diagnostics
             .is_empty()
     );
-    assert_eq!(app.lsp_contexts[&card].attachment.diagnostics_version, None);
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.diagnostics_version(),
+        None
+    );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
         unreachable!()
     };
@@ -11572,7 +11553,7 @@ fn closing_a_document_retracts_it_from_the_routing_map() {
     let state = &app.lsp_contexts[&card];
     assert!(state.attachment.document.is_none());
     assert!(state.path.is_none());
-    assert_eq!(state.attachment.diagnostics_version, None);
+    assert_eq!(state.attachment.diagnostics_version(), None);
 }
 
 /// The shell re-runs one `RedrawRequested` through update and layout while
