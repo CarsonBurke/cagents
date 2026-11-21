@@ -468,6 +468,25 @@ fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits()
 }
 
 #[test]
+fn ordinary_shutdown_leaves_a_process_that_left_the_session_holding_the_pty() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    // setsid -f forks into a new session and is reparented, keeping the PTY
+    // as its stdio. It is not a job of this terminal: cleanup must neither
+    // signal it nor wait on it to confirm the terminal's own family.
+    let outside = shutdown_job(
+        &shell,
+        b"setsid -f sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60'\n",
+        "sleep",
+    );
+    let outcome = shell.terminal.shutdown();
+    assert!(outcome.is_ok(), "shutdown: {outcome:?}");
+    assert!(
+        !holder::exits_within(&outside.0, Duration::ZERO).unwrap(),
+        "ordinary shutdown must not stop a process outside the terminal's family"
+    );
+}
+
+#[test]
 fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit() {
     let proof = crate::model::HostSessionProof {
         host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),

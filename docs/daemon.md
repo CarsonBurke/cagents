@@ -144,6 +144,15 @@ cagents daemon stop --confirm
   progress, but does not close the agent. The agent keeps its ID, and its card
   stays in its channel, where its saved conversation can be resumed. A turn
   the stop cut short is never resent. Only closing an agent removes it.
+- Stopping the daemon ends every job of each terminal it hosts, not only its
+  shell. The shell and every process still in its session or started from it,
+  `nohup` and disowned jobs included, get a hangup and half a second to exit
+  before they are killed. A process that left the session with `setsid` and
+  whose parent has exited is not the terminal's and keeps running, and a daemon
+  started from inside a terminal is never treated as one of its jobs. If the
+  stop cannot confirm that a terminal's processes ended, the terminal's holder
+  stays running for the next daemon to adopt, as after a crash, and the
+  stopping daemon reports the error instead of a clean stop.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
 - Inside a hosted session, `terminal write` and `close` reach only the

@@ -168,7 +168,7 @@ impl FrozenFamily {
         for _ in 0..MAX_CENSUS_PASSES {
             check_deadline(deadline)?;
             let processes = census(deadline)?;
-            let owned = process_family(&root.process, &processes, &family.targets);
+            let owned = process_family(&root.process, &processes, &family.targets, this_daemon());
             let before = family.targets.len();
             for process in owned {
                 if family
@@ -500,9 +500,49 @@ fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
 /// After the pinned root exits, a numeric session can only refuse cleanup;
 /// it never grants authority to signal a process discovered after that exit.
 pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Result<bool, String> {
-    Ok(census(deadline)?
+    let processes = census(deadline)?;
+    let daemon = daemon_subtree(this_daemon(), &processes);
+    Ok(processes.iter().all(|process| {
+        process.session != session
+            || matches!(process.state, b'Z' | b'X')
+            || daemon.contains(&process.pid)
+    }))
+}
+
+fn this_daemon() -> libc::pid_t {
+    // SAFETY: getpid has no preconditions and cannot fail.
+    unsafe { libc::getpid() }
+}
+
+/// A daemon started from inside a terminal (for example by a CLI that found
+/// none running) stays in that terminal's session, as do helpers it starts
+/// without a session of their own. Neither is ever that terminal's job:
+/// stopping them would stop the daemon itself. Descent stops where a child
+/// leaves the daemon's session, so every terminal holder, and the family
+/// each holder's root leads, remains outside this set.
+fn daemon_subtree(
+    daemon: libc::pid_t,
+    processes: &[CloseProcess],
+) -> std::collections::HashSet<libc::pid_t> {
+    let mut subtree = std::collections::HashSet::from([daemon]);
+    let Some(session) = processes
         .iter()
-        .all(|process| process.session != session || matches!(process.state, b'Z' | b'X')))
+        .find(|process| process.pid == daemon)
+        .map(|process| process.session)
+    else {
+        return subtree;
+    };
+    loop {
+        let before = subtree.len();
+        for process in processes {
+            if process.session == session && subtree.contains(&process.parent) {
+                subtree.insert(process.pid);
+            }
+        }
+        if subtree.len() == before {
+            return subtree;
+        }
+    }
 }
 
 fn census_with(
@@ -537,8 +577,10 @@ fn process_family(
     root: &CloseProcess,
     processes: &[CloseProcess],
     frozen: &[FrozenProcess],
+    daemon: libc::pid_t,
 ) -> Vec<CloseProcess> {
     use std::collections::{HashMap, HashSet};
+    let excluded = daemon_subtree(daemon, processes);
     let mut children: HashMap<libc::pid_t, Vec<&CloseProcess>> = HashMap::new();
     for process in processes {
         children.entry(process.parent).or_default().push(process);
@@ -551,6 +593,7 @@ fn process_family(
         family.push(root.clone());
     }
     let mut seen: HashSet<_> = family.iter().map(|process| process.pid).collect();
+    seen.extend(excluded);
     for process in processes {
         if process.session == root.session && seen.insert(process.pid) {
             family.push(process.clone());
@@ -700,7 +743,7 @@ mod tests {
             ..root.clone()
         };
         let frozen = |processes: &[CloseProcess]| FrozenFamily {
-            targets: process_family(&root, processes, &[])
+            targets: process_family(&root, processes, &[], 0)
                 .into_iter()
                 .map(|identity| FrozenProcess {
                     identity,
@@ -755,7 +798,73 @@ mod tests {
             session: 20,
             ..root.clone()
         };
-        let family = process_family(&root, &[grandchild, other, detached, background], &[]);
+        let family = process_family(
+            &root,
+            &[
+                grandchild.clone(),
+                other,
+                detached.clone(),
+                background.clone(),
+            ],
+            &[],
+            0,
+        );
+        let mut pids: Vec<_> = family.iter().map(|process| process.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [10, 11, 12, 13]);
+
+        // A daemon started from this terminal shares its session; neither it
+        // nor anything it started (a holder that left the session) is a job.
+        let daemon = CloseProcess {
+            pid: 30,
+            parent: 1,
+            group: 30,
+            ..root.clone()
+        };
+        let daemon_child = CloseProcess {
+            pid: 31,
+            parent: 30,
+            ..root.clone()
+        };
+        let holder = CloseProcess {
+            pid: 32,
+            parent: 30,
+            group: 32,
+            session: 32,
+            ..root.clone()
+        };
+        let family = process_family(
+            &root,
+            &[
+                grandchild.clone(),
+                detached.clone(),
+                background.clone(),
+                daemon,
+                daemon_child,
+                holder,
+            ],
+            &[],
+            30,
+        );
+        let mut pids: Vec<_> = family.iter().map(|process| process.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [10, 11, 12, 13]);
+
+        // The usual daemon is the root's ancestor through its holder, which
+        // left the daemon's session. That ancestry excludes no job.
+        let ordinary_daemon = CloseProcess {
+            pid: 1,
+            parent: 0,
+            group: 1,
+            session: 1,
+            ..root.clone()
+        };
+        let family = process_family(
+            &root,
+            &[grandchild, detached, background, ordinary_daemon],
+            &[],
+            1,
+        );
         let mut pids: Vec<_> = family.iter().map(|process| process.pid).collect();
         pids.sort_unstable();
         assert_eq!(pids, [10, 11, 12, 13]);

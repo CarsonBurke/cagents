@@ -78,6 +78,8 @@ const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
 const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// Keep a bounded tail for exact-child exit and PTY/session confirmation.
 const CHILD_SHUTDOWN_CONFIRMATION_RESERVE: Duration = CHILD_HANGUP_GRACE;
+/// Within that tail, the final session census keeps this much for itself.
+const CHILD_SHUTDOWN_CENSUS_RESERVE: Duration = Duration::from_millis(250);
 /// Actual OS joins happen off-caller; ordinary shutdown shares this deadline.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long shutdown waits for the PTY reader to leave its blocking read
@@ -6133,19 +6135,23 @@ fn confirm_exited_family(
     master: &holder::PtyMaster,
     deadline: Instant,
 ) -> Result<(), String> {
-    // Reconcile natural completion if the shell is already gone. A process
-    // census can miss fork/exit churn, so also require the kernel's proof
-    // that no descendant still holds the PTY slave open.
+    // Reconcile natural completion if the shell is already gone. A job can
+    // fork between thaw and HUP, so give the PTY's last holders the bounded
+    // budget to close it. The hangup only ends that wait: a process outside
+    // the family (one that left the session, such as `setsid -f`) may keep
+    // the PTY open, and cleanup never claims or depends on it.
     let master = master.duplicate().map_err(|error| error.to_string())?;
     let mut target = libc::pollfd {
         fd: master.as_raw_fd(),
         events: 0,
         revents: 0,
     };
+    // Leave the final census its own time, whatever the wait consumed.
+    let drained = deadline
+        .checked_sub(CHILD_SHUTDOWN_CENSUS_RESERVE)
+        .unwrap_or(deadline);
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        // A job can fork between thaw and HUP. Give its final PTY descriptors
-        // the same bounded cleanup budget even after the tracked jobs exit.
+        let remaining = drained.saturating_duration_since(Instant::now());
         // SAFETY: one live, owned descriptor; this only observes readiness.
         match unsafe {
             libc::poll(
@@ -6165,7 +6171,6 @@ fn confirm_exited_family(
     if child
         .exited_within(Duration::ZERO)
         .map_err(|error| format!("observe child exit: {error}"))?
-        && target.revents & libc::POLLHUP != 0
         && close_processes::session_is_empty(child.pid(), deadline)?
     {
         Ok(())
