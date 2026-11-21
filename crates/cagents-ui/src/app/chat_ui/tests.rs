@@ -1999,7 +1999,7 @@ fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() 
         SidebarFilter::All,
     ))));
 
-    // The daemon reports a limit while A is unread, without a pending request.
+    // The daemon reports a limit while the channel is unread, without a pending request.
     let mut snapshot = (*handle.snapshot()).clone();
     snapshot.generation += 1;
     snapshot.error = Some("You've hit your weekly limit".into());
@@ -2036,7 +2036,8 @@ fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() 
     assert_eq!(app.sidebar_state.card_attention(card).limited, 1);
     assert_eq!(app.sidebar_state.card_attention(card).waiting, 0);
 
-    // Read A's update through the normal focused-pane acknowledgement, then leave it.
+    // Read the limited channel's update through the normal focused-pane
+    // acknowledgement, then leave it for the other channel.
     drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
         channel_id: limited_channel,
     })));
@@ -2061,46 +2062,51 @@ fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() 
     assert_eq!(row.attention.limited, 1);
     assert_eq!(row.attention.failed, 0);
 
-    // Both the real compact view and its keyboard order must keep the blocked channel.
+    // Both the real compact view and its keyboard order must keep the blocked
+    // channel, whether checkout rows are shown or hidden.
     let renderer = crate::app::tests::headless_renderer();
-    let mut element = crate::sidebar::view(
-        &app.sidebar_model,
-        &app.sidebar_state,
-        SidebarMode::Compact,
-        320.0,
-        false,
-    );
-    let mut tree = Tree::new(element.as_widget());
-    let node = element.as_widget_mut().layout(
-        &mut tree,
-        &renderer,
-        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 900.0)),
-    );
-    let nodes =
-        element
-            .as_widget()
-            .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-    let names: Vec<_> = nodes
-        .root()
-        .iter()
-        .chain(nodes.children())
-        .filter_map(|node| node.node().label())
-        .collect();
-    assert!(
-        names.iter().any(|name| name.contains("Other channel")),
-        "{names:?}"
-    );
-    assert!(
-        names
+    for mode in [
+        crate::settings::SidebarWorktrees::Expanded,
+        crate::settings::SidebarWorktrees::Hidden,
+    ] {
+        app.sidebar_state.set_sidebar_worktrees(mode);
+        let mut element = crate::sidebar::view(
+            &app.sidebar_model,
+            &app.sidebar_state,
+            SidebarMode::Compact,
+            320.0,
+            false,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 900.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let names: Vec<_> = nodes
+            .root()
             .iter()
-            .any(|name| name.contains("Limited channel")
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("Other channel")),
+            "{mode:?}: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("Limited channel")
                 && name.contains("1 stopped by a usage limit")),
-        "the read channel still needs its Limited badge in the compact view: {names:?}"
-    );
-    assert!(
-        crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, true)
-            .contains(&SelectionRow::Channel(limited_channel))
-    );
+            "{mode:?}: the read channel still needs its Limited badge in the compact view: {names:?}"
+        );
+        assert!(
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, true)
+                .contains(&SelectionRow::Channel(limited_channel))
+        );
+    }
 }
 
 #[test]
