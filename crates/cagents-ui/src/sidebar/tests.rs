@@ -2782,70 +2782,50 @@ fn icon_glyphs_in_control(
 struct ChannelRowLayout {
     /// The title's text, as laid out.
     title: Rectangle,
-    /// The facepile's faces, in their order in the pile.
-    faces: Vec<Rectangle>,
-    /// Every text the row lays out.
-    texts: Vec<String>,
-    /// The count after the faces, if any.
-    count: Option<Rectangle>,
+    /// Every text the row lays out, in the row's order.
+    texts: Vec<(String, Rectangle)>,
+    /// Every drawn leaf of the row's layout: glyphs, texts and spacers.
+    leaves: Vec<Rectangle>,
     /// The delete button laid over the row's end.
     delete: Rectangle,
     /// What a click where the delete button appears does.
     end_click: Vec<SidebarAction>,
 }
 
-/// The faces with the given ids and the texts an operation finds in a laid
-/// out element.
-struct FacesAndTexts {
-    faces: Vec<Id>,
-    found: Vec<(usize, Rectangle)>,
+impl ChannelRowLayout {
+    /// The count badge on the row's mark, if it draws one: every text but
+    /// the title.
+    fn badge(&self) -> Option<(&str, Rectangle)> {
+        let mut others = self
+            .texts
+            .iter()
+            .filter(|(_, bounds)| *bounds != self.title);
+        let badge = others.next().map(|(text, bounds)| (text.as_str(), *bounds));
+        assert!(
+            others.next().is_none(),
+            "a row draws its title and at most a badge: {:?}",
+            self.texts
+        );
+        badge
+    }
+}
+
+/// The texts and focusable controls an operation finds in a laid out
+/// element.
+#[derive(Default)]
+struct TextsAndControls {
     texts: Vec<(String, Rectangle)>,
-    /// The focusable controls, by id.
     controls: Vec<(Id, Rectangle)>,
 }
 
-impl FacesAndTexts {
-    /// What `element`, laid out as `node`, draws: the faces named by
-    /// `faces`, in that order, and every text.
-    fn in_layout(
-        element: &mut Element<'_, SidebarAction>,
-        tree: &mut Tree,
-        node: &layout::Node,
-        faces: Vec<Id>,
-    ) -> Self {
-        let mut collect = Self {
-            faces,
-            found: Vec::new(),
-            texts: Vec::new(),
-            controls: Vec::new(),
-        };
-        element.as_widget_mut().operate(
-            tree,
-            Layout::new(node),
-            &headless_renderer(),
-            &mut collect,
-        );
-        collect.found.sort_by_key(|(index, _)| *index);
-        collect
-    }
-
-    fn faces(&self) -> Vec<Rectangle> {
-        self.found.iter().map(|(_, bounds)| *bounds).collect()
-    }
-}
-
-impl cosmic::iced::advanced::widget::Operation for FacesAndTexts {
+impl cosmic::iced::advanced::widget::Operation for TextsAndControls {
     fn traverse(
         &mut self,
         visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
     ) {
         visit(self);
     }
-    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if let Some(index) = id.and_then(|id| self.faces.iter().position(|face| face == id)) {
-            self.found.push((index, bounds));
-        }
-    }
+    fn container(&mut self, _: Option<&Id>, _: Rectangle) {}
     fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
         self.texts.push((text.to_owned(), bounds));
     }
@@ -2861,12 +2841,40 @@ impl cosmic::iced::advanced::widget::Operation for FacesAndTexts {
     }
 }
 
+/// The texts `element` lays out within `size`.
+fn laid_out_texts(mut element: Element<'_, SidebarAction>, size: Size) -> Vec<(String, Rectangle)> {
+    let renderer = headless_renderer();
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, size),
+    );
+    let mut collect = TextsAndControls::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut collect);
+    collect.texts
+}
+
 fn channel_row_layout(channel: &SidebarChannel, width: f32, hovered: bool) -> ChannelRowLayout {
     use cosmic::iced::{
         Event, Point,
         advanced::{Shell, clipboard},
         mouse,
     };
+    fn leaves(layout: Layout<'_>, out: &mut Vec<Rectangle>) {
+        let mut children = layout.children().peekable();
+        if children.peek().is_none() {
+            let bounds = layout.bounds();
+            if bounds.width > 0.0 && bounds.height > 0.0 {
+                out.push(bounds);
+            }
+        }
+        for child in children {
+            leaves(child, out);
+        }
+    }
     let mut element = channel_view(
         channel,
         Listing::Live,
@@ -2900,10 +2908,10 @@ fn channel_row_layout(channel: &SidebarChannel, width: f32, hovered: bool) -> Ch
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
     }
-    let faces = (0..members::MAX_FACES)
-        .map(|index| channel_face_id(channel.id, index))
-        .collect();
-    let collect = FacesAndTexts::in_layout(&mut element, &mut tree, &node, faces);
+    let mut collect = TextsAndControls::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut collect);
     let mut end_click = Vec::new();
     if hovered {
         for event in [
@@ -2934,15 +2942,12 @@ fn channel_row_layout(channel: &SidebarChannel, width: f32, hovered: bool) -> Ch
         .find(|(id, _)| *id == channel.delete_id)
         .expect("the row mounts its delete button")
         .1;
+    let mut drawn = Vec::new();
+    leaves(Layout::new(&node), &mut drawn);
     ChannelRowLayout {
         title,
-        faces: collect.faces(),
-        count: collect
-            .texts
-            .iter()
-            .find(|(text, _)| text.starts_with('+'))
-            .map(|(_, bounds)| *bounds),
-        texts: collect.texts.into_iter().map(|(text, _)| text).collect(),
+        texts: collect.texts,
+        leaves: drawn,
         delete,
         end_click,
     }
@@ -2974,12 +2979,6 @@ fn channel_with(
     .with_members(members)
 }
 
-/// How wide a channel row's title is with nothing cut from it.
-fn natural_title_width(title: &str) -> f32 {
-    let (font, emphasis) = search_label_fonts(false);
-    search_spans_width(title, "", CHILD_ROW_TEXT_SIZE, font, emphasis).ceil()
-}
-
 /// Claude Code at work with Codex, Oh My Pi and a terminal.
 fn crowded(title: &str) -> SidebarChannel {
     use crate::agent::Provider;
@@ -2994,126 +2993,12 @@ fn crowded(title: &str) -> SidebarChannel {
     )
 }
 
-/// Hovering a channel row reveals its delete button over the row's end
-/// rather than beside it, so at no sidebar width does the pointer entering
-/// the row move its title or any face, or change how many faces there are.
-/// The pointer rests where the button shows, and a click there deletes the
-/// channel, so the hovered layout is the one with the button showing.
-#[test]
-fn hovering_a_channel_row_moves_nothing_in_it() {
-    for title in [
-        "Channel switch perf",
-        "Make the sidebar facepile readable at a glance",
-    ] {
-        let channel = crowded(title);
-        let mut counts = BTreeSet::new();
-        for width in (120..=360).step_by(2) {
-            let width = width as f32;
-            let resting = channel_row_layout(&channel, width, false);
-            let hovered = channel_row_layout(&channel, width, true);
-            assert_eq!(
-                (resting.title, &resting.faces),
-                (hovered.title, &hovered.faces),
-                "{title:?} at {width}px"
-            );
-            assert_eq!(
-                hovered.end_click,
-                vec![SidebarAction::DeleteChannel {
-                    channel_id: channel.id
-                }],
-                "the pointer is over the row, and its delete button shows at {width}px"
-            );
-            counts.insert(resting.faces.len());
-        }
-        assert!(
-            counts.len() > 1,
-            "{title:?}: the widths cover more than one pile: {counts:?}"
-        );
-    }
-}
-
-/// A title that fits its row is never cut for the facepile: where the
-/// pile does not fit beside it, the pile goes.
-#[test]
-fn a_channel_title_that_fits_stays_whole() {
-    let title = "Diff follows editor font";
-    let channel = crowded(title);
-    let natural = natural_title_width(title);
-    let mut whole_without_faces = false;
-    let mut whole_with_faces = false;
-    for width in [220.0, 260.0, 300.0, 360.0] {
-        let row = channel_row_layout(&channel, width, false);
-        assert_eq!(row.title.width, natural, "whole at {width}px");
-        whole_without_faces |= row.faces.is_empty();
-        whole_with_faces |= !row.faces.is_empty();
-        for face in &row.faces {
-            assert!(face.x >= row.title.x + natural, "after the title: {face:?}");
-        }
-    }
-    assert!(
-        whole_without_faces && whole_with_faces,
-        "the widths cover a row with and without room for the pile"
-    );
-}
-
-/// A title too long for its row is cut anyway, so it shares the row with
-/// one face and the count of the rest, as long as enough of it shows.
-#[test]
-fn a_long_channel_title_keeps_one_face_and_the_count() {
-    let title = "Make the sidebar facepile readable at a glance in every theme";
-    let channel = crowded(title);
-    let natural = natural_title_width(title);
-    for width in [220.0, 260.0] {
-        let row = channel_row_layout(&channel, width, false);
-        assert!(
-            row.title.width < natural,
-            "cut at {width}px: {:?}",
-            row.title
-        );
-        assert!(row.title.width >= members::MIN_TITLE, "{:?}", row.title);
-        assert_eq!(row.faces.len(), 1, "one face at {width}px");
-        assert!(
-            row.texts.iter().any(|text| text == "+2"),
-            "and the count at {width}px: {:?}",
-            row.texts
-        );
-    }
-    let cramped = channel_row_layout(&channel, 110.0, false);
-    assert!(
-        cramped.faces.is_empty() && !cramped.texts.iter().any(|text| text.starts_with('+')),
-        "too little title to share: no pile, and never a count alone: {:?}",
-        cramped.texts
-    );
-}
-
-/// One other member is drawn as its face alone, never counted as "+1".
-#[test]
-fn one_other_channel_member_shows_as_its_face() {
-    use crate::agent::Provider;
-    let channel = channel_with(
-        "Shell and agent",
-        &[(Provider::Claude, ChannelMemberState::Idle)],
-        1,
-    );
-    for width in [220.0, 260.0] {
-        let row = channel_row_layout(&channel, width, false);
-        assert_eq!(row.faces.len(), 1, "at {width}px");
-        assert!(
-            !row.texts.iter().any(|text| text.starts_with('+')),
-            "{:?}",
-            row.texts
-        );
-    }
-}
-
-/// A channel whose members are all of one kind still shows who else is
-/// there: the pile stands for the other members whatever their kind.
-#[test]
-fn a_channel_of_one_kind_shows_its_other_members() {
+/// Channels whose members are badged, with the count each badge holds: one
+/// provider, mixed providers, many terminals.
+fn badged_channels() -> Vec<(SidebarChannel, &'static str)> {
     use crate::agent::Provider;
     let claude = |state| (Provider::Claude, state);
-    for (channel, faces, count) in [
-        (channel_with("Shell farm", &[], 10), 1, Some("+8")),
+    vec![
         (
             channel_with(
                 "Release prep",
@@ -3124,60 +3009,131 @@ fn a_channel_of_one_kind_shows_its_other_members() {
                 ],
                 0,
             ),
-            2,
-            None,
+            "3",
         ),
+        (crowded("Channel switch perf"), "4"),
         (
-            channel_with(
-                "Pair",
-                &[
-                    claude(ChannelMemberState::Working),
-                    claude(ChannelMemberState::Idle),
-                ],
-                0,
-            ),
-            1,
-            None,
+            crowded("Investigate why switching channels stalls with many agents open"),
+            "4",
         ),
-    ] {
-        let row = channel_row_layout(&channel, 260.0, false);
-        assert_eq!(row.faces.len(), faces, "{:?}", channel.title);
-        assert_eq!(
-            row.texts
-                .iter()
-                .find(|text| text.starts_with('+'))
-                .map(String::as_str),
-            count,
-            "{:?}",
-            channel.title
-        );
-        assert_eq!(row.title.width, natural_title_width(&channel.title));
+        (channel_with("Shell farm", &[], 10), "9+"),
+    ]
+}
+
+/// Hovering a channel row reveals its delete button over the row's end
+/// rather than beside it, so at no sidebar width does the pointer entering
+/// the row move its title or its mark's badge. The pointer rests where the
+/// button shows, and a click there deletes the channel, so the hovered
+/// layout is the one with the button showing.
+#[test]
+fn hovering_a_channel_row_moves_nothing_in_it() {
+    for (channel, _) in badged_channels() {
+        for width in (120..=360).step_by(2) {
+            let width = width as f32;
+            let resting = channel_row_layout(&channel, width, false);
+            let hovered = channel_row_layout(&channel, width, true);
+            assert_eq!(
+                (resting.title, resting.badge()),
+                (hovered.title, hovered.badge()),
+                "{:?} at {width}px",
+                channel.title
+            );
+            assert_eq!(
+                hovered.end_click,
+                vec![SidebarAction::DeleteChannel {
+                    channel_id: channel.id
+                }],
+                "the pointer is over the row, and its delete button shows at {width}px"
+            );
+        }
     }
 }
 
-/// The delete button a hover lays over a channel row's end covers only the
-/// slot the row keeps for it, never the facepile or the title, so no face
-/// or count is half hidden while the pointer is on the row.
+/// A channel's members are counted by a badge on its mark, before the
+/// title, whatever their providers; nothing follows the title but the
+/// row's status slot, so no member's face repeats after it and no "+N"
+/// trails it.
 #[test]
-fn a_channel_rows_delete_button_never_covers_its_facepile() {
+fn a_channels_member_count_is_a_badge_on_its_mark() {
+    for (channel, count) in badged_channels() {
+        for width in [180.0, 260.0, 360.0] {
+            let row = channel_row_layout(&channel, width, false);
+            let (badge, bounds) = row
+                .badge()
+                .unwrap_or_else(|| panic!("{:?} is badged", channel.title));
+            assert_eq!(badge, count, "{:?}", channel.title);
+            assert!(
+                bounds.x + bounds.width < row.title.x,
+                "{:?}: on the mark, before the title: {bounds:?} {:?}",
+                channel.title,
+                row.title
+            );
+            for leaf in &row.leaves {
+                assert!(
+                    leaf.x < row.title.x || *leaf == row.title || leaf.x >= row.delete.x,
+                    "{:?} at {width}px: {leaf:?} is drawn after the title {:?}",
+                    channel.title,
+                    row.title
+                );
+            }
+        }
+    }
+}
+
+/// One member is its mark alone: a badge saying "1" would say nothing the
+/// mark does not.
+#[test]
+fn a_channel_of_one_member_draws_no_badge() {
     use crate::agent::Provider;
-    let channels = [
-        crowded("Channel switch perf"),
-        crowded("Investigate why switching channels stalls with many agents open"),
-        channel_with("Shell farm", &[], 10),
+    for channel in [
         channel_with(
-            "Shell and agent",
-            &[(Provider::Claude, ChannelMemberState::Idle)],
-            1,
+            "Release prep",
+            &[(Provider::Claude, ChannelMemberState::Working)],
+            0,
         ),
-    ];
-    for channel in &channels {
-        let mut piled = false;
+        channel_with("Shell", &[], 1),
+    ] {
+        let row = channel_row_layout(&channel, 260.0, false);
+        assert_eq!(row.badge(), None, "{:?}", channel.title);
+    }
+}
+
+/// The tooltip and the accessible name still list every member, which the
+/// badge only counts.
+#[test]
+fn a_channels_tooltip_and_name_list_every_member() {
+    let channel = crowded("Channel switch perf");
+    let members = "Claude Code, working; Oh My Pi, idle; Codex, idle; Terminal";
+    assert!(channel.tooltip.contains(members), "{:?}", channel.tooltip);
+    let names = accessible_names(
+        &headless_renderer(),
+        channel_view(
+            &channel,
+            Listing::Live,
+            channel.attention,
+            false,
+            false,
+            Some(1),
+            "",
+        ),
+    );
+    assert!(names.iter().any(|name| name.contains(members)), "{names:?}");
+}
+
+/// The delete button a hover lays over a channel row's end covers only the
+/// slot the row keeps for it, never the title or the mark's badge.
+#[test]
+fn a_channel_rows_delete_button_covers_only_its_status_slot() {
+    for (channel, _) in badged_channels() {
         for width in (120..=360).step_by(2) {
             let width = width as f32;
-            let row = channel_row_layout(channel, width, true);
-            let pile = row.faces.iter().chain(&row.count);
-            for bounds in pile.chain([&row.title]) {
+            let row = channel_row_layout(&channel, width, true);
+            for bounds in row
+                .badge()
+                .map(|(_, bounds)| bounds)
+                .iter()
+                .chain([&row.title])
+            {
                 assert!(
                     bounds.x + bounds.width <= row.delete.x,
                     "{:?} at {width}px: {bounds:?} runs under {:?}",
@@ -3185,16 +3141,14 @@ fn a_channel_rows_delete_button_never_covers_its_facepile() {
                     row.delete
                 );
             }
-            piled |= !row.faces.is_empty();
         }
-        assert!(piled, "{:?} shows a pile at some width", channel.title);
     }
 }
 
-/// A title followed by a facepile sits on the same pixel row as a title on
-/// its own, rather than between two, where it would be drawn blurred.
+/// A badged channel's title sits on the same pixel row as an unbadged
+/// title, rather than between two, where it would be drawn blurred.
 #[test]
-fn a_channel_title_keeps_its_line_beside_a_facepile() {
+fn a_channel_title_keeps_its_line_beside_a_badge() {
     use crate::agent::Provider;
     let title = "Diff follows editor font";
     let plain = SidebarChannel::new(
@@ -3207,7 +3161,7 @@ fn a_channel_title_keeps_its_line_beside_a_facepile() {
         true,
         1,
     );
-    let piled = channel_with(
+    let badged = channel_with(
         title,
         &[
             (Provider::Claude, ChannelMemberState::Working),
@@ -3216,8 +3170,8 @@ fn a_channel_title_keeps_its_line_beside_a_facepile() {
         0,
     );
     let alone = channel_row_layout(&plain, 260.0, false).title;
-    let beside = channel_row_layout(&piled, 260.0, false);
-    assert_eq!(beside.faces.len(), 1);
+    let beside = channel_row_layout(&badged, 260.0, false);
+    assert!(beside.badge().is_some());
     assert_eq!(
         (alone.y, alone.height),
         (beside.title.y, beside.title.height),
@@ -3226,58 +3180,29 @@ fn a_channel_title_keeps_its_line_beside_a_facepile() {
     );
 }
 
-/// The workspace switcher follows a channel's name with the same facepile
-/// as its sidebar row, sharing the name's line by the same rules, and shows
-/// the name alone where the row would.
+/// The workspace switcher leads a channel's row with the sidebar row's
+/// mark, so it carries the same count badge, and a lone member none.
 #[test]
-fn a_channel_name_elsewhere_takes_the_rows_facepile() {
-    let faces_beside = |channel: &SidebarChannel, width: f32| {
-        let name = channel.title.clone();
-        let mut element = channel_name_with_company(
-            channel,
-            &name,
-            RowInk::Full,
-            |width| {
-                widget::text(name.clone())
-                    .width(Length::Fixed(width))
-                    .into()
-            },
-            |index| Id::new(format!("elsewhere.{index}")),
-        )?;
-        let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &headless_renderer(),
-            &layout::Limits::new(Size::ZERO, Size::new(width, WORKTREE_ROW_HEIGHT)),
-        );
-        let ids = (0..members::MAX_FACES)
-            .map(|index| Id::new(format!("elsewhere.{index}")))
-            .collect();
-        Some(
-            FacesAndTexts::in_layout(&mut element, &mut tree, &node, ids)
-                .faces()
-                .len(),
-        )
-    };
+fn a_channel_mark_elsewhere_carries_the_rows_badge() {
     use crate::agent::Provider;
+    let badge = |channel: &SidebarChannel| {
+        laid_out_texts(
+            workspace_mark(WorkspaceMark::Channel(Some(channel)), RowInk::Full),
+            Size::new(ROW_ICON_WIDTH, WORKTREE_ROW_HEIGHT),
+        )
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>()
+    };
+    for (channel, count) in badged_channels() {
+        assert_eq!(badge(&channel), vec![count], "{:?}", channel.title);
+    }
     let lone = channel_with(
         "Release prep",
         &[(Provider::Claude, ChannelMemberState::Working)],
         0,
     );
-    assert_eq!(faces_beside(&lone, 260.0), None);
-    assert_eq!(
-        faces_beside(&channel_with("Shell farm", &[], 10), 260.0),
-        Some(1)
-    );
-    assert_eq!(faces_beside(&crowded("Review sweep"), 260.0), Some(3));
-    assert_eq!(
-        faces_beside(
-            &crowded("Make the sidebar facepile readable at a glance in every theme"),
-            260.0
-        ),
-        Some(1)
-    );
+    assert!(badge(&lone).is_empty());
 }
 
 fn assert_glyph_centered(

@@ -1012,33 +1012,11 @@ impl Cagents {
             ),
         };
         let chip = sidebar::workspace_mark(mark, sidebar::RowInk::Full);
-        let name_edge = row.name_edge();
-        let name = move |width: Length| -> Element<'a, Message> {
-            crate::ui_controls::fade_text(row.name.as_str())
-                .edge(name_edge)
-                .width(width)
-                .into()
-        };
-        // A channel's name is followed by the faces of the members after
-        // its lead, as in its sidebar row.
-        let name = match mark {
-            sidebar::WorkspaceMark::Channel(Some(channel)) => {
-                let channel_id = channel.id;
-                sidebar::channel_name_with_company(
-                    channel,
-                    row.name.as_str(),
-                    sidebar::RowInk::Full,
-                    move |width| name(Length::Fixed(width)),
-                    move |index| {
-                        widget::Id::new(format!("workspace-switcher.face.{channel_id}.{index}"))
-                    },
-                )
-            }
-            _ => None,
-        }
-        .unwrap_or_else(|| name(Length::Fill));
         let text = widget::column::with_children(vec![
-            name,
+            crate::ui_controls::fade_text(row.name.as_str())
+                .edge(row.name_edge())
+                .width(Length::Fill)
+                .into(),
             crate::ui_controls::FadeText::caption(row.place.as_str())
                 .edge(row.place_edge())
                 .width(Length::Fill)

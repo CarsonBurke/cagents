@@ -102,8 +102,9 @@ const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
 /// over its end, where the slot is. The control is laid over the row
 /// without moving anything, so the slot is reserved at rest as wide as the
 /// control reaches past the row's inset and the gutter before the slot: the
-/// control then covers the slot and never the title or facepile beside it. The indicator keeps its own
-/// column at the slot's end, in line with every other row's.
+/// control then covers the slot and never the title beside it. The
+/// indicator keeps its own column at the slot's end, in line with every
+/// other row's.
 const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
 const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
 /// The project header's hover-revealed commands: disclose, new channel, new
@@ -8272,38 +8273,6 @@ pub(crate) fn workspace_mark<Message: 'static>(
         .into()
 }
 
-/// A channel's name followed by the facepile of the members after its lead,
-/// sharing the slot as they do in the channel's expanded sidebar row, so the
-/// workspace switcher shows who is in a channel as the sidebar does.
-/// `title` draws the name in body text at the width it is given; `face_id`
-/// names each face. `None` when there is no pile to show, and the name
-/// stands alone.
-pub(crate) fn channel_name_with_company<'a, Message: 'static>(
-    channel: &SidebarChannel,
-    name: &'a str,
-    ink: RowInk,
-    title: impl Fn(f32) -> Element<'a, Message> + 'a,
-    face_id: impl Fn(usize) -> Id + 'a,
-) -> Option<Element<'a, Message>> {
-    let (font, _) = search_label_fonts(false);
-    let pile = channel_pile(channel)?;
-    Some(pile.beside(
-        ink,
-        move || search_spans_width(name, "", design::TEXT_BODY, font, font),
-        title,
-        face_id,
-    ))
-}
-
-/// The facepile of the members after a channel's lead, with its counts
-/// measured; `None` when there is nobody to show after it.
-fn channel_pile(channel: &SidebarChannel) -> Option<members::Pile> {
-    let (font, _) = search_label_fonts(false);
-    members::Pile::new(&channel.members, |label| {
-        search_spans_width(label, "", design::TEXT_CAPTION, font, font)
-    })
-}
-
 /// Any other glyph that stands in a row's glyph column, in the row's `ink`.
 fn ink_glyph<'a, Message: 'a>(
     icon: widget::icon::Handle,
@@ -8535,11 +8504,17 @@ fn channel_view(
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
-        let label = channel_label(channel, query, ink, has_members);
+        let label = search_label(
+            &channel.title,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            ink.text_class(),
+            false,
+        );
         let indicator = match deletion {
             Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-            // The mark and the facepile after the title show who is there,
-            // and the tooltip lists them, so the row's end keeps to news.
+            // The mark and its badge show who is there, and the tooltip
+            // lists them, so the row's end keeps to news.
             _ if has_members => attention_indicator(attention),
             _ => channel_indicator(attention, channel.chats),
         };
@@ -8606,64 +8581,6 @@ fn channel_view(
         channel.id,
         !inert,
     )
-}
-
-/// A channel row's title, followed by the facepile of the members after its
-/// lead when there are any.
-///
-/// The title keeps priority; see [`members::Pile::fit`] for how the two
-/// share the row. Both are measured once per build of the row, not on every
-/// layout. The row's delete button covers its end rather than narrowing it,
-/// so the title and the pile are laid out across the same width whether the
-/// pointer is over the row or not, and neither moves when it enters.
-fn channel_label(
-    channel: &SidebarChannel,
-    query: &str,
-    ink: RowInk,
-    has_members: bool,
-) -> Element<'static, SidebarAction> {
-    let (font, emphasis) = search_label_fonts(false);
-    let pile = has_members.then(|| channel_pile(channel)).flatten();
-    let Some(pile) = pile else {
-        return search_label(
-            &channel.title,
-            query,
-            CHILD_ROW_TEXT_SIZE,
-            ink.text_class(),
-            false,
-        );
-    };
-    let text = std::rc::Rc::new((channel.title.clone(), query.to_owned()));
-    let measured = text.clone();
-    let channel_id = channel.id;
-    pile.beside(
-        ink,
-        move || {
-            search_spans_width(
-                &measured.0,
-                &measured.1,
-                CHILD_ROW_TEXT_SIZE,
-                font,
-                emphasis,
-            )
-        },
-        move |width| {
-            search_label_within(
-                &text.0,
-                &text.1,
-                CHILD_ROW_TEXT_SIZE,
-                ink.text_class(),
-                false,
-                Length::Fixed(width),
-            )
-        },
-        move |index| channel_face_id(channel_id, index),
-    )
-}
-
-/// The face at `index` in a channel row's facepile.
-fn channel_face_id(channel: ChannelId, index: usize) -> Id {
-    entity_id("channel.face", format_args!("{channel}.{index}"))
 }
 
 /// A child row's leading glyph, in the row's tone.
@@ -13705,20 +13622,6 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
-    search_label_within(label, query, size, class, heading, Length::Fill)
-}
-
-/// [`search_label`] at `width` rather than filling its slot. The label sets
-/// its own width rather than taking a container's, which would draw its
-/// text in the container's colour instead of the row's.
-fn search_label_within(
-    label: &str,
-    query: &str,
-    size: f32,
-    class: theme::Text,
-    heading: bool,
-    width: Length,
-) -> Element<'static, SidebarAction> {
     let (font, emphasis) = search_label_fonts(heading);
     let highlights = search_highlight_ranges(label, query);
     if highlights.is_empty() {
@@ -13730,7 +13633,7 @@ fn search_label_within(
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
             ))
-            .width(width)
+            .width(Length::Fill)
             .into();
     }
     let label = label.to_owned();
@@ -13767,7 +13670,7 @@ fn search_label_within(
         .clip(true)
         .into()
     })
-    .width(width)
+    .width(Length::Fill)
     // As tall as its text, so a highlighted title sits on the same pixel
     // row as a plain one rather than blurred between two.
     .height(Length::Shrink)
