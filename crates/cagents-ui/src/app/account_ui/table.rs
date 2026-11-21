@@ -148,6 +148,25 @@ impl Column {
         Self::Updated,
     ];
 
+    /// The columns that hold an account's usage figures, which a provider
+    /// that reports none has nothing to put in.
+    const USAGE: [Self; 4] = [Self::Session, Self::Weekly, Self::Model, Self::Credits];
+
+    /// Whether `account` has something to show in this column. A column no
+    /// listed account has anything for is left out rather than drawn as a
+    /// line of dashes.
+    fn shows(self, account: &AccountState) -> bool {
+        let window = |kind| figures(account).and_then(|snapshot| window_of(snapshot, kind));
+        match self {
+            Self::Plan => account.plan().is_some(),
+            Self::Session => window(account::WindowKind::Session).is_some(),
+            Self::Weekly => window(account::WindowKind::Weekly).is_some(),
+            Self::Model => window(account::WindowKind::Scoped).is_some(),
+            Self::Credits => figures(account).is_some_and(|snapshot| snapshot.credits.is_some()),
+            Self::Status | Self::Updated => true,
+        }
+    }
+
     fn width(self, usage: f32) -> f32 {
         match self {
             Self::Plan => 72.0,
@@ -186,7 +205,13 @@ struct Layout {
 /// Below this the toolbar's description goes above its controls.
 const TOOLBAR_MIN_WIDTH: f32 = 600.0;
 
+#[cfg(test)]
 fn layout(width: f32) -> Layout {
+    layout_of(width, &Column::ORDER)
+}
+
+/// [`Layout`] for a table of the `shown` columns, `width` wide.
+fn layout_of(width: f32, shown: &[Column]) -> Layout {
     let available = width.min(MAX_WIDTH) - 2.0 * GUTTER;
     let needed = |columns: &[Column], usage: f32| {
         ACCOUNT_MIN_WIDTH
@@ -198,7 +223,10 @@ fn layout(width: f32) -> Layout {
             + COLUMN_SPACING
     };
     let compact_toolbar = available < TOOLBAR_MIN_WIDTH;
-    let mut columns = Column::ORDER.to_vec();
+    let mut columns = Column::ORDER
+        .into_iter()
+        .filter(|column| shown.contains(column))
+        .collect::<Vec<_>>();
     for drop in Column::DROP_ORDER {
         if needed(&columns, USAGE_WIDTH) <= available {
             return Layout {
@@ -223,6 +251,66 @@ fn layout(width: f32) -> Layout {
         stacked,
         compact_toolbar,
     }
+}
+
+/// One cell of a table line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Slot {
+    Column(Column),
+    /// The usage columns of a provider that reports no usage, as one cell
+    /// that says so.
+    Unreported {
+        width: f32,
+    },
+}
+
+impl Slot {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Column(column) => column.title(),
+            Self::Unreported { .. } => "Usage",
+        }
+    }
+
+    fn width(self, layout: &Layout) -> f32 {
+        match self {
+            Self::Column(column) => column.width(layout.usage),
+            Self::Unreported { width } => width,
+        }
+    }
+}
+
+/// The cells `provider`'s lines are laid out in: the layout's columns, with
+/// the usage columns of a provider that reports no usage joined into one,
+/// so its plan and status still line up with every other provider's.
+fn slots(layout: &Layout, provider: Provider) -> Vec<Slot> {
+    if account::reports_usage_limits(provider) {
+        return layout.columns.iter().copied().map(Slot::Column).collect();
+    }
+    let mut slots = Vec::with_capacity(layout.columns.len());
+    for column in &layout.columns {
+        if !Column::USAGE.contains(column) {
+            slots.push(Slot::Column(*column));
+            continue;
+        }
+        let width = column.width(layout.usage);
+        match slots.last_mut() {
+            Some(Slot::Unreported { width: joined }) => *joined += COLUMN_SPACING + width,
+            _ => slots.push(Slot::Unreported { width }),
+        }
+    }
+    slots
+}
+
+/// An account's figures, while they are figures rather than a state such
+/// as signed out.
+fn figures(account: &AccountState) -> Option<&UsageSnapshot> {
+    account.snapshot.as_ref().filter(|snapshot| {
+        matches!(
+            snapshot.status,
+            UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+        )
+    })
 }
 
 /// The tightest of an account's windows of `kind`.
@@ -271,6 +359,22 @@ fn order(state: &State, sort: Sort, left: &AccountState, right: &AccountState) -
     }
 }
 
+/// The columns some account listed under `providers` has something for.
+/// Every group shares them, so a provider's plan and status line up with
+/// the others'.
+fn shown_columns(state: &State, providers: &[Provider]) -> Vec<Column> {
+    Column::ORDER
+        .into_iter()
+        .filter(|column| {
+            providers.iter().any(|provider| {
+                state
+                    .of(*provider)
+                    .any(|account| listed(state, account) && column.shows(account))
+            })
+        })
+        .collect()
+}
+
 /// Pane visibility is separate from a successful account or quota reading:
 /// a system account whose check failed stays listed for its retry control,
 /// unless its CLI is missing, which the group explains with its remedy.
@@ -294,6 +398,11 @@ fn rows(state: &State, provider: Provider, sort: Sort) -> Vec<&AccountState> {
 }
 
 #[cfg(test)]
+pub(super) fn providers_for_test(state: &State) -> Vec<Provider> {
+    table_layout(state, 1_200.0).0
+}
+
+#[cfg(test)]
 pub(super) fn row_ids_for_test(state: &State, provider: Provider) -> Vec<AccountId> {
     rows(state, provider, state.table.sort)
         .into_iter()
@@ -305,9 +414,27 @@ pub(super) fn view(app: &Cagents) -> Element<'_, Message> {
     crate::ui_controls::responsive(move |size| table(app, size.width)).into()
 }
 
+/// The providers the pane has a group for, and the layout their columns
+/// share at `width`.
+fn table_layout(state: &State, width: f32) -> (Vec<Provider>, Layout) {
+    let providers: Vec<Provider> = Account::REPORTED
+        .into_iter()
+        .filter(|provider| state.uses(*provider))
+        .filter(|provider| {
+            // A provider accounts cannot be added to is listed only while it
+            // reports some, or its record of them cannot be read.
+            Account::PROVIDERS.contains(provider)
+                || state.of(*provider).any(|account| listed(state, account))
+                || (*provider == Provider::Omp && state.omp_problem().is_some())
+        })
+        .collect();
+    let layout = layout_of(width, &shown_columns(state, &providers));
+    (providers, layout)
+}
+
 fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     let state = &app.account_ui;
-    let layout = layout(width);
+    let (providers, layout) = table_layout(state, width);
     let mut sections: Vec<Element<'_, Message>> =
         vec![toolbar(state, &layout, app.codex_browser_busy())];
     let project = app.accounts_project();
@@ -322,15 +449,11 @@ fn table(app: &Cagents, width: f32) -> Element<'_, Message> {
     if let Some((provider, path)) = &state.table.link {
         sections.push(link_form(state, *provider, path));
     }
-    for provider in Account::REPORTED {
-        // A provider accounts cannot be added to is listed only while it
-        // reports some, or its record of them cannot be read.
-        if Account::PROVIDERS.contains(&provider)
-            || !rows(state, provider, state.table.sort).is_empty()
-            || (provider == Provider::Omp && state.omp_problem().is_some())
-        {
-            sections.push(group(app, provider, &layout, project));
-        }
+    for provider in providers {
+        sections.push(group(app, provider, &layout, project));
+    }
+    if let Some(turned_off) = turned_off(state) {
+        sections.push(turned_off);
     }
     widget::scrollable(
         widget::container(
@@ -399,82 +522,19 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     } else {
         add_button.into()
     };
-    let add = crate::ui_controls::popover(
-        add_button,
-        state.table.add_menu.then(|| {
-            widget::container(
-                widget::column::with_children(vec![
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Claude),
-                        if state.installed.get(&Provider::Claude) == Some(&false) { "Install Claude" } else { "Claude" },
-                        if state.installed.get(&Provider::Claude) == Some(&false) { "CLI not found on PATH" } else { "Sign in with a Claude subscription" },
-                        action(if state.installed.get(&Provider::Claude) == Some(&false) { Action::Install(Provider::Claude) } else { Action::Add {
-                            provider: Provider::Claude,
-                            device: false,
-                        }}),
-                    )
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Codex),
-                        if state.installed.get(&Provider::Codex) == Some(&false) { "Install Codex" } else { "ChatGPT (Codex)" },
-                        if crate::device::is_remote() {
-                            "Sign in on another device with a one-time code"
-                        } else if browser_busy {
-                            "A browser sign-in is pending; finish it or use a code"
-                        } else {
-                            "Sign in through your browser"
-                        },
-                        action(Action::Add {
-                            provider: Provider::Codex,
-                            device: false,
-                        }),
-                    )
-                    .on_press_maybe((!browser_busy).then(|| {
-                        action(if state.installed.get(&Provider::Codex) == Some(&false) { Action::Install(Provider::Codex) } else { Action::Add {
-                            provider: Provider::Codex,
-                            device: false,
-                        }})
-                    }))
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Codex),
-                        "ChatGPT (Codex) with a code",
-                        "Sign in on another device with a one-time code",
-                        action(if state.installed.get(&Provider::Codex) == Some(&false) {
-                            Action::Install(Provider::Codex)
-                        } else { Action::Add { provider: Provider::Codex, device: true } }),
-                    )
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Claude),
-                        "Existing Claude home",
-                        "Use a Claude login and history already on this computer",
-                        action(Action::LinkStart(Provider::Claude)),
-                    )
-                    .into(),
-                    crate::ui_controls::popover_item(
-                        crate::ui_controls::provider_icon(Provider::Codex),
-                        "Existing Codex home",
-                        "Use a Codex login and history already on this computer",
-                        action(Action::LinkStart(Provider::Codex)),
-                    )
-                    .into(),
-                    design::horizontal_rule(),
-                    crate::ui_controls::field::checkbox(state.table.own_codex_config)
-                        .label("Keep a separate Codex configuration")
-                        .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
-                        .into(),
-                    design::caption("Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.")
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
-                ])
-                .spacing(space::XXS),
+    // With every provider accounts can be added to turned off there is
+    // nothing to add.
+    let add = Account::PROVIDERS
+        .into_iter()
+        .any(|provider| state.uses(provider))
+        .then(|| {
+            crate::ui_controls::popover(
+                add_button,
+                state.table.add_menu.then(|| add_menu(state, browser_busy)),
+                widget::popover::Position::Bottom,
+                action(Action::AddMenu(false)),
             )
-            .width(300)
-            .into()
-        }),
-        widget::popover::Position::Bottom,
-        action(Action::AddMenu(false)),
-    );
+        });
     let description = widget::column::with_children(vec![
         design::heading("Accounts").into(),
         design::caption("Compare usage limits and available resets across your accounts.")
@@ -486,11 +546,12 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
     if layout.compact_toolbar {
         return widget::column::with_children(vec![
             description.into(),
-            widget::row::with_children(vec![
-                sort,
-                iced::widget::Space::new().width(Length::Fill).into(),
-                add,
-            ])
+            widget::row::with_children(
+                [sort, iced::widget::Space::new().width(Length::Fill).into()]
+                    .into_iter()
+                    .chain(add)
+                    .collect::<Vec<_>>(),
+            )
             .spacing(space::M)
             .align_y(Alignment::Center)
             .into(),
@@ -498,9 +559,193 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
         .spacing(space::M)
         .into();
     }
-    widget::row::with_children(vec![description.into(), sort, add])
-        .spacing(space::M)
-        .align_y(Alignment::Center)
+    widget::row::with_children(
+        [description.into(), sort]
+            .into_iter()
+            .chain(add)
+            .collect::<Vec<_>>(),
+    )
+    .spacing(space::M)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The providers turned off in the settings, each with the way to turn it
+/// back on, so the reader who turned one off here can find it again.
+fn turned_off<'a>(state: &State) -> Option<Element<'a, Message>> {
+    let providers: Vec<Provider> = state.turned_off().collect();
+    if providers.is_empty() {
+        return None;
+    }
+    let mut items: Vec<Element<'a, Message>> = vec![design::caption("Turned off").into()];
+    items.extend(providers.into_iter().map(|provider| {
+        crate::interaction::tooltip(
+            widget::button::custom(
+                widget::row::with_children(vec![
+                    widget::icon(crate::ui_controls::provider_icon(provider))
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into(),
+                    design::caption(provider.label())
+                        .class(cosmic::theme::Text::Default)
+                        .into(),
+                    design::caption("Turn on").into(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+            )
+            .name(format!("Turn on {}", provider.label()))
+            .class(crate::ui_controls::control_style(false, None))
+            .padding([space::XXS, space::S])
+            .on_press(use_provider(provider, true)),
+            format!(
+                "Offer {} again, list its accounts and check their usage",
+                provider.label()
+            ),
+        )
+    }));
+    Some(
+        widget::row::with_children(items)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .wrap()
+            .into(),
+    )
+}
+
+/// Turns `provider` on or off, as its switch in the settings does.
+fn use_provider(provider: Provider, used: bool) -> Message {
+    Message::SettingsChanged {
+        field: SettingsField::UseProvider(provider),
+        value: used.to_string(),
+    }
+}
+
+/// The ways to add an account, for each provider in use that accounts can
+/// be added to.
+fn add_menu<'a>(state: &'a State, browser_busy: bool) -> Element<'a, Message> {
+    let action = |action| Message::AccountUi(action);
+    let missing = |provider| state.installed.get(&provider) == Some(&false);
+    let claude = state.uses(Provider::Claude);
+    let codex = state.uses(Provider::Codex);
+    let mut items: Vec<Element<'a, Message>> = Vec::new();
+    if claude {
+        items.push(
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Claude),
+                if missing(Provider::Claude) {
+                    "Install Claude"
+                } else {
+                    "Claude"
+                },
+                if missing(Provider::Claude) {
+                    "CLI not found on PATH"
+                } else {
+                    "Sign in with a Claude subscription"
+                },
+                action(if missing(Provider::Claude) {
+                    Action::Install(Provider::Claude)
+                } else {
+                    Action::Add {
+                        provider: Provider::Claude,
+                        device: false,
+                    }
+                }),
+            )
+            .into(),
+        );
+    }
+    if codex {
+        items.push(
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                if missing(Provider::Codex) {
+                    "Install Codex"
+                } else {
+                    "ChatGPT (Codex)"
+                },
+                if crate::device::is_remote() {
+                    "Sign in on another device with a one-time code"
+                } else if browser_busy {
+                    "A browser sign-in is pending; finish it or use a code"
+                } else {
+                    "Sign in through your browser"
+                },
+                action(Action::Add {
+                    provider: Provider::Codex,
+                    device: false,
+                }),
+            )
+            .on_press_maybe((!browser_busy).then(|| {
+                action(if missing(Provider::Codex) {
+                    Action::Install(Provider::Codex)
+                } else {
+                    Action::Add {
+                        provider: Provider::Codex,
+                        device: false,
+                    }
+                })
+            }))
+            .into(),
+        );
+        items.push(
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                "ChatGPT (Codex) with a code",
+                "Sign in on another device with a one-time code",
+                action(if missing(Provider::Codex) {
+                    Action::Install(Provider::Codex)
+                } else {
+                    Action::Add {
+                        provider: Provider::Codex,
+                        device: true,
+                    }
+                }),
+            )
+            .into(),
+        );
+    }
+    if claude {
+        items.push(
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Claude),
+                "Existing Claude home",
+                "Use a Claude login and history already on this computer",
+                action(Action::LinkStart(Provider::Claude)),
+            )
+            .into(),
+        );
+    }
+    if codex {
+        items.push(
+            crate::ui_controls::popover_item(
+                crate::ui_controls::provider_icon(Provider::Codex),
+                "Existing Codex home",
+                "Use a Codex login and history already on this computer",
+                action(Action::LinkStart(Provider::Codex)),
+            )
+            .into(),
+        );
+        items.push(design::horizontal_rule());
+        items.push(
+            crate::ui_controls::field::checkbox(state.table.own_codex_config)
+                .label("Keep a separate Codex configuration")
+                .on_toggle(|own| Message::AccountUi(Action::OwnCodexConfig(own)))
+                .into(),
+        );
+    } else {
+        items.push(design::horizontal_rule());
+    }
+    items.push(
+        design::caption(match (claude, codex) {
+            (true, true) => "Logins stay separate. Codex accounts can share preferences; new Claude accounts start with a copy of your preferences.",
+            (true, false) => "Logins stay separate. New Claude accounts start with a copy of your preferences.",
+            _ => "Logins stay separate. Codex accounts can share preferences.",
+        })
+        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+        .into(),
+    );
+    widget::container(widget::column::with_children(items).spacing(space::XXS))
+        .width(300)
         .into()
 }
 
@@ -577,13 +822,19 @@ fn group<'a>(
             .into(),
         );
     }
+    header.push(
+        crate::ui_controls::icon_button(Icon::Hide, format!("Turn off {}", provider.label()))
+            .compact()
+            .on_press(use_provider(provider, false))
+            .into(),
+    );
     let header = widget::row::with_children(header)
         .spacing(space::S)
         .align_y(Alignment::Center);
 
     let mut lines: Vec<Element<'a, Message>> = Vec::new();
     if (count > 0 || !logins.is_empty()) && !layout.stacked {
-        lines.push(column_titles(layout));
+        lines.push(column_titles(layout, provider));
     }
     for account in &rows {
         lines.push(design::horizontal_rule());
@@ -684,18 +935,12 @@ fn line<'a>(
     .into()
 }
 
-fn column_titles<'a>(layout: &Layout) -> Element<'a, Message> {
+fn column_titles<'a>(layout: &Layout, provider: Provider) -> Element<'a, Message> {
     line(
         design::caption("Account").into(),
-        layout
-            .columns
-            .iter()
-            .map(|column| {
-                (
-                    column.width(layout.usage),
-                    design::caption(column.title()).into(),
-                )
-            })
+        slots(layout, provider)
+            .into_iter()
+            .map(|slot| (slot.width(layout), design::caption(slot.title()).into()))
             .collect(),
         iced::widget::Space::new().into(),
         design::ROW_HEIGHT,
@@ -703,6 +948,23 @@ fn column_titles<'a>(layout: &Layout) -> Element<'a, Message> {
 }
 
 const ROW_HEIGHT: f32 = 52.0;
+/// Where an account's name begins in its row: past the line's padding and
+/// the provider icon before the name.
+const NAME_INSET: f32 = space::M + design::ROW_ICON_SIZE as f32 + NAME_SPACING;
+const NAME_SPACING: f32 = design::GRID_UNIT * 2.5;
+
+/// A plan as its badge shows it under its provider's heading, which already
+/// says whose plan it is: Antigravity's "Google AI Pro" is "Pro". The
+/// badge's tooltip keeps the whole name.
+fn short_plan(provider: Provider, plan: &str) -> &str {
+    match provider {
+        Provider::Antigravity => plan
+            .strip_prefix("Google AI ")
+            .filter(|tier| !tier.trim().is_empty())
+            .unwrap_or(plan),
+        _ => plan,
+    }
+}
 
 fn dash<'a>() -> Element<'a, Message> {
     design::caption("—").into()
@@ -716,23 +978,32 @@ fn row<'a>(
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
     let now = state.now_ms;
-    let snapshot = account.snapshot.as_ref().filter(|snapshot| {
-        matches!(
-            snapshot.status,
-            UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
-        )
-    });
+    let snapshot = figures(account);
     let stale =
         account.failure.is_some() || snapshot.is_some_and(|snapshot| is_stale(snapshot, now));
-    let cells = layout
-        .columns
-        .iter()
-        .map(|column| {
+    let cells = slots(layout, account.account.provider)
+        .into_iter()
+        .map(|slot| {
+            let column = match slot {
+                Slot::Column(column) => column,
+                Slot::Unreported { .. } => {
+                    // Under the "Usage" title, this says what the five
+                    // dashes it replaces could not.
+                    let cell = crate::interaction::tooltip(
+                        crate::ui_controls::FadeText::caption("Not reported"),
+                        format!(
+                            "{} has usage limits but doesn't report them, so cagents can't show how much is left.",
+                            account.account.provider.label()
+                        ),
+                    );
+                    return (slot, (slot.width(layout), cell));
+                }
+            };
             let cell = match column {
                 Column::Plan => account.plan().map_or_else(dash, |plan| {
                     let label = account.plan_tooltip().expect("plan is present");
                     let badge = crate::ui_controls::bounded_badge(
-                        plan,
+                        short_plan(account.account.provider, &plan).to_owned(),
                         design::Tone::Themed(design::accent_color),
                         Column::Plan.width(layout.usage),
                     );
@@ -765,10 +1036,15 @@ fn row<'a>(
                 Column::Credits => snapshot
                     .and_then(|snapshot| snapshot.credits.as_ref())
                     .map_or_else(dash, |credits| {
-                        design::caption(credits.summary())
-                            .class(cosmic::theme::Text::Default)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .into()
+                        let summary = design::caption(credits.summary())
+                            .wrapping(cosmic::iced::widget::text::Wrapping::None);
+                        // Extra usage that is off is the usual case, and is
+                        // read past like the dash of an empty cell.
+                        if credits.enabled || credits.unlimited {
+                            summary.class(cosmic::theme::Text::Default).into()
+                        } else {
+                            summary.into()
+                        }
                     }),
                 Column::Status => status_badge(account),
                 Column::Updated => account.snapshot.as_ref().map_or_else(dash, |snapshot| {
@@ -784,19 +1060,19 @@ fn row<'a>(
                     }
                 }),
             };
-            (column.width(layout.usage), cell)
+            (slot, (slot.width(layout), cell))
         })
         .collect::<Vec<_>>();
     let content = if layout.stacked {
         stacked_row(
             account_cell(app, account, project),
-            layout.columns.iter().copied().zip(cells).collect(),
+            cells,
             actions(app, account, now, project),
         )
     } else {
         line(
             account_cell(app, account, project),
-            cells,
+            cells.into_iter().map(|(_, cell)| cell).collect(),
             actions(app, account, now, project),
             ROW_HEIGHT,
         )
@@ -804,33 +1080,35 @@ fn row<'a>(
     // Keep the account and its controls in the same child slot when a
     // background check fails. The explanation can wrap below the fixed-height
     // row, including when the Status column has been dropped for space.
-    let mut lines = vec![content];
+    // What the row has to say beyond its figures goes beneath it, under the
+    // account's name, so it reads as part of this row rather than the next.
+    let mut details: Vec<Element<'a, Message>> = Vec::new();
     if let Some(resets) = app.usage_reset_controls(account) {
-        lines.push(
-            widget::container(resets.on_surface("accounts").view())
-                .padding([space::XS, space::M])
-                .width(Length::Fill)
-                .into(),
-        );
+        details.push(resets.on_surface("accounts").view());
     }
     // The group explains a missing CLI once, with the way to install it.
     if let Some(reason) = failure_caption(account, now)
         .filter(|_| state.installed.get(&account.account.provider) != Some(&false))
     {
+        details.push(
+            design::caption(reason)
+                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+        );
+    }
+    let mut lines = vec![content];
+    if !details.is_empty() {
         lines.push(
-            widget::container(
-                design::caption(reason)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .wrapping(cosmic::iced::widget::text::Wrapping::Word),
-            )
-            .padding(Padding {
-                top: 0.0,
-                right: space::M,
-                bottom: space::M,
-                left: space::M,
-            })
-            .width(Length::Fill)
-            .into(),
+            widget::container(widget::column::with_children(details).spacing(space::S))
+                .padding(Padding {
+                    top: 0.0,
+                    right: space::M,
+                    bottom: space::M,
+                    left: NAME_INSET,
+                })
+                .width(Length::Fill)
+                .into(),
         );
     }
     widget::column::with_children(lines)
@@ -842,11 +1120,11 @@ fn row<'a>(
 /// then its figures side by side beneath, each under its column's title.
 fn stacked_row<'a>(
     account: Element<'a, Message>,
-    cells: Vec<(Column, (f32, Element<'a, Message>))>,
+    cells: Vec<(Slot, (f32, Element<'a, Message>))>,
     actions: Element<'a, Message>,
 ) -> Element<'a, Message> {
-    let figures = cells.into_iter().map(|(column, (_, cell))| {
-        widget::column::with_children(vec![design::caption(column.title()).into(), cell])
+    let figures = cells.into_iter().map(|(slot, (_, cell))| {
+        widget::column::with_children(vec![design::caption(slot.title()).into(), cell])
             .spacing(space::XS)
             .width(Length::Fill)
             .into()
@@ -890,13 +1168,9 @@ fn account_cell<'a>(
                 .width(Length::Fill)
                 .into()
         }
-        // Filling the cell is what lets a long name give way to the badge
-        // after it instead of running under the row's actions.
-        None => crate::ui_controls::fade_text(row_name.clone())
-            .width(Length::Fill)
-            .into(),
+        None => crate::ui_controls::fade_text(row_name.clone()).into(),
     };
-    let mut title: Vec<Element<'a, Message>> = vec![name];
+    let mut badges: Vec<Element<'a, Message>> = Vec::new();
     let several = state
         .of(account.account.provider)
         .filter(|other| listed(state, other))
@@ -904,7 +1178,7 @@ fn account_cell<'a>(
         .count()
         > 1;
     if several && state.registry.is_default(&account.account) && renaming.is_none() {
-        title.push(crate::ui_controls::badge(
+        badges.push(crate::ui_controls::badge(
             "Default",
             design::Tone::Themed(design::muted_color),
         ));
@@ -915,7 +1189,7 @@ fn account_cell<'a>(
             .is_project_default(repository, &account.account)
         && renaming.is_none()
     {
-        title.push(crate::ui_controls::badge(
+        badges.push(crate::ui_controls::badge(
             "This project",
             design::Tone::Themed(design::accent_color),
         ));
@@ -931,7 +1205,7 @@ fn account_cell<'a>(
                 design::warning_color
             }
         };
-        title.push(crate::interaction::tooltip(
+        badges.push(crate::interaction::tooltip(
             crate::ui_controls::badge(conflict.label(), design::Tone::Themed(tone)),
             conflict.detail(),
         ));
@@ -970,12 +1244,20 @@ fn account_cell<'a>(
         subtitle =
             vec!["Enter to save, Escape to cancel. Leave empty for the default name.".into()];
     }
-    let mut lines: Vec<Element<'a, Message>> = vec![
-        widget::row::with_children(title)
-            .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
-    ];
+    // The badges stay beside the name, and a long name fades where they
+    // begin rather than pushing them under the row's figures.
+    let title = if badges.is_empty() {
+        name
+    } else {
+        crate::ui_controls::trailing(
+            name,
+            widget::row::with_children(badges)
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+            space::S,
+        )
+    };
+    let mut lines: Vec<Element<'a, Message>> = vec![title];
     if !subtitle.is_empty() {
         lines.push(crate::ui_controls::FadeText::caption(subtitle.join(" · ")).into());
     }
@@ -988,7 +1270,7 @@ fn account_cell<'a>(
             .width(Length::Fill)
             .into(),
     ])
-    .spacing(design::GRID_UNIT * 2.5)
+    .spacing(NAME_SPACING)
     .align_y(Alignment::Center)
     .into()
 }
@@ -1468,6 +1750,104 @@ pub(in crate::app) mod tests {
         assert!(stacked.stacked);
     }
 
+    #[test]
+    fn a_provider_that_reports_no_usage_has_one_usage_cell_in_line_with_the_rest() {
+        let layout = layout(1_400.0);
+        let claude = slots(&layout, Provider::Claude);
+        assert_eq!(
+            claude,
+            layout
+                .columns
+                .iter()
+                .copied()
+                .map(Slot::Column)
+                .collect::<Vec<_>>()
+        );
+        for provider in [Provider::Antigravity, Provider::Muse] {
+            let joined = slots(&layout, provider);
+            let usage = Column::USAGE
+                .iter()
+                .map(|column| column.width(layout.usage))
+                .sum::<f32>()
+                + COLUMN_SPACING * (Column::USAGE.len() - 1) as f32;
+            assert_eq!(
+                joined,
+                [
+                    Slot::Column(Column::Plan),
+                    Slot::Unreported { width: usage },
+                    Slot::Column(Column::Status),
+                    Slot::Column(Column::Updated),
+                ],
+                "{provider:?}"
+            );
+            // The same total width as Claude's cells, so Status and Updated
+            // sit under the same titles in every group.
+            let total = |slots: &[Slot]| {
+                slots.iter().map(|slot| slot.width(&layout)).sum::<f32>()
+                    + COLUMN_SPACING * slots.len() as f32
+            };
+            assert_eq!(total(&joined), total(&claude), "{provider:?}");
+        }
+        // With no usage column left there is no usage cell either.
+        let bare = layout_of(1_400.0, &[Column::Plan, Column::Status]);
+        assert_eq!(
+            slots(&bare, Provider::Muse),
+            [Slot::Column(Column::Plan), Slot::Column(Column::Status)]
+        );
+    }
+
+    #[test]
+    fn columns_no_listed_account_reports_are_left_out() {
+        let mut weekly = account_with(Provider::Claude, 1, Some((0.4, 500)));
+        weekly.snapshot.as_mut().unwrap().windows[0].kind = account::WindowKind::Weekly;
+        let mut state = State {
+            accounts: vec![weekly, account_with(Provider::Codex, 2, None)],
+            ..State::default()
+        };
+        let providers = [Provider::Claude, Provider::Codex];
+        // No plan, session, model window or extra usage anywhere.
+        assert_eq!(
+            shown_columns(&state, &providers),
+            [Column::Weekly, Column::Status, Column::Updated]
+        );
+        // One account starting a session window brings the column back for
+        // every group.
+        state
+            .accounts
+            .push(account_with(Provider::Codex, 3, Some((0.1, 900))));
+        assert_eq!(
+            shown_columns(&state, &providers),
+            [
+                Column::Session,
+                Column::Weekly,
+                Column::Status,
+                Column::Updated
+            ]
+        );
+        // An account the pane does not list does not keep a column.
+        state.accounts[2].account = Account::system(Provider::Codex);
+        state.accounts[2].present = false;
+        assert!(!shown_columns(&state, &providers).contains(&Column::Session));
+    }
+
+    #[test]
+    fn an_antigravity_plan_badge_drops_the_name_its_heading_already_gives() {
+        assert_eq!(short_plan(Provider::Antigravity, "Google AI Pro"), "Pro");
+        assert_eq!(
+            short_plan(Provider::Antigravity, "Google AI Ultra"),
+            "Ultra"
+        );
+        assert_eq!(
+            short_plan(Provider::Antigravity, "Google AI "),
+            "Google AI "
+        );
+        assert_eq!(short_plan(Provider::Antigravity, "Free"), "Free");
+        assert_eq!(
+            short_plan(Provider::Claude, "Google AI Pro"),
+            "Google AI Pro"
+        );
+    }
+
     fn account_with(provider: Provider, key: u128, left: Option<(f32, i64)>) -> AccountState {
         let account = if key == 0 {
             Account::system(provider)
@@ -1563,11 +1943,8 @@ pub(in crate::app) mod tests {
 
         let mut renderer = crate::app::tests::headless_renderer();
         for provider in [Provider::Claude, Provider::Codex] {
-            for (width, stacked, status_visible) in [
-                (420.0, true, false),
-                (500.0, false, false),
-                (1_200.0, false, true),
-            ] {
+            let mut dropped_status = false;
+            for width in [300.0, 380.0, 500.0, 1_200.0] {
                 let mut app = crate::app::tests::context_inspector_test_app(false);
                 app.account_ui.now_ms = 1_790_000_000_000;
                 let now = app.account_ui.now_ms;
@@ -1593,13 +1970,10 @@ pub(in crate::app) mod tests {
                 account.identity = None;
                 account.failure = Some("The provider returned no usable quota".into());
 
-                let columns = layout(width);
-                assert_eq!(columns.stacked, stacked, "{provider:?} {width}");
-                assert_eq!(
-                    columns.columns.contains(&Column::Status),
-                    status_visible,
-                    "{provider:?} {width}"
-                );
+                let (_, columns) = table_layout(&app.account_ui, width);
+                let status_visible = columns.columns.contains(&Column::Status);
+                dropped_status |= !status_visible;
+                assert_eq!(status_visible, width > 300.0, "{provider:?} {width}");
                 let mut ui = UserInterface::build(
                     table(&app, width),
                     iced::Size::new(width, 600.0),
@@ -1693,6 +2067,10 @@ pub(in crate::app) mod tests {
                     "{provider:?} {width}: actual retry click keeps the original account"
                 );
             }
+            assert!(
+                dropped_status,
+                "{provider:?}: a width drops the Status column"
+            );
         }
     }
 
