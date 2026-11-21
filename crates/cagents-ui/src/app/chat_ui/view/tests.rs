@@ -7949,6 +7949,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
         resolved_text: "Queued message".into(),
         model: None,
         draft: runtime.session.clone(),
+        chosen: (None, None),
         since: None,
         rechecking: false,
     };
