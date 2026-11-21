@@ -8430,6 +8430,36 @@ fn choosing_another_model_clears_an_attachment_notice() {
 }
 
 #[test]
+fn choosing_another_model_in_a_live_chat_clears_an_attachment_notice() {
+    let _admission = attachment_draft::test_admission();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, None);
+    show_chat_snapshot_for_test(
+        &mut app,
+        card,
+        Snapshot {
+            generation: 1,
+            models: vec![fixture_model("gpt-b", &[])],
+            ready: true,
+            ..Snapshot::default()
+        },
+    );
+    let target = chat_runtime(&app, card).target;
+    let ticket = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .begin_attachment_insert();
+    drop(app.handle_chat_ui(Action::PasteRefused(
+        target,
+        ticket,
+        "The current model cannot accept images.",
+    )));
+    assert!(chat_runtime(&app, card).attachment_notice.is_some());
+    let _ = app.update(Message::ChatUi(Action::Model(target, "gpt-b".into())));
+    assert!(chat_runtime(&app, card).attachment_notice.is_none());
+}
+
+#[test]
 fn the_next_successfully_staged_attachment_clears_an_attachment_notice() {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::with_test_image(|image| {

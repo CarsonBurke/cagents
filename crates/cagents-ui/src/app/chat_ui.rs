@@ -15886,6 +15886,10 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                if runtime.snapshot.selected_model.as_deref() != Some(id.as_str()) {
+                    // An attachment refusal answered the previous model's rules.
+                    runtime.attachment_notice = None;
+                }
                 let reasoning = runtime
                     .chosen_model()
                     .reasoning

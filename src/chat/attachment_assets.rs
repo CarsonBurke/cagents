@@ -44,7 +44,7 @@ const UNSTAGEABLE: &str =
 
 /// Whether a staging error refused the image for its size, type or the
 /// store's capacity, rather than the store failing to read or write.
-#[cfg(any(feature = "ui", all(test, feature = "host")))]
+#[cfg(feature = "ui")]
 pub fn is_staging_refusal(error: &str) -> bool {
     [STORE_FULL, REGISTRY_FULL, NUMBERING_EXHAUSTED, UNSTAGEABLE].contains(&error)
 }
