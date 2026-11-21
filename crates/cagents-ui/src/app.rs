@@ -11957,9 +11957,7 @@ impl Cagents {
                     browser.load_state = (!state.eq_ignore_ascii_case("complete")).then_some(state);
                 }
             }
-            BrowserEvent::FocusChanged(_)
-            | BrowserEvent::InputHandled { .. }
-            | BrowserEvent::TitleChanged(None) => {}
+            BrowserEvent::FocusChanged(_) | BrowserEvent::TitleChanged(None) => {}
         }
         if durable_changed {
             self.persist();

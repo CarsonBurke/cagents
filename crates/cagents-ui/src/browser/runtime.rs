@@ -776,11 +776,9 @@ impl Card {
             return;
         }
         let session = self.session.as_ref().expect("session checked");
-        let id = session
+        session
             .webview
             .notify_input_event(input::to_servo(event.clone()));
-        let sequence = session.next_input_sequence.fetch_add(1, Ordering::Relaxed);
-        session.input_sequences.borrow_mut().insert(id, sequence);
         if let BrowserInput::Wheel { x, y, .. } = event {
             self.restore.scroll_x = (self.restore.scroll_x - x).max(0.0);
             self.restore.scroll_y = (self.restore.scroll_y - y).max(0.0);
@@ -1026,8 +1024,6 @@ struct CardSession {
     animating: Rc<Cell<bool>>,
     frame_ready: Rc<Cell<bool>>,
     restore_scroll_ready: Rc<Cell<bool>>,
-    input_sequences: Rc<RefCell<HashMap<servo::InputEventId, u64>>>,
-    next_input_sequence: Arc<AtomicU64>,
     pending_clipboard: Rc<RefCell<HashMap<DelegateRequestId, servo::StringRequest>>>,
     pending_file_pickers: Rc<RefCell<HashMap<DelegateRequestId, servo::FilePicker>>>,
     navigation: Rc<RefCell<NavigationState>>,
@@ -1069,8 +1065,6 @@ impl CardSession {
         let animating = Rc::new(Cell::new(false));
         let frame_ready = Rc::new(Cell::new(true));
         let restore_scroll_ready = Rc::new(Cell::new(false));
-        let input_sequences = Rc::new(RefCell::new(HashMap::new()));
-        let next_input_sequence = Arc::new(AtomicU64::new(1));
         let pending_clipboard = Rc::new(RefCell::new(HashMap::new()));
         let pending_file_pickers = Rc::new(RefCell::new(HashMap::new()));
         let navigation = Rc::new(RefCell::new(NavigationState::restored(
@@ -1087,7 +1081,6 @@ impl CardSession {
             animating: animating.clone(),
             frame_ready: frame_ready.clone(),
             restore_scroll_ready: restore_scroll_ready.clone(),
-            input_sequences: input_sequences.clone(),
             pending_file_pickers: pending_file_pickers.clone(),
             request_ids: request_ids.clone(),
             ime_control: RefCell::new(None),
@@ -1131,8 +1124,6 @@ impl CardSession {
             animating,
             frame_ready,
             restore_scroll_ready,
-            input_sequences,
-            next_input_sequence,
             pending_clipboard,
             pending_file_pickers,
             navigation,
@@ -1241,7 +1232,6 @@ struct BrowserDelegate {
     animating: Rc<Cell<bool>>,
     frame_ready: Rc<Cell<bool>>,
     restore_scroll_ready: Rc<Cell<bool>>,
-    input_sequences: Rc<RefCell<HashMap<servo::InputEventId, u64>>>,
     pending_file_pickers: Rc<RefCell<HashMap<DelegateRequestId, servo::FilePicker>>>,
     request_ids: Rc<Cell<u64>>,
     ime_control: RefCell<Option<(servo::EmbedderControlId, DelegateRequestId)>>,
@@ -1362,26 +1352,6 @@ impl servo::WebViewDelegate for BrowserDelegate {
     fn notify_closed(&self, _webview: servo::WebView) {
         self.guard(|| {
             self.events.semantic(BrowserEvent::ClosedByContent);
-        });
-    }
-
-    fn notify_input_event_handled(
-        &self,
-        _webview: servo::WebView,
-        id: servo::InputEventId,
-        result: servo::InputEventResult,
-    ) {
-        self.guard(|| {
-            if let Some(sequence) = self.input_sequences.borrow_mut().remove(&id) {
-                self.events.semantic(BrowserEvent::InputHandled {
-                    sequence,
-                    consumed: result.intersects(
-                        servo::InputEventResult::Consumed
-                            | servo::InputEventResult::DefaultPrevented
-                            | servo::InputEventResult::DispatchFailed,
-                    ),
-                });
-            }
         });
     }
 
@@ -2153,7 +2123,6 @@ mod tests {
             animating: Rc::default(),
             frame_ready: Rc::default(),
             restore_scroll_ready: Rc::default(),
-            input_sequences: Rc::default(),
             pending_file_pickers: Rc::default(),
             request_ids: Rc::new(Cell::new(1)),
             ime_control: RefCell::new(None),
