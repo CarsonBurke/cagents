@@ -3906,11 +3906,15 @@ impl Runtime {
             selection: None,
         });
         self.replace_draft(composer);
-        // The draft a walk through sent messages set aside is in `combined`.
-        self.history_cursor = None;
+        // The draft a walk through sent messages set aside is in `combined`,
+        // and its attachments rather than the recalled message's follow it.
+        let shown = self.replace_attachments(attachments);
+        let later = match self.history_cursor.take() {
+            Some(_) => self.history_attachment_stash.take().unwrap_or_default(),
+            None => shown,
+        };
         self.history_stash = None;
         self.history_attachment_stash = None;
-        let later = self.replace_attachments(attachments);
         self.merge_attachments(later);
     }
 

@@ -1268,6 +1268,40 @@ mod tests {
             assert_eq!(runtime.error.as_deref(), Some("Codex is not answering"));
         }
 
+        /// A message refused while the reader browses sent prompts comes
+        /// back ahead of the draft the walk set aside, with that draft's
+        /// image rather than the recalled prompt's.
+        #[test]
+        fn refusal_during_a_walk_keeps_the_stashed_image_draft() {
+            chat::attachment_assets::with_test_image(|image| {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                let target = sending(&mut app, card, "outgoing message");
+                let draft = format!(
+                    "draft before recall {}",
+                    image.reference.as_ref().unwrap().token()
+                );
+                let recalled = Attachment::file("/tmp/recalled.rs");
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.history = vec!["earlier prompt".into()];
+                runtime.history_images = vec![vec![recalled.clone()]];
+                runtime.replace_draft(text_editor::Content::with_text(&draft));
+                runtime.replace_attachments(vec![image.clone()]);
+                drop(app.update(Message::ChatUi(Action::HistoryOlder(target))));
+                assert_eq!(chat_runtime(&app, card).attachments, [recalled]);
+
+                settle(&mut app, card, Err("Codex is not answering".into()));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(
+                    runtime.composer.text().trim_end(),
+                    format!("outgoing message\n{draft}")
+                );
+                assert_eq!(runtime.attachments, [image.clone()]);
+                assert!(runtime.history_cursor.is_none());
+                assert!(runtime.history_attachment_stash.is_none());
+            });
+        }
+
         #[test]
         fn queuing_recalled_prompt_restores_the_stashed_draft() {
             let mut app = crate::app::tests::context_inspector_test_app(false);
