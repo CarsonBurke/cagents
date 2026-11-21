@@ -782,46 +782,40 @@ fn read_local_with_plan(
     // runs ancestry Git; ordinary edits retain the proof without extra work.
     let mut archived = Vec::new();
     for association in &snapshot.archived.associations {
-        let mut matched = false;
-        for (record, _) in &snapshot.worktrees {
-            let Some(head_repository) = snapshot.heads.get(&record.id) else {
-                continue;
-            };
-            if !association.matches(record, head_repository) {
-                continue;
-            }
-            matched = true;
-            let Some(local_head) = &record.head_oid else {
-                continue;
-            };
-            if !cancellation.is_cancelled()
-                && (association.validated_head == *local_head
-                    || association.pull_request.head_ref_oid == *local_head
-                    || pr_head_is_ancestor(
-                        &record.path,
-                        &association.pull_request.head_ref_oid,
-                        local_head,
-                    ))
-            {
-                archived.push(ArchivedWorktreePr {
-                    pull_request: association.pull_request.clone(),
-                    validated_head: local_head.clone(),
-                });
-            }
-        }
-        // A checkout that is briefly elsewhere (another branch, a rebase's
-        // detached HEAD) has not disproved the association. It applies again
-        // only when a checkout returns to the proved HEAD or a descendant.
-        if !matched {
+        let checkout = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| record)
+            .find(|record| record.id == association.worktree)
+            .and_then(|record| Some((record, snapshot.heads.get(&record.id)?)))
+            .filter(|(record, head_repository)| association.matches(record, head_repository));
+        let Some((record, _)) = checkout else {
+            // A checkout that is briefly elsewhere (another branch, a
+            // rebase's detached HEAD) has not disproved the association. It
+            // applies again only at the proved HEAD or a descendant.
             archived.push(association.clone());
+            continue;
+        };
+        let Some(local_head) = &record.head_oid else {
+            continue;
+        };
+        if !cancellation.is_cancelled()
+            && (association.validated_head == *local_head
+                || association.pull_request.head_ref_oid == *local_head
+                || pr_head_is_ancestor(
+                    &record.path,
+                    &association.pull_request.head_ref_oid,
+                    local_head,
+                ))
+        {
+            archived.push(ArchivedWorktreePr {
+                validated_head: local_head.clone(),
+                ..association.clone()
+            });
         }
     }
-    archived.sort_by(|a, b| {
-        (a.pull_request.number, &a.validated_head).cmp(&(b.pull_request.number, &b.validated_head))
-    });
-    archived.dedup_by(|a, b| {
-        a.pull_request.number == b.pull_request.number && a.validated_head == b.validated_head
-    });
+    archived.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    archived.dedup_by(|a, b| a.sort_key() == b.sort_key());
     snapshot.archived = Arc::new(ArchivedPrs {
         associations: archived,
         revision: snapshot.archived.revision,
@@ -2001,6 +1995,7 @@ mod tests {
         snapshot.archived = Arc::new(ArchivedPrs {
             associations: vec![ArchivedWorktreePr {
                 pull_request: pr,
+                worktree: snapshot.worktrees[0].0.id,
                 validated_head: snapshot.worktrees[0].0.head_oid.clone().unwrap(),
             }],
             revision: 0,
@@ -2279,6 +2274,7 @@ mod tests {
         )
         .unwrap();
         let key = GitHubRepoKey::new("github.com", None, "acme", "repo").unwrap();
+        let worktree = snapshot.worktrees[0].0.id;
         let oid = snapshot.worktrees[0].0.head_oid.clone().unwrap();
         let pr = serde_json::from_value(serde_json::json!({
             "number":7,"title":"Archived feature","state":"MERGED",
@@ -2292,6 +2288,7 @@ mod tests {
             key,
             ArchivedWorktreePr {
                 pull_request: pr,
+                worktree,
                 validated_head: oid,
             },
         )
@@ -2460,6 +2457,73 @@ mod tests {
             result: Ok((rechecked, plan)),
         }));
         assert_eq!(attached_number(&app), Some(7));
+    }
+
+    #[test]
+    fn another_checkout_of_branch_does_not_requeue_its_proof_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let (mut snapshot, _, archived) = archived_fixture(&root);
+        let second = directory.path().join("second");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                second.to_str().unwrap(),
+                "feature",
+            ],
+        );
+        snapshot.archived = Arc::new(ArchivedPrs {
+            associations: vec![archived.clone()],
+            revision: 0,
+        });
+        let (listed, _) = read_local(
+            ProjectId::new(),
+            snapshot,
+            git_watch::Change {
+                membership: true,
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(listed.heads.len(), 2);
+        let second_id = listed
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.id)
+            .find(|id| *id != archived.worktree)
+            .unwrap();
+        // The shared branch moves, but only the second checkout is reread
+        // before the first checkout's own change arrives.
+        git(&second, &["reset", "--hard", "main"]);
+        let (updated, _) = read_local(
+            ProjectId::new(),
+            listed,
+            git_watch::Change {
+                worktrees: [second_id].into_iter().collect(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            !updated
+                .worktrees
+                .iter()
+                .any(|(record, _)| updated.awaits_archived_proof(record)),
+            "the second checkout must not wait on the first checkout's proof"
+        );
+        assert!(
+            updated
+                .archived
+                .associations
+                .iter()
+                .all(|association| association.worktree == archived.worktree)
+        );
     }
 
     #[test]

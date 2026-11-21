@@ -2410,17 +2410,29 @@ static WORKTREE_PR_CACHE: LazyLock<
 static WORKTREE_PR_LOOKUP_LOCK: Mutex<()> = Mutex::new(());
 const WORKTREE_PR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// A historical association is authoritative only for the local commit whose
-/// ancestry was checked. A reused branch name does not preserve that proof.
+/// A historical association is authoritative only for the worktree and local
+/// commit whose ancestry was checked. A reused branch name does not preserve
+/// that proof, and another checkout of the branch has its own.
 #[derive(Debug, Clone)]
 pub struct ArchivedWorktreePr {
     pull_request: crate::github::PullRequest,
+    worktree: crate::model::WorktreeId,
     validated_head: String,
 }
 
 impl ArchivedWorktreePr {
+    /// Orders associations by PR so cleanup can take each PR once.
+    fn sort_key(&self) -> (u64, crate::model::WorktreeId, &str) {
+        (
+            self.pull_request.number,
+            self.worktree,
+            self.validated_head.as_str(),
+        )
+    }
+
     fn matches(&self, record: &WorktreeRecord, head_repository: &GitHubRepoKey) -> bool {
-        !record.detached
+        record.id == self.worktree
+            && !record.detached
             && !record.bare
             && record
                 .branch
@@ -2455,25 +2467,50 @@ fn attached_worktree_pull_requests(
     if cancellation.is_cancelled() {
         return Vec::new();
     }
-    let mut unique = HashSet::new();
-    let missing: Vec<_> = worktrees
-        .iter()
-        .filter_map(|(record, _)| {
-            if record.detached || record.bare {
-                return None;
-            }
-            let branch = record.branch.as_deref()?.strip_prefix("refs/heads/")?;
-            let oid = record.head_oid.as_deref()?.to_owned();
-            let head_repository = head_repositories.get(&record.id)?;
-            if matching_attached_pr(record, head_repository, recent).is_some() {
-                return None;
-            }
-            let branch = branch.to_owned();
-            unique
-                .insert((head_repository.clone(), branch.clone(), oid.clone()))
-                .then_some((branch, oid, record.path.clone(), head_repository.clone()))
-        })
-        .collect();
+    // Checkouts sharing a branch and HEAD share one lookup; each still
+    // receives its own proof.
+    let mut unique = HashMap::new();
+    let mut missing = Vec::<(
+        String,
+        String,
+        PathBuf,
+        GitHubRepoKey,
+        Vec<crate::model::WorktreeId>,
+    )>::new();
+    for (record, _) in worktrees {
+        if record.detached || record.bare {
+            continue;
+        }
+        let Some(branch) = record
+            .branch
+            .as_deref()
+            .and_then(|branch| branch.strip_prefix("refs/heads/"))
+        else {
+            continue;
+        };
+        let (Some(oid), Some(head_repository)) = (
+            record.head_oid.as_deref(),
+            head_repositories.get(&record.id),
+        ) else {
+            continue;
+        };
+        if matching_attached_pr(record, head_repository, recent).is_some() {
+            continue;
+        }
+        let index = *unique
+            .entry((head_repository.clone(), branch.to_owned(), oid.to_owned()))
+            .or_insert_with(|| {
+                missing.push((
+                    branch.to_owned(),
+                    oid.to_owned(),
+                    record.path.clone(),
+                    head_repository.clone(),
+                    Vec::new(),
+                ));
+                missing.len() - 1
+            });
+        missing[index].4.push(record.id);
+    }
     if missing.is_empty() {
         return Vec::new();
     }
@@ -2494,7 +2531,9 @@ fn attached_worktree_pull_requests(
             let missing = &missing;
             let found = &found;
             scope.spawn(move || {
-                for (branch, oid, path, head_repository) in missing.iter().skip(shard).step_by(8) {
+                for (branch, oid, path, head_repository, ids) in
+                    missing.iter().skip(shard).step_by(8)
+                {
                     if cancellation.is_cancelled() {
                         break;
                     }
@@ -2544,19 +2583,18 @@ fn attached_worktree_pull_requests(
                         found
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
-                            .push(ArchivedWorktreePr {
-                                pull_request: pr,
+                            .extend(ids.iter().map(|&worktree| ArchivedWorktreePr {
+                                pull_request: pr.clone(),
+                                worktree,
                                 validated_head: oid.clone(),
-                            });
+                            }));
                     }
                 }
             });
         }
     });
     let mut result = found.into_inner().unwrap_or_else(|p| p.into_inner());
-    result.sort_by(|a, b| {
-        (a.pull_request.number, &a.validated_head).cmp(&(b.pull_request.number, &b.validated_head))
-    });
+    result.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     result
 }
 

@@ -262,6 +262,7 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
         std::slice::from_ref(&open),
         &[ArchivedWorktreePr {
             pull_request: merged,
+            worktree: record.id,
             validated_head: record.head_oid.clone().unwrap(),
         }],
     );
