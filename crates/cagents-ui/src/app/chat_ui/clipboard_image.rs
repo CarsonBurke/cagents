@@ -54,25 +54,56 @@ impl TryFrom<(Vec<u8>, String)> for Image {
 /// provider without its own limit would otherwise keep any size offered.
 const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Rejected input is a composer notice; a failed read or save is still an error.
+#[derive(Debug, Clone)]
+pub enum StagingError {
+    Refused(String),
+    Failed(String),
+}
+
+impl StagingError {
+    pub(super) fn message(&self) -> &str {
+        match self {
+            Self::Refused(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for StagingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+fn storage_error(message: String) -> StagingError {
+    if crate::chat::attachment_assets::is_staging_refusal(&message) {
+        StagingError::Refused(message)
+    } else {
+        StagingError::Failed(message)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn save(image: Image, max_bytes: u64) -> Result<crate::chat::Attachment, String> {
-    save_checked(image, max_bytes, || Ok(()))
+    save_checked(image, max_bytes, || Ok(())).map_err(|error| error.to_string())
 }
 pub(super) fn save_active(
     image: Image,
     max_bytes: u64,
     ticket: &super::attachment_draft::Ticket,
-) -> Result<crate::chat::Attachment, String> {
+) -> Result<crate::chat::Attachment, StagingError> {
     save_checked(image, max_bytes, || ticket.check())
 }
 fn save_checked(
     image: Image,
     max_bytes: u64,
     active: impl Fn() -> Result<(), String>,
-) -> Result<crate::chat::Attachment, String> {
-    active()?;
+) -> Result<crate::chat::Attachment, StagingError> {
+    active().map_err(StagingError::Refused)?;
     if image.oversized {
-        return Err("Clipboard image exceeds the 32 MiB size limit.".into());
+        return Err(StagingError::Refused(
+            "Clipboard image exceeds the 32 MiB size limit.".into(),
+        ));
     }
     let max_bytes = max_bytes.min(MAX_CLIPBOARD_IMAGE_BYTES);
     let expected = match image.mime.as_str() {
@@ -80,20 +111,28 @@ fn save_checked(
         "image/jpeg" => image::ImageFormat::Jpeg,
         "image/webp" => image::ImageFormat::WebP,
         "image/gif" => image::ImageFormat::Gif,
-        _ => return Err("Unsupported clipboard image type".into()),
+        _ => {
+            return Err(StagingError::Refused(
+                "Unsupported clipboard image type".into(),
+            ));
+        }
     };
-    let actual = super::images::validate_attachment(&image.bytes, max_bytes)?;
+    let actual = super::images::validate_attachment(&image.bytes, max_bytes)
+        .map_err(StagingError::Refused)?;
     if actual != expected {
-        return Err("Clipboard image data does not match its image type.".into());
+        return Err(StagingError::Refused(
+            "Clipboard image data does not match its image type.".into(),
+        ));
     }
-    let extension = extension(actual)?;
-    active()?;
+    let extension = extension(actual).map_err(StagingError::Refused)?;
+    active().map_err(StagingError::Refused)?;
     crate::chat::attachment_assets::stage_validated(
         &image.bytes,
         "Pasted image",
         extension,
         max_bytes,
     )
+    .map_err(storage_error)
 }
 
 fn extension(format: image::ImageFormat) -> Result<&'static str, String> {
@@ -112,13 +151,13 @@ pub(super) fn stage_file_active(
     path: PathBuf,
     max_bytes: u64,
     ticket: &super::attachment_draft::Ticket,
-) -> Result<crate::chat::Attachment, String> {
-    ticket.check()?;
+) -> Result<crate::chat::Attachment, StagingError> {
+    ticket.check().map_err(StagingError::Refused)?;
     if crate::device::is_remote() {
-        return Err(
+        return Err(StagingError::Refused(
             "Attach the image on the conversation's device; local image transfer is unavailable."
                 .into(),
-        );
+        ));
     }
     if !crate::chat::is_image_path(&path) {
         return Ok(crate::chat::Attachment::file(path));
@@ -128,19 +167,32 @@ pub(super) fn stage_file_active(
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&path)
-        .map_err(|e| format!("Cannot open image {}: {e}", path.display()))?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Attachment image is not a regular file.".into());
+        .map_err(|e| StagingError::Failed(format!("Cannot open image {}: {e}", path.display())))?;
+    if !file
+        .metadata()
+        .map_err(|e| StagingError::Failed(e.to_string()))?
+        .is_file()
+    {
+        return Err(StagingError::Refused(
+            "Attachment image is not a regular file.".into(),
+        ));
     }
     let bytes = crate::fs_safety::read_bounded(&mut file, max_bytes.min(MAX_CLIPBOARD_IMAGE_BYTES))
-        .map_err(|e| format!("Cannot read image {}: {e}", path.display()))?;
-    let actual = super::images::validate_attachment(&bytes, max_bytes)?;
+        .map_err(|e| StagingError::Failed(format!("Cannot read image {}: {e}", path.display())))?;
+    let actual =
+        super::images::validate_attachment(&bytes, max_bytes).map_err(StagingError::Refused)?;
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy();
-    ticket.check()?;
-    crate::chat::attachment_assets::stage_validated(&bytes, &name, extension(actual)?, max_bytes)
+    ticket.check().map_err(StagingError::Refused)?;
+    crate::chat::attachment_assets::stage_validated(
+        &bytes,
+        &name,
+        extension(actual).map_err(StagingError::Refused)?,
+        max_bytes,
+    )
+    .map_err(storage_error)
 }
 
 /// Resolved once: the attachment row asks for every attachment on each redraw.
@@ -222,7 +274,7 @@ mod tests {
             &ticket,
         )
         .unwrap_err();
-        assert!(error.contains("cancelled"), "{error}");
+        assert!(error.to_string().contains("cancelled"), "{error}");
     }
 
     #[test]
@@ -240,7 +292,7 @@ mod tests {
                 }
             })
             .unwrap_err();
-            assert!(error.contains("cancelled before publication"));
+            assert!(error.to_string().contains("cancelled before publication"));
             assert_eq!(checks.get(), 2);
             assert_eq!(
                 crate::chat::attachment_assets::list().unwrap().images.len(),
@@ -255,6 +307,58 @@ mod tests {
         assert!(save(invalid, 100).is_err());
         let image = Image::try_from((b"\x89PNG\r\n\x1a\n".to_vec(), "image/png".into())).unwrap();
         assert!(save(image, 1).is_err());
+    }
+
+    #[test]
+    fn invalid_clipboard_data_is_a_refusal() {
+        let _admission = super::super::attachment_draft::test_admission();
+        let (ticket, _lease) = super::super::attachment_draft::admit().unwrap();
+        let image = Image::try_from((b"plain text".to_vec(), "image/png".into())).unwrap();
+        let error = save_active(image, u64::MAX, &ticket).unwrap_err();
+        assert!(matches!(&error, StagingError::Refused(_)), "{error}");
+        assert_eq!(error.message(), "The file is not a supported image.");
+    }
+
+    #[test]
+    fn a_missing_source_image_is_a_failure() {
+        let _admission = super::super::attachment_draft::test_admission();
+        let (ticket, _lease) = super::super::attachment_draft::admit().unwrap();
+        let path = PathBuf::from(format!(
+            "/var/tmp/cagents-missing-image-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        let error = stage_file_active(path.clone(), u64::MAX, &ticket).unwrap_err();
+        assert!(matches!(&error, StagingError::Failed(_)), "{error}");
+        assert!(
+            error
+                .message()
+                .starts_with(&format!("Cannot open image {}:", path.display())),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn storage_capacity_is_a_refusal_but_storage_failures_remain_errors() {
+        for message in [
+            "Image storage is full (2 GiB or 4096 images). No images were removed. Run cagents chat image-assets list, then explicitly remove an image you no longer need before attaching another.",
+            "Image storage metadata is full.",
+            "Image numbering is exhausted; no identity was reused.",
+            "Image exceeds this provider's image size limit or has an unsupported type.",
+        ] {
+            let error = storage_error(message.into());
+            assert!(matches!(&error, StagingError::Refused(_)), "{error}");
+            assert_eq!(error.message(), message);
+        }
+        for message in [
+            "Image storage exceeds its size limit.",
+            "Image storage metadata is damaged; no image identity was changed.",
+            "Image storage must be private to this account.",
+            "Cannot write image storage: permission denied",
+        ] {
+            let error = storage_error(message.into());
+            assert!(matches!(&error, StagingError::Failed(_)), "{error}");
+            assert_eq!(error.message(), message);
+        }
     }
 
     #[test]
