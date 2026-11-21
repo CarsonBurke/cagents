@@ -852,11 +852,11 @@ From the build host's User shell, in a fresh task with `TASK` its directory:
 helper=tests/fixtures/cleared-terminal-recovery.py
 scripts/native-evidence --task "$TASK" start before
 python3 -I "$helper" history "$TASK/fixture"
-scripts/native-evidence --task "$TASK" cli project open '{fixture}/project'
+scripts/native-evidence --task "$TASK" cli project open "$TASK/fixture/project"
 scripts/native-evidence --task "$TASK" drive click main --settle 2
-scripts/native-evidence --task "$TASK" cli terminal spawn --cwd '{fixture}/project' -- \
+scripts/native-evidence --task "$TASK" cli terminal spawn --cwd "$TASK/fixture/project" -- \
     claude --resume a1b2c3d4-1111-4111-8111-000000003390   # prints the terminal ID
-scripts/native-evidence --task "$TASK" cli terminal spawn --cwd '{fixture}/project' -- \
+scripts/native-evidence --task "$TASK" cli terminal spawn --cwd "$TASK/fixture/project" -- \
     claude --resume a1b2c3d4-2222-4111-8111-000000003390
 scripts/native-evidence --task "$TASK" cli terminal write FIRST_TERMINAL_ID $'/clear\r'
 python3 -I "$helper" inspect "$TASK/fixture"   # hint_version 2 for the first, 1 for the second
@@ -875,6 +875,18 @@ writes `cleared-terminal-reboot.json` once. Every later `start` restores the
 two panes as **Terminal unavailable**, and **Retry** relaunches each one.
 The terminal then shows the conversation it resumed, or Claude Code's
 conversation picker.
+
+For the pane recovery refuses, spawn a third terminal before stopping, with
+an option recovery doesn't know beside the conversation it resumes:
+
+```sh
+scripts/native-evidence --task "$TASK" cli terminal spawn --cwd "$TASK/fixture/project" -- \
+    claude --resume a1b2c3d4-2222-4111-8111-000000003390 --fixture-unrecognized-option
+```
+
+`inspect` shows hint version 2 for it too. After the reboot its pane offers
+**Open new terminal**, with **Retry** disabled. Without `--resume`, the same
+option leaves **Retry** to run the command again from the beginning.
 
 ### A permanent first-start refusal
 

@@ -161,7 +161,7 @@ fn retry_after_restoring_picker(provider: &str) -> String {
 const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
 /// Retry would refuse to start anything, so the pane doesn't offer it. The
 /// disabled Retry's tooltip and accessible description repeat this.
-pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent because it won't rerun the options it was launched with. Open a new terminal to keep working.";
+pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent. Its saved command may reopen a conversation the agent has since left, and cagents can't open the agent's conversation picker with the other options it was launched with. Open a new terminal to keep working.";
 /// What Retry launches in place of a terminal.
 enum NewTerminal {
     Resume,
@@ -181,16 +181,16 @@ fn recovered_terminal(session: &TerminalSession) -> NewTerminal {
             crate::agent::Provider::recognize_launch(&recipe).map_or("the agent", |p| p.label()),
         ),
         Ok((_, crate::upgrade::RecoveryKind::Shell)) => NewTerminal::Shell,
-        // Retry reruns the saved command unless it follows this plan, in
-        // which case it refuses before starting anything.
-        Err(_) if super::relaunch_follows_recovery_plan(session) => NewTerminal::Refused,
+        // Retry reruns the saved command, unless the conversation it selects
+        // is one observation found stale.
+        Err(_) if super::terminal_relaunch_refused(session) => NewTerminal::Refused,
         Err(_) => NewTerminal::Fresh,
     }
 }
 /// What Retry launches in place of a terminal with no live process, which
 /// follows the recovery plan only when the agent's current launch was observed.
 fn new_terminal(session: &TerminalSession) -> NewTerminal {
-    if super::relaunch_follows_recovery_plan(session) {
+    if super::observed_agent_launch(session).is_some() {
         recovered_terminal(session)
     } else if session.agent_resume_recipe().is_some() {
         NewTerminal::Resume
@@ -1995,13 +1995,17 @@ mod tests {
             unreachable!()
         };
         session.launch.program = "claude".into();
-        session.launch.arguments = vec!["--unknown-option".into()];
+        session.launch.arguments = vec![
+            "--resume".into(),
+            "a1b2c3d4-1111-4111-8111-123456789abc".into(),
+            "--unknown-option".into(),
+        ];
         session.continuity = TerminalContinuity::RelaunchAvailable {
             recipe: session.launch.clone(),
             last_exit: None,
         };
-        // Recognised as Claude, but both the saved and the observed launch
-        // carry an option recovery won't replay.
+        // Recognised as Claude without its current conversation, and the
+        // saved launch selects one beside an option the picker won't replay.
         session.resume_hint =
             Some(serde_json::json!({"version": 2, "recipe": session.launch}).to_string());
         assert!(super::super::terminal_start_mode(session).is_err());
@@ -2035,7 +2039,29 @@ mod tests {
             RETRY_UNAVAILABLE
         );
 
-        // Without an observed launch Retry reruns the saved command, and says so.
+        // A launch that selects no conversation has nothing stale to reopen,
+        // so Retry reruns it from the beginning, and says so.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.launch.arguments = vec!["--unknown-option".into()];
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: None,
+        };
+        session.resume_hint =
+            Some(serde_json::json!({"version": 2, "recipe": session.launch}).to_string());
+        assert!(matches!(
+            super::super::terminal_start_mode(session),
+            Ok(super::super::TerminalStartMode::Spawn(recipe)) if recipe == session.launch
+        ));
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        assert_eq!(app.terminal_details(card).unwrap().consequence, RETRY_FRESH);
+        assert!(!app.terminal_retry_unavailable(card));
+        assert_eq!(rendered_button(&app, card, "Retry"), Some((true, None)));
+        assert_eq!(rendered_button(&app, card, "Open new terminal"), None);
+
+        // Nor without an observed launch, as before.
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!()
         };

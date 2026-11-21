@@ -71,6 +71,21 @@ pub fn picker_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
     interactive_recipe(launch, Selector::Picker)
 }
 
+/// Whether rerunning a launch could reopen a particular conversation: it names
+/// one, or continues the latest, through its provider's own selectors. Options
+/// cagents doesn't know can't be parsed, so any argument that reads as a
+/// selector counts, wherever it falls.
+pub fn selects_conversation(launch: &LaunchRecipe) -> bool {
+    Provider::launched(launch).is_some_and(|(provider, arguments)| {
+        arguments.iter().any(|argument| {
+            let flag = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(flag, _)| flag);
+            provider.is_identity_option(flag) || provider.is_latest_selector(flag)
+        })
+    })
+}
+
 /// Whether `recipe` is exactly the picker `picker_recipe` builds for it.
 pub fn is_picker_recipe(recipe: &LaunchRecipe) -> bool {
     picker_recipe(recipe).as_ref() == Some(recipe)
@@ -2720,6 +2735,40 @@ mod tests {
         // Claude writes its start time as a string; anything else is not its record.
         write_record(100, "0", serde_json::json!({"procStart": 0}));
         assert_eq!(runtime_identity(&root, 100, &recipe, 0), None);
+    }
+
+    #[test]
+    fn a_launch_selects_a_conversation_through_any_selector_it_carries() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let inline = format!("--resume={id}");
+        for (program, arguments) in [
+            ("claude", vec!["--unknown", "--resume", id]),
+            ("claude", vec![inline.as_str(), "--unknown"]),
+            ("claude", vec!["--unknown", "--continue"]),
+            ("claude", vec!["--session-id", id, "--unknown"]),
+            ("codex", vec!["--unknown", "resume", "--last"]),
+        ] {
+            assert!(
+                selects_conversation(&launch(program, &arguments)),
+                "{program} {arguments:?}"
+            );
+        }
+        let mut node = launch(
+            "node",
+            &[
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                "-c",
+            ],
+        );
+        assert!(selects_conversation(&node));
+        node.arguments.pop();
+        assert!(!selects_conversation(&node));
+        assert!(!selects_conversation(&launch(
+            "claude",
+            &["--unknown", "fix the build"]
+        )));
+        // Another program's selector is not the agent's.
+        assert!(!selects_conversation(&launch("bash", &["--resume", id])));
     }
 
     #[cfg(feature = "host")]
