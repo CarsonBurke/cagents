@@ -407,7 +407,7 @@ fn invalid_byte_branch_removal_is_disabled_without_affecting_literal_branch() {
             .to_owned(),
         fetch: false,
     });
-    assert_eq!(result.unwrap_err(), "Invalid UTF-8");
+    assert_eq!(result.unwrap_err(), INVALID_BRANCH_NAME);
     assert_eq!(
         fixture.plan("legacy-\u{fffd}").inspection.branch.as_deref(),
         Some("legacy-\u{fffd}")

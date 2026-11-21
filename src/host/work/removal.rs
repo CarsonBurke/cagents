@@ -15,6 +15,9 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Deleting a large tree of build output can take minutes on a slow disk.
 const GIT_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const CHANGED: &str = "The worktree changed since its removal plan; review the new plan and retry";
+/// Removal reads and deletes branches by their UTF-8 name, so it refuses one
+/// whose name has other bytes rather than act on a lossy look-alike.
+const INVALID_BRANCH_NAME: &str = "This branch's name is not valid UTF-8; remove it with Git";
 
 /// A card's worktree, with what its content is judged against.
 struct Subject {
@@ -170,7 +173,7 @@ impl Handle {
         if let crate::work::ItemKey::Branch(identity) = &item.key
             && crate::work::branch_name(identity).to_str().is_none()
         {
-            return Err("Invalid UTF-8".into());
+            return Err(INVALID_BRANCH_NAME.into());
         }
         let worktree = item
             .worktree

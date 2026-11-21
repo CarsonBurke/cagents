@@ -1090,7 +1090,7 @@ impl State {
                 items.push(if enabled {
                     control.into()
                 } else {
-                    crate::interaction::tooltip(control, "Invalid UTF-8")
+                    crate::interaction::tooltip(control, "This branch name is not valid UTF-8")
                 });
             }
             items.push(design::horizontal_rule());

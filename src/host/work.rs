@@ -1195,8 +1195,11 @@ impl Handle {
             .iter()
             .filter(|item| {
                 (match &item.key {
+                    // The label shown for it: valid UTF-8 unchanged, and
+                    // `\xNN` for each byte that is not, which no ref name
+                    // can contain because Git forbids `\`.
                     crate::work::ItemKey::Branch(identity) => {
-                        crate::work::branch_name(identity).to_str() == Some(name)
+                        crate::work::branch_display(&crate::work::branch_name(identity)) == name
                     }
                     crate::work::ItemKey::Worktree(_) => item.branch.as_deref() == Some(name),
                 }) || item.key.storage_key() == name
@@ -2171,13 +2174,11 @@ mod tests {
         assert_eq!(literal_card.dirty.as_ref().unwrap().paths, 2);
         assert!(raw_card.pull_request.is_none());
         assert_eq!(literal_card.pull_request.as_ref().unwrap().number, 7);
-        // Pin/unpin resolve the exact identity, never the display label.
-        assert_eq!(
-            Handle::card(&board, &raw_card.key.storage_key())
-                .unwrap()
-                .key,
-            raw_card.key
-        );
+        // Commands resolve the exact identity, and the label the table
+        // shows names the same card without aliasing the literal branch.
+        for name in [raw_card.key.storage_key(), raw_card.label()] {
+            assert_eq!(Handle::card(&board, &name).unwrap().key, raw_card.key);
+        }
         assert_eq!(
             Handle::card(&board, literal_name).unwrap().key,
             literal_card.key
