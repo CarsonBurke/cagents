@@ -9443,6 +9443,7 @@ fn a_lone_file_step_names_its_file_on_the_collapsed_strip() {
         role: chat::Role::Assistant,
         content: ItemContent::Changes {
             changes: vec![chat::FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path: "/project/src/platform/a.rs".into(),
                 kind: chat::ChangeKind::Updated,
                 diff: String::new(),
@@ -11422,6 +11423,86 @@ fn file_change_review_fits_narrow_and_wide_panes_and_names_delegated_proposals()
             );
         }
     }
+}
+
+#[test]
+fn a_reported_patch_is_drawn_as_rows_that_fit_and_name_their_controls() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let key = chat::FileChangeKey {
+        source: chat::FileChangeSource::Conversation,
+        path: "src/handlers.rs".into(),
+    };
+    // Two changes 30 lines apart, so the unchanged run between them folds,
+    // and more rows than a patch shows until it is asked to show them all.
+    let mut diff = String::from("@@ -1,40 +1,42 @@\n-fn first() {}\n+fn first() -> u8 { 0 }\n");
+    for line in 2..=31 {
+        diff.push_str(&format!(" let step_{line} = {line};\n"));
+    }
+    diff.push_str("+    tracing::debug!(\"handled\");\n+    tracing::debug!(\"twice\");\n");
+    for line in 32..=40 {
+        diff.push_str(&format!(" let step_{line} = {line};\n"));
+    }
+    runtime.changes.show_page(chat::FileChangePage {
+        request_id: 0,
+        key: key.clone(),
+        revision: 1,
+        patches: vec![chat::FileChangePatch {
+            lines: chat::LineOrigin::File,
+            item_id: "edit-1".into(),
+            kind: chat::ChangeKind::Updated,
+            status: chat::ToolStatus::Succeeded,
+            imported: false,
+            ownership_unverified: false,
+            offset: 0,
+            total_bytes: diff.len(),
+            diff,
+        }],
+        next: None,
+        error: None,
+    });
+    let renderer = crate::app::tests::headless_renderer();
+    let labels = |runtime: &Runtime, width: f32| {
+        let mut element = runtime.changes_view(width);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 600.0)),
+        );
+        assert!(node.size().width <= width, "{width}: the patch must fit");
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    for width in [360.0, 960.0] {
+        let labels = labels(&runtime, width);
+        for expected in ["Show 24 unchanged lines", "Show all 43 lines", "Copy patch"] {
+            assert!(
+                labels.iter().any(|label| label.contains(expected)),
+                "{width}: missing {expected}: {labels:?}"
+            );
+        }
+    }
+    runtime
+        .changes
+        .patch_view
+        .apply(crate::app::chat_ui::patch_view::Event::ShowAll);
+    let labels = labels(&runtime, 960.0);
+    assert!(
+        !labels
+            .iter()
+            .any(|label| label.contains("Show all") || label.contains("unchanged")),
+        "showing all leaves nothing folded or capped: {labels:?}"
+    );
 }
 #[test]
 fn narrow_file_review_restores_actual_scroll_on_back_after_the_old_ui_operation_misses() {

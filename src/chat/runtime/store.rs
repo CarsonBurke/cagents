@@ -3283,6 +3283,7 @@ mod tests {
     }
     fn change(path: &str, diff: String) -> crate::chat::FileChange {
         crate::chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: path.into(),
             kind: crate::chat::ChangeKind::Updated,
             diff,

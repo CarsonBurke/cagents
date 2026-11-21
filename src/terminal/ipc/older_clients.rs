@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 191,
+    proven_at: 193,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -119,15 +119,43 @@ pub(crate) const ANTIGRAVITY_AND_MUSE: u16 = 191;
 /// reported plan details. An earlier client is sent the reading without them.
 pub(crate) const PLAN_AND_RESET_READINGS: u16 = 184;
 
+/// The first protocol whose file changes say what their line numbers count
+/// from. A client before it is sent them without; one from a source before it
+/// is read as an excerpt, whose numbers place nothing.
+pub(crate) const PATCH_LINE_ORIGIN: u16 = 193;
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without: the struct's type name, the fields, and the protocol that
 /// added them. The wire format proof accepts exactly these.
 #[cfg(test)]
-const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[(
-    "cagents::account::info::UsageReading",
-    &["resets", "plan_display_name", "rate_limit_tier"],
-    PLAN_AND_RESET_READINGS,
-)];
+const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
+    (
+        "cagents::account::info::UsageReading",
+        &["resets", "plan_display_name", "rate_limit_tier"],
+        PLAN_AND_RESET_READINGS,
+    ),
+    ("cagents::chat::FileChange", &["lines"], PATCH_LINE_ORIGIN),
+    (
+        "cagents::chat::FileChangePatch",
+        &["lines"],
+        PATCH_LINE_ORIGIN,
+    ),
+];
+
+/// Fields a later protocol added to a struct that this side reads a message
+/// from an update source before it without: the struct's type name, the
+/// fields, and the protocol that added them. Each is decoded in
+/// [`decoding_from`] scope as the source encoded it, so the frozen lifecycle
+/// proof accepts exactly these.
+#[cfg(test)]
+const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
+    ("cagents::chat::FileChange", &["lines"], PATCH_LINE_ORIGIN),
+    (
+        "cagents::chat::FileChangePatch",
+        &["lines"],
+        PATCH_LINE_ORIGIN,
+    ),
+];
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
@@ -198,6 +226,33 @@ pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
 /// Whether the value being encoded goes to a client from before `protocol`.
 pub(crate) fn encoding_before(protocol: u16) -> bool {
     ENCODING_FOR.get().is_some_and(|older| older < protocol)
+}
+
+thread_local! {
+    /// The older protocol of the daemon this thread is decoding a message
+    /// from.
+    static DECODING_FROM: Cell<Option<u16>> = const { Cell::new(None) };
+}
+
+/// Runs `decode` with this thread decoding a message from a daemon of
+/// `protocol`, such as an update source, so that values a later protocol
+/// added a field to decode as that daemon encoded them. The decode scope ends
+/// with `decode`, however it returns or unwinds.
+pub(crate) fn decoding_from<R>(protocol: u16, decode: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u16>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECODING_FROM.set(self.0);
+        }
+    }
+    let older = (protocol < PROTOCOL_VERSION).then_some(protocol);
+    let _restore = Restore(DECODING_FROM.replace(older));
+    decode()
+}
+
+/// Whether the value being decoded comes from a daemon before `protocol`.
+pub(crate) fn decoding_before(protocol: u16) -> bool {
+    DECODING_FROM.get().is_some_and(|older| older < protocol)
 }
 
 /// The older protocol a client opened its connection with, when this daemon
@@ -754,6 +809,150 @@ mod tests {
         // The scope ends with the encoding it was entered for.
         assert!(!encoding_before(PROTOCOL_VERSION + 1));
         assert_eq!(encode(ToolStatus::Waiting), waiting);
+    }
+
+    /// A file change crosses the protocol that added its line origin both
+    /// ways: an older client is sent the fields it decodes, and one read
+    /// from an older update source, which never said where its lines are, is
+    /// taken as an excerpt rather than as file positions. What follows it in
+    /// the message stays where it was.
+    #[test]
+    fn file_changes_cross_the_line_origin_protocol_in_both_directions() {
+        use crate::chat::{ChangeKind, FileChange, FileChangePatch, LineOrigin, ToolStatus};
+        let older = PATCH_LINE_ORIGIN - 1;
+        let change = |lines| FileChange {
+            path: "src/lib.rs".into(),
+            kind: ChangeKind::Renamed {
+                from: "src/old.rs".into(),
+            },
+            diff: "@@ -4 +4 @@\n-a\n+b\n".into(),
+            lines,
+        };
+        // As the older protocol has it: three fields, then the next value.
+        let before = postcard::to_stdvec(&(
+            vec![(
+                "src/lib.rs",
+                ChangeKind::Renamed {
+                    from: "src/old.rs".into(),
+                },
+                "@@ -4 +4 @@\n-a\n+b\n",
+            )],
+            7u8,
+        ))
+        .unwrap();
+        for lines in [LineOrigin::File, LineOrigin::Excerpt] {
+            let message = (vec![change(lines)], 7u8);
+            assert_eq!(
+                encoding_for(older, || postcard::to_stdvec(&message).unwrap()),
+                before
+            );
+            let current = postcard::to_stdvec(&message).unwrap();
+            assert_ne!(current, before);
+            assert_eq!(
+                postcard::from_bytes::<(Vec<FileChange>, u8)>(&current).unwrap(),
+                message
+            );
+            assert_eq!(
+                decoding_from(PROTOCOL_VERSION, || {
+                    postcard::from_bytes::<(Vec<FileChange>, u8)>(&current)
+                })
+                .unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            decoding_from(older, || postcard::from_bytes::<(Vec<FileChange>, u8)>(
+                &before
+            ))
+            .unwrap(),
+            (vec![change(LineOrigin::Excerpt)], 7)
+        );
+        // A record from before the field is unplaced as well.
+        assert_eq!(
+            serde_json::from_str::<FileChange>(
+                r#"{"path":"src/lib.rs","kind":{"Renamed":{"from":"src/old.rs"}},"diff":"@@ -4 +4 @@\n-a\n+b\n"}"#
+            )
+            .unwrap(),
+            change(LineOrigin::Excerpt)
+        );
+        let json = serde_json::to_string(&change(LineOrigin::File)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<FileChange>(&json).unwrap(),
+            change(LineOrigin::File)
+        );
+
+        let patch = |lines| FileChangePatch {
+            ownership_unverified: false,
+            item_id: "edit".into(),
+            kind: ChangeKind::Updated,
+            status: ToolStatus::Succeeded,
+            imported: true,
+            offset: 3,
+            total_bytes: 40,
+            diff: "+b\n".into(),
+            lines,
+        };
+        let before = postcard::to_stdvec(&(
+            vec![(
+                false,
+                "edit",
+                ChangeKind::Updated,
+                ToolStatus::Succeeded,
+                true,
+                3usize,
+                40usize,
+                "+b\n",
+            )],
+            7u8,
+        ))
+        .unwrap();
+        for lines in [LineOrigin::File, LineOrigin::Excerpt] {
+            let message = (vec![patch(lines)], 7u8);
+            assert_eq!(
+                encoding_for(older, || postcard::to_stdvec(&message).unwrap()),
+                before
+            );
+            let current = postcard::to_stdvec(&message).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<(Vec<FileChangePatch>, u8)>(&current).unwrap(),
+                message
+            );
+        }
+        assert_eq!(
+            decoding_from(older, || {
+                postcard::from_bytes::<(Vec<FileChangePatch>, u8)>(&before)
+            })
+            .unwrap(),
+            (vec![patch(LineOrigin::Excerpt)], 7)
+        );
+    }
+
+    /// The decode scope belongs to the decode it was entered for: it ends
+    /// when that returns, fails or unwinds, and an inner scope restores the
+    /// outer one.
+    #[test]
+    fn the_decoding_scope_ends_however_its_decode_ends() {
+        let older = PATCH_LINE_ORIGIN - 1;
+        assert!(!decoding_before(PATCH_LINE_ORIGIN));
+        let failed = decoding_from(older, || {
+            assert!(decoding_before(PATCH_LINE_ORIGIN));
+            postcard::from_bytes::<crate::chat::FileChange>(&[0xff])
+        });
+        assert!(failed.is_err());
+        assert!(!decoding_before(PATCH_LINE_ORIGIN));
+        decoding_from(older, || {
+            decoding_from(PROTOCOL_VERSION, || {
+                assert!(!decoding_before(PATCH_LINE_ORIGIN));
+            });
+            assert!(decoding_before(PATCH_LINE_ORIGIN));
+        });
+        let unwound = std::panic::catch_unwind(|| {
+            decoding_from(older, || panic!("a decode that unwinds"));
+        });
+        assert!(unwound.is_err());
+        assert!(!decoding_before(PATCH_LINE_ORIGIN));
+        // Encoding for an older client is a separate scope.
+        encoding_for(older, || assert!(!decoding_before(PATCH_LINE_ORIGIN)));
     }
 
     #[test]

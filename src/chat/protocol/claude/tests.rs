@@ -4060,8 +4060,11 @@ fn a_bash_result_loses_its_terminal_escapes_and_a_read_file_does_not() {
 #[test]
 fn an_edit_is_a_file_change_that_its_result_completes() {
     let input = json!({"file_path":"/workspace/src/app.rs","old_string":"let a = 1;","new_string":"let a = 2;","replace_all":false});
+    // Made from the call, the patch counts from the text it finds; only
+    // the applied one has the file's line numbers.
     let called = ItemContent::Changes {
         changes: vec![FileChange {
+            lines: crate::chat::LineOrigin::Excerpt,
             path: "/workspace/src/app.rs".into(),
             kind: ChangeKind::Updated,
             diff: "@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n".into(),
@@ -4075,6 +4078,7 @@ fn an_edit_is_a_file_change_that_its_result_completes() {
         "message":{"content":[{"type":"tool_result","tool_use_id":"edit","content":"The file /workspace/src/app.rs has been updated successfully."}]}});
     let applied = ItemContent::Changes {
         changes: vec![FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: "/workspace/src/app.rs".into(),
             kind: ChangeKind::Updated,
             diff: "@@ -41,3 +41,3 @@\n fn main() {\n-    let a = 1;\n+    let a = 2;\n }\n".into(),
@@ -4113,6 +4117,39 @@ fn an_edit_is_a_file_change_that_its_result_completes() {
     assert_eq!(items(&streamed.receive(result).unwrap()), vec![applied]);
 }
 
+/// An edit waiting to be allowed is still the patch made from its call,
+/// numbered from the text it finds; once allowed and applied it has the
+/// file's numbers.
+#[test]
+fn an_edit_waiting_for_approval_is_numbered_from_its_snippet_until_applied() {
+    let input =
+        json!({"file_path":"src/app.rs","old_string":"let a = 1;","new_string":"let a = 2;"});
+    let origins = |step: &Step| {
+        items(step)
+            .into_iter()
+            .flat_map(|content| match content {
+                ItemContent::Changes { changes, .. } => changes,
+                _ => Vec::new(),
+            })
+            .map(|change| change.lines)
+            .collect::<Vec<_>>()
+    };
+    let mut adapter = Claude::default();
+    let call = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"tool-1","name":"Edit","input":input}]}})).unwrap();
+    assert_eq!(origins(&call), [crate::chat::LineOrigin::Excerpt]);
+    let asked = adapter.receive(approval("p", "Edit", input)).unwrap();
+    assert!(
+        origins(&asked)
+            .iter()
+            .all(|lines| *lines == crate::chat::LineOrigin::Excerpt),
+        "asking for approval places nothing"
+    );
+    let applied = adapter.receive(json!({"type":"user","uuid":"u1","tool_use_result":{
+        "structuredPatch":[{"oldStart":41,"oldLines":1,"newStart":41,"newLines":1,"lines":["-let a = 1;","+let a = 2;"]}]},
+        "message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}})).unwrap();
+    assert_eq!(origins(&applied), [crate::chat::LineOrigin::File]);
+}
+
 /// A write is an addition, or an update where its result says the file
 /// was already there; a transcript names the structured result
 /// differently from the wire and is read the same.
@@ -4144,6 +4181,7 @@ fn a_write_is_an_addition_until_its_result_says_it_overwrote() {
             items(&adapter.receive(result).unwrap()),
             vec![ItemContent::Changes {
                 changes: vec![FileChange {
+                    lines: crate::chat::LineOrigin::File,
                     path: "notes.md".into(),
                     kind,
                     diff: diff.into(),
@@ -13348,18 +13386,20 @@ fn claude_history_correlates_edits_across_every_100_record_page_boundary() {
         assert_eq!(*status, ToolStatus::Succeeded);
         assert!(changes[0].diff.contains("+actually applied"));
         assert!(!changes[0].diff.contains("+requested"));
+        assert_eq!(changes[0].lines, crate::chat::LineOrigin::File);
     }
     assert!(
         matches!(&items["edit-145"].content,ItemContent::Tool{name,status:ToolStatus::Failed,output,..} if name=="Edit"&&output=="permission denied")
     );
     // Left without a result by a process before this one, which this
     // one never runs.
+    // Nor did it ever say where in the file its lines are.
     assert!(matches!(
         &items["edit-146"].content,
         ItemContent::Changes {
             status: ToolStatus::Stopped,
-            ..
-        }
+            changes,
+        } if changes[0].lines == crate::chat::LineOrigin::Excerpt
     ));
 }
 #[test]

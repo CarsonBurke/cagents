@@ -643,6 +643,7 @@ mod tests {
             Role::Assistant,
             ItemContent::Changes {
                 changes: vec![chat::FileChange {
+                    lines: crate::chat::LineOrigin::File,
                     path: path.into(),
                     kind: chat::ChangeKind::Updated,
                     diff: "-a\n+b\n".into(),

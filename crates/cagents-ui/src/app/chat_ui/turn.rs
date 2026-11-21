@@ -1838,6 +1838,7 @@ mod tests {
     fn a_single_file_change_names_the_path_and_its_kind() {
         let content = ItemContent::Changes {
             changes: vec![FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path: "src/app.rs".into(),
                 kind: ChangeKind::Renamed {
                     from: "src/old.rs".into(),
@@ -1984,6 +1985,7 @@ mod tests {
         assert_eq!(ran(Read, ToolStatus::Failed), "Tried to read");
         let edit = |status| ItemContent::Changes {
             changes: vec![FileChange {
+                lines: crate::chat::LineOrigin::File,
                 path: "a.rs".into(),
                 kind: ChangeKind::Updated,
                 diff: String::new(),
@@ -2046,6 +2048,7 @@ mod tests {
             "Used Linear: get issue"
         );
         let change = |path: &str| chat::FileChange {
+            lines: crate::chat::LineOrigin::File,
             path: path.into(),
             kind: chat::ChangeKind::Updated,
             diff: String::new(),
@@ -2066,6 +2069,7 @@ mod tests {
             changes: paths
                 .iter()
                 .map(|path| FileChange {
+                    lines: crate::chat::LineOrigin::File,
                     path: (*path).into(),
                     kind: ChangeKind::Updated,
                     diff: String::new(),

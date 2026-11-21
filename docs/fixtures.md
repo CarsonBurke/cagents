@@ -422,7 +422,7 @@ the separate option below.
 
 | PEER | Script | Each prompt |
 | --- | --- | --- |
-| `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
+| `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction, a renamed and edited file, and a diff, started then completed |
 | `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect`, `closed-after-finish` and `auth-required` pick the neighbouring cases |
 | `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
 | `usage-resets` | `codex-usage-resets.py` | reports invented usage and reset credits; consumes update only its private fixture state |
@@ -1176,6 +1176,7 @@ The first of these words a prompt contains chooses what it does:
 | Word | The agent |
 | --- | --- |
 | `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
+| `edits` | edits three files in one step (a two-hunk change to `src/config.rs`, a new `src/error.rs` and a deleted `docs/legacy-config.md`), then rewrites `src/handlers.rs` with a long patch |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
