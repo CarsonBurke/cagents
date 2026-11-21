@@ -186,7 +186,9 @@ impl Homes {
         fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // Not blocking keeps a FIFO by this name from stalling the daemon
+            // while it holds the account list.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .mode(0o600)
             .open(self.released_marker(provider, key))?;
         Ok(())
