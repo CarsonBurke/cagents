@@ -3906,11 +3906,15 @@ impl Runtime {
             selection: None,
         });
         self.replace_draft(composer);
-        // The draft a walk through sent messages set aside is in `combined`.
-        self.history_cursor = None;
+        // The draft a walk through sent messages set aside is in `combined`,
+        // and its attachments rather than the recalled message's follow it.
+        let shown = self.replace_attachments(attachments);
+        let later = match self.history_cursor.take() {
+            Some(_) => self.history_attachment_stash.take().unwrap_or_default(),
+            None => shown,
+        };
         self.history_stash = None;
         self.history_attachment_stash = None;
-        let later = self.replace_attachments(attachments);
         self.merge_attachments(later);
     }
 
@@ -4106,8 +4110,8 @@ impl Runtime {
     }
 
     /// Records a message the provider accepted. The same message sent twice
-    /// in a row is one entry, as a shell keeps it, and the walk restarts
-    /// from the newest.
+    /// in a row is one entry, as a shell keeps it. An active history walk
+    /// keeps its position and unsent draft.
     #[cfg(test)]
     fn remember(&mut self, sent: String) {
         self.remember_with_attachments(sent, Vec::new());
@@ -4119,9 +4123,34 @@ impl Runtime {
             self.history.push(sent);
             self.history_images.push(attachments);
         }
+    }
+
+    /// Returns to the draft saved before browsing sent prompts.
+    fn restore_history_draft(&mut self) {
+        let composer = self.history_stash.take().unwrap_or_default();
+        let attachments = self.history_attachment_stash.take().unwrap_or_default();
+        self.replace_attachments(attachments);
         self.history_cursor = None;
-        self.history_stash = None;
-        self.history_attachment_stash = None;
+        self.replace_draft(composer);
+    }
+
+    /// Consumes the shown prompt while preserving a draft saved by history.
+    /// The walk shows the draft's chosen files with each recalled prompt, so
+    /// those that just left with it are not restored a second time.
+    fn finish_history_walk_after_send(&mut self, sent: &[Attachment]) {
+        if self.history_cursor.is_some() {
+            if let Some(stash) = self.history_attachment_stash.as_mut() {
+                stash.retain(|attachment| {
+                    attachment.reference.is_some()
+                        || !sent
+                            .iter()
+                            .any(|gone| gone.reference.is_none() && gone.path == attachment.path)
+                });
+            }
+            self.restore_history_draft();
+        } else {
+            self.replace_draft(text_editor::Content::new());
+        }
     }
 
     /// Walks the history one message older or newer, showing it in the
@@ -4143,29 +4172,22 @@ impl Runtime {
             (Some(index), false) if index + 1 < self.history.len() => Some(index + 1),
             (Some(_), false) => None,
         };
-        let composer = match next {
-            Some(index) => {
-                text_editor::Content::with_text(self.history[index].trim_end_matches('\n'))
-            }
-            None => self.history_stash.take().unwrap_or_default(),
+        let Some(index) = next else {
+            self.restore_history_draft();
+            return;
         };
-        let attachments = match next {
-            Some(index) => {
-                let mut attachments = self
-                    .history_attachment_stash
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|attachment| attachment.reference.is_none())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(images) = self.history_images.get(index) {
-                    attachments.extend(images.clone());
-                }
-                attachments
-            }
-            None => self.history_attachment_stash.take().unwrap_or_default(),
-        };
+        let composer = text_editor::Content::with_text(self.history[index].trim_end_matches('\n'));
+        let mut attachments = self
+            .history_attachment_stash
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|attachment| attachment.reference.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(images) = self.history_images.get(index) {
+            attachments.extend(images.clone());
+        }
         self.replace_attachments(attachments);
         self.history_cursor = next;
         self.replace_draft(composer);
@@ -12002,7 +12024,7 @@ impl Cagents {
             // back with the reason.
             let text = runtime.composer.text().trim_end().to_owned();
             let attachments = runtime.take_attachments();
-            runtime.replace_draft(text_editor::Content::new());
+            runtime.finish_history_walk_after_send(&attachments);
             let mode = match &command {
                 Command::Prompt { mode, .. } => *mode,
                 _ => PromptMode::Send,
@@ -14286,14 +14308,15 @@ impl Cagents {
                     let id = runtime.next_written;
                     runtime.next_written += 1;
                     let text = runtime.composer.text().trim_end().to_owned();
+                    let attachments = runtime.take_attachments();
+                    runtime.finish_history_walk_after_send(&attachments);
                     let followup = Followup {
                         id,
                         preview: prompt::queue_preview(&text),
                         text,
-                        attachments: runtime.take_attachments(),
+                        attachments,
                     };
                     runtime.followups.push(followup);
-                    runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
                     let busy = runtime.turn_under_way();
