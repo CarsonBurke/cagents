@@ -1350,11 +1350,13 @@ Copy `tests/fixtures/update-review.json` there with mode 0600, then start the
 session (or wait for the active review's next status poll). The example includes
 running work, a blocked conversation, a daemon notice and a paused terminal.
 The file must contain a job named `fixture-update-review`: either awaiting
-confirmation with a blocked daemon preview, or ended (`Failed` or `Cancelled`)
-with no confirmation, to show how a review ended. Decisions fail before looking
-up an installation. Replace the awaiting job with an ended one while the session
-runs to show the window that watched the review receive its outcome at the next
-status poll. Remove the file to end the fixture review.
+confirmation with a daemon preview, or ended (`Failed` or `Cancelled`) with no
+confirmation, to show how a review ended. Decisions fail before looking up an
+installation. While the session runs, replace the blocked review with one whose
+blockers are empty and whose sessions continue to show the update becoming
+available at the next status poll, or with an ended one to show the window that
+watched the review receive its outcome. Remove the file to end the fixture
+review.
 
 To show what the header offers when a newer release exists, also copy
 `tests/fixtures/update-release.json` to `home/.config/fixture-update-release.json`

@@ -1739,7 +1739,7 @@ fn perform_update(
         Installation::detect()?;
         turns.apply(observe_impact(&staged.identity, policy)?)
     };
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
     if confirmed.replaces_daemon {
@@ -5798,6 +5798,7 @@ sys.stdin.buffer.read(1)
                 expires_at_unix_ms: u64::MAX,
                 preview,
                 stop: None,
+                terminal_command: None,
             }),
             refusal: None,
             in_flight: Vec::new(),
