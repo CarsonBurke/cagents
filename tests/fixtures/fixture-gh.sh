@@ -465,7 +465,7 @@ api() {
                                  requestedReviewer: {__typename: "User", id: $reviewer}} else null end),
                             timelineItems: {nodes: [range($count) as $i |
                                 {id: ("RRE_fixture" + (.number | tostring) + "_" + ($i | tostring)),
-                                 createdAt: ("2026-11-0" + ($i + 1 | tostring) + "T00:00:00Z"),
+                                 createdAt: (1793491200 + $i * 86400 | todate),
                                  requestedReviewer: {__typename: "User", id: $reviewer}}],
                                 pageInfo: {hasPreviousPage: false, startCursor: null}}}}}}'
                 ;;

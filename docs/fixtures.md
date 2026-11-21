@@ -251,7 +251,7 @@ fixture's `config/`, so no app setting can switch it on. The fixture creates
 the directory; the forge reads the switch on every call, so a step can turn it
 on in a running session. Then it
 answers as a gh signed in to github.com as `fixture`, whose repositories have
-no pull requests and no review requests:
+no pull requests and no review requests except those seeded below:
 
 | The app runs | It answers |
 | --- | --- |
@@ -260,7 +260,7 @@ no pull requests and no review requests:
 | `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below; `--author @me` means `fixture` |
 | `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
 | `gh pr checks N` | gh's `no checks reported` for a seeded pull request; a seed's checks reach the app through `statusCheckRollup` in `gh pr view` and the queries below instead |
-| `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
+| `gh api graphql` | the seeded open pull requests for the review-request poll and the pull request browser, and their review-request history; empty pages for the browser's search; not found for a pull request's own queries |
 | `gh api repos/OWNER/NAME/issues?creator=LOGIN&...` | the creator's most recently updated seeded pull request, with an `Etag` that changes when that row does, and gh's `HTTP 304` failure when `If-None-Match` still matches it |
 | `gh api repos/OWNER/NAME/releases` | `[]`; any other REST endpoint is `404 Not Found` |
 
