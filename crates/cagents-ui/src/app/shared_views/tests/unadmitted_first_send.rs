@@ -461,12 +461,14 @@ fn a_held_message_follows_the_conversation_another_window_started() {
     assert_held(&window, start);
 
     // Another window, whose registry had the channel, sent its own first
-    // message from the same shared draft.
+    // message from the same shared draft: its own new conversation.
     let mut pane = Pane::from_card(window.app.card_state(window.card).unwrap(), None).unwrap();
     let CardKind::Chat(session) = &mut pane.kind else {
         unreachable!("the pane is a chat")
     };
+    session.id = TerminalId::new();
     session.launch.session_id = Some("peer-conversation".into());
+    assert!(!session.is_unstarted());
     let accepted = session.clone();
     seed_applied(&mut window, vec![pane], Vec::new());
 
@@ -480,6 +482,9 @@ fn a_held_message_follows_the_conversation_another_window_started() {
         Some("first message"),
         "the message waits in that conversation's composer"
     );
+    // No later pass starts the held message after all.
+    drop(window.app.reconcile_shared_views());
+    assert!(window.app.chat_start_matches(window.card, &accepted));
 }
 
 #[test]

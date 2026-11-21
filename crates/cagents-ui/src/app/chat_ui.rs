@@ -1069,7 +1069,8 @@ impl Action {
         match self {
             Self::Reconnect(target)
             | Self::ResumeSaved(target)
-            | Self::ResumeAfterSignIn(target) => Some(target.card),
+            | Self::ResumeAfterSignIn(target)
+            | Self::RetryRefusedView(target) => Some(target.card),
             Self::Switch(card) | Self::StartFresh(card) | Self::RecoverAccount(card, _) => {
                 Some(*card)
             }
@@ -8622,10 +8623,7 @@ impl Cagents {
         card: CardId,
         session: &chat::Session,
     ) -> bool {
-        // A first message held for its channel has started nothing here, so
-        // the conversation another window started is the one to follow; the
-        // message goes back to the draft, as one whose start was given up.
-        if session.is_unstarted() || self.chat_start_in_flight(card) {
+        if session.is_unstarted() || self.chat_start_pending(card) {
             return false;
         }
         let draft_of_session = matches!(
@@ -12326,8 +12324,7 @@ impl Cagents {
         {
             return Task::none();
         }
-        if matches!(&action, Action::Submit(target, _) | Action::RetryRefusedView(target) if self.chat_closed_elsewhere(target.card))
-        {
+        if matches!(&action, Action::Submit(target, _) if self.chat_closed_elsewhere(target.card)) {
             return Task::none();
         }
         match action {

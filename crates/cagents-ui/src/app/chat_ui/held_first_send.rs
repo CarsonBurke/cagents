@@ -164,6 +164,9 @@ impl Cagents {
                 continue;
             };
             start.registry = identity;
+            // A pane whose publication the registry refused while it waited
+            // is this window's alone now, and starts here.
+            start.allow_local |= self.durable.local_only_cards.contains(&card);
             tasks.push(self.start_chat_with_upgrade(
                 card,
                 session,
@@ -224,7 +227,11 @@ impl Cagents {
                 self.chat_ui.view_refusals.remove(&card);
                 continue;
             };
-            if !self.view_seed_loaded(&scope) {
+            // A pane moved to another channel since is no longer refused:
+            // Retry would load the one it left.
+            if self.draft_start_scope(card).as_ref() == Some(&scope)
+                && !self.view_seed_loaded(&scope)
+            {
                 continue;
             }
             self.chat_ui.view_refusals.remove(&card);
