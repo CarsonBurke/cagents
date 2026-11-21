@@ -10575,6 +10575,32 @@ mod app_tests {
     }
 
     #[test]
+    fn a_fresh_restored_inventory_waits_for_its_schedule() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(Registry::default());
+            app.refresh_ui.focused = true;
+            let id = Account::system(provider).id();
+            let now = now_ms();
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now - 1_000),
+                    inventory_observed_at: Some(now - 2_000),
+                }),
+            }]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.inventory_observed_at, Some(now - 2_000));
+            assert!(
+                app.probe_account(&id, Trigger::Focus, now).is_none(),
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[test]
     fn probes_after_live_usage_accept_newer_readings_and_clock_rollback() {
         for clock_rolled_back in [false, true] {
             let mut app = context_inspector_test_app(false);

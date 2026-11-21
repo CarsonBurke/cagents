@@ -339,8 +339,12 @@ fn prepare(
         // guarantee that another window is not running the same one.
         Err(_) => None,
     };
+    // Only a complete reading stands in for one: an entry whose figures a
+    // running conversation advanced since its inventory was read would make
+    // that older plan, credit and window inventory look as fresh as them.
     if !force
         && let Some(entry) = key.as_ref().and_then(|key| cache.load(now).remove(key))
+        && entry.inventory_observed_at == Some(entry.snapshot.observed_at)
         && now.saturating_sub(entry.snapshot.observed_at) < STALE_AFTER
     {
         let mut snapshot = entry.snapshot;
@@ -2749,6 +2753,54 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Another window's cached answer stands in for a reading only when it
+    /// is a complete one: figures a running conversation advanced past the
+    /// inventory's reading, or an entry from before inventory stamps, would
+    /// otherwise pass the older plan, credits and windows off as current.
+    #[test]
+    fn only_a_complete_cached_reading_answers_an_ordinary_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home);
+        let program = bin.join(account.provider.executable());
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        make_executable(&program);
+        let cache = Cache::at(directory.path().join("cache"));
+        let key = account.cache_key().unwrap();
+        let now = now_ms();
+        let observed_at = now - 1_000;
+        let answers_from_cache = |inventory_observed_at, force| {
+            cache
+                .store(
+                    &key,
+                    Entry {
+                        identity: None,
+                        snapshot: UsageSnapshot::state(UsageStatus::Ok, "", observed_at),
+                        inventory_observed_at,
+                    },
+                )
+                .unwrap();
+            match prepare(&account, Some(&cache), force, now, Some(bin.as_os_str())) {
+                Prepared::Done(Outcome::Answered { snapshot, .. }) => {
+                    assert_eq!(snapshot.source, UsageSource::Cache);
+                    true
+                }
+                Prepared::Probe { .. } => false,
+                Prepared::Done(_) => panic!("neither a cached answer nor a probe"),
+            }
+        };
+        assert!(answers_from_cache(Some(observed_at), false));
+        assert!(!answers_from_cache(Some(observed_at), true));
+        assert!(!answers_from_cache(
+            Some(observed_at - 2 * STALE_AFTER),
+            false
+        ));
+        assert!(!answers_from_cache(None, false));
     }
 
     /// The system Claude login's two records, as the probe reads them: the
