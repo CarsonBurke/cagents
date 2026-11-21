@@ -7500,8 +7500,8 @@ fn header_selection(
 }
 
 /// A project's news that none of the channel and pane rows drawn under it
-/// shows: news of a pane a search leaves out, or of no pane at all. While
-/// checkouts are hidden its header says this, or nobody would.
+/// shows: news of a pane a search leaves out, or of no pane at all. Folder
+/// roots and hidden checkouts need this on their header, or nobody shows it.
 fn undrawn_attention<'a>(
     state: &SidebarState,
     project: ProjectId,
@@ -8006,14 +8006,12 @@ fn compact_project<'a>(
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
     let has_children = !members.is_empty() || !entity.operations.is_empty();
-    // Every row with news is drawn below the chip with its own badges (see
-    // `compact_rail_shows_channel`), so the chip speaks for the whole
-    // project only while none are: repeating them would count the same news
-    // twice. Hidden checkouts leave news to their panes' rows, and the chip
-    // keeps what no drawn row carries, as the expanded header does.
+    // Drawn children carry their own badges, so only an empty group needs
+    // the full project aggregate. Folder roots and hidden checkouts keep
+    // what no drawn channel or pane carries, as the expanded header does.
     let badge = if members.is_empty() {
         Some(project.state.project_attention(entity.id))
-    } else if project.state.lists_panes(entity) {
+    } else if entity.kind == ProjectKind::Folder || project.state.lists_panes(entity) {
         Some(undrawn_attention(
             project.state,
             entity.id,
