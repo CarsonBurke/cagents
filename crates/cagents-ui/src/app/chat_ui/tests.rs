@@ -14451,6 +14451,9 @@ fn a_channel_closes_when_its_last_pane_does() {
         durable.active_channel = Some(channel);
         // Already in the chat's directory, so starting it changes no scope.
         app.active_workspace = Some(PathBuf::from(FIXTURE_DIRECTORY));
+        // The chat starts before the registry below comes online, so its
+        // first message does not wait for this channel to load.
+        app.shared_views.registry_unavailable = true;
         let chat = match chat_state {
             0 => starting_chat(&mut app).0,
             1 => failed_chat(&mut app),
@@ -14464,6 +14467,7 @@ fn a_channel_closes_when_its_last_pane_does() {
             creation_ordinal: 4,
         };
         let scope = Scope::Channel(channel);
+        app.shared_views.registry_unavailable = false;
         app.workspace_model.identity = home.registry;
         app.workspace_model.sequence = 10;
         app.workspace_model.projects.push(ModelProject {
@@ -15046,6 +15050,8 @@ fn a_chat_replaced_by_its_provider_cli_keeps_its_channel() {
     });
     durable.active_channel = Some(channel);
     app.active_workspace = Some(PathBuf::from(FIXTURE_DIRECTORY));
+    // A daemon with no shared registry, so the channel stays this window's.
+    app.shared_views.registry_unavailable = true;
     let card = failed_chat(&mut app);
     let members = |app: &Cagents| {
         app.durable

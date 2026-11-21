@@ -671,7 +671,7 @@ impl Cagents {
             let pending = self.durable.cards.iter().any(|card| {
                 card.existence.is_open()
                     && self.project_owns_card(project, card, &scope)
-                    && (self.pending_terminal_spawn(card.id) || self.chat_start_pending(card.id))
+                    && (self.pending_terminal_spawn(card.id) || self.chat_start_in_flight(card.id))
             });
             if pending {
                 if self.project_ui.close_started[&project].elapsed() > Duration::from_secs(45) {
@@ -1827,7 +1827,7 @@ impl Cagents {
         if self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && card_belongs_to(card, &target.path)
-                && (self.pending_terminal_spawn(card.id) || self.chat_start_pending(card.id))
+                && (self.pending_terminal_spawn(card.id) || self.chat_start_in_flight(card.id))
         }) {
             return cosmic::task::future(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;

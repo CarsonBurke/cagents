@@ -104,6 +104,7 @@ pub(super) mod images;
 mod kept_draft;
 use kept_draft::ConfirmedLoss;
 use revised::Revised;
+mod held_first_send;
 mod layout;
 mod literal_content;
 mod logical_prose;
@@ -315,6 +316,9 @@ pub enum Action {
     /// Takes back a draft's first message before its conversation has it,
     /// so the draft can be edited or moved again.
     CancelQueued(Target),
+    /// Loads a refused channel or project into the shared workspace again
+    /// and sends the first message that came back for it.
+    RetryRefusedView(Target),
     Switch(CardId),
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
@@ -820,6 +824,7 @@ impl Action {
             Self::AccountPicker(..) => "AccountPicker",
             Self::DispatchQueued(..) => "DispatchQueued",
             Self::CancelQueued(..) => "CancelQueued",
+            Self::RetryRefusedView(..) => "RetryRefusedView",
             Self::Switch(..) => "Switch",
             Self::Ready(..) => "Ready",
             Self::AccountCommitted(..) => "AccountCommitted",
@@ -1293,6 +1298,9 @@ pub(super) struct State {
     generation: u64,
     phases: HashMap<CardId, Phase>,
     draft_checkpoints: HashMap<CardId, DraftStartCheckpoint>,
+    /// Cards whose first message waits for its scope's admission. Each one's
+    /// `Queued::admission` holds the start; this only finds them.
+    admission_holds: HashSet<CardId>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -1381,6 +1389,7 @@ impl Default for State {
             generation: 0,
             phases: HashMap::new(),
             draft_checkpoints: HashMap::new(),
+            admission_holds: HashSet::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -2942,6 +2951,9 @@ struct Queued {
     since: Option<Instant>,
     /// Whether a look back once a wait is over is already scheduled.
     rechecking: bool,
+    /// The start a first message waits to make until its channel or project
+    /// has loaded into the shared workspace (see [`held_first_send`]).
+    admission: Option<held_first_send::Hold>,
 }
 impl Queued {
     fn submission_text<'a>(&'a self, snapshot: &Snapshot) -> &'a str {
@@ -3311,6 +3323,9 @@ pub(super) struct Runtime {
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
+    /// A first message came back because the shared workspace refused to
+    /// load this pane's channel or project; Retry loads it and sends again.
+    view_refused: bool,
     /// A Close the daemon refused, shown on the pane until it closes.
     close_refusal: Option<close_refusal::CloseRefusal>,
     /// Resuming this card's stopped provider failed; the reason stands in
@@ -4491,6 +4506,7 @@ impl Runtime {
             warm: None,
             error: None,
             capacity_refused: false,
+            view_refused: false,
             close_refusal: None,
             resume_failed: false,
             start_blocked: None,
@@ -9876,7 +9892,14 @@ impl Cagents {
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
-        // A reopened conversation still being prepared starts once that ends.
+        // A first message held for its channel starts once that loads.
+        self.chat_start_in_flight(card) || self.first_send_held(card)
+    }
+    /// Whether `card` has a start under way that removing it must wait out.
+    /// A reopened conversation still being prepared starts once that ends.
+    /// A first message held for its channel has started nothing: it stays
+    /// with its draft, and is waited out like any start once released.
+    pub(super) fn chat_start_in_flight(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
     }
     /// Why the daemon cannot host `card`'s `conversation` yet, when this
@@ -9928,6 +9951,28 @@ impl Cagents {
     #[cfg(test)]
     pub(super) fn chat_start_began(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
+    }
+    /// The attempt `card`'s conversation is starting under, if it is.
+    #[cfg(test)]
+    pub(super) fn chat_start_attempt(&self, card: CardId) -> Option<Target> {
+        match self.chat_ui.phases.get(&card) {
+            Some(Phase::Starting(attempt)) => Some(attempt.target),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn chat_error(&self, card: CardId) -> Option<&str> {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.error.as_deref(),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn chat_composer_text(&self, card: CardId) -> Option<String> {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.composer.text()),
+            _ => None,
+        }
     }
     /// Unsent text held for a card that has no chat runtime.
     #[cfg(test)]
@@ -10711,6 +10756,7 @@ impl Cagents {
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.capacity_refused = false;
+            runtime.view_refused = false;
             if intent == chat::Intent::Resume && runtime.resumes_in_place() {
                 runtime.freeze_resume_source();
             }
@@ -11363,6 +11409,7 @@ impl Cagents {
             draft: pending.candidate.clone(),
             since: None,
             rechecking: false,
+            admission: None,
         });
         runtime.replace_draft(text_editor::Content::new());
         runtime.history_cursor = None;
@@ -11375,13 +11422,26 @@ impl Cagents {
         // Only the accepted checkpoint authorizes B's public projection and
         // the first provider handshake. No fallback or first prompt precedes it.
         self.commit_chat_session(target.card, pending.candidate.clone());
-        let pane_start = Some(crate::terminal_ipc::PaneChatStart {
+        let pane_start = crate::terminal_ipc::PaneChatStart {
             registry: pending.registry,
             card: target.card,
             source: pending.source,
             allow_local: pending.scope.is_none()
                 || self.durable.local_only_cards.contains(&target.card),
-        });
+        };
+        if !pane_start.allow_local
+            && let Some(scope) = &pending.scope
+        {
+            match self.first_send_admission(target.card, scope) {
+                super::shared_views::FirstSendAdmission::Admitted => {}
+                super::shared_views::FirstSendAdmission::Waiting => {
+                    return self.hold_first_send(target, pane_start);
+                }
+                super::shared_views::FirstSendAdmission::Refused => {
+                    return self.refuse_first_send(target, scope);
+                }
+            }
+        }
         self.start_chat_with_upgrade(
             target.card,
             pending.candidate,
@@ -11389,7 +11449,7 @@ impl Cagents {
             None,
             false,
             None,
-            pane_start,
+            Some(pane_start),
         )
     }
 
@@ -11812,6 +11872,7 @@ impl Cagents {
         }
         if runtime.is_draft() {
             runtime.unqueue();
+            self.chat_ui.admission_holds.remove(&target.card);
             if let Some(Phase::Starting(attempt)) = self.chat_ui.phases.remove(&target.card) {
                 self.chat_ui
                     .abandoned
@@ -12394,6 +12455,7 @@ impl Cagents {
                 return self.dispatch_queued(target);
             }
             Action::CancelQueued(target) => return self.cancel_queued(target),
+            Action::RetryRefusedView(target) => return self.retry_refused_view_send(target),
             Action::Switch(card) => {
                 if let Some(reason) = self.chat_switch_blocker(card) {
                     self.status = Some(

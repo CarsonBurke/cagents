@@ -687,6 +687,13 @@ impl State {
         self.deleting.contains(&id)
     }
 
+    /// Whether deleting channel `id` is closing its sessions, rather than
+    /// waiting for one still starting.
+    #[cfg(test)]
+    pub(super) fn closing_sessions(&self, id: ChannelId) -> bool {
+        self.closing.contains_key(&id)
+    }
+
     /// Whether any channel deletion is under way.
     pub(super) fn deletion_running(&self) -> bool {
         !self.deleting.is_empty()
@@ -2006,7 +2013,7 @@ impl Cagents {
         for (id, cards) in started {
             if cards
                 .iter()
-                .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
+                .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_in_flight(*card))
             {
                 tasks.push(cosmic::task::future(async move {
                     tokio::time::sleep(Duration::from_millis(50)).await;

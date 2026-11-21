@@ -3408,6 +3408,16 @@ impl Runtime {
         }
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
+        } else if self.view_refused {
+            let enabled = !transitioning
+                && self.commands.is_idle()
+                && self.attachment_chooser_pending.is_none()
+                && (!self.composer.text().trim().is_empty() || !self.attachments.is_empty());
+            content.push(
+                crate::ui_controls::button::primary("Retry")
+                    .on_press_maybe(enabled.then(|| action(Action::RetryRefusedView(target))))
+                    .into(),
+            );
         } else if self.capacity_refused {
             let enabled = !transitioning
                 && self.commands.is_idle()
@@ -6136,7 +6146,9 @@ impl Runtime {
     /// and a message that vanished until the provider answered would read
     /// as lost.
     fn queued_view<'a>(&'a self, queued: &'a Queued) -> Element<'a, Message> {
-        let waiting = if self.is_draft() || !self.snapshot.ready {
+        let waiting = if let Some(hold) = &queued.admission {
+            hold.waiting().to_owned()
+        } else if self.is_draft() || !self.snapshot.ready {
             format!("Starting {}…", family_label(self.session.launch.provider))
         } else {
             "Sending…".to_owned()
