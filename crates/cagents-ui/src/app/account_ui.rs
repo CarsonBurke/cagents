@@ -1024,7 +1024,7 @@ impl AccountState {
         // A result from before this login cannot confirm the new login intent.
         // Abandon that scheduling slot so a fresh verification can start.
         self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
-        self.reset = resets::State::default();
+        self.reset.begin_sign_in();
         self.limit_refresh_identity = None;
         self.inventory_observed_at = None;
         self.limit_wake = None;

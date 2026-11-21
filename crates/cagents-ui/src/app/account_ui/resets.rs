@@ -117,6 +117,24 @@ impl State {
             .map(|asked| asked.surface.as_str())
     }
 
+    /// Forgets what a sign-in makes stale while keeping every request that
+    /// may have been spent. Questions, results and feedback belong to the
+    /// login being replaced. An uncertain request stays retryable once its
+    /// own login is back, and one still in flight becomes uncertain: its
+    /// answer is addressed to the replaced owner and will be dropped, so
+    /// forgetting it could spend a second reset under a new key.
+    pub(super) fn begin_sign_in(&mut self) {
+        let mut uncertain = std::mem::take(&mut self.uncertain);
+        if let Some(attempt) = self.pending.take() {
+            uncertain.insert(attempt.reset.id.clone(), attempt);
+        }
+        *self = Self {
+            uncertain,
+            confirmed: std::mem::take(&mut self.confirmed),
+            ..Self::default()
+        };
+    }
+
     /// Withdraws the question, returning where it was asked.
     pub(super) fn cancel(&mut self) -> Option<String> {
         self.confirmation.take().map(|asked| asked.surface)
@@ -713,17 +731,17 @@ impl Controls {
                 );
             }
         }
-        // Advice to retry would contradict a retry only another login can make.
-        let retry_advice_blocked = self.state.feedback_status == Some(ConsumeStatus::Unconfirmed)
-            && self
-                .state
-                .feedback_reset
-                .as_ref()
-                .and_then(|reset| self.state.uncertain.get(&reset.id))
-                .is_some_and(|attempt| {
-                    attempt.reset.kind != account::resets::ResetKind::WeeklySession
-                        && self.login_changed(attempt)
-                });
+        // Advice about an uncertain request, to retry it or try again, would
+        // contradict a retry only another login can make.
+        let retry_advice_blocked = self
+            .state
+            .feedback_reset
+            .as_ref()
+            .and_then(|reset| self.state.uncertain.get(&reset.id))
+            .is_some_and(|attempt| {
+                attempt.reset.kind != account::resets::ResetKind::WeeklySession
+                    && self.login_changed(attempt)
+            });
         if let Some(feedback) = self.state.feedback.filter(|_| !retry_advice_blocked) {
             rows.push(
                 design::caption(feedback)
@@ -1526,6 +1544,92 @@ pub(in crate::app) mod tests {
                 assert!(state.feedback.unwrap().starts_with("Resets changed"));
             }
         }
+    }
+
+    #[test]
+    fn signing_in_again_keeps_requests_that_may_have_been_spent() {
+        let now = now_ms();
+        let mut app = context_inspector_test_app(false);
+        let id = Account::system(Provider::Codex).id();
+        let original = reset_identity();
+        let grant = reset(ResetScope::Account);
+        let mut in_flight = reset(ResetScope::Model("Fable".into()));
+        in_flight.id = "fixture-fable".into();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![window(account::WindowKind::Session, "codex:primary", 1.0)];
+        snapshot.resets = vec![grant.clone(), in_flight.clone()];
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = true;
+        state.identity = Some(original.clone());
+        state.snapshot = Some(snapshot.clone());
+        state
+            .reset
+            .prepare(grant.clone(), 2, Some(original.clone()), "accounts".into());
+        let uncertain = state.reset.submit(&grant, 2, Some(&original)).unwrap();
+        assert!(state.reset.finish(
+            &uncertain.key,
+            ConsumeStatus::Unconfirmed,
+            "Unconfirmed".into()
+        ));
+        state.reset.prepare(
+            in_flight.clone(),
+            2,
+            Some(original.clone()),
+            "accounts".into(),
+        );
+        let sent = state.reset.submit(&in_flight, 2, Some(&original)).unwrap();
+        state.reset.pending = Some(sent.clone());
+        let owner = state.owner;
+
+        state.begin_sign_in(now);
+        let reset = &app.account_ui.account(&id).unwrap().reset;
+        assert!(reset.pending.is_none() && reset.feedback.is_none());
+        assert_eq!(reset.uncertain[&grant.id].key, uncertain.key);
+        assert_eq!(reset.uncertain[&in_flight.id].key, sent.key);
+        // The in-flight answer is addressed to the replaced owner.
+        drop(app.update(Message::AccountUi(Action::ResetFinished {
+            id: id.clone(),
+            owner,
+            key: sent.key.clone(),
+            result: Ok(ConsumeOutcome {
+                status: ConsumeStatus::Reset,
+                message: None,
+                snapshot: None,
+            }),
+        })));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .reset
+                .uncertain
+                .contains_key(&in_flight.id)
+        );
+
+        // The same login signs back in, now on another plan.
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
+        drop(app.update(Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            owner,
+            ticket,
+            outcome: Outcome::Answered {
+                identity: Some(Identity {
+                    plan: Some("pro".into()),
+                    ..original.clone()
+                }),
+                snapshot: Box::new(snapshot),
+                catalog: None,
+            },
+        })));
+        let retry = app.update(Message::AccountUi(Action::ResetRecover(
+            id.clone(),
+            grant.id.clone(),
+        )));
+        let pending = app.account_ui.account(&id).unwrap().reset.pending.as_ref();
+        assert_eq!(pending.map(|attempt| &attempt.key), Some(&uncertain.key));
+        assert!(retry.units() > 0);
     }
 
     #[test]
