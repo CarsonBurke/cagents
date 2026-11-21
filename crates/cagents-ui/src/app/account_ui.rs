@@ -157,6 +157,9 @@ pub(super) struct State {
     /// [`State::catalogs_unsaved`] is already due.
     saving_live: bool,
     omp: OmpRecord,
+    /// Providers the settings turn off: their accounts are neither listed
+    /// nor checked, and nothing offers them for new work.
+    turned_off: BTreeSet<Provider>,
 }
 
 /// Omp's usage record, which lists the accounts Omp keeps and is read
@@ -341,6 +344,7 @@ impl State {
             catalogs_unsaved: BTreeSet::new(),
             saving_live: false,
             omp: OmpRecord::default(),
+            turned_off: BTreeSet::new(),
         };
         state.sync_accounts();
         state
@@ -641,12 +645,58 @@ impl State {
             .min_by_key(|other| !other.account.is_system())
     }
 
-    /// The accounts of `provider`, in list order.
+    /// The accounts of `provider`, in list order, whether or not the
+    /// provider is turned off: a conversation still open on it keeps its
+    /// account, its limit handling and its login checks. What is listed or
+    /// offered asks [`Self::uses`] as well.
     fn of(&self, provider: Provider) -> impl Iterator<Item = &AccountState> {
         self.accounts
             .iter()
             .filter(move |account| account.account.provider == provider)
             .filter(|account| self.listed(account))
+    }
+
+    /// Whether `provider` is in use, rather than turned off in the settings.
+    pub(super) fn uses(&self, provider: Provider) -> bool {
+        !self.turned_off.contains(&provider)
+    }
+
+    /// The providers turned off in the settings, in the order the app lists
+    /// providers.
+    pub(super) fn turned_off(&self) -> impl Iterator<Item = Provider> + '_ {
+        Account::REPORTED
+            .into_iter()
+            .filter(|provider| self.turned_off.contains(provider))
+    }
+
+    /// Takes the providers `settings` turns off; whether that changed them.
+    pub(super) fn set_turned_off(&mut self, settings: &AppSettings) -> bool {
+        let turned_off: BTreeSet<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|provider| !settings.uses_provider(*provider))
+            .collect();
+        if turned_off == self.turned_off {
+            return false;
+        }
+        self.turned_off = turned_off;
+        if self
+            .popover
+            .as_ref()
+            .and_then(|id| self.account(id))
+            .is_some_and(|account| !self.uses(account.account.provider))
+        {
+            self.popover = None;
+        }
+        self.table.close_popups();
+        if self
+            .table
+            .link
+            .as_ref()
+            .is_some_and(|(provider, _)| !self.uses(*provider))
+        {
+            self.table.link = None;
+        }
+        true
     }
 
     /// Whether `account` is listed, rather than archived.
@@ -737,9 +787,11 @@ impl State {
     /// Whether a new conversation can be started on `provider`: it has
     /// listed its models before, or one of its accounts has a CLI to run.
     pub(super) fn offers(&self, provider: Provider) -> bool {
-        self.catalog(provider)
-            .is_some_and(|catalog| !catalog.models.is_empty())
-            || self.of(provider).any(|account| account.present)
+        self.uses(provider)
+            && (self
+                .catalog(provider)
+                .is_some_and(|catalog| !catalog.models.is_empty())
+                || self.of(provider).any(|account| account.present))
     }
 
     /// Takes what `provider` listed, unless what is known is newer: another
@@ -2519,10 +2571,13 @@ impl Cagents {
             })
             .collect();
         accounts.push(Account::system(Provider::Omp));
+        accounts.retain(|account| self.account_ui.uses(account.provider));
         accounts
     }
     /// The models, and their efforts, a new conversation's composer offers.
     pub(super) fn automation_models(&self) -> crate::automation_ui::Models {
+        // Every provider's, even one turned off: an automation saved on it
+        // keeps its listed model and efforts. The editor offers the providers.
         Provider::ALL
             .into_iter()
             .filter_map(|provider| {
@@ -3084,6 +3139,16 @@ impl Cagents {
         } else {
             trigger
         };
+        // A provider turned off is not checked while no conversation is open
+        // on it. One still open needs its accounts' figures current, to know
+        // when its limit resets and which account Automatic switches to.
+        let provider = self.account_ui.account(id)?.account.provider;
+        if trigger != Trigger::Limit
+            && !self.account_ui.uses(provider)
+            && !self.chat_open_on(provider)
+        {
+            return None;
+        }
         if trigger == Trigger::Limit {
             let state = self.account_ui.account_mut(id)?;
             if !state
@@ -6242,11 +6307,20 @@ impl Cagents {
             .count()
     }
 
+    /// Whether a conversation on `provider` is open in some pane.
+    fn chat_open_on(&self, provider: Provider) -> bool {
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(session) if session.launch.provider == provider)
+        })
+    }
+
     /// The per-provider default choices the settings pane offers.
     pub(super) fn default_account_choices(&self) -> Vec<(Provider, Vec<DefaultChoice>)> {
         let state = &self.account_ui;
         Account::PROVIDERS
             .into_iter()
+            .filter(|provider| state.uses(*provider))
             .map(|provider| {
                 (
                     provider,
@@ -6315,6 +6389,9 @@ impl Cagents {
     /// checked leads as itself; failing that, the first listed.
     fn chip_lead(&self, provider: Provider) -> Option<(&AccountState, usize)> {
         let state = &self.account_ui;
+        if !state.uses(provider) {
+            return None;
+        }
         let present: Vec<&AccountState> = state
             .of(provider)
             .filter(|account| state.shown_in_switcher(account))
@@ -9292,6 +9369,112 @@ mod app_tests {
             app.account_ui.logins.first().map(|login| login.phase),
             Some(LoginPhase::Verifying)
         );
+    }
+
+    #[test]
+    fn a_conversation_open_on_a_turned_off_provider_keeps_its_limit_handling() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let other = app.account_ui.add_managed_fixture(Provider::Claude, 1938);
+        let current = Account::system(Provider::Claude);
+        let now = now_ms();
+        app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+            Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+        let key = app
+            .account_ui
+            .account(&other)
+            .unwrap()
+            .account
+            .registry_key()
+            .unwrap();
+        let identity = app.account_ui.registry.find(key).unwrap().identity();
+        let usage = account::claude::parse_usage(
+            &serde_json::json!({
+                "rate_limits": {"limits": [{"kind": "session", "percent": 20.0}]},
+            }),
+            now,
+        );
+        let state = app.account_ui.account_mut(&other).unwrap();
+        state.present = true;
+        state.identity = Some(identity);
+        state.schedule.succeed(usage.observed_at);
+        state.snapshot = Some(usage);
+        assert_eq!(app.automatic_account(&current).unwrap().id(), other);
+
+        for provider in [Provider::Claude, Provider::Codex] {
+            let _ = app.update(Message::SettingsChanged {
+                field: SettingsField::UseProvider(provider),
+                value: "false".into(),
+            });
+        }
+        // Turned off, Claude is offered nowhere, but an automatic conversation
+        // still open on it still switches to the account with usage left.
+        assert!(!app.account_ui.offers(Provider::Claude));
+        assert_eq!(app.automatic_account(&current).unwrap().id(), other);
+
+        // When one reaches its limit, its account is still checked.
+        let codex = Account::system(Provider::Codex).id();
+        let recipe = recipe_on(&app, &codex);
+        assert!(app.probe_account(&codex, Trigger::Focus, now).is_none());
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert!(app.account_ui.pending_probe_for_test(&codex).is_some());
+
+        // And while one is open, the provider's other accounts are kept
+        // current, so Automatic still has figures to switch by.
+        assert!(app.probe_account(&other, Trigger::Manual, now).is_none());
+        let session = crate::chat::fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/w".into(),
+            &current,
+        )
+        .unwrap();
+        drop(app.insert_chat_card(session, None, None));
+        assert!(app.chat_open_on(Provider::Claude));
+        assert!(app.probe_account(&other, Trigger::Manual, now).is_some());
+    }
+
+    #[test]
+    fn a_turned_off_provider_is_neither_listed_offered_nor_checked_until_turned_on() {
+        let mut app = context_inspector_test_app(false);
+        let muse = Account::system(Provider::Muse).id();
+        let state = app.account_ui.account_mut(&muse).unwrap();
+        state.present = true;
+        state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+        assert!(app.account_ui.offers(Provider::Muse));
+        assert!(app.chip_lead(Provider::Muse).is_some());
+        assert!(table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+
+        let _ = app.update(Message::SettingsChanged {
+            field: SettingsField::UseProvider(Provider::Muse),
+            value: "false".into(),
+        });
+        assert!(!app.settings.uses_provider(Provider::Muse));
+        assert!(!app.account_ui.offers(Provider::Muse));
+        assert!(app.chip_lead(Provider::Muse).is_none());
+        assert!(!table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+        assert_eq!(
+            app.account_ui.turned_off().collect::<Vec<_>>(),
+            [Provider::Muse]
+        );
+        assert!(
+            app.probe_account(&muse, Trigger::Manual, NOW).is_none(),
+            "not even a manual check runs"
+        );
+        // What it last reported is kept for when it is turned back on.
+        assert!(app.account_ui.account(&muse).unwrap().snapshot.is_some());
+        // Other providers are untouched.
+        assert!(app.account_ui.of(Provider::Claude).count() > 0);
+
+        let _ = app.update(Message::SettingsChanged {
+            field: SettingsField::UseProvider(Provider::Muse),
+            value: "true".into(),
+        });
+        assert!(app.settings.uses_provider(Provider::Muse));
+        assert!(app.settings.providers.is_empty());
+        assert!(app.account_ui.offers(Provider::Muse));
+        assert!(table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+        assert_eq!(app.account_ui.turned_off().count(), 0);
     }
 
     #[test]

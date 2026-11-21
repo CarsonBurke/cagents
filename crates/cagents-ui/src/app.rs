@@ -3475,6 +3475,8 @@ pub enum SettingsField {
     CheckForUpdates,
     EditorSyntaxTheme,
     Confirm(settings::Confirmation),
+    /// Whether a provider is in use, as `AppSettings::uses_provider` reads it.
+    UseProvider(crate::agent::Provider),
     FocusFollowsMouse,
     LinkOpenGesture,
     PullRequestOpenTarget,
@@ -3563,7 +3565,7 @@ impl SettingsField {
 
     /// The label the settings pane shows for this setting, which is also
     /// the name its messages use for it.
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         use crate::notifications::Field;
         match self {
             Self::Notifications(Field::Enabled) => "System notifications",
@@ -3640,6 +3642,7 @@ impl SettingsField {
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
             Self::Confirm(settings::Confirmation::CloseActiveTerminal) => "Active processes",
+            Self::UseProvider(provider) => provider.label(),
             Self::FocusFollowsMouse => "Pane focus",
             Self::LinkOpenGesture => "System browser gesture",
             Self::PullRequestOpenTarget => "Open pull requests in",
@@ -3667,7 +3670,7 @@ impl SettingsField {
     const fn category(self) -> SettingsCategory {
         match self {
             Self::Notifications(_) => SettingsCategory::Notifications,
-            Self::AccountUsageDisplay => SettingsCategory::Accounts,
+            Self::AccountUsageDisplay | Self::UseProvider(_) => SettingsCategory::Accounts,
             Self::AppTheme
             | Self::UiScale
             | Self::ShowStatusBar
@@ -3894,6 +3897,8 @@ struct SettingsDraft {
     editor_syntax_theme: settings::EditorSyntaxTheme,
     /// Whether each routine question is asked, as `AppSettings::asks` reads it.
     confirmations: BTreeMap<settings::Confirmation, bool>,
+    /// Whether each provider is in use, as `AppSettings::uses_provider` reads it.
+    providers: BTreeMap<crate::agent::Provider, bool>,
     chat_enter_sends: bool,
     chat_expand_tool_groups: bool,
     chat_content_fraction: String,
@@ -3963,6 +3968,10 @@ impl SettingsDraft {
             confirmations: settings::Confirmation::ALL
                 .into_iter()
                 .map(|kind| (kind, settings.asks(kind)))
+                .collect(),
+            providers: crate::agent::Provider::ALL
+                .into_iter()
+                .map(|provider| (provider, settings.uses_provider(provider)))
                 .collect(),
             confirm_multiline_paste: settings.confirm_multiline_paste,
             browser_search_url: settings.browser_search_url.clone(),
@@ -4036,6 +4045,9 @@ impl SettingsDraft {
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::Confirm(kind) => {
                 self.confirmations.insert(kind, value == "true");
+            }
+            SettingsField::UseProvider(provider) => {
+                self.providers.insert(provider, value == "true");
             }
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = value == "true",
@@ -4280,6 +4292,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|ask| next.set_asks(kind, ask))
             .map_err(|_| "Choose whether to ask first.".to_owned()),
+        SettingsField::UseProvider(provider) => value
+            .parse::<bool>()
+            .map(|used| next.set_uses_provider(provider, used))
+            .map_err(|_| "Choose whether this provider is used.".to_owned()),
         SettingsField::ConfirmMultilinePaste => value
             .parse::<bool>()
             .map(|value| next.confirm_multiline_paste = value)
@@ -12398,6 +12414,10 @@ impl Cagents {
                     invalid: &self.settings_invalid,
                     pressed_key: self.palette.pressed_key_filter(),
                     accounts: self.default_account_choices(),
+                    providers: crate::account::Account::REPORTED
+                        .into_iter()
+                        .map(|provider| (provider, self.account_ui.provider_status(provider)))
+                        .collect(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,
                 },
@@ -15840,7 +15860,12 @@ impl Cagents {
             }));
         }
         if previous.show_status_bar != self.settings.show_status_bar {
+            self.account_ui.set_turned_off(&self.settings);
             self.device_ui.menu_open = false;
+            tasks.push(self.accounts_surface_changed());
+        } else if self.account_ui.set_turned_off(&self.settings) {
+            // A provider turned back on is read again at once, rather than
+            // showing what it last reported until the next check.
             tasks.push(self.accounts_surface_changed());
         }
         if previous.notifications != self.settings.notifications {
@@ -16369,6 +16394,7 @@ impl Application for Cagents {
             .set_worktree_overrides(app.settings.sidebar_worktree_overrides.clone());
         app.sidebar_state
             .set_show_worktree_changes_icons(app.settings.show_worktree_changes_icons);
+        app.account_ui.set_turned_off(&app.settings);
         // `view` lays the strip out against the width `Workspace` holds, which
         // starts at zero, and `PanSurface` only publishes its real bounds once
         // it has been mounted and redrawn. A strip projected against zero
@@ -17105,7 +17131,10 @@ impl Application for Cagents {
                     widget::row::with_children(
                         crate::agent::Provider::ALL
                             .into_iter()
-                            .filter(|provider| crate::account::Account::REPORTED.contains(provider))
+                            .filter(|provider| {
+                                crate::account::Account::REPORTED.contains(provider)
+                                    && self.account_ui.uses(*provider)
+                            })
                             .map(|provider| {
                                 let status = self.account_ui.provider_status(provider);
                                 let control = crate::ui_controls::icon_button(
@@ -18140,6 +18169,7 @@ impl Cagents {
                         into.account_usage_display = settings.account_usage_display;
                         into.confirm_terminal_close = settings.confirm_terminal_close;
                         into.confirmations = settings.confirmations.clone();
+                        into.providers = settings.providers.clone();
                         into.sidebar_worktrees_when_shown = settings.sidebar_worktrees_when_shown;
                     };
                     if let Some(saved) = lane.as_mut() {
@@ -18153,8 +18183,16 @@ impl Cagents {
                     for kind in settings::Confirmation::ALL {
                         self.settings_draft.confirmations.insert(kind, settings.asks(kind));
                     }
+                    for provider in crate::agent::Provider::ALL {
+                        self.settings_draft
+                            .providers
+                            .insert(provider, settings.uses_provider(provider));
+                    }
                     self.sidebar_state.set_sidebar_worktrees(settings.sidebar_worktrees);
                     self.sidebar_state.set_worktree_overrides(settings.sidebar_worktree_overrides);
+                    if self.account_ui.set_turned_off(&self.settings) {
+                        return self.accounts_surface_changed();
+                    }
                 }
                 Task::none()
             }

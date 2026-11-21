@@ -273,7 +273,9 @@ class Session:
                                    if self.level in AGY_MODEL_LEVELS.get(self.model, [])
                                    else self.model),
             }
-            result["_meta"] = {"antigravity": {"tier": {"name": "Fixture tier", "id": "fixture"}}}
+            # The tier a paid Antigravity login reports, so its plan badge
+            # reads as it does for a real reader.
+            result["_meta"] = {"antigravity": {"tier": {"name": "Google AI Pro", "id": "g1-pro-tier"}}}
         if session_id:
             result["sessionId"] = self.id
         return result

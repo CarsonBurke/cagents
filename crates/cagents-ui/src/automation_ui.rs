@@ -18,7 +18,7 @@ use cosmic::{
     iced::{Alignment, Length, widget::text_editor},
     widget,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
 const PAGE: usize = 50;
@@ -434,6 +434,32 @@ impl Draft {
         value
     }
 
+    /// Starts a new draft on the provider at `index` rather than the first,
+    /// as though it had opened there: nothing is yet changed.
+    fn start_on(&mut self, index: usize, models: &Models) {
+        self.provider = index;
+        self.preselect_account();
+        self.choose_model(ModelChoice::Default, models);
+        self.baseline = Some(self.values());
+    }
+
+    /// The indices of the providers the editor offers. One turned off stays
+    /// listed for the automation saved on it, so editing it neither silently
+    /// changes it nor loses the way back, and while it is the one chosen.
+    fn offered_providers(&self, turned_off: &BTreeSet<Provider>) -> Vec<usize> {
+        let saved = self
+            .base
+            .and(self.baseline.as_ref())
+            .map(|baseline| baseline.provider);
+        (0..AUTOMATION_PROVIDERS.len())
+            .filter(|index| {
+                *index == self.provider
+                    || Some(*index) == saved
+                    || !turned_off.contains(&AUTOMATION_PROVIDERS[*index])
+            })
+            .collect()
+    }
+
     fn values(&self) -> DraftValues {
         DraftValues {
             name: self.name.clone(),
@@ -758,6 +784,8 @@ pub struct State {
     accounts: Vec<AccountChoice>,
     models: Models,
     archived_accounts: Vec<AccountChoice>,
+    /// Providers turned off in the settings, which the editor does not offer.
+    turned_off: BTreeSet<Provider>,
 }
 
 impl State {
@@ -911,6 +939,12 @@ impl State {
         self.targets = targets;
         self.accounts = accounts;
         self.models = models;
+    }
+
+    /// The providers the settings turn off, which the editor no longer
+    /// offers for an automation that does not already run on one.
+    pub fn set_turned_off(&mut self, turned_off: BTreeSet<Provider>) {
+        self.turned_off = turned_off;
     }
 
     fn clear_error(&mut self) {
@@ -1701,7 +1735,16 @@ impl State {
             Action::Search(value) => self.search = value,
             Action::New => {
                 self.notice = None;
-                self.draft = Some(Draft::new(&self.targets, &self.accounts, None));
+                let mut draft = Draft::new(&self.targets, &self.accounts, None);
+                // A new automation starts on the first provider still in use.
+                if let Some(index) = AUTOMATION_PROVIDERS
+                    .iter()
+                    .position(|provider| !self.turned_off.contains(provider))
+                    && index != draft.provider
+                {
+                    draft.start_on(index, &self.models);
+                }
+                self.draft = Some(draft);
                 self.run = None;
             }
             Action::Select(id) => {
@@ -2390,7 +2433,13 @@ impl State {
                 .width(Length::Fill),
             ));
         } else if let Some(draft) = &self.draft {
-            content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
+            content = content.push(draft.view(
+                busy,
+                &self.models,
+                &self.turned_off,
+                self.error.as_deref(),
+                width,
+            ));
         } else {
             if self.run.is_none() {
                 if !self.all_history {
@@ -2902,9 +2951,11 @@ impl Draft {
         &'a self,
         busy: bool,
         models: &'a Models,
+        turned_off: &BTreeSet<Provider>,
         error: Option<&'a str>,
         width: f32,
     ) -> Element<'a, Action> {
+        let offered = self.offered_providers(turned_off);
         let provider_accounts = self
             .accounts
             .iter()
@@ -2925,9 +2976,12 @@ impl Draft {
             .into(),
             crate::design::caption("Provider").into(),
             crate::ui_controls::field::select(
-                AUTOMATION_PROVIDERS.map(Provider::label).to_vec(),
-                Some(self.provider),
-                Action::Provider,
+                offered
+                    .iter()
+                    .map(|index| AUTOMATION_PROVIDERS[*index].label())
+                    .collect::<Vec<_>>(),
+                offered.iter().position(|index| *index == self.provider),
+                move |choice| Action::Provider(offered[choice]),
             )
             .into(),
             crate::design::caption("Account").into(),
@@ -5917,6 +5971,28 @@ mod tests {
         // A different zone takes the database's spelling.
         draft.timezone = "europe/london".into();
         assert_eq!(draft.schedule().unwrap().timezone, "Europe/London");
+    }
+
+    #[test]
+    fn the_editor_offers_providers_in_use_and_the_one_an_automation_is_saved_on() {
+        let index = |provider| provider_index(provider).unwrap();
+        let mut state = State::default();
+        state.set_turned_off(BTreeSet::from([Provider::Claude, Provider::Muse]));
+        state.update(Action::New);
+        let draft = state.draft.as_ref().unwrap();
+        assert_eq!(draft.provider, index(Provider::Codex), "the first in use");
+        assert!(!draft.dirty());
+        let offered = draft.offered_providers(&state.turned_off);
+        assert!(!offered.contains(&index(Provider::Claude)));
+        assert!(!offered.contains(&index(Provider::Muse)));
+
+        let mut saved = automation();
+        saved.definition.agent.provider = Provider::Muse;
+        let mut draft = Draft::new(&[], &[], Some(&saved));
+        draft.provider = index(Provider::Codex);
+        let offered = draft.offered_providers(&state.turned_off);
+        assert!(offered.contains(&index(Provider::Muse)), "the way back");
+        assert!(!offered.contains(&index(Provider::Claude)));
     }
 
     #[test]

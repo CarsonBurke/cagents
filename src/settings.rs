@@ -1323,6 +1323,15 @@ pub struct AppSettings {
     /// removes only its own key from what another window saved.
     #[serde(default)]
     pub confirmations: BTreeMap<String, bool>,
+    /// Providers turned off, by [`Provider::executable`] key: the app neither
+    /// offers nor checks one that is `false`; an absent provider is on. Read
+    /// through [`AppSettings::uses_provider`]. A table, like
+    /// `confirmations`, so windows that each turn off a different provider
+    /// merge by key, and a newer build's providers survive an older one.
+    ///
+    /// [`Provider::executable`]: crate::agent::Provider::executable
+    #[serde(default)]
+    pub providers: BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
@@ -1330,6 +1339,7 @@ impl Default for AppSettings {
         Self {
             notifications: crate::notifications::Preferences::default(),
             confirmations: BTreeMap::new(),
+            providers: BTreeMap::new(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -2046,6 +2056,24 @@ impl AppSettings {
                 self.confirmations
                     .insert(confirmation.key().to_owned(), false);
             }
+        }
+    }
+
+    /// Whether `provider` is in use: offered for new work, listed with its
+    /// accounts, and checked for usage. Every provider is until turned off.
+    pub fn uses_provider(&self, provider: crate::agent::Provider) -> bool {
+        self.providers
+            .get(provider.executable())
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn set_uses_provider(&mut self, provider: crate::agent::Provider, used: bool) {
+        if used {
+            self.providers.remove(provider.executable());
+        } else {
+            self.providers
+                .insert(provider.executable().to_owned(), false);
         }
     }
 
@@ -6240,6 +6268,43 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn turned_off_providers_merge_per_key_and_keep_unknown_ones() {
+        use crate::agent::Provider;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut base = AppSettings::default();
+        assert!(
+            Provider::ALL
+                .into_iter()
+                .all(|provider| base.uses_provider(provider))
+        );
+        base.providers.insert("future_agent".into(), false);
+        save(&path, &base).unwrap();
+
+        // Two windows each turn off a different provider from the same base.
+        let mut muse = base.clone();
+        muse.set_uses_provider(Provider::Muse, false);
+        save_merged(&path, &base, &muse).unwrap();
+        let mut antigravity = base.clone();
+        antigravity.set_uses_provider(Provider::Antigravity, false);
+        save_merged(&path, &base, &antigravity).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.uses_provider(Provider::Muse));
+        assert!(!saved.uses_provider(Provider::Antigravity));
+        assert!(saved.uses_provider(Provider::Claude));
+        assert_eq!(saved.providers.get("future_agent"), Some(&false));
+
+        // Turning one back on removes only its key.
+        let mut again = muse.clone();
+        again.set_uses_provider(Provider::Muse, true);
+        save_merged(&path, &muse, &again).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(saved.uses_provider(Provider::Muse));
+        assert!(!saved.uses_provider(Provider::Antigravity));
+        assert!(!saved.providers.contains_key(Provider::Muse.executable()));
     }
 
     #[test]
