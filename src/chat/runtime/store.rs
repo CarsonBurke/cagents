@@ -148,6 +148,20 @@ pub(super) struct Window {
     pub has_earlier: bool,
     pub has_later: bool,
 }
+
+/// Where the earlier page that [`Store::fill`] asks for, which no reader
+/// asked for, stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fill {
+    /// None is outstanding.
+    Idle,
+    /// It is on its way, and no reader waits for it.
+    Requested,
+    /// The provider answered without it. Nothing asks again until a page
+    /// arrives, as with a page the reader asks for.
+    Unanswered,
+}
+
 pub(crate) struct Store {
     db: Connection,
     pub(super) diagnostics: super::child_diagnostics::Backing,
@@ -182,8 +196,8 @@ pub(crate) struct Store {
     /// more: an earlier page grows it instead of sliding it. A full window
     /// holding all of it still slides, so that the page shows.
     room: bool,
-    /// An earlier page asked for by [`Store::fill`] is on its way.
-    filling: bool,
+    /// The earlier page [`Store::fill`] asked for, if any.
+    fill: Fill,
     latest_boundary: Option<LatestBoundary>,
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
@@ -440,7 +454,7 @@ impl Store {
                 pending_earlier: None,
                 pending_pivot: None,
                 room: false,
-                filling: false,
+                fill: Fill::Idle,
                 latest_boundary: None,
                 messages: None,
                 dirty: true,
@@ -1045,7 +1059,7 @@ impl Store {
                     self.pending_pivot = None;
                 }
                 self.provider_earlier = has_earlier;
-                self.filling = false;
+                self.fill = Fill::Idle;
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
                 let warnings = self.merge_history(items, earlier)?;
@@ -1127,7 +1141,7 @@ impl Store {
                 self.pending_earlier = None;
                 self.pending_pivot = None;
                 self.room = false;
-                self.filling = false;
+                self.fill = Fill::Idle;
                 self.latest_boundary = None;
                 self.dirty = true;
                 out.push(Event::Reset { reason });
@@ -1141,7 +1155,15 @@ impl Store {
                 self.pending_earlier = None;
                 self.pending_pivot = None;
                 self.latest_boundary = None;
+                self.fill_unanswered();
                 out.push(Event::HistoryLoading(false));
+                return Ok(out);
+            }
+            // Nobody asked for a page `fill` asked for, so its failure is
+            // nobody's error. The reader can still ask, and hear why it fails.
+            Event::HistoryError(error) if self.fill == Fill::Requested => {
+                tracing::debug!(%error, "No earlier history to fill the transcript window");
+                self.fill_unanswered();
                 return Ok(out);
             }
             Event::LatestHistoryStarted => {
@@ -1288,29 +1310,43 @@ impl Store {
     /// transcript does not show. The window is filled to its budget from such
     /// pages before a reader has to ask, one page at a time, and only once the
     /// last window built is current. A conversation whose window nobody reads
-    /// after it changes fetches nothing more; one that is read, by the app or
-    /// by the host's own snapshots, fetches at most the pages that fill its
+    /// after it changes fetches nothing more, and the actor asks only while
+    /// someone has the conversation shown, so the host's own snapshots fetch
+    /// nothing. One that is read fetches at most the pages that fill its
     /// budget.
     ///
     /// A request that fails, or that the provider answers without a page,
-    /// leaves this set: nothing retries it until a page arrives, as one the
-    /// reader asks for does.
+    /// is not retried until a page arrives, as one the reader asks for is
+    /// not ([`Fill::Unanswered`]).
     pub(super) fn fill(&mut self) -> bool {
         if !self.wants_fill() {
             return false;
         }
-        self.filling = true;
+        self.fill = Fill::Requested;
         true
     }
-    /// Whether a page asked for by [`Store::fill`] has not yet arrived.
-    pub(super) fn filling(&self) -> bool {
-        self.filling
+    /// Hands the page [`Store::fill`] asked for, still on its way, to a
+    /// reader who asks for an earlier page: a second request would be refused
+    /// as a second load. Its arrival answers the reader, and its failure is
+    /// the reader's to see. Returns whether there was such a page.
+    pub(super) fn adopt_fill(&mut self) -> bool {
+        let requested = self.fill == Fill::Requested;
+        if requested {
+            self.fill = Fill::Idle;
+        }
+        requested
+    }
+    /// The provider answered the page [`Store::fill`] asked for without it.
+    pub(super) fn fill_unanswered(&mut self) {
+        if self.fill == Fill::Requested {
+            self.fill = Fill::Unanswered;
+        }
     }
     /// Whether [`Store::fill`] would ask for a page now.
     pub(super) fn wants_fill(&self) -> bool {
         self.room
             && self.provider_earlier
-            && !self.filling
+            && self.fill == Fill::Idle
             && !self.dirty
             && self.pending_earlier.is_none()
     }
@@ -2884,6 +2920,7 @@ mod tests {
         store.apply(Event::HistoryLoading(false)).unwrap();
         store.window().unwrap();
         assert!(!store.fill());
+        assert!(!store.adopt_fill(), "nothing is on its way for a reader");
         // A page the reader asked for clears it.
         assert!(!store.earlier().unwrap());
         store
@@ -2894,6 +2931,31 @@ mod tests {
             .unwrap();
         assert_eq!(store.window().unwrap().items.len(), 20);
         assert!(store.fill());
+        // A provider that fails a page later reports it as a history error.
+        // Nobody asked for this one, so nobody is shown it.
+        assert!(
+            store
+                .apply(Event::HistoryError("refused".into()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.fill());
+        // A page that a reader adopts while it is on its way is theirs: its
+        // failure is shown.
+        store
+            .apply(Event::History {
+                items: rows(270, 280),
+                has_earlier: true,
+            })
+            .unwrap();
+        store.window().unwrap();
+        assert!(store.fill());
+        assert!(store.adopt_fill());
+        assert!(!store.adopt_fill());
+        assert_eq!(
+            store.apply(Event::HistoryError("refused".into())).unwrap(),
+            [Event::HistoryError("refused".into())]
+        );
         store
             .apply(Event::Reset {
                 reason: "replaced".into(),

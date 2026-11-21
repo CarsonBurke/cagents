@@ -2954,6 +2954,7 @@ fn a_window_fills_itself_from_short_provider_pages_once_it_is_read() {
         arguments: Vec::new(),
         working_directory: std::env::temp_dir(),
         environment: BTreeMap::new(),
+        followed: false,
     };
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut adapter: Box<dyn Adapter> = Box::new(Pages {
@@ -2963,6 +2964,17 @@ fn a_window_fills_itself_from_short_provider_pages_once_it_is_read() {
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
     let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    // The host reads windows of conversations nobody shows, as release and
+    // retirement do to hold their generation. Those fetch nothing: each
+    // acknowledged command below follows a whole pass of the actor.
+    until(&handle, |snapshot| snapshot.items.len() == PAGE);
+    handle.check_update_readiness().unwrap();
+    let hidden = handle.snapshot(None).unwrap();
+    handle.check_update_readiness().unwrap();
+    handle.check_update_readiness().unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert_eq!(handle.snapshot(None).unwrap().generation, hidden.generation);
+    handle.set_visible(true);
     let window = until(&handle, |snapshot| {
         snapshot.items.len() == super::store::WINDOW_ITEMS
     });
@@ -3053,6 +3065,7 @@ fn a_reader_paging_back_during_a_fill_waits_for_the_page_on_its_way() {
         arguments: Vec::new(),
         working_directory: std::env::temp_dir(),
         environment: BTreeMap::new(),
+        followed: false,
     };
     let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut adapter: Box<dyn Adapter> = Box::new(Later {
@@ -3062,6 +3075,7 @@ fn a_reader_paging_back_during_a_fill_waits_for_the_page_on_its_way() {
     let mut initial = adapter.initialize().unwrap();
     let store = preflight(&spec, &mut initial).unwrap();
     let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    handle.set_visible(true);
     // Reading the one-row window starts a fill.
     until(&handle, |snapshot| snapshot.history_loading);
     handle.command(Command::LoadEarlier).unwrap();

@@ -1297,7 +1297,7 @@ impl LocalHandle {
         snapshot.sampled_at = observed_at();
         drop(state);
         drop(store);
-        if fill {
+        if fill && self.0.visible.load(Ordering::Acquire) {
             self.wake();
         }
         Some(snapshot)
@@ -1436,7 +1436,7 @@ impl LocalHandle {
         };
         drop(state);
         drop(store);
-        if fill {
+        if fill && self.0.visible.load(Ordering::Acquire) {
             self.wake();
         }
         Some(response)
@@ -3183,15 +3183,15 @@ impl Actor {
                         // a second request would be refused as a second load.
                         if command == Command::LoadEarlier
                             && self
-                                .store
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .filling()
-                            && self
                                 .state
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .history_loading
+                            && self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .adopt_fill()
                         {
                             let _ = reply.send(Ok(()));
                             continue;
@@ -3299,8 +3299,13 @@ impl Actor {
     }
     /// Asks the provider for the earlier page the transcript window has room
     /// for, which no reader asked for; see [`Store::fill`].
+    ///
+    /// Only while someone has the conversation shown: the host reads windows
+    /// of conversations nobody shows, and a page arriving there would change
+    /// the generation that its release and retirement checks hold.
     fn fill_history(&mut self) -> Result<(), String> {
         if self.stop.load(Ordering::Acquire)
+            || !self.visible.load(Ordering::Acquire)
             || self.queued > QUEUE_BACKPRESSURE
             || self
                 .state
@@ -3317,6 +3322,10 @@ impl Actor {
             // The reader can still ask for it, and hear why it failed.
             Err(error) => {
                 tracing::debug!(%error, "No earlier history to fill the transcript window");
+                self.store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .fill_unanswered();
                 Ok(())
             }
         }
