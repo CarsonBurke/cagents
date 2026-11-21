@@ -7,6 +7,8 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+pub(crate) mod client_session;
+
 use crate::{
     instance,
     model::{

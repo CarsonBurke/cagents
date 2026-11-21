@@ -79,7 +79,9 @@ use crate::{
             ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolErrorCode,
             SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse, ShutdownCapability,
             ShutdownOperation, ShutdownOutcome, ShutdownPreflight, TerminalDescriptor,
-            TerminalSnapshot, TerminalVisibility, daemon_socket_path, read_frame, write_frame,
+            TerminalSnapshot, TerminalVisibility,
+            client_session::{HandshakeError, validate_handshake},
+            daemon_socket_path, read_frame, write_frame,
         },
     },
     workspace_model::{
@@ -2880,40 +2882,27 @@ impl HandshakeClient {
         })
         .map_err(|error| reply_error(error, Some(timeout)))?
         .ok_or(ControlError::ConnectionClosed)?;
-        if envelope.version != self.protocol {
-            return Err(ControlError::UnsupportedVersion {
-                actual: envelope.version,
-            });
-        }
-        if envelope.request_id != Some(request_id) {
-            return Err(ControlError::RequestIdMismatch {
-                expected: request_id,
-                actual: envelope.request_id,
-            });
-        }
-        if !envelope.proof.is_complete() {
-            return Err(ControlError::IncompleteProof);
-        }
-        match envelope.message {
-            ServerMessage::Response {
-                response: ServerResponse::Connected { proof, .. },
-            } if !proof.is_complete() => Err(ControlError::IncompleteProof),
-            ServerMessage::Response {
-                response: ServerResponse::Connected { proof, .. },
-            } if proof != envelope.proof => Err(ControlError::ProofMismatch),
-            ServerMessage::Response {
-                response: ServerResponse::Connected { proof, .. },
-            } => Ok(proof),
-            ServerMessage::Error(error) => Err(ControlError::Remote {
-                code: error.code,
-                message: error.message,
-                retryable: error.retryable,
-            }),
-            message => Err(ControlError::UnexpectedMessage {
-                expected: "the connect response",
-                actual: message_name(&message),
-            }),
-        }
+        validate_handshake(&envelope, self.protocol, request_id)
+            .cloned()
+            .map_err(|error| match error {
+                HandshakeError::UnsupportedVersion { actual } => {
+                    ControlError::UnsupportedVersion { actual }
+                }
+                HandshakeError::RequestIdMismatch { expected, actual } => {
+                    ControlError::RequestIdMismatch { expected, actual }
+                }
+                HandshakeError::IncompleteProof => ControlError::IncompleteProof,
+                HandshakeError::ProofMismatch => ControlError::ProofMismatch,
+                HandshakeError::Remote(error) => ControlError::Remote {
+                    code: error.code,
+                    message: error.message.clone(),
+                    retryable: error.retryable,
+                },
+                HandshakeError::UnexpectedMessage(message) => ControlError::UnexpectedMessage {
+                    expected: "the connect response",
+                    actual: message_name(message),
+                },
+            })
     }
 }
 /// How long a reply was awaited, as a person reads it: whole seconds, or a
@@ -9050,6 +9039,94 @@ mod tests {
                     | (2, ControlError::ProofMismatch)
                     | (3, ControlError::UnexpectedMessage { .. })
             ));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn handshake_rejects_missing_and_incorrect_request_ids() {
+        for actual in [None, Some(0), Some(2)] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let peer_proof = proof("session", "boot", "incarnation");
+                let mut response = connected_envelope(1, peer_proof.clone(), peer_proof);
+                response.request_id = actual;
+                write_frame(&mut server_stream, &response).unwrap();
+            });
+            assert!(matches!(
+                ControlClient::from_stream(client_stream),
+                Err(ControlError::RequestIdMismatch { expected: 1, actual: received })
+                    if received == actual
+            ));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn handshake_rejects_each_incomplete_body_proof_field() {
+        for incomplete in [
+            proof("", "boot", "incarnation"),
+            proof("session", "", "incarnation"),
+            proof("session", "boot", ""),
+        ] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, proof("session", "boot", "incarnation"), incomplete),
+                )
+                .unwrap();
+            });
+            assert!(matches!(
+                ControlClient::from_stream(client_stream),
+                Err(ControlError::IncompleteProof)
+            ));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn handshake_preserves_remote_and_unexpected_response_errors() {
+        for remote_error in [false, true] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let server = thread::spawn(move || {
+                let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let peer_proof = proof("session", "boot", "incarnation");
+                let mut response = connected_envelope(1, peer_proof.clone(), peer_proof);
+                response.message = if remote_error {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "refused",
+                        true,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
+                };
+                write_frame(&mut server_stream, &response).unwrap();
+            });
+            let error = ControlClient::from_stream(client_stream).unwrap_err();
+            if remote_error {
+                assert!(matches!(
+                    error,
+                    ControlError::Remote {
+                        code: ProtocolErrorCode::InvalidRequest,
+                        ref message,
+                        retryable: true,
+                    } if message == "refused"
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    ControlError::UnexpectedMessage {
+                        expected: "the connect response",
+                        actual: "response",
+                    }
+                ));
+            }
             server.join().unwrap();
         }
     }
