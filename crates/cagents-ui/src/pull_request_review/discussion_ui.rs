@@ -995,7 +995,7 @@ impl State {
     /// one that carries their count, like a forge's "Finish your review".
     pub fn review_control(&self, modal_open: bool) -> Element<'_, super::Action> {
         let pending = self.pending_count();
-        let available = !modal_open && self.authority().is_some();
+        let available = !modal_open && self.has_discussion_authority();
         let mut label: Vec<Element<'_, Action>> = vec![
             design::body(if pending == 0 {
                 "Review"
@@ -1021,7 +1021,7 @@ impl State {
         .padding([3, 10])
         .selected(self.discussion.review_open)
         .on_press_maybe(available.then_some(Action::ToggleReview));
-        let tip = if self.authority().is_none() {
+        let tip = if !self.has_discussion_authority() {
             "Reviewing needs this pull request loaded from GitHub"
         } else if pending == 0 {
             "Approve, request changes, or comment on the pull request"
@@ -1348,15 +1348,17 @@ impl State {
         // While this file's draft is open the control stays live and leads
         // back to it; any other open draft must be finished first.
         let enabled = !modal_open
-            && self.authority().is_some()
+            && self.has_discussion_authority()
             && (drafting_here
                 || (self.can_mutate_discussion() && self.discussion.composer.is_none()));
         let control: Element<'_, Action> = crate::ui_controls::icon_button(
             Icon::Comment,
             if drafting_here {
                 "Show the comment on this file"
-            } else {
+            } else if self.has_discussion_authority() {
                 "Comment on this file"
+            } else {
+                "Comment on this file · Read only until GitHub refreshes"
             },
         )
         .selected(drafting_here)
@@ -2104,6 +2106,17 @@ pub(crate) mod tests {
             assert!(!state.discussion.saving_composer);
             assert_eq!(state.cache_dirty, dirty, "no draft rewrite is scheduled");
         }
+
+        // Once GitHub verifies the review, the kept draft can be posted.
+        crate::pull_request_review::tests::finish_load(
+            &mut state,
+            loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]),
+        );
+        assert!(state.can_mutate_discussion());
+        let action = state.review_action(Action::SaveNow);
+        drop(state.update(action));
+        assert!(state.discussion.busy, "the restored draft is posted");
+        assert!(state.discussion.saving_composer);
     }
 
     mod reanchor_receipt_tests {
