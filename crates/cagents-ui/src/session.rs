@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -15,8 +15,8 @@ use crate::{
         WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::{
-        RestoreWarning, SnapshotBase, StateStore, StoreError, StoredGenerations,
-        TranscriptPruneReport, TranscriptRetention,
+        RestoreWarning, SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptListing,
+        TranscriptOwners, TranscriptPruneReport, TranscriptRetention,
     },
 };
 // Exported at the shared library's root so its expansion names that crate.
@@ -376,6 +376,8 @@ pub enum SessionError {
     Store(#[from] StoreError),
     #[error("session persistence worker could not start: {0}")]
     Worker(std::io::Error),
+    #[error("the daemon could not name the terminals it holds, so every transcript was kept: {0}")]
+    ResidentTerminalsUnknown(String),
 }
 
 /// A chat card whose shared view holds conversation `canonical` where this
@@ -613,6 +615,129 @@ pub struct SessionRuntime {
     /// these.
     restore_warnings: Vec<RestoreWarning>,
     operation_store: Arc<StateStore>,
+}
+
+/// Reclaims terminal transcript files nothing owns any more.
+///
+/// Session lifecycle owns this because only the session databases know which
+/// terminal ids a window still shows, and only the daemon knows which it is
+/// still writing. It does a single directory scan, one daemon request and one
+/// read-only query per other window, and no database writes.
+///
+/// Every window writes into one transcript directory, and a window records a
+/// new terminal only after the daemon has started it and its writer has
+/// created the file. So the directory is listed first and its owners are asked
+/// afterwards: the daemon names every terminal it holds or is starting, and the
+/// transcript each writes, which covers a terminal no window has saved yet, and
+/// the window databases name the rest. Owners claim files by name, because a
+/// terminal returned from a conversation appends to its predecessor's. If the daemon cannot answer, nothing is removed; if a window
+/// database cannot be read, no transcript is removed as orphaned.
+pub struct TranscriptPruner {
+    store: Arc<StateStore>,
+    database_path: PathBuf,
+}
+
+impl TranscriptPruner {
+    pub fn run(self) -> Result<TranscriptPruneReport, SessionError> {
+        let directories = instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
+        let report = self.prune(
+            &directories.data_dir().join("transcripts"),
+            resident_transcript_names,
+            instance::window_database_paths,
+        )?;
+        if report.removed() > 0 || report.refused > 0 {
+            tracing::info!(
+                orphaned = report.removed_orphaned,
+                oversized = report.removed_oversized,
+                over_budget = report.removed_for_budget,
+                refused = report.refused,
+                retained = report.retained,
+                retained_bytes = report.retained_bytes,
+                "pruned terminal transcripts"
+            );
+        }
+        Ok(report)
+    }
+
+    fn prune<E: std::fmt::Display>(
+        &self,
+        transcripts: &Path,
+        resident: impl FnOnce() -> Result<HashSet<String>, String>,
+        window_databases: impl FnOnce() -> Result<Vec<PathBuf>, E>,
+    ) -> Result<TranscriptPruneReport, SessionError> {
+        let listing = TranscriptListing::scan(transcripts)?;
+        if listing.is_empty() {
+            return Ok(TranscriptPruneReport {
+                refused: listing.refused(),
+                ..TranscriptPruneReport::default()
+            });
+        }
+        let resident = resident().map_err(SessionError::ResidentTerminalsUnknown)?;
+        let mut owners = TranscriptOwners {
+            resident,
+            saved: HashSet::new(),
+            every_window_read: true,
+        };
+        match window_databases() {
+            Ok(paths) => {
+                for path in paths {
+                    if path == self.database_path {
+                        continue;
+                    }
+                    match crate::persistence::read_claimed_transcript_names(&path) {
+                        Ok(ids) => owners.saved.extend(ids),
+                        Err(error) => {
+                            tracing::warn!(
+                                database = %path.display(),
+                                %error,
+                                "could not read another window's terminals; \
+                                 keeping every unclaimed transcript"
+                            );
+                            owners.every_window_read = false;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not enumerate window databases; keeping every unclaimed transcript"
+                );
+                owners.every_window_read = false;
+            }
+        }
+        Ok(self
+            .store
+            .prune_transcripts(listing, owners, TranscriptRetention::default())?)
+    }
+}
+
+/// The transcript names the local daemon's terminals and conversations hold or
+/// are starting: their ids, and the names of the transcripts they write. No
+/// daemon, an older one, or a remote device's (which cannot speak for writers
+/// on this machine) leaves them unknown.
+fn resident_transcript_names() -> Result<HashSet<String>, String> {
+    if crate::device::is_remote() {
+        return Err("this window's terminals run on a remote device".into());
+    }
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client =
+        crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    let resident = client
+        .resident_terminals()
+        .map_err(|error| error.to_string())?;
+    Ok(resident
+        .terminals
+        .iter()
+        .map(ToString::to_string)
+        .chain(
+            resident
+                .transcripts
+                .iter()
+                .filter_map(|path| crate::persistence::transcript_name(path))
+                .map(str::to_owned),
+        )
+        .collect())
 }
 
 impl std::fmt::Debug for SessionRuntime {
@@ -1122,68 +1247,13 @@ impl SessionRuntime {
         &self.restore_warnings
     }
 
-    /// Reclaims terminal transcript files nothing owns any more.
-    ///
-    /// Session lifecycle owns this because only the session databases know
-    /// which terminal ids are still live. Call it once, after opening the
-    /// session; it does a single directory scan and no database writes.
-    ///
-    /// Transcripts are shared by every window while each window keeps its own
-    /// database, so the live set is the union over all of them. If any window
-    /// database cannot be read, unclaimed transcripts are left alone rather
-    /// than risk deleting a transcript another window is still writing.
-    pub fn prune_transcripts(&self) -> Result<TranscriptPruneReport, SessionError> {
-        let directories = instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
-        let transcripts = directories.data_dir().join("transcripts");
-        let mut also_live = std::collections::HashSet::new();
-        let mut complete = true;
-        match instance::window_database_paths() {
-            Ok(paths) => {
-                for path in paths {
-                    if path == self.database_path {
-                        continue;
-                    }
-                    match crate::persistence::read_live_terminal_ids(&path) {
-                        Ok(ids) => also_live.extend(ids),
-                        Err(error) => {
-                            tracing::warn!(
-                                database = %path.display(),
-                                %error,
-                                "could not read another window's terminals; \
-                                 keeping every unclaimed transcript"
-                            );
-                            complete = false;
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "could not enumerate window databases; keeping every unclaimed transcript"
-                );
-                complete = false;
-            }
+    /// What reclaims the terminal transcripts nothing owns any more, to run
+    /// off the UI thread once the session is open.
+    pub fn transcript_pruner(&self) -> TranscriptPruner {
+        TranscriptPruner {
+            store: Arc::clone(&self.operation_store),
+            database_path: self.database_path.clone(),
         }
-        let retention = TranscriptRetention {
-            remove_orphans: complete,
-            ..TranscriptRetention::default()
-        };
-        let report = self
-            .operation_store
-            .prune_transcripts(&transcripts, also_live, retention)?;
-        if report.removed() > 0 || report.refused > 0 {
-            tracing::info!(
-                orphaned = report.removed_orphaned,
-                oversized = report.removed_oversized,
-                over_budget = report.removed_for_budget,
-                refused = report.refused,
-                retained = report.retained,
-                retained_bytes = report.retained_bytes,
-                "pruned terminal transcripts"
-            );
-        }
-        Ok(report)
     }
 
     /// Shares the existing connection, never opens a second startup-reconciling store.

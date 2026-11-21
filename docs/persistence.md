@@ -420,9 +420,16 @@ check, so a stale window cannot overwrite a newer draft from another window.
 Collection runs in the daemon on a background thread every 10 minutes and
 once at start, each pass bounded in rows so a large backlog drains over a few
 passes instead of one long transaction. Transcript pruning
-(`SessionRuntime::prune_transcripts`) keeps the transcripts of every resource
-in `panes` and `closed_panes`, and removes nothing when the daemon cannot be
-asked, so a transcript lives as long as the closed pane that names it.
+(`TranscriptPruner`, run beside each window's startup) keeps the transcripts of
+every resource in `panes` and `closed_panes`, so a transcript lives as long as
+the closed pane that names it. It lists the transcript directory before asking
+who owns each file, and never removes one that a terminal or conversation the
+daemon holds or is starting writes or carries (`ListResidentTerminals`): the
+daemon reserves a terminal, with its transcript path, before its writer creates
+the file, while the window that started it saves it later. Owners claim files by
+name, not only by terminal id, because a terminal returned from a conversation
+appends to its predecessor's transcript. It removes nothing when the daemon
+cannot be asked.
 
 ## Provider history index
 
