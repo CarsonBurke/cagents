@@ -2,9 +2,9 @@
 # Offline GitHub CLI for native-evidence fixtures, installed as the fixture's
 # `gh`. Without the switch it refuses everything, so no forge state appears.
 # With $FIXTURE/home/.config/fixture-forge present it answers as a gh signed in
-# to github.com whose repositories have no pull requests, using the output
-# shapes the app's parsers in src/github.rs expect from the real CLI. Nothing
-# here reaches the network.
+# to github.com whose repositories have only the seeded pull requests below,
+# using the output shapes the app's parsers in src/github.rs expect from the
+# real CLI. Nothing here reaches the network.
 #
 # Optional, with the switch on:
 #   home/.config/fixture-forge-prs.json  An array of pull requests in the shape
@@ -12,7 +12,8 @@
 #       state, headRefName, baseRefName, updatedAt, headRepositoryOwner and
 #       headRepository. Each repository lists
 #       those whose url is under https://github.com/OWNER/NAME/pull/, in file
-#       order.
+#       order. An optional fixtureReviewRequests counts the times the viewer
+#       was asked to review it.
 #   home/.config/fixture-forge-delay  Seconds every answer waits first.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
 #       modification time, whenever the app resolves a repository. Any PNG,
@@ -413,13 +414,61 @@ api() {
                 ;;
             *'pullRequests(first:'*)
                 # The pull request browser, and the review-request poll, which
-                # also asks who is reading: no open pull requests to list.
+                # also asks who is reading: the seeded open pull requests, in
+                # file order, fifty a page from the offset in the cursor. A
+                # seed's fixtureReviewRequests, how many times the viewer was
+                # asked to review it, makes it a current request for the poll.
+                check_seed
                 viewer=
                 case $query in
                     *'viewer{id login}'*) viewer='"viewer":{"id":"'$viewer_id'","login":"'$login'"},' ;;
                 esac
+                poll=false
+                case $query in 'query CagentsReviewRequests('*) poll=true ;; esac
                 ! "$include" || headers '200 OK' graphql
-                printf '{"data":{%s"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}\n' "$viewer"
+                page=$(seeded "$owner/$name" | jq -c --argjson from "${cursor:-0}" \
+                    --argjson poll "$poll" --arg reviewer "$viewer_id" "$checks_jq"'
+                    map(select(.state == "OPEN")) as $open
+                    | {nodes: ($open[$from:$from + 50] | map(
+                        if $poll then
+                            {number, title, url, viewerLatestReviewRequest:
+                                (if (.fixtureReviewRequests // 0) > 0 then
+                                    {id: ("RR_fixture" + (.number | tostring)), asCodeOwner: false,
+                                     requestedReviewer: {__typename: "User", id: $reviewer}}
+                                 else null end)}
+                        else
+                            del(.fixtureReviewRequests)
+                            | .headRepository.owner = .headRepositoryOwner
+                            | .commits = {nodes: [{commit: {statusCheckRollup:
+                                (if (.statusCheckRollup // [] | length) == 0 then null
+                                 else {state: (.statusCheckRollup | aggregate)} end)}}]}
+                            | del(.statusCheckRollup)
+                        end)),
+                       pageInfo: {hasNextPage: (($open | length) > $from + 50),
+                           endCursor: (if ($open | length) > $from + 50
+                               then ($from + 50 | tostring) else null end)}}')
+                printf '{"data":{%s"repository":{"pullRequests":%s}}}\n' "$viewer" "$page"
+                ;;
+            'query CagentsReviewRequestHistory('*)
+                # A seed's fixtureReviewRequests requested-reviewer events, all
+                # naming the viewer: two or more make it re-requested.
+                check_seed
+                found=$(seeded "$owner/$name" | jq -c --argjson number "${number:-0}" \
+                    'map(select(.number == $number)) | .[0] // empty')
+                [ -n "$found" ] || pr_not_found "${number:-0}"
+                ! "$include" || headers '200 OK' graphql
+                printf '%s\n' "$found" | jq -c --arg reviewer "$viewer_id" --arg login "$login" '
+                    (.fixtureReviewRequests // 0) as $count
+                    | {data: {rateLimit: {cost: 1}, viewer: {id: $reviewer, login: $login},
+                        repository: {pullRequest: {
+                            viewerLatestReviewRequest: (if $count > 0 then
+                                {id: ("RR_fixture" + (.number | tostring)), asCodeOwner: false,
+                                 requestedReviewer: {__typename: "User", id: $reviewer}} else null end),
+                            timelineItems: {nodes: [range($count) as $i |
+                                {id: ("RRE_fixture" + (.number | tostring) + "_" + ($i | tostring)),
+                                 createdAt: (1793491200 + $i * 86400 | todate),
+                                 requestedReviewer: {__typename: "User", id: $reviewer}}],
+                                pageInfo: {hasPreviousPage: false, startCursor: null}}}}}}'
                 ;;
             *'search(type:ISSUE'*)
                 ! "$include" || headers '200 OK' graphql

@@ -251,7 +251,7 @@ fixture's `config/`, so no app setting can switch it on. The fixture creates
 the directory; the forge reads the switch on every call, so a step can turn it
 on in a running session. Then it
 answers as a gh signed in to github.com as `fixture`, whose repositories have
-no pull requests and no review requests:
+no pull requests and no review requests except those seeded below:
 
 | The app runs | It answers |
 | --- | --- |
@@ -260,7 +260,7 @@ no pull requests and no review requests:
 | `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below; `--author @me` means `fixture` |
 | `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
 | `gh pr checks N` | gh's `no checks reported` for a seeded pull request; a seed's checks reach the app through `statusCheckRollup` in `gh pr view` and the queries below instead |
-| `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
+| `gh api graphql` | the seeded open pull requests for the review-request poll and the pull request browser, and their review-request history; empty pages for the browser's search; not found for a pull request's own queries |
 | `gh api repos/OWNER/NAME/issues?creator=LOGIN&...` | the creator's most recently updated seeded pull request, with an `Etag` that changes when that row does, and gh's `HTTP 304` failure when `If-None-Match` still matches it |
 | `gh api repos/OWNER/NAME/releases` | `[]`; any other REST endpoint is `404 Not Found` |
 
@@ -345,11 +345,19 @@ icon, and the branch's tooltip names the pull request, its state and its
 checks. Entries that match no worktree still answer `gh pr list`, but nothing
 in the sidebar shows them.
 
-Seeds cannot support evidence of the review flow. The pull request browser
-lists none of them, and opening a seeded pull request's review asks for its
-conversation, which the forge answers as not found. Like any failed GitHub
-read, that pauses the app's GitHub refreshes for a while. That failure is
-exactly what [an offline cached review](#an-offline-cached-review) needs.
+The pull request browser lists the open seeds in file order, fifty a page, so
+53 open seeds give it a second page. An entry may also set
+`fixtureReviewRequests`, the number of times the reader was asked to review it
+(0 if absent). One or more makes it a review request for the reader, labeled
+**Needs your review**; two or more make it **Review re-requested**. A request
+beyond the browser's loaded pages appears under those filters as its own
+request row.
+
+Seeds still cannot support evidence of the review itself. Opening a seeded
+pull request's review asks for its conversation, which the forge answers as
+not found. Like any failed GitHub read, that pauses the app's GitHub refreshes
+for a while. That failure is exactly what
+[an offline cached review](#an-offline-cached-review) needs.
 
 A steps file for a sidebar with an avatar and the fixture worktree's pull
 request. The avatar step needs ImageMagick's `magick` on the build host. It

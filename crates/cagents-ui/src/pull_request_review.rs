@@ -2866,6 +2866,32 @@ impl State {
         matches
     }
 
+    fn request_only_rows(&self) -> Vec<&crate::github::review_requests::scan::Requested> {
+        let query = self.browser_query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        if matches!(
+            self.browser_filter,
+            BrowserFilter::NeedsReview | BrowserFilter::ReRequested
+        ) {
+            for request in self.requests.requested().values() {
+                let entry = &request.entry;
+                let listed = self.listed_pull_request(entry.number).is_some();
+                if listed
+                    || (self.browser_filter == BrowserFilter::ReRequested
+                        && request.history
+                            != crate::github::review_requests::scan::History::ReRequested)
+                    || !(query.is_empty()
+                        || entry.title.to_lowercase().contains(&query)
+                        || entry.number.to_string() == query.trim_start_matches('#'))
+                {
+                    continue;
+                }
+                rows.push(request);
+            }
+        }
+        rows
+    }
+
     pub fn browser<'a>(&'a self, modal_open: bool) -> Element<'a, Action> {
         if self.source.is_none() {
             return widget::container(
@@ -2945,46 +2971,32 @@ impl State {
         };
         // Request discovery is independent of the visible list's first page.
         // Offer exact numbers discovered later without inventing missing PR DTOs.
-        if matches!(
-            self.browser_filter,
-            BrowserFilter::NeedsReview | BrowserFilter::ReRequested
-        ) {
-            for request in self.requests.requested().values() {
-                let entry = &request.entry;
-                let listed = self.listed_pull_request(entry.number).is_some();
-                if listed
-                    || (self.browser_filter == BrowserFilter::ReRequested
-                        && request.history
-                            != crate::github::review_requests::scan::History::ReRequested)
-                    || !(query.is_empty()
-                        || entry.title.to_lowercase().contains(&query)
-                        || entry.number.to_string() == query.trim_start_matches('#'))
-                {
-                    continue;
-                }
-                has_matching_rows = true;
-                rows.push(crate::ui_controls::owned(
-                    entry.number,
-                    button::custom(widget::column::with_children(vec![
-                        design::body(entry.title.as_str()).into(),
-                        design::caption(format!(
-                            "#{} · {}",
-                            entry.number,
-                            self.requests
-                                .label(entry.number)
-                                .unwrap_or("Needs your review")
-                        ))
-                        .into(),
-                    ]))
-                    .class(sidebar_button_style(false))
-                    .width(Length::Fill)
-                    .padding([space::XS, space::S])
-                    .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
-                        generation: self.browser_generation,
-                        action: Box::new(Action::OpenNumber(entry.number)),
-                    })),
-                ));
-            }
+        let request_only_rows = self.request_only_rows();
+        browser_count += request_only_rows.len();
+        for request in request_only_rows {
+            let entry = &request.entry;
+            has_matching_rows = true;
+            rows.push(crate::ui_controls::owned(
+                entry.number,
+                button::custom(widget::column::with_children(vec![
+                    design::body(entry.title.as_str()).into(),
+                    design::caption(format!(
+                        "#{} · {}",
+                        entry.number,
+                        self.requests
+                            .label(entry.number)
+                            .unwrap_or("Needs your review")
+                    ))
+                    .into(),
+                ]))
+                .class(sidebar_button_style(false))
+                .width(Length::Fill)
+                .padding([space::XS, space::S])
+                .on_press_maybe((!modal_open).then_some(Action::BrowserFenced {
+                    generation: self.browser_generation,
+                    action: Box::new(Action::OpenNumber(entry.number)),
+                })),
+            ));
         }
         if (matches!(self.list, ListState::Ready(_)) || search.is_some()) && !has_matching_rows {
             let message = if !query.is_empty() && search.is_none() {
@@ -5091,6 +5103,128 @@ pub(crate) mod tests {
         }));
         let visible: Vec<_> = state.browser_matches().iter().map(|pr| pr.number).collect();
         assert_eq!(visible, vec![2]);
+    }
+
+    /// The text the pull request browser shows, as rendered.
+    fn browser_texts(state: &State) -> Vec<String> {
+        use cosmic::iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element = state.browser(false);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 900.0)),
+        );
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        texts.0
+    }
+
+    #[test]
+    fn request_only_rows_count_toward_the_matching_caption() {
+        use crate::github::review_requests::{
+            Current, Entry,
+            scan::{History, Requested},
+        };
+
+        let (mut state, _) = state();
+        let key = target(1).repository;
+        state.source = Some(ReviewSource {
+            repository: key.clone(),
+            worktree: "/repo".into(),
+        });
+        state.list = ListState::Ready(vec![Arc::new(pull_request(1))]);
+        let requested = [(3, History::ReRequested), (2, History::First)]
+            .into_iter()
+            .map(|(number, history)| {
+                let current = Current {
+                    id: format!("request-{number}"),
+                    as_code_owner: false,
+                    requested_reviewer: None,
+                };
+                (
+                    number,
+                    Requested {
+                        entry: Entry {
+                            number,
+                            title: format!("Requested change {number}"),
+                            url: format!("https://github.com/o/r/pull/{number}")
+                                .parse()
+                                .unwrap(),
+                            viewer_latest_review_request: Some(current.clone()),
+                        },
+                        current,
+                        history,
+                    },
+                )
+            })
+            .collect();
+        state.sync_review_requests([(
+            &key,
+            &Arc::new(request_ui::Snapshot {
+                viewer: None,
+                requested,
+                error: None,
+            }),
+        )]);
+
+        state.browser_filter = BrowserFilter::NeedsReview;
+        assert!(state.browser_matches().is_empty());
+        assert_eq!(state.request_only_rows().len(), 2);
+        // The caption the reader sees counts the two request rows it shows.
+        assert!(
+            browser_texts(&state).contains(&"2 matching · 1 loaded".to_owned()),
+            "{:?}",
+            browser_texts(&state)
+        );
+        assert_eq!(
+            state
+                .request_only_rows()
+                .iter()
+                .map(|request| request.entry.number)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        state.browser_filter = BrowserFilter::ReRequested;
+        assert_eq!(state.request_only_rows().len(), 1);
+        assert_eq!(state.request_only_rows()[0].entry.number, 3);
+        state.browser_query = "no matching request".into();
+        assert_eq!(state.request_only_rows().len(), 0);
+
+        state.browser_filter = BrowserFilter::NeedsReview;
+        assert_eq!(state.request_only_rows().len(), 0);
+        state.browser_query = "  REQUESTED CHANGE 2  ".into();
+        assert_eq!(state.request_only_rows().len(), 1);
+        assert_eq!(state.request_only_rows()[0].entry.number, 2);
+        state.browser_query = " #3 ".into();
+        assert_eq!(state.request_only_rows().len(), 1);
+        assert_eq!(state.request_only_rows()[0].entry.number, 3);
+
+        state.browser_query.clear();
+        state.list = ListState::Ready(vec![Arc::new(pull_request(1)), Arc::new(pull_request(2))]);
+        assert_eq!(state.request_only_rows().len(), 1);
+        assert_eq!(state.request_only_rows()[0].entry.number, 3);
+        assert_eq!(state.browser_matches().len(), 1);
+
+        state.browser_filter = BrowserFilter::All;
+        assert!(state.request_only_rows().is_empty());
     }
 
     #[test]

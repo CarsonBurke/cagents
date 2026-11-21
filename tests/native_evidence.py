@@ -2293,6 +2293,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([
             {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
              "author": {"login": "fixture"}, "url": "https://github.com/octo-org/app/pull/7",
+             "fixtureReviewRequests": 2,
              "statusCheckRollup": [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
                                     "conclusion": "SUCCESS", "workflowName": "CI"}]},
             {**pull, "number": 8, "title": "Merged", "state": "MERGED", "headRefName": "done",
@@ -2327,6 +2328,31 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         self.assertEqual(opened["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"],
                          [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
                            "conclusion": "SUCCESS", "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}}])
+        # The pull request browser lists the open seeds with their check state;
+        # the review-request poll sees a seed's request, and its history the
+        # two requests that make it re-requested.
+        page_query = ("query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name)"
+                      "{pullRequests(first:50,after:$cursor,states:OPEN){nodes{number} "
+                      "pageInfo{hasNextPage endCursor}}}}")
+        browser = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query={page_query}' "
+            "-f owner=Octo-Org -f name=app").stdout)["data"]["repository"]["pullRequests"]
+        (listed,) = browser["nodes"]
+        self.assertEqual((listed["number"], listed["headRepository"]["owner"], "fixtureReviewRequests" in listed),
+                         (7, {"login": "octo-org"}, False))
+        self.assertEqual(listed["commits"]["nodes"][0]["commit"]["statusCheckRollup"], {"state": "SUCCESS"})
+        self.assertEqual(browser["pageInfo"], {"hasNextPage": False, "endCursor": None})
+        poll = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query=query CagentsReviewRequests{page_query[5:]}' "
+            "-f owner=Octo-Org -f name=app").stdout)["data"]["repository"]["pullRequests"]["nodes"]
+        self.assertEqual([(node["number"], node["viewerLatestReviewRequest"]["requestedReviewer"]["__typename"])
+                          for node in poll], [(7, "User")])
+        history = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query CagentsReviewRequestHistory"
+            "($owner:String!,$name:String!,$number:Int!){viewer{id}}' "
+            "-f owner=Octo-Org -f name=app -F number=7").stdout)["data"]["repository"]["pullRequest"]
+        self.assertEqual([event["createdAt"] for event in history["timelineItems"]["nodes"]],
+                         ["2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"])
         # Its probe: the viewer's latest changes, free to ask again while unchanged,
         # dated by the forge's clock as GitHub dates its answers.
         probe = "gh api --include --hostname github.com --method GET " \
@@ -2352,6 +2378,20 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         checks = self.fixture_shell(f"gh pr checks 7 {selector} --json name", check=False)
         self.assertEqual((checks.returncode, checks.stderr), (1, "no checks reported on the 'feature' branch\n"))
         self.assertEqual(self.fixture_shell(f"gh pr view 9 {selector} --json number", check=False).returncode, 1)
+        # Fifty a page: a 51st open seed is on the second, behind the first's cursor.
+        (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([
+            {**pull, "number": number, "title": f"Seed {number}", "state": "OPEN", "headRefName": "feature",
+             "url": f"https://github.com/octo-org/app/pull/{number}"} for number in range(1, 52)]))
+        first_page = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query={page_query}' "
+            "-f owner=octo-org -f name=app").stdout)["data"]["repository"]["pullRequests"]
+        self.assertEqual((len(first_page["nodes"]), first_page["pageInfo"]),
+                         (50, {"hasNextPage": True, "endCursor": "50"}))
+        second_page = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query={page_query}' "
+            "-f owner=octo-org -f name=app -f cursor=50").stdout)["data"]["repository"]["pullRequests"]
+        self.assertEqual(([node["number"] for node in second_page["nodes"]], second_page["pageInfo"]),
+                         ([51], {"hasNextPage": False, "endCursor": None}))
         # A malformed seed fails in gh, naming the file, rather than as bad JSON in the app.
         (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text('{"number": 7}')
         malformed = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
