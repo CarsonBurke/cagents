@@ -12573,8 +12573,8 @@ fn panel_row<'a>(
 /// The confirmation the application mounts before any discard runs.
 ///
 /// It lives here so the copy, the counted paths, and the confirmed request all
-/// come from the surface that raised the intent; `app.rs` only decides where
-/// to put it.
+/// come from the surface that raised the intent; the application mounting it
+/// decides only where to put it and which `surface_id` identifies it.
 pub fn discard_confirmation_dialog(
     pending: &DiscardConfirmation,
     surface_id: Id,

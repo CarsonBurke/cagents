@@ -249,7 +249,8 @@ impl Question {
     }
 }
 
-/// A confirmation whose app-owned question supplies its surface identity and policy.
+/// A [`crate::dialog_ui::confirmation_surface`] asking `question`, which
+/// identifies it; its opener focuses where [`Question::focus`] says.
 pub(crate) fn confirmation_surface<'a, M: 'a>(
     question: Question,
     content: impl Into<Element<'a, M>>,
@@ -259,6 +260,8 @@ pub(crate) fn confirmation_surface<'a, M: 'a>(
     tall_confirmation_surface(question, content, actions, max_width, MAX_HEIGHT)
 }
 
+/// A [`confirmation_surface`] that grows to `max_height`, rather than
+/// [`MAX_HEIGHT`], before its body scrolls.
 pub(crate) fn tall_confirmation_surface<'a, M: 'a>(
     question: Question,
     content: impl Into<Element<'a, M>>,
@@ -276,6 +279,9 @@ pub(crate) fn tall_confirmation_surface<'a, M: 'a>(
     )
 }
 
+/// A [`crate::dialog_ui::inline_question`] asking `question`. Its opener
+/// focuses where [`Question::focus`] says, and Escape answers it with its
+/// dismissal.
 pub(crate) fn inline_question<'a, M: 'a>(
     question: Question,
     content: impl Into<Element<'a, M>>,
