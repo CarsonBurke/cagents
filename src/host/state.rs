@@ -328,6 +328,8 @@ pub(crate) struct HostState {
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
+    /// What linked computers' sessions hold on their connections.
+    pub(super) peers: super::device_trust::Peers,
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
@@ -513,6 +515,7 @@ impl HostState {
             workspace_registry: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
+            peers: Default::default(),
             automations: None,
             work: None,
             mailbox: None,
@@ -612,6 +615,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.peers.disconnect(client_id);
     }
 
     /// Installs the durable shared sidebar model.
@@ -1093,6 +1097,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.peers.disconnect(client_id);
         handles
     }
 

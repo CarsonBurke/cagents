@@ -1658,7 +1658,6 @@ pub fn request(operation: Operation) -> Result<Reply, String> {
         operation,
         authority,
         crate::control::daemon_autostart_disabled(),
-        crate::device::is_remote(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
         ready_client,
     )
@@ -1675,7 +1674,6 @@ pub fn request_for_reader(operation: Operation) -> Result<Reply, String> {
         operation,
         authority,
         crate::control::daemon_autostart_disabled(),
-        crate::device::is_remote(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
         ready_client,
         reader_message,
@@ -1691,7 +1689,6 @@ pub fn request_unless_busy(operation: Operation) -> Result<Reply, crate::control
         operation,
         authority,
         crate::control::daemon_autostart_disabled(),
-        crate::device::is_remote(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
         ready_client,
         crate::control::RequestError::from,
@@ -1718,7 +1715,6 @@ fn request_as(
     operation: Operation,
     authority: crate::agent_execution::Authority,
     no_start: bool,
-    remote: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
     ready_client: impl FnOnce() -> Result<crate::control::ControlClient, String>,
 ) -> Result<Reply, String> {
@@ -1726,7 +1722,6 @@ fn request_as(
         operation,
         authority,
         no_start,
-        remote,
         selected_socket,
         ready_client,
         |error| error.to_string(),
@@ -1737,20 +1732,13 @@ fn request_described<E: From<String>>(
     operation: Operation,
     authority: crate::agent_execution::Authority,
     no_start: bool,
-    remote: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
     ready_client: impl FnOnce() -> Result<crate::control::ControlClient, String>,
     describe: impl FnOnce(crate::control::ControlError) -> E,
 ) -> Result<Reply, E> {
-    // Resolving a remote socket can launch its SSH bridge before authentication.
-    // Device operations are reserved for User, so refuse scoped remote callers
-    // before either resolver can create transport or start a remote daemon.
-    if remote && authority.token().is_some() {
-        return Err(String::from(
-            "Device operations from an agent session require a user terminal on the remote device",
-        )
-        .into());
-    }
+    // A session's capability proves its lineage to the device as the
+    // connection authenticates (`ControlClient::for_device`); the device then
+    // admits only the path lookups a session needs, and refuses the rest.
     // Presence, including an empty/invalid capability, must never become User
     // startup or scope. Use the same captured authority after resolving a socket.
     let mut client = if authority.token().is_some() || no_start {
@@ -1761,8 +1749,42 @@ fn request_described<E: From<String>>(
     };
     client
         .authenticate(authority)
-        .map_err(|error| error.to_string())?;
-    client.device_operation(operation).map_err(describe)
+        .and_then(|()| client.device_operation(operation))
+        .map_err(describe)
+}
+
+/// Why a device operation failed: refused to the caller, or not carried out.
+#[derive(Debug)]
+pub(crate) enum Failure {
+    /// This computer or the device refused it, for the reason given.
+    Refused(String),
+    Failed(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// [`request`] that tells a refusal from a failure to reach the device.
+pub(crate) fn request_refusable(operation: Operation) -> Result<Reply, Failure> {
+    request_described(
+        operation,
+        crate::agent_execution::Authority::from_environment(),
+        crate::control::daemon_autostart_disabled(),
+        || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
+        ready_client,
+        |error| match error {
+            crate::control::ControlError::DeviceAccess(message)
+            | crate::control::ControlError::Remote {
+                code: crate::terminal_ipc::ProtocolErrorCode::PermissionDenied,
+                message,
+                ..
+            } => Failure::Refused(message),
+            error => Failure::Failed(error.to_string()),
+        },
+    )
 }
 
 #[cfg(test)]

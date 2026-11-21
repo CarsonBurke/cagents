@@ -58,6 +58,15 @@ fn access(request: &ClientRequest) -> Access<'_> {
             | crate::work::Request::Snapshots { .. },
         )
         | R::WatchWork
+        // A linked computer's session resolves paths on this device as it
+        // starts agents; nothing else of a device's files is open to it.
+        | R::DeviceOperation {
+            operation:
+                crate::device_service::Operation::Home
+                | crate::device_service::Operation::Discover { .. },
+        }
+        | R::PeerChallenge
+        | R::PeerAuthenticate { .. }
         // Admitted only so its handler can explain that it was removed.
         | R::RetiredChannelWork => Access::Open,
         R::Input { terminal_id, .. }
@@ -78,6 +87,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
+        | R::DeviceTrust { .. }
+        | R::SignDeviceChallenge { .. }
         | R::Agent { .. }
         | R::Automation { .. }
         | R::Shutdown
@@ -168,6 +179,7 @@ pub(in crate::host) fn admit(
     };
     match access(request) {
         Access::Open => Ok(()),
+        Access::Refused if own_peer_request(host, client_id, request) => Ok(()),
         Access::Refused => Err(denied(
             "An agent session's connection may only read terminals and change its own",
         )),
@@ -200,6 +212,24 @@ pub(in crate::host) fn adopt(
         .unwrap_or_else(|p| p.into_inner())
         .own_terminal(Lineage(terminal), owner)
         .map_err(internal)
+}
+
+/// A linked computer's session sends its agent and automation requests on the
+/// connection it proved, carrying the capability that proof issued; each is
+/// then held to that capability's scope as it is handled. Any other authority
+/// on that connection is refused, as on a local session's.
+fn own_peer_request(host: &SharedHost, client_id: ClientId, request: &ClientRequest) -> bool {
+    let (ClientRequest::Agent { authority, .. } | ClientRequest::Automation { authority, .. }) =
+        request
+    else {
+        return false;
+    };
+    authority.token().is_some_and(|token| {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .peers
+            .issued_to(token, client_id)
+    })
 }
 
 fn acting_for(host: &SharedHost, client_id: ClientId) -> Option<Lineage> {

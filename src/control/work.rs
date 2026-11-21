@@ -322,20 +322,19 @@ impl ControlClient {
 /// command covers and then asks for it. Inside a hosted session the daemon
 /// lets a connection read the board but change it only once it names its
 /// authority, which a changing command's connection does first.
-struct Daemon<'a> {
-    context: &'a ServiceRequestContext,
+struct Daemon {
     client: ControlClient,
 }
 
-impl<'a> Daemon<'a> {
-    fn connect(context: &'a ServiceRequestContext, changes: bool) -> Result<Self, AppError> {
+impl Daemon {
+    fn connect(context: &ServiceRequestContext, changes: bool) -> Result<Self, AppError> {
         let mut client = context.connect()?;
         if changes && context.scoped() {
             client
                 .authenticate(context.authority.clone())
                 .map_err(protocol_error)?;
         }
-        Ok(Self { context, client })
+        Ok(Self { client })
     }
 
     /// The projects a command covers: the open project `project` names, or
@@ -352,7 +351,7 @@ impl<'a> Daemon<'a> {
     /// directory; none outside every one. A remote device's projects are not
     /// where this shell runs, so there it finds none.
     fn here(&mut self) -> Result<Option<PathBuf>, AppError> {
-        if self.context.remote {
+        if crate::device::is_remote() {
             return Ok(None);
         }
         let Ok(directory) = std::env::current_dir() else {
@@ -423,7 +422,6 @@ pub(super) fn execute_with_context(
     command: WorkCommand,
     context: &ServiceRequestContext,
 ) -> Result<CommandOutput, AppError> {
-    context.admit_remote()?;
     match command {
         WorkCommand::List(arguments) => list(arguments, context),
         WorkCommand::Pin {
@@ -707,7 +705,7 @@ fn list(
         board.items.retain(|item| item.column == column);
     }
     // The card of the worktree this shell is in is always listed.
-    let current = (!context.remote)
+    let current = (!crate::device::is_remote())
         .then(|| std::env::current_dir().and_then(std::fs::canonicalize).ok())
         .flatten()
         .and_then(|directory| current_worktree(&board.items, &directory));

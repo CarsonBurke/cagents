@@ -104,7 +104,12 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::RetiredChannelWork
         // Inspects what holds a lost helper's Close, ending only processes
         // the person chose and the daemon proves are that conversation's.
-        | R::ChatLostProcesses { .. } => Access::Open,
+        | R::ChatLostProcesses { .. }
+        // Device links name no hosted process.
+        | R::DeviceTrust { .. }
+        | R::PeerChallenge
+        | R::PeerAuthenticate { .. }
+        | R::SignDeviceChallenge { .. } => Access::Open,
         R::ApplyWorkspaceEdit { edit } | R::EditWorkspaceModel { edit } => model_access(edit),
         // Closing an original the reader is still attached to, as when the
         // hold is raised while it runs, is the Close the refusal offers.

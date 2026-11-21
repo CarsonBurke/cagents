@@ -4710,6 +4710,192 @@ fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
 }
 
 #[test]
+fn a_linked_computers_session_owns_the_agents_it_starts_on_the_device() {
+    use crate::device_trust::{LinkKey, Request};
+    use crate::host::device_trust;
+
+    if isolated("a_linked_computers_session_owns_the_agents_it_starts_on_the_device").is_some() {
+        return;
+    }
+    let (host, request, registry_path) = fixture();
+    // A live session here: an agent the person started.
+    let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let registry = registry(&host).unwrap();
+    let session = registry
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let local = registry
+        .lock()
+        .unwrap()
+        .retained_agent_authority(session)
+        .unwrap();
+
+    // This daemon stands for both computers: its store holds the link to
+    // the device and the device's record of this computer.
+    let trust = registry_path.with_file_name("device-trust.json");
+    let (peer, key) = (uuid::Uuid::new_v4(), LinkKey::generate().unwrap());
+    device_trust::process_at(
+        &trust,
+        Request::SaveLink {
+            device: "devx".into(),
+            peer,
+            key: key.clone(),
+            agents_allowed: true,
+        },
+    )
+    .unwrap();
+    device_trust::process_at(
+        &trust,
+        Request::RegisterPeer {
+            peer,
+            label: "laptop".into(),
+            key,
+        },
+    )
+    .unwrap();
+    let client = 41;
+    let nonce = device_trust::challenge(&host, client).unwrap();
+    let (signed, lineage, proof) =
+        device_trust::sign_at(&trust, &host, &local, "devx", &nonce).unwrap();
+    assert_eq!(signed, peer);
+    let remote =
+        device_trust::authenticate_at(&trust, &host, client, peer, lineage, &proof).unwrap();
+
+    // Its proof holds the connection to a session's scope, whether or not it
+    // goes on to authenticate: what is the person's alone is refused, and so
+    // is every authority but the capability the proof issued.
+    use crate::terminal_ipc::{ClientRequest, ProtocolErrorCode, ServerResponse};
+    let _delivery = host.lock().unwrap().register_client(client);
+    let dispatch = |request| crate::host::client::process_request(&host, client, request);
+    for refused in [
+        ClientRequest::DeviceTrust {
+            request: Request::Links,
+        },
+        ClientRequest::Agent {
+            authority: Authority::default(),
+            operation: Operation::List,
+        },
+        ClientRequest::Agent {
+            authority: local.clone(),
+            operation: Operation::List,
+        },
+    ] {
+        let error = dispatch(refused).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PermissionDenied, "{error:?}");
+    }
+    let (listed, ..) = dispatch(ClientRequest::Agent {
+        authority: remote.clone(),
+        operation: Operation::List,
+    })
+    .unwrap();
+    assert!(
+        matches!(listed, ServerResponse::Agent(Reply::Listed(ref agents)) if agents.is_empty()),
+        "{listed:?}"
+    );
+
+    let mut linked = request;
+    linked.idempotency_key = "linked".into();
+    let child = submit(&host, &remote, linked).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    assert_eq!(
+        registry
+            .lock()
+            .unwrap()
+            .agent(child.agent.id)
+            .unwrap()
+            .origin,
+        Origin::Child {
+            parent: crate::device_trust::peer_lineage(peer, lineage)
+        }
+    );
+    let requests = |authority: &Authority| {
+        process(
+            &host,
+            authority.clone(),
+            Operation::Requests(child.agent.id),
+        )
+    };
+    assert!(requests(&remote).is_ok());
+    // Neither the session's own capability nor the device's person owns it.
+    for other in [&local, &Authority::default()] {
+        let error = requests(other).unwrap_err();
+        assert!(error.contains("does not own"), "{error}");
+    }
+
+    host.lock().unwrap().peers.disconnect(client);
+    let error = requests(&remote).unwrap_err();
+    assert!(error.contains("ended with its connection"), "{error}");
+}
+
+#[test]
+fn a_linked_computers_session_reads_only_its_own_mail() {
+    use crate::{
+        agent_execution::{
+            Lineage,
+            mailbox::{Inbox, Message, Party, State as Delivery},
+        },
+        model::MessageId,
+    };
+
+    if isolated("a_linked_computers_session_reads_only_its_own_mail").is_some() {
+        return;
+    }
+    let (host, _, _) = fixture();
+    let registry = registry(&host).unwrap();
+    let peer = Lineage(TerminalId::new());
+    let message = |to: Party, body: &str| Message {
+        id: MessageId::new(),
+        from: Party {
+            lineage: Some(Lineage(TerminalId::new())),
+            session: None,
+            title: None,
+        },
+        to,
+        reply_to: None,
+        body: body.into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms: now(),
+    };
+    let personal = message(Party::user(), "For the person at this device");
+    let linked = message(
+        Party {
+            lineage: Some(peer),
+            session: None,
+            title: None,
+        },
+        "For the linked session",
+    );
+    {
+        let mut registry = registry.lock().unwrap();
+        registry.post_message(&personal).unwrap();
+        registry.post_message(&linked).unwrap();
+    }
+    let token = host.lock().unwrap().peers.issue(1, peer);
+    let Reply::Inbox(read) = process(
+        &host,
+        Authority::session(token),
+        Operation::PeekInbox(Inbox {
+            all: false,
+            replies_to: None,
+        }),
+    )
+    .unwrap() else {
+        panic!("inbox reply");
+    };
+    assert_eq!(
+        read.iter().map(|message| message.id).collect::<Vec<_>>(),
+        vec![linked.id]
+    );
+}
+
+#[test]
 fn disconnected_blocked_inbox_poll_keeps_mail_pending() {
     use crate::{
         agent_execution::{

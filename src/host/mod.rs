@@ -10,6 +10,7 @@ mod client;
 mod control_gate;
 mod delivery;
 pub(crate) mod descriptor_limit;
+mod device_trust;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
 #[cfg(debug_assertions)]
