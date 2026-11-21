@@ -273,10 +273,7 @@ async fn run_reading(
             key.as_ref()
                 .and_then(|key| cache.load(now_ms()).remove(key))
         })
-        && identity
-            .as_ref()
-            .zip(previous.identity.as_ref())
-            .is_some_and(|(current, previous)| reset_consume::same_identity(current, previous))
+        && super::resets::may_act_for(identity.as_ref(), previous.identity.as_ref())
     {
         snapshot.resets = previous.snapshot.resets;
         for reset in &mut snapshot.resets {
