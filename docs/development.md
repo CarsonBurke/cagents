@@ -2252,6 +2252,24 @@ harness, it provides:
   up to 900 seconds to show its app window. The default is 180 seconds; use a
   whole number from 1 to 3600. Readiness still requires the mapped window.
   This deadline counts toward, and does not extend, the `--limit` session lifetime.
+- **Drags.** `drive drag FROM TO` presses, travels and releases in one
+  injector run, moving by relative steps, so the app sees the path between
+  the two points. To write a gesture by hand, run niri-harness's injector
+  VPTR, `build/vptr` beside its `bin/` (`~/.local/lib/niri-harness/build/vptr`
+  on fw16), through `nested` with the marker it requires, separating its
+  commands with `;` arguments: `nested sh -c
+  'NIRI_HARNESS_INJECT_DISPLAY=$WAYLAND_DISPLAY exec "$@"' sh VPTR a X Y \;
+  d left \; w 80 \; r DX DY \; w 12 \; r DX DY \; w 12 ... \; u left`. Press
+  and release within that one run, place the pointer with `a` before the
+  press, and then travel by repeated small `r` steps, as `drive drag` does
+  in 24. The installed injector places every `a` by pinning the pointer to
+  the screen's origin, so a held `a` drags through that corner and a dragged
+  scrollbar thumb snaps to the top between steps.
+  [niri-harness#5](https://github.com/CarsonBurke/niri-harness/pull/5)
+  proposes that a held `a` travel directly once the same run has placed the
+  pointer, and be refused otherwise. Check the frames during a drag, not only
+  where it ended: a long `w` in the run leaves time for a `shot` from another
+  shell.
 - **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
   the GTK backend on the session's private bus, so the app's Attach dialog
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
