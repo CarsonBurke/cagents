@@ -14628,3 +14628,107 @@ fn an_image_no_read_returned_has_no_description() {
         ]
     );
 }
+
+/// Claude reports idle after a stopped turn's result. A reader who sees the
+/// conversation after that frame must still find the turn stopped.
+#[test]
+fn a_stopped_turn_stays_interrupted_once_claude_goes_idle() {
+    let mut adapter = stopped_and_settled();
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, chat::TURN_INTERRUPTED)));
+}
+
+/// The stopped outcome belongs to that turn only: the next one goes idle as
+/// any finished turn does.
+#[test]
+fn the_turn_after_a_stopped_one_goes_idle_as_usual() {
+    let mut adapter = stopped_and_settled();
+    adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
+        .unwrap();
+    // Starting the next turn forgets the stop, before any result arrives.
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, "Claude is idle")));
+    adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"next","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, "Claude turn complete")));
+}
+
+/// A stopped turn that leaves a decision open ends once it is answered. That
+/// answer and the idle frame after it must not turn the stop into a finish.
+#[test]
+fn a_stopped_turn_stays_interrupted_once_its_last_decision_is_answered() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    adapter
+        .receive(approval("background-1", "Bash", json!({"command":"true"})))
+        .unwrap();
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(
+        last_status(&settled),
+        Some((true, "Claude turn ended; decisions remain"))
+    );
+    let answered = adapter
+        .command(Command::Answer {
+            request_id: "background-1".into(),
+            action: "deny".into(),
+            answers: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        last_status(&answered),
+        Some((false, chat::TURN_INTERRUPTED))
+    );
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, chat::TURN_INTERRUPTED)));
+}
+
+/// An adapter whose turn the reader stopped, acknowledged and settled.
+fn stopped_and_settled() -> Claude {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, chat::TURN_INTERRUPTED)));
+    adapter
+}
+
+fn last_status(step: &Step) -> Option<(bool, &str)> {
+    step.events.iter().rev().find_map(|event| match event {
+        Event::Status { busy, detail } => Some((*busy, detail.as_str())),
+        _ => None,
+    })
+}
