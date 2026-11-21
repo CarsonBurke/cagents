@@ -579,33 +579,30 @@ fn turned_off<'a>(state: &State) -> Option<Element<'a, Message>> {
     }
     let mut items: Vec<Element<'a, Message>> = vec![design::caption("Turned off").into()];
     items.extend(providers.into_iter().map(|provider| {
-        crate::interaction::tooltip(
-            widget::button::custom(
-                widget::row::with_children(vec![
-                    widget::icon(crate::ui_controls::provider_icon(provider))
-                        .size(design::COMPACT_ICON_SIZE)
-                        .into(),
-                    design::caption(provider.label())
-                        .class(cosmic::theme::Text::Default)
-                        .into(),
-                    design::caption("Turn on").into(),
-                ])
-                .spacing(space::XS)
-                .align_y(Alignment::Center),
-            )
-            .name(format!("Turn on {}", provider.label()))
-            .class(crate::ui_controls::control_style(false, None))
-            .padding([space::XXS, space::S])
-            .on_press(use_provider(provider, true)),
-            format!(
-                "Offer {} again, list its accounts and check their usage",
-                provider.label()
+        widget::row::with_children(vec![
+            widget::icon(crate::ui_controls::provider_icon(provider))
+                .size(design::COMPACT_ICON_SIZE)
+                .into(),
+            design::caption(provider.label()).into(),
+            crate::interaction::tooltip(
+                widget::button::link("Turn on")
+                    .font_size(design::TEXT_CAPTION as u16)
+                    .padding(0)
+                    .name(format!("Turn on {}", provider.label()))
+                    .on_press(use_provider(provider, true)),
+                format!(
+                    "Offer {} again, list its accounts and check their usage",
+                    provider.label()
+                ),
             ),
-        )
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .into()
     }));
     Some(
         widget::row::with_children(items)
-            .spacing(space::S)
+            .spacing(space::M)
             .align_y(Alignment::Center)
             .wrap()
             .into(),
