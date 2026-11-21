@@ -346,11 +346,12 @@ checks. Entries that match no worktree still answer `gh pr list`, but nothing
 in the sidebar shows them.
 
 The pull request browser lists the open seeds in file order, fifty a page, so
-53 open seeds give it a second page. An entry may also set `fixtureReviewRequests`,
-the number of times the reader was asked to review it (0 if absent). One or
-more makes it a review request for the reader, labeled **Needs your review**;
-two or more make it **Review re-requested**. A request beyond the browser's
-loaded pages appears under those filters as its own request row.
+53 open seeds give it a second page. An entry may also set
+`fixtureReviewRequests`, the number of times the reader was asked to review it
+(0 if absent). One or more makes it a review request for the reader, labeled
+**Needs your review**; two or more make it **Review re-requested**. A request
+beyond the browser's loaded pages appears under those filters as its own
+request row.
 
 Seeds still cannot support evidence of the review itself. Opening a seeded
 pull request's review asks for its conversation, which the forge answers as
