@@ -1346,9 +1346,9 @@ impl State {
             return None;
         }
         // While this file's draft is open the control stays live and leads
-        // back to it; any other open draft must be finished first.
+        // back to it, even in a read-only cached review, since revealing it
+        // writes nothing; any other open draft must be finished first.
         let enabled = !modal_open
-            && self.has_discussion_authority()
             && (drafting_here
                 || (self.can_mutate_discussion() && self.discussion.composer.is_none()));
         let control: Element<'_, Action> = crate::ui_controls::icon_button(
@@ -2117,6 +2117,47 @@ pub(crate) mod tests {
         drop(state.update(action));
         assert!(state.discussion.busy, "the restored draft is posted");
         assert!(state.discussion.saving_composer);
+    }
+
+    #[test]
+    fn offline_cached_review_reveals_a_restored_file_draft_without_writing_it() {
+        use crate::pull_request_review::Action as ReviewAction;
+
+        let mut drafted = ready();
+        drop(drafted.update_discussion(Action::BeginFile("file.rs".into())));
+        drafted.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("File note written before going offline");
+        let drafts =
+            serde_json::from_str(&serde_json::to_string(&drafted.local_drafts()).unwrap()).unwrap();
+
+        let (mut state, _) = crate::pull_request_review::tests::state();
+        drop(state.update(ReviewAction::Open(target(1))));
+        state.cache_loading = true;
+        drop(state.update(ReviewAction::Cached {
+            generation: state.generation,
+            result: Ok(Some(Arc::new(cache::fixture()))),
+        }));
+        drop(state.update(ReviewAction::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Err("Offline".into()),
+        }));
+        state.restore_drafts(drafts, None);
+        drop(state.take_effects());
+        assert!(!state.has_discussion_authority());
+        assert!(state.drafting_file("file.rs"));
+
+        // The file comment control stays live for its own draft offline.
+        let action = state.review_action(Action::BeginFile("file.rs".into()));
+        drop(state.update(action));
+        assert_eq!(state.take_effects(), [Effect::RevealFileDiscussion]);
+        let composer = state.discussion.composer.as_ref().expect("the draft stays");
+        assert_eq!(
+            composer.content.text(),
+            "File note written before going offline"
+        );
+        assert_eq!(composer.destination, Destination::File("file.rs".into()));
+        assert!(!state.discussion.busy, "revealing the draft writes nothing");
     }
 
     mod reanchor_receipt_tests {
