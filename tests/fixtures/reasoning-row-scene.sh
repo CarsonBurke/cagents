@@ -404,7 +404,14 @@ if [ "$scene" = lone-thinking ]; then
     release lone-answer
     for _ in $(seq 40); do seen lone-answer-1 && break; sleep 1; done
     seen lone-answer-1 || late 'the answer did not land'
-    evidence drive wait 'Finished at' --timeout 15 >/dev/null || late 'the turn did not finish'
+    # OCR may read "Finished at 15:34" as one target per word, so look for
+    # the word on screen rather than wait for the phrase as one target.
+    finished=false
+    for _ in $(seq 20); do
+        if evidence drive observe 2>/dev/null | grep -q 'Finished'; then finished=true; break; fi
+        sleep 1
+    done
+    [ "$finished" = true ] || late 'the turn did not finish'
     sleep 1
     shot lone-answered
     printf '%s\n' 'Captured a lone step before, during and after the thinking that follows it.'
