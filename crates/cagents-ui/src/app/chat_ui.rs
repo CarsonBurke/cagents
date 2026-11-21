@@ -4106,8 +4106,8 @@ impl Runtime {
     }
 
     /// Records a message the provider accepted. The same message sent twice
-    /// in a row is one entry, as a shell keeps it, and the walk restarts
-    /// from the newest.
+    /// in a row is one entry, as a shell keeps it. An active history walk
+    /// keeps its position and unsent draft.
     #[cfg(test)]
     fn remember(&mut self, sent: String) {
         self.remember_with_attachments(sent, Vec::new());
@@ -4119,9 +4119,24 @@ impl Runtime {
             self.history.push(sent);
             self.history_images.push(attachments);
         }
+    }
+
+    /// Returns to the draft saved before browsing sent prompts.
+    fn restore_history_draft(&mut self) {
+        let composer = self.history_stash.take().unwrap_or_default();
+        let attachments = self.history_attachment_stash.take().unwrap_or_default();
+        self.replace_attachments(attachments);
         self.history_cursor = None;
-        self.history_stash = None;
-        self.history_attachment_stash = None;
+        self.replace_draft(composer);
+    }
+
+    /// Consumes the shown prompt while preserving a draft saved by history.
+    fn finish_history_walk_after_send(&mut self) {
+        if self.history_cursor.is_some() {
+            self.restore_history_draft();
+        } else {
+            self.replace_draft(text_editor::Content::new());
+        }
     }
 
     /// Walks the history one message older or newer, showing it in the
@@ -4143,29 +4158,22 @@ impl Runtime {
             (Some(index), false) if index + 1 < self.history.len() => Some(index + 1),
             (Some(_), false) => None,
         };
-        let composer = match next {
-            Some(index) => {
-                text_editor::Content::with_text(self.history[index].trim_end_matches('\n'))
-            }
-            None => self.history_stash.take().unwrap_or_default(),
+        let Some(index) = next else {
+            self.restore_history_draft();
+            return;
         };
-        let attachments = match next {
-            Some(index) => {
-                let mut attachments = self
-                    .history_attachment_stash
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|attachment| attachment.reference.is_none())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(images) = self.history_images.get(index) {
-                    attachments.extend(images.clone());
-                }
-                attachments
-            }
-            None => self.history_attachment_stash.take().unwrap_or_default(),
-        };
+        let composer = text_editor::Content::with_text(self.history[index].trim_end_matches('\n'));
+        let mut attachments = self
+            .history_attachment_stash
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|attachment| attachment.reference.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(images) = self.history_images.get(index) {
+            attachments.extend(images.clone());
+        }
         self.replace_attachments(attachments);
         self.history_cursor = next;
         self.replace_draft(composer);
@@ -12002,7 +12010,7 @@ impl Cagents {
             // back with the reason.
             let text = runtime.composer.text().trim_end().to_owned();
             let attachments = runtime.take_attachments();
-            runtime.replace_draft(text_editor::Content::new());
+            runtime.finish_history_walk_after_send();
             let mode = match &command {
                 Command::Prompt { mode, .. } => *mode,
                 _ => PromptMode::Send,
@@ -14281,7 +14289,7 @@ impl Cagents {
                         attachments: runtime.take_attachments(),
                     };
                     runtime.followups.push(followup);
-                    runtime.replace_draft(text_editor::Content::new());
+                    runtime.finish_history_walk_after_send();
                     runtime.error = None;
                     let _ = runtime.present();
                     let busy = runtime.turn_under_way();
