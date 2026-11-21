@@ -1949,7 +1949,9 @@ mod initial_attachment_limits {
     use super::*;
     use crate::agent_execution::directory::UsageLimit;
 
-    fn restore_hidden_chat(limit_wake_before_ready: bool, keep_runtime: bool) {
+    /// Restores an already limited chat behind another pane. The new
+    /// connection reports `still_limited` as the daemon's current judgement.
+    fn restore_hidden_chat(limit_wake_before_ready: bool, keep_runtime: bool, still_limited: bool) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.workspace.resize_viewport(1_600.0);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -1994,7 +1996,15 @@ mod initial_attachment_limits {
         // or deliver its wake after attachment while Ready is still queued.
         let handle = Arc::new(ClientHandle::fixture(session, snapshot));
         handle.set_visible(false).unwrap();
-        handle.judge_limit_for_test(Some(limit.clone()));
+        let current = still_limited.then(|| limit.clone());
+        handle.judge_limit_for_test(current.clone());
+        // Subagent addresses learned before attachment have no wake to carry
+        // them either.
+        let agent = "a1892b93e88999a7d";
+        handle.learn_agent_addresses_for_test(vec![chat::AgentAddress {
+            address: agent.into(),
+            subagent: "toolu_relocate".into(),
+        }]);
         if limit_wake_before_ready {
             drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Limit))));
             assert!(app.chat_start_pending(card));
@@ -2008,24 +2018,44 @@ mod initial_attachment_limits {
         assert!(!handle.is_visible_for_test());
         assert!(!chat_runtime(&app, card).presents());
         assert_eq!(
-            app.sidebar_state.card_attention(card).state(),
-            Some(crate::sidebar::AttentionState::Limited)
+            app.sidebar_state.card_attention(card).limited,
+            usize::from(still_limited)
         );
-        assert_eq!(chat_runtime(&app, card).usage_limit, Some(limit));
+        if still_limited {
+            assert_eq!(
+                app.sidebar_state.card_attention(card).state(),
+                Some(crate::sidebar::AttentionState::Limited)
+            );
+        }
+        assert_eq!(chat_runtime(&app, card).usage_limit, current);
+        assert_eq!(
+            chat_runtime(&app, card)
+                .agent_addresses
+                .get(agent)
+                .map(String::as_str),
+            Some("toolu_relocate")
+        );
         assert!(!app.sidebar_state.has_card_update(card));
     }
 
     #[test]
     fn hidden_restore_installs_a_limit_cached_before_attachment() {
         for keep_runtime in [false, true] {
-            restore_hidden_chat(false, keep_runtime);
+            restore_hidden_chat(false, keep_runtime, true);
+        }
+    }
+
+    #[test]
+    fn hidden_restore_clears_a_limit_lifted_before_attachment() {
+        for keep_runtime in [false, true] {
+            restore_hidden_chat(false, keep_runtime, false);
         }
     }
 
     #[test]
     fn hidden_restore_reconciles_a_limit_wake_handled_before_ready() {
         for keep_runtime in [false, true] {
-            restore_hidden_chat(true, keep_runtime);
+            restore_hidden_chat(true, keep_runtime, true);
         }
     }
 }

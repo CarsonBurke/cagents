@@ -13018,11 +13018,15 @@ impl Cagents {
                         let opening_name =
                             self.request_opening_name(target).unwrap_or_else(Task::none);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
-                        // An early limit wake may have been discarded while
-                        // attaching. Reconcile it after the activity entry exists.
-                        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.usage_limit =
-                                runtime.handle().and_then(|handle| handle.limit());
+                        // The client may have cached a limit or agent addresses
+                        // before it attached, or their wakes were discarded while
+                        // startup was pending. Read both from the installed handle
+                        // once the sidebar's activity entry exists.
+                        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card)
+                            && let Some(handle) = runtime.handle().cloned()
+                        {
+                            runtime.usage_limit = handle.limit();
+                            runtime.agent_addresses = handle.agent_addresses();
                             self.sidebar_state
                                 .set_card_limited(target.card, runtime.usage_limit.is_some());
                         }
