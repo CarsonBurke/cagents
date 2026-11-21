@@ -2335,7 +2335,9 @@ pub struct RepositoryRuntime {
     /// after any read this card did not install.
     file_list_digest: Option<FileInventoryDigest>,
     /// Cancels the outstanding file-list read when a newer read supersedes
-    /// it, the card is retargeted, or the card is closed.
+    /// it, the card gives up on a file it could not open, or the card is
+    /// closed. A read the card no longer wants for any other reason finishes
+    /// and is discarded by [`RepositoryRuntime::accepts_file_list`].
     file_list_read: Option<FileListReadJob>,
     /// Where the worker leaves the digest of the read in flight, tagged with
     /// the generation that asked for it. Committed into

@@ -4003,8 +4003,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         // `--no-ahead-behind`: a file list has no use for the walk that
-        // counts commits against the upstream, and a fetch that moved the
-        // upstream must not make an unchanged list look changed.
+        // counts commits against the upstream, and without the counts a
+        // fetch changes the digest only when the branch starts or stops
+        // matching its upstream.
         let status_output = self.run_checked(
             &self
                 .git_read(
