@@ -98,8 +98,7 @@ impl<'a, Message> Button<'a, Message> {
     }
 
     /// The accessible description: what the name alone leaves out, such as
-    /// why a disabled button can't be pressed. Pair it with a tooltip that
-    /// shows the same text on hover.
+    /// why a disabled button can't be pressed.
     pub fn description(mut self, description: impl Into<Cow<'a, str>>) -> Self {
         self.description = Some(description.into());
         self

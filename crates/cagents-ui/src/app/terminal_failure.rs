@@ -159,8 +159,8 @@ fn retry_after_restoring_picker(provider: &str) -> String {
     )
 }
 const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
-/// Retry would refuse to start anything, so the pane doesn't offer it. The
-/// disabled Retry's tooltip and accessible description repeat this.
+/// Retry would refuse to start anything, so the pane disables it. The disabled
+/// Retry's accessible description repeats this.
 pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent. Its saved command may reopen a conversation the agent has since left, and cagents can't open the agent's conversation picker with the other options it was launched with. Open a new terminal to keep working.";
 /// What Retry launches in place of a terminal.
 enum NewTerminal {

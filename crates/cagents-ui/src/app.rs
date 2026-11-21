@@ -12621,14 +12621,13 @@ impl Cagents {
                                     ))
                                     .into(),
                                 // Disabled rather than hidden, so the pane
-                                // still says why Retry can't help.
-                                crate::interaction::tooltip(
-                                    crate::ui_controls::button::secondary(retry_label)
-                                        .id(card_control_id(id, "retry"))
-                                        .name(format!("{retry_label} {}", labels.type_label))
-                                        .description(terminal_failure::RETRY_UNAVAILABLE),
-                                    terminal_failure::RETRY_UNAVAILABLE,
-                                ),
+                                // still says why Retry can't help: the
+                                // message above it, and its description.
+                                crate::ui_controls::button::secondary(retry_label)
+                                    .id(card_control_id(id, "retry"))
+                                    .name(format!("{retry_label} {}", labels.type_label))
+                                    .description(terminal_failure::RETRY_UNAVAILABLE)
+                                    .into(),
                             ] } else { vec![
                                 (if self.terminal_retry_is_blocked(id) {
                                     crate::ui_controls::button::secondary(retry_label)
