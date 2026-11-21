@@ -15,16 +15,18 @@ static SPINNER_EPOCH: std::sync::LazyLock<cosmic::iced::time::Instant> =
 
 /// How often a visible spinner asks for a frame.
 ///
-/// Every frame repaints the whole window - update, layout and a full render
-/// pass - so this is the price of every working agent on screen, paid for as
-/// long as it works. Ten steps a second, thirty degrees of a
-/// [`crate::design::SPINNER_PERIOD`] turn each, still reads as a turning arc
-/// at indicator size, at a third of the cost of the thirty steps it replaced.
-const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
+/// Every frame repaints the whole window, so this is the price of every
+/// working agent on screen, paid for as long as it works. A frame that only
+/// turns spinners reuses the window's prepared text and skips the sidebar's
+/// focus walks, which leaves it at about 2 ms on the reference machine
+/// (docs/performance.md, "What a spinner frame costs"). Twenty steps a second,
+/// fifteen degrees of a [`crate::design::SPINNER_PERIOD`] turn each, reads as
+/// a smoothly turning arc at indicator size.
+const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
 
 // The cadence is the whole cost of a working agent; it must not creep back
-// toward display refresh.
-const _: () = assert!(SPINNER_FRAME.as_millis() >= 100);
+// toward display refresh without measuring what a spinner frame costs.
+const _: () = assert!(SPINNER_FRAME.as_millis() >= 50);
 
 /// How often a spinner asks for a frame while its window is unfocused.
 ///

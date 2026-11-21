@@ -60,7 +60,7 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (100 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
+`SPINNER_FRAME` (50 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
 focused. An unfocused window may still be in view, so its spinners keep turning,
 but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
 advance one focused step per frame. Measure the UI process with one busy agent
@@ -98,6 +98,40 @@ agent still costs about 3% of a core above idle in this build. Slowing
 unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
+
+### What a spinner frame costs
+
+A frame that only turns spinners skips the application's update, view and
+layout, but it still walks the whole widget tree for the redraw event and
+for drawing, and it presents the whole window. Two changes made such a frame
+about half as expensive (#3564):
+
+- iced_wgpu keeps a text group's prepared glyphs while the group draws the
+  same text in the same place (#3571). Before, every frame prepared every
+  visible glyph again, which took 22% of the UI thread.
+- A sidebar row looks for focus only after an event that may move it, an
+  operation, a rebuild or a layout (#3575). Before, every row in view walked
+  its controls twice on every redraw, which took 7% of the UI thread.
+
+Workload: fw16 (Ryzen 7 7840HS), nested KWin at 1500x900, scale 1. The
+`realistic` seed, with four fixture Claude agents working in one channel, both
+chat panes showing long transcripts, the pointer still and the window
+focused. Both builds are `dev-runtime` at opt-level 2 with frame pointers.
+Measurements are 30 s of `/proc` CPU time plus the `CAGENTS_UI_TRACE` frame
+lines from the same run:
+
+| Build | Cadence | UI main thread | Frame work p50 | Frame work p95 |
+| --- | --- | --- | --- | --- |
+| `2f49dc2f2`, before both changes | 100 ms | 3.4% | 2.8-3.1 ms | 6.3-7.4 ms |
+| `16e894234`, after both | 100 ms | 2.4% | 1.7-2.1 ms | 4.0-7.3 ms |
+| `16e894234` with a 50 ms cadence | 50 ms | 4.5% | 1.9-2.2 ms | 4.4-8.7 ms |
+
+The cadence is now 50 ms: fifteen degrees per step instead of thirty. It
+costs about one percentage point of a core more than the 100 ms cadence did
+before these changes. The remaining per-frame cost is the widget-tree walks
+for the redraw event (about a third of a frame, including overlay
+collection) and the present (about a quarter). Repainting less than the
+whole window would need damage tracking that iced does not have.
 
 ## Idle UI wakeups
 
