@@ -17782,11 +17782,16 @@ impl Cagents {
                 archived,
                 expected,
             } => {
-                let current = self.refresh_ui.git.worktrees(project_id).unwrap_or(&[])
+                let current = self
+                    .refresh_ui
+                    .git
+                    .worktrees(project_id)
+                    .unwrap_or(&[])
                     .iter()
                     .map(|(record, _)| (record.id, record))
                     .collect::<HashMap<_, _>>();
-                let worktrees = worktrees.into_iter()
+                let worktrees = worktrees
+                    .into_iter()
                     .filter(|(record, _)| {
                         current.get(&record.id).is_some_and(|now| {
                             now.path == record.path
@@ -17830,11 +17835,13 @@ impl Cagents {
                         .remember_archived(project_id, generation, &archived);
                     // Separate local HEADs can prove the same PR. Cleanup
                     // continues to receive each historical PR only once.
-                    let mut archived_prs = archived.into_iter()
+                    let mut archived_prs = archived
+                        .into_iter()
                         .map(|association| association.pull_request)
                         .collect::<Vec<_>>();
                     archived_prs.dedup_by_key(|pr| pr.number);
-                    let merged = recent.into_iter()
+                    let merged = recent
+                        .into_iter()
                         .chain(archived_prs)
                         .collect::<Vec<_>>();
                     return Task::batch([

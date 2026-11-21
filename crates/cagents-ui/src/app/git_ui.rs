@@ -772,7 +772,8 @@ fn read_local_with_plan(
             continue;
         };
         for association in &snapshot.archived.associations {
-            if association.matches(record, head_repository)
+            if !cancellation.is_cancelled()
+                && association.matches(record, head_repository)
                 && (association.validated_head == *local_head
                     || association.pull_request.head_ref_oid == *local_head
                     || pr_head_is_ancestor(
@@ -780,7 +781,6 @@ fn read_local_with_plan(
                         &association.pull_request.head_ref_oid,
                         local_head,
                     ))
-                && !cancellation.is_cancelled()
             {
                 archived.push(ArchivedWorktreePr {
                     pull_request: association.pull_request.clone(),
