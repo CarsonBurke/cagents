@@ -66,9 +66,8 @@ pub enum AgentCommand {
         )]
         model: Option<String>,
         #[arg(long, value_name = "MODE")]
-        #[arg(help = "Permission policy. Claude Code: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never. Oh My Pi: always-ask, write or yolo",
-            hide_possible_values = true,
-            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
+        #[arg(help = "Permission policy. Claude Code: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never, each optionally followed by /read-only, /workspace-write or /danger-full-access. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never. Oh My Pi: always-ask, write or yolo. An agent's child gets no more than the agent's own mode",
+            value_parser = permission_mode)]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long, value_name = "EFFORT")]
@@ -550,6 +549,19 @@ impl Handles {
 
     fn name(self, id: impl std::fmt::Display) -> String {
         super::format::prefix(&id.to_string(), self.0).to_owned()
+    }
+}
+
+/// A `--permission-mode` value one of the providers names; the request's own
+/// provider is checked once the provider is resolved.
+fn permission_mode(value: &str) -> Result<String, String> {
+    if Provider::ALL
+        .into_iter()
+        .any(|provider| provider.check_permission_mode(value).is_ok())
+    {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("unknown permission mode {value:?}"))
     }
 }
 
@@ -2300,25 +2312,23 @@ mod tests {
             .get_arguments()
             .find(|argument| argument.get_id() == "permission_mode")
             .unwrap();
-        let mut parsed: Vec<_> = argument
-            .get_possible_values()
-            .iter()
-            .map(|value| value.get_name().to_owned())
-            .collect();
-        let mut accepted: Vec<_> = Provider::ALL
-            .into_iter()
-            .flat_map(|provider| {
-                provider
-                    .permission_modes()
-                    .iter()
-                    .chain(provider.permission_mode_aliases())
-            })
-            .map(|mode| (*mode).to_owned())
-            .collect();
-        parsed.sort_unstable();
-        accepted.sort_unstable();
-        accepted.dedup();
-        assert_eq!(parsed, accepted);
+        // The parser takes exactly the names some provider takes; the
+        // request's own provider refuses the rest of them.
+        for provider in Provider::ALL {
+            for mode in provider
+                .permission_modes()
+                .iter()
+                .chain(provider.permission_mode_aliases())
+            {
+                assert_eq!(permission_mode(mode).as_deref(), Ok(*mode));
+            }
+        }
+        for mode in ["on-request/read-only", "never/danger-full-access"] {
+            assert_eq!(permission_mode(mode).as_deref(), Ok(mode));
+        }
+        for mode in ["Default", "", "yolo/read-only", "never/full", "never/"] {
+            assert!(permission_mode(mode).is_err(), "{mode}");
+        }
         let help = argument.get_help().unwrap().to_string();
         for provider in Provider::ALL {
             let named = format!(

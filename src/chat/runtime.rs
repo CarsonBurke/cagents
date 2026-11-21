@@ -102,6 +102,10 @@ fn await_history_release(directory: &std::path::Path) {
     }
 }
 
+/// The refusal of a decline-only answer whose action the provider doesn't
+/// read as turning the request down, or whose request is no longer pending.
+pub(crate) const NOT_A_DECLINE: &str = "A settled run may only decline a current pending request";
+
 enum ActorCommand {
     RetainedProvider {
         run: Option<crate::model::RunId>,
@@ -1231,6 +1235,15 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .usage
+            .clone()
+    }
+    /// The provider-confirmed permission mode, without publishing a snapshot.
+    pub(crate) fn permission_mode(&self) -> Option<String> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .permission_mode
             .clone()
     }
     /// Bounded resident metadata only; never reads or hydrates transcript pages.
@@ -3071,9 +3084,7 @@ impl Actor {
                             _ => false,
                         };
                         if !valid {
-                            let _ = refuse(
-                                "A settled run may only decline a current pending request".into(),
-                            );
+                            let _ = refuse(NOT_A_DECLINE.into());
                             continue;
                         }
                     }
