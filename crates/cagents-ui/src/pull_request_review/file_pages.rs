@@ -29,6 +29,9 @@ pub(super) struct Pages {
     pub seek_unviewed: bool,
     pub hydrate_all: bool,
     pub(super) seen: BTreeSet<String>,
+    /// Keep old marks visible, but reread demanded files in this refresh epoch.
+    pub(super) revalidate: BTreeSet<RepoPath>,
+    pub(super) restart: Option<String>,
 }
 
 impl Default for Pages {
@@ -43,6 +46,8 @@ impl Default for Pages {
             seek_unviewed: false,
             hydrate_all: false,
             seen: BTreeSet::new(),
+            revalidate: BTreeSet::new(),
+            restart: None,
         }
     }
 }
@@ -107,17 +112,22 @@ impl State {
                 }
                 self.pages.seen.insert(cursor);
                 self.pages.cursor = page.next_cursor.clone();
+                if self.pages.cursor.is_none() {
+                    self.pages.hydrate_all = false;
+                }
                 let marks: HashMap<_, _> = page
                     .files
                     .iter()
                     .map(|file| (file.path.as_str(), file))
                     .collect();
                 for file in &mut self.files {
-                    // Only unknown marks can be hydrated. A concurrent user
-                    // mutation, including its successful ACK, wins over a page.
-                    if file.sync == ViewedSync::Unknown
+                    // Mutations remove revalidation eligibility, including
+                    // when their ACK arrives before this older page does.
+                    if (file.sync == ViewedSync::Unknown
+                        || self.pages.revalidate.contains(&file.entry.path))
                         && let Some(remote) = marks.get(file.entry.path.display().as_ref())
                     {
+                        self.pages.revalidate.remove(&file.entry.path);
                         file.viewed = remote.viewer_viewed_state == FileViewedState::Viewed;
                         file.sync = ViewedSync::Settled;
                     }
@@ -156,12 +166,14 @@ impl State {
         if self.pages.hydrate_all {
             return true;
         }
-        let unknown = |path: &RepoPath| {
-            self.file_index(path)
-                .is_some_and(|index| self.files[index].sync == ViewedSync::Unknown)
+        let needs_read = |path: &RepoPath| {
+            self.pages.revalidate.contains(path)
+                || self
+                    .file_index(path)
+                    .is_some_and(|index| self.files[index].sync == ViewedSync::Unknown)
         };
-        if self.pages.wanted.as_ref().is_some_and(unknown)
-            || self.selected.as_ref().is_some_and(unknown)
+        if self.pages.wanted.as_ref().is_some_and(needs_read)
+            || self.selected.as_ref().is_some_and(needs_read)
         {
             return true;
         }
@@ -169,9 +181,10 @@ impl State {
         window_rows(&self.rows, &displayed, self.pages.offset, self.pages.height)
             .into_iter()
             .any(|position| {
-                self.rows[displayed[position]]
-                    .file
-                    .is_some_and(|file| self.files[file].sync == ViewedSync::Unknown)
+                self.rows[displayed[position]].file.is_some_and(|file| {
+                    self.files[file].sync == ViewedSync::Unknown
+                        || self.pages.revalidate.contains(&self.files[file].entry.path)
+                })
             })
     }
 
@@ -187,6 +200,10 @@ impl State {
             || (!force && !self.needs_file_page())
         {
             return ActionTask::none();
+        }
+        if let Some(cursor) = self.pages.restart.take() {
+            self.pages.cursor = Some(cursor);
+            self.pages.seen.clear();
         }
         let (Some(cursor), Some(target)) = (self.pages.cursor.clone(), self.target.as_ref()) else {
             return ActionTask::none();
@@ -250,10 +267,19 @@ mod tests {
     }
 
     fn answer(state: &mut State, files: Vec<crate::github::PullRequestFile>, viewer: &str) {
+        answer_next(state, files, viewer, None);
+    }
+
+    fn answer_next(
+        state: &mut State,
+        files: Vec<crate::github::PullRequestFile>,
+        viewer: &str,
+        next_cursor: Option<String>,
+    ) {
         let context = state.context.as_ref().unwrap();
         let page = PullRequestFilePage {
             files,
-            next_cursor: None,
+            next_cursor,
             viewer: viewer.into(),
             pull_request_id: context.pull_request_id.clone(),
             head_oid: context.head_oid.clone(),
@@ -417,6 +443,250 @@ mod tests {
         answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
         assert!(state.files[105].viewed);
         assert_eq!(state.files[105].sync, ViewedSync::Settled);
+    }
+
+    #[tokio::test]
+    async fn refresh_revalidates_demanded_settled_marks_after_completed_pagination() {
+        use crate::repository::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput};
+        use cosmic::iced::futures::StreamExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Remote {
+            viewed: AtomicBool,
+            later_reads: AtomicUsize,
+        }
+        impl ProcessExecutor for Remote {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                let later = command.arguments.iter().any(|arg| arg == "cursor=page-2");
+                assert!(command.arguments.iter().any(|arg| {
+                    arg.to_string_lossy().contains(if later {
+                        "files(first:100,after:$cursor)"
+                    } else {
+                        "files(first:100)"
+                    })
+                }));
+                if later {
+                    self.later_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                let files: Vec<_> = (if later { 100..105 } else { 0..100 })
+                    .map(|i| {
+                        serde_json::json!({
+                            "path": format!("file-{i:04}.rs"),
+                            "viewerViewedState": if i != 104 || self.viewed.load(Ordering::Relaxed) {
+                                "VIEWED"
+                            } else {
+                                "UNVIEWED"
+                            }
+                        })
+                    })
+                    .collect();
+                let body = serde_json::json!({"data": {
+                    "viewer": {"login": "me"},
+                    "repository": {"pullRequest": {
+                        "id": "PR_1", "number": 1, "title": "Review", "state": "OPEN",
+                        "headRefName": "feature", "headRefOid": "a".repeat(40),
+                        "baseRefName": "main", "baseRefOid": "b".repeat(40),
+                        "updatedAt": "2026-11-19T00:00:00Z",
+                        "url": "https://viewed-refresh-test.invalid/o/r/pull/1",
+                        "viewerDidAuthor": false,
+                        "reviews": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+                        "files": {"nodes": files, "pageInfo": {
+                            "hasNextPage": !later,
+                            "endCursor": if later { None } else { Some("page-2") }
+                        }}
+                    }}
+                }});
+                Ok(ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: format!("HTTP/2.0 200 OK\r\n\r\n{body}").into_bytes(),
+                    stderr: vec![],
+                })
+            }
+        }
+
+        async fn complete(state: &mut State, task: ActionTask) {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    drop(state.update(action));
+                }
+            }
+        }
+
+        let remote = Arc::new(Remote {
+            viewed: AtomicBool::new(true),
+            later_reads: AtomicUsize::new(0),
+        });
+        let api = Arc::new(crate::github::GitHubService::new("gh", remote.clone()));
+        let mut state = State::new(api, RepositoryService::system("git"));
+        let mut target = target(1);
+        target.repository =
+            GitHubRepoKey::new("viewed-refresh-test.invalid", None, "o", "r").unwrap();
+        drop(state.update(Action::Open(target)));
+        let mut snapshot = loaded(
+            (0..105)
+                .map(|i| entry(&format!("file-{i:04}.rs"), ChangeKind::Modified))
+                .collect(),
+            (0..100)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        finish_load(&mut state, snapshot);
+        let task = state.update(Action::FilePage(PageAction::Viewport {
+            offset: 102.0 * design::DENSE_ROW_HEIGHT,
+            height: 2.0 * design::DENSE_ROW_HEIGHT,
+        }));
+        complete(&mut state, task).await;
+        assert!(state.pages.cursor.is_none());
+        assert!(state.files[104].viewed);
+        assert_eq!(state.files[104].sync, ViewedSync::Settled);
+
+        for (refresh, viewed) in [false, true].into_iter().enumerate() {
+            state.selected = None;
+            drop(state.update(Action::FilePage(PageAction::Viewport {
+                offset: 0.0,
+                height: 2.0 * design::DENSE_ROW_HEIGHT,
+            })));
+            remote.viewed.store(viewed, Ordering::Relaxed);
+            let task = state.update(Action::Refresh);
+            complete(&mut state, task).await;
+            assert!(!state.refreshing);
+            assert!(state.notice.is_none(), "refresh failed: {:?}", state.notice);
+            assert_eq!(
+                state.files[104].viewed, !viewed,
+                "retain the old mark while loading"
+            );
+            assert_eq!(state.files[104].sync, ViewedSync::Settled);
+            assert!(!state.pages.loading, "offscreen marks remain demand-driven");
+            let task = state.update(Action::FilePage(PageAction::Viewport {
+                offset: 102.0 * design::DENSE_ROW_HEIGHT,
+                height: 2.0 * design::DENSE_ROW_HEIGHT,
+            }));
+            assert!(
+                state.pages.loading,
+                "returning to page two must revalidate viewed marks after Refresh"
+            );
+            complete(&mut state, task).await;
+            assert_eq!(remote.later_reads.load(Ordering::Relaxed), refresh + 2);
+            assert_eq!(state.files[104].viewed, viewed);
+            assert_eq!(state.files[104].sync, ViewedSync::Settled);
+            assert!(state.pages.cursor.is_none());
+            drop(state.update(Action::NextUnviewed));
+            assert_eq!(state.selected.is_some(), !viewed);
+            if !viewed {
+                assert_eq!(
+                    state.selected,
+                    Some(RepoPath::parse("file-0104.rs").unwrap())
+                );
+            }
+        }
+    }
+
+    fn refresh_later_pages(state: &mut State) {
+        let mut snapshot = loaded(
+            state.files.iter().map(|file| file.entry.clone()).collect(),
+            (0..100)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        drop(state.update(Action::Refresh));
+        finish_load(state, snapshot);
+    }
+
+    #[test]
+    fn refresh_restarts_before_the_old_cursor_only_when_a_later_mark_is_demanded() {
+        let mut state = thousand_files();
+        drop(state.update(Action::FilePage(PageAction::More)));
+        answer_next(
+            &mut state,
+            vec![remote_file("file-0105.rs", true)],
+            "me",
+            Some("page-3".into()),
+        );
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-3"));
+        refresh_later_pages(&mut state);
+        assert!(!state.pages.loading);
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-3"));
+        assert!(state.files[105].viewed);
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
+
+        drop(state.update(Action::SelectFile(RepoPath::parse("file-0105.rs").unwrap())));
+        assert!(state.pages.loading);
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-2"));
+        assert!(state.pages.seen.is_empty());
+        answer_next(
+            &mut state,
+            vec![remote_file("file-0105.rs", false)],
+            "me",
+            Some("page-3".into()),
+        );
+        assert!(!state.files[105].viewed);
+        assert!(!state.pages.loading, "offscreen page three remains lazy");
+        assert_eq!(state.pages.cursor.as_deref(), Some("page-3"));
+    }
+
+    #[test]
+    fn revalidation_never_overwrites_a_newer_local_mutation_or_its_receipt() {
+        for outcome in [
+            None,
+            Some(ViewedOutcome::Applied),
+            Some(ViewedOutcome::NotApplied("refused".into())),
+            Some(ViewedOutcome::Unknown("lost receipt".into())),
+        ] {
+            let mut state = thousand_files();
+            let path = RepoPath::parse("file-0105.rs").unwrap();
+            drop(state.update(Action::FilePage(PageAction::More)));
+            answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+            refresh_later_pages(&mut state);
+            drop(state.update(Action::SelectFile(path.clone())));
+            assert!(state.pages.loading);
+            assert!(state.pages.revalidate.contains(&path));
+            drop(state.update(Action::ToggleViewed(path.clone())));
+            assert!(!state.pages.revalidate.contains(&path));
+            if let Some(outcome) = outcome {
+                drop(state.update(Action::ViewedApplied {
+                    generation: state.generation,
+                    authority_revision: state.authority_revision,
+                    results: vec![(path.clone(), false, outcome)],
+                }));
+            }
+            let expected = (state.files[105].viewed, state.files[105].sync);
+            answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+            assert_eq!((state.files[105].viewed, state.files[105].sync), expected);
+        }
+    }
+
+    #[test]
+    fn refresh_stays_lazy_after_full_hydration_finishes() {
+        let mut state = thousand_files();
+        drop(state.update(Action::SelectFile(RepoPath::parse("file-0105.rs").unwrap())));
+        drop(state.update(Action::ToggleViewedAndAdvance));
+        assert!(state.pages.hydrate_all);
+        answer(
+            &mut state,
+            (100..1000)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+            "me",
+        );
+        assert!(state.pages.cursor.is_none());
+        assert!(!state.pages.hydrate_all);
+        drop(state.update(Action::SelectFile(RepoPath::parse("file-0000.rs").unwrap())));
+        refresh_later_pages(&mut state);
+        assert!(
+            !state.pages.loading,
+            "completed hydration must not make every refresh eager"
+        );
+        assert!(state.pages.cursor.is_none());
+        assert!(state.files[105].viewed);
     }
 
     #[test]
