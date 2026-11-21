@@ -13101,22 +13101,23 @@ fn navigation_search_ranks(
 }
 
 /// The rail has room only for rows worth a glance: a search's matches, where
-/// the user is, news, live agents, deletions, and rows the Attention list
-/// keeps in place. A worktree with open panes counts as where the user is: the
-/// rail is how they switch back to it. Drawing and keyboard order both ask
-/// this, so the two cannot disagree about which rows exist.
+/// the user is, what the Attention list holds (news, and an agent a usage
+/// limit still stops after its news is read), live agents, deletions, and
+/// rows the Attention list keeps in place. Drawing and keyboard order both
+/// ask this, so the two cannot disagree about which rows exist.
 fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) -> bool {
     // The Attention list holds only channels worth a glance.
     state.filter == SidebarFilter::Attention
         || compact_rail_searching(state)
         || channel.selected
-        || channel.unread
+        || channel.needs_attention()
         || channel.activity.is_some()
         || channel.deletion.is_some()
         || state.retained_in_attention(SelectionRow::Channel(channel.id))
 }
 
-/// [`compact_rail_shows_channel`], for a worktree.
+/// [`compact_rail_shows_channel`], for a worktree. A worktree with open panes
+/// counts as where the user is: the rail is how they switch back to it.
 fn compact_rail_shows_worktree(
     state: &SidebarState,
     project: ProjectId,

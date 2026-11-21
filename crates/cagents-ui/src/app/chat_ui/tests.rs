@@ -2061,6 +2061,170 @@ mod initial_attachment_limits {
 }
 
 #[test]
+fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() {
+    use crate::agent_execution::directory::UsageLimit;
+    use crate::model::{ChannelId, ProjectChannel, ProjectId, WorktreeId};
+    use crate::repository::RepositoryId;
+    use crate::sidebar::{
+        SelectionRow, SidebarFilter, SidebarMode, SidebarProject, SidebarWorktree,
+    };
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.refresh_ui.focused = false;
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let other_card = live_chat(&mut app, None);
+    let target = chat_runtime(&app, card).target;
+    let handle = chat_runtime(&app, card).handle().unwrap().clone();
+    let project = ProjectId::new();
+    let limited_channel = ChannelId::new();
+    let other_channel = ChannelId::new();
+    app.sidebar_model.projects.push(SidebarProject::new(
+        project,
+        RepositoryId::new(),
+        "project".into(),
+        FIXTURE_DIRECTORY.into(),
+        vec![SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            FIXTURE_DIRECTORY.into(),
+            Some("main".into()),
+        )],
+        Vec::new(),
+    ));
+    Arc::make_mut(&mut app.durable).channels = [
+        (limited_channel, card, "Limited channel"),
+        (other_channel, other_card, "Other channel"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, (id, card, title))| ProjectChannel {
+        id,
+        project_id: project,
+        title: title.into(),
+        title_source: Default::default(),
+        ordinal: ordinal as u32,
+        shared: false,
+        cards: vec![card],
+        focused: Some(card),
+    })
+    .collect();
+    app.sidebar_state
+        .set_sidebar_worktrees(crate::settings::SidebarWorktrees::Expanded);
+    drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+        SidebarFilter::All,
+    ))));
+
+    // The daemon reports a limit while the channel is unread, without a pending request.
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.error = Some("You've hit your weekly limit".into());
+    handle.publish_snapshot_for_test(snapshot);
+    drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+    handle.judge_limit_for_test(Some(UsageLimit {
+        summary: "Weekly limit reached".into(),
+        reset: None,
+        resets_at: None,
+    }));
+    drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Limit))));
+    drop(app.update(Message::NotificationUi(
+        crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id: uuid::Uuid::new_v4(),
+                delivered: false,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event::session(
+                    chat_runtime(&app, card).session.id,
+                    Provider::Codex,
+                    FIXTURE_DIRECTORY.into(),
+                    crate::notifications::Evidence {
+                        key: "compact-limited-channel".into(),
+                        kind: crate::notifications::Kind::Failed,
+                    },
+                ),
+            }],
+            diagnostic: None,
+        }),
+    )));
+    assert!(app.sidebar_state.has_card_update(card));
+    assert_eq!(app.sidebar_state.card_attention(card).failed, 1);
+    assert_eq!(app.sidebar_state.card_attention(card).limited, 1);
+    assert_eq!(app.sidebar_state.card_attention(card).waiting, 0);
+
+    // Read the limited channel's update through the normal focused-pane
+    // acknowledgement, then leave it for the other channel.
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: limited_channel,
+    })));
+    assert_eq!(app.workspace.focused(), Some(card));
+    app.refresh_ui.focused = true;
+    drop(app.acknowledge_active_pane());
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: other_channel,
+    })));
+    assert_eq!(app.durable.active_channel, Some(other_channel));
+    let project_row = &app.sidebar_model.projects[0];
+    assert!(!app.sidebar_state.lists_panes(project_row));
+    assert_eq!(app.sidebar_state.filter(), SidebarFilter::All);
+    let row = project_row
+        .channels
+        .iter()
+        .find(|row| row.id == limited_channel)
+        .unwrap();
+    assert!(!row.selected);
+    assert!(!row.unread);
+    assert_eq!(row.activity, None);
+    assert_eq!(row.attention.limited, 1);
+    assert_eq!(row.attention.failed, 0);
+
+    // Both the real compact view and its keyboard order must keep the blocked
+    // channel, whether checkout rows are shown or hidden.
+    let renderer = crate::app::tests::headless_renderer();
+    for mode in [
+        crate::settings::SidebarWorktrees::Expanded,
+        crate::settings::SidebarWorktrees::Hidden,
+    ] {
+        app.sidebar_state.set_sidebar_worktrees(mode);
+        let mut element = crate::sidebar::view(
+            &app.sidebar_model,
+            &app.sidebar_state,
+            SidebarMode::Compact,
+            320.0,
+            false,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 900.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let names: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("Other channel")),
+            "{mode:?}: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("Limited channel")
+                && name.contains("1 stopped by a usage limit")),
+            "{mode:?}: the read channel still needs its Limited badge in the compact view: {names:?}"
+        );
+        assert!(
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, true)
+                .contains(&SelectionRow::Channel(limited_channel))
+        );
+    }
+}
+
+#[test]
 fn tail_only_history_cannot_replace_a_channels_first_task() {
     use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
     use crate::workspace_model::views::{Pane, Scope, View};
