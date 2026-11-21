@@ -244,9 +244,13 @@ fn typing_into(
         .unwrap_or_else(|p| p.into_inner())
         .agent_client_authorities
         .get(&client_id)
-        .cloned()
-        .unwrap_or_default();
-    let ceiling = super::caller_ceiling(host, &authority).map_err(denied)?;
+        .cloned();
+    // A connection acting for an agent without its authority recorded counts
+    // as limited, never as a person.
+    let ceiling = match authority {
+        Some(authority) => super::caller_ceiling(host, &authority).map_err(denied)?,
+        None => Some(crate::agent_execution::permission::Ceiling::unknown()),
+    };
     if ceiling.as_ref().is_none_or(|ceiling| ceiling.may_approve()) {
         return Ok(());
     }
