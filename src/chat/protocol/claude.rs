@@ -649,9 +649,10 @@ struct Claude {
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
-    /// The last turn ended because the reader stopped it, which the idle
-    /// state Claude reports after its result must not turn back into a
-    /// finished turn. Cleared when the next turn starts.
+    /// The last turn ended because the reader stopped it, which neither the
+    /// idle state Claude reports after its result nor the last decision it
+    /// left being answered may turn back into a finished turn. Cleared when
+    /// the next turn starts.
     ended_interrupted: bool,
     /// Whether this turn has shown where it was stopped: Claude Code records
     /// a stop as a user message, which is drawn as the marker in its place.
@@ -1035,7 +1036,12 @@ impl Claude {
                 string(request, "subtype") != "interrupt"
                     || request["_cagents_turn"].as_u64() != Some(self.attention_generation)
             });
-            self.status(false, "Claude turn complete", step);
+            let detail = if self.ended_interrupted {
+                chat::TURN_INTERRUPTED
+            } else {
+                "Claude turn complete"
+            };
+            self.status(false, detail, step);
         }
         self.retired.push_back(id);
         if self.retired.len() > 512 {
@@ -4568,12 +4574,12 @@ impl Claude {
                 // Background agents have their own status. They must not
                 // prevent new input once the main turn has ended.
                 let busy = !self.pending.is_empty();
-                self.ended_interrupted = !busy && stopped;
+                self.ended_interrupted = stopped;
                 self.status(
                     busy,
                     if busy {
                         "Claude turn ended; decisions remain"
-                    } else if self.ended_interrupted {
+                    } else if stopped {
                         chat::TURN_INTERRUPTED
                     } else {
                         "Claude turn complete"
