@@ -9426,12 +9426,10 @@ fn rows_find_focus_only_when_it_may_have_moved() {
     let mut list = logs.selectable_rows(30);
     let renderer = headless_renderer();
     let mut tree = Tree::new(&list);
-    let node = list.as_widget_mut().layout(
-        &mut tree,
-        &renderer,
-        &layout::Limits::new(Size::ZERO, Size::new(280.0, 600.0)),
-    );
+    let limits = layout::Limits::new(Size::ZERO, Size::new(280.0, 600.0));
+    let node = list.as_widget_mut().layout(&mut tree, &renderer, &limits);
     let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+    // Each row a row walked to find its focus, once per walk.
     let send = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, event: Event| {
         let mut messages = Vec::new();
         list.as_widget_mut().update(
@@ -9445,7 +9443,7 @@ fn rows_find_focus_only_when_it_may_have_moved() {
             &top,
         );
         Logs::take(&logs.updates);
-        Logs::take(&logs.operations)
+        std::mem::take(&mut *logs.operations.borrow_mut())
     };
     let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
     let in_view = (0..10).collect::<Vec<_>>();
@@ -9483,8 +9481,18 @@ fn rows_find_focus_only_when_it_may_have_moved() {
                 keyboard::Modifiers::SHIFT
             )),
         ),
-        (0..30).collect::<Vec<_>>(),
-        "a key may move focus in any row"
+        (0..30).flat_map(|row| [row, row]).collect::<Vec<_>>(),
+        "a key may move focus in any row, before or while the row handles it"
+    );
+    assert_eq!(send(&mut list, &mut tree, redraw()), none);
+
+    // Laying a row out again, as hovering its actions does, may move its
+    // target within it.
+    let _ = list.as_widget_mut().layout(&mut tree, &renderer, &limits);
+    assert_eq!(
+        send(&mut list, &mut tree, redraw()),
+        (0..10).chain([20]).collect::<Vec<_>>(),
+        "a row laid out again looks again"
     );
     assert_eq!(send(&mut list, &mut tree, redraw()), none);
 
@@ -9495,6 +9503,82 @@ fn rows_find_focus_only_when_it_may_have_moved() {
         (0..10).chain([20]).collect::<Vec<_>>(),
         "a rebuilt row looks again; the focused one out of view keeps its frames"
     );
+}
+
+/// A selected row's fill is drawn where its target is now, though the row
+/// moved since it last looked for it, as a pinned header does while the list
+/// scrolls under it.
+#[test]
+fn a_selected_rows_fill_follows_the_row() {
+    use cosmic::iced::{
+        Color, Event, Vector,
+        advanced::{Shell, clipboard, mouse, renderer::Headless as _, renderer::Style},
+        time::Instant,
+        window,
+    };
+
+    let row = SelectionRow::Channel(ChannelId::new());
+    let mut state = SidebarState::default();
+    state.select_rows(row, SelectionIntent::Toggle, &[row]);
+    let target = widget::button::custom(widget::Space::new().height(20))
+        .width(Length::Fill)
+        .id(selection_row_focus_id(row))
+        .class(cosmic::theme::Button::Text);
+    let mut element = row_interaction::RowInteraction::selectable(
+        widget::container(target).padding([0, 0, 0, 40]).into(),
+        row,
+        &state,
+        true,
+    );
+    let mut renderer = headless_renderer();
+    let theme = cosmic::Theme::dark();
+    let size = Size::new(200.0, 80.0);
+    let viewport = Rectangle::with_size(size);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(size.width, 20.0)),
+    );
+    let mut redraw = |layout| {
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Window(window::Event::RedrawRequested(Instant::now())),
+            layout,
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+    };
+    redraw(Layout::new(&node));
+    // Pinned below where it was when it looked, without being laid out again.
+    let moved = Layout::with_offset(Vector::new(0.0, 50.0), &node);
+    redraw(moved);
+    element.as_widget().draw(
+        &tree,
+        &mut renderer,
+        &theme,
+        &Style::default(),
+        moved,
+        mouse::Cursor::Unavailable,
+        &viewport,
+    );
+
+    let pixels = renderer.screenshot(
+        Size::new(size.width as u32, size.height as u32),
+        1.0,
+        Color::BLACK,
+    );
+    let filled = |x: usize, y: usize| {
+        let offset = (y * size.width as usize + x) * 4;
+        pixels[offset..offset + 3].iter().any(|value| *value > 0)
+    };
+    assert!(filled(120, 60), "the fill is under the row's target");
+    assert!(!filled(20, 60), "the fill leaves the row's indent");
+    assert!(!filled(120, 10), "no fill is left where the row was");
 }
 
 /// The same culling through the sidebar's own scrollable, which hands its

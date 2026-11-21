@@ -14069,7 +14069,9 @@ mod row_interaction {
     #[derive(Default)]
     struct State {
         modifiers: keyboard::Modifiers,
-        selection_bounds: Option<Rectangle>,
+        /// Where the row's own target sits, relative to the row, so that it
+        /// follows the row when a pinned header or the list moves it.
+        selection_area: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
         dragging: bool,
         drop: Option<(Option<super::SelectionRow>, f32)>,
@@ -14078,9 +14080,10 @@ mod row_interaction {
         /// Whether any control in the row has focus, such as its delete
         /// button, not only the row's own target.
         focus_within: bool,
-        /// Whether `focused`, `focus_within` and `selection_bounds` are
+        /// Whether `focused`, `focus_within` and `selection_area` are
         /// current: they are found again after each event that may move
-        /// focus and each operation, and lapse when the row is rebuilt.
+        /// focus and each operation, and lapse when the row is rebuilt or
+        /// laid out again.
         focus_known: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
@@ -14089,6 +14092,14 @@ mod row_interaction {
         overlaid: Cell<bool>,
         header_node: Option<layout::Node>,
         scroll: Option<Box<FilterScrollState>>,
+    }
+
+    impl State {
+        /// Where the row's own target is drawn in `layout`.
+        fn selection_bounds(&self, layout: Layout<'_>) -> Option<Rectangle> {
+            self.selection_area
+                .map(|area| area + (layout.position() - Point::ORIGIN))
+        }
     }
 
     struct FilterScrollState {
@@ -14275,7 +14286,9 @@ mod row_interaction {
             }
             let state = tree.state.downcast_mut::<State>();
             state.focused = focus.0;
-            state.selection_bounds = focus.2;
+            state.selection_area = focus
+                .2
+                .map(|bounds| bounds - (layout.position() - Point::ORIGIN));
             state.focus_within = focus.3;
             state.focus_known = true;
         }
@@ -14434,6 +14447,8 @@ mod row_interaction {
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
+            // Where the row's target sits may change with the layout.
+            tree.state.downcast_mut::<State>().focus_known = false;
             // Overlay controls are on screen only while the row is hovered or
             // focused, so only then does the base row lose the width they
             // cover. Every other frame the title is measured against the whole
@@ -14671,7 +14686,7 @@ mod row_interaction {
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                         if hovered
                             && state
-                                .selection_bounds
+                                .selection_bounds(layout)
                                 .is_some_and(|bounds| cursor.is_over(bounds)) =>
                     {
                         // A plain click is navigation: the row's own button
@@ -15090,7 +15105,7 @@ mod row_interaction {
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
                 // The row's own button, not the indented slot around it, so
                 // the mark lines up with the active row's highlight.
-                let bounds = state.selection_bounds.unwrap_or(layout.bounds());
+                let bounds = state.selection_bounds(layout).unwrap_or(layout.bounds());
                 if let Some(clip) = bounds.intersection(viewport) {
                     renderer.with_layer(clip, |renderer| {
                         renderer.fill_quad(
