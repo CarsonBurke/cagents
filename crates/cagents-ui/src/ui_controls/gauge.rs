@@ -48,8 +48,8 @@ const SPINNER_BACKGROUND_STEP: std::time::Duration = std::time::Duration::from_m
 const BACKGROUND_SLOWDOWN: u32 =
     (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_BACKGROUND_STEP.as_millis()) as u32;
 
-// Whole multiples keep each background step a whole number of focused steps,
-// so the arc lands on angles a focused spinner draws too.
+// Whole multiples keep the slowdown exact and each background step a whole
+// number of focused steps.
 const _: () = assert!(
     SPINNER_BACKGROUND_FRAME
         .as_millis()
@@ -693,7 +693,7 @@ mod tests {
 
     /// An unfocused window may still be in view, so its spinners keep moving,
     /// but slowly: one frame every background cadence, each advancing the arc
-    /// by one focused step. That holds whether a spinner was turning when focus
+    /// by one background step. That holds whether a spinner was turning when focus
     /// left or was mounted after it did, and the full cadence returns on the
     /// first redraw once the window has focus back.
     #[test]
@@ -733,6 +733,11 @@ mod tests {
                 stepped - slow,
                 SPINNER_BACKGROUND_STEP,
                 "one background frame should advance the arc by one background step"
+            );
+            assert_eq!(
+                SPINNER_BACKGROUND_STEP * 12,
+                crate::design::SPINNER_PERIOD,
+                "a background step should stay thirty degrees"
             );
         }
 

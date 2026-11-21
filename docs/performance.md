@@ -63,8 +63,8 @@ Each visible activity spinner asks for a whole-window redraw every
 `SPINNER_FRAME` (50 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
 focused. An unfocused window may still be in view, so its spinners keep turning,
 but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
-advance one focused step per frame. Measure the UI process with one busy agent
-on screen:
+advance the arc thirty degrees per frame, `SPINNER_BACKGROUND_STEP`. Measure
+the UI process with one busy agent on screen:
 
 1. Run `scripts/run-development --browserless` without `--debug` in a nested
    session, using the isolated environment from
@@ -106,7 +106,7 @@ that stopped them entirely measured 1.0-1.6% with another window focused
 A frame that only turns spinners skips the application's update, view and
 layout, but it still walks the whole widget tree for the redraw event and
 for drawing, and it presents the whole window. Two changes made such a frame
-cheaper by about a third, and in some runs by half (#3564):
+cheaper by a quarter to nearly a half (#3564):
 
 - iced_wgpu keeps a text group's prepared glyphs while the group draws the
   same text in the same place (#3571). Before, every frame prepared every
@@ -133,10 +133,12 @@ nearly doubles a spinner's cost on the UI thread against the 100 ms cadence
 on the same build (2.4% to 4.5% here), and it costs about one percentage
 point of a core more than the 100 ms cadence did before these changes. An
 unfocused window still asks for a frame every 500 ms and still moves the arc
-thirty degrees per frame, so its cost and look are unchanged. The remaining per-frame cost is the widget-tree walks
-for the redraw event (about a third of a frame, including overlay
-collection) and the present (about a quarter). Repainting less than the
-whole window would need damage tracking that iced does not have.
+thirty degrees per frame, so its cost and look are unchanged.
+
+The remaining per-frame cost is the widget-tree walks for the redraw event
+(about a third of a frame, including overlay collection) and the present
+(about a quarter). Repainting less than the whole window would need damage
+tracking that iced does not have.
 
 ## Idle UI wakeups
 
