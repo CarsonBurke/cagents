@@ -17,6 +17,7 @@ person.
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
 | A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat |
+| A pull request review read from cache while GitHub is unavailable, with a restored draft line comment | [`tests/fixtures/offline-review-cache.py`](#an-offline-cached-review), run through `scripts/native-evidence env python3 ...` once the app has started |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
@@ -334,7 +335,8 @@ in the sidebar shows them.
 Seeds cannot support evidence of the review flow. The pull request browser
 lists none of them, and opening a seeded pull request's review asks for its
 conversation, which the forge answers as not found. Like any failed GitHub
-read, that pauses the app's GitHub refreshes for a while.
+read, that pauses the app's GitHub refreshes for a while. That failure is
+exactly what [an offline cached review](#an-offline-cached-review) needs.
 
 A steps file for a sidebar with an avatar and the fixture worktree's pull
 request. The avatar step needs ImageMagick's `magick` on the build host. It
@@ -360,6 +362,62 @@ evidence cli project open '{fixture}/project'
 sleep 12
 evidence shot sidebar-avatar
 ```
+
+## An offline cached review
+
+A pull request review the app has read before reopens from its local cache
+while GitHub can't be reached: its files, viewed marks, selected file and any
+unposted draft, read only until GitHub confirms the review again.
+[`tests/fixtures/offline-review-cache.py`](../tests/fixtures/offline-review-cache.py)
+prepares that state. Run it once the app has started, since the cache lives in
+the app's own session store, and before opening the review; it takes no
+arguments:
+
+```sh
+scripts/native-evidence env python3 "$PWD/tests/fixtures/offline-review-cache.py"
+```
+
+It commits a base and a head to the fixture project, checks the head out as
+the worktree `.worktrees/cache-key` on `fix/cache-key`, gives the project the
+remote `https://github.com/octo-org/fixture-app` and turns the
+[forge](#an-offline-github) on with #57 **Key the response cache by locale**,
+which that worktree heads. It then writes #57's review into the store's
+`review_cache` tables in one transaction, as the app saves it:
+`docs/caching.md` added and viewed, `src/cache.rs` changed and selected, and
+a draft comment on line 23 of `src/cache.rs` that was never posted. The diff's
+commits are the project's own, so it renders; the forge answers the review's
+own queries as not found, so the review stays **Cached for fixture · read
+only**, with the failed `gh` read as its notice. The seed's write order is
+outside the app's clock, so the app's next save of the review replaces it, and
+running the script again rewrites the cache and keeps the commits. Other seeds
+in `fixture-forge-prs.json` are kept.
+
+To open the review as a person does, show the sidebar's search, choose its
+**Pull requests** filter and click the `fix/cache-key` row. The draft's
+composer sits under line 23; its buttons are below the fold at the default
+height, so scroll the diff to reach them. Don't click a diff gutter in a
+revision without the fix for #3417: that starts a comment the cached review has
+no authority for, and the app panics. A steps file:
+
+```sh
+evidence env python3 -I "$tool/tests/fixtures/offline-review-cache.py" >/dev/null
+evidence cli project open '{fixture}/project' >/dev/null
+evidence drive wait 'Worktrees' --timeout 60 >/dev/null
+evidence drive click 206,67 >/dev/null    # the sidebar's search
+evidence drive wait 'Pull requests' --timeout 10 >/dev/null
+evidence drive click 'Pull requests' >/dev/null
+evidence drive wait 'cache-key' --timeout 60 >/dev/null
+evidence drive click 'cache-key' >/dev/null
+evidence drive wait 'read only' --timeout 30 >/dev/null
+evidence drive wait 'empty locale' --timeout 30 >/dev/null
+evidence shot offline-review
+```
+
+If `Worktrees` is collapsed, the filter shows no `fix/cache-key` row until it
+is expanded. `tests/offline_review_cache_fixture.py` checks the rows the
+script writes against the tables `src/persistence.rs` creates, and that the
+forge lists #57 at the cached head; the native review is what shows the app
+reads them.
 
 ## A failed automatic terminal completion
 

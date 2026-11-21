@@ -324,8 +324,27 @@ impl State {
         })
     }
 
+    /// Whether this review was verified against GitHub, so a comment can be
+    /// anchored to it. A cached review read offline has no context yet.
+    pub(crate) fn has_discussion_authority(&self) -> bool {
+        self.target.is_some() && self.context.is_some()
+    }
+
+    /// Gives a thread control the cached review's read-only reason while it
+    /// waits for GitHub, so a disabled control says why.
+    fn read_only_reason<'a>(&self, control: impl Into<Element<'a, Action>>) -> Element<'a, Action> {
+        if self.has_discussion_authority() {
+            control.into()
+        } else {
+            crate::interaction::tooltip(control, READ_ONLY_UNTIL_REFRESH)
+        }
+    }
+
     fn can_mutate_discussion(&self) -> bool {
-        self.load == LoadState::Ready && !self.discussion.busy && self.discussion.unknown.is_none()
+        self.load == LoadState::Ready
+            && self.has_discussion_authority()
+            && !self.discussion.busy
+            && self.discussion.unknown.is_none()
     }
 
     fn can_discard_draft(&self) -> bool {
@@ -1379,6 +1398,9 @@ impl State {
 }
 
 /// Where the submission popover opens, below its anchor button.
+/// Why a cached review's thread controls are disabled, in the words of its
+/// "read only until GitHub refreshes" notice.
+const READ_ONLY_UNTIL_REFRESH: &str = "Read only until GitHub refreshes";
 const REVIEW_POPUP_OFFSET: f32 = 30.0;
 const REVIEW_POPUP_WIDTH: f32 = 380.0;
 
@@ -1779,18 +1801,18 @@ impl State {
                 {
                     rows.push(
                         widget::row::with_children(vec![
-                            crate::ui_controls::button::quiet("Edit")
-                                .on_press_maybe(
+                            self.read_only_reason(
+                                crate::ui_controls::button::quiet("Edit").on_press_maybe(
                                     (enabled && comment.viewer_can_update)
                                         .then_some(Action::Edit(id.clone())),
-                                )
-                                .into(),
-                            crate::ui_controls::button::quiet("Delete draft")
-                                .on_press_maybe(
+                                ),
+                            ),
+                            self.read_only_reason(
+                                crate::ui_controls::button::quiet("Delete draft").on_press_maybe(
                                     (enabled && comment.viewer_can_delete)
                                         .then_some(Action::Delete(id.clone())),
-                                )
-                                .into(),
+                                ),
+                            ),
                         ])
                         .spacing(space::S)
                         .into(),
@@ -1804,16 +1826,18 @@ impl State {
             };
             rows.push(
                 widget::row::with_children(vec![
-                    crate::ui_controls::button::quiet("Reply")
-                        .on_press_maybe(enabled.then_some(Action::Reply(thread.id.clone())))
-                        .into(),
-                    crate::ui_controls::button::quiet("Resolve")
-                        .instead("Reopen", thread.resolved)
-                        .on_press_maybe((enabled && can_resolve).then_some(Action::Resolve {
-                            thread: thread.id.clone(),
-                            resolved: !thread.resolved,
-                        }))
-                        .into(),
+                    self.read_only_reason(
+                        crate::ui_controls::button::quiet("Reply")
+                            .on_press_maybe(enabled.then_some(Action::Reply(thread.id.clone()))),
+                    ),
+                    self.read_only_reason(
+                        crate::ui_controls::button::quiet("Resolve")
+                            .instead("Reopen", thread.resolved)
+                            .on_press_maybe((enabled && can_resolve).then_some(Action::Resolve {
+                                thread: thread.id.clone(),
+                                resolved: !thread.resolved,
+                            })),
+                    ),
                 ])
                 .spacing(space::S)
                 .into(),
@@ -1897,42 +1921,44 @@ impl State {
                 widget::row::with_children(vec![
                     // Starting a review relabels this button; the
                     // controls beside it stay put.
-                    crate::ui_controls::button::primary("Comment")
-                        .instead(
-                            "Save comment",
-                            matches!(composer.destination, Destination::Edit(_)),
-                        )
-                        .instead("Add to review", has_pending_review)
-                        .on_press_maybe(
-                            (enabled
-                                && !stale
-                                && (editing || !pending_on_old_head)
-                                && !composer.content.text().trim().is_empty())
-                            .then_some(
-                                if matches!(composer.destination, Destination::Edit(_))
-                                    || has_pending_review
-                                {
-                                    Action::Save
-                                } else {
-                                    Action::SaveNow
-                                },
+                    self.read_only_reason(
+                        crate::ui_controls::button::primary("Comment")
+                            .instead(
+                                "Save comment",
+                                matches!(composer.destination, Destination::Edit(_)),
+                            )
+                            .instead("Add to review", has_pending_review)
+                            .on_press_maybe(
+                                (enabled
+                                    && !stale
+                                    && (editing || !pending_on_old_head)
+                                    && !composer.content.text().trim().is_empty())
+                                .then_some(
+                                    if matches!(composer.destination, Destination::Edit(_))
+                                        || has_pending_review
+                                    {
+                                        Action::Save
+                                    } else {
+                                        Action::SaveNow
+                                    },
+                                ),
                             ),
-                        )
-                        .into(),
-                    crate::ui_controls::button::secondary("Add to review")
-                        .instead("Comment now", has_pending_review)
-                        .on_press_maybe(
-                            (enabled
-                                && !stale
-                                && !matches!(composer.destination, Destination::Edit(_))
-                                && !composer.content.text().trim().is_empty())
-                            .then_some(if has_pending_review {
-                                Action::SaveNow
-                            } else {
-                                Action::Save
-                            }),
-                        )
-                        .into(),
+                    ),
+                    self.read_only_reason(
+                        crate::ui_controls::button::secondary("Add to review")
+                            .instead("Comment now", has_pending_review)
+                            .on_press_maybe(
+                                (enabled
+                                    && !stale
+                                    && !matches!(composer.destination, Destination::Edit(_))
+                                    && !composer.content.text().trim().is_empty())
+                                .then_some(if has_pending_review {
+                                    Action::SaveNow
+                                } else {
+                                    Action::Save
+                                }),
+                            ),
+                    ),
                     // Local to the draft, so live through a background
                     // refresh, as typing is; only a write in flight holds them.
                     crate::ui_controls::button::quiet("Preview")
@@ -1981,6 +2007,102 @@ pub(crate) mod tests {
             side: ReviewDiffSide::Right,
             start_line: 4,
             line: 7,
+        }
+    }
+
+    #[test]
+    fn offline_cached_review_rejects_comment_actions_until_authority_refreshes() {
+        use crate::pull_request_review::Action as ReviewAction;
+
+        let (mut state, _) = crate::pull_request_review::tests::state();
+        drop(state.update(ReviewAction::Open(target(1))));
+        state.cache_loading = true;
+        drop(state.update(ReviewAction::Cached {
+            generation: state.generation,
+            result: Ok(Some(Arc::new(cache::fixture()))),
+        }));
+        drop(state.update(ReviewAction::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Err("Offline".into()),
+        }));
+        let path = RepoPath::parse("src/main.rs").unwrap();
+        drop(state.update(ReviewAction::SelectFile(path.clone())));
+        assert_eq!(state.load, LoadState::Ready);
+        assert_eq!(state.selected(), Some(&path));
+        assert!(state.context.is_none());
+
+        let anchor = Anchor {
+            path: "src/main.rs".into(),
+            ..anchor()
+        };
+        for action in [
+            Action::Begin(anchor.clone()),
+            Action::BeginFile("src/main.rs".into()),
+            Action::Reply("thread".into()),
+        ] {
+            // Use the same fencing and update dispatch as the diff gutter.
+            let action = state.review_action(action);
+            drop(state.update(action));
+            assert!(state.discussion.composer.is_none());
+            assert!(!state.discussion.busy);
+        }
+        assert!(!state.can_mutate_discussion());
+
+        crate::pull_request_review::tests::finish_load(
+            &mut state,
+            loaded(vec![entry("src/main.rs", ChangeKind::Modified)], vec![]),
+        );
+        assert!(state.can_mutate_discussion());
+        let action = state.review_action(Action::Begin(anchor));
+        drop(state.update(action));
+        assert!(state.discussion.composer.is_some());
+    }
+
+    #[test]
+    fn offline_cached_review_keeps_a_restored_draft_without_writing_it() {
+        use crate::pull_request_review::Action as ReviewAction;
+
+        let mut drafted = ready();
+        drop(drafted.update_discussion(Action::Begin(anchor())));
+        drafted.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Draft written before going offline");
+        let drafts =
+            serde_json::from_str(&serde_json::to_string(&drafted.local_drafts()).unwrap()).unwrap();
+
+        let (mut state, _) = crate::pull_request_review::tests::state();
+        drop(state.update(ReviewAction::Open(target(1))));
+        state.cache_loading = true;
+        drop(state.update(ReviewAction::Cached {
+            generation: state.generation,
+            result: Ok(Some(Arc::new(cache::fixture()))),
+        }));
+        drop(state.update(ReviewAction::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            result: Err("Offline".into()),
+        }));
+        state.restore_drafts(drafts, None);
+        assert!(state.context.is_none());
+        assert!(!state.can_mutate_discussion());
+        let dirty = state.cache_dirty;
+
+        for action in [Action::Save, Action::SaveNow, Action::Reanchor] {
+            let action = state.review_action(action);
+            drop(state.update(action));
+            let composer = state
+                .discussion
+                .composer
+                .as_ref()
+                .expect("the restored draft stays");
+            assert_eq!(
+                composer.content.text(),
+                "Draft written before going offline"
+            );
+            assert_eq!(composer.destination, Destination::Line(anchor()));
+            assert!(!state.discussion.busy, "no review write may start");
+            assert!(!state.discussion.saving_composer);
+            assert_eq!(state.cache_dirty, dirty, "no draft rewrite is scheduled");
         }
     }
 
