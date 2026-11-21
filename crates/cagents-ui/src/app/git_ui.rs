@@ -22,6 +22,19 @@ pub struct Snapshot {
     archived: Arc<ArchivedPrs>,
 }
 
+impl Snapshot {
+    /// Whether an archived PR names this checkout's branch but was proved
+    /// against another HEAD, so only a local ancestry check can settle it.
+    fn awaits_archived_proof(&self, record: &WorktreeRecord) -> bool {
+        self.heads.get(&record.id).is_some_and(|head_repository| {
+            self.archived.associations.iter().any(|association| {
+                association.matches(record, head_repository)
+                    && record.head_oid.as_deref() != Some(association.validated_head.as_str())
+            })
+        })
+    }
+}
+
 /// Shared across snapshot clones to keep local result messages small. Remote
 /// results can replace candidates while a local read is in flight.
 #[derive(Debug, Clone, Default)]
@@ -111,20 +124,8 @@ impl State {
             .snapshot
             .worktrees
             .iter()
-            .filter_map(|(record, _)| {
-                let head = entry.snapshot.heads.get(&record.id)?;
-                entry
-                    .snapshot
-                    .archived
-                    .associations
-                    .iter()
-                    .any(|association| {
-                        association.matches(record, head)
-                            && record.head_oid.as_deref()
-                                != Some(association.validated_head.as_str())
-                    })
-                    .then_some(record.id)
-            })
+            .filter(|(record, _)| entry.snapshot.awaits_archived_proof(record))
+            .map(|(record, _)| record.id)
             .collect::<std::collections::BTreeSet<_>>();
         if !worktrees.is_empty() {
             self.changed(
@@ -402,9 +403,18 @@ impl Cagents {
                             .collect(),
                     );
                     if let Some(entry) = self.refresh_ui.git.entries.get(&project) {
+                        // A proof from before a local commit waits for the
+                        // queued read instead of clearing a valid PR first.
+                        let settled = entry
+                            .snapshot
+                            .worktrees
+                            .iter()
+                            .filter(|(record, _)| !entry.snapshot.awaits_archived_proof(record))
+                            .cloned()
+                            .collect::<Vec<_>>();
                         apply_attached_worktree_prs(
                             row,
-                            &entry.snapshot.worktrees,
+                            &settled,
                             &pull_requests
                                 .iter()
                                 .map(|(pr, _)| pr.clone())
@@ -764,16 +774,20 @@ fn read_local_with_plan(
     // This function runs in the local blocking worker. Only a changed proof
     // runs ancestry Git; ordinary edits retain the proof without extra work.
     let mut archived = Vec::new();
-    for (record, _) in &snapshot.worktrees {
-        let Some(head_repository) = snapshot.heads.get(&record.id) else {
-            continue;
-        };
-        let Some(local_head) = &record.head_oid else {
-            continue;
-        };
-        for association in &snapshot.archived.associations {
+    for association in &snapshot.archived.associations {
+        let mut matched = false;
+        for (record, _) in &snapshot.worktrees {
+            let Some(head_repository) = snapshot.heads.get(&record.id) else {
+                continue;
+            };
+            if !association.matches(record, head_repository) {
+                continue;
+            }
+            matched = true;
+            let Some(local_head) = &record.head_oid else {
+                continue;
+            };
             if !cancellation.is_cancelled()
-                && association.matches(record, head_repository)
                 && (association.validated_head == *local_head
                     || association.pull_request.head_ref_oid == *local_head
                     || pr_head_is_ancestor(
@@ -787,6 +801,12 @@ fn read_local_with_plan(
                     validated_head: local_head.clone(),
                 });
             }
+        }
+        // A checkout that is briefly elsewhere (another branch, a rebase's
+        // detached HEAD) has not disproved the association. It applies again
+        // only when a checkout returns to the proved HEAD or a descendant.
+        if !matched {
+            archived.push(association.clone());
         }
     }
     archived.sort_by(|a, b| {
@@ -2331,6 +2351,74 @@ mod tests {
                 .map(|pr| pr.number),
             Some(7)
         );
+    }
+
+    fn read_worktree(app: &Cagents, project: ProjectId) -> (Snapshot, Option<git_watch::Project>) {
+        let snapshot = app.refresh_ui.git.entries[&project].snapshot.clone();
+        let change = git_watch::Change {
+            worktrees: [snapshot.worktrees[0].0.id].into_iter().collect(),
+            ..Default::default()
+        };
+        read_local(project, snapshot, change, CancellationToken::default()).unwrap()
+    }
+
+    fn attached_number(app: &Cagents) -> Option<u64> {
+        app.sidebar_model.projects[0].worktrees[0]
+            .pull_request()
+            .map(|pr| pr.number)
+    }
+
+    #[test]
+    fn leaving_and_returning_to_proved_head_restores_archived_pr() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, key, archived) = archived_fixture(directory.path());
+        let (mut app, project) = catalog_app(&snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        archived_remote(&mut app, project.id, &key, vec![archived]);
+        assert_eq!(attached_number(&app), Some(7));
+        for (step, expected) in [
+            (&["checkout", "main"][..], None),
+            (&["checkout", "feature"][..], Some(7)),
+        ] {
+            git(directory.path(), step);
+            let (updated, plan) = read_worktree(&app, project.id);
+            drop(app.update_git(Action::Read {
+                project: project.id,
+                generation: 1,
+                result: Ok((updated, plan)),
+            }));
+            assert_eq!(attached_number(&app), expected, "after git {step:?}");
+        }
+    }
+
+    #[test]
+    fn remote_proof_from_before_local_commit_keeps_pr_until_recheck() {
+        let directory = tempfile::tempdir().unwrap();
+        let (snapshot, key, archived) = archived_fixture(directory.path());
+        let (mut app, project) = catalog_app(&snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
+        git(
+            directory.path(),
+            &["commit", "--allow-empty", "-m", "later local work"],
+        );
+        let (updated, plan) = read_worktree(&app, project.id);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((updated, plan)),
+        }));
+        assert_eq!(attached_number(&app), Some(7));
+        // A refresh started before the commit returns its older proof.
+        archived_remote(&mut app, project.id, &key, vec![archived]);
+        assert_eq!(attached_number(&app), Some(7));
+        let (rechecked, plan) = read_worktree(&app, project.id);
+        drop(app.update_git(Action::Read {
+            project: project.id,
+            generation: 1,
+            result: Ok((rechecked, plan)),
+        }));
+        assert_eq!(attached_number(&app), Some(7));
     }
 
     #[test]
