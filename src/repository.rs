@@ -93,7 +93,7 @@ const MAX_UNTRACKED_STATUS_FILES: usize = 4096;
 /// Stdout budget for each of the two reads in [`RepositoryService::file_inventory`].
 ///
 /// A 100,000-file checkout with 60-byte paths lists in about 6 MiB, and its
-/// v2 status grows by roughly 150 bytes per changed path, so a checkout that
+/// v2 status grows by roughly 175 bytes per changed path, so a checkout that
 /// size with every file changed would pass the executor's general-purpose
 /// 16 MiB default. Both reads therefore have an explicit 64 MiB budget.
 /// Exceeding either aborts the read with [`ProcessFailureKind::OutputLimit`],
