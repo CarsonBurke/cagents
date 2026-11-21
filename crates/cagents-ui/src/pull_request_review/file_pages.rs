@@ -192,6 +192,9 @@ impl State {
     /// of a demanded stale mark, otherwise the next unread page when it is
     /// demanded. Stale marks never restart pagination.
     fn page_request(&self, force: bool) -> Option<(String, bool)> {
+        if self.pages.cursor.is_none() && self.pages.revalidate.is_empty() {
+            return None;
+        }
         let mut demanded: Vec<usize> = [self.pages.wanted.as_ref(), self.selected.as_ref()]
             .into_iter()
             .flatten()
@@ -703,6 +706,47 @@ mod tests {
         );
         assert_eq!(state.files[305].sync, ViewedSync::Settled);
         assert_eq!(state.pages.cursor.as_deref(), Some("page-5"));
+    }
+
+    #[test]
+    fn a_failed_reread_waits_for_retry_and_then_settles_its_whole_page() {
+        let mut state = thousand_files();
+        drop(state.update(Action::FilePage(PageAction::More)));
+        answer(
+            &mut state,
+            vec![
+                remote_file("file-0105.rs", true),
+                remote_file("file-0106.rs", true),
+            ],
+            "me",
+        );
+        assert!(state.pages.cursor.is_none());
+        refresh_later_pages(&mut state);
+        drop(state.update(Action::SelectFile(RepoPath::parse("file-0105.rs").unwrap())));
+        assert_eq!(state.pages.revalidating.as_deref(), Some("page-2"));
+        drop(state.update(Action::FilePage(PageAction::Loaded {
+            generation: state.generation,
+            load: state.load_generation,
+            cursor: "page-2".into(),
+            result: Err("network".into()),
+        })));
+        assert!(!state.pages.loading, "a failed reread waits for Retry");
+        assert_eq!(state.pages.error.as_deref(), Some("network"));
+        assert_eq!(state.pages.revalidate.len(), 2);
+
+        drop(state.update(Action::FilePage(PageAction::More)));
+        assert!(state.pages.error.is_none());
+        assert_eq!(state.pages.revalidating.as_deref(), Some("page-2"));
+        answer(&mut state, vec![remote_file("file-0105.rs", false)], "me");
+        assert!(!state.files[105].viewed);
+        assert!(
+            state.pages.revalidate.is_empty(),
+            "a reread settles marks its page no longer lists"
+        );
+        assert!(state.files[106].viewed);
+        assert_eq!(state.files[106].sync, ViewedSync::Settled);
+        drop(state.update(Action::SelectFile(RepoPath::parse("file-0106.rs").unwrap())));
+        assert!(!state.pages.loading);
     }
 
     #[test]
