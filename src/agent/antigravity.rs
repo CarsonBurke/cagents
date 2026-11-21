@@ -85,6 +85,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     permission_modes: &["default", "acceptEdits", "auto", "plan"],
     permission_mode_aliases: &[],
     permission_sandboxes: &[],
+    approves_through_questions: false,
     acp: Some(super::Acp {
         mode_option: "--mode",
         effort_option: "--effort",

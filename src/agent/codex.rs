@@ -73,6 +73,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     permission_modes: &["untrusted", "on-failure", "on-request", "never"],
     permission_mode_aliases: &[],
     permission_sandboxes: &["read-only", "workspace-write", "danger-full-access"],
+    approves_through_questions: false,
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: true,

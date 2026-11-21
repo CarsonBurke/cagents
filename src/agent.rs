@@ -172,6 +172,9 @@ struct ProviderAdapter {
     /// Sandboxes a mode may name after its approval policy and a `/`, as in
     /// Codex's `on-request/read-only`.
     permission_sandboxes: &'static [&'static str],
+    /// Whether its native chat asks for tool approvals as ordinary questions,
+    /// so answering one of its questions may approve a tool.
+    approves_through_questions: bool,
     /// What cagents knows of a provider whose native chat is the Agent
     /// Client Protocol, for one that serves it.
     acp: Option<Acp>,
@@ -373,6 +376,12 @@ impl Provider {
     /// Other names its terminal gives the same modes, also accepted.
     pub fn permission_mode_aliases(self) -> &'static [&'static str] {
         self.adapter().permission_mode_aliases
+    }
+
+    /// Whether answering one of its native chat's questions may approve a
+    /// tool, as an Oh My Pi confirmation does.
+    pub fn approves_through_questions(self) -> bool {
+        self.adapter().approves_through_questions
     }
 
     /// Sandboxes a mode may name after `/`.

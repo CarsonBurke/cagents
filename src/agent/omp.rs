@@ -79,6 +79,9 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     permission_modes: &["always-ask", "write", "yolo"],
     permission_mode_aliases: &[],
     permission_sandboxes: &[],
+    // Its tool approvals arrive as extension confirmations, the same
+    // requests its other questions use.
+    approves_through_questions: true,
     acp: None,
     #[cfg(feature = "host")]
     forwards_to_native_child: false,

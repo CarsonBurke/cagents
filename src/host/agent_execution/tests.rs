@@ -4136,6 +4136,108 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
     settled(&host, stricter.run.id);
 }
 
+/// Oh My Pi asks its tool approvals as questions, so an agent that can't
+/// approve its child's tool requests may only cancel an Oh My Pi child's.
+#[test]
+fn a_limited_agent_only_cancels_an_oh_my_pi_child_s_questions() {
+    if isolated("a_limited_agent_only_cancels_an_oh_my_pi_child_s_questions").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let program = root.join("bin/omp");
+    std::fs::write(&program, r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$HOME/../omp-arguments"
+printf '{"type":"ready"}\n'
+while IFS= read -r frame; do
+  id=${frame#*'"id":"'}; id=${id%%'"'*}
+  kind=${frame#*'"type":"'}; kind=${kind%%'"'*}
+  data='{}'
+  case "$kind" in
+    negotiate_protocol) ;;
+    get_state) data='{"sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","isStreaming":false}' ;;
+    get_available_models) data='{"models":[]}' ;;
+    get_available_commands) data='{"commands":[]}' ;;
+    get_subagents) data='{"subagents":[]}' ;;
+    set_subagent_subscription) data='{"level":"events"}' ;;
+    get_messages_page) data='{"messages":[],"nextCursor":null}' ;;
+    get_session_stats) data='{"tokens":{"input":1,"output":1},"cost":0}' ;;
+    prompt)
+      prompt=$id
+      printf '{"type":"agent_start"}\n'
+      printf '{"type":"extension_ui_request","id":"permission","method":"confirm","title":"Allow write?","message":"src/main.rs"}\n'
+      ;;
+    extension_ui_response)
+      printf '%s\n' "$frame" > "$HOME/../omp-answer"
+      printf '{"type":"message_end","message":{"id":"message-1","role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","timestamp":1}}\n'
+      printf '{"type":"agent_end","isTerminal":true}\n'
+      printf '{"type":"prompt_result","id":"%s","status":"completed","agentInvoked":true}\n' "$prompt"
+      continue
+      ;;
+    abort) ;;
+    *) exit 17 ;;
+  esac
+  printf '{"type":"response","id":"%s","command":"%s","success":true,"data":%s}\n' "$id" "$kind" "$data"
+done
+"#).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let spawn = |authority: &Authority, key: &str, provider, mode: Option<&str>| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.provider = provider;
+        spec.permission_mode = mode.map(str::to_owned);
+        if provider == Provider::Omp {
+            spec.model = Some("fixture/model".into());
+        }
+        request.idempotency_key = key.into();
+        submit(&host, authority, request).unwrap()
+    };
+    let parent = spawn(
+        &Authority::default(),
+        "parent",
+        Provider::Claude,
+        Some("default"),
+    );
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let agent = agent_authority(&host, parent.agent.id);
+    let child = spawn(&agent, "omp", Provider::Omp, None);
+    assert_eq!(
+        child.agent.spec.permission_mode.as_deref(),
+        Some("always-ask")
+    );
+    let asked = pending(&host, &agent, child.agent.id);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(asked.kind, chat::RequestKind::Question);
+    let answer = |action: &str| {
+        process(
+            &host,
+            agent.clone(),
+            Operation::Control {
+                agent: child.agent.id,
+                command: Control::Answer {
+                    request_id: asked.id.clone(),
+                    action: action.into(),
+                    answers: Vec::new(),
+                },
+            },
+        )
+    };
+    assert_eq!(
+        answer("submit").unwrap_err(),
+        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+    );
+    assert!(!root.join("omp-answer").exists(), "nothing was confirmed");
+    answer("cancel").unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let answered = std::fs::read_to_string(root.join("omp-answer")).unwrap();
+    assert!(answered.contains(r#""cancelled":true"#), "{answered}");
+}
+
 fn pending(host: &SharedHost, authority: &Authority, agent: AgentId) -> Vec<chat::Request> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

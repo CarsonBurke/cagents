@@ -2098,7 +2098,7 @@ fn control(
     status(host, authority, id)?;
     let gate = agent_gate(host, id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-    let (_, run, handle) = owned_provider(host, authority, id)?;
+    let (agent, run, handle) = owned_provider(host, authority, id)?;
     if registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2205,14 +2205,19 @@ fn control(
                     actions.join(", ")
                 ));
             }
-            // Approving a tool request grants what the child asked for, so
-            // only an agent that runs with nothing asking may do it. Any
-            // agent may refuse one, as the provider's adapter reads the action.
-            let ceiling = match request.kind {
-                chat::RequestKind::Approval => {
-                    caller_ceiling(host, authority)?.filter(|ceiling| !ceiling.may_approve())
-                }
-                _ => None,
+            // Approving a tool request, or consenting to what a tool asks,
+            // grants what the child asked for, so only an agent that runs with
+            // nothing asking may do it. Any agent may refuse one, as the
+            // provider's adapter reads the action. A provider that asks its
+            // tool approvals as questions has each of its questions treated so.
+            let grants = match request.kind {
+                chat::RequestKind::Approval | chat::RequestKind::Consent => true,
+                chat::RequestKind::Question => agent.spec.provider.approves_through_questions(),
+            };
+            let ceiling = if grants {
+                caller_ceiling(host, authority)?.filter(|ceiling| !ceiling.may_approve())
+            } else {
+                None
             };
             if let Some(answer) = answers
                 .iter()
