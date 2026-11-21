@@ -1,10 +1,10 @@
 //! What a connection that authenticated as an agent session may do. It reads
 //! every terminal, but changes only those its lineage controls: its own
 //! session, the terminals it started and the sessions of the agents it
-//! delegated to. Typing into a delegated agent's session or console acts as
-//! the person at it, who can approve the agent's tool requests, so only an
-//! agent whose own approvals are not limited may do it. Anything outside the
-//! terminal surface stays with the user.
+//! delegated to. Typing into a delegated agent's session, an agent console or
+//! a provider CLI acts as the person at it, who can approve tool requests, so
+//! only an agent whose own approvals are not limited may do it. Anything
+//! outside the terminal surface stays with the user.
 //!
 //! The boundary is the `cagents` CLI, which authenticates before it changes a
 //! terminal from inside a hosted session. A process that reaches the socket
@@ -188,25 +188,52 @@ pub(in crate::host) fn admit(
                     "Terminal {terminal} belongs to another session; message it with `cagents send` instead"
                 )));
             };
-            match (access(request), control) {
-                (Access::Input(_), Control::Delegated { agent, console }) => {
-                    typing_into(host, client_id, &agent, console)
-                }
+            match access(request) {
+                Access::Input(terminal) => typing_into(host, client_id, terminal, control),
                 _ => Ok(()),
             }
         }
     }
 }
 
-/// Refuses input into a delegated agent's session or console from an agent
-/// whose own approvals are limited: whatever it types there, such as an
-/// `/answer` approving a tool request, the agent reads as its person's.
+/// Refuses input from an agent whose own approvals are limited into a
+/// terminal that reads it as its person's, where whatever it types, such as
+/// an `/answer` or a key approving a tool request, could approve work the
+/// agent may not approve itself: a delegated agent's session or console, any
+/// agent's console, or a provider CLI's terminal, its own included.
 fn typing_into(
     host: &SharedHost,
     client_id: ClientId,
-    agent: &crate::agent_execution::Agent,
-    console: bool,
+    terminal: TerminalId,
+    control: Control,
 ) -> Result<(), ProtocolError> {
+    let target = match control {
+        Control::Delegated { agent, console } => {
+            let name = agent
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("agent {}", agent.id));
+            let surface = if console { "console" } else { "session" };
+            format!("{name}'s {surface}")
+        }
+        Control::Own => {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(launch) = state
+                .terminals
+                .get(&terminal)
+                .map(|record| record.execution_launch())
+            else {
+                return Ok(());
+            };
+            if crate::agent_execution::console_agent(launch).is_some() {
+                "its own console".to_owned()
+            } else if let Some((provider, _)) = crate::agent::Provider::launched(launch) {
+                format!("terminal {terminal}, which runs {}", provider.label())
+            } else {
+                return Ok(());
+            }
+        }
+    };
     let authority = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -218,13 +245,8 @@ fn typing_into(
     if ceiling.as_ref().is_none_or(|ceiling| ceiling.may_approve()) {
         return Ok(());
     }
-    let name = agent
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("agent {}", agent.id));
-    let surface = if console { "console" } else { "session" };
     Err(denied(format!(
-        "This agent can't type into {name}'s {surface} because its approvals are limited. Use `cagents agent message` instead."
+        "This agent can't type into {target} because its approvals are limited. Use `cagents agent message` instead."
     )))
 }
 
@@ -287,7 +309,7 @@ enum Control {
     Own,
     /// It is the session, or the console, of an agent the lineage delegated to.
     Delegated {
-        agent: crate::agent_execution::Agent,
+        agent: Box<crate::agent_execution::Agent>,
         console: bool,
     },
 }
@@ -322,7 +344,10 @@ fn controls(
                     .unwrap_or(Lineage(session))
                     == target
             {
-                return Ok(Some(Control::Delegated { agent, console }));
+                return Ok(Some(Control::Delegated {
+                    agent: Box::new(agent),
+                    console,
+                }));
             }
         }
     }

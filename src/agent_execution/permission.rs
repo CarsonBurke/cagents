@@ -488,8 +488,13 @@ fn launched_mode(
             let named = last(&["--permission-mode"])
                 .flatten()
                 .map(str::to_owned)
-                .or_else(|| environment("CLAUDE_CODE_PERMISSION_MODE"))
-                .or_else(|| crate::chat::claude_settings_default_mode(recipe))?;
+                .or_else(|| environment("CLAUDE_CODE_PERMISSION_MODE"));
+            // Settings the command line names or leaves out decide the rest,
+            // which the account's own settings then do not show.
+            if named.is_none() && switch(&["--settings", "--setting-sources"]) {
+                return None;
+            }
+            let named = named.or_else(|| crate::chat::claude_settings_default_mode(recipe))?;
             Mode::parse(provider, &named)
         }
         Provider::Codex => {
@@ -985,6 +990,41 @@ mod tests {
                 Ceiling::launched(&recipe(program, arguments)).tier(),
                 tier,
                 "{program} {arguments:?}"
+            );
+        }
+
+        // Settings the command line chooses or leaves out are not the
+        // account's, which here would bypass permissions.
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join("settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        let account = |arguments: &[&str]| crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: arguments.iter().map(|&argument| argument.into()).collect(),
+            working_directory: config.path().into(),
+            environment: [(
+                "CLAUDE_CONFIG_DIR".into(),
+                config.path().display().to_string(),
+            )]
+            .into(),
+            unset_environment: ["CLAUDE_CODE_PERMISSION_MODE".into()].into(),
+        };
+        for (arguments, tier) in [
+            (&[][..], Tier::Full),
+            (&["--setting-sources", ""][..], Tier::Ask),
+            (&["--settings", "strict.json"][..], Tier::Ask),
+            (
+                &["--setting-sources", "", "--permission-mode", "plan"][..],
+                Tier::ReadOnly,
+            ),
+        ] {
+            assert_eq!(
+                Ceiling::launched(&account(arguments)).tier(),
+                tier,
+                "{arguments:?}"
             );
         }
     }

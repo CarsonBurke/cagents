@@ -5870,6 +5870,22 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     let trusted = submit(&host, &authority(full), trusted).unwrap();
     assert_eq!(settled(&host, trusted.run.id).state, State::Succeeded);
     change(FULL, session_of(trusted.agent.id)).unwrap();
+    // Nor into a provider CLI it runs or started itself, which reads its
+    // keys as its person's; a shell it started is its own to type into.
+    let mut provider = shell(TerminalId::new());
+    provider.launch.program = root.join("bin/claude").display().to_string();
+    let provider_id = provider.id;
+    spawn_as(AGENT, provider).unwrap();
+    let error = change(AGENT, provider_id).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    assert_eq!(
+        error.message,
+        format!(
+            "This agent can't type into terminal {provider_id}, which runs Claude Code, because its approvals are limited. Use `cagents agent message` instead."
+        )
+    );
+    change(AGENT, started).unwrap();
+    change(FULL, full).unwrap();
 
     // The user changes every terminal, and an agent's connection forgets
     // whom it acted for once it disconnects.
