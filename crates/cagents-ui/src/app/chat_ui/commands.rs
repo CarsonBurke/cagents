@@ -1216,6 +1216,58 @@ mod tests {
             });
         }
 
+        /// The walk shows the draft's chosen files with the recalled prompt,
+        /// so they leave with it and do not return to go out a second time.
+        #[test]
+        fn chosen_files_leave_with_the_recalled_prompt() {
+            chat::attachment_assets::with_test_image(|image| {
+                let file = Attachment::file("/tmp/notes.rs");
+                let draft = format!(
+                    "draft before recall {}",
+                    image.reference.as_ref().unwrap().token()
+                );
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                let target =
+                    recall_prompt(&mut app, card, &draft, vec![file.clone(), image.clone()]);
+                assert_eq!(chat_runtime(&app, card).attachments, [file.clone()]);
+
+                drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+                let runtime = chat_runtime(&app, card);
+                assert_restored_draft(runtime, &draft, &[image.clone()]);
+                let outgoing = runtime
+                    .commands
+                    .in_flight()
+                    .unwrap()
+                    .outgoing
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(outgoing.prompt.attachments, [file]);
+            });
+        }
+
+        /// A recalled prompt the provider refuses comes back ahead of the
+        /// restored draft, and nothing is lost or doubled.
+        #[test]
+        fn refused_recalled_prompt_returns_ahead_of_the_restored_draft() {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let file = Attachment::file("/tmp/notes.rs");
+            let target = recall_prompt(&mut app, card, "draft before recall", vec![file.clone()]);
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            assert_restored_draft(chat_runtime(&app, card), "draft before recall", &[]);
+
+            settle(&mut app, card, Err("Codex is not answering".into()));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(
+                runtime.composer.text().trim_end(),
+                "earlier prompt\ndraft before recall"
+            );
+            assert_eq!(runtime.attachments, [file]);
+            assert!(runtime.history_cursor.is_none());
+            assert_eq!(runtime.error.as_deref(), Some("Codex is not answering"));
+        }
+
         #[test]
         fn queuing_recalled_prompt_restores_the_stashed_draft() {
             let mut app = crate::app::tests::context_inspector_test_app(false);

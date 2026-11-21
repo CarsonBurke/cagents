@@ -4131,8 +4131,18 @@ impl Runtime {
     }
 
     /// Consumes the shown prompt while preserving a draft saved by history.
-    fn finish_history_walk_after_send(&mut self) {
+    /// The walk shows the draft's chosen files with each recalled prompt, so
+    /// those that just left with it are not restored a second time.
+    fn finish_history_walk_after_send(&mut self, sent: &[Attachment]) {
         if self.history_cursor.is_some() {
+            if let Some(stash) = self.history_attachment_stash.as_mut() {
+                stash.retain(|attachment| {
+                    attachment.reference.is_some()
+                        || !sent
+                            .iter()
+                            .any(|gone| gone.reference.is_none() && gone.path == attachment.path)
+                });
+            }
             self.restore_history_draft();
         } else {
             self.replace_draft(text_editor::Content::new());
@@ -12010,7 +12020,7 @@ impl Cagents {
             // back with the reason.
             let text = runtime.composer.text().trim_end().to_owned();
             let attachments = runtime.take_attachments();
-            runtime.finish_history_walk_after_send();
+            runtime.finish_history_walk_after_send(&attachments);
             let mode = match &command {
                 Command::Prompt { mode, .. } => *mode,
                 _ => PromptMode::Send,
@@ -14294,14 +14304,15 @@ impl Cagents {
                     let id = runtime.next_written;
                     runtime.next_written += 1;
                     let text = runtime.composer.text().trim_end().to_owned();
+                    let attachments = runtime.take_attachments();
+                    runtime.finish_history_walk_after_send(&attachments);
                     let followup = Followup {
                         id,
                         preview: prompt::queue_preview(&text),
                         text,
-                        attachments: runtime.take_attachments(),
+                        attachments,
                     };
                     runtime.followups.push(followup);
-                    runtime.finish_history_walk_after_send();
                     runtime.error = None;
                     let _ = runtime.present();
                     let busy = runtime.turn_under_way();
