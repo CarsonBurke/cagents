@@ -3251,6 +3251,8 @@ pub(super) struct Runtime {
     /// the next frame keeps that tab mounted wherever its state sorts it.
     child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     child_ordinals: child_navigation::Ordinals,
+    /// What each waiting agent waits on, named once per publication.
+    agent_work: view::AgentWork,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -4462,6 +4464,7 @@ impl Runtime {
             image_viewer: None,
             child_tab_focus: Default::default(),
             child_ordinals: Default::default(),
+            agent_work: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: Revised::default(),
@@ -5816,11 +5819,18 @@ impl Runtime {
             self.release_transcript_presentation();
             self.settle_commands(&snapshot, false);
             Arc::make_mut(&mut snapshot).evict_transcript();
+            // Evicted, its agents have no transcripts to scan.
+            self.agent_work.observe(&snapshot.subagents);
             self.snapshot = snapshot;
             self.source_clock = source_clock;
             return;
         }
         let snapshot = self.logical_prose.project(snapshot);
+        // A publication installed again projects to the one already shown,
+        // whose work is already named.
+        if !Arc::ptr_eq(&self.snapshot, &snapshot) {
+            self.agent_work.observe(&snapshot.subagents);
+        }
         self.install_presented_snapshot(snapshot, source_clock);
     }
 
@@ -15157,7 +15167,11 @@ impl Cagents {
                     && let Some(picker) = runtime.child_picker.as_mut()
                 {
                     let last = picker
-                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
+                        .rows(
+                            &runtime.snapshot.subagents,
+                            &runtime.child_ordinals,
+                            &runtime.agent_work,
+                        )
                         .len()
                         .saturating_sub(1)
                         / 24;

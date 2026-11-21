@@ -42,7 +42,7 @@ const THREAD_RAIL_OFFSET: f32 =
 /// reading any text.
 fn kind_glyph(content: &ItemContent) -> Icon {
     match content {
-        _ if chat::is_stopped_notice(content) => Icon::Stop,
+        _ if chat::is_stopped_notice(content) => Icon::Ended,
         ItemContent::Text { .. } => Icon::Private,
         ItemContent::Command { action, .. } => match action {
             chat::CommandAction::Read => Icon::TextFile,
@@ -474,7 +474,7 @@ impl Runtime {
             return disclosure::row(
                 chat::STOPPED_NOTICE.to_string(),
                 chat::STOPPED_NOTICE.to_string(),
-                Icon::Stop,
+                Icon::Ended,
                 None,
                 None,
                 None,
