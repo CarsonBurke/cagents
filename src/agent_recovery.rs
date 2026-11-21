@@ -23,6 +23,16 @@ pub(crate) struct AgentProcess {
     pub launch: LaunchRecipe,
     pub recovery: LaunchRecipe,
 }
+/// A hint version: the exact conversation, ready to resume.
+const EXACT: u8 = 1;
+/// A hint version: the agent was recognized, but nothing confirmed which
+/// conversation it is in, so any conversation its launch names may be stale.
+const RECOGNIZED: u8 = 2;
+/// A hint version: observation confirmed the agent is still in the only
+/// conversation its launch names, if any, but the launch carries options exact
+/// recovery won't replay.
+const CONFIRMED: u8 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentResumeHint {
@@ -71,18 +81,51 @@ pub fn picker_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
     interactive_recipe(launch, Selector::Picker)
 }
 
-/// Whether rerunning a launch could reopen a particular conversation: it names
-/// one, or continues the latest, through its provider's own selectors. Options
-/// cagents doesn't know can't be parsed, so any argument that reads as a
-/// selector counts, wherever it falls.
-pub fn selects_conversation(launch: &LaunchRecipe) -> bool {
-    Provider::launched(launch).is_some_and(|(provider, arguments)| {
-        arguments.iter().any(|argument| {
-            let flag = argument
-                .split_once('=')
-                .map_or(argument.as_str(), |(flag, _)| flag);
-            provider.is_identity_option(flag) || provider.is_latest_selector(flag)
-        })
+/// The conversations a launch names through its provider's selectors, each
+/// with the value it gives the selector. Options cagents doesn't know can't be
+/// parsed, so any argument that reads as a selector counts, wherever it falls.
+/// A selector without a value opens a picker or the latest conversation, which
+/// names none.
+fn named_conversations(launch: &LaunchRecipe) -> Vec<&str> {
+    let Some((provider, arguments)) = Provider::launched(launch) else {
+        return Vec::new();
+    };
+    let mut named = Vec::new();
+    let mut args = arguments.iter().peekable();
+    while let Some(argument) = args.next() {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        if !provider.is_identity_option(flag) {
+            continue;
+        }
+        if let Some(value) = inline.or_else(|| {
+            args.next_if(|value| !value.starts_with('-'))
+                .map(String::as_str)
+        }) {
+            named.push(value);
+        }
+    }
+    named
+}
+
+/// Whether rerunning a launch reopens a particular conversation.
+pub fn names_conversation(launch: &LaunchRecipe) -> bool {
+    !named_conversations(launch).is_empty()
+}
+
+/// Whether rerunning `launch` could reopen a conversation the agent has since
+/// left: the hint is recognition-only, observation never confirmed the
+/// conversation the launch, or the agent's observed launch, names.
+pub fn reopens_unconfirmed_conversation(hint: &str, launch: &LaunchRecipe) -> bool {
+    if hint.len() > MAX_HINT_BYTES {
+        return false;
+    }
+    serde_json::from_str::<AgentResumeHint>(hint).is_ok_and(|hint| {
+        hint.version == RECOGNIZED
+            && (names_conversation(launch) || names_conversation(&hint.recipe))
     })
 }
 
@@ -224,7 +267,11 @@ pub fn bind_session(launch: &LaunchRecipe, id: &str) -> Option<LaunchRecipe> {
 
 pub fn hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
     let recipe = resume_recipe(launch)?;
-    let hint = serde_json::to_string(&AgentResumeHint { version: 1, recipe }).ok()?;
+    let hint = serde_json::to_string(&AgentResumeHint {
+        version: EXACT,
+        recipe,
+    })
+    .ok()?;
     (hint.len() <= MAX_HINT_BYTES).then_some(hint)
 }
 
@@ -233,7 +280,7 @@ pub fn recipe_from_hint(hint: &str) -> Option<LaunchRecipe> {
         return None;
     }
     let hint: AgentResumeHint = serde_json::from_str(hint).ok()?;
-    (hint.version == 1).then_some(())?;
+    (hint.version == EXACT).then_some(())?;
     resume_recipe(&hint.recipe)
 }
 
@@ -250,7 +297,7 @@ pub fn observed_hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
         return None;
     }
     let hint = serde_json::to_string(&AgentResumeHint {
-        version: 2,
+        version: RECOGNIZED,
         recipe: launch.clone(),
     })
     .ok()?;
@@ -263,8 +310,8 @@ pub fn observed_launch_from_hint(hint: &str) -> Option<LaunchRecipe> {
     }
     let hint: AgentResumeHint = serde_json::from_str(hint).ok()?;
     match hint.version {
-        1 => resume_recipe(&hint.recipe),
-        2 => (Provider::from_program(&hint.recipe.program).is_some()
+        EXACT => resume_recipe(&hint.recipe),
+        RECOGNIZED | CONFIRMED => (Provider::from_program(&hint.recipe.program).is_some()
             && hint.recipe.arguments.len() <= 128
             && hint.recipe.arguments.iter().map(String::len).sum::<usize>() <= MAX_ARGV_BYTES)
             .then_some(hint.recipe),
@@ -1471,16 +1518,20 @@ fn recovery_observation(
         return observed_hint_from_launch(&launch).map(Some).ok_or(());
     };
     // An option the resume cannot carry is no reason to forget the agent.
-    let bound = match identity {
-        SessionIdentity::Exact(id) => bind_session(&launch, &id),
+    let bound = match &identity {
+        SessionIdentity::Exact(id) => bind_session(&launch, id),
         SessionIdentity::Fresh(_) | SessionIdentity::Ambiguous => None,
     };
     if let Some(bound) = bound {
         return observed_hint_from_launch(&bound).map(Some).ok_or(());
     }
     // Recognition still exposes activation, but never stale resume authority.
+    // Rerunning the launch is still sound when the conversation it names, if
+    // any, is the one the agent is in.
+    let confirmed = matches!(&identity, SessionIdentity::Exact(id)
+        if named_conversations(&launch).iter().all(|named| *named == id.as_str()));
     let hint = serde_json::to_string(&AgentResumeHint {
-        version: 2,
+        version: if confirmed { CONFIRMED } else { RECOGNIZED },
         recipe: launch,
     })
     .map_err(|_| ())?;
@@ -2738,18 +2789,19 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_selects_a_conversation_through_any_selector_it_carries() {
+    fn a_launch_names_a_conversation_through_any_selector_that_takes_one() {
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";
         let inline = format!("--resume={id}");
         for (program, arguments) in [
             ("claude", vec!["--unknown", "--resume", id]),
             ("claude", vec![inline.as_str(), "--unknown"]),
-            ("claude", vec!["--unknown", "--continue"]),
             ("claude", vec!["--session-id", id, "--unknown"]),
-            ("codex", vec!["--unknown", "resume", "--last"]),
+            ("claude", vec!["--resume", "search term"]),
+            ("codex", vec!["--unknown", "resume", id]),
+            ("agy", vec!["--conversation", id]),
         ] {
             assert!(
-                selects_conversation(&launch(program, &arguments)),
+                names_conversation(&launch(program, &arguments)),
                 "{program} {arguments:?}"
             );
         }
@@ -2757,18 +2809,73 @@ mod tests {
             "node",
             &[
                 "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
-                "-c",
+                "-r",
+                id,
             ],
         );
-        assert!(selects_conversation(&node));
-        node.arguments.pop();
-        assert!(!selects_conversation(&node));
-        assert!(!selects_conversation(&launch(
-            "claude",
-            &["--unknown", "fix the build"]
-        )));
-        // Another program's selector is not the agent's.
-        assert!(!selects_conversation(&launch("bash", &["--resume", id])));
+        assert!(names_conversation(&node));
+        node.arguments.truncate(2);
+        // A picker or the latest conversation names none.
+        assert!(!names_conversation(&node));
+        for (program, arguments) in [
+            ("claude", vec!["--resume", "--unknown"]),
+            ("claude", vec!["--unknown", "--continue"]),
+            ("codex", vec!["resume", "--last"]),
+            ("agy", vec!["-c"]),
+            ("claude", vec!["--unknown", "fix the build"]),
+            // Another program's selector is not the agent's.
+            ("bash", vec!["--resume", id]),
+        ] {
+            assert!(
+                !names_conversation(&launch(program, &arguments)),
+                "{program} {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_recognition_only_hint_leaves_a_named_conversation_unconfirmed() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let named = launch("claude", &["--resume", id, "--unknown"]);
+        let plain = launch("claude", &["--unknown"]);
+        let hint = |version: u8, recipe: &LaunchRecipe| {
+            serde_json::to_string(&AgentResumeHint {
+                version,
+                recipe: recipe.clone(),
+            })
+            .unwrap()
+        };
+        assert!(reopens_unconfirmed_conversation(
+            &hint(RECOGNIZED, &named),
+            &named
+        ));
+        // An agent observed inside a wrapper whose launch names nothing.
+        let shell = launch("bash", &[]);
+        assert!(reopens_unconfirmed_conversation(
+            &hint(RECOGNIZED, &named),
+            &shell
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            &hint(RECOGNIZED, &plain),
+            &plain
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            &hint(CONFIRMED, &named),
+            &named
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            &hint(EXACT, &named),
+            &named
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            "legacy-provider-session",
+            &named
+        ));
+        assert_eq!(
+            observed_launch_from_hint(&hint(CONFIRMED, &named)),
+            Some(named.clone())
+        );
+        assert_eq!(recipe_from_hint(&hint(CONFIRMED, &named)), None);
     }
 
     #[cfg(feature = "host")]

@@ -135,6 +135,7 @@ const RETRY_REFUSED: &str = "Retry didn't start anything. Open a new terminal to
 const RETRY_BLOCKED_RETIRED: &str =
     "Retry can't restore it while this daemon is running. Open a new terminal to keep working.";
 const RETRY_BLOCKED_RESUME: &str = "That terminal keeps its work. Once it has stopped, Retry resumes the saved conversation in this pane.";
+const RETRY_BLOCKED_REFUSED: &str = "That terminal keeps its work. Even once it has stopped, cagents can't restart this agent: its saved command may reopen a conversation the agent has since left. Open a new terminal to keep working.";
 const RETRY_BLOCKED_PICKER: &str = "That terminal keeps its work. Once it has stopped, Retry opens the agent's conversation picker in this pane.";
 const RETRY_BLOCKED_SHELL: &str =
     "That terminal keeps its work. Once it has stopped, Retry starts a new shell in this pane.";
@@ -161,7 +162,7 @@ fn retry_after_restoring_picker(provider: &str) -> String {
 const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
 /// Retry would refuse to start anything, so the pane disables it. The disabled
 /// Retry's accessible description repeats this.
-pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent. Its saved command may reopen a conversation the agent has since left, and cagents can't open the agent's conversation picker with the other options it was launched with. Open a new terminal to keep working.";
+pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent. Its saved command may reopen a conversation the agent has since left, and cagents can't open the agent's conversation picker instead. Open a new terminal to keep working.";
 /// What Retry launches in place of a terminal.
 enum NewTerminal {
     Resume,
@@ -181,23 +182,22 @@ fn recovered_terminal(session: &TerminalSession) -> NewTerminal {
             crate::agent::Provider::recognize_launch(&recipe).map_or("the agent", |p| p.label()),
         ),
         Ok((_, crate::upgrade::RecoveryKind::Shell)) => NewTerminal::Shell,
-        // Retry reruns the saved command, unless the conversation it selects
-        // is one observation found stale.
-        Err(_) if super::terminal_relaunch_refused(session) => NewTerminal::Refused,
+        // Retry reruns the saved command, unless the conversation it names
+        // may be one the agent has since left.
+        Err(_) if super::terminal_relaunch_plan(session).is_err() => NewTerminal::Refused,
         Err(_) => NewTerminal::Fresh,
     }
 }
-/// What Retry launches in place of a terminal with no live process, which
-/// follows the recovery plan only when the agent's current launch was observed.
+/// What Retry launches in place of a terminal with no live process.
 fn new_terminal(session: &TerminalSession) -> NewTerminal {
-    if super::observed_agent_launch(session).is_some() {
-        recovered_terminal(session)
-    } else if session.agent_resume_recipe().is_some() {
-        NewTerminal::Resume
-    } else if matches!(recovered_terminal(session), NewTerminal::Shell) {
-        NewTerminal::Shell
-    } else {
-        NewTerminal::Fresh
+    match super::terminal_relaunch_plan(session) {
+        Ok(super::Relaunch::Resume) => NewTerminal::Resume,
+        Ok(super::Relaunch::Picker(provider)) => NewTerminal::Picker(provider.label()),
+        Ok(super::Relaunch::Rerun) if matches!(recovered_terminal(session), NewTerminal::Shell) => {
+            NewTerminal::Shell
+        }
+        Ok(super::Relaunch::Rerun) => NewTerminal::Fresh,
+        Err(_) => NewTerminal::Refused,
     }
 }
 fn new_terminal_consequence(session: &TerminalSession) -> Cow<'static, str> {
@@ -259,7 +259,7 @@ fn blocked_consequence(session: &TerminalSession) -> &'static str {
         NewTerminal::Picker(_) => RETRY_BLOCKED_PICKER,
         NewTerminal::Shell => RETRY_BLOCKED_SHELL,
         NewTerminal::Fresh => RETRY_BLOCKED_FRESH,
-        NewTerminal::Refused => RETRY_UNAVAILABLE,
+        NewTerminal::Refused => RETRY_BLOCKED_REFUSED,
     }
 }
 /// What a pane says once Retry was refused for this missing terminal, when
@@ -379,6 +379,7 @@ impl Details {
                     | RETRY_BLOCKED_RETIRED
                     | RETRY_BLOCKED_RESUME
                     | RETRY_BLOCKED_PICKER
+                    | RETRY_BLOCKED_REFUSED
                     | RETRY_BLOCKED_SHELL
                     | RETRY_BLOCKED_FRESH
             )
@@ -404,7 +405,8 @@ impl Details {
     /// between that and the output it saved. See #2142. A refusal or a blocked
     /// state doesn't remove the risk, because a later press can still replace it.
     fn output_warning(&self) -> Option<&'static str> {
-        if self.consequence == NATIVE_OWNER {
+        // Nothing here can replace a terminal Retry can't restart.
+        if matches!(self.consequence.as_ref(), NATIVE_OWNER | RETRY_UNAVAILABLE) {
             return None;
         }
         match self.code {
@@ -2005,7 +2007,7 @@ mod tests {
             last_exit: None,
         };
         // Recognised as Claude without its current conversation, and the
-        // saved launch selects one beside an option the picker won't replay.
+        // saved launch names one beside an option the picker won't replay.
         session.resume_hint =
             Some(serde_json::json!({"version": 2, "recipe": session.launch}).to_string());
         assert!(super::super::terminal_start_mode(session).is_err());
@@ -2039,7 +2041,18 @@ mod tests {
             RETRY_UNAVAILABLE
         );
 
-        // A launch that selects no conversation has nothing stale to reopen,
+        // Once observation confirmed the agent is still in the conversation
+        // its command names, Retry runs that command again.
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.resume_hint =
+            Some(serde_json::json!({"version": 3, "recipe": session.launch}).to_string());
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        assert_eq!(app.terminal_details(card).unwrap().consequence, RETRY_FRESH);
+        assert_eq!(rendered_button(&app, card, "Retry"), Some((true, None)));
+
+        // A launch that names no conversation has nothing stale to reopen,
         // so Retry reruns it from the beginning, and says so.
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!()

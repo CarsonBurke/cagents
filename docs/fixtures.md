@@ -877,16 +877,20 @@ The terminal then shows the conversation it resumed, or Claude Code's
 conversation picker.
 
 For the pane recovery refuses, spawn a third terminal before stopping, with
-an option recovery doesn't know beside the conversation it resumes:
+an option recovery doesn't know beside the conversation it resumes, and
+`/clear` it too:
 
 ```sh
 scripts/native-evidence --task "$TASK" cli terminal spawn --cwd "$TASK/fixture/project" -- \
     claude --resume a1b2c3d4-2222-4111-8111-000000003390 --fixture-unrecognized-option
+scripts/native-evidence --task "$TASK" cli terminal write THIRD_TERMINAL_ID $'/clear\r'
 ```
 
 `inspect` shows hint version 2 for it too. After the reboot its pane offers
-**Open new terminal**, with **Retry** disabled. Without `--resume`, the same
-option leaves **Retry** to run the command again from the beginning.
+**Open new terminal**, with **Retry** disabled. Left uncleared, its hint is
+version 3, which confirms the conversation the command names, and **Retry**
+runs the command again from the beginning, as it does for the same option
+without `--resume`.
 
 ### A permanent first-start refusal
 

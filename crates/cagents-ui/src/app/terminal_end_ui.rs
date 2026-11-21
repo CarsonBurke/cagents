@@ -47,8 +47,14 @@ pub(super) enum TerminalRelaunch {
     OpenConversation,
     /// The agent's exact conversation can be resumed in a new terminal.
     Resume,
+    /// The agent's conversation picker opens in a new terminal, since the
+    /// conversation its command names may be one it has since left.
+    Choose,
     /// Only the command itself can run again, from the start.
     Restart,
+    /// Running the command again could reopen a conversation the agent has
+    /// since left, and nothing else can restart it, so a shell opens instead.
+    NewTerminal,
 }
 
 impl TerminalRelaunch {
@@ -56,7 +62,9 @@ impl TerminalRelaunch {
         match self {
             Self::OpenConversation => "Open conversation",
             Self::Resume => "Resume session",
+            Self::Choose => "Choose conversation",
             Self::Restart => "Restart",
+            Self::NewTerminal => "Open new terminal",
         }
     }
 
@@ -66,10 +74,29 @@ impl TerminalRelaunch {
         match self {
             Self::OpenConversation => "Continue this conversation in the chat view".into(),
             Self::Resume => format!("Continue this {name} conversation in a new terminal"),
+            Self::Choose => format!(
+                "Choose a {name} conversation in a new terminal: cagents couldn't confirm which one this was last in"
+            ),
             Self::Restart => format!(
                 "Run {name} again in {}",
                 display_path(&session.launch.working_directory)
             ),
+            Self::NewTerminal => format!(
+                "Open a shell in {}: running {name} again could reopen a conversation it has since left",
+                display_path(&session.launch.working_directory)
+            ),
+        }
+    }
+
+    /// The message pressing the action sends.
+    pub(super) fn message(self, card: CardId) -> Message {
+        match self {
+            Self::NewTerminal => {
+                Message::TerminalFailure(super::terminal_failure::Action::NewTerminal(card))
+            }
+            Self::OpenConversation | Self::Resume | Self::Choose | Self::Restart => {
+                Message::RetryCard(card)
+            }
         }
     }
 }
@@ -217,10 +244,13 @@ impl Cagents {
     ) -> TerminalRelaunch {
         if self.completed_terminal_has_native_owner(card) {
             TerminalRelaunch::OpenConversation
-        } else if session.agent_resume_recipe().is_some() {
-            TerminalRelaunch::Resume
         } else {
-            TerminalRelaunch::Restart
+            match super::terminal_relaunch_plan(session) {
+                Ok(super::Relaunch::Resume) => TerminalRelaunch::Resume,
+                Ok(super::Relaunch::Picker(_)) => TerminalRelaunch::Choose,
+                Ok(super::Relaunch::Rerun) => TerminalRelaunch::Restart,
+                Err(_) => TerminalRelaunch::NewTerminal,
+            }
         }
     }
 
@@ -244,10 +274,18 @@ impl Cagents {
                 .at_unix_ms
                 .is_none_or(|at| enter_relaunches(at, unix_millis()))
         });
-        if settled {
-            self.retry_card(card)
-        } else {
-            Task::none()
+        let Some(relaunch) = self
+            .ended_terminal(card)
+            .filter(|_| settled)
+            .map(|session| self.terminal_relaunch(card, session))
+        else {
+            return Task::none();
+        };
+        match relaunch {
+            TerminalRelaunch::NewTerminal => {
+                self.update_terminal_failure(super::terminal_failure::Action::NewTerminal(card))
+            }
+            _ => self.retry_card(card),
         }
     }
 
@@ -406,7 +444,7 @@ impl Cagents {
                         .then_some(TerminalRelaunch::OpenConversation.label()),
                 )
                 .id(card_control_id(card, "ended.relaunch"))
-                .on_press(Message::RetryCard(card)),
+                .on_press(relaunch.message(card)),
             format!("{} (Enter)", relaunch.explanation(session)),
         ));
 
@@ -728,6 +766,77 @@ mod tests {
             panic!("terminal fixture");
         };
         assert_eq!(current.id, first);
+    }
+
+    /// An ended Claude terminal launched with `arguments`, whose conversation
+    /// observation recorded with this hint version.
+    fn ended_claude(arguments: &[&str], version: u8) -> (Cagents, CardId, TerminalId) {
+        let (mut app, card, terminal) = restored_ended_card();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        session.launch.program = "claude".into();
+        session.launch.arguments = arguments.iter().map(|arg| (*arg).into()).collect();
+        session.resume_hint =
+            Some(serde_json::json!({"version": version, "recipe": session.launch}).to_string());
+        // Long enough ago that Enter on its final screen was meant for it.
+        let mut exit = terminal_exit(0, None);
+        exit.occurred_at_unix_ms = 1;
+        transition_terminal_to_relaunchable(session, exit);
+        (app, card, terminal)
+    }
+
+    #[test]
+    fn an_ended_agent_offers_what_its_relaunch_will_start() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        for (arguments, version, expected) in [
+            // Cleared away from the conversation its command names.
+            (vec!["--resume", id], 2, TerminalRelaunch::Choose),
+            (
+                vec!["--resume", id, "--unknown"],
+                2,
+                TerminalRelaunch::NewTerminal,
+            ),
+            // Still in it, so its command runs again.
+            (
+                vec!["--resume", id, "--unknown"],
+                3,
+                TerminalRelaunch::Restart,
+            ),
+            // A command that names no conversation can't reopen one.
+            (vec!["--unknown"], 2, TerminalRelaunch::Restart),
+            (vec![], 2, TerminalRelaunch::Restart),
+        ] {
+            let (app, card, _) = ended_claude(&arguments, version);
+            let session = app.completed_terminal(card).unwrap().clone();
+            assert_eq!(
+                app.terminal_relaunch(card, &session),
+                expected,
+                "{arguments:?} v{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_on_an_agent_that_cant_restart_opens_a_new_terminal_beside_it() {
+        let (mut app, card, terminal) = ended_claude(
+            &[
+                "--resume",
+                "a1b2c3d4-1111-4111-8111-123456789abc",
+                "--unknown",
+            ],
+            2,
+        );
+        let before = app.durable.cards.len();
+        drop(app.relaunch_from_ended_screen(card));
+        assert_eq!(app.durable.cards.len(), before + 1);
+        // The ended card stays as it was, final screen and all.
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
+        assert!(!app.terminal_start_in_flight(card));
+        let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        assert_eq!(session.id, terminal);
     }
 
     #[test]

@@ -2176,40 +2176,59 @@ fn terminal_continuity(state: Option<&CardState>) -> Option<&TerminalContinuity>
     }
 }
 
-/// The agent launch observation last found running in this terminal, when it
-/// couldn't confirm which conversation that agent was in.
-fn observed_agent_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
-    session
-        .resume_hint
-        .as_deref()
-        .and_then(crate::model::agent_recovery::observed_launch_from_hint)
+/// What relaunching a terminal starts in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Relaunch {
+    /// The agent's exact saved conversation.
+    Resume,
+    /// The agent's conversation picker, since the conversation its command
+    /// names may be one it has since left.
+    Picker(crate::agent::Provider),
+    /// The saved command, from the beginning.
+    Rerun,
 }
 
-/// Current observation supersedes the original selector, so a relaunch of an
-/// observed agent follows recovery's plan rather than the saved recipe. Where
-/// that plan has nothing to offer, the saved command still runs again, unless
-/// it or the observed launch selects a conversation: that selector is the one
-/// observation found stale.
+/// The command that relaunches a terminal, given the one it saved. An exact
+/// conversation resumes. A saved command reruns, unless observation couldn't
+/// confirm the conversation it, or the agent observed inside it, names, as
+/// after `/clear`: rerunning it could reopen the conversation the agent left.
+/// Then the relaunch follows recovery's plan, the agent's picker, and refuses
+/// when there is none.
+fn terminal_relaunch(
+    session: &TerminalSession,
+    saved: &LaunchRecipe,
+) -> Result<(LaunchRecipe, Relaunch), String> {
+    if let Some(recipe) = session.agent_resume_recipe() {
+        return Ok((recipe, Relaunch::Resume));
+    }
+    if !session.resume_hint.as_deref().is_some_and(|hint| {
+        crate::model::agent_recovery::reopens_unconfirmed_conversation(hint, saved)
+    }) {
+        return Ok((saved.clone(), Relaunch::Rerun));
+    }
+    match crate::upgrade::recovery_plan(session) {
+        Ok((recipe, crate::upgrade::RecoveryKind::Picker)) => {
+            let provider = crate::agent::Provider::recognize_launch(&recipe)
+                .ok_or_else(|| terminal_failure::RETRY_UNAVAILABLE.to_owned())?;
+            Ok((recipe, Relaunch::Picker(provider)))
+        }
+        // A shell cagents made, which the agent ran inside.
+        Ok((recipe, crate::upgrade::RecoveryKind::Shell)) => Ok((recipe, Relaunch::Rerun)),
+        Ok((recipe, crate::upgrade::RecoveryKind::Exact)) => Ok((recipe, Relaunch::Resume)),
+        Err(_) => Err(terminal_failure::RETRY_UNAVAILABLE.into()),
+    }
+}
+
 fn terminal_relaunch_recipe(
     session: &TerminalSession,
     saved: &LaunchRecipe,
 ) -> Result<LaunchRecipe, String> {
-    use crate::model::agent_recovery;
-    let Some(observed) = observed_agent_launch(session) else {
-        return Ok(session
-            .agent_resume_recipe()
-            .unwrap_or_else(|| saved.clone()));
-    };
-    match crate::upgrade::recovery_plan(session) {
-        Ok((recipe, _)) => Ok(recipe),
-        Err(error)
-            if agent_recovery::selects_conversation(saved)
-                || agent_recovery::selects_conversation(&observed) =>
-        {
-            Err(error)
-        }
-        Err(_) => Ok(saved.clone()),
-    }
+    terminal_relaunch(session, saved).map(|(recipe, _)| recipe)
+}
+
+/// What relaunching this terminal starts, or why it starts nothing.
+pub(super) fn terminal_relaunch_plan(session: &TerminalSession) -> Result<Relaunch, String> {
+    terminal_relaunch(session, &saved_relaunch(session).0).map(|(_, relaunch)| relaunch)
 }
 
 /// The command a relaunch falls back to, and the last exit it carries.
@@ -2225,11 +2244,6 @@ fn saved_relaunch(session: &TerminalSession) -> (LaunchRecipe, Option<TerminalEx
         | TerminalContinuity::DetachedSameBoot { .. }
         | TerminalContinuity::Failed { .. } => (session.launch.clone(), None),
     }
-}
-
-/// Whether a relaunch would refuse to start anything.
-fn terminal_relaunch_refused(session: &TerminalSession) -> bool {
-    terminal_relaunch_recipe(session, &saved_relaunch(session).0).is_err()
 }
 
 fn fresh_terminal_relaunch(session: &TerminalSession) -> Result<TerminalSession, String> {

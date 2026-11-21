@@ -7,12 +7,13 @@ Usage:
   cleared-terminal-recovery.py reboot ROOT
 
 `history` writes two invented saved conversations, Cleared and Ordinary,
-under ROOT/home/.claude for ROOT/project. Return each to a terminal from its
-native chat; in the Cleared one, run `/clear` and send nothing.
+under ROOT/home/.claude for ROOT/project. Resume each in a terminal, as
+docs/fixtures.md does; in the Cleared one, run `/clear` and send nothing.
 
 `inspect` prints every saved terminal pane's launch and its recovery hint,
 whose version says whether the terminal was last seen in an exact
-conversation (1) or only recognized as Claude (2).
+conversation (1), only recognized as Claude (2), or in the conversation its
+launch names but with options recovery won't replay (3).
 
 `reboot` makes the stopped fixture look as it does after the machine
 restarts: every record in its stores of the current kernel boot names an

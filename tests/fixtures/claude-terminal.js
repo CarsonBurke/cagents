@@ -26,7 +26,21 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
+const os = require('os');
+
 const config = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME, '.claude');
+// Never write into the account's real Claude home, whatever HOME says.
+const realpath = (file) => {
+    try {
+        return fs.realpathSync(file);
+    } catch {
+        return path.resolve(file);
+    }
+};
+if (realpath(config) === realpath(path.join(os.userInfo().homedir, '.claude'))) {
+    process.stderr.write("claude-terminal fixture: refusing the account's real Claude home\n");
+    process.exit(1);
+}
 const cwd = fs.realpathSync(process.cwd());
 const projectDirectory = path.join(config, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
 const recordPath = path.join(config, 'sessions', `${process.pid}.json`);
