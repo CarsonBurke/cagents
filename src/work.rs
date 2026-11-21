@@ -168,6 +168,13 @@ pub fn branch_name(identity: &str) -> OsString {
     }
 }
 
+/// Whether a byte-encoded identity carries a second checkout's suffix.
+fn is_second_checkout(identity: &str) -> bool {
+    identity
+        .strip_prefix(':')
+        .is_some_and(|encoded| encoded.contains(':'))
+}
+
 /// Shows valid UTF-8 unchanged and escapes each invalid byte as `\xNN`.
 pub fn branch_display(branch: &OsStr) -> String {
     let mut display = String::with_capacity(branch.as_encoded_bytes().len());
@@ -449,10 +456,16 @@ pub struct Item {
 }
 
 impl Item {
-    /// The text that names this card on the command line.
+    /// The text that names this card on the command line. A second checkout
+    /// of a branch is named by its worktree, as it is for any other branch.
     pub fn label(&self) -> String {
         match &self.key {
-            ItemKey::Branch(name) => branch_display(&branch_name(name)),
+            ItemKey::Branch(identity) => match &self.worktree {
+                Some(worktree) if is_second_checkout(identity) => {
+                    worktree.path.display().to_string()
+                }
+                _ => branch_display(&branch_name(identity)),
+            },
             ItemKey::Worktree(path) => path.display().to_string(),
         }
     }

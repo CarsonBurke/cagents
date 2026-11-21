@@ -979,8 +979,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(raw.len(), 2);
         assert_ne!(raw[0].key, raw[1].key);
+        // As for any branch, the second checkout is named by its worktree.
+        assert_eq!(
+            raw.iter().map(|card| card.label()).collect::<Vec<_>>(),
+            [r"legacy-\xFF", "/repo/.worktrees/legacy-again"]
+        );
         for card in raw {
-            assert_eq!(card.label(), r"legacy-\xFF");
             assert_eq!(card.head.as_ref().unwrap().oid, "raw-oid");
             assert!(card.pull_request.is_none());
             assert!(!card.worktree.as_ref().unwrap().primary);
