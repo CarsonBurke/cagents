@@ -1345,12 +1345,7 @@ impl State {
         if !diff_can_show && !drafting_here {
             return None;
         }
-        // While this file's draft is open the control stays live and leads
-        // back to it, even in a read-only cached review, since revealing it
-        // writes nothing; any other open draft must be finished first.
-        let enabled = !modal_open
-            && (drafting_here
-                || (self.can_mutate_discussion() && self.discussion.composer.is_none()));
+        let enabled = self.file_comment_enabled(&path, modal_open);
         let control: Element<'_, Action> = crate::ui_controls::icon_button(
             Icon::Comment,
             if drafting_here {
@@ -1365,6 +1360,15 @@ impl State {
         .on_press_maybe(enabled.then_some(Action::BeginFile(path)))
         .into();
         Some(control.map(|action| self.review_action(action)))
+    }
+
+    /// While a file's draft is open its comment control stays live and leads
+    /// back to it, even in a read-only cached review, since revealing it posts
+    /// nothing; any other open draft must be finished first.
+    fn file_comment_enabled(&self, path: &str, modal_open: bool) -> bool {
+        !modal_open
+            && (self.drafting_file(path)
+                || (self.can_mutate_discussion() && self.discussion.composer.is_none()))
     }
 
     fn drafting_file(&self, path: &str) -> bool {
@@ -2147,7 +2151,11 @@ pub(crate) mod tests {
         assert!(!state.has_discussion_authority());
         assert!(state.drafting_file("file.rs"));
 
-        // The file comment control stays live for its own draft offline.
+        // The file comment control stays live for its own draft offline, and
+        // only for it.
+        assert!(state.file_comment_enabled("file.rs", false));
+        assert!(!state.file_comment_enabled("file.rs", true));
+        assert!(!state.file_comment_enabled("src/main.rs", false));
         let action = state.review_action(Action::BeginFile("file.rs".into()));
         drop(state.update(action));
         assert_eq!(state.take_effects(), [Effect::RevealFileDiscussion]);
@@ -2157,7 +2165,7 @@ pub(crate) mod tests {
             "File note written before going offline"
         );
         assert_eq!(composer.destination, Destination::File("file.rs".into()));
-        assert!(!state.discussion.busy, "revealing the draft writes nothing");
+        assert!(!state.discussion.busy, "revealing the draft posts nothing");
     }
 
     mod reanchor_receipt_tests {
