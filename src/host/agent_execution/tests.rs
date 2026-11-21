@@ -6155,6 +6155,21 @@ fn console_prints_a_provider_notice_as_one_unlabelled_line() {
     let long = line("long", &"x".repeat(5_000)).unwrap();
     assert!(long.ends_with("…\n"));
     assert!(long.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", long.len());
+    let fits = "y".repeat(CONSOLE_NOTICE_BYTES);
+    assert_eq!(
+        line("fits", &fits),
+        Some(format!("{fits}\n")),
+        "a whole line at the limit is printed as it is"
+    );
+    let over = line("over", &"y".repeat(CONSOLE_NOTICE_BYTES + 1)).unwrap();
+    assert!(over.ends_with("…\n"), "{over}");
+    assert!(over.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", over.len());
+    let wide = line("wide", &"é".repeat(CONSOLE_NOTICE_BYTES)).unwrap();
+    assert!(
+        wide.ends_with("é…\n"),
+        "cut on a character boundary: {wide}"
+    );
+    assert!(wide.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", wide.len());
     assert_eq!(
         line(
             "frame",
