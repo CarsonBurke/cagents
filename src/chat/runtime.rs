@@ -3257,6 +3257,7 @@ impl Actor {
                 let _ = refuse(error);
                 continue;
             }
+            let loads_earlier = command == Command::LoadEarlier;
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -3284,6 +3285,14 @@ impl Actor {
                     }
                 }
                 Err(message) => {
+                    if loads_earlier {
+                        // The fill that follows must not ask again for the
+                        // page the reader was just refused.
+                        self.store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .history_failed();
+                    }
                     self.apply(Event::Error {
                         message: message.clone(),
                         fatal: false,
@@ -3317,7 +3326,26 @@ impl Actor {
             return Ok(());
         }
         match self.adapter.command(Command::LoadEarlier) {
-            Ok(step) => self.step(step),
+            Ok(step) => {
+                // A provider may decline without saying so, as one with no
+                // history to page yet does.
+                let answered = step.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::History { .. }
+                            | Event::HistoryLoading(true)
+                            | Event::HistoryError(_)
+                    )
+                });
+                self.step(step)?;
+                if !answered {
+                    self.store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .history_failed();
+                }
+                Ok(())
+            }
             // Nobody asked for this page, so its failure is nobody's error.
             // The reader can still ask for it, and hear why it failed.
             Err(error) => {
@@ -3325,7 +3353,7 @@ impl Actor {
                 self.store
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .fill_unanswered();
+                    .history_failed();
                 Ok(())
             }
         }

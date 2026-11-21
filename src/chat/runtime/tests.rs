@@ -3089,6 +3089,95 @@ fn a_reader_paging_back_during_a_fill_waits_for_the_page_on_its_way() {
     assert_eq!(asked.load(Ordering::SeqCst), 1);
     handle.close().unwrap();
 }
+/// A provider that answers history later, as Codex does, ends a failed
+/// request and then reports its error. A failed page that nobody asked for is
+/// not shown and not asked for again; the reader who then asks sees why.
+#[test]
+fn a_failed_fill_is_not_shown_or_retried_but_the_readers_request_is() {
+    struct Failing {
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Adapter for Failing {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Ready(true),
+                    Event::History {
+                        items: vec![text("newest", "newest")],
+                        has_earlier: true,
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::LoadEarlier => {
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step {
+                        events: vec![Event::HistoryLoading(true)],
+                        ..Step::default()
+                    })
+                }
+                // Answers the outstanding request.
+                Command::Compact => Ok(Step {
+                    writes: vec![json!({"error": true})],
+                    ..Step::default()
+                }),
+                _ => Err("unexpected fixture command".into()),
+            }
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::HistoryLoading(false),
+                    Event::HistoryError("history refused".into()),
+                ],
+                ..Step::default()
+            })
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+        followed: false,
+    };
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut adapter: Box<dyn Adapter> = Box::new(Failing {
+        asked: Arc::clone(&asked),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    handle.set_visible(true);
+    // Reading the one-row window starts a fill, which fails.
+    until(&handle, |snapshot| snapshot.history_loading);
+    handle.command(Command::Compact).unwrap();
+    until(&handle, |snapshot| !snapshot.history_loading);
+    // Each acknowledged command follows a whole pass of the actor, and
+    // reading the window between them would start any retry.
+    handle.check_update_readiness().unwrap();
+    handle.snapshot(None).unwrap();
+    handle.check_update_readiness().unwrap();
+    let window = handle.snapshot(None).unwrap();
+    assert!(window.error.is_none(), "{:?}", window.error);
+    assert!(!window.history_loading);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // The reader's own request fails visibly.
+    handle.command(Command::LoadEarlier).unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    handle.command(Command::Compact).unwrap();
+    let window = until(&handle, |snapshot| snapshot.error.is_some());
+    assert_eq!(window.error.as_deref(), Some("history refused"));
+    handle.close().unwrap();
+}
 impl Adapter for Echo {
     fn initialize(&mut self) -> Result<Step, String> {
         Ok(Step {

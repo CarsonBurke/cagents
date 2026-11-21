@@ -157,8 +157,11 @@ enum Fill {
     Idle,
     /// It is on its way, and no reader waits for it.
     Requested,
-    /// The provider answered without it. Nothing asks again until a page
-    /// arrives, as with a page the reader asks for.
+    /// The provider ended its request without the page. Its error, which a
+    /// provider answering later reports after that, may still follow.
+    Ended,
+    /// The provider failed a history request. Nothing asks again until a
+    /// page arrives, as with a page the reader asks for.
     Unanswered,
 }
 
@@ -992,6 +995,15 @@ impl Store {
         {
             out.push(nonfatal(warning));
         }
+        // Another request starts, so no error of the fill's can follow.
+        if self.fill == Fill::Ended
+            && matches!(
+                &event,
+                Event::HistoryLoading(true) | Event::LatestHistoryStarted
+            )
+        {
+            self.fill = Fill::Unanswered;
+        }
         match event {
             Event::OutputDelta { id, offset, delta } => {
                 let cached: Option<(Vec<u8>, usize, usize)> = self
@@ -1155,15 +1167,24 @@ impl Store {
                 self.pending_earlier = None;
                 self.pending_pivot = None;
                 self.latest_boundary = None;
-                self.fill_unanswered();
+                // Successful pages arrive first, so only a failure ends a
+                // fill here.
+                if self.fill == Fill::Requested {
+                    self.fill = Fill::Ended;
+                }
                 out.push(Event::HistoryLoading(false));
                 return Ok(out);
             }
             // Nobody asked for a page `fill` asked for, so its failure is
             // nobody's error. The reader can still ask, and hear why it fails.
-            Event::HistoryError(error) if self.fill == Fill::Requested => {
+            Event::HistoryError(error) if matches!(self.fill, Fill::Requested | Fill::Ended) => {
                 tracing::debug!(%error, "No earlier history to fill the transcript window");
-                self.fill_unanswered();
+                self.fill = Fill::Unanswered;
+                return Ok(out);
+            }
+            Event::HistoryError(error) => {
+                self.history_failed();
+                out.push(Event::HistoryError(error));
                 return Ok(out);
             }
             Event::LatestHistoryStarted => {
@@ -1268,6 +1289,10 @@ impl Store {
     /// from before it. Returns true when earlier history is already cached
     /// (no provider command).
     pub fn earlier(&mut self) -> Result<bool, String> {
+        // The reader's own request follows, and its error is theirs.
+        if self.fill == Fill::Ended {
+            self.fill = Fill::Unanswered;
+        }
         // A page that arrived since the window was built, as one `fill` asked
         // for may have, is shown by building the window again: one with room
         // grows into it.
@@ -1336,11 +1361,11 @@ impl Store {
         }
         requested
     }
-    /// The provider answered the page [`Store::fill`] asked for without it.
-    pub(super) fn fill_unanswered(&mut self) {
-        if self.fill == Fill::Requested {
-            self.fill = Fill::Unanswered;
-        }
+    /// A history request failed without a history event saying so, as an
+    /// adapter refusing it does, or ended without a page. Fills wait for a
+    /// page before asking again.
+    pub(super) fn history_failed(&mut self) {
+        self.fill = Fill::Unanswered;
     }
     /// Whether [`Store::fill`] would ask for a page now.
     pub(super) fn wants_fill(&self) -> bool {
@@ -2931,8 +2956,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.window().unwrap().items.len(), 20);
         assert!(store.fill());
-        // A provider that fails a page later reports it as a history error.
-        // Nobody asked for this one, so nobody is shown it.
+        // A provider that answers later ends a failed request, then reports
+        // its error. Nobody asked for this page, so nobody is shown it.
+        store.apply(Event::HistoryLoading(true)).unwrap();
+        store.apply(Event::HistoryLoading(false)).unwrap();
         assert!(
             store
                 .apply(Event::HistoryError("refused".into()))
@@ -2940,6 +2967,11 @@ mod tests {
                 .is_empty()
         );
         assert!(!store.fill());
+        // The next error is someone else's.
+        assert_eq!(
+            store.apply(Event::HistoryError("later".into())).unwrap(),
+            [Event::HistoryError("later".into())]
+        );
         // A page that a reader adopts while it is on its way is theirs: its
         // failure is shown.
         store
