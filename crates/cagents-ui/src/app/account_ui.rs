@@ -3492,7 +3492,15 @@ impl Cagents {
                 state.present = true;
                 state.failure = None;
             }
-            if !state.refresh_plan {
+            // A report about one model's allowance leaves a signed-out
+            // reading signed out, and the sign-in watch continues while the
+            // reading still says the account needs a login.
+            if !state.refresh_plan
+                && state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status != UsageStatus::NeedsLogin)
+            {
                 state.schedule.login_settled();
             }
         }
@@ -12140,6 +12148,44 @@ mod app_tests {
             cache.catalogs(now_ms())[&Provider::Codex].models,
             [model("live")]
         );
+    }
+
+    /// A Claude report about one model's allowance is not an answer from the
+    /// account: it neither renews the reading nor ends a sign-in watch while
+    /// the account still reads as signed out. An account-wide report does.
+    #[test]
+    fn a_claude_model_only_report_does_not_end_a_sign_in_watch() {
+        let mut app = context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 7);
+        let recipe = recipe_on(&app, &managed);
+        let now = now_ms();
+        let observed_at = now - 1_000;
+        let state = app.account_ui.account_mut(&managed).unwrap();
+        state.snapshot = Some(UsageSnapshot::state(
+            UsageStatus::NeedsLogin,
+            "",
+            observed_at,
+        ));
+        state.schedule.await_login(now);
+
+        let fable = LiveReport::Claude(
+            account::claude::parse_rate_limit_event(&serde_json::json!({
+                "status": "rejected", "rateLimitType": "seven_day_overage_included",
+                "utilization": 1.0, "resetsAt": 1_893_456_000_i64,
+            }))
+            .unwrap(),
+        );
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(fable, now)]);
+        let state = app.account_ui.account(&managed).unwrap();
+        let snapshot = state.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+        assert_eq!(snapshot.observed_at, observed_at);
+        assert!(state.schedule.awaiting_login(now));
+
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.2), now)]);
+        let state = app.account_ui.account(&managed).unwrap();
+        assert_eq!(state.snapshot.as_ref().unwrap().status, UsageStatus::Ok);
+        assert!(!state.schedule.awaiting_login(now));
     }
 
     #[test]
