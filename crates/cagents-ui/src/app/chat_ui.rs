@@ -13074,6 +13074,18 @@ impl Cagents {
                         let opening_name =
                             self.request_opening_name(target).unwrap_or_else(Task::none);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        // The client may have cached a limit or agent addresses
+                        // before it attached, or their wakes were discarded while
+                        // startup was pending. Read both from the installed handle
+                        // once the sidebar's activity entry exists.
+                        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card)
+                            && let Some(handle) = runtime.handle().cloned()
+                        {
+                            runtime.usage_limit = handle.limit();
+                            runtime.agent_addresses = handle.agent_addresses();
+                            self.sidebar_state
+                                .set_card_limited(target.card, runtime.usage_limit.is_some());
+                        }
                         // A new request can reject before its first Changed
                         // wake reaches this window. Historical reopen alone
                         // does not manufacture a fresh limit occurrence.
