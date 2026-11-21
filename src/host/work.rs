@@ -315,6 +315,16 @@ impl Tracked {
         };
         match crate::work::ItemKey::from_storage_key(item) {
             Some(crate::work::ItemKey::Branch(branch)) => {
+                if let Some((encoded, checkout)) = branch
+                    .strip_prefix(':')
+                    .and_then(|name| name.split_once(':'))
+                {
+                    let identity = format!(":{encoded}");
+                    return local.worktrees.iter().any(|worktree| {
+                        worktree.id.to_string() == checkout
+                            && worktree.branch.as_deref() == Some(identity.as_str())
+                    });
+                }
                 let pull_requests = self
                     .snapshot
                     .iter()
@@ -1152,8 +1162,12 @@ impl Handle {
             .items
             .iter()
             .filter(|item| {
-                item.branch.as_deref() == Some(name)
-                    || item.key.storage_key() == name
+                (match &item.key {
+                    crate::work::ItemKey::Branch(identity) => {
+                        crate::work::branch_name(identity).to_str() == Some(name)
+                    }
+                    crate::work::ItemKey::Worktree(_) => item.branch.as_deref() == Some(name),
+                }) || item.key.storage_key() == name
                     || item.worktree.as_ref().is_some_and(|worktree| {
                         worktree.path == Path::new(name)
                             || rooted(item).is_some_and(|rooted| {
@@ -1368,7 +1382,9 @@ impl Handle {
                             .filter_map(|worktree| {
                                 Some((
                                     worktree.path.clone(),
-                                    worktree.branch.clone()?,
+                                    crate::work::branch_name(worktree.branch.as_deref()?)
+                                        .to_str()?
+                                        .to_owned(),
                                     worktree.head.as_ref()?.oid.clone(),
                                 ))
                             })
@@ -1919,6 +1935,258 @@ mod tests {
         }))
     }
 
+    #[cfg(unix)]
+    fn non_utf8_branch_work_cards(previous_scan: bool) {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        fn git(root: &Path, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(arguments)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let linked = directory.path().join("linked");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, ["init", "-q", "-b", "main"]);
+        git(&root, ["commit", "-q", "--allow-empty", "-m", "initial"]);
+        git(
+            &root,
+            [
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let repository = root.join(".git");
+        let handle = polling_handle();
+        handle.shared().track(&repository, "repo").forge = Forge::NotGitHub;
+        let refresh = || {
+            let job = {
+                let mut shared = handle.shared();
+                let tracked = shared.projects.get_mut(&repository).unwrap();
+                tracked.scans_started += 1;
+                Job {
+                    repository: repository.clone(),
+                    id: tracked.id,
+                    previous: tracked.local.clone(),
+                    change: full_change(),
+                    hints: tracked.hints.clone(),
+                    sequence: tracked.scans_started,
+                }
+            };
+            let result = scan::scan(scan::Input {
+                id: job.id,
+                repository: &job.repository,
+                previous: job.previous.as_deref(),
+                change: &job.change,
+                hints: &job.hints,
+                now_unix_ms: now_unix_ms(),
+                cancellation: &handle.0.cancellation,
+            });
+            handle.publish(job, result);
+        };
+        if previous_scan {
+            refresh();
+            assert!(handle.shared().projects[&repository].local.is_some());
+        }
+
+        let legacy_name = OsStr::from_bytes(b"legacy-\xff");
+        let legacy_ref = OsStr::from_bytes(b"refs/heads/legacy-\xff");
+        let literal_name = "legacy-\u{fffd}";
+        git(
+            &root,
+            [OsStr::new("update-ref"), legacy_ref, OsStr::new("HEAD")],
+        );
+        git(&root, ["branch", literal_name]);
+        let legacy = directory.path().join("legacy");
+        let literal = directory.path().join("literal");
+        git(
+            &root,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-q"),
+                legacy.as_os_str(),
+                legacy_name,
+            ],
+        );
+        git(
+            &root,
+            [
+                "worktree",
+                "add",
+                "-q",
+                literal.to_str().unwrap(),
+                literal_name,
+            ],
+        );
+        git(
+            &legacy,
+            ["commit", "-q", "--allow-empty", "-m", "legacy work"],
+        );
+        git(
+            &legacy,
+            ["commit", "-q", "--allow-empty", "-m", "more legacy work"],
+        );
+        git(
+            &literal,
+            ["commit", "-q", "--allow-empty", "-m", "literal work"],
+        );
+        git(
+            &literal,
+            ["commit", "-q", "--allow-empty", "-m", "more literal work"],
+        );
+        git(
+            &literal,
+            ["commit", "-q", "--allow-empty", "-m", "third literal work"],
+        );
+        let legacy_head = git(&legacy, ["rev-parse", "HEAD"]);
+        let literal_head = git(&literal, ["rev-parse", "HEAD"]);
+        assert_ne!(legacy_head, literal_head);
+        std::fs::write(legacy.join("legacy.txt"), "legacy work\n").unwrap();
+        std::fs::write(literal.join("literal.txt"), "literal work\n").unwrap();
+        std::fs::write(literal.join("another.txt"), "more literal work\n").unwrap();
+        let key = crate::github::GitHubRepoKey::new("github.com", None, "me", "repo").unwrap();
+        let snapshot =
+            forge::Snapshot {
+                repository: key.clone(),
+                remotes: vec![key],
+                pull_requests: vec![serde_json::from_value(serde_json::json!({
+                "number": 7, "title": "Literal branch PR", "state": "OPEN", "isDraft": false,
+                "headRefName": literal_name, "headRefOid": literal_head,
+                "headRepository": {"name": "repo"}, "headRepositoryOwner": {"login": "me"},
+                "baseRefName": "main", "updatedAt": "2026-10-01T00:00:00Z",
+                "url": "https://github.com/me/repo/pull/7"
+            })).unwrap()],
+                others: BTreeMap::new(),
+            };
+        handle.shared().projects.get_mut(&repository).unwrap().hints = Arc::new(snapshot.hints());
+        git(
+            &linked,
+            ["commit", "-q", "--allow-empty", "-m", "feature work"],
+        );
+        let head = git(&linked, ["rev-parse", "HEAD"]);
+        std::fs::write(root.join("primary.txt"), "primary work\n").unwrap();
+        std::fs::write(linked.join("feature.txt"), "linked work\n").unwrap();
+        refresh();
+
+        let shared = handle.shared();
+        let tracked = &shared.projects[&repository];
+        let board = board::assemble(
+            &[board::ProjectView {
+                repository: &repository,
+                name: &tracked.name,
+                local: tracked.local.as_deref(),
+                scan_error: tracked.scan_error.as_deref(),
+                forge: &tracked.forge,
+                snapshot: Some(&snapshot),
+            }],
+            &board::Context {
+                now_unix_ms: now_unix_ms(),
+                stale_after_days: shared.stale_after_days,
+                pins: &shared.pins,
+                session_activity: &shared.session_activity,
+                sessions: &[],
+                tickets: &shared.tickets,
+                linear_unavailable: None,
+            },
+        );
+        assert_eq!(board.projects[0].scan_error, None);
+        assert_eq!(
+            board.items.len(),
+            4,
+            "ordinary and both legacy worktrees have cards"
+        );
+        for branch in ["main", "feature"] {
+            let item = board
+                .items
+                .iter()
+                .find(|item| item.branch.as_deref() == Some(branch))
+                .unwrap();
+            assert_eq!(item.error, None);
+            assert_eq!(item.dirty.as_ref().unwrap().paths, 1);
+            if branch == "feature" {
+                assert_eq!(item.head.as_ref().unwrap().oid, head);
+                assert_eq!(item.comparison.as_ref().unwrap().ahead, 1);
+            }
+        }
+        let card_at = |path: &Path| {
+            board
+                .items
+                .iter()
+                .find(|item| {
+                    item.worktree
+                        .as_ref()
+                        .is_some_and(|worktree| worktree.path == path)
+                })
+                .unwrap()
+        };
+        let raw_card = card_at(&legacy);
+        let literal_card = card_at(&literal);
+        assert_eq!(raw_card.branch.as_deref(), Some(r"legacy-\xFF"));
+        assert_eq!(literal_card.branch.as_deref(), Some(literal_name));
+        assert_eq!(raw_card.label(), r"legacy-\xFF");
+        assert_eq!(literal_card.label(), literal_name);
+        assert_ne!(raw_card.label(), literal_card.label());
+        assert_ne!(raw_card.key, literal_card.key);
+        assert_eq!(raw_card.head.as_ref().unwrap().oid, legacy_head);
+        assert_eq!(literal_card.head.as_ref().unwrap().oid, literal_head);
+        assert_eq!(raw_card.comparison.as_ref().unwrap().ahead, 2);
+        assert_eq!(literal_card.comparison.as_ref().unwrap().ahead, 3);
+        assert_eq!(raw_card.comparison.as_ref().unwrap().behind, 0);
+        assert_eq!(literal_card.comparison.as_ref().unwrap().behind, 0);
+        assert_eq!(raw_card.dirty.as_ref().unwrap().paths, 1);
+        assert_eq!(literal_card.dirty.as_ref().unwrap().paths, 2);
+        assert!(raw_card.pull_request.is_none());
+        assert_eq!(literal_card.pull_request.as_ref().unwrap().number, 7);
+        // Pin/unpin resolve the exact identity, never the display label.
+        assert_eq!(
+            Handle::card(&board, &raw_card.key.storage_key())
+                .unwrap()
+                .key,
+            raw_card.key
+        );
+        assert_eq!(
+            Handle::card(&board, literal_name).unwrap().key,
+            literal_card.key
+        );
+        assert_eq!(tracked.local.as_ref().unwrap().branch_names.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_branch_preserves_first_work_cards() {
+        non_utf8_branch_work_cards(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_branch_preserves_refreshed_work_cards() {
+        non_utf8_branch_work_cards(true);
+    }
+
     #[test]
     fn last_work_watcher_detaching_restores_idle_polling_without_an_extra_read() {
         let handle = polling_handle();
@@ -2423,5 +2691,22 @@ mod tests {
             shared.until_scan(late),
             Some(SCAN_SPACING - Duration::from_secs(1))
         );
+    }
+    #[test]
+    fn duplicate_invalid_branch_pins_follow_the_exact_checkout() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let tracked = shared.track(Path::new("/repo/.git"), "repo");
+        let identity = ":6c65676163792dff";
+        let worktree = polled_worktree("/repo/legacy", Instant::now(), None);
+        let key = format!("branch:{identity}:{}", worktree.id);
+        let mut local = scan::Local::default();
+        local.worktrees.push(worktree);
+        local.worktrees[0].branch = Some(identity.into());
+        tracked.local = Some(Arc::new(local));
+        assert!(tracked.live_pin(&key));
+        Arc::make_mut(tracked.local.as_mut().unwrap()).worktrees[0].branch =
+            Some("legacy-\u{fffd}".into());
+        assert!(!tracked.live_pin(&key));
     }
 }

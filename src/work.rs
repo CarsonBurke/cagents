@@ -7,7 +7,12 @@
 //! column is a pure function of a card and the clock, so it is decided the same
 //! way wherever it is evaluated and can be tested without Git or a daemon.
 
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt,
+    path::PathBuf,
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +118,67 @@ pub enum ItemKey {
     /// A worktree by its path: a detached head, or a second checkout of a
     /// branch another card already shows.
     Worktree(PathBuf),
+}
+
+/// A lossless branch identity in the existing text keys. Git forbids `:` in
+/// ref names, so a byte-encoded name cannot collide with a UTF-8 branch.
+pub fn branch_identity(branch: &OsStr) -> String {
+    if let Some(name) = branch.to_str() {
+        return name.to_owned();
+    }
+    let mut key = String::from(":");
+    for byte in branch.as_encoded_bytes() {
+        use std::fmt::Write;
+        write!(&mut key, "{byte:02x}").expect("writing to a String");
+    }
+    key
+}
+
+/// Decodes a branch key, including a duplicate checkout's optional suffix.
+pub fn branch_name(identity: &str) -> OsString {
+    let Some(encoded) = identity.strip_prefix(':') else {
+        return identity.into();
+    };
+    let encoded = encoded.split(':').next().unwrap_or_default();
+    let bytes = (encoded.len().is_multiple_of(2))
+        .then(|| {
+            encoded
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).ok()?;
+                    u8::from_str_radix(pair, 16).ok()
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
+    let Some(bytes) = bytes else {
+        return identity.into();
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|_| identity.to_owned())
+            .into()
+    }
+}
+
+/// Shows valid UTF-8 unchanged and escapes each invalid byte as `\xNN`.
+pub fn branch_display(branch: &OsStr) -> String {
+    let mut display = String::with_capacity(branch.as_encoded_bytes().len());
+    for chunk in branch.as_encoded_bytes().utf8_chunks() {
+        display.push_str(chunk.valid());
+        for byte in chunk.invalid() {
+            use std::fmt::Write;
+            write!(&mut display, "\\x{byte:02X}").expect("writing to a String");
+        }
+    }
+    display
 }
 
 impl ItemKey {
@@ -386,7 +452,7 @@ impl Item {
     /// The text that names this card on the command line.
     pub fn label(&self) -> String {
         match &self.key {
-            ItemKey::Branch(name) => name.clone(),
+            ItemKey::Branch(name) => branch_display(&branch_name(name)),
             ItemKey::Worktree(path) => path.display().to_string(),
         }
     }
@@ -1191,5 +1257,38 @@ mod tests {
         assert_eq!(stale_after_days(&path), Ok(1));
         std::fs::write(&path, "work_stale_after_days = \"soon\"\n").unwrap();
         assert!(stale_after_days(&path).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn branch_identities_round_trip_bytes_without_aliasing_display_labels() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = OsStr::from_bytes(b"legacy-\xff");
+        let identity = branch_identity(raw);
+        assert_eq!(branch_name(&identity), raw);
+        assert_ne!(identity, branch_identity(OsStr::new("legacy-\u{fffd}")));
+        assert_eq!(branch_name(&format!("{identity}:checkout")), raw);
+        assert_eq!(branch_display(&branch_name(&identity)), r"legacy-\xFF");
+        assert_eq!(
+            ItemKey::from_storage_key(&ItemKey::Branch(identity.clone()).storage_key()),
+            Some(ItemKey::Branch(identity))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn branch_display_preserves_valid_utf8_and_escapes_each_invalid_byte() {
+        use std::os::unix::ffi::OsStrExt;
+
+        for (bytes, expected) in [
+            (b"legacy-\xff".as_slice(), r"legacy-\xFF"),
+            ("legacy-\u{fffd}".as_bytes(), "legacy-\u{fffd}"),
+            (b"legacy-\xf0\x90\x80", r"legacy-\xF0\x90\x80"),
+            (
+                b"caf\xc3\xa9-\xff-\xe6\x9e\x9d-\xe2\x82",
+                "café-\\xFF-枝-\\xE2\\x82",
+            ),
+        ] {
+            assert_eq!(branch_display(OsStr::from_bytes(bytes)), expected);
+        }
     }
 }

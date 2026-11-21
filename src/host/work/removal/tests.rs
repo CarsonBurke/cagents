@@ -89,6 +89,37 @@ impl Fixture {
         self.service.handle().process(&self.host, request)
     }
 
+    /// Wait for a scan that starts after a test changes the checkout topology.
+    /// An already-running scan may still hold the previous branch names.
+    fn refresh(&self) {
+        let handle = self.service.handle();
+        let sequence = {
+            let mut shared = handle.shared();
+            let tracked = shared.track(&self.repository, "repo");
+            tracked
+                .pending
+                .get_or_insert_with(Default::default)
+                .merge(super::super::full_change());
+            tracked.urgent = true;
+            tracked.scans_started + 1
+        };
+        handle.0.scanner.notify();
+        let (shared, _) = handle
+            .0
+            .updated
+            .wait_timeout_while(
+                handle.shared(),
+                std::time::Duration::from_secs(30),
+                |shared| shared.projects[&self.repository].scans < sequence,
+            )
+            .unwrap();
+        assert!(
+            shared.projects[&self.repository].scans >= sequence,
+            "fixture scan timed out"
+        );
+        assert_eq!(shared.projects[&self.repository].scan_error, None);
+    }
+
     fn plan(&self, item: &str) -> RemovalPlan {
         match self.process(Request::RemovalPlan {
             scope: Scope::All,
@@ -301,6 +332,7 @@ fn a_landed_worktree_goes_with_its_branch() {
     let team = fixture.repository.join(loose).join("refs/heads/team");
     let _ = std::fs::remove_dir(&team);
     assert!(!team.exists());
+    fixture.refresh();
 
     let plan = fixture.plan(&landed.display().to_string());
     assert_eq!(plan.inspection.verdict, Verdict::Landed);
@@ -336,4 +368,48 @@ fn a_landed_worktree_goes_with_its_branch() {
         })
         .unwrap_err();
     assert_eq!(error, "The primary worktree is never removed");
+}
+
+#[test]
+fn invalid_byte_branch_removal_is_disabled_without_affecting_literal_branch() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let Some(root) =
+        isolated("invalid_byte_branch_removal_is_disabled_without_affecting_literal_branch")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let raw = OsStr::from_bytes(b"legacy-\xff");
+    let renamed = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.repository)
+        .args([
+            OsStr::new("branch"),
+            OsStr::new("-m"),
+            OsStr::new("feature"),
+            raw,
+        ])
+        .output()
+        .unwrap();
+    assert!(renamed.status.success(), "{renamed:?}");
+    git(
+        &fixture.repository,
+        &["branch", "-m", "landed", "legacy-\u{fffd}"],
+    );
+    fixture.refresh();
+    let result = fixture.process(Request::RemovalPlan {
+        scope: Scope::All,
+        item: fixture
+            .repository
+            .join(".worktrees/feature")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+        fetch: false,
+    });
+    assert_eq!(result.unwrap_err(), "Invalid UTF-8");
+    assert_eq!(
+        fixture.plan("legacy-\u{fffd}").inspection.branch.as_deref(),
+        Some("legacy-\u{fffd}")
+    );
 }

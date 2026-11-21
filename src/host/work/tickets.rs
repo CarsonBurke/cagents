@@ -48,7 +48,9 @@ impl Reference {
     /// default workspace.
     pub(super) fn from_branch(branch: &str) -> Option<Self> {
         Some(Self {
-            id: crate::work::ticket_from_branch(branch)?,
+            id: crate::work::ticket_from_branch(
+                &crate::work::branch_name(branch).to_string_lossy(),
+            )?,
             workspace: None,
         })
     }
