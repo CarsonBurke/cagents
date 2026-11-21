@@ -1261,6 +1261,7 @@ version = "0.1.0"
 dependencies = [
  "iced_accessibility",
  "iced_core",
+ "iced_graphics",
 ]
 
 [[package]]

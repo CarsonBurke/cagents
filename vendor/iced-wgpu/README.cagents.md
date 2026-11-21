@@ -22,3 +22,9 @@ Cargo cannot run it with `-p iced_wgpu` from the parent workspace because this v
 # Editor overscan (#2824)
 
 The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so the lines in the overscan bands reach the glyph renderer. The clip still comes from the widget. iced_tiny_skia is not vendored, and the pinned copy draws `layout_runs`, so the software fallback draws no text in the bands. The selection regions, caret and the app's fade come from iced-graphics and the widget, so they still extend into the bands there, and a click in a band lands on a line that renderer did not draw.
+
+# Reuse of unchanged text (#3564)
+
+`text::State::prepare` keeps, for each text group it prepares, the group's text, clip bounds, transformation and the viewport resolution. When the next frame draws a group that matches at the same position in the frame, it asks the group's renderer to `reuse` its glyphs (vendor/cryoglyph/README.cagents.md) instead of preparing them again, and prepares them as before if that fails. Paragraphs, editors and raw buffers compare by identity, using `is_same_live` from vendor/iced-graphics: none is changed in place while a frame refers to it. Cached text compares by value. A group that is not drawn again releases what it kept when the frame is trimmed.
+
+`drawn_identity` in `crates/iced-contracts` covers the identity contract; `mise run test:contracts` runs it. A native run with an activity spinner over a long transcript covers the reuse itself.

@@ -1,6 +1,6 @@
 use crate::{
-    ColorMode, FontSystem, GlyphDetails, GlyphToRender, GpuCacheStatus, PrepareError, RenderError,
-    SwashCache, SwashContent, TextArea, TextAtlas, Viewport,
+    CacheKey, ColorMode, FontSystem, GlyphDetails, GlyphToRender, GpuCacheStatus, PrepareError,
+    RenderError, SwashCache, SwashContent, TextArea, TextAtlas, Viewport,
 };
 use std::{num::NonZeroU64, slice};
 use wgpu::util::StagingBelt;
@@ -18,6 +18,18 @@ pub struct TextRenderer {
     pipeline: RenderPipeline,
     glyph_vertices: Vec<GlyphToRender>,
     glyphs_to_render: u32,
+    /// The atlas glyphs the last `prepare` drew, and where it found them.
+    /// Sorted and deduplicated by the first `reuse` after that `prepare`.
+    placed: Vec<Placed>,
+    deduplicated: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Placed {
+    key: CacheKey,
+    content_type: ContentType,
+    x: u16,
+    y: u16,
 }
 
 impl TextRenderer {
@@ -45,7 +57,46 @@ impl TextRenderer {
             pipeline,
             glyph_vertices: Vec::new(),
             glyphs_to_render: 0,
+            placed: Vec::new(),
+            deduplicated: true,
         }
+    }
+
+    /// Keeps what the last `prepare` drew for another frame, without walking
+    /// its text again. Like `prepare`, it marks each glyph drawn as in use, so
+    /// the atlas keeps it until it is next trimmed. It returns `false` when a
+    /// glyph has left the atlas or moved within it since, as when another
+    /// renderer evicted it while this one wasn't drawing; then `prepare` must
+    /// run again before `render`.
+    ///
+    /// The caller is responsible for knowing that the text areas, viewport
+    /// and atlas color mode are the ones `prepare` last saw.
+    pub fn reuse(&mut self, atlas: &mut TextAtlas) -> bool {
+        if !self.deduplicated {
+            // A glyph is usually drawn many times; check each one once.
+            self.placed.sort_unstable();
+            self.placed.dedup();
+            self.deduplicated = true;
+        }
+
+        self.placed.iter().all(|placed| {
+            let inner = atlas.inner_for_content_mut(placed.content_type);
+
+            // `get` also marks the glyph recently used, as `prepare` does.
+            let still_placed = matches!(
+                inner.glyph_cache.get(&placed.key),
+                Some(GlyphDetails {
+                    gpu_cache: GpuCacheStatus::InAtlas { x, y, content_type },
+                    ..
+                }) if (*x, *y, *content_type) == (placed.x, placed.y, placed.content_type)
+            );
+
+            if still_placed {
+                inner.glyphs_in_use.insert(placed.key);
+            }
+
+            still_placed
+        })
     }
 
     /// Prepares all of the provided text areas for rendering.
@@ -63,6 +114,8 @@ impl TextRenderer {
     ) -> Result<(), PrepareError> {
         self.staging_belt.recall();
         self.glyph_vertices.clear();
+        self.placed.clear();
+        self.deduplicated = true;
 
         let resolution = viewport.resolution();
 
@@ -203,6 +256,7 @@ impl TextRenderer {
                         GpuCacheStatus::InAtlas { x, y, content_type } => (x, y, content_type),
                         GpuCacheStatus::SkipRasterization => continue,
                     };
+                    let (atlas_x_unclipped, atlas_y_unclipped) = (atlas_x, atlas_y);
 
                     let mut width = details.width as i32;
                     let mut height = details.height as i32;
@@ -253,6 +307,14 @@ impl TextRenderer {
                     };
 
                     let depth = metadata_to_depth(glyph.metadata);
+
+                    self.placed.push(Placed {
+                        key: cache_key,
+                        content_type,
+                        x: atlas_x_unclipped,
+                        y: atlas_y_unclipped,
+                    });
+                    self.deduplicated = false;
 
                     self.glyph_vertices.push(GlyphToRender {
                         pos: [x, y],
@@ -364,7 +426,7 @@ impl TextRenderer {
 }
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ContentType {
     Color = 0,
     Mask = 1,

@@ -13,3 +13,5 @@ workspace = true
 # Root patch selects the same vendored package as the UI, with its production Id.
 iced_core = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y"] }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+# The renderer reuses a frame's prepared text by these identities.
+iced_graphics = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
