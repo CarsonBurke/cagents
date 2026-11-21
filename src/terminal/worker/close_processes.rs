@@ -16,6 +16,22 @@ use std::{
 const MAX_CENSUS_PASSES: usize = 16;
 const MAX_PROCESSES: usize = 65_536;
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CENSUS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELAY_NEXT_CENSUS: std::cell::RefCell<Option<crossbeam_channel::Sender<Instant>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_census_for_test() {
+    FAIL_NEXT_CENSUS.set(true);
+}
+
+#[cfg(test)]
+pub(super) fn delay_next_census_for_test(finished: crossbeam_channel::Sender<Instant>) {
+    DELAY_NEXT_CENSUS.set(Some(finished));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CloseProcess {
     pub pid: libc::pid_t,
@@ -111,7 +127,7 @@ struct FrozenProcess {
 }
 
 /// Every successfully issued SIGSTOP immediately gains a resume-on-drop guard.
-/// Already stopped/traced processes are never resumed by this operation.
+/// Drop only releases capture-owned stops; hangup explicitly resumes all jobs.
 impl Drop for FrozenProcess {
     fn drop(&mut self) {
         if self.resume
@@ -152,7 +168,7 @@ impl FrozenFamily {
         for _ in 0..MAX_CENSUS_PASSES {
             check_deadline(deadline)?;
             let processes = census(deadline)?;
-            let owned = process_family(&root.process, &processes, &family.targets);
+            let owned = process_family(&root.process, &processes, &family.targets, this_daemon());
             let before = family.targets.len();
             for process in owned {
                 if family
@@ -282,9 +298,66 @@ impl FrozenFamily {
 
     pub(super) fn kill(&mut self, deadline: Instant) -> Result<(), String> {
         check_deadline(deadline)?;
-        // All targets remain stopped until every signal has been issued. No
-        // numeric PID is ever signaled, even after a job exits or is reparented.
+        self.kill_survivors()
+    }
+
+    /// Retain every exact handle while restoring the captured family's ability
+    /// to handle HUP. Notify jobs explicitly even when the shell traps HUP.
+    pub(super) fn hangup(&mut self, child: &super::holder::HeldChild) -> Result<(), String> {
+        let mut failure = None;
+        for target in self.targets.iter().skip(1).rev() {
+            match signal(&target.pidfd, libc::SIGHUP) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if let Err(error) = child.kill() {
+            failure.get_or_insert_with(|| format!("hang up child: {error}"));
+        }
+        // HUP stays pending on stopped jobs. Like orphaned process-group
+        // hangup, follow it with CONT for every exact tracked process, including
+        // jobs stopped before capture. No numeric PID grants signal authority.
+        for target in self.targets.iter_mut().rev() {
+            match signal(&target.pidfd, libc::SIGCONT) {
+                Ok(()) => target.resume = false,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                    target.resume = false;
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn wait_until(&self, deadline: Instant) -> Result<bool, String> {
+        for target in &self.targets {
+            if !super::holder::exits_within(
+                &target.pidfd,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn kill_survivors(&mut self) -> Result<(), String> {
+        let mut failure = None;
+        // Checked close holds stopped targets; ordinary shutdown retains the
+        // same handles across its graceful wait. Only survivors receive KILL.
+        // Numeric PID reuse and reparenting cannot change that authority.
         for (index, target) in self.targets.iter_mut().enumerate() {
+            if super::holder::exits_within(&target.pidfd, Duration::ZERO).unwrap_or(false) {
+                target.resume = false;
+                continue;
+            }
             // The root is always first. Serialize receipt publication with
             // exit observation, including upgrades which kill off-worker.
             let mut receipt = (index == 0).then(|| {
@@ -295,7 +368,7 @@ impl FrozenFamily {
             let live_root = receipt.is_some()
                 && read_process(target.identity.pid).is_ok_and(|process| {
                     same_identity(&process, &target.identity)
-                        && matches!(process.state, b'T' | b't')
+                        && !matches!(process.state, b'Z' | b'X')
                 });
             match signal(&target.pidfd, libc::SIGKILL) {
                 Ok(()) => {
@@ -305,10 +378,14 @@ impl FrozenFamily {
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => target.resume = false,
-                Err(error) => return Err(format!("Could not close terminal process: {error}")),
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        format!("Could not close terminal process: {error}")
+                    });
+                }
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -406,7 +483,68 @@ fn parse_process(pid: libc::pid_t, stat: &str) -> Option<CloseProcess> {
     })
 }
 fn census(deadline: Instant) -> Result<Vec<CloseProcess>, String> {
+    #[cfg(test)]
+    if let Some(finished) = DELAY_NEXT_CENSUS.take() {
+        // Exercise capture's deadline without a real uninterruptible process.
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        let _ = finished.send(Instant::now());
+        check_deadline(deadline)?;
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_CENSUS.replace(false) {
+        return Err("injected terminal process census failure".into());
+    }
     census_with(deadline, read_process)
+}
+
+/// After the pinned root exits, a numeric session can only refuse cleanup;
+/// it never grants authority to signal a process discovered after that exit.
+pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Result<bool, String> {
+    let processes = census(deadline)?;
+    let daemon = daemon_subtree(this_daemon(), &processes);
+    Ok(processes.iter().all(|process| {
+        process.session != session
+            || matches!(process.state, b'Z' | b'X')
+            || daemon.contains(&process.pid)
+    }))
+}
+
+fn this_daemon() -> libc::pid_t {
+    // SAFETY: getpid has no preconditions and cannot fail.
+    unsafe { libc::getpid() }
+}
+
+/// A daemon started from inside a terminal (for example by a CLI that found
+/// none running) stays in that terminal's session, as do helpers it starts
+/// without a session of their own. Neither is ever that terminal's job:
+/// stopping them would stop the daemon itself. Descent stops where a child
+/// leaves the daemon's session, so every terminal holder, and the family
+/// each holder's root leads, remains outside this set. A helper's child that
+/// outlived its parent was reparented away and is no longer recognizable as
+/// the daemon's; it is treated like any other session member.
+fn daemon_subtree(
+    daemon: libc::pid_t,
+    processes: &[CloseProcess],
+) -> std::collections::HashSet<libc::pid_t> {
+    let mut subtree = std::collections::HashSet::from([daemon]);
+    let Some(session) = processes
+        .iter()
+        .find(|process| process.pid == daemon)
+        .map(|process| process.session)
+    else {
+        return subtree;
+    };
+    loop {
+        let before = subtree.len();
+        for process in processes {
+            if process.session == session && subtree.contains(&process.parent) {
+                subtree.insert(process.pid);
+            }
+        }
+        if subtree.len() == before {
+            return subtree;
+        }
+    }
 }
 
 fn census_with(
@@ -441,8 +579,10 @@ fn process_family(
     root: &CloseProcess,
     processes: &[CloseProcess],
     frozen: &[FrozenProcess],
+    daemon: libc::pid_t,
 ) -> Vec<CloseProcess> {
     use std::collections::{HashMap, HashSet};
+    let excluded = daemon_subtree(daemon, processes);
     let mut children: HashMap<libc::pid_t, Vec<&CloseProcess>> = HashMap::new();
     for process in processes {
         children.entry(process.parent).or_default().push(process);
@@ -455,6 +595,7 @@ fn process_family(
         family.push(root.clone());
     }
     let mut seen: HashSet<_> = family.iter().map(|process| process.pid).collect();
+    seen.extend(excluded);
     for process in processes {
         if process.session == root.session && seen.insert(process.pid) {
             family.push(process.clone());
@@ -604,7 +745,7 @@ mod tests {
             ..root.clone()
         };
         let frozen = |processes: &[CloseProcess]| FrozenFamily {
-            targets: process_family(&root, processes, &[])
+            targets: process_family(&root, processes, &[], 0)
                 .into_iter()
                 .map(|identity| FrozenProcess {
                     identity,
@@ -659,7 +800,73 @@ mod tests {
             session: 20,
             ..root.clone()
         };
-        let family = process_family(&root, &[grandchild, other, detached, background], &[]);
+        let family = process_family(
+            &root,
+            &[
+                grandchild.clone(),
+                other,
+                detached.clone(),
+                background.clone(),
+            ],
+            &[],
+            0,
+        );
+        let mut pids: Vec<_> = family.iter().map(|process| process.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [10, 11, 12, 13]);
+
+        // A daemon started from this terminal shares its session; neither it
+        // nor anything it started (a holder that left the session) is a job.
+        let daemon = CloseProcess {
+            pid: 30,
+            parent: 1,
+            group: 30,
+            ..root.clone()
+        };
+        let daemon_child = CloseProcess {
+            pid: 31,
+            parent: 30,
+            ..root.clone()
+        };
+        let holder = CloseProcess {
+            pid: 32,
+            parent: 30,
+            group: 32,
+            session: 32,
+            ..root.clone()
+        };
+        let family = process_family(
+            &root,
+            &[
+                grandchild.clone(),
+                detached.clone(),
+                background.clone(),
+                daemon,
+                daemon_child,
+                holder,
+            ],
+            &[],
+            30,
+        );
+        let mut pids: Vec<_> = family.iter().map(|process| process.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [10, 11, 12, 13]);
+
+        // The usual daemon is the root's ancestor through its holder, which
+        // left the daemon's session. That ancestry excludes no job.
+        let ordinary_daemon = CloseProcess {
+            pid: 1,
+            parent: 0,
+            group: 1,
+            session: 1,
+            ..root.clone()
+        };
+        let family = process_family(
+            &root,
+            &[grandchild, detached, background, ordinary_daemon],
+            &[],
+            1,
+        );
         let mut pids: Vec<_> = family.iter().map(|process| process.pid).collect();
         pids.sort_unstable();
         assert_eq!(pids, [10, 11, 12, 13]);

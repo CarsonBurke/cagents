@@ -278,13 +278,15 @@ pub(super) fn spawn_recoverable(
     spawn_reserved(command, size, exits, recovery, reservation)
 }
 
-fn spawn_reserved(
+pub(super) fn spawn_reserved(
     command: CommandBuilder,
     size: PtySize,
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
     reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
+    #[cfg(test)]
+    let fixture_runtime = command.get_env("XDG_RUNTIME_DIR").map(PathBuf::from);
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -293,6 +295,10 @@ fn spawn_reserved(
         UnixStream::pair().map_err(|error| format!("create terminal holder socket: {error}"))?;
     let remote_fd = remote.as_raw_fd();
     let mut process = Command::new("/proc/self/exe");
+    #[cfg(test)]
+    if let Some(runtime) = &fixture_runtime {
+        process.env("XDG_RUNTIME_DIR", runtime);
+    }
     process
         .arg0(PROCESS_NAME.to_str().expect("the holder name is ASCII"))
         .arg(ARGUMENT)
@@ -376,7 +382,16 @@ fn spawn_reserved(
     crate::daemon::process_scope::warn_if_shared(owner.pid as u32, pid as u32);
     holder.protocol = PROTOCOL;
     if let Some(id) = registered_id {
-        let record = registry::evidence(&registry::socket(&registry::directory()?, id))?
+        #[cfg(test)]
+        let directory = match fixture_runtime {
+            Some(runtime) => runtime
+                .join(crate::instance::runtime_subdirectory())
+                .join("holders"),
+            None => registry::directory()?,
+        };
+        #[cfg(not(test))]
+        let directory = registry::directory()?;
+        let record = registry::evidence(&registry::socket(&directory, id))?
             .ok_or("New terminal holder has no discovery evidence")?;
         if record.holder != owner || record.root.pid != pid {
             return Err("New terminal holder evidence does not match its exact child".into());
@@ -635,13 +650,22 @@ fn spawn_original(
 
 impl OriginalChild {
     fn retain(self, pidfd: Option<File>, reason: &str) {
+        self.retain_with_recovery(pidfd, reason, false);
+    }
+
+    fn retain_with_recovery(self, pidfd: Option<File>, reason: &str, recoverable: bool) {
         let Self { child, reservation } = self;
         reservation.quarantine();
         let Some(pidfd) = pidfd else {
             reservation.preserve_suspended(child, None, reason);
             return;
         };
-        if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
+        let retained = if recoverable {
+            reservation.retain_recoverable(child, pidfd)
+        } else {
+            reservation.retain(child, pidfd)
+        };
+        if let Err((error, child, pidfd, reservation)) = retained {
             // retain returns every original operand intact on validation,
             // wakeup or service failure. No second reaper or PID lookup.
             reservation.preserve_suspended(child, Some(pidfd), &format!("{reason}: {error}"));
@@ -698,6 +722,7 @@ pub(super) struct Holder {
     /// The holder's typed answers, relayed by the original control watch.
     acknowledged: Option<Receiver<Result<Acknowledgement, String>>>,
     detached: bool,
+    recoverable_shutdown: bool,
     adoption_pending: bool,
     registered: bool,
     screen_lost: bool,
@@ -750,6 +775,12 @@ impl Holder {
     pub(super) fn leave_for_successor(&mut self) {
         self.detached = true;
         let _ = self.control.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub(super) fn leave_after_unconfirmed_shutdown(&mut self) {
+        debug_assert!(self.registered);
+        self.recoverable_shutdown = true;
+        self.leave_for_successor();
     }
 
     pub(super) fn cache_screen(&mut self, screen: &[u8]) -> Result<(), String> {
@@ -807,6 +838,7 @@ impl Holder {
             release: None,
             acknowledged: None,
             detached: false,
+            recoverable_shutdown: false,
             adoption_pending: false,
             registered: false,
             screen_lost: false,
@@ -917,9 +949,10 @@ impl Drop for Holder {
             }
             // Successful exact wait drops its reservation normally.
         } else if let Some(process) = self.process.take() {
-            process.retain(
+            process.retain_with_recovery(
                 self.pidfd.take(),
                 "Detached terminal child custody transfer",
+                self.recoverable_shutdown,
             );
         }
         // Ending a watch does not end original child custody. A detached
@@ -1089,7 +1122,7 @@ fn open_pidfd(pid: libc::pid_t) -> io::Result<File> {
 
 /// Whether a pidfd's process exits within `grace`: a pidfd becomes readable
 /// when it does.
-fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
+pub(super) fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
     let deadline = Instant::now() + grace;
     let mut target = libc::pollfd {
         fd: pidfd.as_raw_fd(),
@@ -1099,7 +1132,16 @@ fn exits_within(pidfd: &File, grace: Duration) -> io::Result<bool> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         // SAFETY: one live pollfd for the duration of the call.
-        match unsafe { libc::poll(&mut target, 1, remaining.as_millis() as libc::c_int) } {
+        match unsafe {
+            libc::poll(
+                &mut target,
+                1,
+                remaining
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as libc::c_int,
+            )
+        } {
             -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
             -1 => return Err(io::Error::last_os_error()),
             ready => return Ok(ready > 0),
@@ -2894,8 +2936,14 @@ mod tests {
         // Normal worker shutdown waits for the holder's post-reap root report
         // before releasing the holder. Raw Held drop only promises a hangup.
         let root_identity = super::super::RootIdentity::capture(root.pid, None).unwrap();
-        super::super::shutdown_child_exit(&held.child, Some(&root_identity), &exited, false)
-            .expect("normal shutdown must confirm the exact root was reaped");
+        super::super::shutdown_child_exit(
+            &held.child,
+            &held.master,
+            Some(&root_identity),
+            &exited,
+            false,
+        )
+        .expect("normal shutdown must confirm the exact root was reaped");
         assert!(!held.child.unreaped());
         assert_eq!(
             reaper.free(),
