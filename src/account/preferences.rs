@@ -308,6 +308,7 @@ mod tests {
                 ..Default::default()
             }),
             snapshot: UsageSnapshot::state(UsageStatus::Unavailable, "fixture", 1),
+            inventory_observed_at: Some(1),
         };
         let before = fs::read(directory.path().join("accounts.toml")).unwrap();
         let mut cache = BTreeMap::from([(
