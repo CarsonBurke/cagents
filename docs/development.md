@@ -2241,12 +2241,17 @@ harness, it provides:
   This deadline counts toward, and does not extend, the `--limit` session lifetime.
 - **Drags.** `drive drag FROM TO` presses, travels and releases in one
   injector run, moving by relative steps, so the app sees the path between
-  the two points. A gesture written by hand for the injector (`vptr`) must
-  press and release within one run: place the pointer with `a` before the
-  press, then travel only by `r` steps. `a` reaches its point by pinning the
-  pointer to the screen's origin, so with the button held it drags through
-  that corner on every move, and a dragged scrollbar thumb snaps to the top
-  between steps. Check a drag's frames, not only where it ended.
+  the two points. To write a gesture by hand, run niri-harness's injector VPTR,
+  `build/vptr` beside its `bin/` (`~/.local/lib/niri-harness/build/vptr` on
+  fw16), through `nested` with the marker it requires, separating its
+  commands with `;` arguments:
+  `evidence nested sh -c 'NIRI_HARNESS_INJECT_DISPLAY=$WAYLAND_DISPLAY exec "$@"'
+  sh VPTR a X Y \; d left \; w 80 \; r DX DY \; w 12 \; u left`. Press and
+  release within that one run, place the pointer with `a` before the press,
+  and then travel only by `r` steps. The installed injector places every `a`
+  by pinning the pointer to the screen's origin, so a held `a` drags through
+  that corner and a dragged scrollbar thumb snaps to the top between steps
+  (niri-harness#5 proposes refusing such an `a` instead). Check a drag's frames, not only where it ended.
 - **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
   the GTK backend on the session's private bus, so the app's Attach dialog
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
