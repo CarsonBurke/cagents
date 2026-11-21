@@ -704,11 +704,23 @@ mod tests {
             layers(&members(&[], 1), Ground::Row)[0].center_x(),
             BOX / 2.0
         );
+        // The rail is drawn as it was before the expanded row's badge moved:
+        // the lead left of the box's centre, the peeking provider above its
+        // right, and the badge's right edge 13 px and its centre 6 px from
+        // the lead's centre.
+        let rail = layers(&crowd, Ground::Rail);
+        let [peek, lead, badge] = rail[..] else {
+            panic!("the rail keeps its peeking provider beside the lead and badge: {rail:?}");
+        };
+        let centre = lead.center();
+        assert_eq!(centre.x, RAIL_LEAD_X);
+        assert_eq!(centre.y, BOX / 2.0);
         assert_eq!(
-            layers(&crowd, Ground::Rail).len(),
-            3,
-            "the rail keeps its peeking provider beside the lead and badge"
+            (peek.center_x() - centre.x, peek.center_y() - centre.y),
+            (6.0, -3.0)
         );
+        assert_eq!(badge.x + badge.width - centre.x, 13.0);
+        assert_eq!(badge.center_y() - centre.y, 6.0);
     }
 
     #[test]

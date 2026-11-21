@@ -3070,9 +3070,7 @@ fn a_channels_member_count_is_a_badge_on_its_mark() {
             );
             for leaf in &row.leaves {
                 assert!(
-                    leaf.x + leaf.width <= row.title.x
-                        || row.title.contains(leaf.center())
-                        || leaf.x >= row.delete.x,
+                    leaf.x < row.title.x || *leaf == row.title || leaf.x >= row.delete.x,
                     "{:?} at {width}px: {leaf:?} is drawn after the title {:?}",
                     channel.title,
                     row.title
