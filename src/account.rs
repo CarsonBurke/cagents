@@ -1252,8 +1252,9 @@ impl LiveReport {
         }
         match self {
             Self::Claude(update) => {
-                claude::merge_live(current, update, observed_at);
-                current.observed_at = observed_at;
+                if claude::merge_live(current, update, observed_at) {
+                    current.observed_at = observed_at;
+                }
             }
             Self::CodexLimits(update) => {
                 if codex::merge_update(current, update, observed_at) {
