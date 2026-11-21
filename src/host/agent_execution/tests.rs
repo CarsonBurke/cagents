@@ -6170,6 +6170,12 @@ fn console_prints_a_provider_notice_as_one_unlabelled_line() {
         "cut on a character boundary: {wide}"
     );
     assert!(wide.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", wide.len());
+    let spaced = format!("{} tail", "z".repeat(CONSOLE_NOTICE_BYTES - 4));
+    assert_eq!(
+        line("spaced", &spaced),
+        Some(format!("{}…\n", "z".repeat(CONSOLE_NOTICE_BYTES - 4))),
+        "a cut after a space leaves none before the ellipsis"
+    );
     assert_eq!(
         line(
             "frame",

@@ -2611,6 +2611,7 @@ fn console_notice(text: &str) -> Option<String> {
     if line.len() > CONSOLE_NOTICE_BYTES || text.lines().skip(1).any(|line| !line.trim().is_empty())
     {
         crate::agent_execution::truncate(&mut line, CONSOLE_NOTICE_BYTES - '…'.len_utf8());
+        line.truncate(line.trim_end().len());
         line.push('…');
     }
     line.push('\n');
