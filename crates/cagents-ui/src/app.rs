@@ -5646,15 +5646,24 @@ struct PendingLspJump {
 struct LspInspectorState {
     attachment: crate::editor_assistance::AttachmentState,
     /// Independent editor buffers cannot share one language-server URI.
+    /// Keep the refused buffer editable and let Restart retry after its owner
+    /// closes, without registering its text over the other pane's snapshot.
     blocked_by_other_buffer: bool,
-    /// Absolute path, also retained when no configured server claims it.
+    /// Absolute path of the card's open buffer, recorded even when no server
+    /// claims it. A jump target arrives absolute while the card's file list is
+    /// worktree-relative, so this is the only side both can be compared on.
     path: Option<PathBuf>,
-    /// An undismissed failure outranks transient indexing progress.
+    /// A failure the user has not dismissed. Outranks `progress`, because an
+    /// indexing report arriving a second later must not erase the one message
+    /// saying their hover and completions were thrown away.
     failure: Option<String>,
+    /// The server's current progress report, if it is still working.
     progress: Option<String>,
 }
 
 impl LspInspectorState {
+    /// Recomputes the single notice the surface renders from the two
+    /// independent things that can want it.
     fn refresh_notice(&mut self) {
         self.attachment.context.notice = self.failure.clone().or_else(|| self.progress.clone());
     }
@@ -13384,8 +13393,7 @@ impl Cagents {
             runtime.set_lsp_document(None);
         }
         if let Some(state) = self.lsp_contexts.get_mut(&card) {
-            state.attachment.context = inspector::LspInspectorContext::default();
-            state.attachment.diagnostics_version = None;
+            state.attachment.clear_results();
             state.path = None;
             state.blocked_by_other_buffer = false;
         }
@@ -13716,8 +13724,7 @@ impl Cagents {
                     // the dead session's diagnostics on screen would show the
                     // user results from a server that no longer exists.
                     state.attachment.invalidate_answers();
-                    state.attachment.context.diagnostics.clear();
-                    state.attachment.diagnostics_version = None;
+                    state.attachment.clear_diagnostics();
                     state.failure = None;
                     state.progress = None;
                     state.refresh_notice();
@@ -13888,7 +13895,7 @@ impl Cagents {
                     .entry(card)
                     .or_default()
                     .attachment
-                    .completion_request = Some((request, at));
+                    .completion_requested(request, at);
                 request
             }
             LspRequestKind::References => self.lsp.request_references(doc, at),
@@ -13913,7 +13920,7 @@ impl Cagents {
             }
             Action::Hover(at) => {
                 if let Some(state) = self.lsp_contexts.get_mut(&card)
-                    && let Some((request, _)) = state.attachment.editor_hover_request.take()
+                    && let Some(request) = state.attachment.take_hover_request()
                 {
                     self.lsp.cancel(request);
                 }
@@ -13928,7 +13935,7 @@ impl Cagents {
                         .entry(card)
                         .or_default()
                         .attachment
-                        .editor_hover_request = Some((request, at));
+                        .hover_requested(request, at);
                 }
                 Task::none()
             }
@@ -13946,7 +13953,7 @@ impl Cagents {
                         .entry(card)
                         .or_default()
                         .attachment
-                        .editor_navigation = Some(request);
+                        .navigation_requested(request);
                 }
                 Task::none()
             }

@@ -11,13 +11,26 @@ use crate::{
     },
 };
 
-/// Answers and request identities belonging to one card or tab's buffer.
+/// One buffer's language-server results, with the buffer version each describes.
+///
+/// A server answers the text it was given. Keeping the version beside the
+/// answer is what lets a stale one be refused instead of applied to text that
+/// has since moved: a caret jump to a line that no longer exists, or a
+/// completion whose edit range describes characters the user has already
+/// replaced, are both silent corruptions, and neither is recoverable by
+/// looking at the answer alone.
 #[derive(Debug, Default)]
 pub(crate) struct AttachmentState {
     pub(crate) context: LspInspectorContext,
+    /// The document, once opened. `None` while no file is open, or when no
+    /// configured server claims this file's extension, or another independent
+    /// buffer already owns its language-server attachment.
     pub(crate) document: Option<LspDocumentId>,
-    /// The manager's version, including reopen/restart transitions, rather
-    /// than a local count of edits.
+    /// The version the diagnostics were computed for, as the manager stamped
+    /// them. Compared against the manager's document version and never against
+    /// a count of this side's own: the manager re-opens a document on a
+    /// restart, a crash-respawn, or a second buffer opening the same file, and
+    /// none of those are edits this side made.
     pub(crate) diagnostics_version: Option<i32>,
     pub(crate) completion_request: Option<(LspRequestId, LspPosition)>,
     /// Last observed runtime intent; a request is captured against this value.
@@ -38,7 +51,12 @@ impl AttachmentState {
         self.completion_request.take().map(|(request, _)| request)
     }
 
-    /// Drop position-addressed answers while retaining standing diagnostics.
+    /// Drops every answer that describes text the buffer no longer holds.
+    ///
+    /// Diagnostics are kept and re-dated instead of dropped: the server
+    /// replaces them wholesale on its own schedule, and blanking them on each
+    /// keystroke would make the list flicker empty while the user typed. They
+    /// are refused at the point of use by version rather than erased here.
     pub(crate) fn invalidate_answers(&mut self) {
         self.context.locations = None;
         self.context.completions.clear();
@@ -60,9 +78,42 @@ impl AttachmentState {
             shift_diagnostics(&mut self.context.diagnostics, edits);
             self.diagnostics_version = synchronized_version;
         } else {
-            self.context.diagnostics.clear();
-            self.diagnostics_version = None;
+            self.clear_diagnostics();
         }
+    }
+
+    /// Forget the standing diagnostics, for a buffer whose server will
+    /// republish from scratch or whose coordinates can no longer be mapped.
+    pub(crate) fn clear_diagnostics(&mut self) {
+        self.context.diagnostics.clear();
+        self.diagnostics_version = None;
+    }
+
+    /// Forget everything shown for a closed document. Outstanding request
+    /// identities stay; their responses no longer route to this buffer.
+    pub(crate) fn clear_results(&mut self) {
+        self.context = LspInspectorContext::default();
+        self.diagnostics_version = None;
+    }
+
+    /// Record the completion request answering the caret at `at`.
+    pub(crate) fn completion_requested(&mut self, request: LspRequestId, at: LspPosition) {
+        self.completion_request = Some((request, at));
+    }
+
+    /// Retire the pending hover so the shell can cancel it before asking again.
+    pub(crate) fn take_hover_request(&mut self) -> Option<LspRequestId> {
+        self.editor_hover_request.take().map(|(request, _)| request)
+    }
+
+    /// Record the hover request answering the pointer at `at`.
+    pub(crate) fn hover_requested(&mut self, request: LspRequestId, at: LspPosition) {
+        self.editor_hover_request = Some((request, at));
+    }
+
+    /// Record the definition request whose answer may move the caret.
+    pub(crate) fn navigation_requested(&mut self, request: LspRequestId) {
+        self.editor_navigation = Some(request);
     }
 
     /// Refuse a delayed publication without erasing a newer standing set.
@@ -119,7 +170,12 @@ impl AttachmentState {
     }
 }
 
-/// Both versions must be known and equal before diagnostics can be used.
+/// Whether a published diagnostics list still describes the buffer on screen.
+///
+/// `published` is the version the manager stamped the list with; `document` is
+/// the version its snapshot holds now. Both must be known and equal: an
+/// unknown document has no diagnostics worth jumping into, and an unstamped
+/// list is one this side never received.
 pub(crate) const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) -> bool {
     match (published, document) {
         (Some(published), Some(document)) => published == document,
