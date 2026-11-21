@@ -319,10 +319,6 @@ pub enum BrowserEvent {
     TitleChanged(Option<String>),
     LoadStateChanged(String),
     FocusChanged(bool),
-    InputHandled {
-        sequence: u64,
-        consumed: bool,
-    },
     InputMethod(Option<InputMethodState>),
     Delegate(DelegateRequest),
     LifecycleChanged(BrowserLifecycle),
