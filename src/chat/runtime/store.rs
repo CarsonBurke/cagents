@@ -3,12 +3,14 @@
 //! let one enormous tool result be shown as an excerpt and copied whole.
 mod file_changes;
 mod text_copy;
+mod unread;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
+pub use unread::Unread;
 
 /// Keep storage failures distinct from malformed provider events until the
 /// startup boundary chooses recovery. Ordinary runtime callers still receive
@@ -179,6 +181,8 @@ pub(crate) struct Store {
     pub dirty: bool,
     /// Dirty identities are bounded even while the conversation is hidden.
     changed: Option<std::collections::HashSet<String>>,
+    /// What changed since the conversation's follower last read it.
+    following: unread::Following,
     pub presented_generation: Option<u64>,
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
@@ -432,6 +436,7 @@ impl Store {
                 messages: None,
                 dirty: true,
                 changed: Some(Default::default()),
+                following: Default::default(),
                 presented_generation: None,
                 presentation: None,
                 presented_children: Default::default(),
@@ -1410,6 +1415,7 @@ impl Store {
         Ok(())
     }
     fn changed(&mut self, id: &str) {
+        self.following.changed(id);
         if let Some(changed) = &mut self.changed {
             changed.insert(id.into());
             if changed.len() > WINDOW_ITEMS * 2 {

@@ -19,6 +19,9 @@ The prompt chooses the turn, by the first of these words it contains as a
 word:
 
   tools       a plan, a shell command, a file edit with its diff, then an answer
+  work        replays the Claude Code turn in FAKE_ACP_WORK as ACP messages,
+              shell commands and edits: the conversation-work fixture's
+              pull requests and worktrees
   permission  an edit that asks for approval first; refusing fails the edit,
               stopping the turn cancels it
   hold        thinks until the turn is stopped (at most 60 seconds)
@@ -43,6 +46,9 @@ Environment switches:
   FAKE_ACP_REPLAY=N         a loaded conversation starts with N extra
                             exchanges, for long histories
   FAKE_ACP_LOG=FILE         append every frame received, one per line
+  FAKE_ACP_WORK=FILE        Claude Code transcript lines the `work` turn
+                            replays, as tests/fixtures/conversation-work.py
+                            writes them
   FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
   FAKE_ACP_LIST_PAGE=N      list N conversations a page, each page after
                             the first by the `nextCursor` of the one before
@@ -91,6 +97,7 @@ if APP_DATA != "antigravity-cli":
     STATE = os.path.join(STATE, "app-data", APP_DATA.replace("/", "_"))
 AUTH = os.environ.get("FAKE_ACP_AUTH", "")
 LOG = os.environ.get("FAKE_ACP_LOG")
+WORK = os.environ.get("FAKE_ACP_WORK")
 
 AGY_MODES = [
     ("default", "Default", "Ask before edits and commands, per your permission settings."),
@@ -490,6 +497,8 @@ class Agent:
             self.say(session, "Compacted the conversation.")
         elif "tools" in words:
             stop = self.tools(session)
+        elif "work" in words:
+            stop = self.work(session)
         elif "permission" in words:
             stop = self.permission(session)
         elif "hold" in words:
@@ -581,6 +590,43 @@ class Agent:
         self.say(session, "Listed the files and updated notes.md.")
         return "end_turn"
 
+    def work(self, session):
+        """The Claude Code turn in FAKE_ACP_WORK, as an ACP agent reports
+        the same work: its text as messages, `Bash` calls as shell commands
+        with their output, `Edit`, `MultiEdit` and `Write` calls as diffs,
+        `Read` calls as reads, and any other tool by its name."""
+        try:
+            with open(WORK or "") as saved:
+                lines = [json.loads(line) for line in saved if line.strip()]
+        except (OSError, ValueError) as error:
+            self.say(session, f"No work to replay: {error}")
+            return "end_turn"
+        calls = {}
+        for line in lines:
+            if line.get("type") not in ("assistant", "user"):
+                continue
+            content = (line.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                kind = block.get("type")
+                if kind == "text" and line["type"] == "assistant":
+                    self.say(session, block.get("text", ""))
+                elif kind == "tool_use":
+                    call = "call-" + uuid.uuid4().hex[:8]
+                    calls[block.get("id")] = (call, block.get("name", ""), block.get("input") or {})
+                    session.update(work_call(call, block.get("name", ""),
+                                             block.get("input") or {}, session.cwd))
+                elif kind == "tool_result" and block.get("tool_use_id") in calls:
+                    call, name, arguments = calls.pop(block["tool_use_id"])
+                    output = block.get("content")
+                    if isinstance(output, list):
+                        output = "\n".join(part.get("text", "") for part in output
+                                           if isinstance(part, dict))
+                    session.update(work_result(call, name, arguments, output or "",
+                                               bool(block.get("is_error"))))
+        return "end_turn"
+
     def permission(self, session):
         edit = "call-" + uuid.uuid4().hex[:8]
         path = os.path.join(session.cwd, "config.toml")
@@ -643,6 +689,48 @@ class Agent:
         with open(os.path.join(STATE, "index.json.tmp"), "w") as saved:
             json.dump(index, saved)
         os.replace(os.path.join(STATE, "index.json.tmp"), os.path.join(STATE, "index.json"))
+
+
+def work_diffs(name, arguments):
+    """The diffs a Claude Code edit made, as ACP diff content."""
+    path = arguments.get("file_path", "")
+    if name == "Write":
+        return [{"type": "diff", "path": path, "oldText": None,
+                 "newText": arguments.get("content", "")}]
+    edits = arguments.get("edits") if name == "MultiEdit" else [arguments]
+    return [{"type": "diff", "path": path, "oldText": edit.get("old_string", ""),
+             "newText": edit.get("new_string", "")} for edit in edits or []]
+
+
+def work_call(call, name, arguments, cwd):
+    """The ACP `tool_call` for a Claude Code tool call."""
+    update = {"sessionUpdate": "tool_call", "toolCallId": call, "status": "in_progress"}
+    path = arguments.get("file_path")
+    if name in ("Edit", "MultiEdit", "Write"):
+        update.update(title=f"Edit {os.path.basename(path or '')}", kind="edit",
+                      locations=[{"path": path}] if path else [])
+    elif name == "Bash":
+        update.update(title=arguments.get("description") or "Run", kind="execute",
+                      rawInput={"command": arguments.get("command", ""), "cwd": cwd})
+    elif name == "Read":
+        update.update(title=f"Read {os.path.basename(path or '')}", kind="read",
+                      locations=[{"path": path}] if path else [], rawInput=arguments)
+    else:
+        update.update(title=name or "Tool", kind="other", rawInput=arguments)
+    return update
+
+
+def work_result(call, name, arguments, output, failed):
+    """The ACP `tool_call_update` that finishes a Claude Code tool call."""
+    update = {"sessionUpdate": "tool_call_update", "toolCallId": call,
+              "status": "failed" if failed else "completed"}
+    if name in ("Edit", "MultiEdit", "Write") and not failed:
+        update["content"] = work_diffs(name, arguments)
+    else:
+        update["content"] = [{"type": "content", "content": {"type": "text", "text": output}}]
+        if name == "Bash":
+            update["rawOutput"] = {"exitCode": 1 if failed else 0}
+    return update
 
 
 def command_line(arguments):

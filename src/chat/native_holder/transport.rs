@@ -2150,6 +2150,7 @@ exec /bin/sleep 60
         )));
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -2362,6 +2363,7 @@ exec /bin/sleep 60
         assert!(!stripped.owns_codex_listener());
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2567,6 +2569,7 @@ exec /bin/sleep 60
             .boot_id = boot;
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2682,6 +2685,7 @@ exec /bin/sleep 60
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket {
@@ -2791,6 +2795,7 @@ exec /bin/sleep 60
         )));
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -2867,6 +2872,7 @@ exec /bin/sleep 60
             crate::daemon::owned_children::tests::provider_with_detached_work(working.path());
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },

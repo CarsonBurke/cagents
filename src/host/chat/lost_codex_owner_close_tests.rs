@@ -252,6 +252,7 @@ fn provider_actor(root: &std::path::Path) -> chat::runtime::Handle {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -490,6 +491,7 @@ impl Spawned {
         let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
         let spec = chat::protocol::ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: chat::protocol::TransportSpec::OwnedUnixWebSocket { socket },

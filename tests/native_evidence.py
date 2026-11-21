@@ -1044,6 +1044,25 @@ class Evidence(unittest.TestCase):
                 self.assertNotIn("RUST_LOG=", self.run_tool("cli", "print-env").stdout)
                 self.run_tool("stop")
 
+    def test_daemon_trace_logs_the_daemon_of_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        log = str(self.task / "logs/daemon-after.log")
+        for options, expected in (([], None), (["--daemon-trace", "cagents::chat::runtime=debug,warn"], log), ([], None)):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
+                if expected is None:
+                    self.assertNotIn("--daemon-log", arguments)
+                    self.assertEqual((self.logs / "ui-rust-log").read_text(), "unset\n")
+                else:
+                    self.assertEqual(arguments[arguments.index("--daemon-log") + 1], expected)
+                    self.assertEqual((self.logs / "ui-rust-log").read_text(), "cagents::chat::runtime=debug,warn\n")
+                self.run_tool("stop")
+        missing = self.run_tool("start", "after", "--daemon-trace", check=False)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--daemon-trace needs a RUST_LOG filter", missing.stderr)
+
     def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
         for value in ("0", "-1", "+1", "01", "1.5", "3601", "10000", "99999999999999999999", "", "1+2", "1\n2"):
             with self.subTest(value=value):

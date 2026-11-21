@@ -505,6 +505,16 @@ impl Handle {
             Owner::Remote(remote) => remote.attachment_snapshot(),
         }
     }
+    /// The items changed since the last call, whole, and whether the
+    /// conversation is working; see [`super::Unread`]. Only a conversation
+    /// this process owns is followed this way; a retained actor keeps its
+    /// record in another process.
+    pub fn unread(&self, again: &[String]) -> Result<(super::Unread, bool), String> {
+        match &self.0 {
+            Owner::Local(local) => local.unread(again),
+            Owner::Remote(_) => Err("it is kept by another process".into()),
+        }
+    }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         match &self.0 {
             Owner::Local(local) => local.snapshot(after),

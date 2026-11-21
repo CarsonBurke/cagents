@@ -16,7 +16,7 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
-| A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat |
+| A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat, or an Antigravity or Muse chat prompted with `work` |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
@@ -132,6 +132,14 @@ pushed range in the retry-budget output differs between Before and After.
 `host::work::transcript::tests` checks that the daemon reads from these frames
 the pull requests, branches and edited directories the table names, with
 their relations.
+
+An Antigravity or Muse chat can replay the same turn. Start the session with
+`--acp`, run the script, then send the chat a prompt that contains the word
+`work`. The offline ACP agent reports each step the way Antigravity does: a
+shell command with its output, or an edit with its diff. The daemon reads
+the chat's work from cagents' own record of the chat, not from a transcript
+file. `host::work::items::tests` and `chat::runtime::store::unread::tests`
+check that reading.
 
 Mentioned pull requests are listed only once **Show mentioned pull requests**
 is on in Settings; it is off by default.
@@ -1176,6 +1184,7 @@ The first of these words a prompt contains chooses what it does:
 | Word | The agent |
 | --- | --- |
 | `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
+| `work` | replays the [conversation work](#conversation-work) turn: its messages, shell commands with their output, and edits with their diffs |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
@@ -1197,6 +1206,7 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+| `FAKE_ACP_WORK=PATH` | the Claude Code transcript a `work` prompt replays. The installed `agy` and `muse-upstream` read the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
 
 `native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
 fixture as `bin/agy` and `bin/muse-upstream`, through

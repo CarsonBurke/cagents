@@ -620,6 +620,7 @@ pub(super) fn restore_saved_history(
                 .commit_native_installation()
                 .map_err(retryable_unavailable)?;
             state.chats.insert(id, record);
+            state.chat_added(id);
             state.inventory_generation += 1;
             Ok(response)
         }

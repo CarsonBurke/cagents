@@ -655,6 +655,7 @@ fn restore_authenticated(
         .commit_native_installation()
         .map_err(SetupError::Unavailable)?;
     let retired = state.chats.insert(id, record);
+    state.chat_added(id);
     if let Some(context) = execution_context {
         context.installed();
     }

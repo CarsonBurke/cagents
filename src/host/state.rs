@@ -476,6 +476,13 @@ impl Drop for PreparedTerminalInput {
 }
 
 impl HostState {
+    /// Tells the Work tracker about the chat `id`, just put in `chats`.
+    pub(super) fn chat_added(&self, id: TerminalId) {
+        if let (Some(work), Some(record)) = (&self.work, self.chats.get(&id)) {
+            work.chat_added(record.session.launch.provider);
+        }
+    }
+
     pub(super) fn enable_holder_recovery(&mut self) {
         self.recover_holders = true;
     }

@@ -13,6 +13,7 @@
 mod board;
 mod conversations;
 mod forge;
+mod items;
 mod removal;
 mod scan;
 mod store;
@@ -741,6 +742,37 @@ impl Service {
 
     pub(super) fn handle(&self) -> Handle {
         self.handle.clone()
+    }
+}
+
+#[cfg(test)]
+impl Handle {
+    /// A service on `host` whose threads are not running, so a test
+    /// drives each pass itself.
+    pub(super) fn idle(host: Weak<crate::host::state::HostLock>) -> Self {
+        Handle(Arc::new(Inner {
+            host,
+            shared: Mutex::new(Shared {
+                projects: BTreeMap::new(),
+                pins: BTreeMap::new(),
+                session_activity: HashMap::new(),
+                tickets: BTreeMap::new(),
+                linear_unavailable: None,
+                stale_after_days: 7,
+                board_read_at: None,
+                watching: false,
+                restored: BTreeMap::new(),
+            }),
+            updated: Condvar::new(),
+            scanner: Signal::default(),
+            forge: Signal::default(),
+            publisher: Signal::default(),
+            publication: Mutex::new(Publication::default()),
+            jobs: Jobs::default(),
+            store: Mutex::new(None),
+            conversations: conversations::Conversations::default(),
+            cancellation: CancellationToken::new(),
+        }))
     }
 }
 
@@ -1894,29 +1926,7 @@ mod tests {
     }
 
     fn polling_handle() -> Handle {
-        Handle(Arc::new(Inner {
-            host: Weak::new(),
-            shared: Mutex::new(Shared {
-                projects: BTreeMap::new(),
-                pins: BTreeMap::new(),
-                session_activity: HashMap::new(),
-                tickets: BTreeMap::new(),
-                linear_unavailable: None,
-                stale_after_days: 7,
-                board_read_at: None,
-                watching: false,
-                restored: BTreeMap::new(),
-            }),
-            updated: Condvar::new(),
-            scanner: Signal::default(),
-            forge: Signal::default(),
-            publisher: Signal::default(),
-            publication: Mutex::new(Publication::default()),
-            jobs: Jobs::default(),
-            store: Mutex::new(None),
-            conversations: conversations::Conversations::default(),
-            cancellation: CancellationToken::new(),
-        }))
+        Handle::idle(Weak::new())
     }
 
     #[test]

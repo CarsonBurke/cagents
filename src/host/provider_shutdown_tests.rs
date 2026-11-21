@@ -212,6 +212,7 @@ fn quiet_chat(root: &Path) -> Handle {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -507,6 +508,7 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
     let holder = chat::native_holder::spawn(
         ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),

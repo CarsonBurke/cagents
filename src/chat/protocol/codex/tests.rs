@@ -4885,6 +4885,7 @@ fn settled_indexed_declines_are_checked_on_the_actor_without_authorizing_work() 
             super::super::ExecutionContext::new(Some(Arc::new(std::fs::File::open(&cwd).unwrap())));
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(Arc::new(context)),
             messages: None,
             transport: TransportSpec::History,

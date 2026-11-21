@@ -54,7 +54,8 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
-        [--acp] [--instance NAME] [--ui-trace] [--workspace-trace] [--ui-scoped-fixture]
+        [--acp] [--instance NAME] [--ui-trace] [--workspace-trace] [--daemon-trace FILTER]
+        [--ui-scoped-fixture]
         [--projection-oracle] [--wayland-debug] [--restore-existing-only]
         [--launch-handshake]
                   Take one of the host's native slots and start a headless
@@ -84,6 +85,10 @@ both use the same fixture data and selected providers.
                   --workspace-trace logs shared-model update timing, scope
                   projection choices and activity redraw intervals. Both trace
                   options persist through relaunch, until the session stops.
+                  --daemon-trace FILTER writes the daemon's tracing to
+                  logs/daemon-SIDE.log, at FILTER, a RUST_LOG directive such
+                  as cagents::chat::runtime=debug,warn. The app takes the same
+                  filter. It persists like the traces.
                   --projection-oracle has every update that projects less than
                   the whole workspace check that against the full projection,
                   logging what it left stale (cagents::projection_oracle) to
@@ -930,7 +935,7 @@ run_session() {
         } 9>&-
     fi
     local clear_status=0
-    timeout -k 5 30 rm -rf -- "$runtime" "$harness_root" "$compositor_home" "$logs/ui-$side.log" \
+    timeout -k 5 30 rm -rf -- "$runtime" "$harness_root" "$compositor_home" "$logs/ui-$side.log" "$logs/daemon-$side.log" \
         2>"$logs/clear-$side.log" 9>&- || clear_status=$?
     if [ "$clear_status" -eq 124 ] || [ "$clear_status" -eq 137 ]; then
         printf 'could not clear the last session: it was still going after 30 seconds, so a mount in %s may be stuck\n' \
@@ -1173,10 +1178,16 @@ run_app() {
     [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
         RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
     )
+    local daemon_trace runner_daemon_log=()
+    daemon_trace=$(cat "$state/daemon-trace" 2>/dev/null) || daemon_trace=
+    if [ -n "$daemon_trace" ]; then
+        stage_environment+=("RUST_LOG=$daemon_trace")
+        runner_daemon_log=(--daemon-log "$logs/daemon-$side.log")
+    fi
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" "${runner_lifecycle[@]}" \
-            --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
+            "${runner_daemon_log[@]}" --debug --log-file "$ui_log" "${window_arguments[@]}" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
@@ -1333,7 +1344,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= acp= ui_trace= ui_scoped_fixture= workspace_trace= projection_oracle= wayland_debug= restore_existing_only= launch_handshake=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= acp= ui_trace= ui_scoped_fixture= workspace_trace= daemon_trace= projection_oracle= wayland_debug= restore_existing_only= launch_handshake=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1354,6 +1365,9 @@ cmd_start() {
             --ui-trace) ui_trace=1; shift ;;
             --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
+            --daemon-trace)
+                [ "$#" -ge 2 ] && [ -n "$2" ] || die '--daemon-trace needs a RUST_LOG filter' 2
+                daemon_trace=$2; shift 2 ;;
             --projection-oracle) projection_oracle=1; shift ;;
             --wayland-debug) wayland_debug=1; shift ;;
             --restore-existing-only) restore_existing_only=1; shift ;;
@@ -1410,6 +1424,7 @@ cmd_start() {
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
     printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
+    printf '%s\n' "$daemon_trace" >"$state/daemon-trace"
     printf '%s\n' "$projection_oracle" >"$state/projection-oracle"
     printf '%s\n' "$wayland_debug" >"$state/wayland-debug"
     printf '%s\n' "$launch_handshake" >"$state/launch-handshake"

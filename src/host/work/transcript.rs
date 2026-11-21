@@ -246,7 +246,7 @@ impl Reader {
 
 /// Prose with harness framing removed: slash-command wrappers carry no one's
 /// words, and system reminders are the harness's.
-fn prose(text: &str) -> Vec<Signal> {
+pub(super) fn prose(text: &str) -> Vec<Signal> {
     let trimmed = text.trim_start();
     if trimmed.starts_with("<command-")
         || trimmed.starts_with("<local-command")
@@ -284,7 +284,7 @@ fn block_text(content: &Value) -> String {
 
 /// A file edited at `path` points at whatever branch its directory has
 /// checked out.
-fn edited(path: &str) -> Option<Signal> {
+pub(super) fn edited(path: &str) -> Option<Signal> {
     let directory = std::path::Path::new(path).parent()?.to_str()?;
     Some(Signal {
         reference: Reference::CurrentBranch {
@@ -348,7 +348,7 @@ fn codex_script(arguments: &Value) -> Option<String> {
     )
 }
 
-fn shell_quote(word: &str) -> String {
+pub(super) fn shell_quote(word: &str) -> String {
     if !word.is_empty()
         && word
             .bytes()
