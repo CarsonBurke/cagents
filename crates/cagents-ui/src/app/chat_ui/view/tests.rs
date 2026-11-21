@@ -9570,25 +9570,55 @@ fn copy_feedback_invalidates_only_the_messages_own_turns() {
     };
     let original = fingerprints(&runtime, true);
     let copied_at = Instant::now();
-    runtime.copied = Some(("answer-0".into(), copied_at));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: None,
+        at: copied_at,
+    });
     let first = fingerprints(&runtime, true);
     assert_eq!(changed(&original, &first), [true, false, false]);
 
     // Repeating Copy refreshes its expiry but draws the same checkmark.
-    runtime.copied = Some(("answer-0".into(), copied_at + Duration::from_millis(500)));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: None,
+        at: copied_at + Duration::from_millis(500),
+    });
     assert_eq!(first, fingerprints(&runtime, true));
 
+    // Saying why a copy didn't go through draws something else there.
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: Some(chat::TEXT_COPY_CHANGED.into()),
+        at: copied_at,
+    });
+    let refused = fingerprints(&runtime, true);
+    assert_eq!(changed(&first, &refused), [true, false, false]);
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: None,
+        at: copied_at,
+    });
+
     // Moving feedback removes one checkmark and adds the other.
-    runtime.copied = Some(("answer-1".into(), copied_at));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-1".into()),
+        refusal: None,
+        at: copied_at,
+    });
     let second = fingerprints(&runtime, true);
     assert_eq!(changed(&first, &second), [true, true, false]);
-    runtime.copied = None;
+    runtime.copy_feedback = None;
     let cleared = fingerprints(&runtime, true);
     assert_eq!(changed(&second, &cleared), [false, true, false]);
     assert_eq!(original, cleared);
 
     // An item outside this transcript cannot change any visible badge.
-    runtime.copied = Some(("retired-item".into(), copied_at));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("retired-item".into()),
+        refusal: None,
+        at: copied_at,
+    });
     assert_eq!(original, fingerprints(&runtime, true));
 }
 

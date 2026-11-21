@@ -241,7 +241,7 @@ async fn rebind_receipt(
     .and_then(|result| result)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CopyPart {
     Text,
     Input,
@@ -484,6 +484,8 @@ pub enum Action {
     /// Puts away the notice that messages a provider was holding when it
     /// stopped are back in the composer.
     DismissRestoredWaiting(Target),
+    /// Puts away the composer's note of something that didn't happen.
+    DismissComposerNote(Target),
     ComposerActions(Target, bool),
     /// What the reader has typed into the `+` menu's search.
     ComposerActionsQuery(Target, String),
@@ -922,6 +924,7 @@ impl Action {
             Self::TakeBackQueued(..) => "TakeBackQueued",
             Self::RemoveQueued(..) => "RemoveQueued",
             Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
+            Self::DismissComposerNote(..) => "DismissComposerNote",
             Self::ComposerActions(..) => "ComposerActions",
             Self::ComposerActionsQuery(..) => "ComposerActionsQuery",
             Self::ComposerActionsSubmit(..) => "ComposerActionsSubmit",
@@ -3155,7 +3158,8 @@ pub(super) struct Runtime {
     child_find_disclosure: HashMap<String, find::Disclosure>,
     find_index: usize,
     find_navigation: find_navigation::State,
-    copied: Option<(String, Instant)>,
+    /// What the last copy said at the control it was made from.
+    copy_feedback: Option<text_copy::CopyFeedback>,
     /// When a cancel that would also stop background subagents was pressed,
     /// until it is pressed again or lapses.
     pub(super) interrupt_armed: Option<Instant>,
@@ -3308,7 +3312,16 @@ pub(super) struct Runtime {
     /// While hidden, the order this chat was hidden in if it keeps its
     /// presentation and its client's transcript; see [`warm`].
     warm: Option<u64>,
+    /// What went wrong with the conversation itself: its provider or its
+    /// connection. It is the conversation's state, so it is told as a
+    /// failure and decides whether the turn finished with an error.
     error: Option<String>,
+    /// Why something tried in this pane didn't happen: an attachment, a
+    /// paste, a send that was refused, or the pane staying in this window.
+    /// It is about that try, not the conversation, so it is told at the
+    /// composer, never as a failure, until it is put away or the draft
+    /// changes.
+    composer_note: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
     /// A Close the daemon refused, shown on the pane until it closes.
@@ -3638,7 +3651,7 @@ impl Runtime {
 
     fn try_attachment_insert(&mut self) -> Option<attachment_draft::Ticket> {
         let Some((ticket, lease)) = attachment_draft::admit() else {
-            self.error = Some(
+            self.composer_note = Some(
                 "Two attachments are already loading. Wait for them before attaching more.".into(),
             );
             return None;
@@ -3731,7 +3744,7 @@ impl Runtime {
         };
         self.pastes_pending = self.pastes_pending.saturating_sub(1);
         if !bookmark.valid {
-            self.error = Some("The image insertion point changed while loading. Attach the image again at the new caret.".into());
+            self.composer_note = Some("The image insertion point changed while loading. Attach the image again at the new caret.".into());
             self.submit_after_paste = None;
             return false;
         }
@@ -3742,7 +3755,7 @@ impl Runtime {
         }
         let current = attachment_draft::Bookmark::capture(&self.composer);
         if !current.valid {
-            self.error = Some("The current text selection could not be preserved. Attach the image again at the new caret.".into());
+            self.composer_note = Some("The current text selection could not be preserved. Attach the image again at the new caret.".into());
             self.submit_after_paste = None;
             return false;
         }
@@ -3812,7 +3825,7 @@ impl Runtime {
             self.pastes_pending = self.pastes_pending.saturating_sub(1);
             self.submit_after_paste = None;
             if let Some(error) = error {
-                self.error = Some(error);
+                self.composer_note = Some(error);
             }
         }
     }
@@ -3820,7 +3833,7 @@ impl Runtime {
     fn remove_image_token(&mut self, token: &str) -> bool {
         let text = self.composer.text();
         if text.contains(token) && !attachment_draft::Bookmark::capture(&self.composer).valid {
-            self.error = Some("The current text selection could not be preserved. Clear it before removing this image.".into());
+            self.composer_note = Some("The current text selection could not be preserved. Clear it before removing this image.".into());
             return false;
         }
         let excerpt = attachment_draft::excerpt(
@@ -4078,7 +4091,7 @@ impl Runtime {
                     self.recalling.push(recall);
                 }
                 None => {
-                    self.error = Some(
+                    self.composer_note = Some(
                         "The agent had already started on that message, so it was not taken back."
                             .into(),
                     );
@@ -4439,7 +4452,7 @@ impl Runtime {
             child_find_disclosure: HashMap::new(),
             find_index: 0,
             find_navigation: find_navigation::State::default(),
-            copied: None,
+            copy_feedback: None,
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
@@ -4490,6 +4503,7 @@ impl Runtime {
             visible: AtomicBool::new(visible),
             warm: None,
             error: None,
+            composer_note: None,
             capacity_refused: false,
             close_refusal: None,
             resume_failed: false,
@@ -9565,10 +9579,10 @@ impl Cagents {
             "This conversation could not be shared. It is kept only in this window; the current conversation is still attached."
         };
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
-            runtime.error = Some(message.into());
+            runtime.composer_note = Some(message.into());
         }
         if let Some(runtime) = self.chat_ui.parked.get_mut(&card) {
-            runtime.error = Some(message.into());
+            runtime.composer_note = Some(message.into());
         }
         true
     }
@@ -9591,7 +9605,7 @@ impl Cagents {
             return false;
         }
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
-            runtime.error = Some("This pane could not be shared with your other windows. It stays in this window, and sending starts the conversation here.".into());
+            runtime.composer_note = Some("This pane could not be shared with your other windows. It stays in this window, and sending starts the conversation here.".into());
         }
         true
     }
@@ -11369,6 +11383,7 @@ impl Cagents {
         runtime.history_stash = None;
         runtime.history_attachment_stash = None;
         runtime.error = None;
+        runtime.composer_note = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
         runtime.session = pending.candidate.clone();
@@ -11564,7 +11579,7 @@ impl Cagents {
                 },
                 Ok(_) => unreachable!("queue submission always constructs a prompt"),
                 Err(error) => {
-                    runtime.error = Some(error.into());
+                    runtime.composer_note = Some(error.into());
                     return Task::none();
                 }
             };
@@ -12014,6 +12029,7 @@ impl Cagents {
             runtime.prepare_local_prompt();
         }
         runtime.error = None;
+        runtime.composer_note = None;
         let snapshot = runtime.snapshot.clone();
         match runtime.commands.push(pending, command, &snapshot) {
             Some((id, command)) => run_chat_command(target, id, Some(handle), command),
@@ -13727,13 +13743,13 @@ impl Cagents {
                     return Task::none();
                 };
                 if runtime.attachment_chooser_pending.is_some() {
-                    runtime.error = Some(
+                    runtime.composer_note = Some(
                         "Finish or cancel the file chooser before reconnecting the chat.".into(),
                     );
                     return Task::none();
                 }
                 if runtime.pastes_pending > 0 {
-                    runtime.error = Some(
+                    runtime.composer_note = Some(
                         "Wait for the attachments to finish loading before reconnecting the chat."
                             .into(),
                     );
@@ -13894,6 +13910,8 @@ impl Cagents {
                 let mut files = None;
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
+                        // The reader has moved on from what it said.
+                        runtime.composer_note = None;
                         runtime.dismiss_suggestion();
                         runtime.revision = runtime.revision.wrapping_add(1);
                         // Typing into a recalled message makes it the draft,
@@ -13929,7 +13947,7 @@ impl Cagents {
                     return Task::none();
                 };
                 if runtime.pastes_pending >= 2 {
-                    runtime.error = Some(
+                    runtime.composer_note = Some(
                         "Two attachments are already loading. Wait for them before pasting again."
                             .into(),
                     );
@@ -14181,7 +14199,7 @@ impl Cagents {
                     if let Some(runtime) = self.chat_runtime_mut(target)
                         && let Some(refusal) = account_switch_hold(&runtime.snapshot)
                     {
-                        runtime.error = Some(refusal);
+                        runtime.composer_note = Some(refusal);
                         return Task::none();
                     }
                     return self.change_chat_account(
@@ -14198,7 +14216,7 @@ impl Cagents {
                     slash_invocation(&runtime.composer.text(), &runtime.snapshot),
                     Some(SlashInvocation::PermissionsArguments)
                 ) {
-                    runtime.error = Some(
+                    runtime.composer_note = Some(
                         "Use /permissions without arguments to open the permissions panel.".into(),
                     );
                     return Task::none();
@@ -14208,13 +14226,14 @@ impl Cagents {
                     Some(SlashInvocation::Permissions)
                 ) {
                     if runtime.pastes_pending > 0 {
-                        runtime.error = Some(
+                        runtime.composer_note = Some(
                             "Wait for the paste to finish, or use the permissions button.".into(),
                         );
                         return Task::none();
                     }
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
+                    runtime.composer_note = None;
                     return self.handle_chat_ui(Action::PermissionPicker(target, true));
                 }
                 if runtime.pastes_pending > 0 {
@@ -14235,6 +14254,7 @@ impl Cagents {
                     if let Some(runtime) = self.chat_runtime_mut(target) {
                         runtime.replace_draft(text_editor::Content::new());
                         runtime.error = None;
+                        runtime.composer_note = None;
                     }
                     self.resume_ui.replace =
                         self.chat_is_unused(target.card).then_some(target.card);
@@ -14265,7 +14285,7 @@ impl Cagents {
                         .max_count
                         .is_some_and(|limit| count > limit)
                     {
-                        runtime.error = Some(
+                        runtime.composer_note = Some(
                             "The combined queued message exceeds this chat's attachment limit."
                                 .into(),
                         );
@@ -14306,7 +14326,7 @@ impl Cagents {
                 {
                     Ok(command) => command,
                     Err(refusal) => {
-                        runtime.error = Some(refusal.into());
+                        runtime.composer_note = Some(refusal.into());
                         return Task::none();
                     }
                 };
@@ -15251,6 +15271,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                let key = text_copy::CopyKey::of(id.clone(), Some(&part));
                 // The body itself lives in the snapshot; only the extracted
                 // code blocks are the cache's own.
                 let text = runtime.active_item(&id).and_then(|item| {
@@ -15269,14 +15290,9 @@ impl Cagents {
                     }
                 });
                 if let Some(text) = text {
-                    let at = Instant::now();
-                    runtime.copied = Some((id, at));
                     return Task::batch([
                         iced::clipboard::write(text).map(cosmic::Action::App),
-                        cosmic::task::future(async move {
-                            tokio::time::sleep(Duration::from_millis(1500)).await;
-                            Message::ChatUi(Action::ClearCopied(target, at))
-                        }),
+                        runtime.tell_copy(key, None),
                     ]);
                 }
             }
@@ -15442,6 +15458,11 @@ impl Cagents {
                     runtime.restored_waiting = None;
                 }
             }
+            Action::DismissComposerNote(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.composer_note = None;
+                }
+            }
             Action::CopyQueued(target, source) => {
                 if self
                     .card_state(target.card)
@@ -15506,11 +15527,11 @@ impl Cagents {
             Action::ClearCopied(target, at) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && runtime
-                        .copied
+                        .copy_feedback
                         .as_ref()
-                        .is_some_and(|(_, copied)| *copied == at)
+                        .is_some_and(|feedback| feedback.at == at)
                 {
-                    runtime.copied = None;
+                    runtime.copy_feedback = None;
                 }
             }
             Action::Latest(target) => {
@@ -15574,7 +15595,7 @@ impl Cagents {
                     return Task::none();
                 }
                 if runtime.pastes_pending >= 2 {
-                    runtime.error = Some(
+                    runtime.composer_note = Some(
                         "Two attachments are already loading. Wait for them before attaching more."
                             .into(),
                     );
@@ -15667,7 +15688,7 @@ impl Cagents {
                     // window started has no composer here to say it in.
                     if let Some(failure) = failure {
                         match self.chat_runtime_mut(target) {
-                            Some(runtime) => runtime.error = Some(failure),
+                            Some(runtime) => runtime.composer_note = Some(failure),
                             None => self.status = Some(TransientNotice::warning(failure)),
                         }
                     }
@@ -15687,6 +15708,9 @@ impl Cagents {
                 // folder for any - is written into the draft as its path
                 // instead, with web addresses and dropped text, as they are.
                 let mut staged = None;
+                // Said once the drop's own text is in, which as an edit would
+                // otherwise put it away.
+                let mut note = None;
                 let dropped = match payload.decode() {
                     file_drop::Dropped::Items(items) if runtime.accepts_draft_attachments() => {
                         let rules =
@@ -15713,12 +15737,16 @@ impl Cagents {
                         }
                         if !files.is_empty() {
                             if runtime.pastes_pending >= 2 {
-                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                note = Some(
+                                    "Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.",
+                                );
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
                             } else if let Some((id, lease)) = attachment_draft::admit() {
                                 staged = Some((id, files, lease));
                             } else {
-                                runtime.error = Some("Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.".into());
+                                note = Some(
+                                    "Two attachments are already loading. Dropped files were inserted as paths; wait before attaching more.",
+                                );
                                 rest.extend(files.into_iter().map(file_drop::Item::File));
                             }
                         }
@@ -15741,6 +15769,11 @@ impl Cagents {
                         ))),
                     ))
                 };
+                if let Some(note) = note
+                    && let Some(runtime) = self.chat_runtime_mut(target)
+                {
+                    runtime.composer_note = Some(note.into());
+                }
                 return Task::batch([
                     edited,
                     staged.map_or_else(Task::none, |(id, files, lease)| {

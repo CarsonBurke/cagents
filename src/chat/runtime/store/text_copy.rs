@@ -27,10 +27,23 @@ pub(super) fn copy_field(item: &Item) -> Option<i64> {
 /// one is refused, and removing the file lets the same copy succeed again.
 /// The store's sources stay as they are, so the client never sees a newer one.
 fn changed_by_fixture() -> bool {
+    fixture_has("fixture-text-copy-changed")
+}
+
+/// Whether a development build under native evidence should answer a
+/// conversation copy as though the cache no longer held its text: while
+/// `home/.config/fixture-text-copy-unavailable` exists in the fixture, every
+/// one is refused that way, and removing the file lets it succeed again.
+fn unavailable_by_fixture() -> bool {
+    fixture_has("fixture-text-copy-unavailable")
+}
+
+fn fixture_has(_name: &str) -> bool {
     #[cfg(feature = "development")]
     if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE").is_some_and(|root| {
         PathBuf::from(root)
-            .join("home/.config/fixture-text-copy-changed")
+            .join("home/.config")
+            .join(_name)
             .exists()
     }) {
         return true;
@@ -145,6 +158,9 @@ impl Store {
         source: &TextCopySource,
         offset: u64,
     ) -> Result<TextCopyPage, String> {
+        if unavailable_by_fixture() {
+            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
+        }
         self.copy_page(source, offset, changed_by_fixture())
     }
 
@@ -159,7 +175,7 @@ impl Store {
         changed: bool,
     ) -> Result<TextCopyPage, String> {
         if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
-            return Err("The full text is unavailable in this owned cache".into());
+            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
         }
         if source.bytes > crate::chat::TEXT_COPY_LIMIT_BYTES as u64 {
             return Err(
@@ -176,7 +192,7 @@ impl Store {
             .optional()
             .map_err(|error| error.to_string())?;
         let Some((id, field, revision, total)) = record else {
-            return Err("The full text is no longer available in the owned cache".into());
+            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
         };
         if changed || revision != source.revision || source.bytes > total {
             return Err(crate::chat::TEXT_COPY_CHANGED.into());
@@ -190,7 +206,7 @@ impl Store {
             .min(source.bytes as usize);
         let mut bytes = self.field(&id, field, start, end)?;
         if bytes.len() != end - start {
-            return Err("The full text has an unavailable cached range".into());
+            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
         }
         if end < source.bytes as usize {
             while std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_none()) {
@@ -531,6 +547,25 @@ mod tests {
             Err(crate::chat::TEXT_COPY_CHANGED.to_owned())
         );
         assert_eq!(read(&store, &source), Ok(text));
+    }
+
+    #[test]
+    fn a_copy_of_text_the_cache_does_not_hold_says_it_is_unavailable() {
+        let mut store = Store::new().unwrap();
+        store.apply(Event::Item(item("answer", "kept"))).unwrap();
+        let source = source(&mut store, "answer");
+        let unavailable = Err(crate::chat::TEXT_COPY_UNAVAILABLE.to_owned());
+        let gone = TextCopySource {
+            token: source.token + 1,
+            ..source.clone()
+        };
+        assert_eq!(store.copy_page(&gone, 0, false), unavailable);
+        let elsewhere = TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            ..source.clone()
+        };
+        assert_eq!(store.copy_page(&elsewhere, 0, false), unavailable);
+        assert_eq!(read(&store, &source), Ok("kept".into()));
     }
 
     #[test]

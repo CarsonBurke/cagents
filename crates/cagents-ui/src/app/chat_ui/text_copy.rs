@@ -1,8 +1,196 @@
 //! Logical message Copy reads canonical source pages off the UI thread.
 use super::*;
 
-pub(super) const UNAVAILABLE: &str =
-    "This text is unavailable in the local copy cache. Open the provider transcript to recover it.";
+pub(super) const UNAVAILABLE: &str = chat::TEXT_COPY_UNAVAILABLE;
+
+/// What a copy whose text this window no longer has says, with where it
+/// can still be copied from.
+pub(super) fn unavailable_in(provider: Provider) -> String {
+    let owner = match provider {
+        // Its transcript is the reader's conversation with Claude.
+        Provider::Claude => "Claude",
+        provider => provider.label(),
+    };
+    format!("{UNAVAILABLE} Open {owner}'s transcript to copy it.")
+}
+
+/// A details copy whose diagnostic changed between the click and the read.
+const DETAILS_CHANGED: &str = "These details changed while copying. Copy them again.";
+
+/// How long a copy's control shows that it copied. Tests let it lapse at
+/// once, so a copy's task settles as soon as its work does.
+const COPIED_FOR: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_millis(1500)
+};
+/// How long it shows why it didn't: long enough to read the sentence.
+const REFUSED_FOR: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(6)
+};
+
+/// The copy control a copy answers at.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum CopyKey {
+    /// An item's own Copy, in the row under it.
+    Item(String),
+    /// The Copy on one block of a step: its input, its output or a change.
+    Block(String, CopyPart),
+    /// A failure card's Copy details.
+    Failure(String),
+}
+
+impl CopyKey {
+    /// The control a copy of item `id`, or of its `part`, was made from.
+    pub(super) fn of(id: String, part: Option<&CopyPart>) -> Self {
+        match part {
+            None | Some(CopyPart::Text) => Self::Item(id),
+            Some(part) => Self::Block(id, part.clone()),
+        }
+    }
+
+    /// Whether this is the control for item `id`, or for its `part`.
+    pub(super) fn is(&self, id: &str, part: Option<&CopyPart>) -> bool {
+        match (self, part) {
+            (Self::Item(item), None | Some(CopyPart::Text)) => item == id,
+            (Self::Block(item, block), Some(part)) => item == id && block == part,
+            _ => false,
+        }
+    }
+
+    /// The item whose control this is, or "" for a failure card's.
+    pub(super) fn item(&self) -> &str {
+        match self {
+            Self::Item(id) | Self::Block(id, _) => id,
+            Self::Failure(_) => "",
+        }
+    }
+}
+
+/// What a copy control shows: ready to copy, that it just copied, or why it
+/// didn't. Pressing it again is how a refused copy is retried.
+#[derive(Debug, Clone, Default)]
+pub(super) enum CopyState {
+    #[default]
+    Ready,
+    Copied,
+    Refused(Arc<str>),
+}
+
+impl CopyState {
+    pub(super) fn icon(&self) -> Icon {
+        match self {
+            Self::Ready => Icon::Copy,
+            Self::Copied => Icon::Check,
+            Self::Refused(_) => Icon::Warning,
+        }
+    }
+
+    /// Whether the control has something to say, and so stays in view while
+    /// it says it.
+    pub(super) fn is_telling(&self) -> bool {
+        !matches!(self, Self::Ready)
+    }
+
+    /// The control's accessible name: `ready` until a copy is made from it,
+    /// then what that copy did. Why one didn't is in [`Self::said`].
+    pub(super) fn label(&self, ready: &'static str) -> &'static str {
+        match self {
+            Self::Ready => ready,
+            Self::Copied => "Copied",
+            Self::Refused(_) => "Copy again",
+        }
+    }
+
+    /// What the control says beside itself: that it copied, or why it
+    /// didn't. Text is announced as it appears, so a reader who can't see the
+    /// icon change hears it too.
+    pub(super) fn said(&self) -> Option<Element<'static, Message>> {
+        match self {
+            Self::Ready => None,
+            Self::Copied => Some(
+                design::caption("Copied")
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            ),
+            Self::Refused(refusal) => Some(
+                design::caption(refusal.to_string())
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// What the last copy said at the control it was made from: that it copied,
+/// or why it didn't. A copy is the reader's own action, so its outcome is told
+/// there for a moment and is never the conversation's state.
+#[derive(Debug, Clone)]
+pub(super) struct CopyFeedback {
+    pub(super) key: CopyKey,
+    /// Why it didn't copy, or `None` once it did.
+    pub(super) refusal: Option<Arc<str>>,
+    pub(super) at: Instant,
+}
+
+impl Runtime {
+    /// Says at `key` that its copy went through, or with `refusal` why it
+    /// didn't, until a later copy says something else or the moment passes.
+    pub(super) fn tell_copy(&mut self, key: CopyKey, refusal: Option<String>) -> Task<Message> {
+        let at = Instant::now();
+        let shown = if refusal.is_some() {
+            REFUSED_FOR
+        } else {
+            COPIED_FOR
+        };
+        self.copy_feedback = Some(CopyFeedback {
+            key,
+            refusal: refusal.map(Arc::from),
+            at,
+        });
+        let target = self.target;
+        cosmic::task::future(async move {
+            tokio::time::sleep(shown).await;
+            Message::ChatUi(Action::ClearCopied(target, at))
+        })
+    }
+
+    /// What the last copy says at `key`, if it was made there.
+    pub(super) fn copy_feedback_at(&self, key: &CopyKey) -> Option<&CopyFeedback> {
+        self.copy_feedback
+            .as_ref()
+            .filter(|feedback| feedback.key == *key)
+    }
+
+    /// What the Copy for item `id`, or for its `part`, shows.
+    pub(super) fn copy_state(&self, id: &str, part: Option<&CopyPart>) -> CopyState {
+        self.copy_state_where(|key| key.is(id, part))
+    }
+
+    /// What failure `key`'s Copy details shows.
+    pub(super) fn details_copy_state(&self, key: &str) -> CopyState {
+        self.copy_state_where(
+            |copied| matches!(copied, CopyKey::Failure(failure) if failure == key),
+        )
+    }
+
+    fn copy_state_where(&self, at: impl Fn(&CopyKey) -> bool) -> CopyState {
+        match &self.copy_feedback {
+            Some(feedback) if at(&feedback.key) => match &feedback.refusal {
+                // Text this window no longer has is still in the provider's
+                // transcript, and the reader is told whose.
+                Some(refusal) if &**refusal == UNAVAILABLE => {
+                    CopyState::Refused(unavailable_in(self.session.launch.provider).into())
+                }
+                Some(refusal) => CopyState::Refused(refusal.clone()),
+                None => CopyState::Copied,
+            },
+            _ => CopyState::Ready,
+        }
+    }
+}
 
 /// All production UI surfaces share one clipboard intent context. A request
 /// owns this context so async task polling never depends on thread-local state.
@@ -312,17 +500,16 @@ impl Cagents {
         let plan = match runtime.failure_copy_plan(&key) {
             Ok(Some(plan)) => plan,
             Ok(None) => return Task::none(),
-            Err(error) => {
-                runtime.error = Some(error);
-                return Task::none();
-            }
+            Err(error) => return runtime.tell_copy(CopyKey::Failure(key), Some(error)),
         };
         let Some(handle) = runtime.handle().cloned() else {
-            runtime.error = Some(
-                "Original diagnostic unavailable: reconnect this conversation before copying"
-                    .into(),
+            return runtime.tell_copy(
+                CopyKey::Failure(key),
+                Some(
+                    "Original diagnostic unavailable: reconnect this conversation before copying"
+                        .into(),
+                ),
             );
-            return Task::none();
         };
         let request = FailureRequest {
             context: context.clone(),
@@ -364,33 +551,46 @@ impl Cagents {
         {
             return Task::none();
         }
+        let details = CopyKey::Failure(key.clone());
         match result {
             Ok(text) => {
                 if runtime.failure_copy_plan(&key).ok().flatten().as_ref() != Some(&request.plan)
                     || !request.plan.is_current(&request.handle.snapshot())
                 {
-                    return Task::none();
+                    return runtime.tell_copy(details, Some(DETAILS_CHANGED.into()));
                 }
                 let context = request.context.clone();
                 let intent = request.intent;
-                clipboard_write(context, intent, text, move || {
-                    request.plan.is_current(&request.handle.snapshot())
-                })
+                let (plan, handle) = (request.plan.clone(), request.handle.clone());
+                Task::batch([
+                    clipboard_write(
+                        context,
+                        intent,
+                        text,
+                        move || plan.is_current(&handle.snapshot()),
+                        move |text| {
+                            Message::ChatUi(Action::FailureCopied(target, key, request, Ok(text)))
+                        },
+                    ),
+                    runtime.tell_copy(details, None),
+                ])
             }
             Err(error) => {
-                if runtime.failure_plan_still_shown(&key, &request.plan)
+                let refusal = if runtime.failure_plan_still_shown(&key, &request.plan)
                     && request
                         .plan
                         .is_current_or_withdrawn(&request.handle.snapshot())
                 {
                     const PREFIX: &str = "Original diagnostic unavailable: ";
-                    runtime.error = Some(if error.starts_with(PREFIX) {
+                    if error.starts_with(PREFIX) {
                         error
                     } else {
                         format!("{PREFIX}{error}")
-                    });
-                }
-                Task::none()
+                    }
+                } else {
+                    DETAILS_CHANGED.into()
+                };
+                runtime.tell_copy(details, Some(refusal))
             }
         }
     }
@@ -409,9 +609,9 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        let key = CopyKey::of(id.clone(), part.as_ref());
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
-            runtime.error = Some(UNAVAILABLE.into());
-            return Task::none();
+            return runtime.tell_copy(key, Some(UNAVAILABLE.into()));
         };
         let prefix = match &part {
             // By its source: a step's ID may also be a long message's
@@ -420,17 +620,15 @@ impl Cagents {
                 .and_then(|item| step_copy_prefix(part, &item.content))
             {
                 Some(prefix) => prefix,
-                None => {
-                    runtime.error = Some(UNAVAILABLE.into());
-                    return Task::none();
-                }
+                None => return runtime.tell_copy(key, Some(UNAVAILABLE.into())),
             },
             None => String::new(),
         };
         let Some(handle) = runtime.handle().cloned() else {
-            runtime.error =
-                Some("Reconnect this conversation before copying all of this text.".into());
-            return Task::none();
+            return runtime.tell_copy(
+                key,
+                Some("Reconnect this conversation before copying all of this text.".into()),
+            );
         };
         let request = Request {
             context,
@@ -482,15 +680,12 @@ impl Cagents {
         let refused = result
             .as_ref()
             .is_err_and(|error| error == chat::TEXT_COPY_CHANGED);
+        let key = CopyKey::of(id.clone(), request.part.as_ref());
         if refused || !request.snapshot_is_current(&current_snapshot) {
             // It may have been accepted once, before its write found the
             // source changed.
-            if runtime
-                .copied
-                .as_ref()
-                .is_some_and(|(copied, _)| *copied == id)
-            {
-                runtime.copied = None;
+            if runtime.copy_feedback_at(&key).is_some() {
+                runtime.copy_feedback = None;
             }
             return match request.reread(&current_snapshot, &id) {
                 Some(reread)
@@ -498,32 +693,16 @@ impl Cagents {
                 {
                     reread.read(target, id)
                 }
-                Some(_) => {
-                    runtime.error = Some(chat::TEXT_COPY_CHANGED.into());
-                    Task::none()
-                }
-                None => {
-                    runtime.error = Some(UNAVAILABLE.into());
-                    Task::none()
-                }
+                Some(_) => runtime.tell_copy(key, Some(chat::TEXT_COPY_CHANGED.into())),
+                None => runtime.tell_copy(key, Some(UNAVAILABLE.into())),
             };
         }
         match result {
-            Ok(text) => {
-                let at = Instant::now();
-                runtime.copied = Some((id.clone(), at));
-                Task::batch([
-                    message_clipboard_write(target, id, request, text),
-                    cosmic::task::future(async move {
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
-                        Message::ChatUi(Action::ClearCopied(target, at))
-                    }),
-                ])
-            }
-            Err(error) => {
-                runtime.error = Some(error);
-                Task::none()
-            }
+            Ok(text) => Task::batch([
+                message_clipboard_write(target, id, request, text),
+                runtime.tell_copy(key, None),
+            ]),
+            Err(error) => runtime.tell_copy(key, Some(error)),
         }
     }
 }
@@ -581,18 +760,27 @@ impl Intent {
 /// Check again when the returned task is polled, not just when completion is
 /// handled: clipboard intent or source authority may change while this effect
 /// is still pending. Keep both checks next to the emitted clipboard effect.
+/// A source that changed hands the text to `stale`, whose message handles
+/// the read as if the change had come first, rather than dropping the copy
+/// without a word.
 fn clipboard_write(
     context: ClipboardContext,
     intent: u64,
     text: String,
     authority_is_current: impl Fn() -> bool + Send + 'static,
+    stale: impl FnOnce(String) -> Message + Send + 'static,
 ) -> Task<Message> {
-    let mut text = Some(text);
+    let mut pending = Some((text, stale));
     iced::Task::done(()).then(move |_| {
-        if authority_is_current() && context.is_current(intent) {
-            iced::clipboard::write(text.take().unwrap_or_default()).map(cosmic::Action::App)
-        } else {
+        let Some((text, stale)) = pending.take() else {
+            return Task::none();
+        };
+        if !context.is_current(intent) {
             Task::none()
+        } else if authority_is_current() {
+            iced::clipboard::write(text).map(cosmic::Action::App)
+        } else {
+            cosmic::task::message(stale(text))
         }
     })
 }
@@ -642,6 +830,7 @@ fn compatible(captured: &chat::TextCopySource, current: &chat::TextCopySource) -
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{assert_chat_copy_task_has_no_effects, copy_refusal, shows_copied};
     use super::*;
 
     const CHILD: &str = "child";
@@ -818,7 +1007,7 @@ mod tests {
             let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
             let reread = read_by(task, target);
             assert_eq!(reread.source, rewritten, "{scope:?}");
-            assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+            assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
             assert!(app.chat_runtime_mut(target).unwrap().error.is_none());
 
             let task = app.finish_message_copy(target, "step".into(), reread, Ok("new".into()));
@@ -848,14 +1037,96 @@ mod tests {
                 Some((step("cargo build"), source(&scope, 3))),
             );
             let task = app.finish_message_copy(target, "step".into(), reread, Ok("stale".into()));
-            assert!(
-                iced::runtime::task::into_stream(task).is_none(),
-                "{scope:?}"
-            );
+            assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
             let runtime = app.chat_runtime_mut(target).unwrap();
-            assert_eq!(runtime.error.as_deref(), Some(chat::TEXT_COPY_CHANGED));
-            assert!(runtime.copied.is_none());
+            assert_eq!(copy_refusal(runtime), Some(chat::TEXT_COPY_CHANGED));
+            assert!(!shows_copied(runtime));
+            assert!(
+                runtime.error.is_none(),
+                "a copy is not the conversation's failure"
+            );
         }
+    }
+
+    /// A copy that can't go through says why at its own control. It is the
+    /// reader's action, so the conversation reports no error for it, and its
+    /// outcome is never "Finished with error".
+    #[test]
+    fn a_refused_copy_says_why_at_its_control_not_as_the_conversation() {
+        let _context = isolated_context();
+        for scope in scopes() {
+            let (mut app, target, _, request) = copy_fixture(scope.clone());
+            let outcome = |app: &mut Cagents| {
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                (runtime.finished_label(), runtime.conversation_status(false))
+            };
+            let before = outcome(&mut app);
+            let task = app.finish_message_copy(
+                target,
+                "step".into(),
+                request,
+                Err(chat::TEXT_COPY_CHANGED.to_owned()),
+            );
+            assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
+            // The turn keeps its own outcome, and the status its icon.
+            assert_eq!(outcome(&mut app), before, "{scope:?}");
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            // The step's own Copy says it, not its blocks'.
+            assert!(matches!(
+                runtime.copy_state("step", Some(&CopyPart::Text)),
+                CopyState::Refused(refusal) if &*refusal == chat::TEXT_COPY_CHANGED
+            ));
+            assert!(runtime.copy_note_shown("step"));
+            let state = runtime.copy_state("step", None);
+            // The control names what happened, and says why beside itself.
+            assert_eq!(state.label("Copy this message"), "Copy again");
+            assert!(state.said().is_some());
+            assert!(matches!(
+                runtime.copy_state("step", Some(&CopyPart::Output)),
+                CopyState::Ready
+            ));
+            assert!(runtime.error.is_none(), "{scope:?}");
+            assert_eq!(runtime.reported_errors().count(), 0, "{scope:?}");
+        }
+    }
+
+    /// Text this window no longer has is sent to the transcript that has it.
+    #[test]
+    fn an_unavailable_copy_names_the_transcript_to_copy_it_from() {
+        assert_eq!(
+            unavailable_in(Provider::Claude),
+            "The full text of this message is no longer saved here. Open Claude's transcript to copy it."
+        );
+        assert_eq!(
+            unavailable_in(Provider::Codex),
+            "The full text of this message is no longer saved here. Open Codex's transcript to copy it."
+        );
+    }
+
+    /// Each state names itself to a reader who can't see its icon.
+    #[test]
+    fn a_copy_control_names_what_its_copy_did() {
+        assert_eq!(CopyState::Ready.label("Copy this block"), "Copy this block");
+        assert!(CopyState::Ready.said().is_none() && !CopyState::Ready.is_telling());
+        assert_eq!(CopyState::Copied.label("Copy this block"), "Copied");
+        assert!(CopyState::Copied.said().is_some() && CopyState::Copied.is_telling());
+        let refused = CopyState::Refused(chat::TEXT_COPY_UNAVAILABLE.into());
+        assert_eq!(refused.label("Copy this block"), "Copy again");
+        assert_eq!(refused.icon(), Icon::Warning);
+        assert!(refused.said().is_some() && refused.is_telling());
+    }
+
+    /// A block's Copy answers at that block: copying a step's output does not
+    /// light the step's own Copy.
+    #[test]
+    fn a_copy_key_belongs_to_the_control_it_was_made_from() {
+        let item = CopyKey::of("step".into(), Some(&CopyPart::Text));
+        let output = CopyKey::of("step".into(), Some(&CopyPart::Output));
+        assert_eq!(item, CopyKey::of("step".into(), None));
+        assert!(item.is("step", None) && !item.is("step", Some(&CopyPart::Output)));
+        assert!(output.is("step", Some(&CopyPart::Output)) && !output.is("step", None));
+        assert!(!output.is("other", Some(&CopyPart::Output)));
+        assert!(!CopyKey::Failure("step".into()).is("step", None));
     }
 
     /// The store can see the change before this client's snapshot does. Its
@@ -868,12 +1139,9 @@ mod tests {
             let changed = || Err(chat::TEXT_COPY_CHANGED.to_owned());
             let (mut app, target, _, request) = copy_fixture(scope.clone());
             let task = app.finish_message_copy(target, "step".into(), request, changed());
-            assert!(
-                iced::runtime::task::into_stream(task).is_none(),
-                "{scope:?}"
-            );
+            assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
             assert_eq!(
-                app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                copy_refusal(app.chat_runtime_mut(target).unwrap()),
                 Some(chat::TEXT_COPY_CHANGED)
             );
 
@@ -892,12 +1160,9 @@ mod tests {
             // The store refuses the second read too: it says so, rather than
             // reading a third time.
             let task = app.finish_message_copy(target, "step".into(), reread, changed());
-            assert!(
-                iced::runtime::task::into_stream(task).is_none(),
-                "{scope:?}"
-            );
+            assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
             assert_eq!(
-                app.chat_runtime_mut(target).unwrap().error.as_deref(),
+                copy_refusal(app.chat_runtime_mut(target).unwrap()),
                 Some(chat::TEXT_COPY_CHANGED)
             );
         }
@@ -982,12 +1247,15 @@ mod tests {
                 Some(CopyPart::Text),
                 Some(request.source.clone()),
             );
-            assert!(
-                iced::runtime::task::into_stream(task).is_none(),
-                "{scope:?}"
-            );
+            assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
             let runtime = app.chat_runtime_mut(target).unwrap();
-            assert_eq!(runtime.error.as_deref(), Some(UNAVAILABLE), "{scope:?}");
+            assert_eq!(copy_refusal(runtime), Some(UNAVAILABLE), "{scope:?}");
+            // Shown with whose transcript still has it.
+            let provider = runtime.session.launch.provider;
+            assert!(matches!(
+                runtime.copy_state("step", None),
+                CopyState::Refused(shown) if *shown == *unavailable_in(provider)
+            ));
         }
     }
 
@@ -1020,13 +1288,10 @@ mod tests {
             let (mut app, target, handle, request) = copy_fixture(scope.clone());
             publish(&handle, &scope, None);
             let task = app.finish_message_copy(target, "step".into(), request, Ok("old".into()));
-            assert!(
-                iced::runtime::task::into_stream(task).is_none(),
-                "{scope:?}"
-            );
+            assert_chat_copy_task_has_no_effects(task, &format!("{scope:?}"));
             let runtime = app.chat_runtime_mut(target).unwrap();
-            assert_eq!(runtime.error.as_deref(), Some(UNAVAILABLE));
-            assert!(runtime.copied.is_none());
+            assert_eq!(copy_refusal(runtime), Some(UNAVAILABLE));
+            assert!(!shows_copied(runtime));
         }
     }
 
@@ -1067,6 +1332,7 @@ mod tests {
             context.advance(),
             "old logical message".into(),
             || true,
+            |_| unreachable!("the source is current"),
         );
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.update(Message::Repository(RepositoryAction::Clipboard {
@@ -1095,9 +1361,13 @@ mod tests {
             invalidate();
             assert!(first.is_current(intent));
         }
-        let task = clipboard_write(first.clone(), intent, "first context source".into(), || {
-            true
-        });
+        let task = clipboard_write(
+            first.clone(),
+            intent,
+            "first context source".into(),
+            || true,
+            |_| unreachable!("the source is current"),
+        );
         let copied = std::thread::spawn(move || {
             // This thread has no injected context. The task must use its
             // captured first context rather than the process default.

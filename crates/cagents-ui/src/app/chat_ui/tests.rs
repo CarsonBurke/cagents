@@ -197,6 +197,62 @@ fn native_permissions_opens_locally_even_while_busy_and_preserves_attachments() 
     );
 }
 
+/// Something tried at the composer that didn't happen is said there, as
+/// a note about that try. The conversation did nothing wrong, so it reports
+/// no error, and its turn keeps its own outcome.
+#[test]
+fn a_refused_composer_action_is_a_note_at_the_composer_not_the_conversations_error() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some("permissions"));
+    let runtime = match app.cards.get_mut(&card).unwrap() {
+        CardRuntime::Chat(runtime) => runtime,
+        _ => unreachable!(),
+    };
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.permission_modes = vec!["manual".into(), "auto".into()];
+    snapshot.commands.push(chat::SlashCommand {
+        name: "permissions".into(),
+        description: "Provider dialog".into(),
+    });
+    runtime.replace_draft(text_editor::Content::with_text(
+        "/permissions allow Bash(*)",
+    ));
+    let target = runtime.target;
+    let refuse = |app: &mut Cagents| {
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        let runtime = chat_runtime(app, card);
+        assert!(
+            runtime
+                .composer_note
+                .as_deref()
+                .is_some_and(|note| note.contains("/permissions")),
+            "{:?}",
+            runtime.composer_note
+        );
+        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.reported_errors().next(), None);
+        assert_eq!(runtime.composer.text().trim(), "/permissions allow Bash(*)");
+        assert!(runtime.commands.is_idle());
+    };
+
+    refuse(&mut app);
+    // Changing the draft moves on from what the note was about.
+    drop(app.update(Message::ChatUi(Action::Composer(
+        target,
+        text_editor::Action::Edit(text_editor::Edit::Insert(' ')),
+    ))));
+    assert_eq!(chat_runtime(&app, card).composer_note, None);
+
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .replace_draft(text_editor::Content::with_text(
+            "/permissions allow Bash(*)",
+        ));
+    refuse(&mut app);
+    drop(app.handle_chat_ui(Action::DismissComposerNote(target)));
+    assert_eq!(chat_runtime(&app, card).composer_note, None);
+}
+
 #[test]
 fn permission_retry_preserves_the_draft_and_requires_a_current_exact_action() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -1574,7 +1630,13 @@ fn combined_followup_attachment_limit_keeps_both_messages_editable() {
             reference: None,
         }]
     );
-    assert!(runtime.error.as_ref().unwrap().contains("attachment limit"));
+    assert!(
+        runtime
+            .composer_note
+            .as_ref()
+            .unwrap()
+            .contains("attachment limit")
+    );
 }
 
 #[test]
@@ -2493,7 +2555,13 @@ fn a_message_the_agent_started_on_is_not_taken_back() {
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.composer.text().trim(), "draft");
     assert!(runtime.recalling.is_empty());
-    assert!(runtime.error.as_ref().unwrap().contains("already started"));
+    assert!(
+        runtime
+            .composer_note
+            .as_ref()
+            .unwrap()
+            .contains("already started")
+    );
 }
 
 #[test]
@@ -3959,7 +4027,7 @@ fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
     drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
     let runtime = chat_runtime(&app, card);
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.composer_note.as_deref(),
         Some(
             "Sending would move this conversation to another account, but it can't move while background work is still going. Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Stop it from its tab in the conversation, then send again."
         )
@@ -7199,7 +7267,7 @@ fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata
         );
         assert!(
             runtime
-                .error
+                .composer_note
                 .as_deref()
                 .unwrap()
                 .contains("Clear it before removing")
@@ -7731,7 +7799,7 @@ fn valid_empty_paste_preserves_later_native_selection_and_caret() {
             assert!(runtime.attachment_order.is_empty());
             assert!(runtime.submit_after_paste.is_none());
             assert!(runtime.commands.is_idle());
-            assert!(runtime.error.is_none());
+            assert!(runtime.composer_note.is_none());
         }
     }
 }
@@ -7913,7 +7981,7 @@ fn attach_files_refuses_a_non_image_for_an_images_only_provider() {
         assert!(runtime.attachment_order.is_empty());
         assert!(runtime.attachment_chooser_pending.is_none());
         assert_eq!(
-            runtime.error.as_deref(),
+            runtime.composer_note.as_deref(),
             Some(
                 "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
             )
@@ -7960,7 +8028,7 @@ fn a_chooser_refusal_survives_a_deferred_account_change() {
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.session, chosen);
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.composer_note.as_deref(),
         Some(
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
@@ -8003,7 +8071,7 @@ fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.session.launch.provider, Provider::Codex);
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.composer_note.as_deref(),
         Some(
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
@@ -8041,7 +8109,7 @@ fn attach_files_still_stages_images_for_an_images_only_provider() {
 
         assert!(task.units() > 0, "accepted images must schedule staging");
         let runtime = chat_runtime(&app, card);
-        assert!(runtime.error.is_none());
+        assert!(runtime.composer_note.is_none());
         assert_eq!(runtime.pastes_pending, 1);
         assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
         assert!(runtime.attachment_chooser_pending.is_none());
@@ -8073,7 +8141,7 @@ fn attach_files_takes_any_file_for_a_provider_that_accepts_files() {
 
     assert!(task.units() > 0, "accepted files must schedule staging");
     let runtime = chat_runtime(&app, card);
-    assert!(runtime.error.is_none());
+    assert!(runtime.composer_note.is_none());
     assert_eq!(runtime.pastes_pending, 1);
     assert!(runtime.attachment_bookmarks.contains_key(&ticket.id));
     assert!(runtime.attachment_chooser_pending.is_none());
@@ -8139,7 +8207,7 @@ fn cancelled_chooser_and_repeated_drops_cannot_queue_unbounded_image_staging() {
         );
         assert!(
             chat_runtime(&app, card)
-                .error
+                .composer_note
                 .as_deref()
                 .unwrap()
                 .contains("already loading")
@@ -8200,7 +8268,7 @@ fn a_mixed_drop_replaces_selection_once_and_keeps_its_images_after_its_own_prose
             Ok(vec![image.clone()]),
         )));
         let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.error, None);
+        assert_eq!(runtime.composer_note, None);
         assert_eq!(runtime.attachments, [image.clone()]);
         let text = runtime.composer.text();
         assert!(
@@ -8263,7 +8331,7 @@ fn conflicting_pending_image_selection_refuses_without_erasing_new_prose() {
         assert!(runtime.attachments.is_empty());
         assert!(
             runtime
-                .error
+                .composer_note
                 .as_deref()
                 .unwrap()
                 .contains("insertion point changed")
@@ -8353,7 +8421,10 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
         Some(image),
     )));
     let runtime = chat_runtime(&app, card);
-    assert_eq!(runtime.error, None, "the clipboard text is read first");
+    assert_eq!(
+        runtime.composer_note, None,
+        "the clipboard text is read first"
+    );
     assert_eq!(runtime.pastes_pending, 1);
     assert_eq!(runtime.submit_after_paste, Some(PromptMode::Send));
 
@@ -8363,7 +8434,7 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
         Some("pasted cell".into()),
     )));
     let runtime = chat_runtime(&app, card);
-    assert_eq!(runtime.error, None);
+    assert_eq!(runtime.composer_note, None);
     assert_eq!(runtime.pastes_pending, 0);
     assert!(runtime.attachments.is_empty());
     assert!(
@@ -8381,7 +8452,7 @@ fn an_image_the_chat_cannot_take_falls_back_to_clipboard_text() {
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.pastes_pending, 0);
     assert_eq!(
-        runtime.error.as_deref(),
+        runtime.composer_note.as_deref(),
         Some("The current model cannot accept images.")
     );
 }
@@ -20215,7 +20286,24 @@ fn auth_warning_remains_when_new_work_or_error_prevents_idle_recovery() {
 }
 /// The actual App entry batches even an empty action. Observe its effects
 /// rather than assuming that a no-op task has no stream representation.
-fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
+/// Why the last copy didn't go through, as its control says.
+pub(super) fn copy_refusal(runtime: &Runtime) -> Option<&str> {
+    runtime
+        .copy_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.refusal.as_deref())
+}
+
+/// Whether the last copy's control says it copied.
+pub(super) fn shows_copied(runtime: &Runtime) -> bool {
+    runtime
+        .copy_feedback
+        .as_ref()
+        .is_some_and(|feedback| feedback.refusal.is_none())
+}
+
+/// `task` neither copies nor reads: at most, a refusal's note lapses.
+pub(super) fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
     use iced::futures::StreamExt;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -20235,7 +20323,15 @@ fn assert_chat_copy_task_has_no_effects(task: Task<Message>, reason: &str) {
     // The owning process supervisor retains its separate hard deadline.
     runtime.shutdown_timeout(Duration::from_secs(1));
     let effects = result.expect("a rejected copy must settle without asynchronous work");
-    assert!(effects.is_empty(), "{reason}");
+    assert!(
+        effects.iter().all(|effect| matches!(
+            effect,
+            iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::ClearCopied(..)
+            )))
+        )),
+        "{reason}"
+    );
 }
 
 fn assert_chat_copy_task_writes(task: Task<Message>, expected: &str) {
@@ -20339,13 +20435,11 @@ fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() 
         "missing source must never copy the loaded fragment",
     );
     assert!(
-        chat_runtime(&app, card)
-            .error
-            .as_deref()
+        copy_refusal(chat_runtime(&app, card))
             .unwrap()
             .contains("unavailable")
     );
-    assert!(chat_runtime(&app, card).copied.is_none());
+    assert!(!shows_copied(chat_runtime(&app, card)));
 }
 
 /// A long output's row shows only its start and end. Its Copy reads the
@@ -20490,7 +20584,7 @@ fn valid_message_copy_completion(
     ));
     assert_chat_copy_task_writes(control, &body);
     assert_eq!(app.workspace.focused(), Some(card));
-    app.chat_runtime_mut(target).unwrap().copied = None;
+    app.chat_runtime_mut(target).unwrap().copy_feedback = None;
     (card, target, request, body)
 }
 
@@ -20618,18 +20712,20 @@ fn child_failure_copy_refuses_unavailable_original_instead_of_copying_preview() 
         task,
         "an unavailable original must never copy the resident excerpt",
     );
+    let runtime = app.chat_runtime_mut(target).unwrap();
     assert!(
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .error
-            .as_deref()
+        copy_refusal(runtime)
             .unwrap()
             .contains("Original diagnostic unavailable")
+    );
+    assert!(
+        runtime.error.is_none(),
+        "a copy is not the conversation's failure"
     );
 }
 
 #[test]
-fn child_failure_read_error_reports_withdrawal_but_suppresses_replacement_feedback() {
+fn child_failure_read_error_says_why_it_did_not_copy_when_withdrawn_or_replaced() {
     let _context = text_copy::isolated_context();
     for change in ["withdrawn", "replacement"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20660,11 +20756,18 @@ fn child_failure_read_error_reports_withdrawal_but_suppresses_replacement_feedba
             Err("owned backing read failed".into()),
         ));
         assert_chat_copy_task_has_no_clipboard_write(task, "read errors cannot copy a preview");
-        let error = app.chat_runtime_mut(target).unwrap().error.as_deref();
-        assert_eq!(
-            error.is_some_and(|error| error.contains("Original diagnostic unavailable")),
-            change == "withdrawn"
-        );
+        let refusal = copy_refusal(app.chat_runtime_mut(target).unwrap()).unwrap();
+        if change == "withdrawn" {
+            assert!(
+                refusal.contains("Original diagnostic unavailable"),
+                "{refusal}"
+            );
+        } else {
+            assert_eq!(
+                refusal,
+                "These details changed while copying. Copy them again."
+            );
+        }
     }
 }
 
@@ -20690,7 +20793,7 @@ fn logical_message_copy_completion_survives_parent_window_eviction() {
         Ok(body.clone()),
     )));
     assert_chat_copy_task_writes(task, &body);
-    assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
+    assert!(shows_copied(app.chat_runtime_mut(target).unwrap()));
 }
 
 #[test]
@@ -20925,7 +21028,7 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             Ok(body),
         )));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        assert!(runtime.copied.is_none());
+        assert!(!shows_copied(runtime));
         if change == "rewrite" {
             // The rewritten item is read again; only that read reaches the
             // clipboard.
@@ -20959,7 +21062,7 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
         } else {
             assert_chat_copy_task_has_no_effects(task, change);
             assert_eq!(
-                runtime.error.as_deref(),
+                copy_refusal(runtime),
                 Some(text_copy::UNAVAILABLE),
                 "{change}"
             );
@@ -21039,7 +21142,7 @@ fn logical_message_copy_deferred_write_reads_again_after_destructive_publication
             target, id, request, result,
         )));
         let runtime = app.chat_runtime_mut(target).unwrap();
-        assert!(runtime.copied.is_none(), "{change}");
+        assert!(!shows_copied(runtime), "{change}");
         if change == "rewrite" {
             assert!(runtime.error.is_none(), "{change}");
             assert!(
@@ -21048,7 +21151,7 @@ fn logical_message_copy_deferred_write_reads_again_after_destructive_publication
             );
         } else {
             assert_eq!(
-                runtime.error.as_deref(),
+                copy_refusal(runtime),
                 Some(text_copy::UNAVAILABLE),
                 "{change}"
             );
@@ -21177,13 +21280,10 @@ fn logical_message_copy_completion_refuses_scope_handle_focus_and_failed_canonic
             result,
         )));
         assert_chat_copy_task_has_no_effects(task, change);
-        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
         if change == "canonical read" {
             assert!(
-                app.chat_runtime_mut(target)
-                    .unwrap()
-                    .error
-                    .as_deref()
+                copy_refusal(app.chat_runtime_mut(target).unwrap())
                     .unwrap()
                     .contains("Message changed")
             );
@@ -21208,7 +21308,7 @@ fn newer_chat_copy_blocks_delayed_full_message_clipboard_write() {
         task,
         "a delayed read must not overwrite the newer clipboard intent",
     );
-    assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+    assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
 }
 
 #[test]
@@ -21239,7 +21339,7 @@ fn captured_builtin_copy_event_on_same_card_supersedes_async_message_copy() {
         task,
         "a builtin copy captured by the same card must supersede the old read",
     );
-    assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+    assert!(!shows_copied(app.chat_runtime_mut(target).unwrap()));
 }
 
 #[test]
