@@ -3138,13 +3138,13 @@ impl Cagents {
         } else {
             trigger
         };
-        // A provider turned off is not checked, except when a conversation
-        // still open on it reaches its limit and needs to know when it resets
-        // or which account to switch to.
+        // A provider turned off is not checked while no conversation is open
+        // on it. One still open needs its accounts' figures current, to know
+        // when its limit resets and which account Automatic switches to.
+        let provider = self.account_ui.account(id)?.account.provider;
         if trigger != Trigger::Limit
-            && !self
-                .account_ui
-                .uses(self.account_ui.account(id)?.account.provider)
+            && !self.account_ui.uses(provider)
+            && !self.chat_open_on(provider)
         {
             return None;
         }
@@ -6306,6 +6306,14 @@ impl Cagents {
             .count()
     }
 
+    /// Whether a conversation on `provider` is open in some pane.
+    fn chat_open_on(&self, provider: Provider) -> bool {
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(session) if session.launch.provider == provider)
+        })
+    }
+
     /// The per-provider default choices the settings pane offers.
     pub(super) fn default_account_choices(&self) -> Vec<(Provider, Vec<DefaultChoice>)> {
         let state = &self.account_ui;
@@ -9403,12 +9411,26 @@ mod app_tests {
         assert!(!app.account_ui.offers(Provider::Claude));
         assert_eq!(app.automatic_account(&current).unwrap().id(), other);
 
-        // And when one reaches its limit, its account is still checked.
+        // When one reaches its limit, its account is still checked.
         let codex = Account::system(Provider::Codex).id();
         let recipe = recipe_on(&app, &codex);
         assert!(app.probe_account(&codex, Trigger::Focus, now).is_none());
         drop(app.account_limit_reported(Provider::Codex, &recipe));
         assert!(app.account_ui.pending_probe_for_test(&codex).is_some());
+
+        // And while one is open, the provider's other accounts are kept
+        // current, so Automatic still has figures to switch by.
+        assert!(app.probe_account(&other, Trigger::Manual, now).is_none());
+        let session = crate::chat::fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/w".into(),
+            &current,
+        )
+        .unwrap();
+        drop(app.insert_chat_card(session, None, None));
+        assert!(app.chat_open_on(Provider::Claude));
+        assert!(app.probe_account(&other, Trigger::Manual, now).is_some());
     }
 
     #[test]
