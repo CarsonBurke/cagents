@@ -13936,16 +13936,18 @@ mod row_interaction {
     use cosmic::{Element, Renderer, Theme};
     use std::{cell::Cell, rc::Rc};
 
-    /// Whether a row scrolled out of the list's view can let `event` pass it
-    /// by. These are what every widget in the window receives on each frame
-    /// or message: a redraw, the runtime's resize request, and pointer
-    /// motion. A row out of view can't be under the pointer, and either isn't
-    /// drawn or, as a member passing under its group's pinned header, is
-    /// drawn hidden by it. Whatever its widgets would note from these, such as
-    /// their hover status, they note from the redraw that precedes their next
-    /// visible draw. Keys, modifier changes, presses and releases still reach
-    /// every row, since a focused or pressed row may be scrolled away.
-    fn unseen_rows_may_skip(event: &Event) -> bool {
+    /// Whether `event` is one every widget in the window receives on each
+    /// frame or message: a redraw, the runtime's resize request, or pointer
+    /// motion. None of these moves focus.
+    ///
+    /// A row scrolled out of the list's view can let these pass it by. It
+    /// can't be under the pointer, and either isn't drawn or, as a member
+    /// passing under its group's pinned header, is drawn hidden by it.
+    /// Whatever its widgets would note from these, such as their hover
+    /// status, they note from the redraw that precedes their next visible
+    /// draw. Keys, modifier changes, presses and releases still reach every
+    /// row, since a focused or pressed row may be scrolled away.
+    fn routine(event: &Event) -> bool {
         matches!(
             event,
             Event::Window(window::Event::RedrawRequested(_))
@@ -14076,6 +14078,10 @@ mod row_interaction {
         /// Whether any control in the row has focus, such as its delete
         /// button, not only the row's own target.
         focus_within: bool,
+        /// Whether `focused`, `focus_within` and `selection_bounds` are
+        /// current: they are found again after each event that may move
+        /// focus and each operation, and lapse when the row is rebuilt.
+        focus_known: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
         /// Whether something in the row, such as a menu, was open the last
@@ -14271,6 +14277,7 @@ mod row_interaction {
             state.focused = focus.0;
             state.selection_bounds = focus.2;
             state.focus_within = focus.3;
+            state.focus_known = true;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -14394,6 +14401,7 @@ mod row_interaction {
                 }
             }
             tree.diff_children(&mut self.children);
+            tree.state.downcast_mut::<State>().focus_known = false;
             if let Kind::Reorder {
                 ids,
                 disabled,
@@ -14558,7 +14566,7 @@ mod row_interaction {
             viewport: &Rectangle,
         ) {
             // Without this, every frame and every message walks each of a
-            // long list's rows and their focus, however few are in view. A
+            // long list's rows, however few are in view. A
             // row that last saw the pointer, or that a drag started in, still
             // hears the event that tells it the pointer has gone. A row with
             // focus anywhere in it keeps every frame: its focused control may
@@ -14571,17 +14579,22 @@ mod row_interaction {
             // So does a row whose tooltip or menu is still on screen: a
             // tooltip fades out over the frames after the pointer leaves, and
             // would stay frozen there without them.
+            let routine = routine(event);
             let state = tree.state.downcast_ref::<State>();
             if !layout.bounds().intersects(viewport)
                 && !state.hovered
                 && !state.focus_within
                 && !state.overlaid.get()
                 && state.origin.is_none()
-                && unseen_rows_may_skip(event)
+                && routine
             {
                 return;
             }
-            self.focus(tree, layout, renderer);
+            // Finding focus walks the row's controls, so a frame that moves
+            // no focus relies on what the last event or operation found.
+            if !routine || !state.focus_known {
+                self.focus(tree, layout, renderer);
+            }
             if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
@@ -14916,10 +14929,12 @@ mod row_interaction {
                     break;
                 }
             }
-            let focused = tree.state.downcast_ref::<State>().focused;
-            self.focus(tree, layout, renderer);
-            if reserves && tree.state.downcast_ref::<State>().focused != focused {
-                shell.invalidate_layout();
+            if !routine {
+                let focused = tree.state.downcast_ref::<State>().focused;
+                self.focus(tree, layout, renderer);
+                if reserves && tree.state.downcast_ref::<State>().focused != focused {
+                    shell.invalidate_layout();
+                }
             }
         }
 

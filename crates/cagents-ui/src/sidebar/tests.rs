@@ -8994,6 +8994,9 @@ mod row_probe {
     pub(super) struct Logs {
         pub(super) updates: Log,
         pub(super) queries: Log,
+        /// Rows whose controls an operation visited, such as a row finding
+        /// its focus.
+        pub(super) operations: Log,
         pub(super) overlays: Log,
         pub(super) menu: Rc<Cell<Option<usize>>>,
         pub(super) focus: Rc<Cell<Option<usize>>>,
@@ -9106,6 +9109,7 @@ mod row_probe {
             _: &Renderer,
             operation: &mut dyn Operation,
         ) {
+            self.logs.operations.borrow_mut().push(self.row);
             operation.focusable(
                 None,
                 layout.bounds(),
@@ -9400,6 +9404,96 @@ fn rows_out_of_view_keep_frames_for_a_control_focused_within() {
         redraw(&mut list, &mut tree),
         (0..10).collect::<Vec<_>>(),
         "once focus leaves the row, so do its frames"
+    );
+}
+
+/// Finding a row's focus walks its controls. Frames and pointer motion move
+/// no focus, so a row looks again only after an event that may have moved
+/// it, or once it is rebuilt; an operation that moves focus tells the row
+/// itself.
+#[test]
+fn rows_find_focus_only_when_it_may_have_moved() {
+    use cosmic::iced::{
+        Event, Point,
+        advanced::{Shell, clipboard, mouse},
+        keyboard,
+        time::Instant,
+        window,
+    };
+    use row_probe::Logs;
+
+    let logs = Logs::default();
+    let mut list = logs.selectable_rows(30);
+    let renderer = headless_renderer();
+    let mut tree = Tree::new(&list);
+    let node = list.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(280.0, 600.0)),
+    );
+    let top = Rectangle::new(Point::ORIGIN, Size::new(280.0, 200.0));
+    let send = |list: &mut Element<'_, SidebarAction>, tree: &mut Tree, event: Event| {
+        let mut messages = Vec::new();
+        list.as_widget_mut().update(
+            tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(10.0, 10.0)),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &top,
+        );
+        Logs::take(&logs.updates);
+        Logs::take(&logs.operations)
+    };
+    let redraw = || Event::Window(window::Event::RedrawRequested(Instant::now()));
+    let in_view = (0..10).collect::<Vec<_>>();
+    let none = Vec::<usize>::new();
+
+    assert_eq!(
+        send(&mut list, &mut tree, redraw()),
+        in_view,
+        "a new row looks once"
+    );
+    assert_eq!(send(&mut list, &mut tree, redraw()), none);
+    assert_eq!(
+        send(
+            &mut list,
+            &mut tree,
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(10.0, 10.0)
+            }),
+        ),
+        none
+    );
+
+    // An operation moving focus, as keyboard navigation does, finds it.
+    logs.focus.set(Some(20));
+    list.as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut VisitAll);
+    Logs::take(&logs.operations);
+    assert_eq!(send(&mut list, &mut tree, redraw()), none);
+
+    assert_eq!(
+        send(
+            &mut list,
+            &mut tree,
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::SHIFT
+            )),
+        ),
+        (0..30).collect::<Vec<_>>(),
+        "a key may move focus in any row"
+    );
+    assert_eq!(send(&mut list, &mut tree, redraw()), none);
+
+    let mut rebuilt = logs.selectable_rows(30);
+    tree.diff(&mut rebuilt);
+    assert_eq!(
+        send(&mut rebuilt, &mut tree, redraw()),
+        (0..10).chain([20]).collect::<Vec<_>>(),
+        "a rebuilt row looks again; the focused one out of view keeps its frames"
     );
 }
 
