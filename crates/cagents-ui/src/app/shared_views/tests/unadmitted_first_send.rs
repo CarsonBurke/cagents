@@ -392,11 +392,134 @@ fn a_held_message_waits_out_the_removal_of_its_worktree() {
     let mut window = seeding_channel();
     let start = send(&mut window);
     assert_held(&window, start);
-    window.app.project_ui.begin_deleting(PathBuf::from("/repo"));
+    let deleting = window.app.project_ui.begin_deleting(PathBuf::from("/repo"));
     assert!(window.app.deleting_card_reason(window.card).is_some());
     // The channel loads while the chat's worktree is being deleted: nothing
     // starts in a directory being emptied.
     seed_applied(&mut window, Vec::new(), Vec::new());
     assert!(window.app.first_send_held(window.card));
     assert!(window.app.chat_start_attempt(window.card).is_none());
+
+    // The deletion fails, so the worktree stays and the message starts,
+    // without waiting for an unrelated change to the shared workspace.
+    let capture = window.app.capture_worktree_removal(&deleting);
+    drop(window.app.update(Message::ProjectUi(
+        crate::app::project_ui::Action::Deleted {
+            target: deleting,
+            capture,
+            result: Err("the worktree has changes".into()),
+        },
+    )));
+    assert!(window.app.deleting_card_reason(window.card).is_none());
+    assert_started_once(&mut window);
+}
+
+#[test]
+fn a_refusal_settled_by_the_workspace_notice_takes_its_retry_off_the_pane() {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    let scope = window.scope.clone();
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::SeedRefused {
+                scope: scope.clone(),
+                attempt: window.app.shared_views.seed_attempts[&scope],
+                error: "The registry could not store these panes".into(),
+            }),
+    );
+    assert!(window.app.chat_error(window.card).is_some());
+
+    // The workspace notice's Retry loads every refused channel.
+    window.app.retry_view_seeds();
+    assert!(window.app.shared_views.seeding.contains(&scope));
+    assert!(
+        window.app.chat_error(window.card).is_some(),
+        "the refusal stands until the new seed's receipt"
+    );
+    let pane = Pane::from_card(window.app.card_state(window.card).unwrap(), None).unwrap();
+    seed_applied(&mut window, vec![pane], Vec::new());
+    assert!(window.app.chat_error(window.card).is_none());
+    assert_eq!(
+        window.app.chat_composer_text(window.card).as_deref(),
+        Some("first message"),
+        "the message waits in the composer for the user to send"
+    );
+    // No Retry is left to press.
+    let retry = window
+        .app
+        .handle_chat_ui(Action::RetryRefusedView(window.target));
+    assert_eq!(retry.units(), 0);
+    assert!(window.app.chat_start_attempt(window.card).is_none());
+}
+
+#[test]
+fn a_held_message_follows_the_conversation_another_window_started() {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+
+    // Another window, whose registry had the channel, sent its own first
+    // message from the same shared draft.
+    let mut pane = Pane::from_card(window.app.card_state(window.card).unwrap(), None).unwrap();
+    let CardKind::Chat(session) = &mut pane.kind else {
+        unreachable!("the pane is a chat")
+    };
+    session.launch.session_id = Some("peer-conversation".into());
+    let accepted = session.clone();
+    seed_applied(&mut window, vec![pane], Vec::new());
+
+    assert!(!window.app.first_send_held(window.card));
+    assert!(
+        window.app.chat_start_matches(window.card, &accepted),
+        "the window connects to the running conversation, starting none"
+    );
+    assert_eq!(
+        window.app.held_chat_draft(window.card),
+        Some("first message"),
+        "the message waits in that conversation's composer"
+    );
+}
+
+#[test]
+fn a_held_message_never_starts_outside_the_channel_it_was_sent_in() {
+    let mut window = seeding_channel();
+    let start = send(&mut window);
+    assert_held(&window, start);
+    // While the message waits, its pane comes to be listed by another
+    // channel, one already loaded.
+    let Scope::Channel(channel) = window.scope.clone() else {
+        unreachable!("the window's scope is its channel")
+    };
+    let other = ChannelId::new();
+    let durable = Arc::make_mut(&mut window.app.durable);
+    let mut moved = durable
+        .channels
+        .iter()
+        .find(|candidate| candidate.id == channel)
+        .unwrap()
+        .clone();
+    for candidate in &mut durable.channels {
+        candidate.cards.retain(|card| *card != window.card);
+    }
+    moved.id = other;
+    moved.cards = vec![window.card];
+    durable.channels.push(moved);
+    window.app.workspace_model.views.push(View::empty(other));
+    window
+        .app
+        .shared_views
+        .initialized
+        .insert(Scope::Channel(other));
+    drop(window.app.reconcile_shared_views());
+
+    assert!(!window.app.first_send_held(window.card));
+    // The pane is that channel's draft now; its message is not sent there
+    // unasked.
+    assert!(window.app.chat_start_attempt(window.card).is_none());
+    assert_eq!(
+        window.app.chat_composer_text(window.card).as_deref(),
+        Some("first message")
+    );
 }

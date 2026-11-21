@@ -85,6 +85,15 @@ impl Cagents {
             .or_insert(error);
     }
 
+    /// Whether `scope` has loaded into the shared workspace since a refusal,
+    /// or this window has no shared workspace to load it into.
+    pub(in crate::app) fn view_seed_loaded(&self, scope: &Scope) -> bool {
+        self.shared_views.registry_unavailable
+            || (self.shared_views.initialized.contains(scope)
+                && !self.shared_views.seeding.contains(scope)
+                && !self.shared_views.seed_failures.contains_key(scope))
+    }
+
     fn seed_scope_name(&self, scope: &Scope) -> String {
         match scope {
             Scope::Channel(id) => self

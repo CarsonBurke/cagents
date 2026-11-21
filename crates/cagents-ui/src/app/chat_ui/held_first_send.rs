@@ -13,16 +13,16 @@ use crate::workspace_model::views::Scope;
 /// The start a held first message makes once its scope is admitted.
 pub(super) struct Hold {
     start: crate::terminal_ipc::PaneChatStart,
-    /// Whether the scope is a channel, for wording; otherwise a project.
-    channel: bool,
+    /// The channel or project the message was sent in. It starts there or
+    /// not at all.
+    scope: Scope,
 }
 
 impl Hold {
     pub(super) fn waiting(&self) -> &'static str {
-        if self.channel {
-            "Waiting for this channel to load…"
-        } else {
-            "Waiting for this project to load…"
+        match self.scope {
+            Scope::Channel(_) => "Waiting for this channel to load…",
+            Scope::Worktree { .. } => "Waiting for this project to load…",
         }
     }
 }
@@ -54,19 +54,15 @@ impl Cagents {
         &mut self,
         target: Target,
         start: crate::terminal_ipc::PaneChatStart,
+        scope: Scope,
     ) -> Task<Message> {
-        let channel = self
-            .durable
-            .channels
-            .iter()
-            .any(|channel| channel.cards.contains(&target.card));
         let Some(queued) = self
             .chat_card_runtime_mut(target)
             .and_then(|runtime| runtime.queued.as_mut())
         else {
             return Task::none();
         };
-        queued.admission = Some(Hold { start, channel });
+        queued.admission = Some(Hold { start, scope });
         self.chat_ui.admission_holds.insert(target.card);
         Task::none()
     }
@@ -79,9 +75,10 @@ impl Cagents {
             return Task::none();
         };
         runtime.unqueue();
-        runtime.view_refused = true;
+        runtime.view_refused = Some(scope.clone());
         runtime.error = Some(refusal(scope).into());
         let shown = runtime.session.clone();
+        self.chat_ui.view_refusals.insert(target.card);
         Task::batch([
             self.adopt_stored_draft_session(target.card),
             self.restore_failed_draft_start_focus(target, &shown),
@@ -94,6 +91,7 @@ impl Cagents {
     /// elsewhere. The daemon still retries a start that reaches it before the
     /// Insert does, so ordering between the two connections is not needed.
     pub(in crate::app) fn release_admitted_first_sends(&mut self) -> Task<Message> {
+        self.withdraw_settled_view_refusals();
         if self.chat_ui.admission_holds.is_empty() {
             return Task::none();
         }
@@ -104,21 +102,23 @@ impl Cagents {
                     .queued
                     .as_ref()
                     .and_then(|queued| queued.admission.as_ref())
-                    .map(|hold| (runtime.target, hold.start.registry)),
+                    .map(|hold| (runtime.target, hold.start.registry, hold.scope.clone())),
                 _ => None,
             };
             // Taken back, closed or replaced since: nothing to start.
-            let Some((target, registry)) = held else {
+            let Some((target, registry, held_scope)) = held else {
                 self.chat_ui.admission_holds.remove(&card);
                 continue;
             };
             // A message sent while the registry was still connecting was
             // bound to none, and starts in whichever registry this window
             // then joined; one bound to a registry this window has since left
-            // must not start in another.
+            // must not start in another. Nor does one whose pane has left the
+            // channel or project it was sent in start in another.
             let identity = self.workspace_model.identity;
-            let Some(scope) = self.draft_start_scope(card).filter(|_| {
-                registry == identity || registry == crate::workspace_model::NO_REGISTRY
+            let Some(scope) = self.draft_start_scope(card).filter(|scope| {
+                *scope == held_scope
+                    && (registry == identity || registry == crate::workspace_model::NO_REGISTRY)
             }) else {
                 tasks.push(self.unhold_first_send(
                     target,
@@ -199,14 +199,41 @@ impl Cagents {
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
-        if !runtime.view_refused {
+        let Some(scope) = runtime.view_refused.take() else {
             return Task::none();
-        }
-        runtime.view_refused = false;
+        };
         runtime.error = None;
-        if let Some(scope) = self.draft_start_scope(target.card) {
-            self.retry_view_seed(&scope);
-        }
+        self.chat_ui.view_refusals.remove(&target.card);
+        self.retry_view_seed(&scope);
         self.handle_chat_ui(Action::Submit(target, PromptMode::Send))
+    }
+
+    /// Takes the refusal notice and its Retry off each pane whose channel or
+    /// project has loaded since, as by the workspace notice's Retry. The
+    /// message stays in the composer for the user to send.
+    fn withdraw_settled_view_refusals(&mut self) {
+        if self.chat_ui.view_refusals.is_empty() {
+            return;
+        }
+        for card in self.chat_ui.view_refusals.clone() {
+            let scope = match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime.view_refused.clone(),
+                _ => None,
+            };
+            let Some(scope) = scope else {
+                self.chat_ui.view_refusals.remove(&card);
+                continue;
+            };
+            if !self.view_seed_loaded(&scope) {
+                continue;
+            }
+            self.chat_ui.view_refusals.remove(&card);
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+                runtime.view_refused = None;
+                if runtime.error.as_deref() == Some(refusal(&scope)) {
+                    runtime.error = None;
+                }
+            }
+        }
     }
 }

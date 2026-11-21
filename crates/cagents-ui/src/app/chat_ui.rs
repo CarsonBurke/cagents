@@ -1089,6 +1089,7 @@ impl Action {
             | Self::ResumeAfterSignIn(target)
             | Self::AcceptSuggestion(target, _)
             | Self::Submit(target, _)
+            | Self::RetryRefusedView(target)
             | Self::DiscardClosedDraft(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
@@ -1301,6 +1302,9 @@ pub(super) struct State {
     /// Cards whose first message waits for its scope's admission. Each one's
     /// `Queued::admission` holds the start; this only finds them.
     admission_holds: HashSet<CardId>,
+    /// Cards whose first message came back because the registry refused
+    /// their scope; the reconcile that settles the refusal withdraws it.
+    view_refusals: HashSet<CardId>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -1390,6 +1394,7 @@ impl Default for State {
             phases: HashMap::new(),
             draft_checkpoints: HashMap::new(),
             admission_holds: HashSet::new(),
+            view_refusals: HashSet::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -3324,8 +3329,8 @@ pub(super) struct Runtime {
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
     /// A first message came back because the shared workspace refused to
-    /// load this pane's channel or project; Retry loads it and sends again.
-    view_refused: bool,
+    /// load this channel or project; Retry loads it and sends again.
+    view_refused: Option<crate::workspace_model::views::Scope>,
     /// A Close the daemon refused, shown on the pane until it closes.
     close_refusal: Option<close_refusal::CloseRefusal>,
     /// Resuming this card's stopped provider failed; the reason stands in
@@ -4528,7 +4533,7 @@ impl Runtime {
             warm: None,
             error: None,
             capacity_refused: false,
-            view_refused: false,
+            view_refused: None,
             close_refusal: None,
             resume_failed: false,
             start_blocked: None,
@@ -8617,7 +8622,10 @@ impl Cagents {
         card: CardId,
         session: &chat::Session,
     ) -> bool {
-        if session.is_unstarted() || self.chat_start_pending(card) {
+        // A first message held for its channel has started nothing here, so
+        // the conversation another window started is the one to follow; the
+        // message goes back to the draft, as one whose start was given up.
+        if session.is_unstarted() || self.chat_start_in_flight(card) {
             return false;
         }
         let draft_of_session = matches!(
@@ -10787,7 +10795,7 @@ impl Cagents {
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.capacity_refused = false;
-            runtime.view_refused = false;
+            runtime.view_refused = None;
             if intent == chat::Intent::Resume && runtime.resumes_in_place() {
                 runtime.freeze_resume_source();
             }
@@ -11447,6 +11455,7 @@ impl Cagents {
         runtime.history_stash = None;
         runtime.history_attachment_stash = None;
         runtime.error = None;
+        runtime.view_refused = None;
         runtime.model_picker = None;
         runtime.account_picker = false;
         runtime.session = pending.candidate.clone();
@@ -11466,7 +11475,7 @@ impl Cagents {
             match self.first_send_admission(target.card, scope) {
                 super::shared_views::FirstSendAdmission::Admitted => {}
                 super::shared_views::FirstSendAdmission::Waiting => {
-                    return self.hold_first_send(target, pane_start);
+                    return self.hold_first_send(target, pane_start, scope.clone());
                 }
                 super::shared_views::FirstSendAdmission::Refused => {
                     return self.refuse_first_send(target, scope);
@@ -12317,7 +12326,8 @@ impl Cagents {
         {
             return Task::none();
         }
-        if matches!(&action, Action::Submit(target, _) if self.chat_closed_elsewhere(target.card)) {
+        if matches!(&action, Action::Submit(target, _) | Action::RetryRefusedView(target) if self.chat_closed_elsewhere(target.card))
+        {
             return Task::none();
         }
         match action {

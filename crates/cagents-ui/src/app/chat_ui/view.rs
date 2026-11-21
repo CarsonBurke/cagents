@@ -3408,7 +3408,7 @@ impl Runtime {
         }
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
-        } else if self.view_refused {
+        } else if self.view_refused.is_some() {
             let enabled = !transitioning
                 && self.commands.is_idle()
                 && self.attachment_chooser_pending.is_none()

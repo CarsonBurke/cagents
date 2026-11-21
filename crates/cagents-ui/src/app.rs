@@ -19382,7 +19382,12 @@ impl Cagents {
             Message::SettingsAutosave { field, generation } => {
                 self.autosave_setting(field, generation)
             }
-            Message::ProjectUi(action) => self.handle_project_action(action),
+            Message::ProjectUi(action) => {
+                let task = self.handle_project_action(action);
+                // A removal that ends without removing lets a first message
+                // held for its channel or project start.
+                Task::batch([task, self.release_admitted_first_sends()])
+            }
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
             Message::PullRequestCheckoutReady {
                 card,
@@ -19433,7 +19438,12 @@ impl Cagents {
                 }
                 task
             }
-            Message::ChannelUi(action) => self.handle_channel_ui(action),
+            Message::ChannelUi(action) => {
+                let task = self.handle_channel_ui(action);
+                // A removal that ends without removing lets a first message
+                // held for its channel or project start.
+                Task::batch([task, self.release_admitted_first_sends()])
+            }
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::AccountUi(action) => self.update_account_ui(action),
