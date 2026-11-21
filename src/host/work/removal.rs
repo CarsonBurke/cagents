@@ -15,6 +15,9 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Deleting a large tree of build output can take minutes on a slow disk.
 const GIT_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const CHANGED: &str = "The worktree changed since its removal plan; review the new plan and retry";
+/// Removal reads and deletes branches by their UTF-8 name, so it refuses one
+/// whose name has other bytes rather than act on a lossy look-alike.
+const INVALID_BRANCH_NAME: &str = "This branch's name is not valid UTF-8; remove it with Git";
 
 /// A card's worktree, with what its content is judged against.
 struct Subject {
@@ -167,6 +170,11 @@ impl Handle {
     fn subject(&self, host: &SharedHost, scope: &Scope, name: &str) -> Result<Subject, String> {
         let board = self.board(host, scope, false)?;
         let item = Self::card(&board, name)?;
+        if let crate::work::ItemKey::Branch(identity) = &item.key
+            && crate::work::branch_name(identity).to_str().is_none()
+        {
+            return Err(INVALID_BRANCH_NAME.into());
+        }
         let worktree = item
             .worktree
             .as_ref()
@@ -176,24 +184,31 @@ impl Handle {
         }
         let path = std::fs::canonicalize(&worktree.path)
             .map_err(|error| format!("Cannot open {}: {error}", worktree.path.display()))?;
-        let merged = item.branch.as_deref().and_then(|branch| {
-            let shared = self.shared();
-            let snapshot = shared.projects.get(&item.project)?.snapshot.clone()?;
-            let head = item.head.as_ref().map(|head| head.oid.as_str());
-            snapshot
-                .for_branch(branch, head)
-                .filter(|pull_request| {
-                    pull_request.state.0 == "MERGED"
-                        && Some(pull_request.head_ref_oid.as_str()) == head
-                })
-                .map(|pull_request| {
-                    (
-                        pull_request.number,
-                        pull_request.base_ref_name.clone(),
-                        pull_request.head_ref_oid.clone(),
-                    )
-                })
-        });
+        let branch = match &item.key {
+            crate::work::ItemKey::Branch(identity) => Some(crate::work::branch_name(identity)),
+            crate::work::ItemKey::Worktree(_) => item.branch.as_deref().map(Into::into),
+        };
+        let merged = branch
+            .as_deref()
+            .and_then(|branch| branch.to_str())
+            .and_then(|branch| {
+                let shared = self.shared();
+                let snapshot = shared.projects.get(&item.project)?.snapshot.clone()?;
+                let head = item.head.as_ref().map(|head| head.oid.as_str());
+                snapshot
+                    .for_branch(branch, head)
+                    .filter(|pull_request| {
+                        pull_request.state.0 == "MERGED"
+                            && Some(pull_request.head_ref_oid.as_str()) == head
+                    })
+                    .map(|pull_request| {
+                        (
+                            pull_request.number,
+                            pull_request.base_ref_name.clone(),
+                            pull_request.head_ref_oid.clone(),
+                        )
+                    })
+            });
         let (merged_pull_request, targets, merged_head) = match merged {
             Some((number, base, head)) => {
                 (Some(number), remote_branches(&path, &base)?, Some(head))

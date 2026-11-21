@@ -4,6 +4,160 @@ use crate::workspace::{CardWidth, WorkspaceCard};
 use std::collections::HashSet;
 
 #[test]
+fn unfocused_file_editor_cannot_overwrite_a_finished_primary_selection() {
+    use crate::repository_widget::text_editor::{Action, Content, Edit, TextEditor};
+    use cosmic::iced::advanced::{clipboard, widget::operation::Outcome};
+    use cosmic::iced::futures::{StreamExt, executor::block_on};
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct PrimaryClipboard(Vec<String>);
+
+    impl Clipboard for PrimaryClipboard {
+        fn read(&self, kind: clipboard::Kind) -> Option<String> {
+            (kind == clipboard::Kind::Primary)
+                .then(|| self.0.last().cloned())
+                .flatten()
+        }
+
+        fn write(&mut self, kind: clipboard::Kind, contents: String) {
+            assert_eq!(kind, clipboard::Kind::Primary);
+            self.0.push(contents);
+        }
+    }
+
+    fn strip<'a>(
+        contents: &'a [Content; 2],
+        cards: [CardId; 2],
+        containers: &[widget::Id; 2],
+        editors: &[widget::Id; 2],
+    ) -> Element<'a, (usize, Action)> {
+        VirtualStrip {
+            total_width: 640.0,
+            viewport_width: 640.0,
+            retained: Arc::new(
+                cards
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, id)| (id, i))
+                    .collect(),
+            ),
+            focused: None,
+            cards: contents
+                .iter()
+                .enumerate()
+                .map(|(index, content)| VirtualCard {
+                    id: cards[index],
+                    x: index as f32 * 320.0,
+                    width: 320.0,
+                    content_width: 320.0,
+                    on_screen: true,
+                    content: cosmic::widget::id_container(
+                        TextEditor::new(content)
+                            .id(editors[index].clone())
+                            .font(cosmic::iced::Font::MONOSPACE)
+                            .size(16.0)
+                            .height(Length::Fill)
+                            .on_action(move |action| (index, action)),
+                        containers[index].clone(),
+                    )
+                    .into(),
+                })
+                .collect(),
+        }
+        .into()
+    }
+
+    let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    let contents = RefCell::new([
+        Content::with_text("fresh selection in A\n"),
+        Content::with_text("stale selection in B\n"),
+    ]);
+    let cards = [CardId::new(), CardId::new()];
+    let containers = [widget::Id::unique(), widget::Id::unique()];
+    let editors = [widget::Id::unique(), widget::Id::unique()];
+    let viewport = Rectangle::with_size(Size::new(640.0, 200.0));
+    let limits = layout::Limits::new(Size::ZERO, viewport.size());
+    let mut tree = Tree::new(strip(&contents.borrow(), cards, &containers, &editors));
+    let mut clipboard = PrimaryClipboard::default();
+    let mut send = |event: mouse::Event, point: Point| {
+        let mut actions = Vec::new();
+        {
+            let contents = contents.borrow();
+            let mut element = strip(&contents, cards, &containers, &editors);
+            tree.diff(&mut element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard,
+                &mut Shell::new(&mut actions),
+                &viewport,
+            );
+
+            // Focus follows mouse is off. After a press, run the same scoped
+            // handoff as the app, preserving the editor's native pointer focus.
+            if matches!(event, mouse::Event::ButtonPressed(mouse::Button::Left)) {
+                let index = usize::from(point.x >= 320.0);
+                let mut stream = cosmic::iced::runtime::task::into_stream(
+                    focus_card_if_outside::<()>(containers[index].clone(), editors[index].clone()),
+                )
+                .unwrap();
+                while let Some(action) = block_on(stream.next()) {
+                    let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("focus handoff must issue a widget operation");
+                    };
+                    loop {
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            operation.as_mut(),
+                        );
+                        match operation.finish() {
+                            Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
+        for (index, action) in &actions {
+            contents.borrow_mut()[*index].perform(action.clone());
+        }
+        actions
+    };
+
+    let b_start = Point::new(340.0, 20.0);
+    let b_end = Point::new(430.0, 20.0);
+    send(mouse::Event::ButtonPressed(mouse::Button::Left), b_start);
+    send(mouse::Event::CursorMoved { position: b_end }, b_end);
+    send(mouse::Event::ButtonReleased(mouse::Button::Left), b_end);
+    let stale = contents.borrow()[1].selection().expect("B has a selection");
+
+    let a_start = Point::new(20.0, 20.0);
+    let a_end = Point::new(110.0, 20.0);
+    send(mouse::Event::ButtonPressed(mouse::Button::Left), a_start);
+    send(mouse::Event::CursorMoved { position: a_end }, a_end);
+    let fresh = contents.borrow()[0].selection().expect("A has a selection");
+    assert_ne!(fresh, stale);
+    assert_eq!(contents.borrow()[1].selection().as_ref(), Some(&stale));
+    send(mouse::Event::ButtonReleased(mouse::Button::Left), a_end);
+
+    let pasted = send(mouse::Event::ButtonPressed(mouse::Button::Middle), a_end);
+    assert!(
+        matches!(pasted.as_slice(), [(0, Action::Click(_)), (0, Action::Edit(Edit::Paste(text)))] if text.as_str() == fresh),
+        "middle click must paste A's new selection, got {pasted:?}"
+    );
+    assert_eq!(clipboard.0, vec![stale, fresh]);
+}
+
+#[test]
 fn workspace_surface_forwards_drop_targets_in_native_collection_order() {
     use super::forwarding_test::{leaf, renderer};
     use cosmic::iced::advanced::clipboard::DndDestinationRectangles;

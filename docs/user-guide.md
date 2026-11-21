@@ -45,9 +45,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   opened while it was selected, and its row shows how many when there is more
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
-  use their provider's mark. Antigravity (`agy`) and Muse terminals are
-  recognized, but run only in a terminal: cagents has no native chat for them
-  yet.
+  use their provider's mark. Antigravity (`agy`) runs as a native chat too;
+  Muse terminals are recognized, but run only in a terminal: cagents has no
+  native chat for Muse yet.
 - Drag a tab title to reorder panes. The
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
@@ -444,6 +444,12 @@ worktree it edited whose branch heads none of them. Nobody declares them:
 cagents reads them from what the conversation and its subagents did, such as
 `gh pr create` output, pushed branches, checkouts, reviews, and PR links or
 `#123` references. The list updates on its own; there is nothing to refresh.
+For Claude and Codex it reads the provider's own transcript. For OMP,
+Antigravity and Muse it reads cagents' own record of the chat, from the
+moment the daemon starts the chat, whether or not the chat is on screen,
+including the history a resumed chat loads. When some of that history isn't
+read, such as one the provider doesn't hand over in full, the section says
+the list may leave out older work.
 
 A row's glyph is the PR's state: open, draft, merged or closed. An open PR's
 row ends with a glyph for its checks, the worst of them, and one for its
@@ -1145,7 +1151,8 @@ the recorded account selection; choose **System default** to inherit credentials
 
 ### Switching between terminal and chat
 
-Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**,
+Supported OMP, Claude, Codex and Antigravity terminal sessions offer **Switch
+to chat**,
 and the New tab menu starts a native conversation without a terminal.
 The focused tab has a switch button next to its close control; the same action
 is in its context menu. **Return to terminal** resumes an existing conversation
@@ -1170,6 +1177,13 @@ automatically.
   This is a handoff, not a simultaneous live view: only one side runs at a
   time, and available history depends on the provider. The original launch
   recipe and terminal descriptor are kept for the return.
+- **Antigravity** uses the same stop-and-resume handoff, through its Agent
+  Client Protocol server, `agy acp`, which cagents always runs with telemetry
+  off. A terminal offers **Switch to chat** only once its command names its
+  conversation, as `agy --conversation ID` does, since `agy` reports no other
+  sign of which conversation it is in. Antigravity has no accounts of its own
+  in cagents: chats use the Google sign-in `agy` keeps in `~/.gemini`, and
+  **Sign in** in the Accounts pane runs `agy acp --login`.
 - **Codex** threads use a cagents-owned local server, so native and CLI views
   attach to the same thread, even mid-response, and switching keeps drafts,
   attachments, and pending native commands. Existing sessions on a shared Unix
@@ -1195,7 +1209,9 @@ queued follow-ups, attachments, compaction, and model and thinking selection;
 Claude supports async steering and queueing on verified versions, attachments,
 advertised models and slash commands, compaction
 when advertised, and permission modes; Codex controls depend on the session's
-advertised capabilities, and image attachments need an image-capable model.
+advertised capabilities, and image attachments need an image-capable model;
+Antigravity offers the models, thinking levels and modes its session lists,
+with approvals, stop, and image attachments when it accepts images.
 Unsupported controls are not offered, and are never imitated with terminal
 keystrokes.
 Usage and cost come from provider reports.

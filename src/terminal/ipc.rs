@@ -7,6 +7,8 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+pub(crate) mod client_session;
+
 use crate::{
     instance,
     model::{
@@ -323,6 +325,9 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Omit grid replay while attaching a hidden view. This is not an observed
+/// presentation revision; the daemon continues above its finite watermark.
+pub const SUPPRESS_GRID_REPLAY: u64 = u64::MAX;
 /// Encoded descriptor bytes a `ListedPage` fills before it ends, leaving the
 /// rest of the frame for the envelope. A descriptor larger than this still
 /// gets a page of its own, as every descriptor must fit `Attached`.
@@ -393,6 +398,8 @@ pub enum ClientRequest {
     },
     Attach {
         terminal_id: TerminalId,
+        /// Last applied presentation revision, or [`SUPPRESS_GRID_REPLAY`] to
+        /// omit grid replay while retaining finite presentation continuity.
         after_generation: u64,
         after_event_sequence: u64,
     },
@@ -436,6 +443,8 @@ pub enum ClientRequest {
     },
     Snapshot {
         terminal_id: TerminalId,
+        /// Last applied presentation revision; zero requests a full grid and
+        /// [`SUPPRESS_GRID_REPLAY`] suppresses the grid entirely.
         after_generation: u64,
     },
     AcknowledgeRedraw {
@@ -767,6 +776,8 @@ pub struct PaneChatStart {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeCursor {
     pub terminal_id: TerminalId,
+    /// Last applied presentation revision, or [`SUPPRESS_GRID_REPLAY`] to
+    /// omit grid replay while retaining finite presentation continuity.
     pub generation: u64,
     pub event_sequence: u64,
 }

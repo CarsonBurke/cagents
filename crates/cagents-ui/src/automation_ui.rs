@@ -18,7 +18,7 @@ use cosmic::{
     iced::{Alignment, Length, widget::text_editor},
     widget,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
 const PAGE: usize = 50;
@@ -31,7 +31,6 @@ const LIST_WIDTH: f32 = 240.0;
 /// The most of a narrow pane's height the stacked list takes from the
 /// selection below it, including short split panes.
 const STACKED_LIST_SHARE: f32 = 0.4;
-const PROVIDERS: [&str; 3] = ["Claude", "Codex", "Omp"];
 const SCHEDULES: [&str; 5] = ["Hourly", "Daily", "Weekdays", "Weekly", "Cron"];
 const WEEKDAYS: [&str; 7] = [
     "Monday",
@@ -435,6 +434,32 @@ impl Draft {
         value
     }
 
+    /// Starts a new draft on the provider at `index` rather than the first,
+    /// as though it had opened there: nothing is yet changed.
+    fn start_on(&mut self, index: usize, models: &Models) {
+        self.provider = index;
+        self.preselect_account();
+        self.choose_model(ModelChoice::Default, models);
+        self.baseline = Some(self.values());
+    }
+
+    /// The indices of the providers the editor offers. One turned off stays
+    /// listed for the automation saved on it, so editing it neither silently
+    /// changes it nor loses the way back, and while it is the one chosen.
+    fn offered_providers(&self, turned_off: &BTreeSet<Provider>) -> Vec<usize> {
+        let saved = self
+            .base
+            .and(self.baseline.as_ref())
+            .map(|baseline| baseline.provider);
+        (0..AUTOMATION_PROVIDERS.len())
+            .filter(|index| {
+                *index == self.provider
+                    || Some(*index) == saved
+                    || !turned_off.contains(&AUTOMATION_PROVIDERS[*index])
+            })
+            .collect()
+    }
+
     fn values(&self) -> DraftValues {
         DraftValues {
             name: self.name.clone(),
@@ -759,6 +784,8 @@ pub struct State {
     accounts: Vec<AccountChoice>,
     models: Models,
     archived_accounts: Vec<AccountChoice>,
+    /// Providers turned off in the settings, which the editor does not offer.
+    turned_off: BTreeSet<Provider>,
 }
 
 impl State {
@@ -914,6 +941,12 @@ impl State {
         self.models = models;
     }
 
+    /// The providers the settings turn off, which the editor no longer
+    /// offers for an automation that does not already run on one.
+    pub fn set_turned_off(&mut self, turned_off: BTreeSet<Provider>) {
+        self.turned_off = turned_off;
+    }
+
     fn clear_error(&mut self) {
         self.error = None;
         self.error_is_command = false;
@@ -946,10 +979,9 @@ impl State {
             | Action::Effort(..)
             | Action::Reuse(..)
             | Action::Precheck(..) => self.draft.is_some(),
-            Action::Provider(index) => self
-                .draft
-                .as_ref()
-                .is_some_and(|draft| *index < PROVIDERS.len() && *index != draft.provider),
+            Action::Provider(index) => self.draft.as_ref().is_some_and(|draft| {
+                *index < AUTOMATION_PROVIDERS.len() && *index != draft.provider
+            }),
             Action::Target(index) => self
                 .draft
                 .as_ref()
@@ -1505,7 +1537,15 @@ impl State {
                         self.manual_requests.remove(&firing.automation);
                     }
                     self.notice = Some(format!("Run requested: {}", state_label(firing.state)));
-                    self.history.insert(0, firing);
+                    if let Some(current) = self
+                        .history
+                        .iter_mut()
+                        .find(|current| current.id == firing.id)
+                    {
+                        *current = firing;
+                    } else {
+                        self.history.insert(0, firing);
+                    }
                 }
                 Ok(Response::Removed) => {
                     self.lifecycle = None;
@@ -1695,7 +1735,16 @@ impl State {
             Action::Search(value) => self.search = value,
             Action::New => {
                 self.notice = None;
-                self.draft = Some(Draft::new(&self.targets, &self.accounts, None));
+                let mut draft = Draft::new(&self.targets, &self.accounts, None);
+                // A new automation starts on the first provider still in use.
+                if let Some(index) = AUTOMATION_PROVIDERS
+                    .iter()
+                    .position(|provider| !self.turned_off.contains(provider))
+                    && index != draft.provider
+                {
+                    draft.start_on(index, &self.models);
+                }
+                self.draft = Some(draft);
                 self.run = None;
             }
             Action::Select(id) => {
@@ -1768,7 +1817,7 @@ impl State {
                     }
                 }
             }
-            Action::Provider(index) if index < PROVIDERS.len() => {
+            Action::Provider(index) if index < AUTOMATION_PROVIDERS.len() => {
                 if let Some(draft) = &mut self.draft
                     && draft.provider != index
                 {
@@ -2384,7 +2433,13 @@ impl State {
                 .width(Length::Fill),
             ));
         } else if let Some(draft) = &self.draft {
-            content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
+            content = content.push(draft.view(
+                busy,
+                &self.models,
+                &self.turned_off,
+                self.error.as_deref(),
+                width,
+            ));
         } else {
             if self.run.is_none() {
                 if !self.all_history {
@@ -2896,9 +2951,11 @@ impl Draft {
         &'a self,
         busy: bool,
         models: &'a Models,
+        turned_off: &BTreeSet<Provider>,
         error: Option<&'a str>,
         width: f32,
     ) -> Element<'a, Action> {
+        let offered = self.offered_providers(turned_off);
         let provider_accounts = self
             .accounts
             .iter()
@@ -2919,9 +2976,12 @@ impl Draft {
             .into(),
             crate::design::caption("Provider").into(),
             crate::ui_controls::field::select(
-                PROVIDERS.to_vec(),
-                Some(self.provider),
-                Action::Provider,
+                offered
+                    .iter()
+                    .map(|index| AUTOMATION_PROVIDERS[*index].label())
+                    .collect::<Vec<_>>(),
+                offered.iter().position(|index| *index == self.provider),
+                move |choice| Action::Provider(offered[choice]),
             )
             .into(),
             crate::design::caption("Account").into(),
@@ -3262,7 +3322,9 @@ fn launch_description<'a>(
     let description = format!(
         "Provider: {}\nAccount: {}\nProject: {}\nDirectory: {}\nModel: {}\nReasoning effort: {}\nPermissions: {}\nSession: {}\nSchedule: {} ({})\nRevision: {}",
         provider_index(definition.agent.provider)
-            .map_or(definition.agent.provider.label(), |index| PROVIDERS[index]),
+            .map_or(definition.agent.provider.label(), |index| {
+                AUTOMATION_PROVIDERS[index].label()
+            }),
         account,
         definition.agent.target.repository.display(),
         definition.agent.target.directory.display(),
@@ -3521,9 +3583,15 @@ fn firing_state_label(firing: &Firing) -> String {
     }
 }
 
-/// The providers an automation can run, in the order `PROVIDERS` names them:
+/// The providers an automation can run, in the order the editor lists them:
 /// those with native chat, which every scheduled agent runs as.
-const AUTOMATION_PROVIDERS: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+const AUTOMATION_PROVIDERS: [Provider; 5] = [
+    Provider::Claude,
+    Provider::Codex,
+    Provider::Antigravity,
+    Provider::Muse,
+    Provider::Omp,
+];
 
 fn provider(index: usize) -> Provider {
     AUTOMATION_PROVIDERS
@@ -5906,6 +5974,28 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_offers_providers_in_use_and_the_one_an_automation_is_saved_on() {
+        let index = |provider| provider_index(provider).unwrap();
+        let mut state = State::default();
+        state.set_turned_off(BTreeSet::from([Provider::Claude, Provider::Muse]));
+        state.update(Action::New);
+        let draft = state.draft.as_ref().unwrap();
+        assert_eq!(draft.provider, index(Provider::Codex), "the first in use");
+        assert!(!draft.dirty());
+        let offered = draft.offered_providers(&state.turned_off);
+        assert!(!offered.contains(&index(Provider::Claude)));
+        assert!(!offered.contains(&index(Provider::Muse)));
+
+        let mut saved = automation();
+        saved.definition.agent.provider = Provider::Muse;
+        let mut draft = Draft::new(&[], &[], Some(&saved));
+        draft.provider = index(Provider::Codex);
+        let offered = draft.offered_providers(&state.turned_off);
+        assert!(offered.contains(&index(Provider::Muse)), "the way back");
+        assert!(!offered.contains(&index(Provider::Claude)));
+    }
+
+    #[test]
     fn absent_saved_account_cannot_silently_switch_to_a_default() {
         let selected = automation();
         let claude = account("Only Claude account", Provider::Claude);
@@ -7745,6 +7835,171 @@ mod tests {
             })
         ));
         assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn uncertain_manual_retry_does_not_duplicate_polled_history() {
+        let owner = automation();
+        let mut state = State {
+            selected: Some(owner.clone()),
+            rows: vec![owner.summary(None)],
+            history_status: HistoryStatus::Loaded,
+            ..State::default()
+        };
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::RunNow { request, .. },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("manual request");
+        };
+        let error = "Connection lost after send";
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err(error.into())),
+        });
+        assert_eq!(state.error.as_deref(), Some(error));
+
+        let mut firing = history_firing(100, crate::automations::FiringState::Succeeded);
+        firing.automation = owner.id;
+        firing.revision = owner.execution_revision;
+        firing.trigger = crate::automations::Trigger::Manual { request };
+        firing.finished_ms = Some(200);
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("poll automation");
+        };
+        assert_eq!(id, owner.id);
+        let Some(Effect::Request {
+            sequence,
+            request: Request::History { id, .. },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(Box::new(owner.clone())))),
+        })
+        else {
+            panic!("poll history");
+        };
+        assert_eq!(id, Some(owner.id));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(
+                vec![firing.clone()],
+                false,
+            )))),
+        });
+        assert_eq!(state.history, vec![firing.clone()]);
+        assert_eq!(
+            state.manual_requests.get(&owner.id),
+            Some(&(owner.execution_revision, request))
+        );
+
+        state.update(Action::RunNow);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request:
+                Request::RunNow {
+                    id,
+                    execution_revision,
+                    request: retried,
+                    ..
+                },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("retry original receipt");
+        };
+        assert_eq!(id, owner.id);
+        assert_eq!(execution_revision, owner.execution_revision);
+        assert_eq!(retried, request);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Firing(firing.clone()))),
+        });
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .filter(|row| row.id == firing.id)
+                .count(),
+            1,
+            "one idempotent run must appear only once in history"
+        );
+        assert_eq!(state.history, vec![firing]);
+        assert!(!state.manual_requests.contains_key(&owner.id));
+    }
+
+    #[test]
+    fn manual_firing_receipts_update_in_place_and_prepend_only_new_runs() {
+        use crate::automations::{FiringState, Trigger};
+
+        let owner = automation();
+        let mut firing = history_firing(100, FiringState::Running);
+        firing.automation = owner.id;
+        firing.revision = owner.execution_revision;
+        let Trigger::Manual { request } = firing.trigger else {
+            panic!("manual firing");
+        };
+        let mut newer = history_firing(200, FiringState::Succeeded);
+        newer.automation = owner.id;
+        let mut older = history_firing(50, FiringState::Succeeded);
+        older.automation = owner.id;
+        let next = history_cursor(history_key(&older));
+        let mut state = State {
+            selected: Some(owner.clone()),
+            history: vec![newer.clone(), firing.clone(), older.clone()],
+            history_status: HistoryStatus::Loaded,
+            history_next: Some(next.clone()),
+            history_newer: true,
+            manual_requests: std::collections::BTreeMap::from([(
+                owner.id,
+                (owner.execution_revision, request),
+            )]),
+            ..State::default()
+        };
+        firing.state = FiringState::Succeeded;
+        firing.finished_ms = Some(150);
+        firing.diagnostic = Some("Completed after the last poll".into());
+        for (receipt_index, mut expected) in [
+            (1, vec![newer.clone(), firing.clone(), older.clone()]),
+            (
+                0,
+                vec![
+                    history_firing(300, FiringState::Accepted),
+                    newer,
+                    firing,
+                    older,
+                ],
+            ),
+        ] {
+            state.update(Action::RunNow);
+            let generation = state.confirmation.as_ref().unwrap().generation;
+            let Some(Effect::Request {
+                sequence,
+                request: Request::RunNow { request, .. },
+            }) = state.update(Action::Confirm(generation))
+            else {
+                panic!("confirmed manual run");
+            };
+            let mut receipt = expected[receipt_index].clone();
+            receipt.automation = owner.id;
+            receipt.revision = owner.execution_revision;
+            receipt.trigger = Trigger::Manual { request };
+            expected[receipt_index] = receipt.clone();
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Firing(receipt))),
+            });
+            assert_eq!(state.history, expected);
+            assert_eq!(state.history_next, Some(next.clone()));
+            assert!(state.history_newer);
+            assert!(!state.manual_requests.contains_key(&owner.id));
+        }
     }
 
     #[test]

@@ -102,8 +102,9 @@ const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
 /// over its end, where the slot is. The control is laid over the row
 /// without moving anything, so the slot is reserved at rest as wide as the
 /// control reaches past the row's inset and the gutter before the slot: the
-/// control then covers the slot and never the title or facepile beside it. The indicator keeps its own
-/// column at the slot's end, in line with every other row's.
+/// control then covers the slot and never the title beside it. The
+/// indicator keeps its own column at the slot's end, in line with every
+/// other row's.
 const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
 const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
 /// The project header's hover-revealed commands: disclose, new channel, new
@@ -7500,8 +7501,8 @@ fn header_selection(
 }
 
 /// A project's news that none of the channel and pane rows drawn under it
-/// shows: news of a pane a search leaves out, or of no pane at all. While
-/// checkouts are hidden its header says this, or nobody would.
+/// shows: news of a pane a search leaves out, or of no pane at all. Folder
+/// roots and hidden checkouts need this on their header, or nobody shows it.
 fn undrawn_attention<'a>(
     state: &SidebarState,
     project: ProjectId,
@@ -7548,20 +7549,20 @@ fn project_view<'a>(
     let has_children =
         worktree_count > 0 || !project.channels.is_empty() || !project.cards.is_empty();
     let attention_list = project.state.filter == SidebarFilter::Attention;
-    // Folder roots are their own destination: there is no child worktree row
-    // to display their activity. Expanded roots show only that root's news;
-    // collapsed headers keep the existing aggregate over all children. The
-    // Attention list gives every pane and channel it counts a row of its own,
-    // so an expanded header there repeats none of it. Hidden checkouts give
-    // their panes rows too, so the header says only what none of the rows
-    // drawn does: news of a pane a search leaves out, or of no pane at all.
+    // Collapsed headers keep the aggregate over all children. The Attention
+    // list gives every pane and channel it counts a row of its own, so an
+    // expanded header there repeats none of it. Otherwise an expanded header
+    // says only what none of the rows drawn under it does: a Folder root,
+    // which is its own destination with no row, whatever the checkout
+    // display, and for hidden checkouts news of a pane a search leaves out
+    // or of no pane at all.
     let header_attention = if !expanded {
         project
             .state
             .shown_attention(project.state.project_attention(project_id))
     } else if attention_list {
         AttentionSummary::default()
-    } else if project.state.lists_panes(entity) {
+    } else if project.state.lists_panes(entity) || entity.kind == ProjectKind::Folder {
         undrawn_attention(
             project.state,
             project_id,
@@ -7571,13 +7572,7 @@ fn project_view<'a>(
     } else if !project.state.shows_checkouts(project_id) {
         project.state.project_attention(project_id)
     } else {
-        entity
-            .folder_key()
-            .map_or_else(AttentionSummary::default, |key| {
-                project
-                    .state
-                    .worktree_attention(project_id, key.worktree_id)
-            })
+        AttentionSummary::default()
     };
     let project_identity = project_identity_row(
         entity,
@@ -8006,14 +8001,17 @@ fn compact_project<'a>(
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
     let has_children = !members.is_empty() || !entity.operations.is_empty();
-    // Every row with news is drawn below the chip with its own badges (see
-    // `compact_rail_shows_channel`), so the chip speaks for the whole
-    // project only while none are: repeating them would count the same news
-    // twice. Hidden checkouts leave news to their panes' rows, and the chip
-    // keeps what no drawn row carries, as the expanded header does.
+    // Drawn children carry their own badges, so only an empty group needs
+    // the full project aggregate. In All, a Folder root has no row of its
+    // own and hidden checkouts leave their panes' rows, so the chip keeps
+    // what no drawn channel or pane carries. The Attention list draws every
+    // row it counts, in its main section or In progress, so its chip
+    // repeats none of them, as the expanded header does not.
     let badge = if members.is_empty() {
         Some(project.state.project_attention(entity.id))
-    } else if project.state.lists_panes(entity) {
+    } else if project.state.lists_panes(entity)
+        || (entity.kind == ProjectKind::Folder && project.state.filter == SidebarFilter::All)
+    {
         Some(undrawn_attention(
             project.state,
             entity.id,
@@ -8275,38 +8273,6 @@ pub(crate) fn workspace_mark<Message: 'static>(
         .into()
 }
 
-/// A channel's name followed by the facepile of the members after its lead,
-/// sharing the slot as they do in the channel's expanded sidebar row, so the
-/// workspace switcher shows who is in a channel as the sidebar does.
-/// `title` draws the name in body text at the width it is given; `face_id`
-/// names each face. `None` when there is no pile to show, and the name
-/// stands alone.
-pub(crate) fn channel_name_with_company<'a, Message: 'static>(
-    channel: &SidebarChannel,
-    name: &'a str,
-    ink: RowInk,
-    title: impl Fn(f32) -> Element<'a, Message> + 'a,
-    face_id: impl Fn(usize) -> Id + 'a,
-) -> Option<Element<'a, Message>> {
-    let (font, _) = search_label_fonts(false);
-    let pile = channel_pile(channel)?;
-    Some(pile.beside(
-        ink,
-        move || search_spans_width(name, "", design::TEXT_BODY, font, font),
-        title,
-        face_id,
-    ))
-}
-
-/// The facepile of the members after a channel's lead, with its counts
-/// measured; `None` when there is nobody to show after it.
-fn channel_pile(channel: &SidebarChannel) -> Option<members::Pile> {
-    let (font, _) = search_label_fonts(false);
-    members::Pile::new(&channel.members, |label| {
-        search_spans_width(label, "", design::TEXT_CAPTION, font, font)
-    })
-}
-
 /// Any other glyph that stands in a row's glyph column, in the row's `ink`.
 fn ink_glyph<'a, Message: 'a>(
     icon: widget::icon::Handle,
@@ -8538,11 +8504,17 @@ fn channel_view(
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
-        let label = channel_label(channel, query, ink, has_members);
+        let label = search_label(
+            &channel.title,
+            query,
+            CHILD_ROW_TEXT_SIZE,
+            ink.text_class(),
+            false,
+        );
         let indicator = match deletion {
             Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-            // The mark and the facepile after the title show who is there,
-            // and the tooltip lists them, so the row's end keeps to news.
+            // The mark and its badge show who is there, and the tooltip
+            // lists them, so the row's end keeps to news.
             _ if has_members => attention_indicator(attention),
             _ => channel_indicator(attention, channel.chats),
         };
@@ -8609,64 +8581,6 @@ fn channel_view(
         channel.id,
         !inert,
     )
-}
-
-/// A channel row's title, followed by the facepile of the members after its
-/// lead when there are any.
-///
-/// The title keeps priority; see [`members::Pile::fit`] for how the two
-/// share the row. Both are measured once per build of the row, not on every
-/// layout. The row's delete button covers its end rather than narrowing it,
-/// so the title and the pile are laid out across the same width whether the
-/// pointer is over the row or not, and neither moves when it enters.
-fn channel_label(
-    channel: &SidebarChannel,
-    query: &str,
-    ink: RowInk,
-    has_members: bool,
-) -> Element<'static, SidebarAction> {
-    let (font, emphasis) = search_label_fonts(false);
-    let pile = has_members.then(|| channel_pile(channel)).flatten();
-    let Some(pile) = pile else {
-        return search_label(
-            &channel.title,
-            query,
-            CHILD_ROW_TEXT_SIZE,
-            ink.text_class(),
-            false,
-        );
-    };
-    let text = std::rc::Rc::new((channel.title.clone(), query.to_owned()));
-    let measured = text.clone();
-    let channel_id = channel.id;
-    pile.beside(
-        ink,
-        move || {
-            search_spans_width(
-                &measured.0,
-                &measured.1,
-                CHILD_ROW_TEXT_SIZE,
-                font,
-                emphasis,
-            )
-        },
-        move |width| {
-            search_label_within(
-                &text.0,
-                &text.1,
-                CHILD_ROW_TEXT_SIZE,
-                ink.text_class(),
-                false,
-                Length::Fixed(width),
-            )
-        },
-        move |index| channel_face_id(channel_id, index),
-    )
-}
-
-/// The face at `index` in a channel row's facepile.
-fn channel_face_id(channel: ChannelId, index: usize) -> Id {
-    entity_id("channel.face", format_args!("{channel}.{index}"))
 }
 
 /// A child row's leading glyph, in the row's tone.
@@ -12576,9 +12490,12 @@ fn panel_row<'a>(
 /// The confirmation the application mounts before any discard runs.
 ///
 /// It lives here so the copy, the counted paths, and the confirmed request all
-/// come from the surface that raised the intent; `app.rs` only decides where
-/// to put it.
-pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_, SidebarAction> {
+/// come from the surface that raised the intent; the application mounting it
+/// decides only where to put it and which `surface_id` identifies it.
+pub fn discard_confirmation_dialog(
+    pending: &DiscardConfirmation,
+    surface_id: Id,
+) -> Element<'_, SidebarAction> {
     let tracked = pending.tracked_count();
     let untracked = pending.untracked_count();
     let mut detail = Vec::with_capacity(2);
@@ -12594,8 +12511,8 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             if untracked == 1 { "file" } else { "files" }
         ));
     }
-    crate::app::dialog_ui::confirmation_surface(
-        crate::app::dialog_ui::Question::DiscardChanges,
+    crate::dialog_ui::confirmation_surface(
+        surface_id,
         widget::column::with_children(vec![
             design::title("Discard changes?").into(),
             design::body(detail.join(". "))
@@ -12604,7 +12521,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             design::caption("Discarded work is not recoverable from Git.").into(),
         ])
         .spacing(space::M),
-        crate::app::dialog_ui::confirmation_actions(
+        crate::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(discard_cancel_id())
                 .on_press(SidebarAction::CancelDiscard),
@@ -13101,22 +13018,23 @@ fn navigation_search_ranks(
 }
 
 /// The rail has room only for rows worth a glance: a search's matches, where
-/// the user is, news, live agents, deletions, and rows the Attention list
-/// keeps in place. A worktree with open panes counts as where the user is: the
-/// rail is how they switch back to it. Drawing and keyboard order both ask
-/// this, so the two cannot disagree about which rows exist.
+/// the user is, what the Attention list holds (news, and an agent a usage
+/// limit still stops after its news is read), live agents, deletions, and
+/// rows the Attention list keeps in place. Drawing and keyboard order both
+/// ask this, so the two cannot disagree about which rows exist.
 fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) -> bool {
     // The Attention list holds only channels worth a glance.
     state.filter == SidebarFilter::Attention
         || compact_rail_searching(state)
         || channel.selected
-        || channel.unread
+        || channel.needs_attention()
         || channel.activity.is_some()
         || channel.deletion.is_some()
         || state.retained_in_attention(SelectionRow::Channel(channel.id))
 }
 
-/// [`compact_rail_shows_channel`], for a worktree.
+/// [`compact_rail_shows_channel`], for a worktree. A worktree with open panes
+/// counts as where the user is: the rail is how they switch back to it.
 fn compact_rail_shows_worktree(
     state: &SidebarState,
     project: ProjectId,
@@ -13707,20 +13625,6 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
-    search_label_within(label, query, size, class, heading, Length::Fill)
-}
-
-/// [`search_label`] at `width` rather than filling its slot. The label sets
-/// its own width rather than taking a container's, which would draw its
-/// text in the container's colour instead of the row's.
-fn search_label_within(
-    label: &str,
-    query: &str,
-    size: f32,
-    class: theme::Text,
-    heading: bool,
-    width: Length,
-) -> Element<'static, SidebarAction> {
     let (font, emphasis) = search_label_fonts(heading);
     let highlights = search_highlight_ranges(label, query);
     if highlights.is_empty() {
@@ -13732,7 +13636,7 @@ fn search_label_within(
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
             ))
-            .width(width)
+            .width(Length::Fill)
             .into();
     }
     let label = label.to_owned();
@@ -13769,7 +13673,7 @@ fn search_label_within(
         .clip(true)
         .into()
     })
-    .width(width)
+    .width(Length::Fill)
     // As tall as its text, so a highlighted title sits on the same pixel
     // row as a plain one rather than blurred between two.
     .height(Length::Shrink)
@@ -13938,16 +13842,18 @@ mod row_interaction {
     use cosmic::{Element, Renderer, Theme};
     use std::{cell::Cell, rc::Rc};
 
-    /// Whether a row scrolled out of the list's view can let `event` pass it
-    /// by. These are what every widget in the window receives on each frame
-    /// or message: a redraw, the runtime's resize request, and pointer
-    /// motion. A row out of view can't be under the pointer, and either isn't
-    /// drawn or, as a member passing under its group's pinned header, is
-    /// drawn hidden by it. Whatever its widgets would note from these, such as
-    /// their hover status, they note from the redraw that precedes their next
-    /// visible draw. Keys, modifier changes, presses and releases still reach
-    /// every row, since a focused or pressed row may be scrolled away.
-    fn unseen_rows_may_skip(event: &Event) -> bool {
+    /// Whether `event` is one every widget in the window receives on each
+    /// frame or message: a redraw, the runtime's resize request, or pointer
+    /// motion. None of these moves focus.
+    ///
+    /// A row scrolled out of the list's view can let these pass it by. It
+    /// can't be under the pointer, and either isn't drawn or, as a member
+    /// passing under its group's pinned header, is drawn hidden by it.
+    /// Whatever its widgets would note from these, such as their hover
+    /// status, they note from the redraw that precedes their next visible
+    /// draw. Keys, modifier changes, presses and releases still reach every
+    /// row, since a focused or pressed row may be scrolled away.
+    fn routine(event: &Event) -> bool {
         matches!(
             event,
             Event::Window(window::Event::RedrawRequested(_))
@@ -14069,7 +13975,9 @@ mod row_interaction {
     #[derive(Default)]
     struct State {
         modifiers: keyboard::Modifiers,
-        selection_bounds: Option<Rectangle>,
+        /// Where the row's own target sits, relative to the row, so that it
+        /// follows the row when a pinned header or the list moves it.
+        selection_area: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
         dragging: bool,
         drop: Option<(Option<super::SelectionRow>, f32)>,
@@ -14078,6 +13986,11 @@ mod row_interaction {
         /// Whether any control in the row has focus, such as its delete
         /// button, not only the row's own target.
         focus_within: bool,
+        /// Whether `focused`, `focus_within` and `selection_area` are
+        /// current: they are found again after each event that may move
+        /// focus and each operation, and lapse when the row is rebuilt or
+        /// laid out again.
+        focus_known: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
         /// Whether something in the row, such as a menu, was open the last
@@ -14085,6 +13998,14 @@ mod row_interaction {
         overlaid: Cell<bool>,
         header_node: Option<layout::Node>,
         scroll: Option<Box<FilterScrollState>>,
+    }
+
+    impl State {
+        /// Where the row's own target is drawn in `layout`.
+        fn selection_bounds(&self, layout: Layout<'_>) -> Option<Rectangle> {
+            self.selection_area
+                .map(|area| area + (layout.position() - Point::ORIGIN))
+        }
     }
 
     struct FilterScrollState {
@@ -14271,8 +14192,11 @@ mod row_interaction {
             }
             let state = tree.state.downcast_mut::<State>();
             state.focused = focus.0;
-            state.selection_bounds = focus.2;
+            state.selection_area = focus
+                .2
+                .map(|bounds| bounds - (layout.position() - Point::ORIGIN));
             state.focus_within = focus.3;
+            state.focus_known = true;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -14396,6 +14320,7 @@ mod row_interaction {
                 }
             }
             tree.diff_children(&mut self.children);
+            tree.state.downcast_mut::<State>().focus_known = false;
             if let Kind::Reorder {
                 ids,
                 disabled,
@@ -14428,6 +14353,8 @@ mod row_interaction {
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
+            // Where the row's target sits may change with the layout.
+            tree.state.downcast_mut::<State>().focus_known = false;
             // Overlay controls are on screen only while the row is hovered or
             // focused, so only then does the base row lose the width they
             // cover. Every other frame the title is measured against the whole
@@ -14560,7 +14487,7 @@ mod row_interaction {
             viewport: &Rectangle,
         ) {
             // Without this, every frame and every message walks each of a
-            // long list's rows and their focus, however few are in view. A
+            // long list's rows, however few are in view. A
             // row that last saw the pointer, or that a drag started in, still
             // hears the event that tells it the pointer has gone. A row with
             // focus anywhere in it keeps every frame: its focused control may
@@ -14573,17 +14500,22 @@ mod row_interaction {
             // So does a row whose tooltip or menu is still on screen: a
             // tooltip fades out over the frames after the pointer leaves, and
             // would stay frozen there without them.
+            let routine = routine(event);
             let state = tree.state.downcast_ref::<State>();
             if !layout.bounds().intersects(viewport)
                 && !state.hovered
                 && !state.focus_within
                 && !state.overlaid.get()
                 && state.origin.is_none()
-                && unseen_rows_may_skip(event)
+                && routine
             {
                 return;
             }
-            self.focus(tree, layout, renderer);
+            // Finding focus walks the row's controls, so a frame that moves
+            // no focus relies on what the last event or operation found.
+            if !routine || !state.focus_known {
+                self.focus(tree, layout, renderer);
+            }
             if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
@@ -14660,7 +14592,7 @@ mod row_interaction {
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                         if hovered
                             && state
-                                .selection_bounds
+                                .selection_bounds(layout)
                                 .is_some_and(|bounds| cursor.is_over(bounds)) =>
                     {
                         // A plain click is navigation: the row's own button
@@ -14918,10 +14850,12 @@ mod row_interaction {
                     break;
                 }
             }
-            let focused = tree.state.downcast_ref::<State>().focused;
-            self.focus(tree, layout, renderer);
-            if reserves && tree.state.downcast_ref::<State>().focused != focused {
-                shell.invalidate_layout();
+            if !routine {
+                let focused = tree.state.downcast_ref::<State>().focused;
+                self.focus(tree, layout, renderer);
+                if reserves && tree.state.downcast_ref::<State>().focused != focused {
+                    shell.invalidate_layout();
+                }
             }
         }
 
@@ -15077,7 +15011,7 @@ mod row_interaction {
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
                 // The row's own button, not the indented slot around it, so
                 // the mark lines up with the active row's highlight.
-                let bounds = state.selection_bounds.unwrap_or(layout.bounds());
+                let bounds = state.selection_bounds(layout).unwrap_or(layout.bounds());
                 if let Some(clip) = bounds.intersection(viewport) {
                     renderer.with_layer(clip, |renderer| {
                         renderer.fill_quad(

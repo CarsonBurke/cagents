@@ -60,12 +60,36 @@ impl HostState {
         id: TerminalId,
         after: u64,
     ) {
+        // Replay suppression carries no finite client cursor. Rebase above
+        // both departed views and still-connected views: the replacement
+        // connection can attach before the old socket unregisters.
+        let after = if after == crate::terminal_ipc::SUPPRESS_GRID_REPLAY {
+            let retained = self
+                .terminals
+                .get(&id)
+                .map_or(0, |record| record.presentation_watermark);
+            self.subscriptions
+                .viewports
+                .iter()
+                .filter(|((_, terminal), _)| *terminal == id)
+                .map(|(_, view)| view.revision)
+                .fold(retained, u64::max)
+        } else {
+            after
+        };
         let view = self
             .subscriptions
             .viewports
             .entry((client, id))
             .or_default();
         view.revision = view.revision.max(after.saturating_add(1));
+    }
+    pub(super) fn retain_presentation_watermark(&mut self, client: ClientId, id: TerminalId) {
+        if let Some(view) = self.subscriptions.viewports.get(&(client, id))
+            && let Some(record) = self.terminals.get_mut(&id)
+        {
+            record.presentation_watermark = record.presentation_watermark.max(view.revision);
+        }
     }
     pub(in crate::host) fn scroll_client(
         &mut self,
@@ -227,6 +251,40 @@ impl HostState {
     }
 }
 
+/// Validates a capture taken outside the lock, once the lock is held again.
+/// `Ok(None)` asks the caller to capture again. Like `plan_redraw`, this checks
+/// worker identity under the lock: a same-ID replacement can reattach the
+/// client at epoch 0, which the epoch and generation checks alone would accept.
+pub(super) fn accept_pulled_capture(
+    state: &mut HostState,
+    client: ClientId,
+    id: TerminalId,
+    handle: &TerminalHandle,
+    epoch: u64,
+    source: u64,
+) -> Result<Option<u64>, ProtocolError> {
+    if !state.subscriptions.attached(client, id) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PermissionDenied,
+            "client detached during capture",
+            false,
+        ));
+    }
+    if !state
+        .terminals
+        .get(&id)
+        .is_some_and(|record| record.handle.same_worker(handle))
+    {
+        return Ok(None);
+    }
+    let revision = state.presentation_observed(client, id, source);
+    let view = &state.subscriptions.viewports[&(client, id)];
+    if view.epoch != epoch || view.source_generation > source {
+        return Ok(None);
+    }
+    Ok(Some(revision))
+}
+
 /// Worker queries wait outside the host mutex: a worker's publication callback
 /// may itself acquire that mutex. This also keeps unrelated sessions responsive.
 pub(in crate::host) fn snapshot(
@@ -261,19 +319,11 @@ pub(in crate::host) fn snapshot(
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.subscriptions.attached(client, id) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                "client detached during capture",
-                false,
-            ));
-        }
         let source = capture.generation;
-        let revision = state.presentation_observed(client, id, source);
-        let view = &state.subscriptions.viewports[&(client, id)];
-        if view.epoch != epoch || view.source_generation > source {
+        let Some(revision) = accept_pulled_capture(&mut state, client, id, &handle, epoch, source)?
+        else {
             continue;
-        }
+        };
         let mut capture = (*capture).clone();
         capture.generation = revision;
         let (capture, wire) = match state.subscriptions.last_sent(client, id) {
@@ -310,6 +360,84 @@ pub(in crate::host) fn snapshot(
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe};
+
+    #[derive(Default)]
+    struct ReadTimings {
+        capture_time: Duration,
+        slowest_capture: Option<(usize, ClientId, Duration)>,
+        sleep_time: Duration,
+    }
+
+    impl ReadTimings {
+        fn record_capture(&mut self, round: usize, client: ClientId, elapsed: Duration) {
+            self.capture_time += elapsed;
+            if self
+                .slowest_capture
+                .is_none_or(|(_, _, slowest)| elapsed > slowest)
+            {
+                self.slowest_capture = Some((round, client, elapsed));
+            }
+        }
+
+        fn record_sleep(&mut self, elapsed: Duration) {
+            self.sleep_time += elapsed;
+        }
+    }
+
+    impl std::fmt::Display for ReadTimings {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "total capture time: {:?}; slowest capture: ",
+                self.capture_time
+            )?;
+            if let Some((round, client, elapsed)) = self.slowest_capture {
+                write!(f, "round {round}, client {client}, {elapsed:?}")?;
+            } else {
+                write!(f, "none")?;
+            }
+            write!(
+                f,
+                "; total sleep time: {:?} (requested 150ms)",
+                self.sleep_time
+            )?;
+
+            let loadavg = std::fs::read_to_string("/proc/loadavg")
+                .unwrap_or_else(|e| format!("unavailable: {e}"));
+            let loadavg = if loadavg.starts_with("unavailable: ") {
+                loadavg
+            } else {
+                loadavg
+                    .split_whitespace()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let cpu_pressure = std::fs::read_to_string("/proc/pressure/cpu")
+                .unwrap_or_else(|e| format!("unavailable: {e}"));
+            let cpu_pressure = cpu_pressure
+                .lines()
+                .find(|line| line.starts_with("some "))
+                .unwrap_or(cpu_pressure.trim());
+            write!(f, "; loadavg: {loadavg}; CPU pressure: {cpu_pressure}")
+        }
+    }
+
+    #[test]
+    fn read_timings_report_names_the_slowest_capture() {
+        let mut timings = ReadTimings::default();
+        timings.record_capture(1, 1, Duration::from_millis(4));
+        timings.record_capture(2, 2, Duration::from_millis(8));
+        timings.record_capture(3, 1, Duration::from_millis(2));
+        timings.record_sleep(Duration::from_millis(5));
+        timings.record_sleep(Duration::from_millis(7));
+
+        let report = timings.to_string();
+        assert!(report.contains("total capture time: 14ms"));
+        assert!(report.contains("slowest capture: round 2, client 2, 8ms"));
+        assert!(report.contains("total sleep time: 12ms (requested 150ms)"));
+    }
+
     fn fixture() -> (SharedHost, TerminalHandle, TerminalId, tempfile::TempDir) {
         fixture_with(
             r#"i=1; while [ $i -le 100 ]; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); done; exec sleep 600"#,
@@ -638,17 +766,23 @@ mod tests {
                 .scroll_client(1, id, crate::terminal::ipc::TerminalScroll::Top)
                 .unwrap();
         }
+        let mut timings = ReadTimings::default();
         let started = Instant::now();
-        for _ in 0..30 {
+        for round in 0..30 {
             for client in [1, 2] {
-                assert!(snapshot(&host, client, id, 0).unwrap().is_some());
+                let capture_started = Instant::now();
+                let capture = snapshot(&host, client, id, 0);
+                timings.record_capture(round, client, capture_started.elapsed());
+                assert!(capture.unwrap().is_some());
             }
+            let sleep_started = Instant::now();
             thread::sleep(Duration::from_millis(5));
+            timings.record_sleep(sleep_started.elapsed());
         }
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(3),
-            "60 viewport reads took {elapsed:?}"
+            "60 viewport reads took {elapsed:?}; {timings}"
         );
         handle.shutdown().unwrap();
     }

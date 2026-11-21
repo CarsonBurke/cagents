@@ -423,11 +423,7 @@ fn begin_history() -> (tempfile::TempDir, Cagents, Scope, Task<Message>) {
     drop(app.update(Message::ResumeConversation(
         crate::app::resume_ui::Action::Indexed(
             1,
-            crate::app::resume_ui::Progress::Saved {
-                entries: vec![entry.clone()],
-                seeds: Arc::from([]),
-                error: None,
-            },
+            crate::app::resume_ui::Progress::saved(vec![entry.clone()], Vec::new()),
         ),
     )));
     let task = app.update(Message::ResumeConversation(

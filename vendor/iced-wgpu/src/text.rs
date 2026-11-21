@@ -305,9 +305,117 @@ impl Pipeline {
 #[derive(Default)]
 pub struct State {
     renderers: Vec<cryoglyph::TextRenderer>,
+    /// What each of `renderers` last prepared, while it may be reused.
+    prepared: Vec<Option<Prepared>>,
     prepare_layer: usize,
     cache: BufferCache,
     storage: Storage,
+}
+
+/// The inputs of a group's last `prepare`. A frame that draws the same group
+/// again, such as one that only turns a spinner elsewhere, reuses its glyphs
+/// instead of walking every glyph of its text again.
+struct Prepared {
+    text: Vec<Text>,
+    bounds: Rectangle,
+    transformation: Transformation,
+    resolution: cryoglyph::Resolution,
+    /// The shaped cached text it drew, kept while the group is reused.
+    cached: Vec<text_cache::KeyHash>,
+}
+
+impl Prepared {
+    fn matches(
+        &self,
+        text: &[Text],
+        bounds: Rectangle,
+        transformation: Transformation,
+        resolution: cryoglyph::Resolution,
+    ) -> bool {
+        self.bounds == bounds
+            && self.transformation == transformation
+            && self.resolution == resolution
+            && self.text.len() == text.len()
+            && self
+                .text
+                .iter()
+                .zip(text)
+                .all(|(old, new)| same_text(old, new))
+    }
+}
+
+/// Whether `new` draws exactly what `old` drew. Paragraphs, editors and raw
+/// buffers are compared by identity: they are replaced rather than changed in
+/// place while a frame refers to them.
+fn same_text(old: &Text, new: &Text) -> bool {
+    match (old, new) {
+        (
+            Text::Paragraph {
+                paragraph: old,
+                position: old_position,
+                color: old_color,
+                clip_bounds: old_clip,
+                transformation: old_transformation,
+            },
+            Text::Paragraph {
+                paragraph: new,
+                position,
+                color,
+                clip_bounds,
+                transformation,
+            },
+        ) => {
+            new.is_same_live(old)
+                && (old_position, old_color, old_clip, old_transformation)
+                    == (position, color, clip_bounds, transformation)
+        }
+        (
+            Text::Editor {
+                editor: old,
+                position: old_position,
+                color: old_color,
+                clip_bounds: old_clip,
+                transformation: old_transformation,
+            },
+            Text::Editor {
+                editor: new,
+                position,
+                color,
+                clip_bounds,
+                transformation,
+            },
+        ) => {
+            new.is_same_live(old)
+                && (old_position, old_color, old_clip, old_transformation)
+                    == (position, color, clip_bounds, transformation)
+        }
+        (Text::Cached { .. }, Text::Cached { .. }) => old == new,
+        (
+            Text::Raw {
+                raw: old,
+                transformation: old_transformation,
+            },
+            Text::Raw {
+                raw: new,
+                transformation,
+            },
+        ) => {
+            new.buffer.strong_count() > 0
+                && sync::Weak::ptr_eq(&old.buffer, &new.buffer)
+                && (
+                    old.position,
+                    old.color,
+                    old.clip_bounds,
+                    old_transformation,
+                ) == (
+                    new.position,
+                    new.color,
+                    new.clip_bounds,
+                    transformation,
+                )
+        }
+        _ => false,
+    }
 }
 
 impl State {
@@ -341,10 +449,35 @@ impl State {
                             wgpu::MultisampleState::default(),
                             None,
                         ));
+                        self.prepared.push(None);
                     }
 
                     let renderer = &mut self.renderers[self.prepare_layer];
-                    let result = prepare(
+                    let prepared = &mut self.prepared[self.prepare_layer];
+                    let bounds = layer_bounds * layer_transformation;
+                    let transformation = layer_transformation * *transformation;
+                    let resolution = viewport.0.resolution();
+
+                    if let Some(prepared) =
+                        prepared.as_ref().filter(|prepared| {
+                            prepared.matches(
+                                text,
+                                bounds,
+                                transformation,
+                                resolution,
+                            )
+                        })
+                        && renderer.reuse(&mut atlas)
+                    {
+                        for &key in &prepared.cached {
+                            self.cache.keep(key);
+                        }
+
+                        self.prepare_layer += 1;
+                        continue;
+                    }
+
+                    match prepare(
                         device,
                         queue,
                         &viewport.0,
@@ -353,15 +486,23 @@ impl State {
                         &mut atlas,
                         &mut self.cache,
                         text,
-                        layer_bounds * layer_transformation,
-                        layer_transformation * *transformation,
-                    );
+                        bounds,
+                        transformation,
+                    ) {
+                        Ok(cached) => {
+                            *prepared = Some(Prepared {
+                                text: text.clone(),
+                                bounds,
+                                transformation,
+                                resolution,
+                                cached,
+                            });
 
-                    match result {
-                        Ok(()) => {
                             self.prepare_layer += 1;
                         }
                         Err(cryoglyph::PrepareError::AtlasFull) => {
+                            *prepared = None;
+
                             // If the atlas cannot grow, then all bets are off.
                             // Instead of panicking, we will just pray that the result
                             // will be somewhat readable...
@@ -436,6 +577,11 @@ impl State {
         self.cache.trim();
         self.storage.trim();
 
+        // Release what renderers left unused this frame last prepared.
+        for prepared in &mut self.prepared[self.prepare_layer..] {
+            *prepared = None;
+        }
+
         self.prepare_layer = 0;
     }
 }
@@ -451,7 +597,7 @@ fn prepare(
     sections: &[Text],
     layer_bounds: Rectangle,
     layer_transformation: Transformation,
-) -> Result<(), cryoglyph::PrepareError> {
+) -> Result<Vec<text_cache::KeyHash>, cryoglyph::PrepareError> {
     let mut font_system = font_system().write().expect("Write font system");
     let font_system = font_system.raw();
 
@@ -500,6 +646,14 @@ fn prepare(
                 Some(Allocation::Cache(key))
             }
             Text::Raw { raw, .. } => raw.buffer.upgrade().map(Allocation::Raw),
+        })
+        .collect();
+
+    let cached = allocations
+        .iter()
+        .filter_map(|allocation| match allocation {
+            Some(Allocation::Cache(key)) => Some(*key),
+            _ => None,
         })
         .collect();
 
@@ -636,14 +790,16 @@ fn prepare(
         },
     );
 
-    renderer.prepare(
-        device,
-        queue,
-        encoder,
-        font_system,
-        atlas,
-        viewport,
-        text_areas,
-        &mut cryoglyph::SwashCache::new(),
-    )
+    renderer
+        .prepare(
+            device,
+            queue,
+            encoder,
+            font_system,
+            atlas,
+            viewport,
+            text_areas,
+            &mut cryoglyph::SwashCache::new(),
+        )
+        .map(|()| cached)
 }

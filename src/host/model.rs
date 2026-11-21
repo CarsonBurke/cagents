@@ -33,6 +33,8 @@ pub(super) use automation_attention::AutomationAttentionReceipt;
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
+#[cfg(test)]
+mod channel_replay_tests;
 mod channel_retirement;
 pub(super) use automations::Claimed;
 pub(super) mod console_relaunch;
@@ -66,7 +68,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 28;
+const SCHEMA_VERSION: u32 = 29;
 
 /// Wait for another connection's writer rather than failing at admission.
 /// Read-then-write transactions must start immediate so SQLite can use this
@@ -532,7 +534,8 @@ impl Registry {
                 let key = repository_key(repository)?;
                 let exists: bool = transaction
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?1)",
+                        "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?1 \
+                         UNION ALL SELECT 1 FROM deleted_channels WHERE id = ?1)",
                         params![id.to_string()],
                         |row| row.get(0),
                     )
@@ -611,6 +614,16 @@ impl Registry {
             }
             ModelEdit::DeleteChannel { id } => {
                 views::record_channel_removal(&transaction, *id, &mut recorder)?;
+                // A lost creation reply can be retried after this deletion.
+                // Keep its identity independently of the project and live row;
+                // automatic empty-channel retirement still permits revival.
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO deleted_channels(id) \
+                         SELECT id FROM channels WHERE id = ?1",
+                        params![id.to_string()],
+                    )
+                    .map_err(|error| error.to_string())?;
                 transaction
                     .execute(
                         "DELETE FROM channels WHERE id = ?1",
@@ -1103,6 +1116,11 @@ fn migrate_through(
     if version < 28 && target >= 28 {
         pane_chat_starts::migrate(tx)?;
         schema::migration_checkpoint(28)?;
+    }
+    if version < 29 && target >= 29 {
+        tx.execute_batch("CREATE TABLE deleted_channels(id TEXT PRIMARY KEY) STRICT;")
+            .map_err(|error| error.to_string())?;
+        schema::migration_checkpoint(29)?;
     }
     Ok(())
 }
@@ -1645,7 +1663,8 @@ mod tests {
         let legacy = Connection::open(&path).unwrap();
         legacy
             .execute_batch(
-                "DROP TABLE pane_chat_allocations;
+                "DROP TABLE deleted_channels;
+                 DROP TABLE pane_chat_allocations;
                  DROP TABLE pane_chat_starts;
                  DROP TABLE terminal_pane_bindings;
                  DROP TRIGGER session_channel_insert;

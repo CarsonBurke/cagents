@@ -4,6 +4,26 @@ use crate::workspace_model::views::{Change, TerminalRemovalBasis};
 
 const CAPACITY: usize = 8192;
 
+/// Whether `before` names the chat `record` holds: as it was started, or
+/// with the conversation its provider has named since. A new conversation
+/// learns its provider's ID only after it starts; the window records that ID
+/// on its pane, and a Close sent from that pane names it.
+fn removes_resident_chat(
+    before: &crate::workspace_model::views::Pane,
+    record: &super::super::chat::Record,
+) -> bool {
+    let holds = |session: crate::chat::Session| {
+        crate::workspace_model::views::same_removal_source(
+            before,
+            &crate::workspace_model::views::Pane {
+                kind: crate::model::CardKind::Chat(session),
+                ..before.clone()
+            },
+        )
+    };
+    holds(record.session.clone()) || holds(record.current_session())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11,6 +31,99 @@ mod tests {
         model::{BootId, CardId, CardKind, HostIncarnation, HostSessionId, LaunchRecipe},
         workspace_model::views::{Pane, Scope},
     };
+
+    /// A new conversation learns its provider's ID after it starts, and the
+    /// window's Close names it; that is still the chat the daemon holds.
+    #[test]
+    fn a_chat_closes_after_its_provider_names_its_conversation() {
+        let mut state = HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("removal-fixture"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        });
+        let started = crate::chat::Session {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            proof: None,
+            terminal: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Muse,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "/bin/true".into(),
+                    arguments: vec![],
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+        };
+        let (handle, _) = crate::chat::runtime::Handle::fixture_remote_attachment_pair();
+        state.chats.insert(
+            started.id,
+            crate::host::chat::Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: started.clone(),
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: Default::default(),
+                observations: Default::default(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let close = |session: &crate::chat::Session| ModelEdit::ChangeView {
+            scope: Scope::Worktree {
+                repository: "/fixture".into(),
+                path: "/fixture".into(),
+            },
+            expected_revision: 1,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::RemoveSource {
+                registry: uuid::Uuid::new_v4(),
+                repository: "/fixture".into(),
+                before: Pane {
+                    id: CardId::new(),
+                    title: "quiet-heron".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 0.5,
+                    scope: None,
+                    kind: CardKind::Chat(session.clone()),
+                },
+                terminal: None,
+                capture: None,
+            },
+        };
+        let mut named = started.clone();
+        named.launch.session_id = Some("conversation".into());
+        // Before the provider names it, only the chat as started is held.
+        assert!(state.validate_view_removal(&close(&started)).is_ok());
+        assert!(state.validate_view_removal(&close(&named)).is_err());
+
+        handle.fixture_publish_session("conversation".into());
+        assert!(state.validate_view_removal(&close(&named)).is_ok());
+        // Its native cleanup records the name too, so that a pending
+        // cleanup does not refuse this Close. A source an upgrade left
+        // under the same ID names an older identity and keeps its own.
+        let record = &state.chats[&started.id];
+        assert_eq!(
+            record.names(&started).launch.session_id.as_deref(),
+            Some("conversation")
+        );
+        let mut alias = started.clone();
+        alias.launch.recipe.program = "/bin/false".into();
+        assert_eq!(record.names(&alias), alias);
+        // A Close the window sent before it learned the name still holds.
+        assert!(state.validate_view_removal(&close(&started)).is_ok());
+        // Another conversation is not this chat.
+        let mut other = started.clone();
+        other.launch.session_id = Some("another".into());
+        assert!(state.validate_view_removal(&close(&other)).is_err());
+    }
 
     #[test]
     fn evicted_publication_cannot_restore_an_old_absence_stamp() {
@@ -253,14 +366,10 @@ impl HostState {
                 {
                     return Err(conflict());
                 }
-                if let Some(record) = self.chats.get(&source.id) {
-                    let current = crate::workspace_model::views::Pane {
-                        kind: crate::model::CardKind::Chat(record.session.clone()),
-                        ..before.clone()
-                    };
-                    if !crate::workspace_model::views::same_removal_source(before, &current) {
-                        return Err(conflict());
-                    }
+                if let Some(record) = self.chats.get(&source.id)
+                    && !removes_resident_chat(before, record)
+                {
+                    return Err(conflict());
                 }
             }
             return if terminal.is_none() {

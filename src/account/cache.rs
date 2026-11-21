@@ -46,6 +46,8 @@ const ORPHAN_AFTER: u64 = 7 * 24 * 3_600_000;
 pub struct Entry {
     pub identity: Option<Identity>,
     pub snapshot: UsageSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_observed_at: Option<u64>,
 }
 
 /// The models a provider last listed.
@@ -610,8 +612,42 @@ mod tests {
                 plan: Some("max".into()),
                 disputed_by: None,
             }),
+            inventory_observed_at: Some(snapshot.observed_at),
             snapshot,
         }
+    }
+
+    #[test]
+    fn an_entry_without_an_inventory_stamp_reads_as_none() {
+        let expected = entry(20, "legacy cache");
+        let document = serde_json::json!({
+            "version": VERSION,
+            "entries": {"claude:/fixture": {
+                "identity": expected.identity,
+                "snapshot": expected.snapshot,
+            }},
+        });
+        let decoded: Document = serde_json::from_value(document).unwrap();
+        let restored = &decoded.entries["claude:/fixture"];
+        assert_eq!(restored.inventory_observed_at, None);
+        assert_eq!(restored.snapshot, expected.snapshot);
+        assert_eq!(restored.identity, expected.identity);
+        assert!(
+            serde_json::to_value(restored)
+                .unwrap()
+                .get("inventory_observed_at")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_entry_round_trips_its_inventory_stamp_separately_from_its_figures() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let mut expected = entry(20, "live figures");
+        expected.inventory_observed_at = Some(10);
+        cache.store("claude:/fixture", expected.clone()).unwrap();
+        assert_eq!(cache.load(100).remove("claude:/fixture"), Some(expected));
     }
 
     #[test]

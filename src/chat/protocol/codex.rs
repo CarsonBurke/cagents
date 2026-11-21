@@ -551,6 +551,7 @@ fn create_inner(
             is_child: false,
             child_failure: None,
             child_buffer: BTreeMap::new(),
+            waiting_child_resumes: BTreeMap::new(),
             turn_diffs: BTreeMap::new(),
             repo_root: None,
         }),
@@ -732,6 +733,8 @@ struct Codex {
     /// Codex repeats in that turn's failed completion: one failure, one item.
     child_failure: Option<(String, String)>,
     child_buffer: BTreeMap<String, Vec<Value>>,
+    /// Children whose thread read waits for their parent child's, by parent.
+    waiting_child_resumes: BTreeMap<String, Vec<String>>,
     /// Each running turn's latest cumulative diff and the files its own
     /// file-change items edited. The part of the diff no item shows, such as
     /// a file a shell command rewrote, is shown as the turn's own change.
@@ -963,7 +966,12 @@ impl Codex {
                     )?;
                 }
             }
-            if self.children.len() >= 32 || self.pending.len() >= MAX_PENDING {
+            let waiting = self
+                .waiting_child_resumes
+                .values()
+                .map(Vec::len)
+                .sum::<usize>();
+            if self.children.len() >= 32 || self.pending.len() + waiting >= MAX_PENDING {
                 return Ok(false);
             }
             let mut child = Codex::default();
@@ -973,12 +981,17 @@ impl Codex {
             child.is_child = true;
             self.children.insert(id.into(), Box::new(child));
             self.child_buffer.insert(id.into(), Vec::new());
-            self.call(
-                step,
-                "thread/resume",
-                json!({"threadId":id,"excludeTurns":true,"initialTurnsPage":{"limit":4,"sortDirection":"desc","itemsView":"full"}}),
-                Pending::ChildResume(id.into()),
-            )?;
+            // Codex resumes a nested child only through its loaded parent and
+            // refuses it while that parent's own read is still outstanding,
+            // as it is when one listing discovers both.
+            match parent_thread(metadata).filter(|parent| self.child_resume_pending(parent)) {
+                Some(parent) => self
+                    .waiting_child_resumes
+                    .entry(parent.into())
+                    .or_default()
+                    .push(id.into()),
+                None => self.resume_child(id, step)?,
+            }
         }
         let model = metadata["model"]
             .as_str()
@@ -1024,6 +1037,96 @@ impl Codex {
             background: Some(true),
         });
         Ok(nickname.is_some())
+    }
+    fn resume_child(&mut self, id: &str, step: &mut Step) -> Result<(), String> {
+        self.call(
+            step,
+            "thread/resume",
+            json!({"threadId":id,"excludeTurns":true,"initialTurnsPage":{"limit":4,"sortDirection":"desc","itemsView":"full"}}),
+            Pending::ChildResume(id.into()),
+        )
+    }
+    fn child_resume_pending(&self, id: &str) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::ChildResume(child) if child == id))
+            || self
+                .waiting_child_resumes
+                .values()
+                .any(|waiting| waiting.iter().any(|child| child == id))
+    }
+    /// Read the children that waited for `parent`'s read, now answered. A
+    /// failed parent read is still the earliest a child's read can succeed,
+    /// and its own failure is reported like any other.
+    fn resume_waiting_children(&mut self, parent: &str, step: &mut Step) -> Result<(), String> {
+        for child in self
+            .waiting_child_resumes
+            .remove(parent)
+            .unwrap_or_default()
+        {
+            if self.pending.len() >= MAX_PENDING {
+                self.child_read_failed(&child, "Too many outstanding Codex requests", step)?;
+            } else {
+                self.resume_child(&child, step)?;
+            }
+        }
+        Ok(())
+    }
+    /// Hydration failed, not execution. Keep the live parser and replay the
+    /// events observed while the read was pending. A child that showed no
+    /// sign of life meanwhile isn't running here: whatever said it was, an
+    /// old call's record or no status at all, predates this server, which
+    /// has nothing loaded that a stop could reach.
+    fn child_read_failed(
+        &mut self,
+        id: &str,
+        message: &str,
+        step: &mut Step,
+    ) -> Result<(), String> {
+        step.events.extend(chat::child_events(
+            id,
+            vec![session_notice(format!(
+                "Child history unavailable: {message}. Live activity is still shown."
+            ))],
+        ));
+        if let Some(child) = self.children.get_mut(id) {
+            child.ready = true;
+        }
+        let buffered = self.child_buffer.remove(id).unwrap_or_default();
+        let quiet = buffered.is_empty();
+        for frame in buffered {
+            if let Some(child) = self.children.get_mut(id) {
+                let content = child.receive(frame)?;
+                self.child_step(id, content, step)?;
+            }
+        }
+        if quiet
+            && let Some(child) = self.children.get_mut(id)
+            && !child.busy
+        {
+            child.settle_idle_child(id, step);
+        }
+        self.resume_waiting_children(id, step)
+    }
+    /// Publish a child with no turn as settled: the outcome it already has,
+    /// or stopped where it was only ever thought to be running.
+    fn settle_idle_child(&mut self, id: &str, step: &mut Step) {
+        let status = self
+            .subagent_status
+            .filter(|status| *status != ToolStatus::Running)
+            .unwrap_or(ToolStatus::Stopped);
+        self.subagent_status = Some(status);
+        self.subagent_waiting = false;
+        step.events.push(Event::Subagent {
+            id: id.into(),
+            kind: String::new(),
+            description: String::new(),
+            status: Some(status),
+            background: None,
+            model: None,
+            waiting: Some(false),
+            detail: None,
+        });
     }
     /// Publish the nickname a child's own thread read reports, which can name
     /// a child discovered without one. A name already current, such as the
@@ -2146,9 +2249,14 @@ impl Adapter for Codex {
             // the parent nor its siblings. Unlike input, this is not refused
             // for a child the server keeps from direct use.
             Command::StopSubagent { id } => {
-                let child = self.children.get(&id).ok_or("This Codex subagent is no longer followed")?;
-                let turn = child.turn.clone().ok_or("This Codex subagent has no active turn to stop")?;
-                self.call(&mut step, "turn/interrupt", json!({"threadId":id,"turnId":turn}), Pending::StopChild)?;
+                let child = self.children.get_mut(&id).ok_or("This Codex subagent is no longer followed")?;
+                match child.turn.clone() {
+                    Some(turn) => self.call(&mut step, "turn/interrupt", json!({"threadId":id,"turnId":turn}), Pending::StopChild)?,
+                    // Working, but Codex hasn't named the turn a stop must target.
+                    None if child.busy || child.starting_turn() => return Err("This Codex subagent's current turn isn't known yet; stop it again in a moment".into()),
+                    // Nothing runs: settle whatever still showed it working.
+                    None => child.settle_idle_child(&id, &mut step),
+                }
             }
             operation @ (Command::RemoveQueued { .. } | Command::StartQueued { .. }) => {
                 if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
@@ -2345,23 +2453,7 @@ impl Codex {
                     let message = error["message"]
                         .as_str()
                         .unwrap_or("Unknown provider error");
-                    step.events.extend(chat::child_events(
-                        id,
-                        vec![session_notice(format!(
-                            "Child history unavailable: {message}. Live activity is still shown."
-                        ))],
-                    ));
-                    // Hydration failed, not execution. Retain the live parser
-                    // and replay the events observed while the read was pending.
-                    if let Some(child) = self.children.get_mut(id) {
-                        child.ready = true;
-                    }
-                    for frame in self.child_buffer.remove(id).unwrap_or_default() {
-                        if let Some(child) = self.children.get_mut(id) {
-                            let content = child.receive(frame)?;
-                            self.child_step(id, content, &mut step)?;
-                        }
-                    }
+                    self.child_read_failed(id, message, &mut step)?;
                     return Ok(step);
                 }
                 if matches!(pending, Pending::Prediction) {
@@ -3042,6 +3134,7 @@ impl Codex {
                     }
                 }
                 Pending::ChildResume(id) => {
+                    self.resume_waiting_children(&id, &mut step)?;
                     let exact = result["thread"]["id"].as_str() == Some(id.as_str());
                     if exact {
                         self.read_child_name(&id, &result["thread"], &mut step);
@@ -3149,9 +3242,7 @@ impl Codex {
             .or_else(|| params["thread"]["id"].as_str());
         if method == "thread/started" {
             let metadata = &params["thread"];
-            let parent = metadata["parentThreadId"].as_str().or_else(|| {
-                metadata["source"]["subAgent"]["thread_spawn"]["parent_thread_id"].as_str()
-            });
+            let parent = parent_thread(metadata);
             if parent.is_some_and(|id| {
                 self.thread.as_deref() == Some(id) || self.children.contains_key(id)
             }) && let Some(id) = thread
@@ -3925,6 +4016,13 @@ impl Codex {
         Ok(())
     }
 }
+/// The thread that spawned a subagent's thread, as its metadata names it.
+fn parent_thread(metadata: &Value) -> Option<&str> {
+    metadata["parentThreadId"]
+        .as_str()
+        .or_else(|| metadata["source"]["subAgent"]["thread_spawn"]["parent_thread_id"].as_str())
+}
+
 /// The nickname Codex reported for a child, if it reported a real one.
 fn agent_nickname(metadata: &Value) -> Option<&str> {
     metadata["agentNickname"]
@@ -3935,7 +4033,9 @@ fn agent_nickname(metadata: &Value) -> Option<&str> {
 
 fn agent_status(status: &Value) -> Option<ToolStatus> {
     match status.as_str().or_else(|| status["type"].as_str()) {
-        Some("completed" | "idle" | "shutdown") => Some(ToolStatus::Succeeded),
+        // A thread the server hasn't loaded runs nothing: it is as finished
+        // as an idle one, whose last turn its own read then reports.
+        Some("completed" | "idle" | "notLoaded" | "shutdown") => Some(ToolStatus::Succeeded),
         Some("errored" | "failed" | "notFound" | "systemError") => Some(ToolStatus::Failed),
         Some("interrupted") => Some(ToolStatus::Stopped),
         Some("running" | "pendingInit" | "active" | "inProgress") => Some(ToolStatus::Running),
@@ -4670,10 +4770,10 @@ fn parse_item_with_windows(
         // unfinished, or one replayed from a turn still running, never reads
         // as still compacting once it is not.
         "contextCompaction" => tool_call("Compact context".into(), String::new(), String::new()),
-        // Context the hooks added for the model, in their own words, shown
-        // as a notice of where it came from rather than as the agent's prose;
-        // the run IDs the fragments are keyed by are Codex's bookkeeping.
-        // Hooks that added nothing leave no row.
+        // Context the hooks added for the model, in their own words, as a
+        // step among the turn's work rather than as the agent's prose or a
+        // notice; the run IDs the fragments are keyed by are Codex's
+        // bookkeeping. Hooks that added nothing leave no row.
         "hookPrompt" => {
             let added = value["fragments"]
                 .as_array()
@@ -4687,19 +4787,7 @@ fn parse_item_with_windows(
             if added.is_empty() {
                 Vec::new()
             } else {
-                vec![Item {
-                    id: id.into(),
-                    role: Role::System,
-                    content: ItemContent::Delivery {
-                        kind: chat::DeliveryKind::Notice,
-                        from: String::new(),
-                        sender: String::new(),
-                        summary: "Context from a hook".into(),
-                        body: added,
-                    },
-                    started_at: None,
-                    at: None,
-                }]
+                tool_call(super::HOOK_CONTEXT.into(), String::new(), added)
             }
         }
         // The agent pausing, named as a pause. As with compaction, the status

@@ -37,6 +37,9 @@ use super::{
 };
 use crate::{agent::Provider, chat::Model};
 
+mod acp;
+pub mod conversations;
+mod muse;
 mod reset_consume;
 #[cfg(test)]
 mod reset_contract_tests;
@@ -139,7 +142,7 @@ pub enum Outcome {
 
 /// Probes `account`, sharing the answer with other windows through `cache`.
 ///
-/// Unless `force`d, a cached answer another window observed within
+/// Unless `force`d, a complete reading another window cached within
 /// [`STALE_AFTER`] is returned instead of probing again. Explicit refreshes
 /// wait for an in-flight reader within [`TIMEOUT`], then take a fresh reading:
 /// a read that started before a reset cannot establish its resulting state.
@@ -148,8 +151,29 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     if force {
         run_forced(account, cache, second_home, TIMEOUT).await
     } else {
-        run_reading(account, cache, false, second_home).await
+        run_reading(account, cache, Reuse::Reading, second_home).await
     }
+}
+
+/// Asks who is signed in to `account`, for callers that use only the
+/// identity: any answer another window cached within [`STALE_AFTER`] serves,
+/// even one whose figures a running conversation advanced since the full
+/// reading, because the login it names is current either way.
+pub async fn login(account: Account, cache: Option<Cache>) -> Outcome {
+    let second_home = second_home(&account, &|name| std::env::var(name).ok());
+    run_reading(account, cache, Reuse::Login, second_home).await
+}
+
+/// Which cached answer a probe may return instead of running the CLI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reuse {
+    /// None: the caller needs a reading taken now.
+    Never,
+    /// A complete reading, whose plan, credits and windows are as current as
+    /// its figures. The caller treats the answer's time as the inventory's.
+    Reading,
+    /// Any recent answer, for a caller that uses only the identity.
+    Login,
 }
 
 async fn run_forced(
@@ -160,8 +184,13 @@ async fn run_forced(
 ) -> Outcome {
     let reading = async {
         loop {
-            let outcome =
-                run_reading(account.clone(), cache.clone(), true, second_home.clone()).await;
+            let outcome = run_reading(
+                account.clone(),
+                cache.clone(),
+                Reuse::Never,
+                second_home.clone(),
+            )
+            .await;
             if !matches!(outcome, Outcome::Busy) {
                 return outcome;
             }
@@ -185,7 +214,7 @@ async fn run_forced(
 async fn run_reading(
     account: Account,
     cache: Option<Cache>,
-    force: bool,
+    reuse: Reuse,
     second_home: Option<PathBuf>,
 ) -> Outcome {
     let now = now_ms();
@@ -195,7 +224,7 @@ async fn run_reading(
         let cache = cache.clone();
         let search_path = search_path.clone();
         tokio::task::spawn_blocking(move || {
-            prepare(&account, cache.as_ref(), force, now, search_path.as_deref())
+            prepare(&account, cache.as_ref(), reuse, now, search_path.as_deref())
         })
         .await
     };
@@ -244,10 +273,7 @@ async fn run_reading(
             key.as_ref()
                 .and_then(|key| cache.load(now_ms()).remove(key))
         })
-        && identity
-            .as_ref()
-            .zip(previous.identity.as_ref())
-            .is_some_and(|(current, previous)| reset_consume::same_identity(current, previous))
+        && super::resets::may_act_for(identity.as_ref(), previous.identity.as_ref())
     {
         snapshot.resets = previous.snapshot.resets;
         for reset in &mut snapshot.resets {
@@ -267,6 +293,7 @@ async fn run_reading(
         let entry = Entry {
             identity: identity.clone(),
             snapshot: UsageSnapshot::clone(snapshot),
+            inventory_observed_at: Some(snapshot.observed_at),
         };
         let catalog = catalog.clone();
         let provider = account.provider;
@@ -298,7 +325,7 @@ enum Prepared {
 fn prepare(
     account: &Account,
     cache: Option<&Cache>,
-    force: bool,
+    reuse: Reuse,
     now: u64,
     search_path: Option<&OsStr>,
 ) -> Prepared {
@@ -335,8 +362,13 @@ fn prepare(
         // guarantee that another window is not running the same one.
         Err(_) => None,
     };
-    if !force
+    // Only a complete reading stands in for one: an entry whose figures a
+    // running conversation advanced since its inventory was read would make
+    // that older plan, credit and window inventory look as fresh as them.
+    if reuse != Reuse::Never
         && let Some(entry) = key.as_ref().and_then(|key| cache.load(now).remove(key))
+        && (reuse == Reuse::Login
+            || entry.inventory_observed_at == Some(entry.snapshot.observed_at))
         && now.saturating_sub(entry.snapshot.observed_at) < STALE_AFTER
     {
         let mut snapshot = entry.snapshot;
@@ -443,10 +475,8 @@ async fn probe_cli(
         Provider::Claude => probe_claude_with_path(account, program, search_path, cache).await,
         Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
-        Provider::Antigravity | Provider::Muse => Err(format!(
-            "cagents does not read {} account usage yet",
-            account.provider.label()
-        )),
+        Provider::Antigravity => acp::probe_antigravity(account, program, search_path).await,
+        Provider::Muse => muse::probe_muse(account, program, search_path).await,
     }
 }
 
@@ -1871,6 +1901,7 @@ mod tests {
                 Entry {
                     identity: Some(first.clone()),
                     snapshot: UsageSnapshot::state(UsageStatus::Ok, "fixture", now_ms()),
+                    inventory_observed_at: None,
                 },
             )
             .unwrap();
@@ -2748,6 +2779,55 @@ cat >/dev/null
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Another window's cached answer stands in for a reading only when it
+    /// is a complete one: figures a running conversation advanced past the
+    /// inventory's reading, or an entry from before inventory stamps, would
+    /// otherwise pass the older plan, credits and windows off as current.
+    #[test]
+    fn only_a_complete_cached_reading_answers_an_ordinary_probe_for_usage() {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        let home = directory.path().join("home");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home);
+        let program = bin.join(account.provider.executable());
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        make_executable(&program);
+        let cache = Cache::at(directory.path().join("cache"));
+        let key = account.cache_key().unwrap();
+        let now = now_ms();
+        let observed_at = now - 1_000;
+        let answers_from_cache = |inventory_observed_at, reuse| {
+            cache
+                .store(
+                    &key,
+                    Entry {
+                        identity: None,
+                        snapshot: UsageSnapshot::state(UsageStatus::Ok, "", observed_at),
+                        inventory_observed_at,
+                    },
+                )
+                .unwrap();
+            match prepare(&account, Some(&cache), reuse, now, Some(bin.as_os_str())) {
+                Prepared::Done(Outcome::Answered { snapshot, .. }) => {
+                    assert_eq!(snapshot.source, UsageSource::Cache);
+                    true
+                }
+                Prepared::Probe { .. } => false,
+                Prepared::Done(_) => panic!("neither a cached answer nor a probe"),
+            }
+        };
+        let partial = Some(observed_at - 2 * STALE_AFTER);
+        assert!(answers_from_cache(Some(observed_at), Reuse::Reading));
+        assert!(!answers_from_cache(Some(observed_at), Reuse::Never));
+        assert!(!answers_from_cache(partial, Reuse::Reading));
+        assert!(!answers_from_cache(None, Reuse::Reading));
+        // Asking only who is signed in, any recent answer serves.
+        assert!(answers_from_cache(partial, Reuse::Login));
+        assert!(answers_from_cache(None, Reuse::Login));
+    }
+
     /// The system Claude login's two records, as the probe reads them: the
     /// one in `~/.claude`, which earlier cagents launches kept, disputes the
     /// login the CLI reported until a sign-in settles which is right.
@@ -2770,6 +2850,7 @@ cat >/dev/null
                     Entry {
                         identity: Some(identity),
                         snapshot: UsageSnapshot::state(UsageStatus::Ok, "", observed_at),
+                        inventory_observed_at: Some(observed_at),
                     },
                 )
                 .unwrap();

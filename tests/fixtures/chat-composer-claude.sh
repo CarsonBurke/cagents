@@ -289,7 +289,10 @@ long_history_turn() {
 # frames are also recorded in the synthetic history, as Claude records them;
 # system frames, such as a background task's lifecycle, are live only. A frame
 # with "_history": true is only recorded, as Claude records a queued
-# notification. A frame with "_live": true is only emitted, as a subagent's
+# notification; with "_linked": true as well, it joins the conversation's
+# parent chain where it stands, as Claude records what it adds to the
+# model's context and streams differently, such as a skill's instructions.
+# A frame with "_live": true is only emitted, as a subagent's
 # frames are, which Claude records in the subagent's own transcript. A line
 # {"_sleep": SECONDS} pauses while still servicing controls; interruption or
 # input EOF discards the remaining replay. A line
@@ -348,7 +351,11 @@ frames_turn() {
         fi
         frame=$(printf '%s' "$spec" | jq -c --arg turn "$turn" 'walk(if type == "string" then gsub("@TURN@"; $turn) else . end)')
         if [ "$(printf '%s' "$frame" | jq -r '._history // false')" = true ]; then
-            printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            if [ "$(printf '%s' "$frame" | jq -r '._linked // false')" = true ]; then
+                persist_record "$(printf '%s' "$frame" | jq -c 'del(._history, ._linked)')"
+            else
+                printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            fi
             continue
         fi
         if [ "$(printf '%s' "$frame" | jq -r '._live // false')" = true ]; then
@@ -599,6 +606,14 @@ handle_control() {
     esac
 }
 
+# With home/.claude/fixture-session-idle, a main turn's result is followed by
+# the session_state_changed idle frame Claude Code 2.1 sends once it is idle.
+session_idle() {
+    [ -e "$config/fixture-session-idle" ] || return 0
+    jq -cn --arg session "$session" \
+        '{type:"system",subtype:"session_state_changed",state:"idle",session_id:$session}'
+}
+
 # Claude Code 2.1's record of a stop, as its sdk-cli transcripts and its
 # 2.1.317 stream hold it: a replayed call still running gets a result worded
 # as the person declining it, then a user message says the request was
@@ -622,6 +637,7 @@ record_stop() {
         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,
           terminal_reason:$reason,stop_reason:(if $stop == "null" then null else $stop end),
           errors:["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason="+$stop],session_id:$session}'
+    session_idle
 }
 
 queue_user() {
@@ -695,6 +711,7 @@ settle_first_turn() {
         busy=false
         jq -cn --arg session "$session" --arg turn "$turn" \
             '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+        session_idle
     fi
 }
 
@@ -812,6 +829,7 @@ while next_frame; do
                     busy=false
                     jq -cn --arg session "$session" --arg turn "$turn" \
                         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+                    session_idle
                 fi
             fi
             ;;

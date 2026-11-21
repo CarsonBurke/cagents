@@ -409,6 +409,32 @@ pub struct BrowserHandle {
     teardown: Option<Receiver<()>>,
 }
 
+#[cfg(all(test, feature = "browser-protocol-fixture"))]
+type RecordedSpawns = std::rc::Rc<std::cell::RefCell<Vec<(BrowserRestoreState, bool)>>>;
+
+#[cfg(all(test, feature = "browser-protocol-fixture"))]
+thread_local! {
+    static SPAWN_FIXTURE: std::cell::RefCell<Option<RecordedSpawns>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Records admission at the engine boundary without starting Servo or a window.
+#[cfg(all(test, feature = "browser-protocol-fixture"))]
+pub(crate) struct SpawnFixture(RecordedSpawns);
+
+#[cfg(all(test, feature = "browser-protocol-fixture"))]
+impl SpawnFixture {
+    pub(crate) fn spawns(&self) -> Vec<(BrowserRestoreState, bool)> {
+        self.0.borrow().clone()
+    }
+}
+
+#[cfg(all(test, feature = "browser-protocol-fixture"))]
+impl Drop for SpawnFixture {
+    fn drop(&mut self) {
+        SPAWN_FIXTURE.with(|active| *active.borrow_mut() = None);
+    }
+}
+
 impl std::fmt::Debug for BrowserHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -418,6 +444,17 @@ impl std::fmt::Debug for BrowserHandle {
 }
 
 impl BrowserHandle {
+    #[cfg(all(test, feature = "browser-protocol-fixture"))]
+    pub(crate) fn record_spawns() -> SpawnFixture {
+        let spawns = std::rc::Rc::default();
+        SPAWN_FIXTURE.with(|active| {
+            let mut active = active.borrow_mut();
+            assert!(active.is_none(), "browser spawn fixture already active");
+            *active = Some(std::rc::Rc::clone(&spawns));
+        });
+        SpawnFixture(spawns)
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self {
@@ -447,6 +484,11 @@ impl BrowserHandle {
                     crate::capability::BrowserUnavailable::ParentUnavailable,
                 ));
             }
+        }
+        #[cfg(all(test, feature = "browser-protocol-fixture"))]
+        if let Some(spawns) = SPAWN_FIXTURE.with(|active| active.borrow().clone()) {
+            spawns.borrow_mut().push((restore, visible));
+            return Ok(Self::fixture());
         }
         let mailbox = CommandMailbox::new();
         let events = EventBus::new();
@@ -881,10 +923,11 @@ mod tests {
     fn pressure_evicts_only_telemetry_and_preserves_control_edges() {
         let events = EventBus::new();
         for sequence in 0..EVENT_CAPACITY - CRITICAL_EVENT_RESERVE - 2 {
-            assert!(events.semantic(BrowserEvent::InputHandled {
-                sequence: sequence as u64,
-                consumed: false,
-            }));
+            assert!(events.semantic(BrowserEvent::Delegate(
+                super::super::DelegateRequest::ClipboardRead {
+                    id: DelegateRequestId(sequence as u64 + 100),
+                },
+            )));
         }
         assert!(events.semantic(BrowserEvent::LoadStateChanged("Loading".into())));
         assert!(events.semantic(BrowserEvent::Delegate(

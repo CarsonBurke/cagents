@@ -1,6 +1,15 @@
 //! Resident actors, in-flight starts and retained startup custody share one budget.
 use super::*;
 
+/// An explicit Close's claim on removing its pane: the source its teardown
+/// fences, and that source as its actor now holds it, which is what the pane
+/// names once the provider has named a new conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::host) struct CloseRemoval {
+    pub(in crate::host) source: Session,
+    pub(in crate::host) current: Session,
+}
+
 pub(in crate::host) fn usage(state: &HostState) -> usize {
     state.chats.len()
         + state
@@ -71,15 +80,22 @@ impl Reservation {
     /// Explicit pane Close may publish its removal while teardown runs.
     /// Other users of the teardown fence, such as recovery and conversion,
     /// retain their ordinary transition fence against pane removal.
+    /// `current` is `source` as its actor now holds it
+    /// ([`Record::current_session`]).
     pub(super) fn removing(
         host: &SharedHost,
         state: &mut HostState,
         source: &Session,
+        current: Session,
     ) -> Result<Self, ProtocolError> {
         let reservation = Self::closing(host, state, source)?;
-        state
-            .chat_close_reservations
-            .insert(source.id, source.clone());
+        state.chat_close_reservations.insert(
+            source.id,
+            CloseRemoval {
+                source: source.clone(),
+                current,
+            },
+        );
         Ok(reservation)
     }
 
@@ -217,7 +233,10 @@ impl Reservation {
         // Installation may retarget an admission. It is no longer evidence
         // that only the original source's explicit Close is in flight.
         if let Some(admission) = admission.as_ref()
-            && state.chat_close_reservations.get(&admission.source.id) == Some(&admission.source)
+            && state
+                .chat_close_reservations
+                .get(&admission.source.id)
+                .is_some_and(|removal| removal.source == admission.source)
         {
             state.chat_close_reservations.remove(&admission.source.id);
         }
@@ -237,7 +256,11 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chat_close_reservations.get(&self.source.id) == Some(&self.source) {
+        if state
+            .chat_close_reservations
+            .get(&self.source.id)
+            .is_some_and(|removal| removal.source == self.source)
+        {
             state.chat_close_reservations.remove(&self.source.id);
         }
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
@@ -309,9 +332,7 @@ fn inspected_record(
     // Retained actors are never eligible for resident eviction. Inspect only
     // cached identity metadata while holding HostState, without a helper RPC.
     if record.handle.actor_identity().is_some() {
-        let mut session = record.session.clone();
-        session.launch.session_id = record.handle.session_id();
-        session.native_continuity = record.handle.native_continuity();
+        let session = record.current_session();
         return Ok((crate::terminal_ipc::ChatReleaseInspection {
             proof: crate::terminal_ipc::ChatReleaseProof {
                 session,
@@ -599,6 +620,7 @@ pub(super) fn restore_saved_history(
                 .commit_native_installation()
                 .map_err(retryable_unavailable)?;
             state.chats.insert(id, record);
+            state.chat_added(id);
             state.inventory_generation += 1;
             Ok(response)
         }
@@ -861,8 +883,17 @@ mod tests {
                 views::{Change, Pane, Scope},
             },
         };
-        for purpose in ["startup", "transition", "close"] {
-            let cleanup = purpose == "close";
+        // A close of a conversation whose provider named it after it
+        // started, from a pane that records that name, is the same cleanup;
+        // a pane naming another conversation is not.
+        for purpose in [
+            "startup",
+            "transition",
+            "close",
+            "named close",
+            "misnamed close",
+        ] {
+            let cleanup = matches!(purpose, "close" | "named close");
             let directory = tempfile::tempdir().unwrap();
             let host = host();
             host.lock()
@@ -881,6 +912,17 @@ mod tests {
             let mut source = session();
             source.proof = Some(host.lock().unwrap().proof().clone());
             source.launch.recipe.working_directory = directory.path().into();
+            let mut named = source.clone();
+            named.launch.session_id = Some("provider-named".into());
+            let shown = match purpose {
+                "named close" => named.clone(),
+                "misnamed close" => {
+                    let mut other = source.clone();
+                    other.launch.session_id = Some("another-conversation".into());
+                    other
+                }
+                _ => source.clone(),
+            };
             let scope = Scope::Worktree {
                 repository: directory.path().into(),
                 path: directory.path().into(),
@@ -892,7 +934,7 @@ mod tests {
                 pending_terminal_start: false,
                 width_fraction: 0.5,
                 scope: None,
-                kind: CardKind::Chat(source.clone()),
+                kind: CardKind::Chat(shown),
             };
             let model = workspace::edit(
                 &host,
@@ -917,8 +959,13 @@ mod tests {
                     capture: None,
                 },
             };
-            let reservation = if cleanup {
-                Reservation::removing(&host, &mut host.lock().unwrap(), &source).unwrap()
+            let reservation = if purpose.ends_with("close") {
+                let current = if purpose == "close" {
+                    source.clone()
+                } else {
+                    named.clone()
+                };
+                Reservation::removing(&host, &mut host.lock().unwrap(), &source, current).unwrap()
             } else if purpose == "transition" {
                 Reservation::closing(&host, &mut host.lock().unwrap(), &source).unwrap()
             } else {

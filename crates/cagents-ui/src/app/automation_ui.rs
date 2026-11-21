@@ -58,6 +58,8 @@ impl Cagents {
             self.automation_account_choices(),
             self.automation_models(),
         );
+        self.automation_ui
+            .set_turned_off(self.account_ui.turned_off().collect());
     }
 
     pub(super) fn open_automations(&mut self) -> Task<Message> {

@@ -333,6 +333,7 @@ fn parent_prompt_availability_tracks_whole_steps_independently_of_children() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -513,6 +514,7 @@ fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_pro
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -665,6 +667,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
     let directory = tempfile::tempdir_in("/var/tmp").unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -775,6 +778,7 @@ fn resident_title_admission_refuses_without_waiting_for_the_state_owner() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::History,
@@ -1101,6 +1105,7 @@ fn update_readiness_fences_a_prompt_whose_caller_stopped_waiting() {
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -1194,6 +1199,7 @@ fn startup_cleanup_joins_the_exact_actor_before_releasing_ownership() {
     let context = Arc::new(ExecutionContext::default());
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: Some(context.clone()),
         messages: None,
         unset_environment: Default::default(),
@@ -1461,6 +1467,7 @@ fn queued_interrupt_rechecks_background_tasks_at_provider_dispatch() {
     let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -2695,6 +2702,7 @@ fn original_launch_directory_survives_rename_and_replacement_without_recapture()
         );
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: if cleanup_only {
                 Some(Arc::new(super::super::protocol::ExecutionContext::default()))
             } else {
@@ -2774,6 +2782,7 @@ fn identity_only_context_never_recaptures_a_replacement_directory() {
     assert!(context.pinned_launch_directory().is_err());
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: Some(context),
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -2797,8 +2806,12 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
             Ok(Step {
                 events: vec![
                     Event::Ready(true),
+                    // A full window, so only the reader asks for the earlier
+                    // page.
                     Event::History {
-                        items: vec![text("current", "current")],
+                        items: (0..super::store::WINDOW_ITEMS)
+                            .map(|index| text(&format!("current-{index}"), "current"))
+                            .collect(),
                         has_earlier: true,
                     },
                 ],
@@ -2840,6 +2853,7 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
     for unrelated in [None, Some("different failure"), Some("page failed")] {
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -2883,6 +2897,286 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
         assert!(handle.snapshot(None).unwrap().error.is_none());
         handle.close().unwrap();
     }
+}
+/// A provider hands saved history over in pages of its own records, which
+/// can amount to a few rows: a Claude page is 100 records, and in a working
+/// session most are tool calls and bookkeeping the transcript does not show.
+/// The window fills itself from those pages until its budget is met, once it
+/// has been read and without the reader asking, then asks for nothing more.
+#[test]
+fn a_window_fills_itself_from_short_provider_pages_once_it_is_read() {
+    const PAGE: usize = 10;
+    const TOTAL: usize = 300;
+    struct Pages {
+        next: usize,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Pages {
+        fn page(&mut self) -> Event {
+            let end = self.next;
+            self.next -= PAGE;
+            Event::History {
+                items: (self.next..end)
+                    .map(|index| text(&format!("row-{index:03}"), "row"))
+                    .collect(),
+                has_earlier: self.next > 0,
+            }
+        }
+    }
+    impl Adapter for Pages {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![Event::Ready(true), self.page()],
+                ..Step::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            if command != Command::LoadEarlier {
+                return Err("unexpected fixture command".into());
+            }
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(Step {
+                events: vec![self.page()],
+                ..Step::default()
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+        followed: false,
+    };
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut adapter: Box<dyn Adapter> = Box::new(Pages {
+        next: TOTAL,
+        asked: Arc::clone(&asked),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    // The host reads windows of conversations nobody shows, as release and
+    // retirement do to hold their generation. Those fetch nothing: each
+    // acknowledged command below follows a whole pass of the actor.
+    until(&handle, |snapshot| snapshot.items.len() == PAGE);
+    handle.check_update_readiness().unwrap();
+    let hidden = handle.snapshot(None).unwrap();
+    handle.check_update_readiness().unwrap();
+    handle.check_update_readiness().unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert_eq!(handle.snapshot(None).unwrap().generation, hidden.generation);
+    handle.set_visible(true);
+    let window = until(&handle, |snapshot| {
+        snapshot.items.len() == super::store::WINDOW_ITEMS
+    });
+    let ids: Vec<&str> = window.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids.first(), Some(&"row-172"));
+    assert_eq!(ids.last(), Some(&"row-299"));
+    assert!(window.has_earlier);
+    assert!(!window.has_later);
+    // Until the cache holds more than the window can show, and no more.
+    let pages = (super::store::WINDOW_ITEMS + 1).div_ceil(PAGE) - 1;
+    assert_eq!(asked.load(Ordering::SeqCst), pages);
+    // Paging back slides the window by half to end at row-236, past the
+    // start of what is cached, so it fills itself again: until rows 100 to
+    // 236 are cached, and it shows the newest 128 of them.
+    handle.command(Command::LoadEarlier).unwrap();
+    let window = until(&handle, |snapshot| {
+        snapshot.items.len() == super::store::WINDOW_ITEMS
+            && snapshot.items.last().unwrap().id == "row-236"
+    });
+    assert_eq!(window.items[0].id, "row-109");
+    assert!(window.has_later);
+    assert_eq!(asked.load(Ordering::SeqCst), pages + 7);
+    handle.close().unwrap();
+}
+/// A provider that answers history later, as Codex does, refuses a second
+/// request while one is loading. A reader who pages back while a page asked
+/// for to fill the window is on its way is answered by that page, rather than
+/// shown the provider's refusal.
+#[test]
+fn a_reader_paging_back_during_a_fill_waits_for_the_page_on_its_way() {
+    struct Later {
+        loading: bool,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Adapter for Later {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Ready(true),
+                    Event::History {
+                        items: vec![text("newest", "newest")],
+                        has_earlier: true,
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::LoadEarlier if self.loading => Err("history is already loading".into()),
+                Command::LoadEarlier => {
+                    self.loading = true;
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step {
+                        events: vec![Event::HistoryLoading(true)],
+                        ..Step::default()
+                    })
+                }
+                // Answers the outstanding request.
+                Command::Compact => Ok(Step {
+                    writes: vec![json!({"page": true})],
+                    ..Step::default()
+                }),
+                _ => Err("unexpected fixture command".into()),
+            }
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            self.loading = false;
+            Ok(Step {
+                events: vec![
+                    Event::HistoryLoading(false),
+                    Event::History {
+                        items: vec![text("older", "older")],
+                        has_earlier: false,
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+        followed: false,
+    };
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut adapter: Box<dyn Adapter> = Box::new(Later {
+        loading: false,
+        asked: Arc::clone(&asked),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    handle.set_visible(true);
+    // Reading the one-row window starts a fill.
+    until(&handle, |snapshot| snapshot.history_loading);
+    handle.command(Command::LoadEarlier).unwrap();
+    assert!(handle.snapshot(None).unwrap().error.is_none());
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    handle.command(Command::Compact).unwrap();
+    let window = until(&handle, |snapshot| snapshot.items.len() == 2);
+    assert_eq!(window.items[0].id, "older");
+    assert!(!window.history_loading);
+    assert!(window.error.is_none());
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    handle.close().unwrap();
+}
+/// A provider that answers history later, as Codex does, ends a failed
+/// request and then reports its error. A failed page that nobody asked for is
+/// not shown and not asked for again; the reader who then asks sees why.
+#[test]
+fn a_failed_fill_is_not_shown_or_retried_but_the_readers_request_is() {
+    struct Failing {
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Adapter for Failing {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Ready(true),
+                    Event::History {
+                        items: vec![text("newest", "newest")],
+                        has_earlier: true,
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            match command {
+                Command::LoadEarlier => {
+                    self.asked.fetch_add(1, Ordering::SeqCst);
+                    Ok(Step {
+                        events: vec![Event::HistoryLoading(true)],
+                        ..Step::default()
+                    })
+                }
+                // Answers the outstanding request.
+                Command::Compact => Ok(Step {
+                    writes: vec![json!({"error": true})],
+                    ..Step::default()
+                }),
+                _ => Err("unexpected fixture command".into()),
+            }
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::HistoryLoading(false),
+                    Event::HistoryError("history refused".into()),
+                ],
+                ..Step::default()
+            })
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+        followed: false,
+    };
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut adapter: Box<dyn Adapter> = Box::new(Failing {
+        asked: Arc::clone(&asked),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    handle.set_visible(true);
+    // Reading the one-row window starts a fill, which fails.
+    until(&handle, |snapshot| snapshot.history_loading);
+    handle.command(Command::Compact).unwrap();
+    until(&handle, |snapshot| !snapshot.history_loading);
+    // Each acknowledged command follows a whole pass of the actor, and
+    // reading the window between them would start any retry.
+    handle.check_update_readiness().unwrap();
+    handle.snapshot(None).unwrap();
+    handle.check_update_readiness().unwrap();
+    let window = handle.snapshot(None).unwrap();
+    assert!(window.error.is_none(), "{:?}", window.error);
+    assert!(!window.history_loading);
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // The reader's own request fails visibly.
+    handle.command(Command::LoadEarlier).unwrap();
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    handle.command(Command::Compact).unwrap();
+    let window = until(&handle, |snapshot| snapshot.error.is_some());
+    assert_eq!(window.error.as_deref(), Some("history refused"));
+    handle.close().unwrap();
 }
 impl Adapter for Echo {
     fn initialize(&mut self) -> Result<Step, String> {
@@ -2979,6 +3273,7 @@ fn actor_publishes_completion_only_after_the_entire_frame_and_late_children() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3113,6 +3408,7 @@ fn notification_preview_uses_live_store_events_without_paging_or_tool_output() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3225,6 +3521,7 @@ fn notification_waiting_context_revises_without_an_activity_transition() {
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3301,6 +3598,7 @@ fn presentation_serves_multiple_readers_and_resyncs_missed_revisions() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3371,6 +3669,7 @@ fn native_child_receives_only_the_preserved_source_environment() {
     ]);
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3398,6 +3697,7 @@ fn native_child_receives_only_the_preserved_source_environment() {
 fn selected_account_removals_win_at_the_native_child_boundary() {
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -3502,6 +3802,7 @@ fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory
     let socket = directory.path().join("server").join("control.sock");
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3560,6 +3861,7 @@ fn an_account_report_reaches_the_surfaces_without_touching_the_conversation() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3642,6 +3944,7 @@ fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3728,6 +4031,7 @@ fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3767,6 +4071,7 @@ fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
 fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -3899,6 +4204,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4035,6 +4341,7 @@ fn unix_websocket_rejects_oversized_frame_before_receiving_its_payload() {
     let metadata = std::fs::metadata(&path).unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4490,6 +4797,7 @@ fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
 fn json_lines_spec(arguments: Vec<String>, program: &str) -> ProcessSpec {
     ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4732,6 +5040,7 @@ fn json_line_noise_resets_its_failure_streak_after_each_valid_frame() {
     }
     let spec = ProcessSpec {
         stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4763,6 +5072,7 @@ fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
     );
     let spec = ProcessSpec {
         stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4796,6 +5106,7 @@ fn json_line_noise_fails_after_eight_lines_with_a_bounded_escaped_preview() {
 fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
     let spec = ProcessSpec {
         stdout_noise: Some(super::super::protocol::claude::embedded_protocol_frame),
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -4818,6 +5129,7 @@ fn json_line_noise_does_not_swallow_a_valid_frames_adapter_error() {
 fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -5138,6 +5450,7 @@ fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
         let directory = tempfile::tempdir().unwrap();
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             unset_environment: Default::default(),
@@ -5187,6 +5500,7 @@ fn provider_exit_during_a_write_reports_its_exit_status_not_the_broken_pipe() {
     let release = directory.path().join("release");
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -5254,6 +5568,7 @@ fn a_provider_is_never_handed_a_parent_session() {
     use std::io::Read;
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -5298,6 +5613,7 @@ fn direct_provider_scope_preserves_pipes_and_process_group() {
     use std::io::{BufRead, Write};
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -5372,6 +5688,7 @@ fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -5569,6 +5886,7 @@ fn a_detached_command_outlives_a_closed_or_finished_provider() {
     ] {
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: None,
             messages: None,
             transport: TransportSpec::JsonLines,
@@ -5665,6 +5983,7 @@ fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -5757,6 +6076,107 @@ fn logical_copy_serves_parent_and_complete_child_but_refuses_trimmed_child_after
 }
 
 #[test]
+fn provider_exit_stops_pending_claude_file_edits_in_cached_and_fresh_queries() {
+    use super::super::FileChangeReply;
+    for (name, input) in [
+        (
+            "Edit",
+            serde_json::json!({"file_path":"a.rs","old_string":"old","new_string":"new"}),
+        ),
+        (
+            "Write",
+            serde_json::json!({"file_path":"a.rs","content":"new\n"}),
+        ),
+    ] {
+        let call = serde_json::json!({
+            "type":"assistant", "uuid":"call", "message":{
+                "id":"message", "role":"assistant", "content":[{
+                    "type":"tool_use", "id":"edit", "name":name, "input":input
+                }]
+            }
+        });
+        let (_directory, handle) = claude_initialization_pipe(&format!(
+            "print(json.dumps({{'type': 'control_response', 'response': {{'subtype': 'success', 'request_id': request['request_id'], 'response': {{}}}}}}), flush=True)\n\
+             print({call:?}, flush=True)\n\
+             json.loads(sys.stdin.readline())\n\
+             sys.exit(7)\n",
+            call = call.to_string(),
+        ));
+        // Keep the provider blocked until its running edit has been published.
+        let running = until(&handle, |snapshot| {
+            snapshot.file_changes.files.len() == 1 && snapshot.file_changes.files[0].pending == 1
+        });
+        let file = &running.file_changes.files[0];
+        let Some(FileChangeReply::Patches(before)) = handle
+            .file_query(&Command::LoadFileChangePatches {
+                request_id: 1,
+                key: file.key.clone(),
+                cursor: None,
+                revision: file.revision,
+            })
+            .unwrap()
+        else {
+            panic!("expected running patch");
+        };
+        assert!(before.error.is_none());
+        assert_eq!(before.patches[0].status, ToolStatus::Running);
+        handle.command(Command::Refresh).unwrap();
+        let stopped = until(&handle, |snapshot| snapshot.exited && handle.is_completed());
+        handle.close().unwrap();
+        assert!(
+            stopped.items.iter().any(|item| matches!(
+                item.content,
+                ItemContent::Changes {
+                    status: ToolStatus::Stopped,
+                    ..
+                }
+            )),
+            "the transcript must stop the {name} call"
+        );
+        let Some(FileChangeReply::Files(fresh)) = handle
+            .file_query(&Command::LoadFileChanges {
+                request_id: 2,
+                after: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected retained file list");
+        };
+        let Some(FileChangeReply::Patches(after)) = handle
+            .file_query(&Command::LoadFileChangePatches {
+                request_id: 3,
+                key: file.key.clone(),
+                cursor: None,
+                revision: file.revision,
+            })
+            .unwrap()
+        else {
+            panic!("expected retained patch");
+        };
+        assert!(after.error.is_none());
+        assert_eq!(after.patches[0].diff, before.patches[0].diff);
+        let published = &stopped.file_changes.files[0];
+        let queried = &fresh.files[0];
+        assert_eq!(
+            (
+                (published.pending, published.failed, published.succeeded),
+                (queried.pending, queried.failed, queried.succeeded),
+                after.patches[0].status,
+            ),
+            ((0, 1, 0), (0, 1, 0), ToolStatus::Stopped),
+            "provider exit must stop {name} in the published summary, fresh list and patch"
+        );
+        assert_eq!(stopped.file_changes.files, fresh.files);
+        assert_eq!(stopped.file_changes.revision, fresh.revision);
+        assert!(fresh.revision > running.file_changes.revision);
+        assert!(queried.revision > file.revision);
+        assert_eq!(after.revision, queried.revision);
+        assert_eq!(fresh.total_files, 1);
+        assert_eq!(fresh.applied_files, 0);
+    }
+}
+
+#[test]
 fn file_changes_cache_queries_remain_available_after_provider_exit() {
     struct CacheFixture;
     impl Adapter for CacheFixture {
@@ -5788,6 +6208,7 @@ fn file_changes_cache_queries_remain_available_after_provider_exit() {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),

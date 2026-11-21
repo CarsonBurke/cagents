@@ -1049,3 +1049,73 @@ async fn resolved_cleanup_keeps_warning_until_a_real_save_qualifies_the_baseline
     assert!(!runtime.is_dirty());
     assert!(runtime.save_error().is_none());
 }
+
+/// A file link to a note an agent wrote under `~/.gemini`, which is the
+/// user's own symlink into a dotfiles checkout: one in a folder beneath the
+/// link, and one directly inside it, whose pane directory is the link itself.
+/// Each opens and saves like any other file, writing the physical file and
+/// leaving the link in place.
+#[tokio::test]
+async fn file_link_under_a_symlinked_directory_opens_and_saves_through_the_link() {
+    if isolated_test(
+        "repository_widget::retained_save_tests::file_link_under_a_symlinked_directory_opens_and_saves_through_the_link",
+    ) {
+        return;
+    }
+    // Take production directory leases, as a running window does.
+    crate::worktree_cleanup::prepare_standalone_editor_protection();
+    let fixture = tempfile::tempdir().unwrap();
+    let dotfiles = fixture.path().join("dotfiles/gemini");
+    std::fs::create_dir_all(dotfiles.join("brain")).unwrap();
+    let home = fixture.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::os::unix::fs::symlink(&dotfiles, home.join(".gemini")).unwrap();
+    for (linked, physical) in [
+        (home.join(".gemini/brain"), dotfiles.join("brain")),
+        (home.join(".gemini"), dotfiles.clone()),
+    ] {
+        std::fs::write(physical.join("notes.md"), "# Concepts\n").unwrap();
+        let card = CardId::new();
+        // The view a transcript file link opens: the file's directory as named.
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: linked.clone(),
+            worktree: linked.clone(),
+            selected_file: Some("notes.md".into()),
+        });
+        runtime.set_auto_save(false);
+        let task = runtime.initial_load(card);
+        finish(&mut runtime, task).await;
+        assert_eq!(
+            runtime.editor_text().as_deref(),
+            Some("# Concepts\n"),
+            "{linked:?}: {}",
+            load_state(&runtime)
+        );
+        assert!(runtime.original_read_attested);
+        // The census names the pane's directory as the pane does.
+        let custody = crate::operation_recovery::Shared::default();
+        assert!(runtime.configure_save_recovery(custody.clone(), vec![linked.clone()]));
+        insert(&mut runtime, card, '!');
+        let submitted = runtime.editor_text().unwrap();
+        let save = runtime.request_save(card, false);
+        finish(&mut runtime, save).await;
+        assert!(
+            runtime.save_error().is_none(),
+            "{linked:?}: {:?}",
+            runtime.save_error()
+        );
+        assert!(!runtime.is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(physical.join("notes.md")).unwrap(),
+            submitted
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join(".gemini"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!custody.lock().unwrap().is_pending());
+    }
+}

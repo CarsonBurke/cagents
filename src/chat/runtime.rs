@@ -46,6 +46,7 @@ mod retained_actor;
 #[cfg(test)]
 pub(crate) use retained_actor::receipt_fixture as retained_receipt_fixture;
 mod store;
+pub use store::Unread;
 mod websocket;
 pub(crate) use store::Store;
 
@@ -100,6 +101,10 @@ fn await_history_release(directory: &std::path::Path) {
         let _ = held.recv();
     }
 }
+
+/// The refusal of a decline-only answer whose action the provider doesn't
+/// read as turning the request down, or whose request is no longer pending.
+pub(crate) const NOT_A_DECLINE: &str = "A settled run may only decline a current pending request";
 
 enum ActorCommand {
     RetainedProvider {
@@ -1232,6 +1237,15 @@ impl LocalHandle {
             .usage
             .clone()
     }
+    /// The provider-confirmed permission mode, without publishing a snapshot.
+    pub(crate) fn permission_mode(&self) -> Option<String> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .permission_mode
+            .clone()
+    }
     /// Bounded resident metadata only; never reads or hydrates transcript pages.
     #[cfg(test)]
     pub(crate) fn notification_content(
@@ -1244,6 +1258,15 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .notification_content(kind)
     }
+    /// The items changed since the last call, whole, for a reader that
+    /// follows the conversation without presenting it; `again` names items
+    /// to serve once more. See [`store::Unread`].
+    pub fn unread(&self, again: &[String]) -> Result<(store::Unread, bool), String> {
+        let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        let unread = store.unread(again)?;
+        let busy = self.0.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+        Ok((unread, busy))
+    }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1255,12 +1278,14 @@ impl LocalHandle {
         }
         let refresh_publication =
             store.presented_generation != Some(state.generation) || store.dirty;
+        let mut fill = false;
         if store.dirty {
             match store.window_reusing(&mut state.items) {
                 Ok(window) => {
                     state.items = window.items;
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
+                    fill = store.wants_fill();
                 }
                 Err(error) => {
                     state.error = Some(format!("Cannot page owned transcript cache: {error}"))
@@ -1283,6 +1308,11 @@ impl LocalHandle {
         }
         let mut snapshot = state.clone();
         snapshot.sampled_at = observed_at();
+        drop(state);
+        drop(store);
+        if fill && self.0.visible.load(Ordering::Acquire) {
+            self.wake();
+        }
         Some(snapshot)
     }
     /// The last publication is retained for other readers of the same revision.
@@ -1297,6 +1327,7 @@ impl LocalHandle {
         if after == Some(state.generation) && !store.dirty {
             return None;
         }
+        let mut fill = false;
         if store.presented_generation != Some(state.generation) || store.dirty {
             if let Err(error) = store.publish_files(&mut state) {
                 state.error = Some(format!("Cannot read reported edits: {error}"));
@@ -1308,6 +1339,7 @@ impl LocalHandle {
                         state.items = window.items;
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
+                        fill = store.wants_fill();
                         window.changes
                     }
                     Err(error) => {
@@ -1399,22 +1431,28 @@ impl LocalHandle {
                 .map(|agent| (agent.id.clone(), agent.items.clone()))
                 .collect();
         }
-        if let Some(presentation) = store
+        let response = if let Some(presentation) = store
             .presentation
             .as_ref()
             .filter(|update| after == Some(update.base_generation))
         {
             let mut update = presentation.clone();
             update.metadata.sampled_at = observed_at();
-            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update })
+            crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update }
         } else {
             let mut snapshot = state.clone();
             snapshot.sampled_at = observed_at();
-            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+            crate::terminal_ipc::ServerResponse::ChatSnapshot {
                 chat_id,
                 snapshot: Some(snapshot),
-            })
+            }
+        };
+        drop(state);
+        drop(store);
+        if fill && self.0.visible.load(Ordering::Acquire) {
+            self.wake();
         }
+        Some(response)
     }
     pub fn session_id(&self) -> Option<String> {
         self.0
@@ -1823,6 +1861,9 @@ fn preflight_inner(
         return Err("Provider initialization exceeds stdin queue capacity".into());
     }
     let mut store = Store::new().map_err(SetupError::Unavailable)?;
+    if spec.followed {
+        store.follow();
+    }
     store.file_cwd = Some(spec.working_directory.clone());
     store.recognize_messages(spec.messages.clone());
     let mut metadata = Vec::new();
@@ -3043,9 +3084,7 @@ impl Actor {
                             _ => false,
                         };
                         if !valid {
-                            let _ = refuse(
-                                "A settled run may only decline a current pending request".into(),
-                            );
+                            let _ = refuse(NOT_A_DECLINE.into());
                             continue;
                         }
                     }
@@ -3150,6 +3189,24 @@ impl Actor {
                             let _ = reply.send(Ok(()));
                             continue;
                         }
+                        // An earlier page asked for to fill the window is
+                        // still on its way, and it answers the reader too:
+                        // a second request would be refused as a second load.
+                        if command == Command::LoadEarlier
+                            && self
+                                .state
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .history_loading
+                            && self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .adopt_fill()
+                        {
+                            let _ = reply.send(Ok(()));
+                            continue;
+                        }
                     }
                     Err(error) => {
                         let _ = refuse(error);
@@ -3211,6 +3268,7 @@ impl Actor {
                 let _ = refuse(error);
                 continue;
             }
+            let loads_earlier = command == Command::LoadEarlier;
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -3238,6 +3296,14 @@ impl Actor {
                     }
                 }
                 Err(message) => {
+                    if loads_earlier {
+                        // The fill that follows must not ask again for the
+                        // page the reader was just refused.
+                        self.store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .history_failed();
+                    }
                     self.apply(Event::Error {
                         message: message.clone(),
                         fatal: false,
@@ -3246,7 +3312,62 @@ impl Actor {
                 }
             }
         }
-        Ok(())
+        if closing {
+            return Ok(());
+        }
+        self.fill_history()
+    }
+    /// Asks the provider for the earlier page the transcript window has room
+    /// for, which no reader asked for; see [`Store::fill`].
+    ///
+    /// Only while someone has the conversation shown: the host reads windows
+    /// of conversations nobody shows, and a page arriving there would change
+    /// the generation that its release and retirement checks hold.
+    fn fill_history(&mut self) -> Result<(), String> {
+        if self.stop.load(Ordering::Acquire)
+            || !self.visible.load(Ordering::Acquire)
+            || self.queued > QUEUE_BACKPRESSURE
+            || self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .history_loading
+            || !self.store.lock().unwrap_or_else(|p| p.into_inner()).fill()
+        {
+            return Ok(());
+        }
+        match self.adapter.command(Command::LoadEarlier) {
+            Ok(step) => {
+                // A provider may decline without saying so, as one with no
+                // history to page yet does.
+                let answered = step.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::History { .. }
+                            | Event::HistoryLoading(true)
+                            | Event::HistoryError(_)
+                    )
+                });
+                self.step(step)?;
+                if !answered {
+                    self.store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .history_failed();
+                }
+                Ok(())
+            }
+            // Nobody asked for this page, so its failure is nobody's error.
+            // The reader can still ask for it, and hear why it failed.
+            Err(error) => {
+                tracing::debug!(%error, "No earlier history to fill the transcript window");
+                self.store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .history_failed();
+                Ok(())
+            }
+        }
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
@@ -4565,6 +4686,7 @@ pub(crate) fn notification_frames_with_probe_for_test<R>(
     let directory = tempfile::tempdir().unwrap();
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),

@@ -665,7 +665,10 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
         paused_terminals: vec![terminal],
     });
     let report = survivors.paused_report();
-    assert!(report.contains("Offline tool rows · alpha: choose Resume conversation in the new tab (+) menu to continue"), "{report}");
+    assert!(
+        report.contains("Offline tool rows · alpha: open its tab to continue"),
+        "{report}"
+    );
     assert!(
         report.contains("Build shell · alpha: reopen a terminal to continue"),
         "{report}"
@@ -2435,7 +2438,7 @@ fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
         }
         if ordinary_answer == "\n" {
             for message in [
-                "Waiting for these conversations to finish their turns:",
+                "Waiting for these conversations to finish their current work:",
                 "Ctrl-C cancels the update; nothing has been ended or stopped.",
             ] {
                 assert_eq!(output.matches(message).count(), 1, "{output}");
@@ -2556,7 +2559,8 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
             kind: super::super::source_inspection::StoppedKind::Chat,
             label: "stale saved label".into(),
             reason: "its conversation could not be confirmed".into(),
-            recovery: "Choose Resume conversation in the new tab (+) menu".into(),
+            recovery: "Open its tab; if the conversation doesn't reopen, the tab says what to do"
+                .into(),
         });
     let mut survivors = Survivors::default();
     assert!(survivors.prepared_report().is_empty());
@@ -2570,7 +2574,7 @@ fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery(
         ),
         "{report}"
     );
-    assert!(report.contains("Reviewed paused conversation: current turn interrupted; after the update: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu"), "{report}");
+    assert!(report.contains("Reviewed paused conversation: current turn interrupted; after the update: its conversation could not be confirmed. Open its tab; if the conversation doesn't reopen, the tab says what to do"), "{report}");
     assert!(
         report.contains("3 background tasks stopped; they do not resume automatically."),
         "{report}"

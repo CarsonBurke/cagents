@@ -870,8 +870,7 @@ impl Cagents {
                         _ => None,
                     }),
             );
-        self.worktree_paths
-            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        self.refresh_worktree_paths();
         self.known_worktree_roots.resolve_new(&self.worktree_paths);
         let index = &self.worktree_paths;
         let known = &self.known_worktree_roots;
@@ -910,6 +909,18 @@ impl Cagents {
         selected.map(resolve)
     }
 
+    /// Rebuilds the index of the paths Projects lists, and places each
+    /// inspected conversation's Work rows again when it changed, since
+    /// which rows there are depends on it.
+    fn refresh_worktree_paths(&mut self) {
+        let generation = self.worktree_paths.generation();
+        self.worktree_paths
+            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        if self.worktree_paths.generation() != generation {
+            self.place_inspected_work();
+        }
+    }
+
     /// Refresh which worktree rows hold an open pane after state changes,
     /// never during rendering.
     ///
@@ -937,8 +948,7 @@ impl Cagents {
             terminal_output_tests::record_folder_root_refresh();
             self.refresh_worktree_owners(None);
         }
-        self.worktree_paths
-            .refresh(&self.known_worktree_roots, &self.sidebar_model.projects);
+        self.refresh_worktree_paths();
         let index = &self.worktree_paths;
         let channeled = channeled_cards(&self.durable);
         // One resolution per pane serves both occupancy and where the pane

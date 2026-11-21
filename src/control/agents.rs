@@ -35,7 +35,7 @@ pub enum AgentCommand {
         /// Unique lowercase handle among your open agents, such as reviewer.
         #[arg(long)]
         name: Option<String>,
-        /// claude, codex or omp; defaults to the calling session's.
+        /// claude, codex, agy, muse or omp; defaults to the calling session's.
         #[arg(long, value_parser = parse_provider)]
         provider: Option<Provider>,
         /// The open project to work in, by any directory inside it; defaults
@@ -62,13 +62,12 @@ pub enum AgentCommand {
         surface: String,
         #[arg(long)]
         #[arg(
-            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. OMP: provider/model. The native chat model picker lists available IDs"
+            help = "Provider model ID; omit for the provider default. Claude: an alias the installed Claude Code resolves, such as fable, opus, sonnet or haiku, or a full ID such as claude-fable-5-2. Codex: an exact provider catalog ID. Antigravity: a model ID such as gemini-3.8-flash. Muse: a model ID such as muse-spark-1.2. Oh My Pi: provider/model. The native chat model picker lists available IDs"
         )]
         model: Option<String>,
         #[arg(long, value_name = "MODE")]
-        #[arg(help = "Permission policy. Claude: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never. OMP: always-ask, write or yolo",
-            hide_possible_values = true,
-            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
+        #[arg(help = "Permission policy. Claude Code: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never, each optionally followed by /read-only, /workspace-write or /danger-full-access. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never. Oh My Pi: always-ask, write or yolo. An agent's child gets no more than the agent's own mode",
+            value_parser = permission_mode)]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long, value_name = "EFFORT")]
@@ -211,6 +210,9 @@ pub struct ShowArgs {
     #[arg(long, default_value_t = 20)]
     tail: usize,
 }
+
+/// The providers an agent can be spawned with: those with native chat.
+const CHOOSE_PROVIDER: &str = "Choose --provider claude, codex, agy, muse or omp";
 
 pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
@@ -547,6 +549,19 @@ impl Handles {
 
     fn name(self, id: impl std::fmt::Display) -> String {
         super::format::prefix(&id.to_string(), self.0).to_owned()
+    }
+}
+
+/// A `--permission-mode` value one of the providers names; the request's own
+/// provider is checked once the provider is resolved.
+fn permission_mode(value: &str) -> Result<String, String> {
+    if Provider::ALL
+        .into_iter()
+        .any(|provider| provider.check_permission_mode(value).is_ok())
+    {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("unknown permission mode {value:?}"))
     }
 }
 
@@ -1361,17 +1376,11 @@ pub(super) fn execute_with_context(
                 Some(provider) => {
                     return Err(AppError::new(
                         "agent_request",
-                        format!(
-                            "{} Choose --provider claude, codex, or omp",
-                            provider.native_chat_refusal()
-                        ),
+                        format!("{} {CHOOSE_PROVIDER}", provider.native_chat_refusal()),
                     ));
                 }
                 None => {
-                    return Err(AppError::new(
-                        "agent_request",
-                        "Choose --provider claude, codex, or omp",
-                    ));
+                    return Err(AppError::new("agent_request", CHOOSE_PROVIDER));
                 }
             };
             let request = Submit {
@@ -2289,6 +2298,50 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_help_names_each_provider_s_own_permission_modes() {
+        use clap::CommandFactory;
+        let mut command = crate::control::Cli::command();
+        command.build();
+        let spawn = command
+            .find_subcommand("agent")
+            .and_then(|agent| agent.find_subcommand("spawn"))
+            .unwrap();
+        let argument = spawn
+            .get_arguments()
+            .find(|argument| argument.get_id() == "permission_mode")
+            .unwrap();
+        // The parser takes exactly the names some provider takes; the
+        // request's own provider refuses the rest of them.
+        for provider in Provider::ALL {
+            for mode in provider
+                .permission_modes()
+                .iter()
+                .chain(provider.permission_mode_aliases())
+            {
+                assert_eq!(permission_mode(mode).as_deref(), Ok(*mode));
+            }
+        }
+        for mode in ["on-request/read-only", "never/danger-full-access"] {
+            assert_eq!(permission_mode(mode).as_deref(), Ok(mode));
+        }
+        for mode in ["Default", "", "yolo/read-only", "never/full", "never/"] {
+            assert!(permission_mode(mode).is_err(), "{mode}");
+        }
+        let help = argument.get_help().unwrap().to_string();
+        for provider in Provider::ALL {
+            let named = format!(
+                "{}: {}",
+                provider.label(),
+                provider.permission_mode_choices()
+            );
+            assert!(
+                help.contains(&format!("{named}.")) || help.ends_with(&named),
+                "{help} lacks {named}"
+            );
+        }
+    }
 
     #[test]
     fn mailbox_requests_wait_for_store_replies_beyond_the_ordinary_socket_timeout() {

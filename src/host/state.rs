@@ -68,6 +68,9 @@ pub(crate) type SharedHost = Arc<HostLock>;
 
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
+    /// Finite presentation revisions outlive disconnected viewports. Hidden
+    /// reconnects suppress replay instead of sending their retained revision.
+    presentation_watermark: u64,
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
@@ -325,6 +328,9 @@ pub(crate) struct HostState {
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
+    /// The capability each of those connections authenticated with last,
+    /// from which its own permission ceiling is read.
+    pub(super) agent_client_authorities: BTreeMap<ClientId, crate::agent_execution::Authority>,
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
@@ -390,7 +396,7 @@ pub(crate) struct HostState {
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     /// Subset of transition reservations that retire an exact original source.
-    pub(super) chat_close_reservations: BTreeMap<TerminalId, crate::chat::Session>,
+    pub(super) chat_close_reservations: BTreeMap<TerminalId, super::chat::capacity::CloseRemoval>,
     pub(super) pane_chat_starts: BTreeMap<CardId, super::chat::pane_start::Claim>,
     /// Private inventory exclusions for exact historical cleanup reservations.
     pub(super) historical_chat_retirements: BTreeMap<TerminalId, crate::chat::Session>,
@@ -473,6 +479,13 @@ impl Drop for PreparedTerminalInput {
 }
 
 impl HostState {
+    /// Tells the Work tracker about the chat `id`, just put in `chats`.
+    pub(super) fn chat_added(&self, id: TerminalId) {
+        if let (Some(work), Some(record)) = (&self.work, self.chats.get(&id)) {
+            work.chat_added(record.session.launch.provider);
+        }
+    }
+
     pub(super) fn enable_holder_recovery(&mut self) {
         self.recover_holders = true;
     }
@@ -503,6 +516,7 @@ impl HostState {
             workspace_registry: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
+            agent_client_authorities: BTreeMap::new(),
             automations: None,
             work: None,
             mailbox: None,
@@ -602,6 +616,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.agent_client_authorities.remove(&client_id);
     }
 
     /// Installs the durable shared sidebar model.
@@ -1062,6 +1077,9 @@ impl HostState {
                     .map(|record| record.handle.clone())
             })
             .collect::<Vec<_>>();
+        for (terminal_id, _) in &terminals {
+            self.retain_presentation_watermark(client_id, *terminal_id);
+        }
         self.subscriptions.disconnect(client_id);
         for (terminal_id, old_visibility) in terminals {
             self.refresh_presentation_owner(terminal_id);
@@ -1080,6 +1098,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.agent_client_authorities.remove(&client_id);
         handles
     }
 
@@ -1112,18 +1131,20 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<(), ProtocolError> {
-        let record = self
-            .terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
+        if !self.terminals.contains_key(&terminal_id) {
+            return Err(not_found(terminal_id));
+        }
         if !self.subscriptions.attached(client_id, terminal_id) {
             return Ok(());
         }
+        self.retain_presentation_watermark(client_id, terminal_id);
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
         let new_visibility = self.subscriptions.visibility(terminal_id);
         if old_visibility != new_visibility {
-            record.handle.set_host_visibility(new_visibility);
+            self.terminals[&terminal_id]
+                .handle
+                .set_host_visibility(new_visibility);
         }
         self.refresh_presentation_owner(terminal_id);
         self.disarm_output_if_observed(terminal_id);
@@ -1626,7 +1647,7 @@ impl HostState {
         let id = session.id;
         let instance = handle.execution_instance();
         let descriptor = self.install_startup_parent(
-            client_id,
+            Some(client_id),
             session,
             handle,
             initially_visible,
@@ -1639,9 +1660,11 @@ impl HostState {
         Ok(descriptor)
     }
 
+    /// Installs a starting terminal's worker, attaching `subscriber` hidden
+    /// when the request came from a client that will present it.
     fn install_startup_parent(
         &mut self,
-        client_id: ClientId,
+        subscriber: Option<ClientId>,
         mut session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
@@ -1665,6 +1688,7 @@ impl HostState {
             terminal_id,
             TerminalRecord {
                 screen_lost_after_crash: false,
+                presentation_watermark: 0,
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
@@ -1683,6 +1707,9 @@ impl HostState {
                 working_directory: None,
             },
         );
+        let Some(client_id) = subscriber else {
+            return self.descriptor_as(false, terminal_id);
+        };
         let visibility = if initially_visible {
             TerminalVisibility::Visible
         } else {
@@ -4696,6 +4723,11 @@ fn start_terminal_view_owned_reserved(
     }
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
+    // A native chat starts its terminal from the chat's own connection, which
+    // reads only that chat's frames and ends its presentation on anything
+    // else. The window attaches the terminal on a terminal connection once it
+    // has the handoff, so that requester never subscribes to it here.
+    let subscriber = execution_environment.is_none().then_some(client_id);
     let repair = {
         let state = shared.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -4706,14 +4738,7 @@ fn start_terminal_view_owned_reserved(
     };
     if let Some(handle) = repair {
         let descriptor =
-            publish_installed_terminal(shared, Some(client_id), session.id, &handle, &options)?;
-        if execution_environment.is_some() {
-            shared
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .subscriptions
-                .detach(client_id, session.id);
-        }
+            publish_installed_terminal(shared, subscriber, session.id, &handle, &options)?;
         return Ok((descriptor, handle));
     }
     let recovery = {
@@ -4800,7 +4825,6 @@ fn start_terminal_view_owned_reserved(
         )?;
     }
     let terminal_id = session.id;
-    let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
     // Adoption already inspected this holder's issued source. Keep that exact
     // receipt alias in the independently installed owner, including when the
@@ -4839,13 +4863,8 @@ fn start_terminal_view_owned_reserved(
             let handle = pending.handle.clone();
             drop(state);
             drop(registry);
-            let descriptor = publish_installed_terminal(
-                shared,
-                Some(client_id),
-                terminal_id,
-                &handle,
-                &options,
-            )?;
+            let descriptor =
+                publish_installed_terminal(shared, subscriber, terminal_id, &handle, &options)?;
             return Ok((descriptor, handle));
         }
         if let Some(reservation) = &reservation {
@@ -5056,7 +5075,7 @@ fn start_terminal_view_owned_reserved(
             // exact Handle before its thread may send CommitAdoption.
             state
                 .install_startup_parent(
-                    client_id,
+                    subscriber,
                     install_session,
                     handle.clone(),
                     false,
@@ -5143,7 +5162,7 @@ fn start_terminal_view_owned_reserved(
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
         if !adopting
             && let Err(error) = state.install_startup_parent(
-                client_id,
+                subscriber,
                 registered_session,
                 handle.clone(),
                 false,
@@ -5194,7 +5213,7 @@ fn start_terminal_view_owned_reserved(
 
     let descriptor = match publish_installed_terminal(
         shared,
-        Some(client_id),
+        subscriber,
         terminal_id,
         &handle,
         &options,
@@ -5207,13 +5226,6 @@ fn start_terminal_view_owned_reserved(
             return Err(error);
         }
     };
-    if native_handoff {
-        shared
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .subscriptions
-            .detach(client_id, terminal_id);
-    }
     Ok((descriptor, redraw_handle))
 }
 

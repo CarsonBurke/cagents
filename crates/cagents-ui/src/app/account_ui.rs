@@ -157,6 +157,9 @@ pub(super) struct State {
     /// [`State::catalogs_unsaved`] is already due.
     saving_live: bool,
     omp: OmpRecord,
+    /// Providers the settings turn off: their accounts are neither listed
+    /// nor checked, and nothing offers them for new work.
+    turned_off: BTreeSet<Provider>,
 }
 
 /// Omp's usage record, which lists the accounts Omp keeps and is read
@@ -341,6 +344,7 @@ impl State {
             catalogs_unsaved: BTreeSet::new(),
             saving_live: false,
             omp: OmpRecord::default(),
+            turned_off: BTreeSet::new(),
         };
         state.sync_accounts();
         state
@@ -641,12 +645,58 @@ impl State {
             .min_by_key(|other| !other.account.is_system())
     }
 
-    /// The accounts of `provider`, in list order.
+    /// The accounts of `provider`, in list order, whether or not the
+    /// provider is turned off: a conversation still open on it keeps its
+    /// account, its limit handling and its login checks. What is listed or
+    /// offered asks [`Self::uses`] as well.
     fn of(&self, provider: Provider) -> impl Iterator<Item = &AccountState> {
         self.accounts
             .iter()
             .filter(move |account| account.account.provider == provider)
             .filter(|account| self.listed(account))
+    }
+
+    /// Whether `provider` is in use, rather than turned off in the settings.
+    pub(super) fn uses(&self, provider: Provider) -> bool {
+        !self.turned_off.contains(&provider)
+    }
+
+    /// The providers turned off in the settings, in the order the app lists
+    /// providers.
+    pub(super) fn turned_off(&self) -> impl Iterator<Item = Provider> + '_ {
+        Account::REPORTED
+            .into_iter()
+            .filter(|provider| self.turned_off.contains(provider))
+    }
+
+    /// Takes the providers `settings` turns off; whether that changed them.
+    pub(super) fn set_turned_off(&mut self, settings: &AppSettings) -> bool {
+        let turned_off: BTreeSet<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|provider| !settings.uses_provider(*provider))
+            .collect();
+        if turned_off == self.turned_off {
+            return false;
+        }
+        self.turned_off = turned_off;
+        if self
+            .popover
+            .as_ref()
+            .and_then(|id| self.account(id))
+            .is_some_and(|account| !self.uses(account.account.provider))
+        {
+            self.popover = None;
+        }
+        self.table.close_popups();
+        if self
+            .table
+            .link
+            .as_ref()
+            .is_some_and(|(provider, _)| !self.uses(*provider))
+        {
+            self.table.link = None;
+        }
+        true
     }
 
     /// Whether `account` is listed, rather than archived.
@@ -682,7 +732,7 @@ impl State {
                 let mut snapshot = entry.snapshot;
                 snapshot.source = UsageSource::Cache;
                 state.schedule.observe(snapshot.observed_at);
-                state.inventory_observed_at = Some(snapshot.observed_at);
+                state.inventory_observed_at = Some(entry.inventory_observed_at.unwrap_or(0));
                 state.identity = entry.identity;
                 state.snapshot = Some(snapshot);
             }
@@ -737,9 +787,11 @@ impl State {
     /// Whether a new conversation can be started on `provider`: it has
     /// listed its models before, or one of its accounts has a CLI to run.
     pub(super) fn offers(&self, provider: Provider) -> bool {
-        self.catalog(provider)
-            .is_some_and(|catalog| !catalog.models.is_empty())
-            || self.of(provider).any(|account| account.present)
+        self.uses(provider)
+            && (self
+                .catalog(provider)
+                .is_some_and(|catalog| !catalog.models.is_empty())
+                || self.of(provider).any(|account| account.present))
     }
 
     /// Takes what `provider` listed, unless what is known is newer: another
@@ -778,6 +830,7 @@ impl State {
                     Entry {
                         identity: state.identity.clone(),
                         snapshot: state.snapshot.clone()?,
+                        inventory_observed_at: state.inventory_observed_at,
                     },
                 ))
             })
@@ -971,7 +1024,7 @@ impl AccountState {
         // A result from before this login cannot confirm the new login intent.
         // Abandon that scheduling slot so a fresh verification can start.
         self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
-        self.reset = resets::State::default();
+        self.reset.begin_sign_in();
         self.limit_refresh_identity = None;
         self.inventory_observed_at = None;
         self.limit_wake = None;
@@ -1904,8 +1957,11 @@ fn chip_with_window(
                 .clone()
                 .unwrap_or_else(|| format!("{name} reports no usage")),
         },
+        // A limit with no window to show, as for a login with no allowance at
+        // all, is still a limit.
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
-            if snapshot.ordinary_usage_allowed == Some(false) =>
+            if snapshot.ordinary_usage_allowed == Some(false)
+                || (snapshot.status == UsageStatus::Limited && window_of(snapshot).is_none()) =>
         {
             Chip {
                 text: "Limited".into(),
@@ -1916,17 +1972,35 @@ fn chip_with_window(
                     ChipTone::Attention
                 },
                 essential: true,
-                tooltip: format!("{name} reports usage is limited"),
+                // Only a window-less limit says why in its detail; another
+                // limit's detail describes its windows, not the limit.
+                tooltip: snapshot
+                    .detail
+                    .clone()
+                    .filter(|_| window_of(snapshot).is_none())
+                    .unwrap_or_else(|| format!("{name} reports usage is limited")),
             }
         }
         UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited => {
             let Some(window) = window_of(snapshot) else {
-                return Chip {
-                    text: "No limits".into(),
-                    usage_fraction: None,
-                    tone: ChipTone::Current,
-                    essential: false,
-                    tooltip: format!("{name} reports no usage limits for this account"),
+                return if account::reports_usage_limits(account.account.provider) {
+                    Chip {
+                        text: "No limits".into(),
+                        usage_fraction: None,
+                        tone: ChipTone::Current,
+                        essential: false,
+                        tooltip: format!("{name} reports no usage limits for this account"),
+                    }
+                } else {
+                    Chip {
+                        text: "Limits not reported".into(),
+                        usage_fraction: None,
+                        tone: ChipTone::Current,
+                        essential: false,
+                        tooltip: format!(
+                            "{name} is signed in. It does not report its usage limits, so cagents cannot show them."
+                        ),
+                    }
                 };
             };
             let stale = is_stale(snapshot, now);
@@ -1995,9 +2069,16 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Claude, _) => &["auth", "login", "--claudeai"],
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
-        (Provider::Omp | Provider::Antigravity | Provider::Muse, _) => return None,
+        (Provider::Antigravity, _) => ANTIGRAVITY_LOGIN,
+        // A device code shown in the terminal, approved in any browser.
+        (Provider::Muse, _) => &["login"],
+        (Provider::Omp, _) => return None,
     })
 }
+
+/// Antigravity's sign-in, which its ACP server offers a client to run in a
+/// terminal: Google's, in the browser, after which `agy` exits.
+const ANTIGRAVITY_LOGIN: &[&str] = &["acp", "--login", "--disable-telemetry"];
 
 /// The terminal that runs `account`'s login command: the CLI at `program`,
 /// the same executable the probes run, started in the reader's home - not in
@@ -2041,7 +2122,14 @@ fn login_launch_with_path(
             .iter()
             .map(|name| (*name).into())
             .collect(),
-        program: program.to_str()?.to_owned(),
+        // Muse's `muse` may be a wrapper that cannot run `login`.
+        program: account.provider.subcommand_program(
+            program.to_str()?,
+            &home,
+            search_path
+                .and_then(|path| path.to_str())
+                .unwrap_or_default(),
+        ),
         arguments: command
             .iter()
             .map(|argument| (*argument).to_owned())
@@ -2053,14 +2141,54 @@ fn login_launch_with_path(
     Some(recipe)
 }
 
+/// The provider sign-ins running in open terminals, as of a workspace and
+/// an account list, so a frame asks whether an account is signing in without
+/// passing over every card or resolving any account's home.
+#[derive(Default)]
+pub(super) struct SignIns {
+    /// The workspace the sign-ins were read from. Holding it weakly pins its
+    /// allocation, so a changed workspace always has a different address.
+    source: std::sync::Weak<WorkspaceState>,
+    /// The [`Accounts`] revision each sign-in's accounts were matched at.
+    accounts: u64,
+    running: Vec<RunningSignIn>,
+}
+
+/// An open terminal whose sign-in process has not ended.
+struct RunningSignIn {
+    card: CardId,
+    launch: LaunchRecipe,
+    /// The listed accounts it signs in to (see [`signs_in`]).
+    accounts: Vec<Account>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SIGN_IN_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has passed over every card for the sign-ins
+/// running in them.
+#[cfg(test)]
+pub(super) fn sign_in_scans() -> usize {
+    SIGN_IN_SCANS.with(std::cell::Cell::get)
+}
+
 /// Whether the sign-in `recipe` signs `account` in: whether it names the
 /// account's home, as every sign-in on an account with a home of its own
 /// does, and one started before cagents stopped exporting the system default
 /// did; or names none, as one on the system account does (see
 /// [`Account::launch_home`]).
 fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
-    let Some(variable) = account::home_variable(account.provider) else {
+    // Another provider's login signs in none of this one's accounts, though
+    // neither names a home.
+    if sign_in_provider(recipe) != Some(account.provider) {
         return false;
+    }
+    // A provider without a home of its own, as Muse, has only its system
+    // account, which every one of its sign-ins signs in.
+    let Some(variable) = account::home_variable(account.provider) else {
+        return account.is_system();
     };
     let named = recipe
         .environment
@@ -2068,12 +2196,12 @@ fn signs_in(account: &Account, recipe: &LaunchRecipe) -> bool {
         .filter(|value| !value.is_empty() && !recipe.unset_environment.contains(variable))
         .map(PathBuf::from);
     match named {
-        Some(named) => account.resolved_home() == Some(named),
+        Some(named) => resolved_home(account) == Some(named),
         // An unset home is the CLI's default, which only a system account
         // exporting no home of its own resolves (as `ProviderChoices::running`).
         None => {
             account.is_system()
-                && (!recipe.unset_environment.contains(variable) || account.launch_home().is_none())
+                && (!recipe.unset_environment.contains(variable) || launch_home(account).is_none())
         }
     }
 }
@@ -2095,18 +2223,19 @@ fn signed_in(session: &TerminalSession) -> bool {
 /// Whether `recipe` runs a provider's sign-in, as [`login_launch`] builds
 /// it or as a reader types it.
 pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
-    let program = Path::new(&recipe.program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let arguments: Vec<&str> = recipe.arguments.iter().map(String::as_str).collect();
-    matches!(
-        (program, arguments.as_slice()),
-        ("claude", ["auth", "login"])
-            | ("claude", ["auth", "login", "--claudeai"])
-            | ("codex", ["login"])
-            | ("codex", ["login", "--device-auth"])
-    )
+    sign_in_provider(recipe).is_some()
+}
+
+/// The provider whose login `recipe` runs, if it runs one: the command
+/// [`login_arguments`] gives, or Claude's older `auth login`.
+fn sign_in_provider(recipe: &LaunchRecipe) -> Option<Provider> {
+    let (provider, arguments) = Provider::launched(recipe)?;
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let login = [false, true]
+        .into_iter()
+        .filter_map(|device| login_arguments(provider, device))
+        .any(|login| login == arguments.as_slice());
+    (login || (provider == Provider::Claude && arguments == ["auth", "login"])).then_some(provider)
 }
 
 #[cfg(test)]
@@ -2173,6 +2302,9 @@ impl<'a> RecipeHome<'a> {
 #[derive(Default)]
 pub(super) struct Accounts {
     state: State,
+    /// Counts the times the state was reached mutably, so a value derived
+    /// from it can tell it may have changed (see [`SignIns`]).
+    revision: u64,
     /// One for each way [`AccountUsageDisplay`] states usage, which the
     /// settings choose between.
     choices: [std::cell::OnceCell<Choices>; AccountUsageDisplay::ALL.len()],
@@ -2182,6 +2314,7 @@ impl From<State> for Accounts {
     fn from(state: State) -> Self {
         Self {
             state,
+            revision: 0,
             choices: Default::default(),
         }
     }
@@ -2200,6 +2333,7 @@ impl std::ops::DerefMut for Accounts {
         for choices in &mut self.choices {
             choices.take();
         }
+        self.revision = self.revision.wrapping_add(1);
         &mut self.state
     }
 }
@@ -2437,10 +2571,13 @@ impl Cagents {
             })
             .collect();
         accounts.push(Account::system(Provider::Omp));
+        accounts.retain(|account| self.account_ui.uses(account.provider));
         accounts
     }
     /// The models, and their efforts, a new conversation's composer offers.
     pub(super) fn automation_models(&self) -> crate::automation_ui::Models {
+        // Every provider's, even one turned off: an automation saved on it
+        // keeps its listed model and efforts. The editor offers the providers.
         Provider::ALL
             .into_iter()
             .filter_map(|provider| {
@@ -3002,6 +3139,16 @@ impl Cagents {
         } else {
             trigger
         };
+        // A provider turned off is not checked while no conversation is open
+        // on it. One still open needs its accounts' figures current, to know
+        // when its limit resets and which account Automatic switches to.
+        let provider = self.account_ui.account(id)?.account.provider;
+        if trigger != Trigger::Limit
+            && !self.account_ui.uses(provider)
+            && !self.chat_open_on(provider)
+        {
+            return None;
+        }
         if trigger == Trigger::Limit {
             let state = self.account_ui.account_mut(id)?;
             if !state
@@ -3345,7 +3492,15 @@ impl Cagents {
                 state.present = true;
                 state.failure = None;
             }
-            if !state.refresh_plan {
+            // A report about one model's allowance leaves a signed-out
+            // reading signed out, and the sign-in watch continues while the
+            // reading still says the account needs a login.
+            if !state.refresh_plan
+                && state
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status != UsageStatus::NeedsLogin)
+            {
                 state.schedule.login_settled();
             }
         }
@@ -4855,19 +5010,91 @@ impl Cagents {
     }
 
     pub(super) fn account_sign_in_running(&self, account: &Account) -> bool {
-        if self.account_ui.account(&account.id()).is_some_and(|state| {
-            state.account == *account && self.account_ui.preparing_logins.contains(&state.owner)
-        }) {
+        let listed = self
+            .account_ui
+            .account(&account.id())
+            .filter(|state| state.account == *account);
+        if listed.is_some_and(|state| self.account_ui.preparing_logins.contains(&state.owner)) {
             return true;
         }
-        self.durable.cards.iter().any(|card| {
-            card.existence.is_open()
-                && !matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
-                && matches!(&card.kind, CardKind::Terminal(session)
-                    if is_sign_in(&session.launch)
-                        && !terminal_ended(session)
-                        && signs_in(account, &session.launch))
+        let failed = |card: CardId| matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)));
+        // Within an update the workspace or the accounts may have moved on
+        // from the index, which the update's end brings up to date.
+        if !self.sign_ins_current() {
+            return self
+                .running_sign_ins()
+                .any(|(card, launch)| !failed(card) && signs_in(account, launch));
+        }
+        self.sign_ins.running.iter().any(|sign_in| {
+            !failed(sign_in.card)
+                && if listed.is_some() {
+                    sign_in.accounts.contains(account)
+                } else {
+                    signs_in(account, &sign_in.launch)
+                }
         })
+    }
+
+    /// The open terminals running a provider's sign-in whose process has not
+    /// ended, whether or not their runtime failed. A pass over every card.
+    fn running_sign_ins(&self) -> impl Iterator<Item = (CardId, &LaunchRecipe)> {
+        #[cfg(test)]
+        SIGN_IN_SCANS.with(|count| count.set(count.get() + 1));
+        self.durable
+            .cards
+            .iter()
+            .filter_map(|card| match &card.kind {
+                CardKind::Terminal(session)
+                    if card.existence.is_open()
+                        && is_sign_in(&session.launch)
+                        && !terminal_ended(session) =>
+                {
+                    Some((card.id, &session.launch))
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether [`Self::sign_ins`] was read from the current workspace and
+    /// matched against the current accounts.
+    fn sign_ins_current(&self) -> bool {
+        self.sign_ins.source.as_ptr() == Arc::as_ptr(&self.durable)
+            && self.sign_ins.accounts == self.account_ui.revision
+    }
+
+    /// Brings [`Self::sign_ins`] up to the workspace and the accounts, at the
+    /// end of an update, so the frame it ends in looks the sign-ins up.
+    ///
+    /// The cards are read again only when the workspace changed, which is
+    /// how a sign-in terminal opens, ends or closes. The accounts each signs
+    /// in to are matched again when the accounts may have changed, which
+    /// costs nothing while no sign-in runs.
+    pub(super) fn sync_sign_ins(&mut self) {
+        if self.sign_ins_current() {
+            return;
+        }
+        if self.sign_ins.source.as_ptr() != Arc::as_ptr(&self.durable) {
+            let running = self
+                .running_sign_ins()
+                .map(|(card, launch)| RunningSignIn {
+                    card,
+                    launch: launch.clone(),
+                    accounts: Vec::new(),
+                })
+                .collect();
+            self.sign_ins.running = running;
+            self.sign_ins.source = Arc::downgrade(&self.durable);
+        }
+        for sign_in in &mut self.sign_ins.running {
+            sign_in.accounts = self
+                .account_ui
+                .accounts
+                .iter()
+                .filter(|state| signs_in(&state.account, &sign_in.launch))
+                .map(|state| state.account.clone())
+                .collect();
+        }
+        self.sign_ins.accounts = self.account_ui.revision;
     }
 
     /// Opens a terminal running a provider's login, which keeps no
@@ -5990,6 +6217,13 @@ impl Cagents {
             .map(|state| state.account.clone())
     }
 
+    /// What the reader calls the known account `id`, as its pickers name it.
+    pub(super) fn account_label(&self, id: &AccountId) -> Option<String> {
+        self.account_ui
+            .account(id)
+            .map(|state| self.account_ui.display_name(state))
+    }
+
     /// The account a conversation launched as `recipe` runs on, if it is
     /// one cagents knows.
     pub(super) fn chat_account(
@@ -6081,11 +6315,20 @@ impl Cagents {
             .count()
     }
 
+    /// Whether a conversation on `provider` is open in some pane.
+    fn chat_open_on(&self, provider: Provider) -> bool {
+        self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Chat(session) if session.launch.provider == provider)
+        })
+    }
+
     /// The per-provider default choices the settings pane offers.
     pub(super) fn default_account_choices(&self) -> Vec<(Provider, Vec<DefaultChoice>)> {
         let state = &self.account_ui;
         Account::PROVIDERS
             .into_iter()
+            .filter(|provider| state.uses(*provider))
             .map(|provider| {
                 (
                     provider,
@@ -6154,6 +6397,9 @@ impl Cagents {
     /// checked leads as itself; failing that, the first listed.
     fn chip_lead(&self, provider: Provider) -> Option<(&AccountState, usize)> {
         let state = &self.account_ui;
+        if !state.uses(provider) {
+            return None;
+        }
         let present: Vec<&AccountState> = state
             .of(provider)
             .filter(|account| state.shown_in_switcher(account))
@@ -8016,6 +8262,34 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_without_a_window_reads_as_limited_not_unlimited() {
+        // Muse reports a login with no subscription allowance this way.
+        let mut limited = snapshot(Vec::new(), NOW);
+        limited.status = UsageStatus::Limited;
+        limited.detail = Some("This Muse login has no subscription allowance".into());
+        let summary = chip(
+            &state_with(Some(limited)),
+            "Muse",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(summary.text, "Limited");
+        assert_eq!(summary.tone, ChipTone::Attention);
+        assert_eq!(
+            summary.tooltip,
+            "This Muse login has no subscription allowance"
+        );
+
+        let unlimited = chip(
+            &state_with(Some(snapshot(Vec::new(), NOW))),
+            "Muse",
+            NOW,
+            AccountUsageDisplay::Left,
+        );
+        assert_eq!(unlimited.text, "No limits");
+    }
+
+    #[test]
     fn old_figures_and_figures_from_before_a_reset_are_shown_as_of_when_they_were_read() {
         let observed = NOW - schedule::DISPLAY_STALE_AFTER - 1;
         let old = chip(
@@ -8147,6 +8421,31 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_sign_in_signs_in_its_system_account() {
+        let system = Account::system(Provider::Muse);
+        let launch = login_launch(
+            &system,
+            Path::new("/opt/bin/muse-upstream"),
+            PathBuf::from("/h"),
+            false,
+        )
+        .expect("Muse logs in");
+        assert_eq!(launch.arguments, ["login"]);
+        assert_eq!(Provider::recognize_launch(&launch), None);
+        assert!(is_sign_in(&launch));
+        assert!(signs_in(&system, &launch));
+        assert!(!signs_in(&Account::system(Provider::Codex), &launch));
+        let claude = login_launch(
+            &Account::system(Provider::Claude),
+            Path::new("/opt/bin/claude"),
+            PathBuf::from("/h"),
+            false,
+        )
+        .expect("Claude logs in");
+        assert!(!signs_in(&Account::system(Provider::Codex), &claude));
+    }
+
+    #[test]
     fn only_a_providers_sign_in_is_kept_off_the_disk() {
         let recipe = |program: &str, arguments: &[&str]| LaunchRecipe {
             unset_environment: Default::default(),
@@ -8165,6 +8464,17 @@ mod tests {
         )));
         assert!(is_sign_in(&recipe("codex", &["login"])));
         assert!(is_sign_in(&recipe("codex", &["login", "--device-auth"])));
+        // Muse's login runs through its upstream executable, as cagents
+        // starts it, or through the `muse` a reader types.
+        assert!(is_sign_in(&recipe("/opt/bin/muse-upstream", &["login"])));
+        assert!(is_sign_in(&recipe("muse", &["login"])));
+        assert!(!is_sign_in(&recipe("muse-upstream", &["acp"])));
+        assert!(!is_sign_in(&recipe("agy", &["login"])));
+        assert!(is_sign_in(&recipe(
+            "/usr/bin/agy",
+            &["acp", "--login", "--disable-telemetry"]
+        )));
+        assert!(!is_sign_in(&recipe("agy", &["acp"])));
         assert!(!is_sign_in(&recipe("claude", &[])));
         assert!(!is_sign_in(&recipe("claude", &["login"])));
         assert!(!is_sign_in(&recipe(
@@ -8223,6 +8533,52 @@ mod tests {
 
 #[cfg(test)]
 mod app_tests {
+    /// Antigravity's probe answers a working sign-in with its plan and no
+    /// limits. That system login is listed, with its plan, and its chip says
+    /// it reports no limits; signed out, it asks for sign-in again.
+    #[test]
+    fn a_signed_in_antigravity_login_is_listed_with_its_plan_and_unreported_limits() {
+        let mut app = context_inspector_test_app(false);
+        let provider = Provider::Antigravity;
+        let id = Account::system(provider).id();
+        app.account_ui.installed.insert(provider, true);
+        assert!(!table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+        let answer = |app: &mut Cagents, status, plan: Option<&str>| {
+            let now = app.account_ui.now_ms;
+            let (owner, ticket) = admit_actual_ticket(app, &id, now);
+            let mut snapshot = UsageSnapshot::state(status, "probed", now);
+            snapshot.plan_display_name = plan.map(str::to_owned);
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner,
+                id: id.clone(),
+                ticket,
+                outcome: Outcome::Answered {
+                    catalog: None,
+                    identity: plan.map(|plan| Identity {
+                        plan: Some(plan.into()),
+                        ..Identity::default()
+                    }),
+                    snapshot: Box::new(snapshot),
+                },
+            })));
+            app.account_ui.now_ms = now + schedule::MANUAL_DEBOUNCE + 1;
+        };
+        answer(&mut app, UsageStatus::Ok, Some("Google AI Pro"));
+        assert!(table::row_ids_for_test(&app.account_ui, provider).contains(&id));
+        let state = app.account_ui.account(&id).unwrap();
+        let snapshot = state.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.plan_display_name.as_deref(), Some("Google AI Pro"));
+        let shown = chip(
+            state,
+            "Antigravity",
+            app.account_ui.now_ms,
+            Default::default(),
+        );
+        assert_eq!(shown.text, "Limits not reported");
+        answer(&mut app, UsageStatus::NeedsLogin, None);
+        assert_eq!(app.account_ui.provider_status(provider), "Sign in again");
+    }
+
     #[test]
     fn codex_device_relogin_keeps_the_home_and_other_browser_preparation() {
         let mut app = context_inspector_test_app(false);
@@ -9024,6 +9380,112 @@ mod app_tests {
     }
 
     #[test]
+    fn a_conversation_open_on_a_turned_off_provider_keeps_its_limit_handling() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let other = app.account_ui.add_managed_fixture(Provider::Claude, 1938);
+        let current = Account::system(Provider::Claude);
+        let now = now_ms();
+        app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+            Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+        let key = app
+            .account_ui
+            .account(&other)
+            .unwrap()
+            .account
+            .registry_key()
+            .unwrap();
+        let identity = app.account_ui.registry.find(key).unwrap().identity();
+        let usage = account::claude::parse_usage(
+            &serde_json::json!({
+                "rate_limits": {"limits": [{"kind": "session", "percent": 20.0}]},
+            }),
+            now,
+        );
+        let state = app.account_ui.account_mut(&other).unwrap();
+        state.present = true;
+        state.identity = Some(identity);
+        state.schedule.succeed(usage.observed_at);
+        state.snapshot = Some(usage);
+        assert_eq!(app.automatic_account(&current).unwrap().id(), other);
+
+        for provider in [Provider::Claude, Provider::Codex] {
+            let _ = app.update(Message::SettingsChanged {
+                field: SettingsField::UseProvider(provider),
+                value: "false".into(),
+            });
+        }
+        // Turned off, Claude is offered nowhere, but an automatic conversation
+        // still open on it still switches to the account with usage left.
+        assert!(!app.account_ui.offers(Provider::Claude));
+        assert_eq!(app.automatic_account(&current).unwrap().id(), other);
+
+        // When one reaches its limit, its account is still checked.
+        let codex = Account::system(Provider::Codex).id();
+        let recipe = recipe_on(&app, &codex);
+        assert!(app.probe_account(&codex, Trigger::Focus, now).is_none());
+        drop(app.account_limit_reported(Provider::Codex, &recipe));
+        assert!(app.account_ui.pending_probe_for_test(&codex).is_some());
+
+        // And while one is open, the provider's other accounts are kept
+        // current, so Automatic still has figures to switch by.
+        assert!(app.probe_account(&other, Trigger::Manual, now).is_none());
+        let session = crate::chat::fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/w".into(),
+            &current,
+        )
+        .unwrap();
+        drop(app.insert_chat_card(session, None, None));
+        assert!(app.chat_open_on(Provider::Claude));
+        assert!(app.probe_account(&other, Trigger::Manual, now).is_some());
+    }
+
+    #[test]
+    fn a_turned_off_provider_is_neither_listed_offered_nor_checked_until_turned_on() {
+        let mut app = context_inspector_test_app(false);
+        let muse = Account::system(Provider::Muse).id();
+        let state = app.account_ui.account_mut(&muse).unwrap();
+        state.present = true;
+        state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", NOW));
+        assert!(app.account_ui.offers(Provider::Muse));
+        assert!(app.chip_lead(Provider::Muse).is_some());
+        assert!(table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+
+        let _ = app.update(Message::SettingsChanged {
+            field: SettingsField::UseProvider(Provider::Muse),
+            value: "false".into(),
+        });
+        assert!(!app.settings.uses_provider(Provider::Muse));
+        assert!(!app.account_ui.offers(Provider::Muse));
+        assert!(app.chip_lead(Provider::Muse).is_none());
+        assert!(!table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+        assert_eq!(
+            app.account_ui.turned_off().collect::<Vec<_>>(),
+            [Provider::Muse]
+        );
+        assert!(
+            app.probe_account(&muse, Trigger::Manual, NOW).is_none(),
+            "not even a manual check runs"
+        );
+        // What it last reported is kept for when it is turned back on.
+        assert!(app.account_ui.account(&muse).unwrap().snapshot.is_some());
+        // Other providers are untouched.
+        assert!(app.account_ui.of(Provider::Claude).count() > 0);
+
+        let _ = app.update(Message::SettingsChanged {
+            field: SettingsField::UseProvider(Provider::Muse),
+            value: "true".into(),
+        });
+        assert!(app.settings.uses_provider(Provider::Muse));
+        assert!(app.settings.providers.is_empty());
+        assert!(app.account_ui.offers(Provider::Muse));
+        assert!(table::providers_for_test(&app.account_ui).contains(&Provider::Muse));
+        assert_eq!(app.account_ui.turned_off().count(), 0);
+    }
+
+    #[test]
     fn device_connections_remain_available_without_provider_accounts() {
         let mut app = context_inspector_test_app(false);
         app.account_ui.accounts.clear();
@@ -9303,6 +9765,176 @@ mod app_tests {
         }));
         assert!(!app.account_sign_in_running(&account));
         assert!(app.account_ui.browser_preparing);
+    }
+
+    /// Opens `id`'s sign-in terminal through the update that receives its
+    /// prepared CLI, returning the terminal's card.
+    fn sign_in_through_update(app: &mut Cagents, id: &AccountId) -> CardId {
+        let owner = app.account_ui.probe_owner(id).unwrap();
+        let _ = app.sign_in(id.clone(), true);
+        let cards: BTreeSet<CardId> = app.durable.cards.iter().map(|card| card.id).collect();
+        let _ = app.update(Message::AccountUi(Action::LoginReady {
+            owner,
+            id: id.clone(),
+            provider: Provider::Codex,
+            device: true,
+            program: Ok(("/tools/codex".into(), None)),
+        }));
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(|card| !cards.contains(&card.id))
+            .expect("the sign-in opened a terminal")
+            .id;
+        assert!(!app.account_ui.preparing_logins.contains(&owner));
+        card
+    }
+
+    /// Ends an update whose handler returns before owing a projection, so
+    /// only what every update runs at its end can bring the index up.
+    fn end_bare_update(app: &mut Cagents) {
+        assert!(app.transient_work_close.is_none());
+        let _ = app.update(Message::ReturnToDeviceBeforeClose);
+    }
+
+    /// Asks after `account`'s sign-in before the update that changed what it
+    /// reads has ended, which passes over the cards rather than trust the
+    /// index.
+    fn running_mid_update(app: &Cagents, account: &Account) -> bool {
+        let scans = sign_in_scans();
+        let running = app.account_sign_in_running(account);
+        assert_eq!(sign_in_scans(), scans + 1, "the stale index was not read");
+        running
+    }
+
+    /// A frame asks after an account's sign-in on every draw. Once the update
+    /// that opened it ends, the answer is looked up: no pass over the cards
+    /// and no account's home resolved, for the account signing in or another.
+    #[test]
+    fn a_frame_looks_up_a_running_sign_in_without_scanning_the_cards() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let mut logins = linked_logins(
+            &mut app,
+            directory.path(),
+            &["work@example.com", "home@example.com"],
+        );
+        let (_, other) = logins.pop().unwrap();
+        let (_, id) = logins.pop().unwrap();
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let other = app.account_ui.account(&other).unwrap().account.clone();
+        sign_in_through_update(&mut app, &id);
+
+        let (scans, homes) = (sign_in_scans(), home_resolutions());
+        for _ in 0..3 {
+            assert!(app.account_sign_in_running(&account));
+            assert!(!app.account_sign_in_running(&other));
+        }
+        assert_eq!(sign_in_scans(), scans, "a frame passes over no card");
+        assert_eq!(
+            home_resolutions(),
+            homes,
+            "a frame resolves no account's home"
+        );
+    }
+
+    /// The index follows its terminal: opening the sign-in, its process
+    /// ending, a relaunch, and the terminal's close each show from the end of
+    /// the update that made them. A failed runtime stops the sign-in at once.
+    #[test]
+    fn the_sign_in_index_follows_its_terminal_opening_ending_and_closing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        // Read from the index, never from a fallback pass over the cards.
+        let running = |app: &Cagents| {
+            let scans = sign_in_scans();
+            let running = app.account_sign_in_running(&account);
+            assert_eq!(sign_in_scans(), scans, "the index was current");
+            running
+        };
+        end_bare_update(&mut app);
+        assert!(!running(&app));
+
+        let card = sign_in_through_update(&mut app, &id);
+        assert!(running(&app), "opening the sign-in");
+
+        let fresh = match &app.card_state(card).unwrap().kind {
+            CardKind::Terminal(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        app.retire_ended_terminal(card, 1, None, false);
+        assert!(!running_mid_update(&app, &account));
+        end_bare_update(&mut app);
+        assert!(!running(&app), "its process ending");
+
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(fresh);
+        assert!(running_mid_update(&app, &account));
+        end_bare_update(&mut app);
+        assert!(running(&app), "a relaunch that started");
+
+        let runtime = app.cards.remove(&card);
+        app.cards.insert(card, CardRuntime::Failed("gone".into()));
+        assert!(!running(&app), "a failed runtime, without an update");
+        match runtime {
+            Some(runtime) => app.cards.insert(card, runtime),
+            None => app.cards.remove(&card),
+        };
+        assert!(running(&app));
+
+        // Closing a running terminal waits on the daemon, so until it confirms
+        // the sign-in runs on.
+        let _ = app.close_card_unasked(card);
+        end_bare_update(&mut app);
+        assert!(running(&app), "a close the daemon has not confirmed");
+        // Every close that lands retires the durable card.
+        app.card_state_mut(card).unwrap().existence =
+            super::super::project_ui::removed_existence("closed by user");
+        assert!(!running_mid_update(&app, &account));
+        end_bare_update(&mut app);
+        assert!(!running(&app), "closing the terminal");
+    }
+
+    /// Accounts that change under a running sign-in are matched again: the
+    /// index follows the account list, not the one it was built against.
+    #[test]
+    fn a_running_sign_in_is_matched_again_when_its_account_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = context_inspector_test_app(false);
+        let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
+            .pop()
+            .unwrap();
+        let original = app.account_ui.account(&id).unwrap().account.clone();
+        sign_in_through_update(&mut app, &id);
+        assert!(app.account_sign_in_running(&original));
+
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let mut registry = app.account_ui.registry.clone();
+        registry.unregister(key);
+        registry
+            .link(Provider::Codex, key, elsewhere, None, None, 2)
+            .unwrap();
+        app.account_ui.set_registry(registry);
+        let moved = app.account_ui.account(&id).unwrap().account.clone();
+        assert_ne!(moved, original);
+        assert!(!running_mid_update(&app, &moved));
+        assert!(running_mid_update(&app, &original));
+        end_bare_update(&mut app);
+        let scans = sign_in_scans();
+        assert!(
+            !app.account_sign_in_running(&moved),
+            "the terminal signs in to the old home, not the account's new one"
+        );
+        assert!(
+            app.account_sign_in_running(&original),
+            "an unlisted account is still asked"
+        );
+        assert_eq!(sign_in_scans(), scans);
     }
 
     #[test]
@@ -10089,6 +10721,73 @@ mod app_tests {
                 true,
             ));
             assert!(app.automatic_account(&current).is_none(), "{source:?}");
+        }
+    }
+
+    fn assert_restored_inventory_admits_full_probe(inventory_observed_at: Option<Millis>) {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(Registry::default());
+            app.refresh_ui.focused = true;
+            let id = Account::system(provider).id();
+            let now = now_ms();
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now - 1_000),
+                    inventory_observed_at,
+                }),
+            }]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(
+                state.inventory_observed_at,
+                Some(inventory_observed_at.unwrap_or(0))
+            );
+            assert!(!state.schedule.should_probe(Trigger::Focus, now, true));
+            let probe = app.probe_account(&id, Trigger::Focus, now);
+            assert!(probe.is_some(), "{provider:?}");
+            assert!(app.account_ui.pending_probe_is_forced_for_test(&id));
+            drop(probe);
+        }
+    }
+
+    #[test]
+    fn a_live_figure_cached_before_close_does_not_make_inventory_look_fresh() {
+        assert_restored_inventory_admits_full_probe(Some(
+            now_ms() - 2 * schedule::REFRESH_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn restore_without_an_inventory_stamp_probes_in_full_on_first_focus() {
+        assert_restored_inventory_admits_full_probe(None);
+    }
+
+    #[test]
+    fn a_fresh_restored_inventory_waits_for_its_schedule() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut app = context_inspector_test_app(false);
+            app.account_ui.set_registry(Registry::default());
+            app.refresh_ui.focused = true;
+            let id = Account::system(provider).id();
+            let now = now_ms();
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(Entry {
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now - 1_000),
+                    inventory_observed_at: Some(now - 2_000),
+                }),
+            }]);
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.inventory_observed_at, Some(now - 2_000));
+            assert!(
+                app.probe_account(&id, Trigger::Focus, now).is_none(),
+                "{provider:?}"
+            );
         }
     }
 
@@ -11451,6 +12150,44 @@ mod app_tests {
         );
     }
 
+    /// A Claude report about one model's allowance is not an answer from the
+    /// account: it neither renews the reading nor ends a sign-in watch while
+    /// the account still reads as signed out. An account-wide report does.
+    #[test]
+    fn a_claude_model_only_report_does_not_end_a_sign_in_watch() {
+        let mut app = context_inspector_test_app(false);
+        let managed = app.account_ui.add_managed_fixture(Provider::Claude, 7);
+        let recipe = recipe_on(&app, &managed);
+        let now = now_ms();
+        let observed_at = now - 1_000;
+        let state = app.account_ui.account_mut(&managed).unwrap();
+        state.snapshot = Some(UsageSnapshot::state(
+            UsageStatus::NeedsLogin,
+            "",
+            observed_at,
+        ));
+        state.schedule.await_login(now);
+
+        let fable = LiveReport::Claude(
+            account::claude::parse_rate_limit_event(&serde_json::json!({
+                "status": "rejected", "rateLimitType": "seven_day_overage_included",
+                "utilization": 1.0, "resetsAt": 1_893_456_000_i64,
+            }))
+            .unwrap(),
+        );
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(fable, now)]);
+        let state = app.account_ui.account(&managed).unwrap();
+        let snapshot = state.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+        assert_eq!(snapshot.observed_at, observed_at);
+        assert!(state.schedule.awaiting_login(now));
+
+        let _ = app.account_reported(Provider::Claude, &recipe, vec![(claude_report(0.2), now)]);
+        let state = app.account_ui.account(&managed).unwrap();
+        assert_eq!(state.snapshot.as_ref().unwrap().status, UsageStatus::Ok);
+        assert!(!state.schedule.awaiting_login(now));
+    }
+
     #[test]
     fn live_codex_percentages_do_not_postpone_a_due_permission_probe() {
         for (allowed, used) in [(true, 100), (false, 10)] {
@@ -11581,6 +12318,10 @@ mod app_tests {
         let cached = cache.load(now_ms()).remove(&key).unwrap();
         assert!((cached.snapshot.windows[0].used - 0.5).abs() < 1e-6);
         assert_eq!(cached.snapshot.observed_at, now + 1);
+        assert_eq!(
+            cached.inventory_observed_at,
+            Some(now - 2 * schedule::REFRESH_INTERVAL)
+        );
     }
 
     /// The startup load does not wait on the shell: an account whose CLI only
@@ -11595,6 +12336,7 @@ mod app_tests {
         let now = now_ms();
         let cached = |used| Entry {
             identity: None,
+            inventory_observed_at: Some(now),
             snapshot: UsageSnapshot {
                 resets: Vec::new(),
                 windows: vec![UsageWindow {

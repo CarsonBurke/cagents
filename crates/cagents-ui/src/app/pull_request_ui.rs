@@ -147,6 +147,7 @@ impl Cagents {
                 for state in self.pull_request_inspector.conversations.values_mut() {
                     state.update(watch.clone());
                 }
+                self.place_inspected_work();
                 Task::none()
             }
             Action::Choose { card, key } => {
@@ -222,14 +223,24 @@ impl Cagents {
         })
     }
 
+    /// The conversations of the mounted inspectors that the daemon can be
+    /// asked about: a draft, or a chat this window is still starting or
+    /// attaching to, is not one the daemon hosts yet, and is watched once it
+    /// answers with it.
+    fn watched_conversations(&self) -> impl Iterator<Item = TerminalId> + '_ {
+        self.mounted_inspectors().filter_map(|card| {
+            let conversation = self.pane_conversation(card)?;
+            self.chat_unhosted(card, conversation)
+                .is_none()
+                .then_some(conversation)
+        })
+    }
+
     /// The mounted inspectors' conversations' pull requests and edited
     /// worktrees, pushed by the daemon. A closed inspector watches nothing,
     /// and two panes showing one conversation share its watch.
     pub(super) fn conversation_pull_request_subscription(&self) -> Subscription<Message> {
-        let mut conversations: Vec<TerminalId> = self
-            .mounted_inspectors()
-            .filter_map(|card| self.pane_conversation(card))
-            .collect();
+        let mut conversations: Vec<TerminalId> = self.watched_conversations().collect();
         conversations.sort_unstable();
         conversations.dedup();
         Subscription::batch(conversations.into_iter().map(conversation::subscription))
@@ -238,8 +249,8 @@ impl Cagents {
 
     /// Whether a mounted inspector watches `conversation`'s pull requests.
     pub(super) fn inspector_watches(&self, conversation: TerminalId) -> bool {
-        self.mounted_inspectors()
-            .any(|card| self.pane_conversation(card) == Some(conversation))
+        self.watched_conversations()
+            .any(|watched| watched == conversation)
     }
 
     /// Conversations with a current list in a mounted inspector. Compute this
@@ -252,8 +263,7 @@ impl Cagents {
             .filter_map(conversation::State::latest_list)
             .map(|(conversation, _, _)| conversation)
             .collect();
-        self.mounted_inspectors()
-            .filter_map(|card| self.pane_conversation(card))
+        self.watched_conversations()
             .filter(|conversation| listed.contains(conversation))
             .collect()
     }
@@ -289,6 +299,26 @@ impl Cagents {
         self.lists_worktree(directory).then(|| directory.clone())
     }
 
+    /// Fits each inspected conversation's latest list into the rows its
+    /// Work section shows, with what Projects lists now. Which rows there
+    /// are depends on both, so this runs when a list arrives and when
+    /// Projects' worktrees change.
+    pub(super) fn place_inspected_work(&mut self) {
+        let heres: Vec<(CardId, Option<PathBuf>)> = self
+            .pull_request_inspector
+            .conversations
+            .keys()
+            .map(|card| (*card, self.inspected_here(*card)))
+            .collect();
+        let paths = &self.worktree_paths;
+        let openable = |path: &std::path::Path| paths.lists(path);
+        for (card, here) in heres {
+            if let Some(state) = self.pull_request_inspector.conversations.get_mut(&card) {
+                state.place(here.as_deref(), &openable);
+            }
+        }
+    }
+
     /// Whether Projects lists a worktree at `path`, so its changes can be
     /// shown. This runs for each piece of work on every frame, so it reads
     /// the path index the update keeps rather than scanning every row.
@@ -310,8 +340,14 @@ impl Cagents {
     }
 
     /// Where `card`'s conversation's list is: a pane whose inspector has not
-    /// followed its conversation yet is still reading it.
+    /// followed its conversation yet is still reading it, as is one whose
+    /// chat is still starting, and a draft has done nothing.
     pub(super) fn work_phase(&self, card: CardId) -> conversation::Phase {
+        if let Some(conversation) = self.pane_conversation(card)
+            && self.chat_unhosted(card, conversation) == Some(chat_ui::Unhosted::Unstarted)
+        {
+            return conversation::Phase::Unstarted;
+        }
         self.pull_request_inspector
             .conversation(card)
             .map_or(conversation::Phase::Reading, conversation::State::phase)
@@ -613,6 +649,61 @@ mod tests {
         assert!(app.pull_request_inspector.conversation(chat).is_none());
         drop(app.handle_pull_request_ui(listed(conversation, 2, &rows, true)));
         assert_eq!(app.work_summary(reopened_id).shown.as_ref(), Some(&key));
+    }
+
+    /// The row of the worktree the chat runs in, shown once Projects lists
+    /// it, keeps its place when later work arrives, though Projects began
+    /// listing it between two of the conversation's lists.
+    #[test]
+    fn the_chats_own_worktree_row_is_placed_when_projects_lists_it() {
+        let (
+            mut app,
+            Panes {
+                conversation, chat, ..
+            },
+        ) = conversation_app();
+        app.sync_pull_request_inspector();
+        let rows = |app: &Cagents| -> Vec<String> {
+            let here = app.inspected_here(chat);
+            let openable = |path: &std::path::Path| app.lists_worktree(path);
+            app.pull_request_inspector
+                .conversation(chat)
+                .unwrap()
+                .work(here.as_deref(), &openable)
+                .iter()
+                .map(|work| match work.pull_request() {
+                    Some(row) => format!("#{}", row.number),
+                    None => work.scope_label(),
+                })
+                .collect()
+        };
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[(1, Relation::Created)], true)));
+        assert_eq!(rows(&app), ["#1"]);
+
+        // Projects begins to list the chat's working directory.
+        *app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "tmp".into(),
+            "/tmp".into(),
+            vec![SidebarWorktree::new(
+                crate::model::WorktreeId::new(),
+                "/tmp".into(),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        )];
+        app.refresh_sidebar_worktree_panes();
+        assert_eq!(rows(&app), ["#1", "tmp"]);
+
+        let both = [(1, Relation::Created), (2, Relation::Pushed)];
+        drop(app.handle_pull_request_ui(listed(conversation, 2, &both, false)));
+        assert_eq!(rows(&app), ["#1", "tmp", "#2"]);
     }
 
     #[test]

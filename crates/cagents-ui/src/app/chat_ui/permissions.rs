@@ -58,6 +58,11 @@ fn mode_description(provider: Provider, mode: &str) -> &str {
             "Approve edits and safe commands; ask before irreversible actions"
         }
         (Provider::Antigravity, "plan") => "Plan carefully before carrying out a task",
+        // Muse's.
+        (Provider::Muse, "manual") => "Ask for approval when no permission rule covers the action",
+        (Provider::Muse, "auto") => "Ask for approval only when the action requires it",
+        (Provider::Muse, "bypassPermissions") => "Run every action without asking for approval",
+        (Provider::Muse, "dontAsk") => "Refuse any action no permission rule covers",
         _ => generic_mode_description(mode),
     }
 }
@@ -298,7 +303,11 @@ impl Runtime {
                 content.push(
                     widget::button::custom(
                         widget::column::with_children(vec![
-                            design::body(view::permission_mode_label(mode)).into(),
+                            design::body(view::permission_mode_label(
+                                self.session.launch.provider,
+                                mode,
+                            ))
+                            .into(),
                             design::caption(mode_description(self.session.launch.provider, mode))
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
                                 .into(),

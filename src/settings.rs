@@ -1323,6 +1323,15 @@ pub struct AppSettings {
     /// removes only its own key from what another window saved.
     #[serde(default)]
     pub confirmations: BTreeMap<String, bool>,
+    /// Providers turned off, by [`Provider::executable`] key: the app neither
+    /// offers nor checks one that is `false`; an absent provider is on. Read
+    /// through [`AppSettings::uses_provider`]. A table, like
+    /// `confirmations`, so windows that each turn off a different provider
+    /// merge by key, and a newer build's providers survive an older one.
+    ///
+    /// [`Provider::executable`]: crate::agent::Provider::executable
+    #[serde(default)]
+    pub providers: BTreeMap<String, bool>,
 }
 
 impl Default for AppSettings {
@@ -1330,6 +1339,7 @@ impl Default for AppSettings {
         Self {
             notifications: crate::notifications::Preferences::default(),
             confirmations: BTreeMap::new(),
+            providers: BTreeMap::new(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             palette_recents: Vec::new(),
             max_hot_cards: 6,
@@ -2049,6 +2059,24 @@ impl AppSettings {
         }
     }
 
+    /// Whether `provider` is in use: offered for new work, listed with its
+    /// accounts, and checked for usage. Every provider is until turned off.
+    pub fn uses_provider(&self, provider: crate::agent::Provider) -> bool {
+        self.providers
+            .get(provider.executable())
+            .copied()
+            .unwrap_or(true)
+    }
+
+    pub fn set_uses_provider(&mut self, provider: crate::agent::Provider, used: bool) {
+        if used {
+            self.providers.remove(provider.executable());
+        } else {
+            self.providers
+                .insert(provider.executable().to_owned(), false);
+        }
+    }
+
     /// Sets how every project shows its checkouts. Hiding them remembers the
     /// visible mode they had, which [`Self::toggled_sidebar_worktrees`]
     /// returns to.
@@ -2202,11 +2230,14 @@ impl AppSettings {
                 "inspector_width must be between 320 and 480",
             ));
         }
-        if !(0.25..=1.0).contains(&self.chat_content_fraction)
-            || !(0.25..=1.0).contains(&self.default_native_pane_fraction)
-        {
+        if !(0.25..=1.0).contains(&self.chat_content_fraction) {
             return Err(SettingsError::Invalid(
-                "Native pane and chat content widths must be between 0.25 and 1.0",
+                "chat_content_fraction must be between 0.25 and 1.0",
+            ));
+        }
+        if !(0.25..=1.0).contains(&self.default_native_pane_fraction) {
+            return Err(SettingsError::Invalid(
+                "default_native_pane_fraction must be between 0.25 and 1.0",
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
@@ -3686,6 +3717,42 @@ mod tests {
                 }
                 .validate()
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn both_invalid_pane_fractions_fall_back_without_losing_other_settings() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = path_in(&directory);
+        let defaults = AppSettings::default();
+        let settings = AppSettings {
+            chat_content_fraction: 1.5,
+            default_native_pane_fraction: 1.5,
+            default_column_fraction: 0.6,
+            ..defaults.clone()
+        };
+        fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+
+        let loaded = load_detailed(&path).unwrap();
+        assert_eq!(
+            loaded.settings.chat_content_fraction,
+            defaults.chat_content_fraction
+        );
+        assert_eq!(
+            loaded.settings.default_native_pane_fraction,
+            defaults.default_native_pane_fraction
+        );
+        assert_eq!(loaded.settings.default_column_fraction, 0.6);
+        let notes = loaded.set_aside().collect::<Vec<_>>();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        for key in ["chat_content_fraction", "default_native_pane_fraction"] {
+            assert!(
+                notes.iter().any(|note| {
+                    note.contains(&format!("“{key}”"))
+                        && note.contains(&format!("{key} must be between 0.25 and 1.0"))
+                }),
+                "{notes:?}"
             );
         }
     }
@@ -6201,6 +6268,43 @@ new_thread = "Alt+Shift+G"
             Err(SettingsError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
         ));
         assert!(!target.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn turned_off_providers_merge_per_key_and_keep_unknown_ones() {
+        use crate::agent::Provider;
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut base = AppSettings::default();
+        assert!(
+            Provider::ALL
+                .into_iter()
+                .all(|provider| base.uses_provider(provider))
+        );
+        base.providers.insert("future_agent".into(), false);
+        save(&path, &base).unwrap();
+
+        // Two windows each turn off a different provider from the same base.
+        let mut muse = base.clone();
+        muse.set_uses_provider(Provider::Muse, false);
+        save_merged(&path, &base, &muse).unwrap();
+        let mut antigravity = base.clone();
+        antigravity.set_uses_provider(Provider::Antigravity, false);
+        save_merged(&path, &base, &antigravity).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(!saved.uses_provider(Provider::Muse));
+        assert!(!saved.uses_provider(Provider::Antigravity));
+        assert!(saved.uses_provider(Provider::Claude));
+        assert_eq!(saved.providers.get("future_agent"), Some(&false));
+
+        // Turning one back on removes only its key.
+        let mut again = muse.clone();
+        again.set_uses_provider(Provider::Muse, true);
+        save_merged(&path, &muse, &again).unwrap();
+        let saved = load(&path).unwrap();
+        assert!(saved.uses_provider(Provider::Muse));
+        assert!(!saved.uses_provider(Provider::Antigravity));
+        assert!(!saved.providers.contains_key(Provider::Muse.executable()));
     }
 
     #[test]

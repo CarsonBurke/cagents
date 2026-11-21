@@ -197,7 +197,10 @@ impl FilesystemRecoveryContext {
         };
         let mut excluded = Vec::with_capacity(known.len());
         for path in known {
-            match Root::open(path) {
+            // A pane names its directory as the user reached it, which may be
+            // through their own link (`~/.gemini` into a dotfiles checkout).
+            // Exclude the directory it names.
+            match std::fs::canonicalize(path).and_then(|path| Root::open(&path)) {
                 Ok(root) => excluded.push(Arc::new(root)),
                 // An absent negative-census spelling cannot contain the
                 // current holding. The actual source is separately pinned.

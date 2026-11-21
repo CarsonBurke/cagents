@@ -359,49 +359,6 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
 }
 
 #[test]
-fn image_gallery_is_modal_and_reuses_the_transcript_handle() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let card = draft_chat(&mut app);
-    let runtime = match app.cards.get_mut(&card).unwrap() {
-        CardRuntime::Chat(runtime) => runtime,
-        _ => unreachable!(),
-    };
-    let content = ItemContent::Image {
-        path: "/fixture/image.png".into(),
-        description: "Generated image".into(),
-        reference: None,
-    };
-    let mut cached = CachedItem::new(&content, runtime.syntax_theme);
-    cached.image = Some(iced::widget::image::Handle::from_rgba(
-        1,
-        1,
-        vec![0, 0, 0, 255],
-    ));
-    runtime.cache.insert("image".into(), cached);
-    Arc::make_mut(&mut runtime.snapshot).items = vec![
-        chat::Item {
-            id: "image".into(),
-            role: chat::Role::Assistant,
-            content,
-            started_at: None,
-            at: None,
-        }
-        .into(),
-    ];
-    let target = runtime.target;
-    drop(app.handle_chat_ui(Action::OpenImage(target, "image".into())));
-    assert!(app.chat_ui.image_viewer.is_some());
-    assert!(app.modal_is_open());
-    assert!(app.dialog().is_some());
-    let before = app.pane_inspectors.visible().count();
-    drop(app.update(Message::ToggleContextInspector));
-    assert_eq!(app.pane_inspectors.visible().count(), before);
-    assert!(Action::ImageNext(true).allowed_while_modal());
-    assert!(!Action::OpenImage(target, "image".into()).allowed_while_modal());
-    drop(app.update(Message::ChatUi(Action::CloseImage)));
-    assert!(!app.modal_is_open());
-}
-#[test]
 fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
     use iced::clipboard::mime::AsMimeTypes;
     use iced::futures::StreamExt;
@@ -514,11 +471,26 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
         .unwrap()
         .image = Some(shown.clone());
 
-    // Open image from the menu opens the viewer on the same pixels.
+    // Open image from the menu opens the viewer on the same pixels, in the
+    // pane that shows them.
     drop(app.image_command(preview, images::ImageCommand::Open));
-    let viewer = app.chat_ui.image_viewer.as_ref().unwrap().selected_image();
-    assert_eq!(viewer, images::ImageRef::Viewer(shown.id()));
-    assert!(Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
+    let host = images::ViewerHost::Pane(target);
+    let viewer = app.image_viewer(host).unwrap().selected_image(host);
+    assert_eq!(viewer, images::ImageRef::Viewer(host, shown.id()));
+    assert!(
+        !app.modal_is_open(),
+        "the viewer is the pane's, not a dialog"
+    );
+    // Its controls sit under a dialog like the rest of the pane, while the
+    // dialog viewer's are the dialog's own.
+    assert!(!Action::Image(viewer, images::ImageCommand::Copy).allowed_while_modal());
+    assert!(
+        Action::Image(
+            images::ImageRef::Viewer(images::ViewerHost::Dialog, shown.id()),
+            images::ImageCommand::Copy
+        )
+        .allowed_while_modal()
+    );
     assert!(Action::ImageCopied(text_copy::Intent::begin(), Ok(None)).allowed_while_modal());
     assert!(!Action::Image(preview, images::ImageCommand::Copy).allowed_while_modal());
 
@@ -551,98 +523,21 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
     assert_eq!(copied(&mut app, run(press)), ["image/png"]);
     assert_eq!(notice(&app).1, "Copied image");
     assert!(
-        app.chat_ui.image_viewer.is_some(),
+        app.image_viewer(host).is_some(),
         "copying keeps the viewer open"
     );
-
-    // Escape is the viewer's own rather than the app-wide key handler's,
-    // so nothing focused beneath the viewer can claim it first, while the
-    // Escape that its open context menu claims closes only that menu.
-    let escape = keyboard::Event::KeyPressed {
-        key: keyboard::Key::Named(keyboard::key::Named::Escape),
-        modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
-        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-        location: keyboard::Location::Standard,
-        modifiers: keyboard::Modifiers::empty(),
-        text: None,
-        repeat: false,
-    };
-    drop(app.update(Message::KeyEvent {
-        event: escape.clone(),
-        captured: true,
-    }));
-    assert!(app.chat_ui.image_viewer.is_some());
-    {
-        use iced::advanced::layout::{Layout, Limits};
-        use iced::advanced::widget::Tree;
-        use iced::advanced::{Shell, clipboard, mouse};
-        let renderer = crate::app::tests::headless_renderer();
-        let window = iced::Size::new(1000.0, 800.0);
-        let viewport = iced::Rectangle::with_size(window);
-        let gallery = app.chat_ui.image_viewer.as_ref().unwrap();
-        let mut element = gallery.view();
-        let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &Limits::new(iced::Size::ZERO, window),
-        );
-        let pointer = mouse::Cursor::Available(viewport.center());
-        let send = |element: &mut Element<'_, Message>, tree: &mut Tree, event: iced::Event| {
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                tree,
-                &event,
-                Layout::new(&node),
-                pointer,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            messages
-                .iter()
-                .filter(|message| matches!(message, Message::ChatUi(Action::CloseImage)))
-                .count()
-        };
-        let menu_open = |element: &mut Element<'_, Message>, tree: &mut Tree| {
-            element
-                .as_widget_mut()
-                .overlay(
-                    tree,
-                    Layout::new(&node),
-                    &renderer,
-                    &viewport,
-                    iced::Vector::ZERO,
-                )
-                .is_some()
-        };
-        send(
-            &mut element,
-            &mut tree,
-            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
-        );
-        assert!(
-            menu_open(&mut element, &mut tree),
-            "the image's menu opened"
-        );
-        assert_eq!(
-            send(
-                &mut element,
-                &mut tree,
-                iced::Event::Keyboard(escape.clone())
-            ),
-            0
-        );
-        assert!(
-            !menu_open(&mut element, &mut tree),
-            "Escape closed the menu"
-        );
-        assert_eq!(
-            send(&mut element, &mut tree, iced::Event::Keyboard(escape)),
-            1
-        );
-    }
+    // A text field that took the chord, such as the composer copying its
+    // selection, keeps it: the image is not copied over that.
+    app.status = None;
+    app.notices.entries.clear();
+    assert!(
+        run(app.update(Message::KeyEvent {
+            event: control_c(false),
+            captured: true,
+        }))
+        .is_empty()
+    );
+    assert!(app.status.is_none() && app.notices.entries.is_empty());
 }
 
 #[test]
@@ -2048,6 +1943,285 @@ fn a_usage_limit_the_daemon_judges_reads_limited_until_it_lifts_even_unseen() {
         chat_runtime(&app, card).conversation_status(false).1,
         "Account limit reached"
     );
+}
+
+mod initial_attachment_limits {
+    use super::*;
+    use crate::agent_execution::directory::UsageLimit;
+
+    /// Restores an already limited chat behind another pane. The new
+    /// connection reports `still_limited` as the daemon's current judgement.
+    fn restore_hidden_chat(limit_wake_before_ready: bool, keep_runtime: bool, still_limited: bool) {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.workspace.resize_viewport(1_600.0);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let old_target = chat_runtime(&app, card).target;
+        let old_handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let limit = UsageLimit {
+            summary: "Codex usage limit reached".into(),
+            reset: None,
+            resets_at: None,
+        };
+        let mut snapshot = (*old_handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.error = Some("Usage limit reached for this plan".into());
+        old_handle.publish_snapshot_for_test(snapshot.clone());
+        old_handle.judge_limit_for_test(Some(limit.clone()));
+        drop(app.update(Message::ChatUi(Action::Wake(old_target, Wake::Changed))));
+        assert_eq!(app.sidebar_state.card_attention(card).limited, 1);
+        assert!(!app.sidebar_state.has_card_update(card));
+        let session = chat_runtime(&app, card).session.clone();
+
+        // Another pane stays selected while this already-hosted chat restores.
+        drop(app.select_worktree("/workspace/elsewhere".into(), true));
+        let focused = app.workspace.focused().expect("another pane is selected");
+        assert_ne!(focused, card);
+        assert_ne!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        app.chat_forget(card);
+        if !keep_runtime {
+            app.cards.insert(card, CardRuntime::Loading);
+        }
+        drop(app.open_chat(card, session.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        assert_eq!(
+            app.chat_ui.attempt(card).unwrap().intent,
+            chat::Intent::Restore
+        );
+        assert_eq!(app.sidebar_state.card_attention(card).limited, 0);
+
+        // The transport can cache the limit before ChatAttached without a wake,
+        // or deliver its wake after attachment while Ready is still queued.
+        let handle = Arc::new(ClientHandle::fixture(session, snapshot));
+        handle.set_visible(false).unwrap();
+        let current = still_limited.then(|| limit.clone());
+        handle.judge_limit_for_test(current.clone());
+        // Subagent addresses learned before attachment have no wake to carry
+        // them either.
+        let agent = "a1892b93e88999a7d";
+        handle.learn_agent_addresses_for_test(vec![chat::AgentAddress {
+            address: agent.into(),
+            subagent: "toolu_relocate".into(),
+        }]);
+        if limit_wake_before_ready {
+            drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Limit))));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(app.sidebar_state.card_attention(card).limited, 0);
+        }
+        answer_start(&mut app, target, Ok(handle.clone()));
+
+        // No Changed or Limit follows Ready, and the conversation stays hidden.
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(app.workspace.focused(), Some(focused));
+        assert!(!handle.is_visible_for_test());
+        assert!(!chat_runtime(&app, card).presents());
+        assert_eq!(
+            app.sidebar_state.card_attention(card).limited,
+            usize::from(still_limited)
+        );
+        if still_limited {
+            assert_eq!(
+                app.sidebar_state.card_attention(card).state(),
+                Some(crate::sidebar::AttentionState::Limited)
+            );
+        }
+        assert_eq!(chat_runtime(&app, card).usage_limit, current);
+        assert_eq!(
+            chat_runtime(&app, card)
+                .agent_addresses
+                .get(agent)
+                .map(String::as_str),
+            Some("toolu_relocate")
+        );
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn hidden_restore_installs_a_limit_cached_before_attachment() {
+        for keep_runtime in [false, true] {
+            restore_hidden_chat(false, keep_runtime, true);
+        }
+    }
+
+    #[test]
+    fn hidden_restore_clears_a_limit_lifted_before_attachment() {
+        for keep_runtime in [false, true] {
+            restore_hidden_chat(false, keep_runtime, false);
+        }
+    }
+
+    #[test]
+    fn hidden_restore_reconciles_a_limit_wake_handled_before_ready() {
+        for keep_runtime in [false, true] {
+            restore_hidden_chat(true, keep_runtime, true);
+        }
+    }
+}
+
+#[test]
+fn a_read_usage_limited_channel_stays_visible_after_selecting_another_channel() {
+    use crate::agent_execution::directory::UsageLimit;
+    use crate::model::{ChannelId, ProjectChannel, ProjectId, WorktreeId};
+    use crate::repository::RepositoryId;
+    use crate::sidebar::{
+        SelectionRow, SidebarFilter, SidebarMode, SidebarProject, SidebarWorktree,
+    };
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.refresh_ui.focused = false;
+    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+    let other_card = live_chat(&mut app, None);
+    let target = chat_runtime(&app, card).target;
+    let handle = chat_runtime(&app, card).handle().unwrap().clone();
+    let project = ProjectId::new();
+    let limited_channel = ChannelId::new();
+    let other_channel = ChannelId::new();
+    app.sidebar_model.projects.push(SidebarProject::new(
+        project,
+        RepositoryId::new(),
+        "project".into(),
+        FIXTURE_DIRECTORY.into(),
+        vec![SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            FIXTURE_DIRECTORY.into(),
+            Some("main".into()),
+        )],
+        Vec::new(),
+    ));
+    Arc::make_mut(&mut app.durable).channels = [
+        (limited_channel, card, "Limited channel"),
+        (other_channel, other_card, "Other channel"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, (id, card, title))| ProjectChannel {
+        id,
+        project_id: project,
+        title: title.into(),
+        title_source: Default::default(),
+        ordinal: ordinal as u32,
+        shared: false,
+        cards: vec![card],
+        focused: Some(card),
+    })
+    .collect();
+    app.sidebar_state
+        .set_sidebar_worktrees(crate::settings::SidebarWorktrees::Expanded);
+    drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
+        SidebarFilter::All,
+    ))));
+
+    // The daemon reports a limit while the channel is unread, without a pending request.
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.error = Some("You've hit your weekly limit".into());
+    handle.publish_snapshot_for_test(snapshot);
+    drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Changed))));
+    handle.judge_limit_for_test(Some(UsageLimit {
+        summary: "Weekly limit reached".into(),
+        reset: None,
+        resets_at: None,
+    }));
+    drop(app.update(Message::ChatUi(Action::Wake(target, Wake::Limit))));
+    drop(app.update(Message::NotificationUi(
+        crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot {
+            notices: vec![crate::notifications::Notice {
+                id: uuid::Uuid::new_v4(),
+                delivered: false,
+                acknowledged: false,
+                window: None,
+                event: crate::notifications::Event::session(
+                    chat_runtime(&app, card).session.id,
+                    Provider::Codex,
+                    FIXTURE_DIRECTORY.into(),
+                    crate::notifications::Evidence {
+                        key: "compact-limited-channel".into(),
+                        kind: crate::notifications::Kind::Failed,
+                    },
+                ),
+            }],
+            diagnostic: None,
+        }),
+    )));
+    assert!(app.sidebar_state.has_card_update(card));
+    assert_eq!(app.sidebar_state.card_attention(card).failed, 1);
+    assert_eq!(app.sidebar_state.card_attention(card).limited, 1);
+    assert_eq!(app.sidebar_state.card_attention(card).waiting, 0);
+
+    // Read the limited channel's update through the normal focused-pane
+    // acknowledgement, then leave it for the other channel.
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: limited_channel,
+    })));
+    assert_eq!(app.workspace.focused(), Some(card));
+    app.refresh_ui.focused = true;
+    drop(app.acknowledge_active_pane());
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: other_channel,
+    })));
+    assert_eq!(app.durable.active_channel, Some(other_channel));
+    let project_row = &app.sidebar_model.projects[0];
+    assert!(!app.sidebar_state.lists_panes(project_row));
+    assert_eq!(app.sidebar_state.filter(), SidebarFilter::All);
+    let row = project_row
+        .channels
+        .iter()
+        .find(|row| row.id == limited_channel)
+        .unwrap();
+    assert!(!row.selected);
+    assert!(!row.unread);
+    assert_eq!(row.activity, None);
+    assert_eq!(row.attention.limited, 1);
+    assert_eq!(row.attention.failed, 0);
+
+    // Both the real compact view and its keyboard order must keep the blocked
+    // channel, whether checkout rows are shown or hidden.
+    let renderer = crate::app::tests::headless_renderer();
+    for mode in [
+        crate::settings::SidebarWorktrees::Expanded,
+        crate::settings::SidebarWorktrees::Hidden,
+    ] {
+        app.sidebar_state.set_sidebar_worktrees(mode);
+        let mut element = crate::sidebar::view(
+            &app.sidebar_model,
+            &app.sidebar_state,
+            SidebarMode::Compact,
+            320.0,
+            false,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(320.0, 900.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let names: Vec<_> = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("Other channel")),
+            "{mode:?}: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.contains("Limited channel")
+                && name.contains("1 stopped by a usage limit")),
+            "{mode:?}: the read channel still needs its Limited badge in the compact view: {names:?}"
+        );
+        assert!(
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, true)
+                .contains(&SelectionRow::Channel(limited_channel))
+        );
+    }
 }
 
 #[test]
@@ -4071,6 +4245,38 @@ fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
     );
     assert_eq!(runtime.composer.text().trim(), "Keep this message");
     assert!(!app.chat_start_pending(card), "no switch was attempted");
+}
+
+#[test]
+fn omp_snapshot_error_renders_provider_reason_once_while_idle() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Omp, Some("omp-error"));
+    show_chat_snapshot_for_test(
+        &mut app,
+        card,
+        Snapshot {
+            ready: true,
+            busy: false,
+            error: Some("API quota exhausted".into()),
+            ..Snapshot::default()
+        },
+    );
+
+    let text = visible_text(&app, card);
+    assert_eq!(
+        text.iter()
+            .map(|text| text.matches("API quota exhausted").count())
+            .sum::<usize>(),
+        1,
+        "the provider reason must appear once in the chat view: {text:#?}"
+    );
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.snapshot.ready);
+    assert!(!runtime.snapshot.busy);
+    assert_eq!(
+        runtime.snapshot.activity(),
+        crate::agent::ActivityState::Idle
+    );
 }
 
 /// The text `card`'s view lays out within 900 by 980, in order. The
@@ -7207,6 +7413,11 @@ fn settle_first_start_checkpoint(app: &mut Cagents, card: CardId, task: Task<Mes
 }
 
 fn submit_target(app: &mut Cagents, target: Target) {
+    start_with(app, target, Action::Submit(target, PromptMode::Send));
+}
+
+/// Takes `action`, which may start `target`'s draft for its first message.
+fn start_with(app: &mut Cagents, target: Target, action: Action) {
     // Existing start/Ready tests exercise the provider boundary, not a
     // fabricated save receipt. Supply and drive the real writer barrier
     // first, while never polling the returned provider-start Task.
@@ -7219,7 +7430,7 @@ fn submit_target(app: &mut Cagents, target: Target) {
         .unwrap();
         app.session = Some(writer);
     }
-    let task = app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send)));
+    let task = app.update(Message::ChatUi(action));
     settle_first_start_checkpoint(app, target.card, task);
     if directory.is_some() {
         drop(app.session.take());
@@ -8559,7 +8770,7 @@ pub(super) fn answer_start(
 /// Focus is a widget operation, not a message. Each operation the task
 /// issues is shown two controls the way a widget tree would show them:
 /// the one asked about, and another that holds the keyboard.
-fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+pub(super) fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
     task_focuses_from(task, control, &widget::Id::new("the control in use"))
 }
 
@@ -8883,6 +9094,76 @@ pub(in crate::app) fn working_chat(app: &mut Cagents, session_id: &str) -> CardI
     snapshot.busy = true;
     handle.publish_snapshot_for_test(snapshot);
     card
+}
+
+/// A new chat's inspector asks the daemon for its work only once the daemon
+/// hosts the chat. Asked sooner, the daemon refuses a conversation it does
+/// not know, and the Work section read "Couldn't load this chat's work" for
+/// the half minute before it asked again (#3498).
+#[test]
+fn a_new_chat_reads_its_work_once_the_daemon_hosts_it() {
+    use crate::app::pull_request_ui::{Action as Work, ConversationWatch, WorkPhase};
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1600.0);
+    let card = draft_chat(&mut app);
+    app.open_pane_inspector_now(card);
+    let conversation = |app: &Cagents| match &app.card_state(card).unwrap().kind {
+        CardKind::Chat(session) => session.id,
+        _ => unreachable!("a chat card"),
+    };
+    drop(app.update(Message::ChatUi(Action::Tick)));
+
+    // A draft has done nothing, and nothing asks the daemon about it.
+    let draft = conversation(&app);
+    assert!(!app.inspector_watches(draft));
+    assert_eq!(app.work_phase(card), WorkPhase::Unstarted);
+
+    // Sending its first message starts it: still unknown to the daemon,
+    // so it reads as on its way rather than failed.
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+    let target = app.chat_ui.attempt(card).unwrap().target;
+    let started = conversation(&app);
+    assert_ne!(
+        started, draft,
+        "the first message gives it its own identity"
+    );
+    assert!(!app.inspector_watches(started));
+    assert_eq!(app.work_phase(card), WorkPhase::Reading);
+
+    // The daemon answers the start with the chat, and from then it is
+    // watched, its list showing as soon as it arrives.
+    let handle = fixture_handle(&app, card, Some("session"));
+    answer_start(&mut app, target, Ok(handle));
+    assert_eq!(chat_runtime(&app, card).session.id, started);
+    assert!(app.inspector_watches(started));
+    assert_eq!(app.work_phase(card), WorkPhase::Reading);
+    let mut list = pull_request_links::fixture::fixture_list();
+    list.transcript = crate::work::TranscriptCoverage::Complete;
+    drop(app.update(Message::PullRequestUi(Work::Conversation(
+        ConversationWatch::Listed {
+            conversation: started,
+            revision: 1,
+            list: Arc::new(list),
+            first: true,
+        },
+    ))));
+    assert_eq!(app.work_phase(card), WorkPhase::Listed);
+}
+
+/// A pane awaiting admission can wait there until the reader acts, and the
+/// daemon often hosts its conversation meanwhile, so it is still watched
+/// rather than reading forever.
+#[test]
+fn a_chat_awaiting_admission_still_reads_its_work() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.workspace.resize_viewport(1600.0);
+    let card = live_chat(&mut app, Some("session"));
+    app.open_pane_inspector_now(card);
+    let conversation = chat_runtime(&app, card).session.id;
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().connection = Connection::AwaitingAdmission;
+    assert!(app.inspector_watches(conversation));
 }
 
 #[test]
@@ -20423,6 +20704,134 @@ fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
     );
     assert!(app.chat_ui.attempt(card).is_none());
 }
+/// An ACP provider reports a missing sign-in when its conversation starts,
+/// not during a turn, so the card goes back to its draft. That draft offers
+/// the sign-in a started conversation gets, on the system account a provider
+/// with no home of its own runs on, and sends its message again after.
+#[test]
+fn a_draft_whose_start_needs_sign_in_offers_sign_in_and_sends_again() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let handle = fixture_handle(&app, card, None);
+    // The adapter has not yet said it takes commands.
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, target, Ok(handle.clone()));
+    let target = chat_runtime(&app, card).target;
+    let failure = format!(
+        "{}: sign in to Antigravity, then try again. (Authentication required)",
+        chat::ACP_SIGN_IN_PREFIX
+    );
+    handle.replace_snapshot_for_test(Snapshot {
+        error: Some(failure.clone()),
+        exited: true,
+        ..Snapshot::default()
+    });
+    let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+    retired(&mut app, card);
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(runtime.error.as_deref(), Some(failure.as_str()));
+    let target = runtime.target;
+    let system = Account::system(Provider::Antigravity);
+    let recovery = app
+        .chat_auth_recovery(chat_runtime(&app, card))
+        .expect("the draft offers sign-in");
+    assert_eq!(recovery.account, system);
+    assert!(recovery.draft);
+    assert!(app.chat_auth_recovery_enabled(target));
+    // A draft has no conversation to resume.
+    assert!(!app.chat_auth_resume_enabled(target));
+    // The composer's Send is the one way to send it again: the card adds no
+    // second control doing the same (#3438).
+    let buttons = super::blocked_recovery_tests::buttons(&app, card);
+    assert!(
+        buttons
+            .iter()
+            .any(|(label, enabled)| label == "Sign in" && *enabled),
+        "{buttons:?}"
+    );
+    assert!(
+        buttons.iter().all(|(label, _)| label != "Send again"),
+        "{buttons:?}"
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|(label, enabled)| label.starts_with("Send message") && *enabled),
+        "{buttons:?}"
+    );
+
+    // Sending again is the composer's own Send of the draft's first
+    // message, not a resume of a conversation it never had.
+    start_with(&mut app, target, Action::Submit(target, PromptMode::Send));
+    let attempt = app
+        .chat_ui
+        .attempt(card)
+        .expect("sending again starts the conversation anew");
+    assert_ne!(attempt.target, target);
+    assert!(chat_runtime(&app, card).queued.is_some());
+}
+
+/// Recovery needs the draft's message: with nothing left to send, signing in
+/// is still offered but sending again is not.
+#[test]
+fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(
+        &mut app,
+        Provider::Antigravity,
+        Path::new(FIXTURE_DIRECTORY),
+    );
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target).unwrap().error = Some(format!(
+        "{}: sign in to Antigravity, then try again. (log in first)",
+        chat::ACP_SIGN_IN_PREFIX
+    ));
+    assert!(app.chat_auth_recovery_enabled(target));
+    assert!(!app.chat_auth_resume_enabled(target));
+    drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
+    assert!(app.chat_ui.attempt(card).is_none());
+    // Overriding HOME still hides which sign-in the provider would read.
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .environment
+        .insert("HOME".into(), "/unknown/agy-recovery-home".into());
+    assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+}
+
+/// A start that stops for any other reason keeps its plain report.
+#[test]
+fn a_draft_whose_start_fails_otherwise_offers_no_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+    let handle = fixture_handle(&app, card, None);
+    // The adapter has not yet said it takes commands.
+    handle.replace_snapshot_for_test(Snapshot::default());
+    answer_start(&mut app, target, Ok(handle.clone()));
+    let target = chat_runtime(&app, card).target;
+    handle.replace_snapshot_for_test(Snapshot {
+        error: Some("fixture: adapter crashed".into()),
+        exited: true,
+        ..Snapshot::default()
+    });
+    let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "The conversation stopped before it took the first message. Its last report: fixture: adapter crashed"
+        )
+    );
+    assert!(runtime.auth_error().is_none());
+    assert!(app.chat_auth_recovery(runtime).is_none());
+    assert!(!app.chat_auth_recovery_enabled(runtime.target));
+}
 #[test]
 fn auth_recovery_reconnect_preserves_session_and_draft_and_rejects_resolved_error() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20997,7 +21406,8 @@ fn an_excerpted_output_copies_whole_from_its_source() {
         Ok(whole.clone()),
     ));
     assert_chat_copy_task_writes(task, &whole);
-    let request = text_copy::Request::for_test(handle, excerpted).with_prefix("cargo build");
+    let request =
+        text_copy::Request::for_test(handle, excerpted).for_step(CopyPart::Text, "cargo build");
     let task = app.handle_chat_ui(Action::MessageCopied(
         target,
         "long".into(),
@@ -21439,6 +21849,7 @@ fn shared_code_copy_keeps_exact_bytes_typed_target_and_clipboard_intent_until_ef
 
 #[test]
 fn logical_message_copy_completion_refuses_destructive_changes_after_last_page() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -21470,13 +21881,55 @@ fn logical_message_copy_completion_refuses_destructive_changes_after_last_page()
             request,
             Ok(body),
         )));
-        assert_chat_copy_task_has_no_effects(task, change);
-        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none());
+        if change == "rewrite" {
+            // The rewritten item is read again; only that read reaches the
+            // clipboard.
+            assert!(runtime.error.is_none());
+            handle.disconnect_for_test();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut effects =
+                    iced::runtime::task::into_stream(task).expect("a rewrite reads again");
+                tokio::time::timeout(Duration::from_secs(1), effects.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+            let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                Action::MessageCopied(target, id, reread, _),
+            ))) = completion
+            else {
+                panic!("a rewrite reads again before it writes");
+            };
+            let task = app.update(Message::ChatUi(Action::MessageCopied(
+                target,
+                id,
+                reread,
+                Ok("replacement".into()),
+            )));
+            assert_chat_copy_task_writes(task, "replacement");
+        } else {
+            assert_chat_copy_task_has_no_effects(task, change);
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
+                "{change}"
+            );
+        }
     }
 }
 
+/// A publication that reaches the client after a read was accepted, but
+/// before its write is polled, writes nothing stale. The copy is handled as if
+/// the publication had come first: it reads again or says why it can't.
 #[test]
-fn logical_message_copy_deferred_write_refuses_destructive_publication_before_poll() {
+fn logical_message_copy_deferred_write_reads_again_after_destructive_publication_before_poll() {
+    use iced::futures::StreamExt;
     let _context = text_copy::isolated_context();
     for change in ["rewrite", "remove", "reset"] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -21511,7 +21964,53 @@ fn logical_message_copy_deferred_write_refuses_destructive_publication_before_po
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         // The ordinary UI refresh has not consumed this publication.
-        assert_chat_copy_task_has_no_clipboard_write(task, change);
+        let effects = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    iced::runtime::task::into_stream(task)
+                        .expect("a deferred write")
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .expect("deferred copy and its acknowledgement timer must settle")
+            });
+        let mut bounced = None;
+        for effect in effects {
+            match effect {
+                iced::runtime::Action::Clipboard(iced::runtime::clipboard::Action::Write {
+                    ..
+                }) => panic!("{change}: a stale read reached the clipboard"),
+                iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
+                    Action::MessageCopied(target, id, request, result),
+                ))) => bounced = Some((target, id, request, result)),
+                _ => {}
+            }
+        }
+        let (target, id, request, result) =
+            bounced.unwrap_or_else(|| panic!("{change}: the copy is handled again"));
+        let task = app.update(Message::ChatUi(Action::MessageCopied(
+            target, id, request, result,
+        )));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.copied.is_none(), "{change}");
+        if change == "rewrite" {
+            assert!(runtime.error.is_none(), "{change}");
+            assert!(
+                iced::runtime::task::into_stream(task).is_some(),
+                "{change}: the rewritten item is read again"
+            );
+        } else {
+            assert_eq!(
+                runtime.error.as_deref(),
+                Some(text_copy::UNAVAILABLE),
+                "{change}"
+            );
+            assert_chat_copy_task_has_no_effects(task, change);
+        }
     }
 }
 
@@ -23654,4 +24153,16 @@ pub(in crate::app) fn sent(app: &Cagents, card: CardId) -> Option<String> {
 pub(in crate::app) fn held(app: &Cagents, card: CardId) -> Option<String> {
     let runtime = chat_runtime(app, card);
     (!runtime.followups.is_empty()).then(|| runtime.combined_followups().0)
+}
+
+#[test]
+fn a_new_thread_skips_a_turned_off_provider() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    assert_eq!(app.preferred_chat_provider(), Provider::Codex);
+    app.settings.set_uses_provider(Provider::Codex, false);
+    app.account_ui.set_turned_off(&app.settings);
+    assert_eq!(app.preferred_chat_provider(), Provider::Claude);
+    app.settings.set_uses_provider(Provider::Claude, false);
+    app.account_ui.set_turned_off(&app.settings);
+    assert_eq!(app.preferred_chat_provider(), Provider::Antigravity);
 }

@@ -525,6 +525,14 @@ impl Weak {
     pub fn upgrade(&self) -> Option<Paragraph> {
         self.raw.upgrade().map(Paragraph)
     }
+
+    /// Whether both refer to the same [`Paragraph`], and it is still alive.
+    ///
+    /// A [`Paragraph`] is never changed in place while a [`Weak`] refers to
+    /// it, so this one has the same contents as when `other` was taken.
+    pub fn is_same_live(&self, other: &Self) -> bool {
+        self.raw.strong_count() > 0 && sync::Weak::ptr_eq(&self.raw, &other.raw)
+    }
 }
 
 impl PartialEq for Weak {

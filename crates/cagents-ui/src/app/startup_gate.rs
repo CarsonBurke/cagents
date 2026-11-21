@@ -425,8 +425,8 @@ impl Cagents {
     }
 
     /// What is true of each kind of unsettled pane, since opening one does
-    /// different things: a failed pane offers a retry, a held one says what it
-    /// waits for, and an out-of-step one is already working.
+    /// different things: a failed pane says why and what can be done, a held
+    /// one says what it waits for, and an out-of-step one is already working.
     fn startup_unsettled_sentences(
         &self,
         failures: &[CardId],
@@ -441,7 +441,7 @@ impl Cagents {
         if !failed.is_empty() {
             let them = pronoun(failed.len());
             sentences.push(format!(
-                "{} could not reconnect: {}. Open {them} to see why and retry.",
+                "{} could not reconnect: {}. Open {them} to see why and what to do next.",
                 saved_panes(failed.len()),
                 self.startup_pane_names(&failed),
             ));
@@ -883,11 +883,12 @@ impl Cagents {
                     .asked
                     .is_some_and(|asked| now.duration_since(asked) >= SETTLED_ANSWER_BOUND);
                 // An earlier phase's worker can hold the one slot for its own
-                // bound before this phase may ask.
+                // bound before this phase may ask. The inventory budget caps
+                // this wait like the others.
                 let past_backstop = gate
                     .settled
                     .is_some_and(|settled| now.duration_since(settled) >= SETTLED_ANSWER_BOUND * 2);
-                if answer_overdue || past_backstop {
+                if answer_overdue || past_backstop || self.startup_budget_spent(now) {
                     Settled::Save
                 } else {
                     Settled::Wait

@@ -95,6 +95,40 @@ pub(super) fn checked_caller(
     Ok((origin, session))
 }
 
+/// The permission ceiling on the agents `authority`'s caller starts: its live
+/// session's mode, or `None` for a person's own connection, which has none.
+/// A native conversation's mode is the one its provider confirmed; a
+/// terminal's is the one it launched in.
+pub(super) fn caller_ceiling(
+    host: &SharedHost,
+    authority: &Authority,
+) -> Result<Option<crate::agent_execution::permission::Ceiling>, String> {
+    use crate::agent_execution::permission::Ceiling;
+    let source = registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .checked_agent_authority_source(authority)
+        .map_err(|error| error.to_string())?;
+    Ok(source.map(|source| match source {
+        HostedSession::Chat(source) => {
+            let handle = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chats
+                .get(&source.id)
+                .filter(|record| record.session.proof == source.proof)
+                .map(|record| record.handle.clone());
+            let mode = handle.and_then(|handle| handle.permission_mode());
+            Ceiling::conversation(
+                source.launch.provider,
+                mode.as_deref(),
+                &source.launch.recipe,
+            )
+        }
+        HostedSession::Terminal(source) => Ceiling::launched(&source.launch),
+    }))
+}
+
 pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
     let store = Store::installation().ok_or("Account registry is unavailable")?;
     let accounts = store.load().map_err(|e| e.to_string())?;
@@ -235,6 +269,11 @@ fn accept(
             std::fs::canonicalize(&spec.target.directory).map_err(|e| e.to_string())?;
         if !selected.target.directory.is_dir() {
             return Err("The agent working directory is not a directory".into());
+        }
+        // An agent never gives its child more than it has itself.
+        if let Some(ceiling) = caller_ceiling(host, authority)? {
+            selected.permission_mode =
+                Some(ceiling.child(spec.provider, spec.permission_mode.as_deref())?);
         }
         selected.account = Some(selected_account(&selected)?.id());
         Some(selected)
@@ -736,8 +775,16 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
             }
         };
         let mode = acp.map_or(mode.as_str(), |acp| acp.own_mode(mode));
+        // A Codex mode may name its sandbox after its approval policy.
+        let (mode, sandbox) = match spec.provider {
+            Provider::Codex => crate::agent_execution::permission::codex_launch(mode),
+            _ => (mode, None),
+        };
         if acp.is_none_or(|acp| mode != acp.default_mode) {
             arguments.extend([flag.into(), mode.to_owned()]);
+        }
+        if let Some(sandbox) = sandbox {
+            arguments.extend(["--sandbox".into(), sandbox.to_owned()]);
         }
     }
     if let Some(effort) = &spec.reasoning_effort {
@@ -2051,7 +2098,7 @@ fn control(
     status(host, authority, id)?;
     let gate = agent_gate(host, id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-    let (_, run, handle) = owned_provider(host, authority, id)?;
+    let (agent, run, handle) = owned_provider(host, authority, id)?;
     if registry(host)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2158,6 +2205,20 @@ fn control(
                     actions.join(", ")
                 ));
             }
+            // Approving a tool request, or consenting to what a tool asks,
+            // grants what the child asked for, so only an agent that runs with
+            // nothing asking may do it. Any agent may refuse one, as the
+            // provider's adapter reads the action. A provider that asks its
+            // tool approvals as questions has each of its questions treated so.
+            let grants = match request.kind {
+                chat::RequestKind::Approval | chat::RequestKind::Consent => true,
+                chat::RequestKind::Question => agent.spec.provider.approves_through_questions(),
+            };
+            let ceiling = if grants {
+                caller_ceiling(host, authority)?.filter(|ceiling| !ceiling.may_approve())
+            } else {
+                None
+            };
             if let Some(answer) = answers
                 .iter()
                 .find(|answer| !request.fields.iter().any(|field| field.id == answer.field))
@@ -2173,8 +2234,15 @@ fn control(
                 answers,
             };
             let synchronization = super::chat::retained_actor::AnswerSync::capture(host, &handle)?;
-            if run.state.is_terminal() {
-                handle.decline_answer(command)?;
+            if run.state.is_terminal() || ceiling.is_some() {
+                handle
+                    .decline_answer(command)
+                    .map_err(|error| match &ceiling {
+                        Some(ceiling) if error == chat::runtime::NOT_A_DECLINE => {
+                            ceiling.approval_refusal()
+                        }
+                        _ => error,
+                    })?;
             } else {
                 handle.command(command)?;
             }
@@ -2557,13 +2625,15 @@ fn console_text(snapshot: &chat::Snapshot, now: u64) -> (String, bool) {
     // A provider opens its next text block empty, which has no line to hold.
     let writing = snapshot.busy
         && snapshot.items.last().is_some_and(|item| {
-            matches!(
-                item.content,
-                chat::ItemContent::Text {
-                    thinking: false,
-                    ..
-                }
-            ) && console_line(item, now).is_some()
+            item.role == chat::Role::Assistant
+                && matches!(
+                    item.content,
+                    chat::ItemContent::Text {
+                        thinking: false,
+                        ..
+                    }
+                )
+                && console_line(item, now).is_some()
         });
     if writing {
         text.pop();
@@ -2595,6 +2665,7 @@ fn console_paged_files(snapshot: &chat::Snapshot) -> std::collections::HashMap<&
 /// What the provider's harness said about the session, as one unlabelled line,
 /// the way the native chat recesses it. Adapters file command output and whole
 /// protocol frames under this role, so only the start of plain text is shown.
+/// A cut notice ends with an ellipsis.
 fn console_notice(text: &str) -> Option<String> {
     let text = text.trim();
     if serde_json::from_str::<serde_json::Value>(text)
@@ -2603,8 +2674,13 @@ fn console_notice(text: &str) -> Option<String> {
         return None;
     }
     let mut line = text.lines().next()?.trim_end().to_owned();
-    if line.len() > CONSOLE_NOTICE_BYTES {
-        crate::agent_execution::truncate(&mut line, CONSOLE_NOTICE_BYTES);
+    // Room for the ellipsis is taken only from a notice that is cut anyway, so
+    // a whole line that fits is printed as it is.
+    if line.len() > CONSOLE_NOTICE_BYTES || text.lines().skip(1).any(|line| !line.trim().is_empty())
+    {
+        crate::agent_execution::truncate(&mut line, CONSOLE_NOTICE_BYTES - '…'.len_utf8());
+        line.truncate(line.trim_end().len());
+        line.push('…');
     }
     line.push('\n');
     Some(line)
@@ -2694,7 +2770,16 @@ fn console_line(item: &chat::Item, now: u64) -> Option<String> {
                 .and_then(|verb| label.strip_prefix(verb))
                 .filter(|target| !target.is_empty())
                 .unwrap_or(label);
-            let target = first_line(if label.is_empty() { command } else { label });
+            let target = if *action == CommandAction::Run {
+                // Like native step_label, show what ran: a description reads as a second verb after "Ran".
+                first_line(if command.trim().is_empty() {
+                    label
+                } else {
+                    command
+                })
+            } else {
+                first_line(if label.is_empty() { command } else { label })
+            };
             let exit = match (status, exit_code) {
                 (ToolStatus::Failed, Some(code)) => format!(" (failed, exit {code})"),
                 _ => outcome(status).to_owned(),

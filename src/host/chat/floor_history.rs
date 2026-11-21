@@ -161,6 +161,7 @@ fn install(
                 returning_terminal: false,
             },
         );
+        state.chat_added(id);
         state.inventory_generation += 1;
     }
     Ok(())

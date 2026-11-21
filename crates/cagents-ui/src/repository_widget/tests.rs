@@ -4430,6 +4430,123 @@ fn gutter_ranges_preserve_side_and_original_anchor_when_backtracking() {
     }
 }
 
+#[tokio::test]
+async fn cached_offline_gutter_waits_for_verified_review_authority() {
+    use crate::pull_request_review::{self, Action, Effect, LoadState, cache};
+    use cosmic::iced::futures::StreamExt;
+
+    async fn dispatch_gutter(
+        runtime: &mut RepositoryRuntime,
+        review: &mut pull_request_review::State,
+        action: RepositoryAction,
+    ) {
+        let mut stream = iced::runtime::task::into_stream(runtime.update(action)).unwrap();
+        let mut delivered = 0;
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(RepositoryAction::Review { action, .. }) = action {
+                drop(review.update(action));
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 1,
+            "the selected gutter action reaches the review"
+        );
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(cache::JsonStore::new(directory.path().join("review.json")));
+    cache::Store::save(
+        store.as_ref(),
+        &cache::fixture(),
+        &cache::WriteOrder::capture().unwrap(),
+    )
+    .unwrap();
+    let (review, _) = pull_request_review::tests::state();
+    let mut review = review.with_cache(Some(store));
+    let open = review.update(Action::Open(pull_request_review::tests::target(1)));
+    let mut stream = iced::runtime::task::into_stream(open).unwrap();
+    let Some(iced::runtime::Action::Output(cached @ Action::Cached { .. })) = stream.next().await
+    else {
+        panic!("opening the review reads its real cached snapshot");
+    };
+    assert!(stream.next().await.is_none());
+    drop(review.update(cached));
+    drop(review.update(Action::Loaded {
+        generation: review.selection_generation(),
+        load: 1,
+        result: Err("Offline".into()),
+    }));
+    assert_eq!(review.load_state(), &LoadState::Ready);
+
+    let card = CardId::new();
+    let (mut runtime, _) = diff_runtime(card);
+    let effects = review.take_effects();
+    let [
+        Effect::SelectionChanged(Some(1)),
+        Effect::OpenFile {
+            path,
+            old_path,
+            basis,
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("the cached selection opens its pull request diff: {effects:?}");
+    };
+    drop(runtime.update(RepositoryAction::OpenCommittedFile {
+        card,
+        path: path.clone(),
+        old_path: old_path.clone(),
+        basis: basis.clone(),
+    }));
+    let model = crate::diff_view::build_diff("old\n", "new\n");
+    let line_counts = model.line_counts;
+    runtime.set_diff_state(basis.clone(), DiffState::ready(staged_text_diff(model)));
+    assert_eq!(runtime.selected.as_ref().unwrap().path, path.as_path());
+    assert_eq!(runtime.selected_diff_basis(), basis);
+    assert_eq!(review.selected(), Some(path));
+    let path = path.as_path().to_str().unwrap();
+    let action = DiffReviewContext {
+        card,
+        runtime: &runtime,
+        review: &review,
+        path,
+        line_counts,
+    }
+    .line_action(None, Some(1));
+    // Dispatch before asserting availability so the unfixed path reaches its panic.
+    if let Some(action) = action.clone() {
+        dispatch_gutter(&mut runtime, &mut review, action).await;
+    }
+    assert!(
+        action.is_none(),
+        "cached review gutters offer no comment action"
+    );
+    assert!(!review.has_annotation(path, None, Some(1), false));
+
+    pull_request_review::tests::finish_load(
+        &mut review,
+        pull_request_review::tests::loaded(
+            vec![pull_request_review::tests::entry(
+                path,
+                ChangeKind::Modified,
+            )],
+            vec![],
+        ),
+    );
+    let action = DiffReviewContext {
+        card,
+        runtime: &runtime,
+        review: &review,
+        path,
+        line_counts,
+    }
+    .line_action(None, Some(1))
+    .expect("verified review authority restores gutter comments");
+    dispatch_gutter(&mut runtime, &mut review, action).await;
+    assert!(review.has_annotation(path, None, Some(1), false));
+}
+
 #[test]
 fn measured_diff_blocks_preserve_anchor_and_change_navigation() {
     let card = CardId::new();
@@ -9337,6 +9454,33 @@ fn directory_listings_are_one_level_until_a_folder_is_opened() {
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
     assert_eq!(nested_names, vec!["nested/child.txt", "nested/deeper"]);
+}
+
+#[test]
+fn a_folder_that_is_a_symlink_lists_the_folder_it_names() {
+    // `~/.gemini` opened as a folder, where it links into a dotfiles checkout.
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = fixture.path().join("dotfiles/gemini");
+    std::fs::create_dir_all(physical.join("brain")).unwrap();
+    std::fs::write(physical.join("GEMINI.md"), "a").unwrap();
+    std::fs::write(physical.join("brain/notes.md"), "b").unwrap();
+    let linked = fixture.path().join(".gemini");
+    std::os::unix::fs::symlink(&physical, &linked).unwrap();
+    let names: Vec<_> = load_directory_files(&linked)
+        .unwrap()
+        .iter()
+        .map(|file| (file.path.to_string_lossy().into_owned(), file.directory))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("GEMINI.md".into(), false), ("brain".into(), true)]
+    );
+    let nested: Vec<_> = load_directory_listing(&linked, Path::new("brain"))
+        .unwrap()
+        .iter()
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(nested, vec!["brain/notes.md"]);
 }
 
 #[test]

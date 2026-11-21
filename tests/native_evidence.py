@@ -1044,6 +1044,25 @@ class Evidence(unittest.TestCase):
                 self.assertNotIn("RUST_LOG=", self.run_tool("cli", "print-env").stdout)
                 self.run_tool("stop")
 
+    def test_daemon_trace_logs_the_daemon_of_only_the_session_that_asked_for_it(self) -> None:
+        self.built()
+        log = str(self.task / "logs/daemon-after.log")
+        for options, expected in (([], None), (["--daemon-trace", "cagents::chat::runtime=debug,warn"], log), ([], None)):
+            with self.subTest(options=options):
+                (self.logs / "ui-ran").unlink(missing_ok=True)
+                self.run_tool("start", "after", *options)
+                arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
+                if expected is None:
+                    self.assertNotIn("--daemon-log", arguments)
+                    self.assertEqual((self.logs / "ui-rust-log").read_text(), "unset\n")
+                else:
+                    self.assertEqual(arguments[arguments.index("--daemon-log") + 1], expected)
+                    self.assertEqual((self.logs / "ui-rust-log").read_text(), "cagents::chat::runtime=debug,warn\n")
+                self.run_tool("stop")
+        missing = self.run_tool("start", "after", "--daemon-trace", check=False)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("--daemon-trace needs a RUST_LOG filter", missing.stderr)
+
     def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
         for value in ("0", "-1", "+1", "01", "1.5", "3601", "10000", "99999999999999999999", "", "1+2", "1\n2"):
             with self.subTest(value=value):
@@ -2274,6 +2293,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([
             {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
              "author": {"login": "fixture"}, "url": "https://github.com/octo-org/app/pull/7",
+             "fixtureReviewRequests": 2,
              "statusCheckRollup": [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
                                     "conclusion": "SUCCESS", "workflowName": "CI"}]},
             {**pull, "number": 8, "title": "Merged", "state": "MERGED", "headRefName": "done",
@@ -2308,6 +2328,31 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         self.assertEqual(opened["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"],
                          [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
                            "conclusion": "SUCCESS", "checkSuite": {"workflowRun": {"workflow": {"name": "CI"}}}}])
+        # The pull request browser lists the open seeds with their check state;
+        # the review-request poll sees a seed's request, and its history the
+        # two requests that make it re-requested.
+        page_query = ("query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name)"
+                      "{pullRequests(first:50,after:$cursor,states:OPEN){nodes{number} "
+                      "pageInfo{hasNextPage endCursor}}}}")
+        browser = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query={page_query}' "
+            "-f owner=Octo-Org -f name=app").stdout)["data"]["repository"]["pullRequests"]
+        (listed,) = browser["nodes"]
+        self.assertEqual((listed["number"], listed["headRepository"]["owner"], "fixtureReviewRequests" in listed),
+                         (7, {"login": "octo-org"}, False))
+        self.assertEqual(listed["commits"]["nodes"][0]["commit"]["statusCheckRollup"], {"state": "SUCCESS"})
+        self.assertEqual(browser["pageInfo"], {"hasNextPage": False, "endCursor": None})
+        poll = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query=query CagentsReviewRequests{page_query[5:]}' "
+            "-f owner=Octo-Org -f name=app").stdout)["data"]["repository"]["pullRequests"]["nodes"]
+        self.assertEqual([(node["number"], node["viewerLatestReviewRequest"]["requestedReviewer"]["__typename"])
+                          for node in poll], [(7, "User")])
+        history = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query CagentsReviewRequestHistory"
+            "($owner:String!,$name:String!,$number:Int!){viewer{id}}' "
+            "-f owner=Octo-Org -f name=app -F number=7").stdout)["data"]["repository"]["pullRequest"]
+        self.assertEqual([event["createdAt"] for event in history["timelineItems"]["nodes"]],
+                         ["2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"])
         # Its probe: the viewer's latest changes, free to ask again while unchanged,
         # dated by the forge's clock as GitHub dates its answers.
         probe = "gh api --include --hostname github.com --method GET " \
@@ -2333,6 +2378,20 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         checks = self.fixture_shell(f"gh pr checks 7 {selector} --json name", check=False)
         self.assertEqual((checks.returncode, checks.stderr), (1, "no checks reported on the 'feature' branch\n"))
         self.assertEqual(self.fixture_shell(f"gh pr view 9 {selector} --json number", check=False).returncode, 1)
+        # Fifty a page: a 51st open seed is on the second, behind the first's cursor.
+        (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([
+            {**pull, "number": number, "title": f"Seed {number}", "state": "OPEN", "headRefName": "feature",
+             "url": f"https://github.com/octo-org/app/pull/{number}"} for number in range(1, 52)]))
+        first_page = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query={page_query}' "
+            "-f owner=octo-org -f name=app").stdout)["data"]["repository"]["pullRequests"]
+        self.assertEqual((len(first_page["nodes"]), first_page["pageInfo"]),
+                         (50, {"hasNextPage": True, "endCursor": "50"}))
+        second_page = json.loads(self.fixture_shell(
+            f"gh api graphql --hostname github.com -f 'query={page_query}' "
+            "-f owner=octo-org -f name=app -f cursor=50").stdout)["data"]["repository"]["pullRequests"]
+        self.assertEqual(([node["number"] for node in second_page["nodes"]], second_page["pageInfo"]),
+                         ([51], {"hasNextPage": False, "endCursor": None}))
         # A malformed seed fails in gh, naming the file, rather than as bad JSON in the app.
         (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text('{"number": 7}')
         malformed = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
@@ -2469,6 +2528,8 @@ GATE_STUB = """
 REMOTE_TOOL = """
     #!/bin/bash
     if [ "$1" = __build-arguments ]; then
+        # The real one reads the layout of the checkout it is run in.
+        pwd -P > "$STUB_LOG/build-arguments-from"
         printf -- '--profile dev-runtime --bin %s\\n' cagents cagentsd cagents-ui
         exit 0
     fi
@@ -2873,7 +2934,10 @@ class RemoteEvidence(unittest.TestCase):
     def test_a_checkout_builds_through_its_own_gate_and_sends_what_it_built(self) -> None:
         checkout = self.checkout("after", {"src.rs": "fn main() {}\n"})
         (checkout / "src.rs").write_text("fn main() { edited(); }\n")
-        self.run_tool("build", "after", str(checkout))
+        # From anywhere: what to build depends on the checkout's layout.
+        self.run_tool("build", "after", str(checkout), cwd=self.root)
+        self.assertEqual((self.logs / "build-arguments-from").read_text().strip(),
+                         str(checkout.resolve()))
         gate = [line.split("\t") for line in (self.logs / "gate").read_text().splitlines()]
         self.assertEqual({directory for directory, _ in gate}, {str(checkout)})
         # In one slot, held for the three, as the tool says to build them.

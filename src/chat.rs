@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod failure;
-mod fresh;
+pub(crate) mod fresh;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
@@ -2045,6 +2045,9 @@ impl<'a> TranscriptPart<'a> {
 /// envelope, with headroom; longer accumulated streams fail explicitly.
 pub const TEXT_COPY_PAGE_BYTES: usize = TRANSCRIPT_PART_BYTES;
 pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// Why a copy whose text changed before it finished put nothing on the
+/// clipboard. The store refuses with it, and the UI shows it.
+pub const TEXT_COPY_CHANGED: &str = "This text changed while copying. Copy it again.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextCopyPage {
@@ -2530,11 +2533,11 @@ pub enum ItemContent {
         reference: Option<ImageReference>,
     },
     /// Something another agent or the provider harness delivered to this
-    /// conversation: a report, a message, a background-work notice, or context
-    /// the provider added without attributing it to the user.
+    /// conversation: a report, a message, a background-work notice, or where
+    /// the provider compacted its context, with the summary that replaced it.
     ///
     /// It can arrive in the user's slot and the agent acts on it as on a
-    /// prompt; provider context uses the System role. The user did not write
+    /// prompt; a compaction uses the System role. The user did not write
     /// either. Typesetting it as their own
     /// message, wrapped in the framing the harness adds for the model,
     /// made the transcript read as though they had.
@@ -2551,7 +2554,7 @@ pub enum ItemContent {
         /// message. Empty when there is none.
         summary: String,
         /// A report/message with harness framing removed, a notice's quoted
-        /// output, or provider context retained verbatim without interpretation.
+        /// output, or a compaction's summary retained verbatim.
         body: String,
     },
 }
@@ -2563,7 +2566,7 @@ pub enum DeliveryKind {
     /// A message from a teammate or another session.
     Message,
     /// A provider/harness notice, including background-work events and
-    /// provider context. An empty sender makes no agent-origin claim.
+    /// compaction. An empty sender makes no agent-origin claim.
     Notice,
 }
 
@@ -2580,7 +2583,9 @@ impl DeliveryKind {
 }
 
 /// The summary of the notice that marks where the person stopped a turn.
-pub const STOPPED: &str = "Stopped";
+/// It says who stopped it, so it neither repeats the stopped step's own
+/// "Stopped" just above it nor reads as the agent giving up.
+pub const STOPPED_NOTICE: &str = "You stopped this turn";
 
 /// The status detail of a conversation whose last turn was stopped before it
 /// finished, whichever provider ran it.
@@ -2597,7 +2602,7 @@ pub fn stopped_notice(id: String) -> Item {
             kind: DeliveryKind::Notice,
             from: String::new(),
             sender: String::new(),
-            summary: STOPPED.into(),
+            summary: STOPPED_NOTICE.into(),
             body: String::new(),
         },
         started_at: None,
@@ -2610,7 +2615,7 @@ pub fn is_stopped_notice(content: &ItemContent) -> bool {
     matches!(
         content,
         ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body }
-            if summary == STOPPED && body.is_empty() && from.is_empty() && sender.is_empty()
+            if summary == STOPPED_NOTICE && body.is_empty() && from.is_empty() && sender.is_empty()
     )
 }
 
@@ -3895,6 +3900,46 @@ mod tests {
         assert_eq!(claude_configured_default_mode(&recipe), None);
     }
 
+    /// cagents pins the system choice only on a managed account's native
+    /// conversation; the account's terminal reads its own home's settings.
+    #[test]
+    #[cfg(feature = "host")]
+    fn a_managed_claude_terminal_reads_its_own_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let homes = crate::account::home::Homes::at(directory.path().join("accounts"));
+        let account = homes.path(Provider::Claude, uuid::Uuid::new_v4());
+        let system = directory.path().join("system");
+        let project = directory.path().join("project");
+        for path in [&account, &system, &project] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(
+            system.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            account.join("settings.json"),
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        )
+        .unwrap();
+        let recipe = LaunchRecipe {
+            unset_environment: ["HOME".into(), "CLAUDE_CODE_PERMISSION_MODE".into()].into(),
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: project,
+            environment: [("CLAUDE_CONFIG_DIR".into(), account.display().to_string())].into(),
+        };
+        assert_eq!(
+            claude_configured_default_mode_in(&recipe, Some(&homes), Some(&system)).as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(
+            claude_settings_default_mode(&recipe).as_deref(),
+            Some("plan")
+        );
+    }
+
     #[test]
     #[cfg(any(feature = "host", feature = "ui"))]
     fn managed_claude_accounts_follow_the_current_global_permission_default() {
@@ -4328,6 +4373,18 @@ pub fn claude_configured_default_mode(recipe: &LaunchRecipe) -> Option<String> {
     let homes = crate::account::home::Homes::installation();
     let system_home = crate::account::Account::system(Provider::Claude).resolved_home();
     claude_configured_default_mode_in(recipe, homes.as_ref(), system_home.as_deref())
+}
+
+/// The `permissions.defaultMode` a Claude CLI reads itself under `recipe`:
+/// its own configuration home's, without the system choice cagents pins
+/// for a managed account's native conversation, which a terminal does not
+/// receive. A project's own choice, or a remote device's, is unknown.
+#[cfg(feature = "host")]
+pub(crate) fn claude_settings_default_mode(recipe: &LaunchRecipe) -> Option<String> {
+    if crate::device::is_remote() {
+        return None;
+    }
+    claude_configured_default_mode_in(recipe, None, None)
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]

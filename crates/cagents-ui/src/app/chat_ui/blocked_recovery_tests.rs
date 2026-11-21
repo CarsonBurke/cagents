@@ -1338,7 +1338,7 @@ fn pane_labels(app: &mut Cagents, card: CardId) -> Vec<String> {
     labels
 }
 
-fn buttons(app: &Cagents, card: CardId) -> Vec<(String, bool)> {
+pub(super) fn buttons(app: &Cagents, card: CardId) -> Vec<(String, bool)> {
     let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
     tree.root()
         .iter()
@@ -1696,5 +1696,70 @@ fn a_conversation_the_update_stopped_offers_reopen_and_reopens_on_request() {
         } else {
             assert!(!app.chat_ui.blocked_starts.contains_key(&card), "{case}");
         }
+    }
+}
+
+/// A refused conversation keeps its message box for the unsent draft, but its
+/// disabled Send says why it sends nothing instead of naming a chord (#2905).
+#[test]
+fn blocked_send_says_why_it_cannot_send() {
+    for (reopen, named, valid_recipe, expected) in [
+        (
+            blocked_recovery::Reopen::AfterRestart,
+            true,
+            true,
+            blocked_recovery::UNSENDABLE_UNTIL_RESTART,
+        ),
+        (
+            blocked_recovery::Reopen::Unproven,
+            true,
+            true,
+            blocked_recovery::UNSENDABLE_UNTIL_FRESH,
+        ),
+        (
+            blocked_recovery::Reopen::Unproven,
+            false,
+            true,
+            blocked_recovery::UNSENDABLE,
+        ),
+        // An update's refusals offer no new conversation in its place.
+        (
+            blocked_recovery::Reopen::UpdateRecovery,
+            true,
+            true,
+            blocked_recovery::UNSENDABLE_UNTIL_RESTART,
+        ),
+        (
+            blocked_recovery::Reopen::UpdateStopped,
+            true,
+            true,
+            blocked_recovery::UNSENDABLE_UNTIL_REOPENED,
+        ),
+    ] {
+        let (app, card) = blocked_app_with(named, valid_recipe, true, reopen);
+        assert_eq!(
+            app.chat_offers_fresh_conversation(card),
+            named && reopen.offers_fresh(),
+            "{reopen:?}"
+        );
+        let (tree, _) = frame(app.card_view(card, true, false), 1200.0, None);
+        let send = tree
+            .root()
+            .iter()
+            .chain(tree.children())
+            .filter(|node| {
+                node.node().role() == Role::Button
+                    && node
+                        .node()
+                        .label()
+                        .is_some_and(|text| text.starts_with("Send message"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(send.len(), 1, "{reopen:?}");
+        assert!(send[0].node().is_disabled());
+        assert_eq!(
+            send[0].node().label(),
+            Some(format!("Send message — {}", expected.reason).as_str())
+        );
     }
 }

@@ -20,7 +20,11 @@ pub(crate) use codex::archived_rollout as codex_archived_rollout;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub use codex::rollout as codex_rollout;
 mod antigravity;
+#[cfg(feature = "host")]
+pub(crate) use antigravity::MODES as ANTIGRAVITY_MODES;
 mod muse;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) use muse::offers_model as muse_offers_model;
 mod omp;
 
 #[cfg(feature = "host")]
@@ -157,6 +161,20 @@ struct ProviderAdapter {
     /// Whether cagents can run this provider's conversations as native chat.
     /// Without it the provider runs only in a terminal.
     native_chat: bool,
+    /// The permission modes an agent cagents starts may be given, by the
+    /// names `agent spawn --permission-mode` and automations take: the
+    /// provider's own for Claude, Codex and OMP, and for an ACP agent the
+    /// cagents name of each of its session modes.
+    permission_modes: &'static [&'static str],
+    /// Other names the provider's own terminal gives the same modes, which a
+    /// launch or a saved automation may use instead.
+    permission_mode_aliases: &'static [&'static str],
+    /// Sandboxes a mode may name after its approval policy and a `/`, as in
+    /// Codex's `on-request/read-only`.
+    permission_sandboxes: &'static [&'static str],
+    /// Whether its native chat asks for tool approvals as ordinary questions,
+    /// so answering one of its questions may approve a tool.
+    approves_through_questions: bool,
     /// What cagents knows of a provider whose native chat is the Agent
     /// Client Protocol, for one that serves it.
     acp: Option<Acp>,
@@ -331,11 +349,97 @@ impl Provider {
             .find(|provider| provider.programs().any(|program| program == name))
     }
 
+    /// The executable that runs one of this provider's subcommands, such as
+    /// its ACP server or its login, for `program`, the one its terminal runs.
+    /// They differ only where `program` is a wrapper that puts options before
+    /// any subcommand: Muse's `muse`. A relative `program` or `path` entry is
+    /// taken from `directory`.
+    pub fn subcommand_program(self, program: &str, directory: &Path, path: &str) -> String {
+        match self {
+            Self::Muse => muse::subcommand_program(program, directory, path),
+            _ => program.to_owned(),
+        }
+    }
+
     /// Whether cagents can run this provider's conversations as native chat.
     /// A provider without it is recognised in a terminal but never offered,
     /// converted or started as a native conversation.
     pub fn has_native_chat(self) -> bool {
         self.adapter().native_chat
+    }
+
+    /// The permission modes an agent of this provider may be started with.
+    pub fn permission_modes(self) -> &'static [&'static str] {
+        self.adapter().permission_modes
+    }
+
+    /// Other names its terminal gives the same modes, also accepted.
+    pub fn permission_mode_aliases(self) -> &'static [&'static str] {
+        self.adapter().permission_mode_aliases
+    }
+
+    /// Whether answering one of its native chat's questions may approve a
+    /// tool, as an Oh My Pi confirmation does.
+    pub fn approves_through_questions(self) -> bool {
+        self.adapter().approves_through_questions
+    }
+
+    /// Sandboxes a mode may name after `/`.
+    pub fn permission_sandboxes(self) -> &'static [&'static str] {
+        self.adapter().permission_sandboxes
+    }
+
+    /// The permission modes this provider takes, as its help and errors name
+    /// them: "a, b or c", then any sandbox suffix or terminal aliases.
+    pub fn permission_mode_choices(self) -> String {
+        fn list<S: AsRef<str>>(names: &[S]) -> String {
+            match names {
+                [] => String::new(),
+                [only] => only.as_ref().to_owned(),
+                [rest @ .., last] => {
+                    let rest: Vec<_> = rest.iter().map(AsRef::as_ref).collect();
+                    format!("{} or {}", rest.join(", "), last.as_ref())
+                }
+            }
+        }
+        let mut choices = list(self.permission_modes());
+        if let sandboxes @ [_, ..] = self.permission_sandboxes() {
+            let sandboxes: Vec<_> = sandboxes
+                .iter()
+                .map(|sandbox| format!("/{sandbox}"))
+                .collect();
+            choices = format!(
+                "{choices}, each optionally followed by {}",
+                list(&sandboxes)
+            );
+        }
+        if let aliases @ [_, ..] = self.permission_mode_aliases() {
+            choices = format!("{choices}, or its terminal's {}", list(aliases));
+        }
+        choices
+    }
+
+    /// Refuses a permission mode this provider has no such mode for, such as
+    /// another provider's, naming the ones it has.
+    pub fn check_permission_mode(self, mode: &str) -> Result<(), String> {
+        let (named, sandbox) = mode
+            .split_once('/')
+            .map_or((mode, None), |(named, sandbox)| (named, Some(sandbox)));
+        let sandbox_known =
+            sandbox.is_none_or(|sandbox| self.permission_sandboxes().contains(&sandbox));
+        if sandbox_known && self.permission_modes().contains(&named)
+            || self.permission_mode_aliases().contains(&mode)
+        {
+            return Ok(());
+        }
+        if self.permission_modes().is_empty() {
+            return Err(format!("{} takes no permission mode", self.label()));
+        }
+        Err(format!(
+            "{} has no permission mode {mode:?}; choose {}",
+            self.label(),
+            self.permission_mode_choices()
+        ))
     }
 
     /// How this provider serves the Agent Client Protocol, for one whose
@@ -375,7 +479,7 @@ impl Provider {
     /// The provider a launch runs, whatever it runs it for, and the arguments
     /// it passes that provider: a known executable, or an interpreter running
     /// one of the provider's known entrypoints.
-    pub(crate) fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
+    pub fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
         if Self::is_interpreter(&launch.program) {
             let script = Path::new(launch.arguments.first()?);
             let provider = ADAPTERS

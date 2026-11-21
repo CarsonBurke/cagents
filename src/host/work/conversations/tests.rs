@@ -994,3 +994,221 @@ fn a_conversation_with_no_transcript_yet_reads_as_complete_once_looked_for() {
     assert_eq!(watched.coverage, TranscriptCoverage::Complete);
     assert!(watched.references.is_empty());
 }
+
+#[test]
+fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_opened() {
+    use crate::chat::{
+        ChangeKind, CommandAction, FileChange, Item, ItemContent, Role, ToolStatus, runtime::Unread,
+    };
+    let item = |id: &str, content| Item {
+        started_at: None,
+        id: id.into(),
+        role: Role::Assistant,
+        content,
+        at: None,
+    };
+    let unread = Unread {
+        restarted: true,
+        items: vec![
+            item(
+                "edit",
+                ItemContent::Changes {
+                    changes: vec![FileChange {
+                        path: "/w/app/.worktrees/feat/src/lib.rs".into(),
+                        kind: ChangeKind::Updated,
+                        diff: String::new(),
+                    }],
+                    status: ToolStatus::Succeeded,
+                },
+            ),
+            item(
+                "create",
+                ItemContent::Command {
+                    label: String::new(),
+                    command: "gh pr create --fill".into(),
+                    working_directory: "/w/app/.worktrees/feat".into(),
+                    action: CommandAction::Run,
+                    status: ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    output: "https://github.com/me/repo/pull/1\n".into(),
+                },
+            ),
+        ],
+        ..Unread::default()
+    };
+    let mut items = Items::default();
+    let mut found = Vec::new();
+    items.read(unread, false, &mut found);
+    let facts = facts("/w/app");
+    let mut watched = Watched::new();
+    watched.source = Source::Recorded;
+    watched.apply(
+        Scanned {
+            found,
+            coverage: items.coverage(),
+        },
+        Some(&facts),
+    );
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(list.transcript, TranscriptCoverage::Complete);
+    assert_eq!(rows(&list), vec![(1, Relation::Created, false, false)]);
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/feat", Some(1))]
+    );
+}
+
+/// Hosts an Antigravity chat whose record holds `items`, the way the daemon
+/// installs one, and tells the Work tracker.
+fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> TerminalId {
+    use crate::chat::{
+        self, Command, Event,
+        protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+    };
+    struct Idle;
+    impl Adapter for Idle {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let directory = std::env::temp_dir();
+    let recipe = crate::model::LaunchRecipe {
+        program: "unused-history-reader".into(),
+        arguments: Vec::new(),
+        working_directory: directory.clone(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec {
+        transport: TransportSpec::History,
+        followed: true,
+        ..ProcessSpec::from(&recipe)
+    };
+    let mut initial = Step {
+        events: items.into_iter().map(Event::Item).collect(),
+        ..Step::default()
+    };
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle =
+        chat::runtime::Handle::start(spec, Box::new(Idle), initial, store, None, |_| {}).unwrap();
+    let id = TerminalId::new();
+    let mut state = host.lock().unwrap();
+    let session = chat::Session {
+        id,
+        launch: chat::Launch {
+            provider: Provider::Antigravity,
+            recipe,
+            session_id: None,
+        },
+        proof: Some(state.proof().clone()),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: Default::default(),
+    };
+    state.chats.insert(
+        id,
+        crate::host::chat::Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session,
+            handle,
+            source_process: None,
+            subscribers: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    state.chat_added(id);
+    id
+}
+
+#[test]
+fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_it() {
+    use crate::chat::{CommandAction, Item, ItemContent, Role, ToolStatus};
+    use crate::model::{HostIncarnation, HostSessionId, HostSessionProof};
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(
+        crate::host::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        }),
+    ));
+    let work = Handle::idle(Arc::downgrade(&host));
+    host.lock().unwrap().work = Some(work.clone());
+    let signal = &work.0.conversations.signal;
+
+    // Nothing to read: the loop would wait for its idle interval.
+    let observed = signal.observe().unwrap();
+    assert!(!work.conversation_pass(&host));
+
+    let id = host_recorded_chat(
+        &host,
+        vec![Item {
+            id: "create".into(),
+            role: Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "gh pr create --fill".into(),
+                working_directory: "/w/app".into(),
+                action: CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: "https://github.com/me/repo/pull/1\n".into(),
+            },
+            started_at: None,
+            at: None,
+        }],
+    );
+    // The loop's wait ends: it was told.
+    signal.wait(observed, Duration::from_secs(5));
+    assert_ne!(signal.observe(), Some(observed));
+
+    // Followed with no watcher, and read from its start.
+    assert!(work.conversation_pass(&host));
+    let state = work.conversations();
+    let watched = &state.watched[&id];
+    assert!(watched.watchers.is_empty());
+    assert_eq!(numbers(watched), [1]);
+    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+    drop(state);
+    let record = host.lock().unwrap().chats.remove(&id).unwrap();
+    let _ = record.handle.close();
+}
+
+#[test]
+fn invalid_branch_identity_is_displayed_with_escapes_without_a_forge_query() {
+    let identity = ":6c65676163792dff";
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    Arc::make_mut(project.local.as_mut().unwrap()).worktrees[0].branch = Some(identity.into());
+    let mut watched = Watched::new();
+    watched.edited_in(PathBuf::from("/w/app/src"), false);
+    assert!(matches!(
+        resolve(&branch(None, identity), &facts, &BTreeMap::new()),
+        Resolved::Nothing
+    ));
+    let project = facts.project.as_ref().unwrap();
+    let worktrees = edited_worktrees(&watched, project, |_| None);
+    assert_eq!(worktrees.len(), 1);
+    assert_eq!(worktrees[0].branch.as_deref(), Some(r"legacy-\xFF"));
+    assert!(worktrees[0].pull_request.is_none());
+}

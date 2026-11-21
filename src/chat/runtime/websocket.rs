@@ -701,6 +701,7 @@ mod tests {
             execution: None,
             messages: None,
             stdout_noise: None,
+            followed: false,
             transport: TransportSpec::UnixWebSocket {
                 socket: path,
                 device: metadata.dev(),

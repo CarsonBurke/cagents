@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I
 """Runs builds on the build host.
 
-Each build waits for its share of the memory set aside for builds, then runs
+Each build waits for its share of the memory set aside for builds, or for an
+extra share while the host's memory allows, then runs
 in a systemd scope in background-cagents.slice. That slice sits in the user
 manager's background.slice, whose CPU weight is below interactive work and
 tests, and its memory is capped as a whole, so the kernel throttles builds
@@ -50,7 +51,7 @@ USAGE = """usage: build-host cargo [OPTIONS] -- CARGO SUBCOMMAND [ARGUMENT...]
 `bench` and `run` the tests or program then run without them, tests in
 app-cagents-test.slice under memory-capped. `build` holds the shares for all of
 COMMAND, such as a script of builds. `count` prints how many shares the host
-has.
+has, the extra ones it takes while memory allows included.
 
 Options:
   --shares N         Memory shares the build needs (default 1); 0 within
@@ -69,6 +70,14 @@ Environment:
                        (default /var/tmp/cagents-cargo.lock)
   CAGENTS_BUILD_SLOTS  Shares on this host (default: three quarters of its
                        memory, in shares of 4 GiB, and at least 2)
+  CAGENTS_BUILD_EXTRA_SHARES
+                       Shares beyond those, taken only while MemAvailable,
+                       less 8 GiB, and the build slice's room hold the
+                       build's shares and the extra shares others hold, and
+                       memory pressure is low (default 2, or 0 when
+                       CAGENTS_BUILD_SLOTS is set)
+  CAGENTS_BUILD_PROC   Where meminfo and pressure/memory are read, for tests
+                       (default /proc)
   CAGENTS_BUILD_SCOPE=0
                        Run builds in place, without a scope or the jobserver
   CAGENTS_BUILD_JOBSERVER
@@ -77,11 +86,38 @@ Environment:
 """
 HERE = os.path.dirname(os.path.realpath(__file__))
 SHARE = 4 * 2**30
+# Shares beyond the host's count of them, taken only while there is memory
+# for the build: builds' peaks rarely coincide, and with every share held,
+# builds' anonymous memory on fw16 came to about a third of their shares' on
+# average and at most 57%. A build takes extra shares only
+# when they complete what it needs, and only if both the host's MemAvailable,
+# less a floor, and what the build slice's MemoryHigh leaves above its builds'
+# anonymous memory hold the build's share memory and that of the extra shares
+# others hold, which may not be in use yet; memory PSI's "some" avg10 must be
+# at most EXTRA_PRESSURE percent too. Otherwise the build waits in line as for
+# any share. MemoryHigh, which the extra shares overcommit, throttles builds
+# whose peaks coincide after all.
+EXTRA_SHARES = 2
+EXTRA_FLOOR = 8 * 2**30
+EXTRA_PRESSURE = 1.0
 # Builds go in systemd's background.slice, whose CPUWeight of 30 is below the
 # 100 of app.slice, where agent sessions, the desktop's applications and tests
 # run.
 BUILD_SLICE = "background-cagents.slice"
 TEST_SLICE = "app-cagents-test.slice"
+# Builds' outputs fill the page cache, which counts toward the build slice's
+# MemoryHigh. Reclaim at that cap takes anonymous memory as well as cache: on
+# fw16, with 12.5 to 17 GiB still available, builds at about 25 GiB of
+# anonymous memory and 7 GiB of cache pushed swap up by as much as 10 GiB,
+# past zram onto disk. So while builds
+# run in scopes, one build-host at a time asks the kernel, once a second, to
+# drop cache alone (memory.reclaim with swappiness=0, Linux 6.13 on) whenever
+# the slice comes within RECLAIM_HEADROOM of its cap, down to RECLAIM_SLACK
+# further below it: only cache the kernel counts inactive, and only when that
+# is enough, so builds near the cap on their own keep the cache they use.
+RECLAIM_HEADROOM = 2 * 2**30
+RECLAIM_SLACK = 2**30
+RECLAIM_TICK = 1.0
 # How often build-host restocks its build's tokens from the pool, and how
 # often it counts the builds sharing it.
 TOKEN_TICK = 0.02
@@ -135,6 +171,154 @@ def share_count():
     return max(2, budget() // SHARE)
 
 
+def extra_share_count():
+    """Shares beyond share_count() taken only while memory allows: none where
+    the share count is configured, as for a lock that is a mutex."""
+    configured = os.environ.get("CAGENTS_BUILD_EXTRA_SHARES")
+    if configured:
+        if not configured.isdecimal():
+            say("CAGENTS_BUILD_EXTRA_SHARES must be a whole number")
+            raise SystemExit(2)
+        return int(configured)
+    return 0 if os.environ.get("CAGENTS_BUILD_SLOTS") else EXTRA_SHARES
+
+
+def build_slice_memory():
+    """The memory.stat of the build slice that builds here run in, or None
+    where they run in place."""
+    if os.environ.get("CAGENTS_BUILD_SCOPE") == "0":
+        return None
+    uid = os.getuid()
+    return (f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/"
+            f"background.slice/{BUILD_SLICE}/memory.stat")
+
+
+def slice_directory():
+    """The build slice's cgroup directory, or None where builds run in place."""
+    memory = build_slice_memory()
+    return memory and os.path.dirname(memory)
+
+
+def cache_to_drop(current, inactive, high):
+    """How much of the build slice's `inactive` page cache, of its `current`
+    memory, to reclaim under a MemoryHigh of `high` bytes (None for none):
+    none while the slice is not near its cap, nor when dropping all of that
+    cache would not take it to the target, where only builds' own memory
+    could."""
+    target = high - RECLAIM_HEADROOM - RECLAIM_SLACK if high is not None else None
+    if target is None or current <= high - RECLAIM_HEADROOM or current - inactive > target:
+        return 0
+    return current - target
+
+
+class CacheTrimmer:
+    """Keeps the build slice's page cache from making the kernel swap builds
+    out at its cap, while this build runs: one build-host at a time, the
+    one holding `lock`, drops cache that would take the slice near its cap."""
+
+    def __init__(self, directory, lock):
+        self.directory, self.lock = directory, lock
+        self.stopped = threading.Event()
+        self.leading = None
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+        # Signals go to the main thread, as for the jobserver's.
+        masked = signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+        try:
+            self.thread.start()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, masked)
+
+    def lead(self):
+        """Whether this build-host is the one that trims, taking that on if
+        no other is."""
+        if self.leading is None:
+            try:
+                file = open(self.lock, "a")
+            except OSError:
+                return False
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                file.close()
+                return False
+            self.leading = file
+        return True
+
+    def read(self, name):
+        with open(os.path.join(self.directory, name)) as file:
+            return file.read().strip()
+
+    def trim(self):
+        """Drops what cache_to_drop says; False once this kernel or slice
+        cannot drop cache alone, or does not say what it holds."""
+        try:
+            high = self.read("memory.high")
+            # Cache the kernel can drop and that builds have not used of late;
+            # tmpfs, which only swap could free, is not in it.
+            cache = next(int(line.split()[1]) for line in self.read("memory.stat").splitlines()
+                         if line.startswith("inactive_file "))
+            amount = cache_to_drop(int(self.read("memory.current")), cache,
+                                   None if high == "max" else int(high))
+        except FileNotFoundError:
+            return True  # The slice comes and goes with its builds.
+        except (OSError, ValueError, StopIteration, IndexError):
+            return False
+        if amount:
+            try:
+                with open(os.path.join(self.directory, "memory.reclaim"), "w") as file:
+                    file.write(f"{amount} swappiness=0")
+            except BlockingIOError:
+                pass  # Less cache was left to drop than asked for.
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False  # EINVAL: a kernel whose reclaim takes no swappiness.
+        return True
+
+    def watch(self):
+        while not self.stopped.wait(RECLAIM_TICK):
+            if self.lead() and not self.trim():
+                return
+
+    def close(self):
+        self.stopped.set()
+        # A reclaim under way finishes on its own.
+        self.thread.join(RECLAIM_TICK)
+        if self.leading:
+            self.leading.close()
+
+
+def memory_allows(reserved, slice_memory):
+    """Whether the host has `reserved` bytes available above EXTRA_FLOOR, the
+    build slice's cap leaves them above its anonymous memory (where
+    `slice_memory` names its memory.stat), and the host is not stalling on
+    memory; not when any of these cannot be read. A slice that does not exist
+    yet, under a user manager that does, holds nothing."""
+    proc = os.environ.get("CAGENTS_BUILD_PROC") or "/proc"
+    try:
+        with open(os.path.join(proc, "meminfo")) as file:
+            available = next(int(line.split()[1]) * 1024 for line in file
+                             if line.startswith("MemAvailable:"))
+        with open(os.path.join(proc, "pressure/memory")) as file:
+            some = next(line.split() for line in file if line.startswith("some "))
+        pressure = float(next(field for field in some if field.startswith("avg10="))[6:])
+        anonymous = 0
+        if slice_memory is not None:
+            try:
+                with open(slice_memory) as file:
+                    anonymous = next(int(line.split()[1]) for line in file if line.startswith("anon "))
+            except FileNotFoundError:
+                # Not started yet, under a user manager whose cgroup is where
+                # it is looked for; elsewhere the slice is not known.
+                manager = os.path.dirname(os.path.dirname(os.path.dirname(slice_memory)))
+                if not os.path.isdir(manager):
+                    return False
+    except (OSError, StopIteration, ValueError, IndexError):
+        return False
+    return (available >= reserved + EXTRA_FLOOR and anonymous + reserved <= budget()
+            and pressure <= EXTRA_PRESSURE)
+
+
 def share_paths(lock, count):
     return [lock] + [f"{lock}.{index}" for index in range(1, count)]
 
@@ -176,17 +360,23 @@ def shares(needed, deadline, queue_up=True):
     """Holds `needed` of the host's shares until the block ends. Waiters line
     up on a queue lock, and the one at its head takes shares as they free, so
     a build needing two is not passed over by builds needing one. A command
-    run under `flock /var/tmp/cagents-cargo.lock` holds the first. Unless it
-    may `queue_up`, this takes them only if they are free at once, and raises
-    Busy otherwise."""
+    run under `flock /var/tmp/cagents-cargo.lock` holds the first. Once the
+    host's shares are taken, it may take extra ones while memory allows.
+    Unless it may `queue_up`, this takes them only if they are free at once,
+    and raises Busy otherwise."""
     lock = lock_path()
     total = share_count()
     needed = max(1, min(needed, total))
+    paths = share_paths(lock, total + extra_share_count())
+    extras = paths[total:]
+    slice_memory = build_slice_memory() if extras else None
     held = []
     with open(f"{lock}.queue", "a") as queue:
         announced = False
+        short = [False]
         def wait(take):
             nonlocal announced
+            told = False
             while not take():
                 if deadline is not None and time.monotonic_ns() >= deadline:
                     raise Expired
@@ -194,6 +384,9 @@ def shares(needed, deadline, queue_up=True):
                     announced = True
                     say(f"waiting for {needed} of the {total} build memory shares on "
                         f"{os.uname().nodename}; the others are in use")
+                if short[0] and not told:
+                    told = True
+                    say("an extra share is free, but not the memory for it")
                 time.sleep(0.25)
         try:
             fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -204,10 +397,11 @@ def shares(needed, deadline, queue_up=True):
                 f"{os.uname().nodename}; the others are in use")
             announced = True
             flock_until(queue, deadline)
-        def take():
-            for path in share_paths(lock, total):
-                if len(held) == needed:
-                    break
+        def free(candidates):
+            """Locks each of `candidates` this does not hold that is free,
+            and returns those and how many others hold."""
+            taken, busy = [], 0
+            for path in candidates:
                 if any(name == path for name, _ in held):
                     continue
                 share = open(path, "a")
@@ -215,8 +409,32 @@ def shares(needed, deadline, queue_up=True):
                     fcntl.flock(share, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError:
                     share.close()
+                    busy += 1
                     continue
-                held.append((path, share))
+                taken.append((path, share))
+            return taken, busy
+        def take():
+            for path in paths[:total]:
+                if len(held) == needed:
+                    break
+                taken, _ = free([path])
+                held.extend(taken)
+            # Extra shares only to complete the build, so that the memory
+            # they are taken on is the memory it starts with.
+            if len(held) < needed and extras:
+                taken, busy = free(extras)
+                short[0] = False
+                if len(held) + len(taken) >= needed:
+                    if memory_allows((needed + busy) * SHARE, slice_memory):
+                        extra = needed - len(held)
+                        held.extend(taken[:extra])
+                        taken = taken[extra:]
+                        say(f"admitted on {extra} extra build memory "
+                            f"share{'s' if extra > 1 else ''}, as memory allows")
+                    else:
+                        short[0] = True
+                for _, share in taken:
+                    share.close()
             return len(held) == needed
         try:
             if not queue_up and not take():
@@ -831,9 +1049,15 @@ class Build:
                         self.jobserver = Jobserver(jobserver_directory(), os.cpu_count() or 1)
                     except OSError as error:
                         say(f"building without the shared jobserver: {error}")
+                trimmer = None
                 try:
+                    directory = slice_directory() if self.scoped else None
+                    if directory:
+                        trimmer = CacheTrimmer(directory, jobserver_directory() + ".reclaim")
                     yield self
                 finally:
+                    if trimmer:
+                        trimmer.close()
                     if self.jobserver:
                         self.jobserver.close()
         except Expired:
@@ -973,7 +1197,7 @@ def options(arguments):
 
 def main(arguments):
     if arguments == ["count"]:
-        print(share_count())
+        print(share_count() + extra_share_count())
         return 0
     if arguments[:1] not in (["cargo"], ["build"]):
         print(USAGE, end="", file=sys.stderr)

@@ -5,7 +5,7 @@ use super::{Provider, Session};
 pub(super) const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
 /// The only Codex config override with an equivalent native fresh-thread field.
-pub(super) fn codex_config_effort(value: &str) -> Option<&str> {
+pub(crate) fn codex_config_effort(value: &str) -> Option<&str> {
     value
         .strip_prefix(CODEX_REASONING_EFFORT_KEY)
         .and_then(|rest| rest.strip_prefix('='))
@@ -19,7 +19,7 @@ pub(super) fn codex_config_effort(value: &str) -> Option<&str> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ArgumentArity {
+pub(crate) enum ArgumentArity {
     Switch,
     Value,
     Values,
@@ -27,7 +27,7 @@ pub(super) enum ArgumentArity {
 
 /// Shared with the native Claude constructor so selector-looking option values
 /// are consumed as data in both paths. Transport branches keep their own checks.
-pub(super) fn claude_arity(flag: &str) -> Option<ArgumentArity> {
+pub(crate) fn claude_arity(flag: &str) -> Option<ArgumentArity> {
     use ArgumentArity::*;
     Some(match flag {
         "--model"

@@ -34,6 +34,8 @@ fn supports_async_input(version: &str) -> bool {
 }
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
+/// Skill calls still waiting for their instructions; see `skill_loads`.
+const MAX_SKILL_LOADS: usize = 32;
 const ATTACHMENTS: AttachmentRules = AttachmentRules::for_provider(Provider::Claude);
 const MAX_IMAGE: u64 = ATTACHMENTS.max_image_bytes;
 const MAX_DOCUMENT: u64 = ATTACHMENTS.max_file_bytes.unwrap();
@@ -647,6 +649,11 @@ struct Claude {
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
+    /// The last turn ended because the reader stopped it, which neither the
+    /// idle state Claude reports after its result nor the last decision it
+    /// left being answered may turn back into a finished turn. Cleared when
+    /// the next turn starts.
+    ended_interrupted: bool,
     /// Whether this turn has shown where it was stopped: Claude Code records
     /// a stop as a user message, which is drawn as the marker in its place.
     stop_marked: bool,
@@ -703,6 +710,13 @@ struct Claude {
     /// again; the input says which tool that was only while it is still
     /// held, which a large write's never is.
     edit_tools: HashMap<ScopedId, String>,
+    /// Skill calls whose instructions have not arrived, with the skill each
+    /// asked for, oldest first. Only the transcript names the call a skill's
+    /// instructions belong to; the wire names just the skill's directory.
+    skill_loads: VecDeque<(ScopedId, String)>,
+    /// Skill calls whose output is the instructions they loaded, which the
+    /// call's "Launching skill" result must not replace. Bounded by `tools`.
+    loaded_skills: HashSet<ScopedId>,
     tool_inputs: HashMap<ScopedId, String>,
     tool_input_order: VecDeque<ScopedId>,
     dismissed_denials: VecDeque<String>,
@@ -987,6 +1001,7 @@ impl Claude {
     }
 
     fn start_turn(&mut self, step: &mut Step) {
+        self.ended_interrupted = false;
         if self.started_generation != Some(self.attention_generation) {
             self.suggestion_turn = None;
             step.events.push(Event::PromptSuggestionCleared);
@@ -1021,7 +1036,12 @@ impl Claude {
                 string(request, "subtype") != "interrupt"
                     || request["_cagents_turn"].as_u64() != Some(self.attention_generation)
             });
-            self.status(false, "Claude turn complete", step);
+            let detail = if self.ended_interrupted {
+                chat::TURN_INTERRUPTED
+            } else {
+                "Claude turn complete"
+            };
+            self.status(false, detail, step);
         }
         self.retired.push_back(id);
         if self.retired.len() > 512 {
@@ -1061,11 +1081,92 @@ impl Claude {
         self.tools.remove(key);
         self.labelled_agents.remove(&key.id);
         self.edit_tools.remove(key);
+        self.loaded_skills.remove(key);
+        self.skill_loads.retain(|(known, _)| known != key);
         self.tool_inputs.remove(key);
         self.tool_input_order.retain(|known| known != key);
         if key.parent.is_none() {
             self.visible_task_rows.remove(&key.id);
         }
+    }
+    /// Shows the instructions a skill loaded as its call's output, so that
+    /// loading it is one "Read skill" step, its text read on demand. The
+    /// transcript names the call; the wire names only the skill's directory,
+    /// which is the skill the latest call in that conversation asked for.
+    /// Instructions no call asked for were expanded from a command the
+    /// reader typed, which their prompt already shows.
+    fn skill_loaded(
+        &mut self,
+        frame: &Value,
+        child: Option<&str>,
+        directory: &str,
+        body: String,
+        step: &mut Step,
+    ) {
+        let call = match frame["sourceToolUseID"].as_str() {
+            // The main chat's saved instructions load only into the call
+            // their page found on their own branch; another branch's call may
+            // share its ID. A helper's are replayed in order with its calls.
+            Some(_) if child.is_none() && frame[SKILL_CALL].is_null() => return,
+            Some(id) => ScopedId::new(child, id),
+            None => {
+                let scope = ScopedId::new(child, "").parent;
+                let named = |skill: &str| {
+                    skill == directory
+                        || skill
+                            .rsplit_once(':')
+                            .is_some_and(|(_, name)| name == directory)
+                };
+                // The latest launch of the skill it names, or, when the
+                // skill's name is not its directory's, the one skill this
+                // agent is loading.
+                let mut pending = self
+                    .skill_loads
+                    .iter()
+                    .rev()
+                    .filter(|(call, _)| call.parent == scope);
+                let named_call = pending.clone().find(|(_, skill)| named(skill));
+                match named_call.or_else(|| {
+                    let only = pending.next();
+                    pending.next().is_none().then_some(only).flatten()
+                }) {
+                    Some((call, _)) => call.clone(),
+                    None => return,
+                }
+            }
+        };
+        self.skill_loads.retain(|(known, _)| known != &call);
+        // A reopened chat's page carries the call when the call and its
+        // result are on an earlier page; the call launched, as its
+        // instructions loaded.
+        let saved = &frame[SKILL_CALL];
+        let Some(mut item) = self.tools.get(&call).cloned().or_else(|| {
+            (string(saved, "name") == "Skill").then(|| {
+                let mut content = tool_content("Skill", &saved["input"], &self.cwd);
+                if let ItemContent::Tool { status, .. } = &mut content {
+                    *status = ToolStatus::Succeeded;
+                }
+                Item {
+                    id: call.id.clone(),
+                    role: Role::Assistant,
+                    content,
+                    started_at: None,
+                    at: None,
+                }
+            })
+        }) else {
+            return;
+        };
+        let ItemContent::Tool { name, output, .. } = &mut item.content else {
+            return;
+        };
+        if name != "Skill" {
+            return;
+        }
+        *output = body;
+        self.loaded_skills.insert(call);
+        self.tool(child, item.clone());
+        step.events.push(Event::Item(item));
     }
     fn completed_tool(&self, parent: Option<&str>, id: &str) -> bool {
         self.tools
@@ -1829,23 +1930,43 @@ impl Claude {
         if fresh_live_carrier && role == Role::User && child.is_none() && !model_only(frame) {
             self.settle_live_notifications(frame, step);
         }
-        // Explicit meta context is model-only. The wire isSynthetic marker is
-        // broader: it also covers intentionally visible compact summaries.
-        if delivered.is_empty() && frame["isMeta"].as_bool() == Some(true) {
+        // What Claude Code put in front of the model itself. The wire marks
+        // what it streams isSynthetic; the transcript marks that and more
+        // isMeta, or with the more specific summary/transcript-only flags.
+        // Both are read by what they say, and of the meta only what Claude
+        // Code also streams is shown (see `saved_context_shown`), so a chat
+        // reads the same live and reopened.
+        let meta = delivered.is_empty() && frame["isMeta"].as_bool() == Some(true);
+        if meta && (role != Role::User || !saved_context_shown(frame)) {
             self.track_carrier(carrier, Vec::new(), child);
             return Ok(());
         }
-        // Raw transcripts retain the more specific summary/transcript-only
-        // flags that stream-json folds into isSynthetic. All preserve their
-        // text under the same honest, generic provider-context disclosure.
         let context = role == Role::User
-            && [
-                "isSynthetic",
-                "isCompactSummary",
-                "isVisibleInTranscriptOnly",
-            ]
-            .iter()
-            .any(|key| frame[*key].as_bool() == Some(true));
+            && (meta
+                || [
+                    "isSynthetic",
+                    "isCompactSummary",
+                    "isVisibleInTranscriptOnly",
+                ]
+                .iter()
+                .any(|key| frame[*key].as_bool() == Some(true)));
+        if context && delivered.is_empty() && frame["isCompactSummary"].as_bool() != Some(true) {
+            match injected(&frame["message"]["content"]) {
+                Injected::Skill { directory, body } => {
+                    self.skill_loaded(frame, child, directory, body, step);
+                    if let Some(parent) = child {
+                        route_subagent_events(&mut step.events, event_start, parent);
+                    }
+                    self.track_carrier(carrier, Vec::new(), child);
+                    return Ok(());
+                }
+                Injected::ModelOnly => {
+                    self.track_carrier(carrier, Vec::new(), child);
+                    return Ok(());
+                }
+                Injected::Other => {}
+            }
+        }
         // The transcript names its compaction summary; the wire folds that
         // flag away, so there the summary is the context that follows a
         // compaction boundary.
@@ -2069,6 +2190,28 @@ impl Claude {
                                     string(block, "name").into(),
                                 );
                             }
+                            if string(block, "name") == "Skill" {
+                                let call = ScopedId::new(child, &tool_id);
+                                if self.loaded_skills.contains(&call) {
+                                    // A repeated call keeps what it loaded.
+                                    if let (
+                                        Some(ItemContent::Tool { output: loaded, .. }),
+                                        ItemContent::Tool { output, .. },
+                                    ) = (
+                                        self.tools.get(&call).map(|known| &known.content),
+                                        &mut item.content,
+                                    ) {
+                                        output.clone_from(loaded);
+                                    }
+                                } else {
+                                    self.skill_loads.retain(|(known, _)| known != &call);
+                                    self.skill_loads
+                                        .push_back((call, string(&block["input"], "skill").into()));
+                                    while self.skill_loads.len() > MAX_SKILL_LOADS {
+                                        self.skill_loads.pop_front();
+                                    }
+                                }
+                            }
                             self.tool(child, item.clone());
                             step.events.push(Event::Item(item));
                         } else if history {
@@ -2127,6 +2270,15 @@ impl Claude {
                         } else {
                             &Value::Null
                         };
+                        // A skill's instructions can arrive before the
+                        // result that only says it is launching.
+                        let instructions = self
+                            .loaded_skills
+                            .contains(&ScopedId::new(child, &tool_id))
+                            .then(|| match &item.content {
+                                ItemContent::Tool { output, .. } => output.clone(),
+                                _ => String::new(),
+                            });
                         apply_result(
                             &mut item.content,
                             content_text(&block["content"]),
@@ -2139,6 +2291,33 @@ impl Claude {
                                 .map(String::as_str),
                             structured,
                         );
+                        if let (
+                            Some(instructions),
+                            ItemContent::Tool {
+                                output,
+                                status: ToolStatus::Succeeded,
+                                ..
+                            },
+                        ) = (instructions, &mut item.content)
+                        {
+                            *output = instructions;
+                        }
+                        // Instructions follow the result of the skill that
+                        // just launched, and a skill that did not launch
+                        // loads nothing.
+                        let call = ScopedId::new(child, &tool_id);
+                        if let Some(index) = self
+                            .skill_loads
+                            .iter()
+                            .position(|(known, _)| *known == call)
+                            && let Some(load) = self.skill_loads.remove(index)
+                            && matches!(
+                                item.content.status(),
+                                Some(ToolStatus::Running | ToolStatus::Succeeded)
+                            )
+                        {
+                            self.skill_loads.push_back(load);
+                        }
                         if let Some(task) = structured["backgroundTaskId"].as_str() {
                             self.foreground_tasks.retain(|known| known != task);
                             self.background_launch(&tool_id, history, &mut item.content);
@@ -2209,15 +2388,33 @@ impl Claude {
                             }
                         }
                         if let Some(content) = block["content"].as_array() {
+                            // The picture a Read returned is the file it read,
+                            // and is named for it.
+                            let read = match &item.content {
+                                ItemContent::Command {
+                                    action: CommandAction::Read,
+                                    command,
+                                    ..
+                                } => Path::new(command)
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned()),
+                                _ => None,
+                            };
                             for (index, attachment) in content
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, value)| string(value, "type") == "image")
                             {
+                                let mut image = image_content(attachment);
+                                if let (ItemContent::Image { description, .. }, Some(name)) =
+                                    (&mut image, &read)
+                                {
+                                    description.clone_from(name);
+                                }
                                 step.events.push(Event::Item(Item {
                                     id: format!("{}:image:{index}", item.id),
                                     role: Role::Assistant,
-                                    content: image_content(attachment),
+                                    content: image,
                                     started_at: None,
                                     at: None,
                                 }));
@@ -3911,6 +4108,8 @@ impl Claude {
                 self.labelled_agents.clear();
                 self.visible_task_rows.clear();
                 self.edit_tools.clear();
+                self.skill_loads.clear();
+                self.loaded_skills.clear();
                 self.tool_inputs.clear();
                 self.tool_input_order.clear();
                 self.dismissed_denials.clear();
@@ -4375,6 +4574,7 @@ impl Claude {
                 // Background agents have their own status. They must not
                 // prevent new input once the main turn has ended.
                 let busy = !self.pending.is_empty();
+                self.ended_interrupted = stopped;
                 self.status(
                     busy,
                     if busy {
@@ -4984,10 +5184,167 @@ fn model_only(frame: &Value) -> bool {
     frame["isMeta"].as_bool() == Some(true) && string(&frame["origin"], "kind") != "peer"
 }
 
+/// Whether a record Claude Code saved as meta shows anything once read. Only
+/// what Claude Code also streams does, so a reopened chat shows the steps the
+/// live one did: the instructions a skill call loaded, and what a hook said
+/// back. The rest it saves as meta never reaches the wire: a goal's setup
+/// note, a scheduled wakeup's prompt, the prompt resuming a response a
+/// classifier stopped or a stream cut off, and what a typed command expanded
+/// into, whose instructions name no call.
+fn saved_context_shown(frame: &Value) -> bool {
+    let content = &frame["message"]["content"];
+    string(frame, "type") == "user"
+        && string(&frame["origin"], "kind").is_empty()
+        && recorded_notification(frame).is_none()
+        && match injected(content) {
+            Injected::Skill { .. } => frame["sourceToolUseID"].is_string(),
+            Injected::ModelOnly => false,
+            Injected::Other => message_text(content).is_some_and(|text| hook_feedback(&text)),
+        }
+}
+
+/// What Claude Code put in front of the model on its own, by what it says.
+#[derive(Debug, PartialEq, Eq)]
+enum Injected<'a> {
+    /// The instructions a skill loads, which open by naming the skill's
+    /// directory, followed by the body Claude Code read from it.
+    Skill { directory: &'a str, body: String },
+    /// Bookkeeping meant for the model alone, which says nothing a reader
+    /// does not already see: how an image the reader sees was scaled or where
+    /// it was saved, a harness reminder, the caveat before a local command's
+    /// record, and a reloaded skill's note that its instructions follow.
+    ModelOnly,
+    /// Anything else, which is shown, compactly, as what it is.
+    Other,
+}
+
+const SKILL_DIRECTORY: &str = "Base directory for this skill: ";
+/// Where a reopened chat's page puts the call a saved skill's instructions
+/// name, which may be on an earlier page.
+const SKILL_CALL: &str = "_cagents_skill_call";
+/// The block a saved skill's instructions stand for in the history index:
+/// none of the record's own, as they name their call in `sourceToolUseID`.
+const SKILL_INSTRUCTIONS: usize = usize::MAX;
+
+fn injected(content: &Value) -> Injected<'_> {
+    // A skill's body is a single text, which the transcript stores as a
+    // string and the wire as one text block.
+    let first = content.as_str().or_else(|| {
+        content
+            .as_array()
+            .and_then(|blocks| blocks.first())
+            .filter(|block| string(block, "type") == "text")
+            .and_then(|block| block["text"].as_str())
+    });
+    if let Some(text) = first
+        && let Some(rest) = text.strip_prefix(SKILL_DIRECTORY)
+        && let Some(path) = rest.lines().next().map(str::trim)
+        && let Some(directory) = path.rsplit('/').find(|part| !part.is_empty())
+        && let Some(body) = message_text(content)
+    {
+        return Injected::Skill { directory, body };
+    }
+    let texts: Option<Vec<&str>> = match content {
+        Value::String(text) => Some(vec![text.as_str()]),
+        Value::Array(blocks) if !blocks.is_empty() => blocks
+            .iter()
+            .map(|block| (string(block, "type") == "text").then(|| string(block, "text")))
+            .collect(),
+        _ => None,
+    };
+    if texts.is_some_and(|texts| texts.iter().all(|text| model_only_note(text))) {
+        Injected::ModelOnly
+    } else {
+        Injected::Other
+    }
+}
+
+/// Whether `text` is wholly one of the notes Claude Code writes for the
+/// model alone; see [`Injected::ModelOnly`].
+fn model_only_note(text: &str) -> bool {
+    let text = text.trim();
+    let wrapped = |tag: &str| {
+        let mut rest = text;
+        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+        while let Some(inner) = rest.strip_prefix(open.as_str()) {
+            let Some((_, after)) = inner.split_once(close.as_str()) else {
+                return false;
+            };
+            rest = after.trim_start();
+            if rest.is_empty() {
+                return true;
+            }
+        }
+        false
+    };
+    image_note(text)
+        || wrapped("system-reminder")
+        || wrapped("local-command-caveat")
+        || (text.starts_with("(Re-invocation of /") && text.ends_with(')'))
+}
+
+/// Claude Code's notes on an image: how it scaled one a tool returned, such
+/// as `[Image: original 2600x1800, displayed at 2306x1596. Multiply
+/// coordinates by 1.13 to map to original image.]`, or where it saved one the
+/// reader attached, as `[Image: source: /path/1.png]`. Every line must be one
+/// whole note, so a note followed by anything else still shows, even when
+/// that ends in a bracket of its own. A saved path may hold brackets, but a
+/// closing one before more words ends its note.
+fn image_note(text: &str) -> bool {
+    let note = |line: &str| {
+        line.strip_prefix("[Image: ")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|rest| match rest.strip_prefix("source: ") {
+                Some(path) => !path.contains("] "),
+                None => {
+                    !rest.contains(['[', ']'])
+                        && rest
+                            .strip_prefix("original ")
+                            .is_some_and(|rest| rest.contains(", displayed at "))
+                }
+            })
+    };
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    lines.next().is_some_and(note) && lines.all(note)
+}
+
+/// The name Claude Code's context steps carry, as a call to no tool of the
+/// agent's: what it put in front of the model that neither the reader nor
+/// the agent wrote, kept with the work around it rather than as a notice.
+const CONTEXT_STEP: &str = "Claude context";
+
+/// Whether `text` is what a hook said back to the model, such as a Stop hook
+/// keeping the turn going: `Stop hook feedback:` and what the hook said.
+fn hook_feedback(text: &str) -> bool {
+    text.split_once(" hook feedback:")
+        .is_some_and(|(event, _)| {
+            !event.is_empty() && event.chars().all(|c| c.is_ascii_alphabetic())
+        })
+}
+
 /// Preserve opaque provider context without attributing it to the user, a
-/// particular tool, or another agent. System notices are explicit disclosures.
+/// particular tool, or another agent: a finished step whose output is the
+/// context itself, read on demand.
 fn context_item(id: String, body: String) -> Item {
-    notice_item(id, "Claude context", body)
+    // What a hook said back names the hook that said it.
+    let hook = hook_feedback(&body);
+    Item {
+        id,
+        role: Role::Assistant,
+        content: ItemContent::Tool {
+            name: if hook {
+                super::HOOK_CONTEXT
+            } else {
+                CONTEXT_STEP
+            }
+            .into(),
+            input: String::new(),
+            output: body,
+            status: ToolStatus::Succeeded,
+        },
+        started_at: None,
+        at: None,
+    }
 }
 
 /// Where compaction restarted the model's context, with the summary that
@@ -6347,7 +6704,7 @@ fn image_content(block: &Value) -> ItemContent {
     ItemContent::Image {
         reference: None,
         path,
-        description: "Claude image attachment".into(),
+        description: String::new(),
     }
 }
 fn content_text(value: &Value) -> String {
@@ -6897,7 +7254,14 @@ impl Claude {
                 let state = string(frame, "state");
                 step.events.push(Event::Waiting(state == "requires_action"));
                 match state {
-                    "idle" => self.status(false, "Claude is idle", step),
+                    "idle" => {
+                        let detail = if self.ended_interrupted {
+                            chat::TURN_INTERRUPTED
+                        } else {
+                            "Claude is idle"
+                        };
+                        self.status(false, detail, step);
+                    }
                     "requires_action" => {
                         self.start_turn(step);
                         self.status(true, "Claude is waiting for your response", step)
@@ -7894,7 +8258,7 @@ impl History {
             }
             // A manual compaction's output repeats the summary shown above it.
             let visible = message
-                && !model_only(&value)
+                && (!model_only(&value) || saved_context_shown(&value))
                 && main
                 && value["repeatsCompactSummary"].as_bool() != Some(true);
             // A rewritten record keeps what it first said: where it was, the
@@ -7988,6 +8352,23 @@ impl History {
                         tool_refs.push((tool.to_owned(), index, result));
                     }
                 }
+            }
+            // A skill's instructions need their call, as a result does.
+            if visible
+                && main
+                && model_only(&value)
+                && let Some(call) = value["sourceToolUseID"].as_str()
+                && matches!(
+                    injected(&value["message"]["content"]),
+                    Injected::Skill { .. }
+                )
+            {
+                tool_ref_bytes = tool_ref_bytes.saturating_add(call.len() + 64);
+                tool_ref_count += 1;
+                if tool_ref_bytes > tool_bytes_limit || tool_ref_count > tool_count_limit {
+                    return Err("Claude transcript exceeds the tool correlation index limit".into());
+                }
+                tool_refs.push((call.to_owned(), SKILL_INSTRUCTIONS, true));
             }
 
             let (mut agents, result) = if message && main {
@@ -8680,6 +9061,20 @@ impl History {
             if let Some(calls) = self.result_calls.get(&offset) {
                 let record = &mut result[positions[&offset]];
                 for &(result_index, (call, _, _, call_index)) in calls {
+                    if result_index == SKILL_INSTRUCTIONS {
+                        let mut context = (*call_blocks[&(call, call_index)]).clone();
+                        if record.frame["sourceToolUseID"] != context["id"] {
+                            return Err(super::SetupError::Unavailable(
+                                "Claude indexed skill instructions changed while reading".into(),
+                            ));
+                        }
+                        if let Some(identity) = self.tool_identities.get(&(call, call_index)) {
+                            context["id"] = json!(identity);
+                            record.frame["sourceToolUseID"] = json!(identity);
+                        }
+                        record.frame[SKILL_CALL] = context;
+                        continue;
+                    }
                     let block = record.frame["message"]["content"]
                         .as_array()
                         .and_then(|blocks| blocks.get(result_index))

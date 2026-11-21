@@ -58,14 +58,14 @@ pub enum AccountCommand {
     /// List active accounts.
     #[command(after_help = "Includes any retained caller account. Reads from the selected daemon.")]
     List {
-        /// Limit rows to claude, codex, or omp; never probe its CLI.
+        /// Limit rows to claude, codex, agy, muse, or omp; never probe its CLI.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
         provider: Option<crate::agent::Provider>,
     },
     /// Read caller context and configured account plan allowances.
     #[command(after_help = "Probes no provider unless --refresh asks.")]
     Info {
-        /// Limit account rows to claude, codex, or omp.
+        /// Limit account rows to claude, codex, agy, muse, or omp.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
         provider: Option<crate::agent::Provider>,
         /// Select a stable provider/account ID from this report.

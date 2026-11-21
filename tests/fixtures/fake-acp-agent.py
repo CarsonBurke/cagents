@@ -6,16 +6,22 @@ credentials or a model, and never touches the real agents' data. Its replies
 copy the shapes of Antigravity 1.5.12's and Muse 1.4.23's `initialize` and
 `session/new` answers: by default Antigravity's, Muse's when it is run as
 `muse` or `muse-upstream` or with FAKE_ACP_SHAPE=muse. Any command-line
-arguments, such as `acp --disable-telemetry`, are accepted and ignored.
+arguments, such as `acp --disable-telemetry`, are accepted and ignored,
+but for Antigravity's `--app-data-dir DIR`, which keeps that process's
+conversations apart from the ones it lists otherwise, as `agy` keeps them
+in ~/.gemini/DIR rather than ~/.gemini/antigravity-cli.
 
 Each conversation is saved under FAKE_ACP_STATE (default: a directory in
 the system's temporary directory) as the session updates it sent, so
-`session/load` replays it and `session/list` lists it.
+`session/load` replays it and `session/list` lists it, newest first.
 
 The prompt chooses the turn, by the first of these words it contains as a
 word:
 
   tools       a plan, a shell command, a file edit with its diff, then an answer
+  work        replays the Claude Code turn in FAKE_ACP_WORK as ACP messages,
+              shell commands and edits: the conversation-work fixture's
+              pull requests and worktrees
   permission  an edit that asks for approval first; refusing fails the edit,
               stopping the turn cancels it
   hold        thinks until the turn is stopped (at most 60 seconds)
@@ -32,7 +38,7 @@ Anything else is answered with a short thought and a streamed reply.
 Environment switches:
   FAKE_ACP_SHAPE=agy|muse   which agent's replies to copy
   FAKE_ACP_STATE=DIR        where conversations are saved
-  FAKE_ACP_AUTH=initialize|new|load|prompt
+  FAKE_ACP_AUTH=initialize|new|load|list|prompt
                             refuse that request as signed out (-32000)
   FAKE_ACP_NO_LOAD=1        do not offer session/load
   FAKE_ACP_NOISE=1          print a line that is not JSON before answering
@@ -40,7 +46,25 @@ Environment switches:
   FAKE_ACP_REPLAY=N         a loaded conversation starts with N extra
                             exchanges, for long histories
   FAKE_ACP_LOG=FILE         append every frame received, one per line
+  FAKE_ACP_WORK=FILE        Claude Code transcript lines the `work` turn
+                            replays, as tests/fixtures/conversation-work.py
+                            writes them
+  FAKE_ACP_LOGIN_SECONDS=N  how long `login` waits before signing in
+  FAKE_ACP_LIST_PAGE=N      list N conversations a page, each page after
+                            the first by the `nextCursor` of the one before
+  FAKE_ACP_PRESENCE=1       hold the lock the agent holds on a conversation
+                            while it has it open, under $HOME as the real
+                            agent does: Antigravity's
+                            ~/.gemini/antigravity-cli/presence/ID.lock, which
+                            it leaves behind, and Muse's
+                            $XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/ID/.session.lock.
+                            Only for a $HOME that is the fixture's own.
+
+In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
+account commands. Signing out lasts, as a file under FAKE_ACP_STATE, until
+`login`.
 """
+import fcntl
 import json
 import os
 import queue
@@ -59,8 +83,21 @@ SHAPE = os.environ.get("FAKE_ACP_SHAPE") or (
 STATE = os.environ.get("FAKE_ACP_STATE") or os.path.join(
     tempfile.gettempdir(), f"fake-acp-agent-{os.getuid()}"
 )
+# Antigravity's own data directory, relative to ~/.gemini, for the
+# conversations a process started with `--app-data-dir` keeps apart.
+APP_DATA = "antigravity-cli"
+for _index, _argument in enumerate(sys.argv[1:]):
+    if SHAPE != "agy":
+        break
+    if _argument == "--app-data-dir" and _index + 2 < len(sys.argv):
+        APP_DATA = sys.argv[_index + 2]
+    elif _argument.startswith("--app-data-dir="):
+        APP_DATA = _argument.split("=", 1)[1]
+if APP_DATA != "antigravity-cli":
+    STATE = os.path.join(STATE, "app-data", APP_DATA.replace("/", "_"))
 AUTH = os.environ.get("FAKE_ACP_AUTH", "")
 LOG = os.environ.get("FAKE_ACP_LOG")
+WORK = os.environ.get("FAKE_ACP_WORK")
 
 AGY_MODES = [
     ("default", "Default", "Ask before edits and commands, per your permission settings."),
@@ -71,8 +108,17 @@ AGY_MODES = [
 AGY_MODELS = [
     ("gemini-3.8-flash", "Gemini 3.8 Flash"),
     ("gemini-4-neon", "Gemini 4 Neon"),
+    ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)"),
+    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
 ]
 AGY_LEVELS = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "Extra")]
+# As agy 1.x lists them: its thinking option names every level, but each
+# model offers its own, which its `models` state spells as combined
+# identifiers. Flash has no Extra, and some models take no level at all.
+AGY_MODEL_LEVELS = {
+    "gemini-3.8-flash": ["low", "medium", "high"],
+    "gemini-4-neon": ["low", "medium", "high", "xhigh"],
+}
 MUSE_MODES = [
     ("allowAll", "Allow all", "Run every action without asking for approval"),
     ("promptUnmatched", "Ask before unmatched actions",
@@ -80,7 +126,17 @@ MUSE_MODES = [
     ("onRequest", "Ask on request", "Ask for approval only when the action requires it"),
     ("denyUnmatched", "Deny unmatched actions", "Refuse any action no permission rule covers"),
 ]
-MUSE_MODELS = [("muse-spark-1.2", "muse-spark-1.2"), ("muse-wonder-1.0", "muse-wonder-1.0")]
+MUSE_MODELS = [("muse-spark-1.2", "muse-spark-1.2"), ("muse-spark-1.2-contributor",
+                                                    "muse-spark-1.2-contributor"),
+               ("muse-wonder-1.0", "muse-wonder-1.0")]
+# Muse 1.4.24 offers a reasoning option only for some models, listing just
+# the tiers its catalog describes, with the description as the name.
+MUSE_LEVELS = {
+    "muse-spark-1.2": [("xhigh", "Use this for deepest analysis and complex fixes.")],
+    "muse-spark-1.2-contributor": [("xhigh", "Use this for deepest analysis and complex fixes.")],
+}
+# Muse names a new session with two random words before it is asked anything.
+MUSE_NAMES = ["cyan-wezen", "quiet-heron", "weathered-planetesimal"]
 COMMANDS = [
     {"name": "compact", "description": "Summarize the conversation to free context"},
     {"name": "review", "description": "Review the current changes",
@@ -111,7 +167,15 @@ def fail(id, code, message):
 
 
 def signed_out(id):
-    fail(id, -32000, "Authentication required: sign in to the fake agent")
+    if SHAPE == "muse":
+        fail(id, -32000, "log in to Muse before opening a session")
+    else:
+        fail(id, -32000, "Authentication required: sign in to the fake agent")
+
+
+def logged_out():
+    """Signed out until `login`: the state's marker, written by `logout`."""
+    return os.path.exists(os.path.join(STATE, "signed-out"))
 
 
 class Session:
@@ -123,6 +187,27 @@ class Session:
         else:
             self.mode, self.model, self.level = "default", "gemini-3.8-flash", "low"
         self.title = None
+        self.lock = None
+
+    def hold_presence(self):
+        """Locks the conversation as the agent does while it has it open."""
+        if not os.environ.get("FAKE_ACP_PRESENCE") or self.lock is not None:
+            return
+        home = os.environ["HOME"]
+        if SHAPE == "muse":
+            data = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+            path = os.path.join(data, "muse", "sessions", time.strftime("%Y/%m/%d"),
+                                self.id, ".session.lock")
+        else:
+            path = os.path.join(home, ".gemini", APP_DATA, "presence", self.id + ".lock")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.lock = open(path, "a")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+
+    def release_presence(self):
+        if self.lock is not None:
+            self.lock.close()
+            self.lock = None
 
     def path(self):
         return os.path.join(STATE, "sessions", self.id + ".jsonl")
@@ -149,11 +234,30 @@ class Session:
                  "currentValue": self.model,
                  "options": [{"value": v, "name": n} for v, n in models]}
         if SHAPE == "muse":
-            return [mode, model]
+            levels = MUSE_LEVELS.get(self.model)
+            if not levels:
+                return [mode, model]
+            if self.level not in [v for v, _ in levels]:
+                self.level = levels[0][0]
+            return [mode, model,
+                    {"id": "thought_level", "name": "Reasoning effort",
+                     "category": "thought_level", "type": "select", "currentValue": self.level,
+                     "options": [{"value": v, "name": n} for v, n in levels]}]
         level = {"id": "thought_level", "name": "Thinking Level", "category": "thought_level",
                  "type": "select", "currentValue": self.level,
                  "options": [{"value": v, "name": n} for v, n in AGY_LEVELS]}
         return [model, level, mode]
+
+    def agy_combined_models(self):
+        names = dict(AGY_LEVELS)
+        combined = []
+        for v, n in AGY_MODELS:
+            levels = AGY_MODEL_LEVELS.get(v)
+            if not levels:
+                combined.append({"modelId": v, "name": n})
+            combined.extend({"modelId": f"{v}-{level}", "name": f"{n} ({names[level]})"}
+                            for level in levels or [])
+        return combined
 
     def setup(self, session_id=True):
         result = {
@@ -164,11 +268,14 @@ class Session:
         }
         if SHAPE == "agy":
             result["models"] = {
-                "availableModels": [{"modelId": f"{v}-{level}", "name": f"{n} ({ln})"}
-                                    for v, n in AGY_MODELS for level, ln in AGY_LEVELS],
-                "currentModelId": f"{self.model}-{self.level}",
+                "availableModels": self.agy_combined_models(),
+                "currentModelId": (f"{self.model}-{self.level}"
+                                   if self.level in AGY_MODEL_LEVELS.get(self.model, [])
+                                   else self.model),
             }
-            result["_meta"] = {"antigravity": {"tier": {"name": "Fixture tier", "id": "fixture"}}}
+            # The tier a paid Antigravity login reports, so its plan badge
+            # reads as it does for a real reader.
+            result["_meta"] = {"antigravity": {"tier": {"name": "Google AI Pro", "id": "g1-pro-tier"}}}
         if session_id:
             result["sessionId"] = self.id
         return result
@@ -280,22 +387,29 @@ class Agent:
                        "authMethods": [{"id": "muse-login", "name": "Log in to Muse"}]})
 
     def on_session_new(self, id, params):
-        if AUTH == "new":
+        if AUTH == "new" or logged_out():
             return signed_out(id)
         session = Session(str(uuid.uuid4()), params.get("cwd", ""))
         self.sessions[session.id] = session
+        session.hold_presence()
         self.remember(session)
         reply(id, session.setup())
         session.update({"sessionUpdate": "available_commands_update",
                         "availableCommands": COMMANDS}, record=False)
+        if SHAPE == "muse":
+            session.title = MUSE_NAMES[int(session.id[:8], 16) % len(MUSE_NAMES)]
+            self.remember(session)
+            session.update({"sessionUpdate": "session_info_update", "title": session.title},
+                           record=False)
 
     def on_session_load(self, id, params):
-        if AUTH == "load":
+        if AUTH == "load" or logged_out():
             return signed_out(id)
         session = Session(params["sessionId"], params.get("cwd", ""))
         if not os.path.exists(session.path()):
             return fail(id, -32002, f"Session {session.id} not found")
         self.sessions[session.id] = session
+        session.hold_presence()
         for index in range(int(os.environ.get("FAKE_ACP_REPLAY") or 0)):
             session.update({"sessionUpdate": "user_message_chunk",
                             "content": {"type": "text", "text": f"Earlier question {index}"}},
@@ -311,16 +425,28 @@ class Agent:
                         "availableCommands": COMMANDS}, record=False)
 
     def on_session_list(self, id, params):
+        if AUTH == "list":
+            return signed_out(id)
         index = self.index()
-        reply(id, {"sessions": [
+        sessions = [
             {"sessionId": sid, "cwd": entry["cwd"], "title": entry.get("title"),
              "updatedAt": entry["updatedAt"]}
             for sid, entry in sorted(index.items(), key=lambda kv: kv[1]["updatedAt"],
                                      reverse=True)
-            if not params.get("cwd") or entry["cwd"] == params["cwd"]]})
+            if not params.get("cwd") or entry["cwd"] == params["cwd"]]
+        page = int(os.environ.get("FAKE_ACP_LIST_PAGE") or 0)
+        if page <= 0:
+            return reply(id, {"sessions": sessions})
+        start = int(params.get("cursor") or 0)
+        result = {"sessions": sessions[start:start + page]}
+        if start + page < len(sessions):
+            result["nextCursor"] = str(start + page)
+        reply(id, result)
 
     def on_session_close(self, id, params):
-        self.sessions.pop(params.get("sessionId"), None)
+        session = self.sessions.pop(params.get("sessionId"), None)
+        if session is not None:
+            session.release_presence()
         reply(id, {})
 
     def on_session_set_config_option(self, id, params):
@@ -337,6 +463,9 @@ class Agent:
             session.model = value
         else:
             session.level = value
+        if SHAPE == "muse" and option == "model":
+            # The options a model offers change with it.
+            session.level = None
         reply(id, {"configOptions": session.config_options()})
 
     def on_session_set_mode(self, id, params):
@@ -352,7 +481,7 @@ class Agent:
         session = self.sessions.get(params.get("sessionId"))
         if session is None:
             return fail(id, -32002, "Unknown session")
-        if AUTH == "prompt":
+        if AUTH == "prompt" or logged_out():
             return signed_out(id)
         self.cancelled.discard(session.id)
         blocks = params.get("prompt") or []
@@ -370,6 +499,8 @@ class Agent:
             self.say(session, "Compacted the conversation.")
         elif "tools" in words:
             stop = self.tools(session)
+        elif "work" in words:
+            stop = self.work(session)
         elif "permission" in words:
             stop = self.permission(session)
         elif "hold" in words:
@@ -405,12 +536,20 @@ class Agent:
             self.think(session, "Considering the question.")
             self.say(session, "Fake answer to: " + text.strip().splitlines()[0][:200]
                      if text.strip() else "Fake answer.")
-        session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000,
-                        "cost": {"amount": 0.0012, "currency": "USD"}}, record=False)
+        if SHAPE == "muse":
+            # Muse reports no context window size.
+            session.update({"sessionUpdate": "usage_update", "used": 0, "size": 0,
+                            "_meta": {"dev.muse": {"contextSizeUnknown": True}}}, record=False)
+        else:
+            # Antigravity reports its context window, never a cost.
+            session.update({"sessionUpdate": "usage_update", "used": 1200, "size": 200000},
+                           record=False)
         if session.id in self.cancelled:
             stop = "cancelled"
-        reply(id, {"stopReason": stop,
-                   "usage": {"totalTokens": 30, "inputTokens": 20, "outputTokens": 10}})
+        result = {"stopReason": stop}
+        if SHAPE == "agy":
+            result["usage"] = {"totalTokens": 30, "inputTokens": 20, "outputTokens": 10}
+        reply(id, result)
 
     def say(self, session, text, message=None):
         message = message or str(uuid.uuid4())
@@ -451,6 +590,43 @@ class Agent:
         plan[1]["status"] = "completed"
         session.update({"sessionUpdate": "plan", "entries": plan})
         self.say(session, "Listed the files and updated notes.md.")
+        return "end_turn"
+
+    def work(self, session):
+        """The Claude Code turn in FAKE_ACP_WORK, as an ACP agent reports
+        the same work: its text as messages, `Bash` calls as shell commands
+        with their output, `Edit`, `MultiEdit` and `Write` calls as diffs,
+        `Read` calls as reads, and any other tool by its name."""
+        try:
+            with open(WORK or "") as saved:
+                lines = [json.loads(line) for line in saved if line.strip()]
+        except (OSError, ValueError) as error:
+            self.say(session, f"No work to replay: {error}")
+            return "end_turn"
+        calls = {}
+        for line in lines:
+            if line.get("type") not in ("assistant", "user"):
+                continue
+            content = (line.get("message") or {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                kind = block.get("type")
+                if kind == "text" and line["type"] == "assistant":
+                    self.say(session, block.get("text", ""))
+                elif kind == "tool_use":
+                    call = "call-" + uuid.uuid4().hex[:8]
+                    calls[block.get("id")] = (call, block.get("name", ""), block.get("input") or {})
+                    session.update(work_call(call, block.get("name", ""),
+                                             block.get("input") or {}, session.cwd))
+                elif kind == "tool_result" and block.get("tool_use_id") in calls:
+                    call, name, arguments = calls.pop(block["tool_use_id"])
+                    output = block.get("content")
+                    if isinstance(output, list):
+                        output = "\n".join(part.get("text", "") for part in output
+                                           if isinstance(part, dict))
+                    session.update(work_result(call, name, arguments, output or "",
+                                               bool(block.get("is_error"))))
         return "end_turn"
 
     def permission(self, session):
@@ -517,7 +693,82 @@ class Agent:
         os.replace(os.path.join(STATE, "index.json.tmp"), os.path.join(STATE, "index.json"))
 
 
+def work_diffs(name, arguments):
+    """The diffs a Claude Code edit made, as ACP diff content."""
+    path = arguments.get("file_path", "")
+    if name == "Write":
+        return [{"type": "diff", "path": path, "oldText": None,
+                 "newText": arguments.get("content", "")}]
+    edits = arguments.get("edits") if name == "MultiEdit" else [arguments]
+    return [{"type": "diff", "path": path, "oldText": edit.get("old_string", ""),
+             "newText": edit.get("new_string", "")} for edit in edits or []]
+
+
+def work_call(call, name, arguments, cwd):
+    """The ACP `tool_call` for a Claude Code tool call."""
+    update = {"sessionUpdate": "tool_call", "toolCallId": call, "status": "in_progress"}
+    path = arguments.get("file_path")
+    if name in ("Edit", "MultiEdit", "Write"):
+        update.update(title=f"Edit {os.path.basename(path or '')}", kind="edit",
+                      locations=[{"path": path}] if path else [])
+    elif name == "Bash":
+        update.update(title=arguments.get("description") or "Run", kind="execute",
+                      rawInput={"command": arguments.get("command", ""), "cwd": cwd})
+    elif name == "Read":
+        update.update(title=f"Read {os.path.basename(path or '')}", kind="read",
+                      locations=[{"path": path}] if path else [], rawInput=arguments)
+    else:
+        update.update(title=name or "Tool", kind="other", rawInput=arguments)
+    return update
+
+
+def work_result(call, name, arguments, output, failed):
+    """The ACP `tool_call_update` that finishes a Claude Code tool call."""
+    update = {"sessionUpdate": "tool_call_update", "toolCallId": call,
+              "status": "failed" if failed else "completed"}
+    if name in ("Edit", "MultiEdit", "Write") and not failed:
+        update["content"] = work_diffs(name, arguments)
+    else:
+        update["content"] = [{"type": "content", "content": {"type": "text", "text": output}}]
+        if name == "Bash":
+            update["rawOutput"] = {"exitCode": 1 if failed else 0}
+    return update
+
+
+def command_line(arguments):
+    """Muse's account commands, for a fixture installed as `muse-upstream`:
+    `usage --json`, `login` and `logout`. Anything else serves ACP."""
+    if SHAPE != "muse" or not arguments or arguments[0] not in ("usage", "login", "logout"):
+        return None
+    marker = os.path.join(STATE, "signed-out")
+    os.makedirs(STATE, exist_ok=True)
+    if arguments[0] == "logout":
+        open(marker, "w").close()
+        print("Logged out of Muse.")
+        return 0
+    if arguments[0] == "login":
+        print("To log in, open https://example.invalid/device and enter the code FAKE-CODE.")
+        sys.stdout.flush()
+        time.sleep(float(os.environ.get("FAKE_ACP_LOGIN_SECONDS") or 2))
+        if os.path.exists(marker):
+            os.remove(marker)
+        print("Logged in to Muse.")
+        return 0
+    if AUTH or os.path.exists(marker):
+        print("muse usage: not logged in: run `muse login` first", file=sys.stderr)
+        return 1
+    if "--json" in arguments:
+        print(json.dumps({"allowance": None, "hint": None, "reason": "no_allowance",
+                          "schemaVersion": 1}))
+    else:
+        print("No subscription allowance.")
+    return 0
+
+
 if __name__ == "__main__":
+    status = command_line(sys.argv[1:])
+    if status is not None:
+        sys.exit(status)
     try:
         Agent().run()
     except (SystemExit, BrokenPipeError, KeyboardInterrupt):

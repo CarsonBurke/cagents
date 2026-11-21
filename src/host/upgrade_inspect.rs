@@ -80,7 +80,11 @@ fn connect(request: &Request, deadline: Instant) -> Result<current::Client, Insp
 }
 
 const UNCHECKED: &str = "could not be checked before the update";
-const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
+/// The tab stays open through the update, and Resume conversation in the
+/// new tab (+) menu only returns to an open tab, so the tab is where its
+/// conversation reopens or says why it can't.
+const CHAT_RECOVERY: &str =
+    "Open its tab; if the conversation doesn't reopen, the tab says what to do";
 const TERMINAL_RECOVERY: &str = "Press Reconnect in the pane to check the saved terminal";
 const CONSOLE_REFUSAL: &str = "This update cannot keep a running agent console connected. Finish or close the console, then retry.";
 const CONSOLE_UNSAFE: &str = "its console cannot reconnect safely after the update";
@@ -1792,7 +1796,7 @@ fn saved_chat_problem(
                         provider_name(source.launch.provider)
                     ),
                 },
-                "Stop that process, then choose Resume conversation in the new tab (+) menu",
+                "Stop that process, then open its tab; if the conversation doesn't reopen, the tab says what to do",
             )
         } else if execution == Some(SavedExecution::Unchecked) {
             (UNCHECKED.into(), CHAT_RECOVERY)
@@ -3593,7 +3597,7 @@ mod tests {
         );
         assert_eq!(
             running.recovery,
-            "Stop that process, then choose Resume conversation in the new tab (+) menu"
+            "Stop that process, then open its tab; if the conversation doesn't reopen, the tab says what to do"
         );
         let held = inspection
             .stopped

@@ -56,6 +56,15 @@ impl Handle {
     pub(crate) fn fixture_failed_remote() -> Self {
         Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
     }
+    /// Model the provider naming its conversation after it started, as a new
+    /// one does.
+    #[cfg(test)]
+    pub(crate) fn fixture_publish_session(&self, session: String) {
+        match &self.0 {
+            Owner::Remote(remote) => remote.publish_session_fixture(session),
+            Owner::Local(_) => panic!("session publication fixture requires a retained actor"),
+        }
+    }
     /// Model the provider confirming its conversation after this attachment.
     #[cfg(test)]
     pub(crate) fn fixture_confirm_session(&self, session: String) {
@@ -496,6 +505,16 @@ impl Handle {
             Owner::Remote(remote) => remote.attachment_snapshot(),
         }
     }
+    /// The items changed since the last call, whole, and whether the
+    /// conversation is working; see [`super::Unread`]. Only a conversation
+    /// this process owns is followed this way; a retained actor keeps its
+    /// record in another process.
+    pub fn unread(&self, again: &[String]) -> Result<(super::Unread, bool), String> {
+        match &self.0 {
+            Owner::Local(local) => local.unread(again),
+            Owner::Remote(_) => Err("it is kept by another process".into()),
+        }
+    }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         match &self.0 {
             Owner::Local(local) => local.snapshot(after),
@@ -636,6 +655,16 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.is_idle(),
             Owner::Remote(remote) => remote.state().idle,
+        }
+    }
+    /// The provider-confirmed permission mode. A local actor reads it
+    /// without publishing a snapshot.
+    pub(crate) fn permission_mode(&self) -> Option<String> {
+        match &self.0 {
+            Owner::Local(local) => local.permission_mode(),
+            Owner::Remote(remote) => remote
+                .snapshot(None)
+                .and_then(|snapshot| snapshot.permission_mode),
         }
     }
     pub(crate) fn requests(&self) -> Vec<chat::Request> {

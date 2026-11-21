@@ -16,7 +16,8 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
-| A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat |
+| A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat, or an Antigravity or Muse chat prompted with `work` |
+| A pull request review read from cache while GitHub is unavailable, with a restored draft line comment | [`tests/fixtures/offline-review-cache.py`](#an-offline-cached-review), run through `scripts/native-evidence env python3 ...` once the app has started |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
@@ -90,6 +91,11 @@ paragraph count enough to exercise provider history paging with prose alone.
 `--untitled` leaves out the conversation's name and `--first-prompt TEXT`
 replaces the first checkpoint, for a channel that only its first prompt can
 name, which lies outside the loaded window.
+`--working 16` gives each exchange 16 commands, each with the hook records
+Claude Code writes around a tool call, and a one-line answer. A saved page of
+100 records then holds about two exchanges, as in an agent's long working
+session, so opening the conversation shows whether the transcript fills its
+window from further pages without the reader asking.
 The generator writes under `HOME/.claude`; always run it through
 `native-evidence env`, which supplies the private fixture HOME. Stop and
 `save-seed` after setup to reuse exactly the same conversation on both sides.
@@ -132,6 +138,14 @@ pushed range in the retry-budget output differs between Before and After.
 `host::work::transcript::tests` checks that the daemon reads from these frames
 the pull requests, branches and edited directories the table names, with
 their relations.
+
+An Antigravity or Muse chat can replay the same turn. Start the session with
+`--acp`, run the script, then send the chat a prompt that contains the word
+`work`. The offline ACP agent reports each step the way Antigravity does: a
+shell command with its output, or an edit with its diff. The daemon reads
+the chat's work from cagents' own record of the chat, not from a transcript
+file. `host::work::items::tests` and `chat::runtime::store::unread::tests`
+check that reading.
 
 Mentioned pull requests are listed only once **Show mentioned pull requests**
 is on in Settings; it is off by default.
@@ -176,9 +190,9 @@ evidence cli --json agent spawn --provider claude --model haiku --surface chat \
 # The turn has replayed once its answer is in the transcript.
 evidence env sh -c 'for _ in $(seq 60); do grep -qs work-answer "$HOME"/.claude/projects/*/*.jsonl && exit 0; sleep 1; done; exit 1'
 
-# Open the chat from its sidebar row.
-evidence drive wait 'Locale cache work' --timeout 30 >/dev/null
-evidence drive click 'Locale cache work' >/dev/null
+# Open the chat from its sidebar row, by one word of its title.
+evidence drive wait 'Locale' --timeout 30 >/dev/null
+evidence drive click 'Locale' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
 evidence drive hover 1,1 >/dev/null
 # Open the pane's inspector (Ctrl+Shift+I) unless it already is.
@@ -237,7 +251,7 @@ fixture's `config/`, so no app setting can switch it on. The fixture creates
 the directory; the forge reads the switch on every call, so a step can turn it
 on in a running session. Then it
 answers as a gh signed in to github.com as `fixture`, whose repositories have
-no pull requests and no review requests:
+no pull requests and no review requests except those seeded below:
 
 | The app runs | It answers |
 | --- | --- |
@@ -246,7 +260,7 @@ no pull requests and no review requests:
 | `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below; `--author @me` means `fixture` |
 | `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
 | `gh pr checks N` | gh's `no checks reported` for a seeded pull request; a seed's checks reach the app through `statusCheckRollup` in `gh pr view` and the queries below instead |
-| `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
+| `gh api graphql` | the seeded open pull requests for the review-request poll and the pull request browser, and their review-request history; empty pages for the browser's search; not found for a pull request's own queries |
 | `gh api repos/OWNER/NAME/issues?creator=LOGIN&...` | the creator's most recently updated seeded pull request, with an `Etag` that changes when that row does, and gh's `HTTP 304` failure when `If-None-Match` still matches it |
 | `gh api repos/OWNER/NAME/releases` | `[]`; any other REST endpoint is `404 Not Found` |
 
@@ -331,10 +345,19 @@ icon, and the branch's tooltip names the pull request, its state and its
 checks. Entries that match no worktree still answer `gh pr list`, but nothing
 in the sidebar shows them.
 
-Seeds cannot support evidence of the review flow. The pull request browser
-lists none of them, and opening a seeded pull request's review asks for its
-conversation, which the forge answers as not found. Like any failed GitHub
-read, that pauses the app's GitHub refreshes for a while.
+The pull request browser lists the open seeds in file order, fifty a page, so
+53 open seeds give it a second page. An entry may also set
+`fixtureReviewRequests`, the number of times the reader was asked to review it
+(0 if absent). One or more makes it a review request for the reader, labeled
+**Needs your review**; two or more make it **Review re-requested**. A request
+beyond the browser's loaded pages appears under those filters as its own
+request row.
+
+Seeds still cannot support evidence of the review itself. Opening a seeded
+pull request's review asks for its conversation, which the forge answers as
+not found. Like any failed GitHub read, that pauses the app's GitHub refreshes
+for a while. That failure is exactly what
+[an offline cached review](#an-offline-cached-review) needs.
 
 A steps file for a sidebar with an avatar and the fixture worktree's pull
 request. The avatar step needs ImageMagick's `magick` on the build host. It
@@ -360,6 +383,62 @@ evidence cli project open '{fixture}/project'
 sleep 12
 evidence shot sidebar-avatar
 ```
+
+## An offline cached review
+
+A pull request review the app has read before reopens from its local cache
+while GitHub can't be reached: its files, viewed marks, selected file and any
+unposted draft, read only until GitHub confirms the review again.
+[`tests/fixtures/offline-review-cache.py`](../tests/fixtures/offline-review-cache.py)
+prepares that state. Run it once the app has started, since the cache lives in
+the app's own session store, and before opening the review; it takes no
+arguments:
+
+```sh
+scripts/native-evidence env python3 "$PWD/tests/fixtures/offline-review-cache.py"
+```
+
+It commits a base and a head to the fixture project, checks the head out as
+the worktree `.worktrees/cache-key` on `fix/cache-key`, gives the project the
+remote `https://github.com/octo-org/fixture-app` and turns the
+[forge](#an-offline-github) on with #57 **Key the response cache by locale**,
+which that worktree heads. It then writes #57's review into the store's
+`review_cache` tables in one transaction, as the app saves it:
+`docs/caching.md` added and viewed, `src/cache.rs` changed and selected, and
+a draft comment on line 23 of `src/cache.rs` that was never posted. The diff's
+commits are the project's own, so it renders; the forge answers the review's
+own queries as not found, so the review stays **Cached for fixture · read
+only**, with the failed `gh` read as its notice. The seed's write order is
+outside the app's clock, so the app's next save of the review replaces it, and
+running the script again rewrites the cache and keeps the commits. Other seeds
+in `fixture-forge-prs.json` are kept.
+
+To open the review as a person does, show the sidebar's search, choose its
+**Pull requests** filter and click the `fix/cache-key` row. The draft's
+composer sits under line 23; its buttons are below the fold at the default
+height, so scroll the diff to reach them. Don't click a diff gutter in a
+revision without the fix for #3417: that starts a comment the cached review has
+no authority for, and the app panics. A steps file:
+
+```sh
+evidence env python3 -I "$tool/tests/fixtures/offline-review-cache.py" >/dev/null
+evidence cli project open '{fixture}/project' >/dev/null
+evidence drive wait 'Worktrees' --timeout 60 >/dev/null
+evidence drive click 206,67 >/dev/null    # the sidebar's search
+evidence drive wait 'Pull requests' --timeout 10 >/dev/null
+evidence drive click 'Pull requests' >/dev/null
+evidence drive wait 'cache-key' --timeout 60 >/dev/null
+evidence drive click 'cache-key' >/dev/null
+evidence drive wait 'read only' --timeout 30 >/dev/null
+evidence drive wait 'empty locale' --timeout 30 >/dev/null
+evidence shot offline-review
+```
+
+If `Worktrees` is collapsed, the filter shows no `fix/cache-key` row until it
+is expanded. `tests/offline_review_cache_fixture.py` checks the rows the
+script writes against the tables `src/persistence.rs` creates, and that the
+forge lists #57 at the cached head; the native review is what shows the app
+reads them.
 
 ## A failed automatic terminal completion
 
@@ -388,6 +467,30 @@ output before typing. `SCENE_SHOT_PREFIX=narrow-` keeps a second layout's images
 separate; the app's responsive inspector state is preserved. Single-word OCR
 locators tolerate split text runs. The unique `Retry` locator targets the existing
 **Retry save** button even when OCR splits that label into two boxes.
+
+## A copy whose text changed
+
+A message's Copy reads its whole text from the daemon's transcript store,
+which refuses the read if the item changed after the snapshot the app copied
+from. That happens only when a provider rewrites the item within the few
+milliseconds a read takes, so development builds under `native-evidence`
+refuse every such read as changed while
+`home/.config/fixture-text-copy-changed` exists in `CAGENTS_EVIDENCE_FIXTURE`.
+The store's sources stay as they are, so the app has nothing newer to read
+and shows the refusal in the chat's error line. Remove the file and the same
+Copy succeeds. Only the conversation's own items are refused; a subagent's
+copies are unaffected.
+
+```sh
+scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-changed'
+# Click a finished reply's Copy, and capture the error line.
+scripts/native-evidence env rm '{fixture}/home/.config/fixture-text-copy-changed'
+```
+
+This covers the store noticing the change first. When the app's snapshot sees
+it first, the app reads the item again before the store answers; the unit
+tests in `text_copy::tests` cover that order. The fault is absent from builds
+without the `development` feature, and contacts no provider.
 
 ## An offline Codex
 
@@ -430,6 +533,12 @@ With `home/.codex/fixture-unnamed-child` present, the `tool-rows` peer's
 collaboration calls and thread listing report its child without a nickname,
 and only the child's own thread read names it Quinn: a child discovered before
 Codex named it.
+
+With `home/.codex/fixture-nested-child` present, its thread listing also
+reports a subagent the child spawned earlier, Ada, which never runs live. Like
+Codex, the peer lists a child it hasn't loaded since it started as
+`notLoaded`, and refuses to read Ada until the child's own read has loaded it:
+the state a restarted daemon restores nested subagents from.
 
 The `tool-rows` peer also reads an optional `model/list` result from
 `home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
@@ -591,6 +700,13 @@ Refresh account usage after switching plans. The fake auth status and
 `get_usage` responses continue to omit display labels and tier metadata,
 matching the installed client; the extra information comes from the fake
 profile and cached-metadata marker.
+
+For Claude login-change evidence, `usage-reset-scene.sh login EMAIL` accepts
+only an address at a reserved example domain, such as `other@example.com` or
+the seed's `fixture@example.test`, and changes
+only the fake profile and auth-status email, plus the marker's email when
+present. Organization UUID, plan, usage windows, reset counts and prior claims
+stay unchanged; it never submits a consume. Refresh account usage afterwards.
 
 Pro reports `Pro`. Max cases report the label `Max` with the known cached tier
 IDs `default_claude_max_5x` and `default_claude_max_20x`. Ultra reports `Ultra`
@@ -823,8 +939,8 @@ python3 tests/fixtures/native-retired-ownership.py \
     ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
 ```
 
-The helper recognizes only schema 22 shared views or schema 23 to 28
-normalized panes with descriptor format 1. Schemas 24 to 28 add tables beside
+The helper recognizes only schema 22 shared views or schema 23 to 29
+normalized panes with descriptor format 1. Schemas 24 to 29 add tables beside
 those panes without changing their columns. It requires one current committed Claude pane
 for that exact thread, matching ownership source and proof, and a completed
 retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
@@ -1104,20 +1220,49 @@ PR merges to remove the task's checkouts from the host.
 speaks the Agent Client Protocol over stdio the way Antigravity's `agy acp`
 does, with its configuration options for model, thinking level and mode and
 its older `models` and `modes` lists. Run as `muse...` or with
-`FAKE_ACP_SHAPE=muse`, it offers Muse's model and mode options instead, with
-no thinking level. It ignores its arguments, so a launch recipe written for
-the real agent runs it unchanged. It contacts no model, account or network.
+`FAKE_ACP_SHAPE=muse`, it copies Muse 1.4.24 instead: its four modes, a
+`-contributor` model beside each ordinary one, a reasoning option only on
+`muse-spark-1.2` (offering only `xhigh`), a two-word session name sent as
+soon as a session opens, and usage with no context size. It ignores its
+arguments, so a launch recipe written for the real agent runs it unchanged,
+except Antigravity's `--app-data-dir DIR`: like `agy`, a process started
+with it keeps its conversations apart from the ones it lists otherwise, so
+the account check's own sessions are not listed as the reader's.
+It contacts no model, account or network.
+
+In the Muse shape, three account commands answer the way `muse` does, so the
+fixture can stand in for `muse-upstream` on a fixture `PATH`:
+
+| Command | The fixture |
+| --- | --- |
+| `usage --json` | prints Muse's no-allowance report, or exits 1 with `not logged in` when signed out |
+| `logout` | signs out: every later `session/new`, `session/load` and prompt answers Muse's `log in to Muse before opening a session` |
+| `login` | prints a made-up device code, waits `FAKE_ACP_LOGIN_SECONDS` (default 2), and signs back in |
+
+Signing out is a `signed-out` file under `FAKE_ACP_STATE`, so it lasts
+across processes until `login`.
 
 It keeps sessions as JSON lines under `FAKE_ACP_STATE`, so `session/load`
-replays a conversation from an earlier process and `session/list` finds it.
-Point it at the fixture's own directory; without it, sessions go to a
-directory in the system's temporary directory.
+replays a conversation from an earlier process and `session/list` lists
+it, newest first, with its directory, title and last activity. Point it at
+the fixture's own directory; without it, sessions go to a directory in the
+system's temporary directory.
+
+With `FAKE_ACP_PRESENCE=1`, it locks a conversation while it has one open,
+where the real agent does under `$HOME`: Antigravity's
+`~/.gemini/antigravity-cli/presence/ID.lock`, which stays behind unlocked
+once it closes, and Muse's `.session.lock` in the conversation's dated
+directory under `~/.local/share/muse/sessions`. The Resume conversation
+picker reads these locks to say a conversation is open elsewhere. Set it
+only for a `$HOME` that is the fixture's own; `fixture-acp.sh` sets it when
+that is so.
 
 The first of these words a prompt contains chooses what it does:
 
 | Word | The agent |
 | --- | --- |
 | `tools` | updates a plan, runs `ls -1` and edits `notes.md` with a diff |
+| `work` | replays the [conversation work](#conversation-work) turn: its messages, shell commands with their output, and edits with their diffs |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
@@ -1133,11 +1278,37 @@ failures:
 
 | Variable | Effect |
 | --- | --- |
-| `FAKE_ACP_AUTH=initialize`, `new`, `load` or `prompt` | that request answers that sign-in is required |
+| `FAKE_ACP_AUTH=initialize`, `new`, `load`, `list` or `prompt` | that request answers that sign-in is required |
+| `FAKE_ACP_LIST_PAGE=N` | `session/list` answers `N` conversations a page, each with the `nextCursor` of the next |
 | `FAKE_ACP_NO_LOAD=1` | the agent does not offer to load a session |
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+| `FAKE_ACP_WORK=PATH` | the Claude Code transcript a `work` prompt replays. The installed `agy` and `muse-upstream` read the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
+
+`native-evidence start SIDE --acp` (or `pair ... --acp`) installs it into the
+fixture as `bin/agy` and `bin/muse-upstream`, through
+[`tests/fixtures/fixture-acp.sh`](../tests/fixtures/fixture-acp.sh), with a
+`bin/muse` that runs `muse-upstream` behind root options as a reader's own
+wrapper might. Each keeps its sessions in the fixture's `acp/agy` or
+`acp/muse`, and logs the frames it receives to `frames.log` there, so a check
+can read which settings and prompts cagents sent. While `acp/agy/signed-out`
+exists, `agy` answers every new or loaded session that sign-in is required,
+and the app's sign-in, `agy acp --login`, removes it:
+
+```sh
+evidence env touch '{fixture}/acp/agy/signed-out'
+```
+
+A conversation started outside cagents is one the fake agent saved without
+the app: run the fixture's `agy acp` (or `muse-upstream acp`) and open a
+session with `session/new`, or write an entry into `acp/AGENT/index.json`
+(`{"ID": {"cwd": DIRECTORY, "title": TITLE, "updatedAt": RFC3339}}`), which
+`session/list` lists as it is. `session/load` replays it only once
+`acp/AGENT/sessions/ID.jsonl` holds its session updates, one a line; an
+empty file loads it with no history.
+
+A plain start installs neither, so Antigravity and Muse are not installed.
 
 The ACP adapter's runtime test in `src/chat/runtime/tests.rs` drives it
 through a real pipe.

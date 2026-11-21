@@ -459,10 +459,13 @@ pub enum Action {
     Figure(Target, u64, images::figure::Command),
     ThumbnailLoaded(Target, Arc<PathBuf>, images::Loaded),
     RetryThumbnails(Target),
-    CloseImage,
-    ImageNext(bool),
-    ImageFit,
-    ImageExternal,
+    /// Keyboard to the pane's image viewer, as sending from its composer
+    /// hands it back.
+    FocusImage(Target),
+    CloseImage(images::ViewerHost),
+    ImageNext(images::ViewerHost, bool),
+    ImageFit(images::ViewerHost),
+    ImageExternal(images::ViewerHost),
     /// A context menu, viewer control or shortcut acting on displayed pixels.
     Image(images::ImageRef, images::ImageCommand),
     /// PNG encoding finished; `None` when a newer copy superseded it first.
@@ -626,6 +629,18 @@ impl std::fmt::Debug for Action {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
     }
+}
+
+/// Why the daemon does not host a pane's conversation yet; see
+/// [`Cagents::chat_unhosted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum Unhosted {
+    /// A draft: nothing has run it, and nothing will until its first
+    /// message is sent, so it has done no work.
+    Unstarted,
+    /// This window is starting the conversation, or attaching to it, and
+    /// the daemon has not answered with it yet.
+    Starting,
 }
 
 /// What an action may confine itself to: one conversation, or the
@@ -893,10 +908,11 @@ impl Action {
             Self::Figure(..) => "Figure",
             Self::ThumbnailLoaded(..) => "ThumbnailLoaded",
             Self::RetryThumbnails(..) => "RetryThumbnails",
-            Self::CloseImage => "CloseImage",
+            Self::FocusImage(..) => "FocusImage",
+            Self::CloseImage(..) => "CloseImage",
             Self::ImageNext(..) => "ImageNext",
-            Self::ImageFit => "ImageFit",
-            Self::ImageExternal => "ImageExternal",
+            Self::ImageFit(..) => "ImageFit",
+            Self::ImageExternal(..) => "ImageExternal",
             Self::Image(..) => "Image",
             Self::ImageCopied(..) => "ImageCopied",
             Self::CopyLiteral(..) => "CopyLiteral",
@@ -1032,11 +1048,13 @@ impl Action {
                 | Self::Files(..)
                 | Self::Tick
                 | Self::AccountPicker(_, false)
-                | Self::CloseImage
-                | Self::ImageNext(_)
-                | Self::ImageFit
-                | Self::ImageExternal
-                | Self::Image(images::ImageRef::Viewer(_), _)
+                // The dialog's own controls; a pane's viewer sits under a
+                // dialog like the rest of its pane.
+                | Self::CloseImage(images::ViewerHost::Dialog)
+                | Self::ImageNext(images::ViewerHost::Dialog, _)
+                | Self::ImageFit(images::ViewerHost::Dialog)
+                | Self::ImageExternal(images::ViewerHost::Dialog)
+                | Self::Image(images::ImageRef::Viewer(images::ViewerHost::Dialog, _), _)
                 | Self::ImageCopied(..)
         )
     }
@@ -1266,7 +1284,9 @@ pub(super) struct State {
     /// while the window runs for a channel with no name: `None` while the
     /// read runs, then the name it found, if any.
     opening_names: HashMap<(CardId, String), Option<Option<String>>>,
-    pub(super) image_viewer: Option<images::Gallery>,
+    /// The image viewer as a dialog, for an image no conversation shows. A
+    /// conversation's own images open in its pane: [`Runtime::image_viewer`].
+    pub(super) image_dialog: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
@@ -1355,7 +1375,7 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
-            image_viewer: None,
+            image_dialog: None,
             channel_names: HashMap::new(),
             opening_names: HashMap::new(),
             files: HashMap::new(),
@@ -3245,6 +3265,10 @@ pub(super) struct Runtime {
     /// The images answers' Markdown shows, decoded as they come into view.
     figures: images::figure::Figures,
     child_picker: Option<child_navigation::Picker>,
+    /// The image viewer over this conversation's transcript. It stays open
+    /// as the conversation moves on, and closes only when the reader closes
+    /// it, searches the transcript, or the pane goes.
+    pub(super) image_viewer: Option<images::Gallery>,
     /// The child whose tab holds keyboard focus. The tab strip reports it, so
     /// the next frame keeps that tab mounted wherever its state sorts it.
     child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
@@ -3910,11 +3934,15 @@ impl Runtime {
             selection: None,
         });
         self.replace_draft(composer);
-        // The draft a walk through sent messages set aside is in `combined`.
-        self.history_cursor = None;
+        // The draft a walk through sent messages set aside is in `combined`,
+        // and its attachments rather than the recalled message's follow it.
+        let shown = self.replace_attachments(attachments);
+        let later = match self.history_cursor.take() {
+            Some(_) => self.history_attachment_stash.take().unwrap_or_default(),
+            None => shown,
+        };
         self.history_stash = None;
         self.history_attachment_stash = None;
-        let later = self.replace_attachments(attachments);
         self.merge_attachments(later);
     }
 
@@ -4110,8 +4138,8 @@ impl Runtime {
     }
 
     /// Records a message the provider accepted. The same message sent twice
-    /// in a row is one entry, as a shell keeps it, and the walk restarts
-    /// from the newest.
+    /// in a row is one entry, as a shell keeps it. An active history walk
+    /// keeps its position and unsent draft.
     #[cfg(test)]
     fn remember(&mut self, sent: String) {
         self.remember_with_attachments(sent, Vec::new());
@@ -4123,9 +4151,34 @@ impl Runtime {
             self.history.push(sent);
             self.history_images.push(attachments);
         }
+    }
+
+    /// Returns to the draft saved before browsing sent prompts.
+    fn restore_history_draft(&mut self) {
+        let composer = self.history_stash.take().unwrap_or_default();
+        let attachments = self.history_attachment_stash.take().unwrap_or_default();
+        self.replace_attachments(attachments);
         self.history_cursor = None;
-        self.history_stash = None;
-        self.history_attachment_stash = None;
+        self.replace_draft(composer);
+    }
+
+    /// Consumes the shown prompt while preserving a draft saved by history.
+    /// The walk shows the draft's chosen files with each recalled prompt, so
+    /// those that just left with it are not restored a second time.
+    fn finish_history_walk_after_send(&mut self, sent: &[Attachment]) {
+        if self.history_cursor.is_some() {
+            if let Some(stash) = self.history_attachment_stash.as_mut() {
+                stash.retain(|attachment| {
+                    attachment.reference.is_some()
+                        || !sent
+                            .iter()
+                            .any(|gone| gone.reference.is_none() && gone.path == attachment.path)
+                });
+            }
+            self.restore_history_draft();
+        } else {
+            self.replace_draft(text_editor::Content::new());
+        }
     }
 
     /// Walks the history one message older or newer, showing it in the
@@ -4147,29 +4200,22 @@ impl Runtime {
             (Some(index), false) if index + 1 < self.history.len() => Some(index + 1),
             (Some(_), false) => None,
         };
-        let composer = match next {
-            Some(index) => {
-                text_editor::Content::with_text(self.history[index].trim_end_matches('\n'))
-            }
-            None => self.history_stash.take().unwrap_or_default(),
+        let Some(index) = next else {
+            self.restore_history_draft();
+            return;
         };
-        let attachments = match next {
-            Some(index) => {
-                let mut attachments = self
-                    .history_attachment_stash
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|attachment| attachment.reference.is_none())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if let Some(images) = self.history_images.get(index) {
-                    attachments.extend(images.clone());
-                }
-                attachments
-            }
-            None => self.history_attachment_stash.take().unwrap_or_default(),
-        };
+        let composer = text_editor::Content::with_text(self.history[index].trim_end_matches('\n'));
+        let mut attachments = self
+            .history_attachment_stash
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|attachment| attachment.reference.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(images) = self.history_images.get(index) {
+            attachments.extend(images.clone());
+        }
         self.replace_attachments(attachments);
         self.history_cursor = next;
         self.replace_draft(composer);
@@ -4473,6 +4519,7 @@ impl Runtime {
             scroll_memory: Default::default(),
             figures: Default::default(),
             child_picker: None,
+            image_viewer: None,
             child_tab_focus: Default::default(),
             child_ordinals: Default::default(),
             asked_after: HashSet::new(),
@@ -4550,6 +4597,7 @@ impl Runtime {
         self.last_presented_tail = None;
         self.turns = Revised::default();
         self.selected_subagent = None;
+        self.image_viewer = None;
         self.subagent_scroll.clear();
         self.page_request = None;
         self.deferred_page = None;
@@ -6301,35 +6349,42 @@ impl Runtime {
 
     fn restore_find_disclosures(&mut self) {
         self.restore_failure_find();
-        self.find_disclosure
-            .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
+        let collapsed =
+            self.find_disclosure
+                .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         // Restoring reads a child's disclosures before it writes them; an
         // absent child has nothing to restore, so give it no entry.
         let mut no_items = Revised::default();
+        let mut child_collapsed = Vec::new();
         for (child, mut disclosure) in self.child_find_disclosure.drain() {
-            disclosure.restore(
+            let restored = disclosure.restore(
                 self.child_expanded.get_mut(&child).unwrap_or(&mut no_items),
-                self.child_unfolded.entry(child).or_default(),
+                self.child_unfolded.entry(child.clone()).or_default(),
                 &mut Revised::default(),
             );
+            if self.selected_subagent.as_ref() == Some(&child) {
+                child_collapsed = restored;
+            }
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
-        // again when search restores a collapsed report; manual disclosures
-        // retain both their state and their prepared body.
+        // again for each report this restore collapsed; manual disclosures
+        // retain both their state and their prepared body. Only those reports
+        // are visited, so a keystroke costs what it revealed, not the cache.
         fn collapse_reports(
             cache: &mut HashMap<String, CachedItem>,
-            expanded: &HashSet<String>,
+            collapsed: Vec<String>,
             theme: crate::settings::EditorSyntaxTheme,
         ) {
-            let closed: Vec<_> = cache
-                .iter()
-                .filter_map(|(id, cached)| {
-                    (cached.report_expanded == Some(true) && !expanded.contains(id))
-                        .then(|| cached.item.as_ref().map(|item| (id.clone(), item.clone())))
-                        .flatten()
-                })
-                .collect();
-            for (id, item) in closed {
+            for id in collapsed {
+                #[cfg(test)]
+                REPORT_COLLAPSE_VISITS.with(|visits| visits.set(visits.get() + 1));
+                let Some(item) = cache
+                    .get(&id)
+                    .filter(|cached| cached.report_expanded == Some(true))
+                    .and_then(|cached| cached.item.clone())
+                else {
+                    continue;
+                };
                 let previous = cache.remove(&id);
                 let mut cached =
                     CachedItem::updated(&item.content, theme, previous, false, false, None);
@@ -6337,16 +6392,8 @@ impl Runtime {
                 cache.insert(id, cached);
             }
         }
-        collapse_reports(&mut self.cache, &self.expanded, self.syntax_theme);
-        if let Some(child) = &self.selected_subagent {
-            collapse_reports(
-                &mut self.child_cache,
-                self.child_expanded
-                    .get(child)
-                    .map_or(&HashSet::new(), |set| &**set),
-                self.syntax_theme,
-            );
-        }
+        collapse_reports(&mut self.cache, collapsed, self.syntax_theme);
+        collapse_reports(&mut self.child_cache, child_collapsed, self.syntax_theme);
     }
 
     fn find_anchor(&self, key: &str) -> iced::advanced::widget::Id {
@@ -6538,6 +6585,8 @@ impl Runtime {
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.find_navigation.changed_document();
         self.presentation_evicted = true;
+        // An open viewer keeps only the image it shows.
+        images::sync_viewer(self);
     }
 
     /// Evict disposable body/presentation owners while keeping the small
@@ -7749,6 +7798,8 @@ impl Cagents {
             return None;
         };
         runtime.find.get_or_insert_with(String::new);
+        // Find shows its matches in the transcript the viewer covers.
+        runtime.image_viewer = None;
         Some(
             iced::widget::operation::focus(card_control_id(card, "chat-find"))
                 .map(cosmic::Action::App),
@@ -7756,10 +7807,17 @@ impl Cagents {
     }
 
     fn chat_find_next(&mut self, target: Target, forward: bool) -> Task<Message> {
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.refresh_find();
+        }
+        self.chat_find_step(target, forward)
+    }
+
+    /// Moves to the next or previous of the matches Find last refreshed.
+    fn chat_find_step(&mut self, target: Target, forward: bool) -> Task<Message> {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        runtime.refresh_find();
         if runtime.find_matches.is_empty() {
             if runtime.find.as_ref().is_some_and(|query| !query.is_empty()) {
                 return self.begin_find_navigation(target, None);
@@ -8704,6 +8762,10 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return None;
         };
+        // An image viewer covers the transcript: it would scroll unseen.
+        if runtime.image_viewer.is_some() {
+            return None;
+        }
         use keyboard::key::Named;
         let id = card_control_id(card, "chat-transcript");
         let task = match key {
@@ -8767,8 +8829,17 @@ impl Cagents {
                     .filter(|card| card.existence.is_open()),
             )
             .find_map(|card| match &card.kind {
-                CardKind::Chat(session) => Some(session.launch.provider),
+                CardKind::Chat(session) if self.account_ui.uses(session.launch.provider) => {
+                    Some(session.launch.provider)
+                }
                 _ => None,
+            })
+            // Codex, unless it is turned off: then the first provider in use
+            // that has native chat.
+            .or_else(|| {
+                std::iter::once(Provider::Codex)
+                    .chain(crate::account::Account::REPORTED)
+                    .find(|provider| provider.has_native_chat() && self.account_ui.uses(*provider))
             })
             .unwrap_or(Provider::Codex)
     }
@@ -9944,6 +10015,50 @@ impl Cagents {
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         // A reopened conversation still being prepared starts once that ends.
         self.chat_ui.phases.contains_key(&card) || self.reopen_preparing(card)
+    }
+    /// Why the daemon cannot host `card`'s `conversation` yet, when this
+    /// window knows it cannot: nothing has run the conversation, or this
+    /// window is still starting or attaching it. A pane exists from the
+    /// moment it is opened, but the daemon registers its chat only once the
+    /// provider has started, so asking it about the conversation before then
+    /// is refused as a conversation it does not host. `None` once the daemon
+    /// has answered this window's start or attachment with the conversation,
+    /// and whenever this window cannot tell, as for a chat whose start
+    /// failed.
+    pub(in crate::app) fn chat_unhosted(
+        &self,
+        card: CardId,
+        conversation: TerminalId,
+    ) -> Option<Unhosted> {
+        let starting = self.chat_start_pending(card);
+        match self.cards.get(&card) {
+            // A connection that was lost and is being made again may reach a
+            // daemon that has not restored the chat yet.
+            Some(CardRuntime::Chat(runtime))
+                if runtime.session.id == conversation
+                    && runtime.handle().is_some()
+                    && !(starting && runtime.disconnected) =>
+            {
+                None
+            }
+            Some(CardRuntime::Chat(runtime))
+                if runtime.is_draft() && runtime.queued.is_none() && !starting =>
+            {
+                Some(Unhosted::Unstarted)
+            }
+            // A pane awaiting admission may wait there until the reader acts,
+            // and the daemon often hosts its conversation meanwhile.
+            Some(CardRuntime::Chat(runtime))
+                if runtime.handle().is_none() && !runtime.awaiting_admission() =>
+            {
+                Some(Unhosted::Starting)
+            }
+            // A start for a conversation other than the one the runtime is
+            // connected to, a reconnection, or a start with no chat runtime
+            // yet, as a saved conversation's while it reopens.
+            _ if starting => Some(Unhosted::Starting),
+            _ => None,
+        }
     }
     /// Whether `card` has begun starting its conversation, as opposed to
     /// waiting for that start to be allowed.
@@ -11619,9 +11734,12 @@ impl Cagents {
         let snapshot = handle.snapshot();
         if snapshot.exited {
             // The error is the last the conversation reported, which is
-            // not always why it stopped.
+            // not always why it stopped. A sign-in failure is why, and kept
+            // in the provider's own words it offers the draft the sign-in
+            // recovery a started conversation gets.
             let stopped = "The conversation stopped before it took the first message.";
             let error = match &snapshot.error {
+                Some(error) if chat::requires_sign_in(provider, error) => error.clone(),
                 Some(error) => format!("{stopped} Its last report: {error}"),
                 None => stopped.to_owned(),
             };
@@ -12030,7 +12148,7 @@ impl Cagents {
             // back with the reason.
             let text = runtime.composer.text().trim_end().to_owned();
             let attachments = runtime.take_attachments();
-            runtime.replace_draft(text_editor::Content::new());
+            runtime.finish_history_walk_after_send(&attachments);
             let mode = match &command {
                 Command::Prompt { mode, .. } => *mode,
                 _ => PromptMode::Send,
@@ -13102,6 +13220,18 @@ impl Cagents {
                         let opening_name =
                             self.request_opening_name(target).unwrap_or_else(Task::none);
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        // The client may have cached a limit or agent addresses
+                        // before it attached, or their wakes were discarded while
+                        // startup was pending. Read both from the installed handle
+                        // once the sidebar's activity entry exists.
+                        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card)
+                            && let Some(handle) = runtime.handle().cloned()
+                        {
+                            runtime.usage_limit = handle.limit();
+                            runtime.agent_addresses = handle.agent_addresses();
+                            self.sidebar_state
+                                .set_card_limited(target.card, runtime.usage_limit.is_some());
+                        }
                         // A new request can reject before its first Changed
                         // wake reaches this window. Historical reopen alone
                         // does not manufacture a fresh limit occurrence.
@@ -14142,18 +14272,26 @@ impl Cagents {
                 // the keyboard itself.
                 // Starting a draft can replace its runtime, so the card, not
                 // the generation, names the composer that keeps the keyboard.
-                let composer = match self.cards.get(&target.card) {
-                    Some(CardRuntime::Chat(runtime)) => !runtime.permission_picker,
-                    _ => false,
+                // An open image takes the keyboard back, as sending with the
+                // keyboard does, so the next Escape closes it rather than
+                // interrupt the reply.
+                let (composer, viewing) = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) => (
+                        !runtime.permission_picker,
+                        runtime.image_viewer.is_some() && runtime.child_picker.is_none(),
+                    ),
+                    _ => (false, false),
                 };
                 if self.resume_ui.open || !composer {
                     return submitted;
                 }
-                return Task::batch([
-                    submitted,
+                let focus = if viewing {
+                    self.focus_image_viewer(target)
+                } else {
                     iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
-                        .map(cosmic::Action::App),
-                ]);
+                        .map(cosmic::Action::App)
+                };
+                return Task::batch([submitted, focus]);
             }
             Action::Submit(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -14294,14 +14432,15 @@ impl Cagents {
                     let id = runtime.next_written;
                     runtime.next_written += 1;
                     let text = runtime.composer.text().trim_end().to_owned();
+                    let attachments = runtime.take_attachments();
+                    runtime.finish_history_walk_after_send(&attachments);
                     let followup = Followup {
                         id,
                         preview: prompt::queue_preview(&text),
                         text,
-                        attachments: runtime.take_attachments(),
+                        attachments,
                     };
                     runtime.followups.push(followup);
-                    runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     let _ = runtime.present();
                     let busy = runtime.turn_under_way();
@@ -14505,7 +14644,8 @@ impl Cagents {
                     runtime.refresh_find();
                     runtime.find_index = runtime.find_matches.len().saturating_sub(1);
                 }
-                return self.chat_find_next(target, true);
+                // Just refreshed: stepping must not search the transcript again.
+                return self.chat_find_step(target, true);
             }
             // Pressing the Previous or Next button blurs the search field;
             // the keyboard goes back to it, so Enter keeps stepping through
@@ -15247,16 +15387,10 @@ impl Cagents {
                 }
             }
             Action::CopyMessage(target, id, source) => {
-                return self.start_message_copy(target, id, source, String::new());
+                return self.start_message_copy(target, id, None, source);
             }
             Action::CopyStep(target, id, part, source) => {
-                let prefix = self
-                    .chat_runtime_mut(target)
-                    .and_then(|runtime| runtime.active_item(&id))
-                    .and_then(|item| step_copy_prefix(&part, &item.content));
-                if let Some(prefix) = prefix {
-                    return self.start_message_copy(target, id, Some(source), prefix);
-                }
+                return self.start_message_copy(target, id, Some(part), Some(source));
             }
             Action::MessageCopied(target, id, request, result) => {
                 return self.finish_message_copy(target, id, request, result);
@@ -15439,32 +15573,13 @@ impl Cagents {
                     }
                 }
             }
-            Action::OpenImage(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let gallery = images::Gallery::new(runtime, &id);
-                    self.chat_ui.image_viewer = gallery;
-                }
-            }
-            Action::CloseImage => self.chat_ui.image_viewer = None,
-            Action::ImageNext(forward) => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
-                    gallery.next(forward);
-                }
-            }
-            Action::ImageFit => {
-                if let Some(gallery) = &mut self.chat_ui.image_viewer {
-                    gallery.reset = gallery.reset.wrapping_add(1);
-                }
-            }
-            Action::ImageExternal => {
-                if let Some(image) = self
-                    .chat_ui
-                    .image_viewer
-                    .as_ref()
-                    .map(images::Gallery::selected_image)
-                {
-                    return self.image_command(image, images::ImageCommand::OpenExternally);
-                }
+            Action::OpenImage(..)
+            | Action::FocusImage(_)
+            | Action::CloseImage(_)
+            | Action::ImageNext(..)
+            | Action::ImageFit(_)
+            | Action::ImageExternal(_) => {
+                return self.image_viewer_action(&action).unwrap_or_else(Task::none);
             }
             Action::Image(image, command) => return self.image_command(image, command),
             // A superseded copy reports nothing, not even its failure.
@@ -16542,3 +16657,12 @@ mod peer_draft_tests;
 #[cfg(test)]
 #[path = "chat_ui/startup_restore_tests.rs"]
 mod startup_restore_tests;
+
+#[cfg(test)]
+thread_local! { static REPORT_COLLAPSE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+/// How many cached items restoring Find's disclosures has examined to drop a
+/// report body it revealed.
+#[cfg(test)]
+pub(super) fn report_collapse_visits() -> usize {
+    REPORT_COLLAPSE_VISITS.with(std::cell::Cell::get)
+}

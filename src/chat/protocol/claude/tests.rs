@@ -4276,36 +4276,35 @@ fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
                 matches!(&items(&call)[..], [ItemContent::Tool { name, input, status: ToolStatus::Running, .. }]
                 if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example")
             );
-            let call_id = call
-                .events
-                .iter()
-                .find_map(|event| match event {
-                    Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
-                        Some(item.id.clone())
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(call_id, "skill-1");
 
             let mut frame = json!({"type":"user","uuid":"internal","message":{"role":"user","content":content}});
             frame[marker] = json!(true);
             // Stream-json omits the other internal fields, including
             // turnCompanion and sourceToolUseID, so do not depend on them.
             let context = adapter.receive(frame).unwrap();
+            let compaction = marker == "isCompactSummary";
             if marker == "isMeta" {
-                assert!(context.events.is_empty(), "{marker}: {context:?}");
+                // Saved instructions naming no call are what a typed command
+                // expanded into, which Claude Code never streams.
+                assert!(context.events.is_empty(), "{context:?}");
                 assert!(adapter.carrier_items["internal"].is_empty());
-            } else {
-                // Only the transcript's own summary flag names a
-                // compaction; the broader flags stay generic context.
-                let expected = if marker == "isCompactSummary" {
-                    compaction_item("internal:0".into(), body.into())
-                } else {
-                    context_item("internal:0".into(), body.into())
-                };
+            } else if compaction {
+                // Only the transcript's own summary flag names a compaction.
+                let expected = compaction_item("internal:0".into(), body.into());
                 assert_eq!(deliveries(&context), vec![(Role::System, expected.content)]);
                 assert_eq!(adapter.carrier_items["internal"], vec!["internal:0"]);
+            } else {
+                // The instructions are the call's, read on demand from its
+                // step, even before the result that says it is launching.
+                let [Event::Item(item)] = &context.events[..] else {
+                    panic!("{marker}: {context:?}");
+                };
+                assert_eq!(item.id, "skill-1");
+                assert!(
+                    matches!(&item.content, ItemContent::Tool { name, output, status: ToolStatus::Running, .. }
+                    if name == "Skill" && output == body)
+                );
+                assert!(adapter.carrier_items["internal"].is_empty());
             }
 
             for flag in [
@@ -4325,21 +4324,20 @@ fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
                 );
             }
             let result = adapter.receive(json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
+            let expected = if compaction || marker == "isMeta" {
+                "Launching skill: example"
+            } else {
+                body
+            };
+            let [Event::Item(item)] = &result.events[..] else {
+                panic!("{result:?}");
+            };
+            assert_eq!(item.id, "skill-1");
             assert!(
-                matches!(&items(&result)[..], [ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }]
-                if name == "Skill" && output == "Launching skill: example")
+                matches!(&item.content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }
+                if name == "Skill" && output == expected),
+                "{marker}: {item:?}"
             );
-            let result_id = result
-                .events
-                .iter()
-                .find_map(|event| match event {
-                    Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
-                        Some(item.id.as_str())
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(result_id, call_id);
             let replacement = adapter.receive(json!({"type":"user","uuid":"replacement","supersedes":["internal"],"message":{"content":"Continue"}})).unwrap();
             assert!(
                 !replacement
@@ -4371,6 +4369,7 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
     let mut expected = vec![
         "root".to_owned(),
         "call".into(),
+        "legacy".into(),
         "wire".into(),
         "raw-summary".into(),
         "result".into(),
@@ -4430,17 +4429,36 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
             .count(),
         16
     );
-    assert!(items(&replay).iter().any(|content| matches!(content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. } if name == "Skill" && output == "Launching skill: example")));
-    let skill_ids = replay.events.iter().filter_map(|event| match event {
-        Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item.id.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>();
-    assert_eq!(skill_ids, vec!["skill-1", "skill-1"]);
+    // The call's instructions are its output, from the transcript's own
+    // correlation; copies no call is waiting for add nothing.
+    let skill = replay
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skill
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["skill-1", "skill-1", "skill-1"]
+    );
+    assert!(
+        matches!(&skill.last().unwrap().content, ItemContent::Tool { output, status: ToolStatus::Succeeded, .. } if output == body)
+    );
     let contexts = replay
         .events
         .iter()
         .filter_map(|event| match event {
-            Event::Item(item) if item.role == Role::System => Some(item),
+            Event::Item(item)
+                if item.role == Role::System
+                    || matches!(&item.content, ItemContent::Tool { name, .. } if name == CONTEXT_STEP) =>
+            {
+                Some(item)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -4449,13 +4467,534 @@ fn synthetic_context_history_preserves_opaque_context_without_rewriting_source()
             .iter()
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["wire:0", "raw-summary:0", "tail:0"]
+        vec!["raw-summary:0"]
     );
-    assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && *summary == if item.id == "raw-summary:0" { COMPACTED } else { "Claude context" } && original.as_bytes() == body.as_bytes())));
+    assert!(
+        matches!(&contexts[0].content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && summary == COMPACTED && original.as_bytes() == body.as_bytes())
+    );
     source.rewind().unwrap();
     let mut after = String::new();
     source.read_to_string(&mut after).unwrap();
     assert_eq!(after, before, "raw provider evidence must remain intact");
+}
+
+/// Items as a chat holds them once `steps` are applied: each ID in the
+/// place it first appeared, with what it last said.
+fn shown_items(steps: &[Step]) -> Vec<Item> {
+    let mut settled: Vec<Item> = Vec::new();
+    for event in steps.iter().flat_map(|step| &step.events) {
+        if let Event::Item(item) = event {
+            match settled.iter_mut().find(|known| known.id == item.id) {
+                Some(known) => *known = item.clone(),
+                None => settled.push(item.clone()),
+            }
+        }
+    }
+    settled
+}
+
+fn settled_live(frames: &[Value]) -> Vec<Item> {
+    let mut adapter = Claude::default();
+    let steps = frames
+        .iter()
+        .map(|frame| adapter.receive(frame.clone()).unwrap())
+        .collect::<Vec<_>>();
+    shown_items(&steps)
+}
+
+fn settled_history(frames: Vec<Value>) -> Vec<Item> {
+    let mut history = correlation_history(frames);
+    let records = history.page().unwrap();
+    let mut adapter = Claude::default();
+    let mut replay = Step::default();
+    for record in &records {
+        adapter.history_message(record, &mut replay).unwrap();
+    }
+    shown_items(&[replay])
+}
+
+const SKILL_BODY: &str = "Base directory for this skill: /work/.claude/skills/release-notes\n\n# Release notes\n\nWrite one sentence of release notes. Do not use any tools.\n\n\nARGUMENTS: Write release notes for a typo fix.";
+
+/// A skill the agent loads is one "Read skill" step whose output is the
+/// instructions it read, live and reopened alike: never a context notice,
+/// and never a message.
+#[test]
+fn a_loaded_skill_is_its_calls_step_live_and_in_history() {
+    let prompt = "Use the release-notes skill to write release notes for a typo fix.";
+    let call = json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes","args":"Write release notes for a typo fix."}}]}});
+    let answer = json!({"type":"assistant","uuid":"answer","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Fixed a typo in the user-facing text."}]}});
+    let result = |extra: Value| {
+        let mut frame = json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_skill","content":"Launching skill: release-notes"}]}});
+        frame
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        frame
+    };
+    // As Claude Code 2.1.325 streams it: the instructions follow the result,
+    // marked only isSynthetic and naming no call.
+    let live = settled_live(&[
+        json!({"type":"user","uuid":"prompt","isReplay":true,"message":{"role":"user","content":prompt}}),
+        call.clone(),
+        result(json!({"tool_use_result":{"success":true,"commandName":"release-notes"}})),
+        json!({"type":"user","uuid":"instructions","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        answer.clone(),
+    ]);
+    // As it saves them: marked isMeta, naming the call.
+    let history = settled_history(vec![
+        json!({"type":"user","uuid":"prompt","message":{"role":"user","content":prompt}}),
+        call,
+        result(json!({"toolUseResult":{"success":true,"commandName":"release-notes"}})),
+        json!({"type":"user","uuid":"instructions","isMeta":true,"turnCompanion":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        answer,
+    ]);
+    let shown = |items: &[Item]| {
+        items
+            .iter()
+            .map(|item| (item.id.clone(), item.role, item.content.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shown(&live), shown(&history));
+    assert_eq!(
+        live.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+        ["prompt:0", "toolu_skill", "msg-answer:0"]
+    );
+    assert!(
+        matches!(&live[1].content, ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded }
+        if name == "Skill"
+            && serde_json::from_str::<Value>(input).unwrap()["skill"] == "release-notes"
+            && output == SKILL_BODY)
+    );
+}
+
+/// A reopened chat pages back 100 records at a time, so a skill's call and
+/// result can be on an earlier page than its instructions. Wherever the
+/// boundary falls, the step reads the instructions, on every page shown.
+#[test]
+fn a_loaded_skill_keeps_its_instructions_across_history_pages() {
+    for after in 97..=99 {
+        let mut frames = vec![
+            json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Write release notes."}}),
+            json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+            json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_skill","content":"Launching skill: release-notes"}]},"toolUseResult":{"success":true,"commandName":"release-notes"}}),
+            json!({"type":"user","uuid":"instructions","isMeta":true,"turnCompanion":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        ];
+        for index in 0..after {
+            frames.push(json!({"type":"assistant","uuid":format!("answer-{index}"),"message":{"id":format!("msg-{index}"),"role":"assistant","content":[{"type":"text","text":format!("Note {index}.")}]}}));
+        }
+        let mut adapter = Claude {
+            history: Some(correlation_history(frames)),
+            ..Claude::default()
+        };
+        let mut steps = Vec::new();
+        while adapter.history.as_ref().unwrap().offset > 0 {
+            let Event::History { items, .. } = adapter
+                .command(Command::LoadEarlier)
+                .unwrap()
+                .events
+                .into_iter()
+                .next()
+                .unwrap()
+            else {
+                panic!("history")
+            };
+            steps.push(items);
+        }
+        assert_eq!(steps.len(), 2, "{after}");
+        for (page, items) in steps.iter().enumerate() {
+            for item in items.iter().filter(|item| item.id == "toolu_skill") {
+                assert!(
+                    matches!(&item.content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }
+                    if name == "Skill" && output == SKILL_BODY),
+                    "{after} records after, page {page}: {item:?}"
+                );
+            }
+        }
+        assert!(
+            steps.iter().flatten().any(|item| item.id == "toolu_skill"),
+            "{after}"
+        );
+        assert!(
+            !steps.iter().flatten().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text.contains("Release notes"))),
+            "{after}"
+        );
+    }
+}
+
+/// A skill an agent's own helper loads is that helper's step: its
+/// instructions update the helper's call, not a row of the main chat.
+#[test]
+fn a_helpers_skill_instructions_stay_with_the_helper() {
+    let mut adapter = Claude::default();
+    adapter
+        .receive(json!({"type":"assistant","uuid":"agent-call","message":{"id":"msg-agent","role":"assistant","content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Notes","prompt":"Write release notes.","subagent_type":"general-purpose"}}]}}))
+        .unwrap();
+    let mut steps = Vec::new();
+    for frame in [
+        json!({"type":"assistant","uuid":"child-call","parent_tool_use_id":"toolu_agent","message":{"id":"msg-child-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_child_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+        json!({"type":"user","uuid":"child-result","parent_tool_use_id":"toolu_agent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_child_skill","content":"Launching skill: release-notes"}]},"tool_use_result":{"success":true,"commandName":"release-notes"}}),
+        json!({"type":"user","uuid":"child-instructions","parent_tool_use_id":"toolu_agent","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+    ] {
+        steps.push(adapter.receive(frame).unwrap());
+    }
+    let events = steps.iter().flat_map(|step| &step.events);
+    assert!(
+        !events
+            .clone()
+            .any(|event| matches!(event, Event::Item(item) if item.id == "toolu_child_skill")),
+        "{steps:?}"
+    );
+    let last = events
+        .filter_map(|event| match event {
+            Event::SubagentItem { id, item } if item.id == "toolu_child_skill" => Some((id, item)),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(last.0, "toolu_agent");
+    assert!(
+        matches!(&last.1.content, ItemContent::Tool { name, output, .. } if name == "Skill" && output == SKILL_BODY),
+        "{last:?}"
+    );
+}
+
+/// Live, instructions name no call, so each goes to the skill that just
+/// launched by its directory: the same skill loaded twice at once, a
+/// plugin's namespaced skill, and the one skill loading when its name is
+/// not its directory's.
+#[test]
+fn live_instructions_reach_the_skill_that_launched_them() {
+    let body = |directory: &str, arguments: &str| {
+        format!(
+            "Base directory for this skill: /skills/{directory}\n\n# Notes\n\nARGUMENTS: {arguments}"
+        )
+    };
+    let call = |id: &str, skill: &str| json!({"type":"tool_use","id":id,"name":"Skill","input":{"skill":skill}});
+    let result = |id: &str| json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"Launching skill"}]}});
+    let instructions = |text: String| json!({"type":"user","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":text}]}});
+    let outputs = |frames: &[Value]| {
+        let frames = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let mut frame = frame.clone();
+                frame["uuid"] = json!(format!("frame-{index}"));
+                frame
+            })
+            .collect::<Vec<_>>();
+        settled_live(&frames)
+            .into_iter()
+            .filter_map(|item| match item.content {
+                ItemContent::Tool { output, .. } => Some((item.id, output)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        outputs(&[
+            json!({"type":"assistant","message":{"id":"msg-calls","role":"assistant","content":[call("first", "release-notes"), call("second", "release-notes")]}}),
+            result("first"),
+            instructions(body("release-notes", "one")),
+            result("second"),
+            instructions(body("release-notes", "two")),
+        ]),
+        [
+            ("first".to_owned(), body("release-notes", "one")),
+            ("second".to_owned(), body("release-notes", "two")),
+        ]
+    );
+    assert_eq!(
+        outputs(&[
+            json!({"type":"assistant","message":{"id":"msg-call","role":"assistant","content":[call("plugin", "docs:release-notes")]}}),
+            result("plugin"),
+            instructions(body("release-notes", "one")),
+        ]),
+        [("plugin".to_owned(), body("release-notes", "one"))]
+    );
+    assert_eq!(
+        outputs(&[
+            json!({"type":"assistant","message":{"id":"msg-call","role":"assistant","content":[call("renamed", "Release Notes")]}}),
+            result("renamed"),
+            instructions(body("release-notes", "one")),
+        ]),
+        [("renamed".to_owned(), body("release-notes", "one"))]
+    );
+}
+
+/// A skill that failed to launch keeps its error, even when instructions of
+/// the same name arrive later without a call of their own.
+/// A skill call Claude retracted before it loaded leaves no claim on the
+/// instructions a later skill loads, even one whose name is not its
+/// directory's.
+#[test]
+fn a_retracted_skill_call_never_takes_later_instructions() {
+    let mut adapter = Claude::default();
+    adapter
+        .receive(json!({"type":"assistant","uuid":"call-a","message":{"id":"msg-a","role":"assistant","content":[{"type":"tool_use","id":"toolu_a","name":"Skill","input":{"skill":"draft-notes"}}]}}))
+        .unwrap();
+    adapter
+        .receive(json!({"type":"assistant","uuid":"call-b","supersedes":["call-a"],"message":{"id":"msg-b","role":"assistant","content":[{"type":"tool_use","id":"toolu_b","name":"Skill","input":{"skill":"notes"}}]}}))
+        .unwrap();
+    assert!(
+        adapter
+            .skill_loads
+            .iter()
+            .all(|(call, _)| call.id != "toolu_a")
+    );
+    adapter
+        .receive(json!({"type":"user","uuid":"result-b","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_b","content":"Launching skill: notes"}]},"tool_use_result":{"success":true,"commandName":"notes"}}))
+        .unwrap();
+    let step = adapter
+        .receive(json!({"type":"user","uuid":"instructions","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}))
+        .unwrap();
+    assert!(
+        matches!(&step.events[..], [Event::Item(item)] if item.id == "toolu_b"
+            && matches!(&item.content, ItemContent::Tool { output, .. } if output == SKILL_BODY)),
+        "{step:?}"
+    );
+}
+
+/// A reopened chat replays a helper's own transcript, where its skill's
+/// instructions are its step's output, as they were live.
+#[test]
+fn a_helpers_saved_skill_instructions_are_its_steps_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = "00000000-0000-4000-8000-000000000001";
+    let records = [
+        json!({"type":"user","uuid":"prompt","parentUuid":null,"sessionId":session,"message":{"role":"user","content":"Write release notes."}}),
+        json!({"type":"assistant","uuid":"agent","parentUuid":"prompt","sessionId":session,"message":{"id":"msg-agent","role":"assistant","content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{"description":"Notes","prompt":"Write release notes.","subagent_type":"general-purpose"}}]}}),
+        json!({"type":"user","uuid":"agent-result","parentUuid":"agent","sessionId":session,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call","content":"Done."}]}}),
+    ];
+    let root = directory.path().join("root.jsonl");
+    std::fs::write(
+        &root,
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut history = History::index(File::open(root).unwrap(), session).unwrap();
+    let children = directory.path().join("subagents");
+    std::fs::create_dir(&children).unwrap();
+    history.subagent_dir = Some(children.clone());
+    std::fs::write(
+        children.join("agent-one.meta.json"),
+        json!({"toolUseId":"agent-call","agentType":"general-purpose","description":"Notes"})
+            .to_string(),
+    )
+    .unwrap();
+    let child = |uuid: &str, frame: Value| {
+        let mut frame = frame;
+        frame["uuid"] = json!(uuid);
+        frame["sessionId"] = json!(session);
+        frame["agentId"] = json!("one");
+        frame["isSidechain"] = json!(true);
+        format!("{frame}\n")
+    };
+    std::fs::write(
+        children.join("agent-one.jsonl"),
+        [
+            child("child-call", json!({"type":"assistant","message":{"id":"child-message","role":"assistant","content":[{"type":"tool_use","id":"child-skill","name":"Skill","input":{"skill":"release-notes"}}]}})),
+            child("child-result", json!({"type":"user","toolUseResult":{"success":true,"commandName":"release-notes"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"child-skill","content":"Launching skill: release-notes"}]}})),
+            child("child-instructions", json!({"type":"user","isMeta":true,"sourceToolUseID":"child-skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}})),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let mut adapter = Claude {
+        history: Some(history),
+        ..Claude::default()
+    };
+    let replayed = adapter.initialize().unwrap();
+    let events = format!("{:?}", replayed.events);
+    let shown = replayed
+        .events
+        .iter()
+        .flat_map(|event| match event {
+            Event::History { items, .. } => items.iter().collect::<Vec<_>>(),
+            Event::Item(item) => vec![item],
+            _ => Vec::new(),
+        })
+        .chain(replayed.events.iter().filter_map(|event| match event {
+            Event::SubagentItem { id, item } if id == "agent-call" => Some(item),
+            _ => None,
+        }))
+        .rfind(|item| item.id == "child-skill")
+        .unwrap_or_else(|| panic!("{events}"));
+    assert!(
+        matches!(&shown.content, ItemContent::Tool { name, output, .. } if name == "Skill" && output == SKILL_BODY),
+        "{shown:?}"
+    );
+}
+
+/// Saved instructions whose call is on no branch they share, such as one
+/// Claude retracted, load into no call, even one reusing that call's ID.
+#[test]
+fn saved_instructions_without_their_call_load_nowhere() {
+    let mut adapter = Claude::default();
+    let mut step = Step::default();
+    adapter
+        .history_message(
+            &HistoryRecord {
+                frame: json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+                tool_calls: HashMap::new(),
+                gap: None,
+            },
+            &mut step,
+        )
+        .unwrap();
+    let mut loaded = Step::default();
+    adapter
+        .history_message(
+            &HistoryRecord {
+                frame: json!({"type":"user","uuid":"instructions","isMeta":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+                tool_calls: HashMap::new(),
+                gap: None,
+            },
+            &mut loaded,
+        )
+        .unwrap();
+    assert!(loaded.events.is_empty(), "{loaded:?}");
+    assert!(
+        matches!(&adapter.tools[&ScopedId::new(None, "toolu_skill")].content, ItemContent::Tool { output, .. } if output.is_empty())
+    );
+}
+
+#[test]
+fn a_failed_skill_call_never_takes_later_instructions() {
+    let live = settled_live(&[
+        json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
+        json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_skill","is_error":true,"content":"Unknown skill: release-notes"}]}}),
+        json!({"type":"user","uuid":"instructions","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+    ]);
+    assert!(
+        matches!(&live[..], [Item { content: ItemContent::Tool { name, output, status: ToolStatus::Failed, .. }, .. }]
+        if name == "Skill" && output.contains("Unknown skill")),
+        "{live:?}"
+    );
+}
+
+/// A skill the reader runs as a command is shown by the prompt they typed.
+/// Claude Code saves its instructions but never streams them, so the
+/// reopened chat must not add a step the live one lacked.
+#[test]
+fn a_typed_skill_command_shows_only_its_prompt_live_and_in_history() {
+    let command = "<command-message>release-notes</command-message>\n<command-name>/release-notes</command-name>\n<command-args>a typo fix</command-args>";
+    let answer = json!({"type":"assistant","uuid":"answer","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Fixed a typo."}]}});
+    let live = settled_live(&[
+        json!({"type":"user","uuid":"prompt","isReplay":true,"message":{"role":"user","content":command}}),
+        answer.clone(),
+    ]);
+    let history = settled_history(vec![
+        json!({"type":"user","uuid":"prompt","message":{"role":"user","content":command}}),
+        json!({"type":"user","uuid":"instructions","isMeta":true,"turnCompanion":true,"message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
+        answer,
+    ]);
+    assert_eq!(live, history);
+    assert!(matches!(&live[..], [
+        Item { role: Role::User, content: ItemContent::Text { text, .. }, .. },
+        Item { role: Role::Assistant, .. },
+    ] if text == "/release-notes a typo fix"));
+}
+
+/// Claude Code's note on how it scaled a picture a tool returned.
+const SCALED: &str = "[Image: original 2600x1800, displayed at 2306x1596. Multiply coordinates by 1.13 to map to original image.]";
+
+/// Everything else Claude Code puts in front of the model is read by what it
+/// says. Notes for the model alone leave no row, live or reopened. What a
+/// hook said back streams as it is saved, so both show it as the same compact
+/// step, whose output is the text. Other context it streams is a step live;
+/// what it saves as meta is not, since most of that never streams (see
+/// `saved_meta_claude_code_never_streams_stays_hidden`).
+#[test]
+fn injected_context_is_classified_by_what_it_says() {
+    let hidden = [
+        json!(SCALED),
+        json!(format!("{SCALED}\n{SCALED}")),
+        json!([{"type":"text","text":"[Image: source: /var/tmp/claude/images/1.png]"}]),
+        json!("[Image: source: /var/tmp/claude/images/mock[dark].png]"),
+        json!(
+            "<system-reminder>\nThe session's working directory has changed.\n</system-reminder>"
+        ),
+        json!("<system-reminder>a</system-reminder>\n<system-reminder>b</system-reminder>"),
+        json!(
+            "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>"
+        ),
+        json!(
+            "(Re-invocation of /release-notes — the skill instructions were previously loaded; the arguments or dynamic output below are new.)"
+        ),
+    ];
+    let hooks = [
+        json!("Stop hook feedback:\n[goal]: The goal is not met."),
+        json!([{"type":"text","text":"SubagentStop hook feedback:\nKeep going."}]),
+    ];
+    let live_only = [
+        json!("<system-reminder>a</system-reminder> and a request"),
+        json!("[Image: a diagram the reader described]"),
+        json!("Base directory for nothing in particular"),
+        json!("A reminder about Stop hook feedback: none"),
+        // A note is withheld only whole: what follows it still shows, even
+        // when it ends in a bracket of its own.
+        json!(format!("{SCALED}\nAlso read README [required]")),
+        json!([{"type":"text","text":format!("{SCALED} Also read README [required]")}]),
+        json!("[Image: source: /var/tmp/claude/images/1.png] Also read README [required]"),
+    ];
+    let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
+    let step = |items: &[Item], name: &str, text: &str| {
+        matches!(items, [Item { id, role: Role::Assistant, content: ItemContent::Tool { name: shown, input, output, status: ToolStatus::Succeeded }, .. }]
+            if id == "context:0" && shown == name && input.is_empty() && output == text)
+    };
+    for content in hidden.iter().chain(&hooks).chain(&live_only) {
+        let text = message_text(content).unwrap();
+        let live = settled_live(&[
+            prompt.clone(),
+            json!({"type":"user","uuid":"context","isSynthetic":true,"message":{"role":"user","content":content}}),
+        ]);
+        let history = settled_history(vec![
+            prompt.clone(),
+            json!({"type":"user","uuid":"context","isMeta":true,"message":{"role":"user","content":content}}),
+        ]);
+        if hooks.contains(content) {
+            assert!(step(&live[1..], "Hook context", &text), "{live:?}");
+            assert_eq!(live, history, "{text}");
+        } else if live_only.contains(content) {
+            assert!(step(&live[1..], CONTEXT_STEP, &text), "{live:?}");
+            assert_eq!(history.len(), 1, "{text}: {history:?}");
+        } else {
+            assert_eq!(live.len(), 1, "{text}: {live:?}");
+            assert_eq!(live, history, "{text}");
+        }
+    }
+}
+
+/// A reopened chat shows only the steps the live one did. These are records
+/// Claude Code 2.1.325 saves as meta, shaped as saved, which it never streams
+/// to `--output-format stream-json`: a goal's setup note and a scheduled
+/// wakeup's prompt were observed absent from the wire, and the goal check-in
+/// about background work and the prompts resuming a stopped or cut-off
+/// response were never seen there.
+#[test]
+fn saved_meta_claude_code_never_streams_stays_hidden() {
+    let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
+    let answer = json!({"type":"assistant","uuid":"answer","parentUuid":"saved","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Done."}]}});
+    for record in [
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":"A session-scoped Stop hook is now active with condition: \"the tests pass\". Briefly acknowledge the goal, then immediately start (or continue) working toward it."}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":"Goal check-in: «the tests pass» is not met yet, and background work is still running:\n- b1 · shell · cargo test\nCheck on their progress (e.g. read their output)."}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"promptSource":"system","turnOrigin":"scheduled","message":{"role":"user","content":[{"type":"text","text":"Continue from where you left off."}]}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"turnCompanion":true,"refusedMessageId":"msg-refused","message":{"role":"user","content":"Your response above was stopped by a safety classifier — this is not a tool or API error."}}),
+        json!({"type":"user","uuid":"saved","parentUuid":"prompt","isMeta":true,"turnCompanion":true,"message":{"role":"user","content":"Your response above was cut off mid-stream. Resume directly from where it stops — no apology, no recap."}}),
+    ] {
+        let history = settled_history(vec![prompt.clone(), record.clone(), answer.clone()]);
+        assert_eq!(
+            history
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["prompt:0", "msg-answer:0"],
+            "{record}: {history:?}"
+        );
+    }
 }
 
 #[test]
@@ -4482,6 +5021,79 @@ fn synthetic_context_peer_delivery_and_assistant_text_remain_visible() {
     assert!(
         matches!(&deliveries(&answer)[..], [(Role::Assistant, ItemContent::Text { text, .. })] if text == "Skill findings")
     );
+}
+
+/// A reopened chat does not add what the live one never showed: a task's
+/// notification Claude Code saved as meta, which is shown as that task's
+/// notice, and what a command the reader typed expanded into.
+#[test]
+fn saved_meta_notifications_and_command_expansions_stay_hidden() {
+    let prompt = json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Go"}});
+    let notification = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>";
+    for record in [
+        json!({"type":"user","uuid":"notice","parentUuid":"prompt","isMeta":true,"origin":{"kind":"task-notification"},"message":{"role":"user","content":notification}}),
+        json!({"type":"user","uuid":"notice","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":notification}}),
+        json!({"type":"user","uuid":"notice","parentUuid":"prompt","isMeta":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"Check in."}}),
+    ] {
+        let shown = settled_history(vec![prompt.clone(), record.clone()]);
+        assert!(
+            !shown
+                .iter()
+                .any(|item| matches!(&item.content, ItemContent::Tool { .. })),
+            "{record}: {shown:?}"
+        );
+    }
+    // A command whose expansion names no skill directory, as a project's
+    // own commands and Claude Code's built-in prompts do.
+    let command = "<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>the diff</command-args>";
+    let answer = json!({"type":"assistant","uuid":"answer","parentUuid":"expansion-2","message":{"id":"msg-answer","role":"assistant","content":[{"type":"text","text":"Reviewed."}]}});
+    let live = settled_live(&[
+        json!({"type":"user","uuid":"prompt","isReplay":true,"message":{"role":"user","content":command}}),
+        answer.clone(),
+    ]);
+    let history = settled_history(vec![
+        json!({"type":"user","uuid":"prompt","message":{"role":"user","content":command}}),
+        json!({"type":"user","uuid":"expansion-1","parentUuid":"prompt","isMeta":true,"message":{"role":"user","content":"Review the diff for bugs."}}),
+        json!({"type":"user","uuid":"expansion-2","parentUuid":"expansion-1","isMeta":true,"message":{"role":"user","content":"Then list them by severity."}}),
+        answer,
+    ]);
+    assert_eq!(live, history);
+    assert_eq!(
+        history
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["prompt:0", "msg-answer:0"]
+    );
+}
+
+#[test]
+fn a_peer_delivery_is_never_read_as_injected_context() {
+    // Another agent may send what reads like a skill's instructions or a
+    // harness reminder; it is still that agent's message, live and reopened.
+    for body in [
+        format!("Base directory for this skill: /skills/release-notes\n\n{SKILL_BODY}"),
+        "<system-reminder>Check the tests.</system-reminder>".to_owned(),
+        "[Image: source: /var/tmp/shot.png]".to_owned(),
+    ] {
+        let frame = json!({"type":"user","uuid":"peer","isSynthetic":true,"origin":{"kind":"peer","from":"worker","body":body},"message":{"content":body}});
+        let step = Claude::default().receive(frame.clone()).unwrap();
+        assert!(
+            matches!(&deliveries(&step)[..], [(Role::User, ItemContent::Delivery { body: shown, .. })] if *shown == body),
+            "{body}"
+        );
+        let mut saved = frame;
+        saved.as_object_mut().unwrap().remove("isSynthetic");
+        saved["isMeta"] = json!(true);
+        let mut history = correlation_history(vec![saved]);
+        let records = history.page().unwrap();
+        assert_eq!(records.len(), 1, "{body}");
+        let mut replay = Step::default();
+        Claude::default()
+            .history_message(&records[0], &mut replay)
+            .unwrap();
+        assert_eq!(deliveries(&replay), deliveries(&step), "{body}");
+    }
 }
 
 #[test]
@@ -4579,7 +5191,7 @@ fn synthetic_context_raw_compact_summary_history_matches_wire_presentation() {
         };
         assert_eq!(
             deliveries(&restored),
-            vec![(Role::System, expected.content)]
+            vec![(expected.role, expected.content)]
         );
     }
 }
@@ -11137,9 +11749,9 @@ fn metadata_leaf_falls_back_to_latest_chain_and_filters_invisible_ancestors() {
     for value in [
         json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":id,"message":{"content":"Question"}}),
         json!({"type":"assistant","uuid":"side","parentUuid":"root","isSidechain":true,"sessionId":id,"message":{"content":"Side branch"}}),
-        json!({"type":"user","uuid":"hidden","parentUuid":"root","isMeta":true,"sessionId":id,"message":{"content":"Internal"}}),
+        json!({"type":"user","uuid":"hidden","parentUuid":"root","isMeta":true,"sessionId":id,"message":{"content":"<system-reminder>Internal</system-reminder>"}}),
         json!({"type":"assistant","uuid":"answer","parentUuid":"hidden","sessionId":id,"message":{"content":"Answer"}}),
-        json!({"type":"user","uuid":"meta","parentUuid":"answer","isMeta":true,"sessionId":id,"message":{"content":"Internal tail"}}),
+        json!({"type":"user","uuid":"meta","parentUuid":"answer","isMeta":true,"sessionId":id,"message":{"content":"[Image: source: /tmp/internal-tail.png]"}}),
         json!({"type":"progress","uuid":"progress","parentUuid":"meta","sessionId":id}),
     ] {
         writeln!(file, "{value}").unwrap();
@@ -11298,7 +11910,6 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
         Some(snapshot.detail.as_str())
     );
     assert!(!handle.owns_work());
-    assert_eq!(snapshot.items.len(), 100);
     assert!(snapshot.has_earlier);
     assert!(
         handle
@@ -11334,11 +11945,19 @@ fn deleted_working_directory_keeps_exact_history_readable_without_a_provider() {
         assert!(indices.iter().copied().eq(run.clone()), "{indices:?}");
         run
     };
-    assert_eq!(prompts(&snapshot), 120..220, "the newest history first");
+    // A saved page is 100 records, fewer than the window's 128 items, so the
+    // window fills itself from the next page before the reader asks.
+    let snapshot = crate::test_timing::wait_for("the window to fill from saved pages", || {
+        handle
+            .snapshot(None)
+            .filter(|snapshot| snapshot.items.len() == 128)
+    });
+    assert_eq!(prompts(&snapshot), 92..220, "the newest history first");
+    assert!(snapshot.has_earlier);
     // Each earlier page slides the window back by half of it, so the
     // history is read a window at a time until its start, and every prompt
     // is shown on the way.
-    let mut seen = std::collections::BTreeSet::from_iter(120..220);
+    let mut seen = std::collections::BTreeSet::from_iter(92..220);
     let mut snapshot = snapshot;
     let mut pages = 0;
     while snapshot.has_earlier {
@@ -12399,7 +13018,7 @@ fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
     assert_eq!(
         deliveries(&later),
         vec![(
-            Role::System,
+            Role::Assistant,
             context_item("later:0".into(), body.into()).content
         )]
     );
@@ -12414,7 +13033,7 @@ fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
     assert_eq!(
         deliveries(&later),
         vec![(
-            Role::System,
+            Role::Assistant,
             context_item("after-agent:0".into(), body.into()).content
         )]
     );
@@ -13913,4 +14532,210 @@ fn an_acknowledged_stop_ends_its_turn_stopped_though_it_succeeded() {
             .events,
     );
     assert_stopped_turn(&events, "an acknowledged stop of a turn that succeeded");
+}
+
+/// Claude Code's own stream for two Reads of large PNGs, recorded from the
+/// real provider: each image comes back in its tool result, followed by a
+/// synthetic note on how Claude scaled it for the model.
+#[test]
+fn read_images_are_named_for_their_files_and_their_scaling_notes_are_not_shown() {
+    let mut adapter = Claude::default();
+    let mut shown = Vec::new();
+    for line in include_str!("../../../../tests/fixtures/claude-read-images-live.jsonl").lines() {
+        let step = adapter
+            .receive(serde_json::from_str(line).unwrap())
+            .unwrap();
+        for event in step.events {
+            if let Event::Item(item) = event {
+                shown.retain(|(id, _): &(String, ItemContent)| *id != item.id);
+                shown.push((item.id, item.content));
+            }
+        }
+    }
+    assert!(
+        !shown.iter().any(|(_, content)| matches!(
+            content,
+            ItemContent::Tool { name, .. } if name == CONTEXT_STEP
+        ) || matches!(content, ItemContent::Delivery { .. })),
+        "the scaling notes are the Reads' own, not context rows: {shown:?}"
+    );
+    let images = shown
+        .iter()
+        .filter_map(|(id, content)| match content {
+            ItemContent::Image {
+                path, description, ..
+            } => Some((
+                id.as_str(),
+                description.as_str(),
+                path.starts_with("data:image/png;base64,"),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        images,
+        vec![
+            (
+                "toolu_012NGrjPMVQA8G3HDzif6xrL:image:0",
+                "big-red.png",
+                true
+            ),
+            (
+                "toolu_019xArHb7CgX2tuV8vGFNnpC:image:0",
+                "big-blue.png",
+                true
+            ),
+        ]
+    );
+    let reads = shown
+        .iter()
+        .filter(|(_, content)| {
+            matches!(
+                content,
+                ItemContent::Command {
+                    action: CommandAction::Read,
+                    status: ToolStatus::Succeeded,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(reads, 2);
+}
+
+/// Only a Read names the image it returned. Any other image Claude Code sends
+/// carries no boilerplate description, so the transcript and text copies fall
+/// back to what they know of it.
+#[test]
+fn an_image_no_read_returned_has_no_description() {
+    let mut adapter = Claude::default();
+    let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}});
+    let frames = [
+        json!({"type":"assistant","uuid":"sent","message":{"id":"msg-sent","role":"assistant","content":[image.clone()]}}),
+        json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_shot","name":"Bash","input":{"command":"grim shot.png"}}]}}),
+        json!({"type":"user","uuid":"result","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_shot","content":[image]}]}}),
+    ];
+    let images = frames
+        .into_iter()
+        .flat_map(|frame| adapter.receive(frame).unwrap().events)
+        .filter_map(|event| match event {
+            Event::Item(Item {
+                id,
+                content: ItemContent::Image { description, .. },
+                ..
+            }) => Some((id, description)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        images,
+        [
+            ("msg-sent:0".to_owned(), String::new()),
+            ("toolu_shot:image:0".to_owned(), String::new()),
+        ]
+    );
+}
+
+/// Claude reports idle after a stopped turn's result. A reader who sees the
+/// conversation after that frame must still find the turn stopped.
+#[test]
+fn a_stopped_turn_stays_interrupted_once_claude_goes_idle() {
+    let mut adapter = stopped_and_settled();
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, chat::TURN_INTERRUPTED)));
+}
+
+/// The stopped outcome belongs to that turn only: the next one goes idle as
+/// any finished turn does.
+#[test]
+fn the_turn_after_a_stopped_one_goes_idle_as_usual() {
+    let mut adapter = stopped_and_settled();
+    adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
+        .unwrap();
+    // Starting the next turn forgets the stop, before any result arrives.
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, "Claude is idle")));
+    adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"running"}))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"next","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, "Claude turn complete")));
+}
+
+/// A stopped turn that leaves a decision open ends once it is answered. That
+/// answer and the idle frame after it must not turn the stop into a finish.
+#[test]
+fn a_stopped_turn_stays_interrupted_once_its_last_decision_is_answered() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    adapter
+        .receive(approval("background-1", "Bash", json!({"command":"true"})))
+        .unwrap();
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(
+        last_status(&settled),
+        Some((true, "Claude turn ended; decisions remain"))
+    );
+    let answered = adapter
+        .command(Command::Answer {
+            request_id: "background-1".into(),
+            action: "deny".into(),
+            answers: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        last_status(&answered),
+        Some((false, chat::TURN_INTERRUPTED))
+    );
+    let idle = adapter
+        .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+        .unwrap();
+    assert_eq!(last_status(&idle), Some((false, chat::TURN_INTERRUPTED)));
+}
+
+/// An adapter whose turn the reader stopped, acknowledged and settled.
+fn stopped_and_settled() -> Claude {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({"still_queued":[]}),
+        ))
+        .unwrap();
+    let settled = adapter
+        .receive(json!({"type":"result","uuid":"done","subtype":"success","is_error":false}))
+        .unwrap();
+    assert_eq!(last_status(&settled), Some((false, chat::TURN_INTERRUPTED)));
+    adapter
+}
+
+fn last_status(step: &Step) -> Option<(bool, &str)> {
+    step.events.iter().rev().find_map(|event| match event {
+        Event::Status { busy, detail } => Some((*busy, detail.as_str())),
+        _ => None,
+    })
 }

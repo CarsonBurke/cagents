@@ -37,6 +37,12 @@ const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
+#[cfg(all(test, feature = "host"))]
+thread_local! {
+    static FAIL_NEXT_WRITE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// How long the daemon keeps asking for a held account-list lock before it
 /// refuses with [`ListHeld`]. The locks are held for the moment it takes to
 /// write the list or start a process, and the person who asked is waiting
@@ -1354,7 +1360,7 @@ impl Store {
                         "Another account in the list already uses this account's key",
                     ));
                 }
-                if registry.is_released(key) {
+                if homes.is_released(provider, key) || registry.is_released(key) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "This home is from a sign-in that was not kept, so it is not restored",
@@ -1380,6 +1386,11 @@ impl Store {
 
     fn path(&self) -> PathBuf {
         self.directory.join(FILE_NAME)
+    }
+
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fail_next_write_for_test(&self) {
+        FAIL_NEXT_WRITE.with(|path| *path.borrow_mut() = Some(self.path()));
     }
 
     pub(crate) fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
@@ -1418,7 +1429,19 @@ impl Store {
         reservation: &crate::host::AccountReservation,
         change: impl FnOnce(&mut Registry) -> T,
     ) -> io::Result<(Registry, T)> {
-        self.update_checked_with_mode(
+        self.try_update_reserved_then(reservation, change, |_| {})
+    }
+
+    /// Runs `after_write` with the saved registry while its lock is still
+    /// held, after a successful write or when `change` left it unchanged.
+    #[cfg(feature = "host")]
+    pub(crate) fn try_update_reserved_then<T>(
+        &self,
+        reservation: &crate::host::AccountReservation,
+        change: impl FnOnce(&mut Registry) -> T,
+        after_write: impl FnOnce(&Registry),
+    ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode_then(
             |registry| {
                 reservation
                     .verify_registry(registry)
@@ -1426,6 +1449,7 @@ impl Store {
                 Ok(change(registry))
             },
             true,
+            after_write,
         )
     }
 
@@ -1456,6 +1480,15 @@ impl Store {
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
         nonblocking: bool,
     ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_mode_then(change, nonblocking, |_| {})
+    }
+
+    fn update_checked_with_mode_then<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> io::Result<T>,
+        nonblocking: bool,
+        after_write: impl FnOnce(&Registry),
+    ) -> io::Result<(Registry, T)> {
         let _lock = if nonblocking {
             self.try_lock()?
         } else {
@@ -1479,6 +1512,7 @@ impl Store {
                 .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
             registry.written = write(&self.directory, &path, &registry)?;
         }
+        after_write(&registry);
         Ok((registry, result))
     }
 
@@ -1513,6 +1547,21 @@ fn read(path: &Path) -> io::Result<Registry> {
 
 /// Replaces the file at `path` with `registry`, and says when it was written.
 fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<Written> {
+    #[cfg(all(test, feature = "host"))]
+    if FAIL_NEXT_WRITE.with(|next| {
+        let mut next = next.borrow_mut();
+        if next.as_deref() == Some(path) {
+            next.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test account registry write failure",
+        ));
+    }
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
     if !document.ends_with('\n') {
         document.push('\n');
@@ -1891,7 +1940,11 @@ mod tests {
         assert!(reloaded.is_default(&default));
         assert!(!reloaded.is_default(&Account::system(Provider::Claude)));
         assert!(reloaded.is_default(&Account::system(Provider::Codex)));
-        assert_eq!(reloaded.accounts(Some(&homes)).len(), 3);
+        // The system accounts and the one registered here.
+        assert_eq!(
+            reloaded.accounts(Some(&homes)).len(),
+            Account::system_accounts().len() + 1
+        );
     }
 
     #[test]
@@ -2637,6 +2690,78 @@ mod tests {
             .update(|registry| registry.release(gone, &homes))
             .unwrap();
         assert!(!registry.is_released(copy) && registry.is_released(gone));
+    }
+
+    #[test]
+    fn a_released_home_is_not_offered_for_restore_after_the_list_is_lost() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, home) = homes.create(provider, None).unwrap();
+        homes.mark_released(provider, key).unwrap();
+
+        let registry = Registry::default();
+        assert!(!registry.is_released(key));
+        assert!(
+            homes
+                .unregistered(&registry)
+                .iter()
+                .all(|(_, found, _)| *found != key)
+        );
+        let error = store
+            .restore_home(&homes, restorable(key, "plan2@example.com"), &[])
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(home.is_dir() && homes.is_released(provider, key));
+        assert!(store.load().unwrap().find(key).is_none());
+    }
+
+    #[test]
+    fn marking_a_home_released_is_idempotent_and_ignores_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, home) = homes.create(provider, None).unwrap();
+        homes.mark_released(provider, key).unwrap();
+        homes.mark_released(provider, key).unwrap();
+        assert!(homes.is_released(provider, key));
+        let marker = home.with_file_name(format!(".released-{}", key.hyphenated()));
+        let metadata = fs::symlink_metadata(&marker).unwrap();
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        let (linked, linked_home) = homes.create(provider, None).unwrap();
+        let link = linked_home.with_file_name(format!(".released-{}", linked.hyphenated()));
+        symlink(&marker, &link).unwrap();
+        assert!(!homes.is_released(provider, linked));
+        assert!(homes.mark_released(provider, linked).is_err());
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn an_unmarked_home_is_still_restorable_from_a_lost_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, _) = homes.create(provider, None).unwrap();
+        let registry = Registry::default();
+        assert_eq!(
+            homes
+                .unregistered(&registry)
+                .into_iter()
+                .map(|(provider, key, _)| (provider, key))
+                .collect::<Vec<_>>(),
+            [(provider, key)]
+        );
+        let (registry, restored) = store
+            .restore_home(&homes, restorable(key, "plan2@example.com"), &[])
+            .unwrap();
+        assert_eq!(restored, Restored::Listed);
+        assert!(registry.find(key).is_some());
     }
 
     #[test]

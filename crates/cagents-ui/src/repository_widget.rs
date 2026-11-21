@@ -2524,10 +2524,14 @@ pub struct RepositoryInspectorContext {
 
 impl RepositoryRuntime {
     fn protect_editor_worktree(&mut self, directory: &Path) -> std::io::Result<()> {
+        // Compared as named, so a directory reached through a link is not
+        // resolved and leased again on every refresh. If the link is
+        // retargeted meanwhile, the lease stays on the original directory,
+        // and the pane's retained read root refuses the replacement anyway.
         if self
             .worktree_protection
             .as_ref()
-            .is_some_and(|guard| guard.directory() == directory)
+            .is_some_and(|guard| guard.requested() == directory)
         {
             return Ok(());
         }
@@ -9073,9 +9077,13 @@ pub(crate) fn load_directory_listing(
     relative: &Path,
 ) -> Result<Vec<RepositoryFile>, String> {
     use std::os::fd::AsRawFd;
-    let handle_root = crate::fs_safety::Root::open(root).map_err(|error| error.to_string())?;
+    // The folder may itself be the user's link, such as `~/.gemini` into a
+    // dotfiles checkout. List the directory it names, as opening it would;
+    // links among its entries are still listed rather than followed.
+    let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let handle_root = crate::fs_safety::Root::open(&root).map_err(|error| error.to_string())?;
     let handle = if relative.as_os_str().is_empty() {
-        std::fs::File::open(root).map_err(|error| error.to_string())?
+        std::fs::File::open(&root).map_err(|error| error.to_string())?
     } else {
         crate::fs_safety::open_beneath(&handle_root, relative).map_err(|error| error.to_string())?
     };
@@ -11475,6 +11483,10 @@ impl<'a> DiffReviewContext<'a> {
 
     fn line_action(self, old: Option<u32>, new: Option<u32>) -> Option<RepositoryAction> {
         use crate::github::ReviewDiffSide;
+        // A cached review read offline is read-only until GitHub verifies it.
+        if !self.review.has_discussion_authority() {
+            return None;
+        }
         let (side, line) = if let Some(line) = new {
             (ReviewDiffSide::Right, line)
         } else {

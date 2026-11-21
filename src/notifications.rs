@@ -84,7 +84,7 @@ impl Kind {
         match self {
             Self::Succeeded => "Agent finished",
             Self::Failed => "Agent failed",
-            Self::Cancelled => "Agent cancelled",
+            Self::Cancelled => "Agent stopped",
             Self::Waiting => "Agent needs your attention",
             Self::ReviewRequested => "Your review was requested",
             Self::Interrupted => "Agent outcome unknown",

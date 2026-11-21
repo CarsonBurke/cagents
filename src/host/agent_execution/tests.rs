@@ -165,10 +165,13 @@ printf 'spawn\n' >> "$HOME/../spawns"
 printf '%s\n' "$@" > "$HOME/../claude-arguments"
 n=0
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+# Confirms the mode it was launched in, as Claude's initialize reply does.
+confirmed='{}'
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --session-id|--resume) shift; session=$1 ;;
     --session-id=*|--resume=*) session=${1#*=} ;;
+    --permission-mode) shift; confirmed="{\"current_permission_mode\":\"$1\"}" ;;
   esac
   shift
 done
@@ -177,7 +180,7 @@ while IFS= read -r frame; do
     *'"type":"control_request"'*)
       id=${frame#*'"request_id":"'}
       id=${id%%'"'*}
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed"
       ;;
     *'"type":"control_response"'*)
       # The answer to a permission request raised below finishes its turn;
@@ -532,6 +535,7 @@ fn blocking_owning_close_preserves_a_replacement_installed_during_provider_join(
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         transport: TransportSpec::JsonLines,
@@ -982,13 +986,13 @@ fn automatic_cleanup_is_exact_run_fenced_and_confirms_provider_retirement() {
     // admission: pending transport must still refuse an idle close.
     let provider = path.parent().unwrap().join("bin/claude");
     let script = std::fs::read_to_string(&provider).unwrap();
-    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed""#;
     let refreshed = r#"      case "$frame" in
         *'"subtype":"get_context_usage"'*)
           printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":424242,"maxTokens":1000000}}}\n' "$id"
           ;;
         *)
-          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+          printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed"
           ;;
       esac"#;
     assert_eq!(script.matches(original).count(), 1);
@@ -1143,13 +1147,13 @@ done
 fn hold_provider_initialization(root: &Path) {
     let provider = root.join("bin/claude");
     let script = std::fs::read_to_string(&provider).unwrap();
-    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+    let original = r#"      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed""#;
     let held = r#"      case "$frame" in
         *'"subtype":"initialize"'*)
           while [ ! -e "$HOME/../initialize-release" ]; do sleep 0.01; done
           ;;
       esac
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id""#;
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed""#;
     assert_eq!(script.matches(original).count(), 1);
     std::fs::write(&provider, script.replace(original, held)).unwrap();
 }
@@ -2148,6 +2152,7 @@ fn retained_old_alias_preflights_current_agent_before_real_holder_release() {
     ))));
     let process = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: Some(context.clone()),
         messages: None,
         transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -3955,6 +3960,301 @@ fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
     }
 }
 
+/// The live session an agent runs in, with the authority it was issued.
+fn agent_authority(host: &SharedHost, agent: AgentId) -> Authority {
+    let registry = registry(host).unwrap();
+    let mut registry = registry.lock().unwrap();
+    let session = registry.agent(agent).unwrap().session.unwrap();
+    registry.register_agent_authority(&session).unwrap()
+}
+
+/// An agent never starts a child with more permission than its own, and
+/// never approves its child's tool requests unless nothing asks it either.
+#[test]
+fn an_agent_gives_its_children_no_more_permission_than_its_own() {
+    if isolated("an_agent_gives_its_children_no_more_permission_than_its_own").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let person = Authority::default();
+    let spawn = |authority: &Authority, key: &str, provider, mode: Option<&str>, prompt: &str| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.provider = provider;
+        spec.permission_mode = mode.map(str::to_owned);
+        request.prompt = prompt.into();
+        request.idempotency_key = key.into();
+        submit(&host, authority, request)
+    };
+    let mode = |accepted: &Accepted| accepted.agent.spec.permission_mode.clone();
+    let launched = || std::fs::read_to_string(root.join("claude-arguments")).unwrap();
+
+    // A person's own connection starts what it asks for, as before.
+    let parent = spawn(
+        &person,
+        "parent",
+        Provider::Claude,
+        Some("default"),
+        "parent",
+    )
+    .unwrap();
+    assert_eq!(mode(&parent).as_deref(), Some("default"));
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let unrestricted = spawn(
+        &person,
+        "person-bypass",
+        Provider::Claude,
+        Some("bypassPermissions"),
+        "work",
+    )
+    .unwrap();
+    assert_eq!(mode(&unrestricted).as_deref(), Some("bypassPermissions"));
+    settled(&host, unrestricted.run.id);
+
+    let agent = agent_authority(&host, parent.agent.id);
+    assert_eq!(
+        spawn(
+            &agent,
+            "looser",
+            Provider::Claude,
+            Some("bypassPermissions"),
+            "work"
+        )
+        .unwrap_err(),
+        "This agent runs in default mode, so it can't start a child in bypassPermissions."
+    );
+    assert_eq!(
+        spawn(
+            &agent,
+            "unranked",
+            Provider::Claude,
+            Some("dontAsk"),
+            "work"
+        )
+        .unwrap_err(),
+        "cagents can't compare Claude Code mode dontAsk with this agent's own, so an agent can't start a child in it; start it yourself."
+    );
+    assert_eq!(
+        spawn(
+            &agent,
+            "codex-looser",
+            Provider::Codex,
+            Some("never"),
+            "work"
+        )
+        .unwrap_err(),
+        "This agent runs in default mode, so it can't start a Codex child in never/workspace-write."
+    );
+
+    // An omitted mode is the parent's own.
+    let inherited = spawn(
+        &agent,
+        "inherited",
+        Provider::Claude,
+        None,
+        "ASK_PERMISSION",
+    )
+    .unwrap();
+    assert_eq!(mode(&inherited).as_deref(), Some("default"));
+    let asked = pending(&host, &agent, inherited.agent.id);
+    assert!(
+        launched().contains("--permission-mode\ndefault\n"),
+        "{}",
+        launched()
+    );
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(asked.kind, chat::RequestKind::Approval);
+    let control = |command| -> Result<Vec<chat::Request>, String> {
+        match process(
+            &host,
+            agent.clone(),
+            Operation::Control {
+                agent: inherited.agent.id,
+                command,
+            },
+        )? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    let answer = |action: &str| Control::Answer {
+        request_id: asked.id.clone(),
+        action: action.into(),
+        answers: Vec::new(),
+    };
+    assert_eq!(
+        control(answer("allow")).unwrap_err(),
+        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+    );
+    assert!(control(answer("allow_session")).is_err());
+    assert!(!root.join("decisions").exists(), "nothing was approved");
+    assert!(control(answer("deny")).unwrap().is_empty());
+    assert_eq!(settled(&host, inherited.run.id).state, State::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(root.join("decisions")).unwrap(),
+        "deny\n"
+    );
+
+    // Another provider's child gets the strictest mode of the parent's tier.
+    let codex = spawn(&agent, "codex", Provider::Codex, None, "work").unwrap();
+    assert_eq!(mode(&codex).as_deref(), Some("untrusted/workspace-write"));
+    settled(&host, codex.run.id);
+
+    // A parent whose mode is not confirmed counts as asking for approval.
+    let unknown = spawn(&person, "unknown", Provider::Claude, None, "unknown").unwrap();
+    assert_eq!(mode(&unknown), None);
+    assert_eq!(settled(&host, unknown.run.id).state, State::Succeeded);
+    let unknown = agent_authority(&host, unknown.agent.id);
+    assert_eq!(
+        spawn(
+            &unknown,
+            "unknown-looser",
+            Provider::Claude,
+            Some("acceptEdits"),
+            "work"
+        )
+        .unwrap_err(),
+        "This agent's own permission mode isn't confirmed, so it counts as asking for approval, and it can't start a child in acceptEdits."
+    );
+    let asking = spawn(&unknown, "unknown-asking", Provider::Claude, None, "work").unwrap();
+    assert_eq!(mode(&asking).as_deref(), Some("default"));
+    settled(&host, asking.run.id);
+    let stricter = spawn(
+        &unknown,
+        "unknown-plan",
+        Provider::Claude,
+        Some("plan"),
+        "work",
+    )
+    .unwrap();
+    assert_eq!(mode(&stricter).as_deref(), Some("plan"));
+    settled(&host, stricter.run.id);
+}
+
+/// Oh My Pi asks its tool approvals as questions, so an agent that can't
+/// approve its child's tool requests may only cancel an Oh My Pi child's.
+#[test]
+fn a_limited_agent_only_cancels_an_oh_my_pi_child_s_questions() {
+    if isolated("a_limited_agent_only_cancels_an_oh_my_pi_child_s_questions").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let program = root.join("bin/omp");
+    std::fs::write(&program, r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$HOME/../omp-arguments"
+printf '{"type":"ready"}\n'
+while IFS= read -r frame; do
+  id=${frame#*'"id":"'}; id=${id%%'"'*}
+  kind=${frame#*'"type":"'}; kind=${kind%%'"'*}
+  data='{}'
+  case "$kind" in
+    negotiate_protocol) ;;
+    get_state) data='{"sessionId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","isStreaming":false}' ;;
+    get_available_models) data='{"models":[]}' ;;
+    get_available_commands) data='{"commands":[]}' ;;
+    get_subagents) data='{"subagents":[]}' ;;
+    set_subagent_subscription) data='{"level":"events"}' ;;
+    get_messages_page) data='{"messages":[],"nextCursor":null}' ;;
+    get_session_stats) data='{"tokens":{"input":1,"output":1},"cost":0}' ;;
+    prompt)
+      prompt=$id
+      printf '{"type":"agent_start"}\n'
+      printf '{"type":"extension_ui_request","id":"permission","method":"confirm","title":"Allow write?","message":"src/main.rs"}\n'
+      ;;
+    extension_ui_response)
+      printf '%s\n' "$frame" > "$HOME/../omp-answer"
+      printf '{"type":"message_end","message":{"id":"message-1","role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop","timestamp":1}}\n'
+      printf '{"type":"agent_end","isTerminal":true}\n'
+      printf '{"type":"prompt_result","id":"%s","status":"completed","agentInvoked":true}\n' "$prompt"
+      continue
+      ;;
+    abort) ;;
+    *) exit 17 ;;
+  esac
+  printf '{"type":"response","id":"%s","command":"%s","success":true,"data":%s}\n' "$id" "$kind" "$data"
+done
+"#).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let spawn = |authority: &Authority, key: &str, provider, mode: Option<&str>| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.provider = provider;
+        spec.permission_mode = mode.map(str::to_owned);
+        if provider == Provider::Omp {
+            spec.model = Some("fixture/model".into());
+        }
+        request.idempotency_key = key.into();
+        submit(&host, authority, request).unwrap()
+    };
+    let parent = spawn(
+        &Authority::default(),
+        "parent",
+        Provider::Claude,
+        Some("default"),
+    );
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let agent = agent_authority(&host, parent.agent.id);
+    let child = spawn(&agent, "omp", Provider::Omp, None);
+    assert_eq!(
+        child.agent.spec.permission_mode.as_deref(),
+        Some("always-ask")
+    );
+    let asked = pending(&host, &agent, child.agent.id);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(asked.kind, chat::RequestKind::Question);
+    let answer = |action: &str| {
+        process(
+            &host,
+            agent.clone(),
+            Operation::Control {
+                agent: child.agent.id,
+                command: Control::Answer {
+                    request_id: asked.id.clone(),
+                    action: action.into(),
+                    answers: Vec::new(),
+                },
+            },
+        )
+    };
+    assert_eq!(
+        answer("submit").unwrap_err(),
+        "This agent runs in default mode, so it can't approve its child's tool requests; answer it in cagents."
+    );
+    assert!(!root.join("omp-answer").exists(), "nothing was confirmed");
+    answer("cancel").unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let answered = std::fs::read_to_string(root.join("omp-answer")).unwrap();
+    assert!(answered.contains(r#""cancelled":true"#), "{answered}");
+}
+
+fn pending(host: &SharedHost, authority: &Authority, agent: AgentId) -> Vec<chat::Request> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let reply = process(host, authority.clone(), Operation::Requests(agent));
+        if let Ok(Reply::Requests(requests)) = &reply
+            && !requests.is_empty()
+        {
+            return requests.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never asked: {reply:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it() {
     if isolated("an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it")
@@ -5551,7 +5851,7 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
     ));
 
     // A delegated agent's session is its owner's to change, not the reverse.
-    let mut delegated = request;
+    let mut delegated = request.clone();
     delegated.idempotency_key = "delegated".into();
     let child = submit(&host, &authority(agent), delegated).unwrap();
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
@@ -5574,8 +5874,63 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
             },
         )
     };
-    change(AGENT, child_session).unwrap();
+    let session_of = |agent: AgentId| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .session
+            .unwrap()
+            .id()
+    };
+    let resize = |client: u64, terminal_id: TerminalId| {
+        super::terminals::admit(
+            &host,
+            client,
+            &ClientRequest::Resize {
+                terminal_id,
+                size: crate::terminal_ipc::WireTerminalSize {
+                    columns: 100,
+                    rows: 30,
+                    cell_width_px: 9,
+                    cell_height_px: 18,
+                },
+            },
+        )
+    };
+    // Typing into a delegated agent's session acts as its person, who may
+    // approve its tool requests, so an agent whose own approvals are limited,
+    // as a plain shell's count, may only arrange it.
+    let limited = |result: Result<(), crate::terminal_ipc::ProtocolError>| {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+        assert!(
+            error.message.ends_with(
+                "'s session because its approvals are limited. Use `cagents agent message` instead."
+            ),
+            "{}",
+            error.message
+        );
+    };
+    for request in [
+        ClientRequest::Input {
+            terminal_id: child_session,
+            bytes: b"/answer request-1 allow\n".to_vec(),
+        },
+        ClientRequest::Paste {
+            terminal_id: child_session,
+            text: "allow".into(),
+            origin: crate::terminal::PasteOrigin::Clipboard,
+        },
+    ] {
+        limited(super::terminals::admit(&host, AGENT, &request));
+    }
+    resize(AGENT, child_session).unwrap();
     change(PEER, child_session).unwrap_err();
+    // A person still types into it.
+    change(USER, child_session).unwrap();
     const CHILD: u64 = 4;
     host.lock().unwrap().register_client(CHILD);
     request_as(
@@ -5590,6 +5945,49 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         change(CHILD, agent).unwrap_err().code,
         ProtocolErrorCode::PermissionDenied
     );
+    // So at every depth: the child, which asks for approval itself, cannot
+    // type into its own child's session, nor can its parent.
+    let mut nested = request.clone();
+    nested.idempotency_key = "grandchild".into();
+    let grandchild = submit(&host, &authority(child_session), nested).unwrap();
+    assert_eq!(settled(&host, grandchild.run.id).state, State::Succeeded);
+    let grandchild_session = session_of(grandchild.agent.id);
+    limited(change(CHILD, grandchild_session));
+    assert_eq!(
+        change(AGENT, grandchild_session).unwrap_err().code,
+        ProtocolErrorCode::PermissionDenied
+    );
+
+    // An agent that runs with nothing asking may type into its child's.
+    let full = TerminalId::new();
+    let mut unrestricted = shell(full);
+    unrestricted.launch.program = root.join("bin/claude").display().to_string();
+    unrestricted.launch.arguments = vec!["--dangerously-skip-permissions".into()];
+    spawn_as(USER, unrestricted).unwrap();
+    const FULL: u64 = 5;
+    host.lock().unwrap().register_client(FULL);
+    authenticate(FULL, full).unwrap();
+    let mut trusted = request.clone();
+    trusted.idempotency_key = "trusted".into();
+    let trusted = submit(&host, &authority(full), trusted).unwrap();
+    assert_eq!(settled(&host, trusted.run.id).state, State::Succeeded);
+    change(FULL, session_of(trusted.agent.id)).unwrap();
+    // Nor into a provider CLI it runs or started itself, which reads its
+    // keys as its person's; a shell it started is its own to type into.
+    let mut provider = shell(TerminalId::new());
+    provider.launch.program = root.join("bin/claude").display().to_string();
+    let provider_id = provider.id;
+    spawn_as(AGENT, provider).unwrap();
+    let error = change(AGENT, provider_id).unwrap_err();
+    assert_eq!(error.code, ProtocolErrorCode::PermissionDenied);
+    assert_eq!(
+        error.message,
+        format!(
+            "This agent can't type into Claude Code's terminal {provider_id} because its approvals are limited. A person can type there in cagents."
+        )
+    );
+    change(AGENT, started).unwrap();
+    change(FULL, full).unwrap();
 
     // The user changes every terminal, and an agent's connection forgets
     // whom it acted for once it disconnects.
@@ -5891,7 +6289,7 @@ fn console_lines_summarize_steps_without_their_payloads() {
         format!(
             "Assistant: Done.\n\
              Ran cargo test --locked\n\
-             Ran Run the tests (failed, exit 101)\n\
+             Ran cargo test --locked (failed, exit 101)\n\
              Read src/app.rs\n\
              Called Agent\n\
              Called Agent (denied)\n\
@@ -5930,6 +6328,34 @@ fn console_lines_summarize_steps_without_their_payloads() {
         .filter_map(|item| console_line(item, 0))
         .collect::<String>();
     assert!(after.starts_with(&before) && after.len() > before.len());
+}
+
+#[test]
+fn a_console_command_line_falls_back_to_its_description_only_without_a_command() {
+    let command = |command: &str| chat::Item {
+        started_at: None,
+        id: "command".into(),
+        role: chat::Role::Assistant,
+        content: chat::ItemContent::Command {
+            label: "Run the tests".into(),
+            command: command.into(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        },
+        at: None,
+    };
+    assert_eq!(
+        console_line(&command(" \n"), 0).as_deref(),
+        Some("Ran Run the tests\n")
+    );
+    assert_eq!(
+        console_line(&command("cargo test --locked\nexit 0"), 0).as_deref(),
+        Some("Ran cargo test --locked\n")
+    );
 }
 
 fn console_snapshot(texts: &[&str], busy: bool) -> chat::Snapshot {
@@ -5981,6 +6407,27 @@ fn console_text_leaves_only_a_line_still_being_written_open() {
     }));
     let (text, _) = console_text(&running, 0);
     assert_eq!(text, "Assistant: About to run the tests.\n");
+}
+
+#[test]
+fn console_text_prints_a_notice_that_ends_a_busy_run() {
+    let mut snapshot = console_snapshot(&["One."], true);
+    snapshot.items.push(std::sync::Arc::new(chat::Item {
+        started_at: None,
+        id: "notice".into(),
+        role: chat::Role::System,
+        content: chat::ItemContent::Text {
+            text: "Reconnecting to the model".into(),
+            thinking: false,
+            phase: Default::default(),
+        },
+        at: None,
+    }));
+    assert!(
+        console_text(&snapshot, 0)
+            .0
+            .ends_with("Reconnecting to the model\n")
+    );
 }
 
 /// A line the client printed never comes back shorter, which would make it
@@ -6097,11 +6544,34 @@ fn console_prints_a_provider_notice_as_one_unlabelled_line() {
     );
     assert_eq!(
         line("output", "Current model: example\nsecond\nthird").as_deref(),
-        Some("Current model: example\n"),
+        Some("Current model: example…\n"),
         "command output filed as a notice stays one line"
     );
+    assert_eq!(line("done", "Done\n\n").as_deref(), Some("Done\n"));
     let long = line("long", &"x".repeat(5_000)).unwrap();
+    assert!(long.ends_with("…\n"));
     assert!(long.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", long.len());
+    let fits = "y".repeat(CONSOLE_NOTICE_BYTES);
+    assert_eq!(
+        line("fits", &fits),
+        Some(format!("{fits}\n")),
+        "a whole line at the limit is printed as it is"
+    );
+    let over = line("over", &"y".repeat(CONSOLE_NOTICE_BYTES + 1)).unwrap();
+    assert!(over.ends_with("…\n"), "{over}");
+    assert!(over.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", over.len());
+    let wide = line("wide", &"é".repeat(CONSOLE_NOTICE_BYTES)).unwrap();
+    assert!(
+        wide.ends_with("é…\n"),
+        "cut on a character boundary: {wide}"
+    );
+    assert!(wide.len() <= CONSOLE_NOTICE_BYTES + 1, "{}", wide.len());
+    let spaced = format!("{} tail", "z".repeat(CONSOLE_NOTICE_BYTES - 4));
+    assert_eq!(
+        line("spaced", &spaced),
+        Some(format!("{}…\n", "z".repeat(CONSOLE_NOTICE_BYTES - 4))),
+        "a cut after a space leaves none before the ellipsis"
+    );
     assert_eq!(
         line(
             "frame",
@@ -6156,16 +6626,16 @@ fn console_counts_the_files_a_paged_edit_adds_in_each_part() {
 }
 
 /// A step is never paged, so a label that reads like a part mark is the
-/// provider's own and is printed as given.
+/// provider's own and is printed as given when no command is supplied.
 #[test]
 fn console_keeps_a_label_that_reads_like_a_part_mark() {
-    let command = chat::Item {
+    let command = |command: &str| chat::Item {
         started_at: None,
         id: "command".into(),
         role: chat::Role::Assistant,
         content: chat::ItemContent::Command {
             label: "cargo test (part 1/8)".into(),
-            command: "cargo test".into(),
+            command: command.into(),
             working_directory: String::new(),
             action: chat::CommandAction::Run,
             status: chat::ToolStatus::Succeeded,
@@ -6176,7 +6646,11 @@ fn console_keeps_a_label_that_reads_like_a_part_mark() {
         at: None,
     };
     assert_eq!(
-        console_line(&command, 0).as_deref(),
+        console_line(&command("cargo test"), 0).as_deref(),
+        Some("Ran cargo test\n")
+    );
+    assert_eq!(
+        console_line(&command(""), 0).as_deref(),
         Some("Ran cargo test (part 1/8)\n")
     );
 }
@@ -6846,5 +7320,37 @@ fn an_acp_agent_s_launch_names_its_mode_in_its_own_words() {
     assert_eq!(
         launch_options(&spec("default")),
         ["--model", "gemini-3.8-flash", "--effort", "low"]
+    );
+}
+
+#[test]
+fn a_codex_agent_s_launch_names_its_approval_and_sandbox() {
+    use crate::agent::Provider;
+    use crate::agent_execution::{Spec, Surface, Target};
+    let spec = |mode: &str| Spec {
+        provider: Provider::Codex,
+        account: None,
+        target: Target {
+            repository: "/work".into(),
+            directory: "/work".into(),
+            placement: None,
+        },
+        surface: Surface::Chat,
+        model: None,
+        permission_mode: Some(mode.into()),
+        reasoning_effort: None,
+    };
+    assert_eq!(
+        launch_options(&spec("untrusted/workspace-write")),
+        [
+            "--ask-for-approval",
+            "untrusted",
+            "--sandbox",
+            "workspace-write"
+        ]
+    );
+    assert_eq!(
+        launch_options(&spec("on-request")),
+        ["--ask-for-approval", "on-request"]
     );
 }

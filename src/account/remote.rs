@@ -436,9 +436,8 @@ fn change(
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
-                let (registry, ()) = reservation.commit(|| {
-                    store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
-                })?;
+                let (registry, ()) = reservation
+                    .commit(|| release_pending(reservation, &homes, &store, provider, key))?;
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| LifecycleError::Failed(error.to_string()));
             }
@@ -446,10 +445,9 @@ fn change(
             // token fences daemon ingress, but an external rename/replacement
             // must not redirect this second provider read to a different home.
             reservation.verify()?;
-            let system_identity = match runtime.block_on(probe::run(
+            let system_identity = match runtime.block_on(probe::login(
                 Account::system(provider),
                 super::cache::Cache::installation(),
-                false,
             )) {
                 Outcome::Answered {
                     identity: Some(identity),
@@ -485,11 +483,8 @@ fn change(
                     snapshot: Some(snapshot),
                 },
                 Err(existing) => {
-                    let (registry, ()) = reservation.commit(|| {
-                        store.try_update_reserved(reservation, |registry| {
-                            registry.release(key, &homes)
-                        })
-                    })?;
+                    let (registry, ()) = reservation
+                        .commit(|| release_pending(reservation, &homes, &store, provider, key))?;
                     Settled::Duplicate {
                         existing,
                         registry: Some(registry),
@@ -507,9 +502,8 @@ fn change(
             {
                 return Err("This pending sign-in changed on the device".into());
             }
-            let (registry, ()) = reservation.commit(|| {
-                store.try_update_reserved(reservation, |registry| registry.release(key, &homes))
-            })?;
+            let (registry, ()) = reservation
+                .commit(|| release_pending(reservation, &homes, &store, provider, key))?;
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| LifecycleError::Failed(error.to_string()))
         }
@@ -544,6 +538,42 @@ fn change(
                 .map_err(|error| LifecycleError::Failed(error.to_string()))
         }
     }
+}
+
+#[cfg(all(test, feature = "host"))]
+thread_local! {
+    static BEFORE_RELEASE_UPDATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Validate and save the release under the registry lock before leaving a
+/// permanent marker: a failed save must not mark a later registered account.
+#[cfg(feature = "host")]
+fn release_pending(
+    reservation: &crate::host::AccountReservation,
+    homes: &super::home::Homes,
+    store: &super::registry::Store,
+    provider: Provider,
+    key: uuid::Uuid,
+) -> std::io::Result<(super::registry::Registry, ())> {
+    #[cfg(test)]
+    BEFORE_RELEASE_UPDATE.with(|hook| {
+        let hook = hook.borrow_mut().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+    store.try_update_reserved_then(
+        reservation,
+        |registry| registry.release(key, homes),
+        |registry| {
+            if registry.is_released(key)
+                && let Err(error) = homes.mark_released(provider, key)
+            {
+                tracing::warn!(%error, ?provider, %key, "Could not mark a released sign-in's home");
+            }
+        },
+    )
 }
 
 /// Why a home was not restored.
@@ -636,7 +666,7 @@ fn restore_reserved(
     if !homes.is_unregistered(&registry, provider, key) {
         return Err(RestoreFailure::settled(NO_HOME));
     }
-    if registry.is_released(key) {
+    if homes.is_released(provider, key) || registry.is_released(key) {
         return Err(RestoreFailure::settled(RELEASED));
     }
     let cli = probe::cli_name(provider);
@@ -668,10 +698,9 @@ fn restore_reserved(
         )));
     }
     reservation.verify()?;
-    let system = match runtime.block_on(probe::run(
+    let system = match runtime.block_on(probe::login(
         Account::system(provider),
         Cache::installation(),
-        false,
     )) {
         Outcome::Answered {
             identity: Some(identity),
@@ -734,12 +763,23 @@ fn login_recipe_with_path(
     if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.into());
     }
+    let program = program.to_str().ok_or("Provider path is not UTF-8")?;
+    let path = search_path
+        .and_then(|path| path.to_str())
+        .unwrap_or_default();
     let mut recipe = crate::model::LaunchRecipe {
-        program: program.to_str().ok_or("Provider path is not UTF-8")?.into(),
+        // Muse's `muse` may be a wrapper that cannot run `login`.
+        program: account
+            .provider
+            .subcommand_program(program, std::path::Path::new("/"), path),
         arguments: match account.provider {
             Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
             Provider::Codex => vec!["login".into(), "--device-auth".into()],
-            Provider::Omp | Provider::Antigravity | Provider::Muse => {
+            Provider::Antigravity => ["acp", "--login", "--disable-telemetry"]
+                .map(str::to_owned)
+                .into(),
+            Provider::Muse => vec!["login".into()],
+            Provider::Omp => {
                 return Err(format!(
                     "{} manages its own sign-in",
                     account.provider.label()
@@ -1131,6 +1171,164 @@ mod tests {
             abandoning.join().unwrap().unwrap();
         });
         assert!(list.store.load().unwrap().pending().is_empty());
+    }
+
+    #[test]
+    fn a_stale_release_writes_no_marker_after_another_window_registers_the_sign_in() {
+        let list = HeldList::new();
+        let (key, home) = list.pending.clone();
+        let provider = Provider::Codex;
+        let account = Account::managed(provider, key, home.clone());
+        let reservation = list.reserve(&[account], std::time::Duration::from_secs(2));
+        let registered = Registered {
+            key,
+            provider,
+            linked_home: None,
+            label: None,
+            email: Some("registered@example.com".into()),
+            organization: None,
+            added_at: 1,
+        };
+        let (store, homes, registration) =
+            (list.store.clone(), list.homes.clone(), registered.clone());
+        // Another window wins after Abandon's prechecks and commit's earlier
+        // verification, immediately before the locked release update.
+        BEFORE_RELEASE_UPDATE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                store
+                    .register_pending(&homes, registration, &[])
+                    .unwrap()
+                    .1
+                    .unwrap();
+            }));
+        });
+
+        let error = list
+            .execute(Operation::Abandon { provider, key }, &reservation)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            LifecycleError::Failed(
+                "The affected account registration changed; reload accounts before retrying".into()
+            )
+        );
+        assert!(!list.homes.is_released(provider, key));
+        let registry = list.store.load().unwrap();
+        assert_eq!(registry.find(key), Some(&registered));
+        assert!(registry.pending().is_empty() && !registry.is_released(key));
+        drop(reservation);
+
+        std::fs::remove_file(list._root.path().join("registry/accounts.toml")).unwrap();
+        let lost = list.store.load().unwrap();
+        assert!(
+            list.homes
+                .unregistered(&lost)
+                .iter()
+                .any(|(found_provider, found, _)| (*found_provider, *found) == (provider, key))
+        );
+        assert!(home.is_dir());
+    }
+
+    #[test]
+    fn a_failed_release_save_does_not_mark_a_later_registered_home_as_released() {
+        let list = HeldList::new();
+        let (key, home) = list.pending.clone();
+        let provider = Provider::Codex;
+        let account = Account::managed(provider, key, home.clone());
+        let reservation = list.reserve(&[account], std::time::Duration::from_secs(2));
+        let before = list.store.load().unwrap();
+        let path = list._root.path().join("registry/accounts.toml");
+        let bytes = std::fs::read(&path).unwrap();
+        list.store.fail_next_write_for_test();
+
+        assert_eq!(
+            list.execute(Operation::Abandon { provider, key }, &reservation)
+                .unwrap_err(),
+            LifecycleError::Failed("test account registry write failure".into())
+        );
+        assert_eq!(list.store.load().unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!list.homes.is_released(provider, key));
+        drop(reservation);
+
+        let registered = Registered {
+            key,
+            provider,
+            linked_home: None,
+            label: None,
+            email: Some("registered@example.com".into()),
+            organization: None,
+            added_at: 1,
+        };
+        let (registry, result) = list
+            .store
+            .register_pending(&list.homes, registered.clone(), &[])
+            .unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(registry.find(key), Some(&registered));
+        assert!(registry.pending().is_empty() && !registry.is_released(key));
+
+        std::fs::remove_file(path).unwrap();
+        let lost = list.store.load().unwrap();
+        assert!(lost.find(key).is_none() && !lost.is_released(key));
+        assert!(
+            list.homes
+                .unregistered(&lost)
+                .iter()
+                .any(|(found_provider, found, _)| (*found_provider, *found) == (provider, key))
+        );
+        assert!(home.is_dir() && !list.homes.is_released(provider, key));
+
+        let account = Account::managed(provider, key, home);
+        let reservation = list.reserve(&[account], std::time::Duration::from_secs(2));
+        let (registry, restored) = reservation
+            .commit(|| {
+                list.store
+                    .try_restore_reserved(&reservation, &list.homes, registered.clone(), &[])
+            })
+            .unwrap();
+        assert_eq!(restored, crate::account::registry::Restored::Listed);
+        assert_eq!(registry.find(key), Some(&registered));
+    }
+
+    #[test]
+    fn an_abandoned_sign_in_is_not_restored_after_the_account_list_is_lost() {
+        let list = HeldList::new();
+        let (key, home) = list.pending.clone();
+        let provider = Provider::Codex;
+        let account = Account::managed(provider, key, home.clone());
+        let reservation = list.reserve(
+            std::slice::from_ref(&account),
+            std::time::Duration::from_secs(2),
+        );
+        let settled: Settled = serde_json::from_value(
+            list.execute(Operation::Abandon { provider, key }, &reservation)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(settled, Settled::Abandoned(Some(_))));
+        assert!(list.store.load().unwrap().is_released(key));
+        assert!(list.homes.is_released(provider, key));
+        drop(reservation);
+
+        std::fs::remove_file(list._root.path().join("registry/accounts.toml")).unwrap();
+        let lost = list.store.load().unwrap();
+        assert!(lost.pending().is_empty() && lost.find(key).is_none());
+        assert!(!lost.is_released(key));
+        assert!(
+            list.homes
+                .unregistered(&lost)
+                .iter()
+                .all(|(_, found, _)| *found != key)
+        );
+        let reservation = list.reserve(&[account], std::time::Duration::from_secs(2));
+        assert_eq!(
+            list.execute(Operation::Restore { provider, key }, &reservation)
+                .unwrap_err(),
+            LifecycleError::Failed(RELEASED.into())
+        );
+        assert!(home.is_dir() && list.homes.is_released(provider, key));
+        assert_eq!(list.store.load().unwrap(), lost);
     }
 
     #[test]

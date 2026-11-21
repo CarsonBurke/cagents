@@ -2545,10 +2545,13 @@ where
                     shell.publish(on_edit(Action::Drag(position)));
                 }
                 Update::Release => {
-                    state.drag_click = None;
                     // X11 and Wayland both expect a finished selection to
                     // become the primary selection, which middle click pastes.
-                    if let Some(selection) = self.content.selection() {
+                    // Every pane receives the release; only its gesture owner
+                    // may publish a selection, including outside its viewport.
+                    if state.drag_click.take().is_some()
+                        && let Some(selection) = self.content.selection()
+                    {
                         clipboard.write(clipboard::Kind::Primary, selection);
                     }
                 }

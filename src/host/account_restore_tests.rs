@@ -105,6 +105,11 @@ fn startup_restores_signed_in_homes_a_lost_registry_no_longer_names() {
             registry.release(released, &homes);
         })
         .unwrap();
+    // One given up after releases were marked beside their homes: the list
+    // that recorded it is gone, and only the marker remains.
+    let (marked, marked_home) = create_home(&homes);
+    sign_in(&marked_home, "marked@example.com");
+    homes.mark_released(Provider::Claude, marked).unwrap();
     let parked = homes
         .path(Provider::Claude, uuid::Uuid::new_v4())
         .with_file_name(format!(".removing-{}", uuid::Uuid::new_v4()));
@@ -207,6 +212,15 @@ fn startup_restores_signed_in_homes_a_lost_registry_no_longer_names() {
         "a sign-in given up is not adopted"
     );
     assert!(released_home.join("login").exists());
+    assert!(
+        homes.is_released(Provider::Claude, released),
+        "a release the list recorded is marked beside its home"
+    );
+    assert!(
+        row(marked).is_none() && !registry.is_released(marked),
+        "a marked sign-in is not adopted without the list's record"
+    );
+    assert!(marked_home.join("login").exists());
     assert_eq!(
         std::fs::read_dir(&unfinished_home).unwrap().count(),
         unfinished_before

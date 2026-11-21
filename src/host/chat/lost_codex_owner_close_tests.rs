@@ -252,6 +252,7 @@ fn provider_actor(root: &std::path::Path) -> chat::runtime::Handle {
     }
     let spec = ProcessSpec {
         stdout_noise: None,
+        followed: false,
         execution: None,
         messages: None,
         unset_environment: Default::default(),
@@ -490,6 +491,7 @@ impl Spawned {
         let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
         let spec = chat::protocol::ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: chat::protocol::TransportSpec::OwnedUnixWebSocket { socket },
@@ -578,11 +580,21 @@ fn shared_chat_removal_accepts_only_its_original_native_cleanup() {
     };
     let mut replacement = fixture.source.clone();
     replacement.launch.session_id = Some("replacement-conversation".into());
-    for (source, blocked) in [(fixture.source.clone(), false), (replacement, true)] {
+    // A provider that names its conversation after launch closes under the
+    // source it launched with, while its pane names the conversation.
+    let mut unnamed = fixture.source.clone();
+    unnamed.launch.session_id = None;
+    for (source, named, blocked) in [
+        (fixture.source.clone(), fixture.source.clone(), false),
+        (replacement.clone(), replacement.clone(), true),
+        (unnamed.clone(), fixture.source.clone(), false),
+        (unnamed.clone(), unnamed, true),
+        (fixture.source.clone(), replacement, false),
+    ] {
         let mut state = fixture.host.lock().unwrap();
         state.native_closing.insert(
             fixture.source.id,
-            native_cleanup::NativeClose::adopted(source, owner.0.clone(), false),
+            native_cleanup::NativeClose::adopted(source, owner.0.clone(), false).named_as(named),
         );
         assert_eq!(shared_removal_in_transition(&state, &pane), blocked);
     }

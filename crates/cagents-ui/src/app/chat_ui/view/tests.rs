@@ -1179,8 +1179,13 @@ fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting
     snapshot.ready = true;
     snapshot.finished_at = Some(42);
     assert_eq!(runtime.conversation_status(false).1, "Finished");
-    Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
-    assert_eq!(runtime.conversation_status(false).1, "Interrupted");
+    // A turn the person stopped says so in the words of its stopped step
+    // and marker, with the marker's glyph.
+    Arc::make_mut(&mut runtime.snapshot).detail = chat::TURN_INTERRUPTED.into();
+    assert_eq!(
+        runtime.conversation_status(false),
+        (Some(Icon::Stop), "Stopped".to_owned())
+    );
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
     assert_eq!(runtime.conversation_status(false).1, "Failed");
     Arc::make_mut(&mut runtime.snapshot).detail.clear();
@@ -1852,7 +1857,7 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
     snapshot.finished_at = Some(42);
     snapshot.detail = "Turn interrupted".into();
     assert_eq!(activity(&runtime), None);
-    assert_eq!(runtime.finished_label(), "Interrupted");
+    assert_eq!(runtime.finished_label(), "Stopped");
     Arc::make_mut(&mut runtime.snapshot).detail.clear();
     assert_eq!(runtime.finished_label(), "Finished");
     Arc::make_mut(&mut runtime.snapshot).error = Some("Provider failed".into());
@@ -1863,11 +1868,11 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
         at: 42,
         clock: "12:00".into(),
         full: "2026-11-05 12:00".into(),
-        outcome: "Interrupted",
+        outcome: "Stopped",
     });
     Arc::make_mut(&mut runtime.snapshot).detail = "Reconnected".into();
     runtime.error = Some("Could not change the model".into());
-    assert_eq!(runtime.finished_label(), "Interrupted");
+    assert_eq!(runtime.finished_label(), "Stopped");
     // Choosing a model is not a message on its way: it neither reads as
     // sending nor takes the stamp away. A message does.
     runtime.error = None;
@@ -5604,7 +5609,9 @@ fn a_stop_marker_is_one_quiet_row_with_nothing_to_open() {
         .filter_map(|node| node.node().label().map(|label| (node.node().role(), label)))
         .collect();
     assert!(
-        labels.iter().any(|(_, label)| *label == chat::STOPPED),
+        labels
+            .iter()
+            .any(|(_, label)| *label == "You stopped this turn"),
         "the marker says the turn stopped: {labels:?}"
     );
     assert!(
@@ -6106,19 +6113,26 @@ fn narrow_footer_model_picker_contains_model_and_reasoning_choices() {
 
 /// Where the controls named `roles`, the footer, and the footer's text
 /// land when `runtime` is drawn `width` wide.
-struct Laid {
+pub(super) struct Laid {
     footer: iced::Rectangle,
-    controls: HashMap<String, iced::Rectangle>,
+    pub(super) controls: HashMap<String, iced::Rectangle>,
     footer_text: Vec<String>,
     /// Every text the view draws.
-    text: Vec<String>,
+    pub(super) text: Vec<String>,
+    /// Every text the view draws, with where it lands.
+    pub(super) placed_text: Vec<(iced::Rectangle, String)>,
     /// What assistive technology is told inside the footer.
     footer_names: Vec<String>,
     /// The far edge of whatever the footer draws, text or named glyph.
     footer_drawn_right: f32,
 }
 
-fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles: &[&str]) -> Laid {
+pub(super) fn lay_out(
+    runtime: &Runtime,
+    width: f32,
+    accounts: Option<ChatAccounts>,
+    roles: &[&str],
+) -> Laid {
     use iced::advanced::{
         Layout, layout,
         widget::{Operation, Tree, operation::Focusable},
@@ -6217,6 +6231,7 @@ fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles:
         .filter(|(bounds, _)| footer.contains(bounds.center()))
         .collect();
     let all_text = probe.text.iter().map(|(_, text)| text.clone()).collect();
+    let placed_text = probe.text.clone();
     let text: Vec<(iced::Rectangle, String)> = probe
         .text
         .into_iter()
@@ -6225,6 +6240,7 @@ fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles:
     Laid {
         footer,
         text: all_text,
+        placed_text,
         controls: probe.controls,
         footer_drawn_right: text
             .iter()
@@ -6237,7 +6253,7 @@ fn lay_out(runtime: &Runtime, width: f32, accounts: Option<ChatAccounts>, roles:
 }
 
 /// A settled conversation with every footer control a provider offers.
-fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
+pub(super) fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
     let (mut runtime, handle) = frame_cost::live_runtime(&frame_cost::transcript(1));
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
     snapshot.capabilities.model_selection = true;
@@ -10224,12 +10240,73 @@ fn submit_tooltips_name_the_chord_the_preference_bound() {
         (PromptMode::Steer, 1, true, "Ctrl+Shift+Enter"),
         (PromptMode::Queue, 1, false, "Ctrl+Shift+Enter"),
     ] {
-        let (_, label) = submit_control(mode, slot, enter_sends);
+        let (_, label) = submit_control(mode, slot, enter_sends, None);
         assert!(
             label.ends_with(chord),
             "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
         );
     }
+}
+
+/// An empty composer in a refused conversation, read-only or not, says why
+/// it sends nothing rather than inviting a message or staying blank. Only a
+/// conversation changing hands leaves it blank.
+#[test]
+fn an_empty_refused_composer_says_why_it_cannot_send() {
+    use blocked_recovery::Reopen;
+    for (reopen, fresh, expected) in [
+        (
+            Reopen::AfterRestart,
+            false,
+            "Messages can be sent once this conversation reopens",
+        ),
+        (
+            Reopen::UpdateRecovery,
+            false,
+            "Messages can be sent once this conversation reopens",
+        ),
+        (
+            Reopen::UpdateStopped,
+            false,
+            "Reopen this conversation to send a message",
+        ),
+        (
+            Reopen::Unproven,
+            true,
+            "Start a new conversation to send a message",
+        ),
+        (
+            Reopen::Unproven,
+            false,
+            "This conversation can't take new messages",
+        ),
+    ] {
+        let unsendable = Some(reopen.unsendable(fresh));
+        assert_eq!(
+            composer_hint(false, unsendable, false, Some(PromptMode::Send), false),
+            expected,
+            "{reopen:?}"
+        );
+        // The main agent's own label doesn't hide the refusal either.
+        assert_eq!(
+            composer_hint(false, unsendable, true, Some(PromptMode::Send), false),
+            expected,
+            "{reopen:?}"
+        );
+        assert_eq!(
+            composer_hint(true, unsendable, false, Some(PromptMode::Send), false),
+            "",
+            "{reopen:?}"
+        );
+    }
+    assert_eq!(
+        composer_hint(false, None, false, Some(PromptMode::Send), false),
+        "Message"
+    );
+    assert_eq!(
+        composer_hint(false, None, true, Some(PromptMode::Send), false),
+        "Message main agent"
+    );
 }
 
 /// A chip the reader cannot read is worse than no chip: the point of it is
@@ -12438,4 +12515,83 @@ fn a_lone_coordinating_step_still_running_says_so() {
             .any(|text| text.contains("live sessions · working")),
         "{texts:?}"
     );
+}
+
+/// A draft names the reasoning level only where its chosen model offers it:
+/// Muse's muse-wonder-1.0 offers none, so a level kept from muse-spark-1.2
+/// is not shown beside it (#3380).
+#[test]
+fn draft_label_names_only_a_reasoning_level_the_chosen_model_offers() {
+    let (mut runtime, _handle) = furnished_runtime();
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.active_model = None;
+    snapshot.models = vec![
+        chat::Model {
+            reasoning: vec!["xhigh".into()],
+            ..model("muse-spark-1.2", "muse-spark-1.2")
+        },
+        model("muse-wonder-1.0", "muse-wonder-1.0"),
+    ];
+    snapshot.reasoning = Some("xhigh".into());
+    let label = |snapshot: &chat::Snapshot, id: &'static str, provider| {
+        footer_model_label(
+            snapshot,
+            ChosenModel {
+                id: Some(id),
+                reasoning: snapshot.reasoning.as_deref(),
+            },
+            true,
+            provider,
+            FooterFit::Wide,
+            None,
+        )
+        .into_owned()
+    };
+    assert_eq!(
+        label(snapshot, "muse-spark-1.2", Provider::Muse),
+        "muse-spark-1.2 · Extra high"
+    );
+    assert_eq!(
+        label(snapshot, "muse-wonder-1.0", Provider::Muse),
+        "muse-wonder-1.0"
+    );
+    // A level the model's list leaves out is not its level either.
+    snapshot.models[0].reasoning = vec!["low".into()];
+    assert_eq!(
+        label(snapshot, "muse-spark-1.2", Provider::Muse),
+        "muse-spark-1.2"
+    );
+    // Claude and Codex catalogs can leave a model's levels unlisted.
+    assert_eq!(
+        label(snapshot, "muse-wonder-1.0", Provider::Claude),
+        "muse-wonder-1.0 · Extra high"
+    );
+}
+
+/// Muse's modes mean what Claude's of the same names do only roughly: they
+/// keep Muse's own words rather than Claude's (#3380).
+#[test]
+fn muse_modes_keep_their_own_names() {
+    for (mode, muse, claude) in [
+        ("manual", "Ask before unmatched", "Ask before edits"),
+        ("auto", "Ask on request", "Auto"),
+        ("dontAsk", "Deny unmatched", "Don't ask"),
+        ("bypassPermissions", "Allow all", "YOLO"),
+    ] {
+        assert_eq!(permission_mode_label(Provider::Muse, mode), muse);
+        assert_eq!(permission_mode_label(Provider::Claude, mode), claude);
+    }
+    assert_eq!(
+        permission_mode_label(Provider::Antigravity, "acceptEdits"),
+        "Auto-accept edits"
+    );
+}
+
+#[test]
+fn a_spend_below_one_cent_never_reads_as_free() {
+    assert_eq!(dollars(0), "$0.00");
+    assert_eq!(dollars(1_200), "<$0.01");
+    assert_eq!(dollars(9_999), "<$0.01");
+    assert_eq!(dollars(10_000), "$0.01");
+    assert_eq!(dollars(1_234_567), "$1.23");
 }

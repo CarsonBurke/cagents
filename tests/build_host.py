@@ -8,9 +8,11 @@ private directory, in this process.
 
 import array
 import contextlib
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -403,7 +405,192 @@ class TheBuildsEnvironment(BuildHostFixture):
         result = self.run_host("count", env=env)
         memory = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         # /proc/meminfo's total is a little below the physical pages'.
-        self.assertIn(int(result.stdout), range(2, max(2, memory * 3 // 4 // 2**32) + 1))
+        # Two extra shares follow the host's own.
+        self.assertIn(int(result.stdout), range(4, max(2, memory * 3 // 4 // 2**32) + 3))
+
+
+class ExtraShares(BuildHostFixture):
+    """Past the host's shares, a build takes an extra one only while memory
+    allows, in the same line as any other."""
+
+    slots = 2
+    GiB = 2**30
+
+    def setUp(self):
+        super().setUp()
+        self.proc = self.root / "proc"
+        (self.proc / "pressure").mkdir(parents=True)
+        self.env |= {"CAGENTS_BUILD_EXTRA_SHARES": "2", "CAGENTS_BUILD_PROC": str(self.proc)}
+        self.memory(available=64 * self.GiB)
+        # The host's own shares are another build's.
+        for index in range(self.slots):
+            self.hold(self.share(index))
+
+    def memory(self, available=None, pressure=0.0):
+        """The host's MemAvailable and memory pressure, as the kernel shows them."""
+        if available is not None:
+            self.write(self.proc / "meminfo", f"MemTotal:       {64 * 2**20} kB\n"
+                       f"MemFree:          123456 kB\nMemAvailable:   {available // 1024} kB\n")
+        self.write(self.proc / "pressure/memory",
+                   f"some avg10={pressure:.2f} avg60=0.05 avg300=0.04 total=4877431889\n"
+                   f"full avg10={pressure / 2:.2f} avg60=0.03 avg300=0.02 total=4427153170\n")
+
+    def write(self, path, text):
+        # Whole, as /proc shows it: a reader never sees half of it.
+        path.with_name(path.name + ".new").write_text(text)
+        path.with_name(path.name + ".new").replace(path)
+
+    def assert_waits(self, name, label):
+        time.sleep(0.6)
+        self.assertFalse(self.started(name), label)
+
+    def test_an_extra_share_is_taken_when_memory_holds_the_build_and_the_floor(self):
+        self.memory(available=(2 * 4 + 8) * self.GiB)
+        build = self.held_build("extra", 2)
+        self.wait_for(lambda: self.started("extra"), "the build on extra shares")
+        self.assertTrue(self.is_locked(self.share(2)) and self.is_locked(self.share(3)))
+        status, _stdout, stderr = self.finish(build, "extra")
+        self.assertEqual(status, 0, stderr)
+        self.assertNotIn("waiting", stderr)
+        self.assertFalse(self.is_locked(self.share(2)) or self.is_locked(self.share(3)))
+
+    def test_a_build_waits_while_memory_available_is_short_and_starts_once_it_is_not(self):
+        self.memory(available=(4 + 8) * self.GiB - 1)
+        build = self.held_build("short", 1)
+        self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the build to queue")
+        self.assert_waits("short", "an extra share was taken without the memory for it")
+        self.assertFalse(self.is_locked(self.share(2)))
+        self.memory(available=(4 + 8) * self.GiB)
+        self.wait_for(lambda: self.started("short"), "the build once memory allowed")
+        status, _stdout, stderr = self.finish(build, "short")
+        self.assertEqual(status, 0, stderr)
+        self.assertIn("waiting for 1 of the 2 build memory shares", stderr)
+        self.assertIn("an extra share is free, but not the memory for it", stderr)
+        self.assertIn("admitted on 1 extra build memory share, as memory allows", stderr)
+
+    def test_extra_shares_others_hold_count_against_memory_available(self):
+        # Another build took an extra share and may not have used its memory yet.
+        self.hold(self.share(2))
+        self.memory(available=(4 + 8) * self.GiB)
+        build = self.held_build("second", 1)
+        self.assert_waits("second", "memory counted once for two builds")
+        self.memory(available=(2 * 4 + 8) * self.GiB)
+        self.wait_for(lambda: self.started("second"), "the build once memory held both")
+        self.assertTrue(self.is_locked(self.share(3)))
+        self.assertEqual(self.finish(build, "second")[0], 0)
+
+    def test_a_build_waits_under_memory_pressure_and_starts_once_it_eases(self):
+        self.memory(pressure=5.0)
+        build = self.held_build("pressed", 1)
+        self.assert_waits("pressed", "an extra share was taken under memory pressure")
+        self.memory(pressure=1.0)
+        self.wait_for(lambda: self.started("pressed"), "the build once pressure eased")
+        self.assertEqual(self.finish(build, "pressed")[0], 0)
+
+    def test_without_memory_readings_no_extra_share_is_taken(self):
+        for missing in ("meminfo", "pressure/memory"):
+            with self.subTest(missing=missing):
+                self.memory(available=64 * self.GiB)
+                (self.proc / missing).unlink()
+                build = self.held_build(f"blind-{missing[:3]}", 1, "--wait-seconds", "1")
+                status, _stdout, stderr = self.finish(build)
+                self.assertEqual(status, 124, stderr)
+                self.assertFalse(self.started(f"blind-{missing[:3]}"))
+
+    def test_a_build_short_of_memory_keeps_its_place_at_the_head_of_the_line(self):
+        self.memory(available=(2 * 4 + 8) * self.GiB - 1)
+        head = self.held_build("head", 2)
+        self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the head")
+        behind = self.held_build("behind", 1)
+        self.wait_for(lambda: "lock" in Path(f"/proc/{behind.pid}/wchan").read_text(),
+                      "the smaller build to queue behind it")
+        # Memory enough for the smaller build alone goes to neither.
+        self.memory(available=(4 + 8) * self.GiB)
+        self.assert_waits("behind", "a smaller build overtook the head on extra shares")
+        self.assertFalse(self.started("head"))
+        self.memory(available=(2 * 4 + 8) * self.GiB)
+        self.wait_for(lambda: self.started("head"), "the head once memory allowed")
+        # The head holds both extra shares: the one behind waits for a share.
+        self.assert_waits("behind", "more shares were taken than the host and its extras have")
+        self.assertEqual(self.finish(head, "head")[0], 0)
+        self.wait_for(lambda: self.started("behind"), "the smaller build after the head")
+        self.assertEqual(self.finish(behind, "behind")[0], 0)
+        self.assertEqual([call["arguments"] for call in self.calls()], [["head"], ["behind"]])
+
+    def test_no_more_than_the_extra_shares_are_taken_however_much_memory_is_free(self):
+        first, second = self.held_build("first", 1), self.held_build("second", 1)
+        self.wait_for(lambda: self.started("first") and self.started("second"), "two extra shares")
+        third = self.held_build("third", 1)
+        self.assert_waits("third", "a third extra share was taken")
+        self.assertEqual(self.finish(first, "first")[0], 0)
+        self.wait_for(lambda: self.started("third"), "the third build once an extra share freed")
+        self.assertEqual([self.finish(build, name)[0] for build, name in
+                          ((second, "second"), (third, "third"))], [0, 0])
+
+    def test_extra_shares_are_taken_only_to_complete_a_build(self):
+        # One extra share is free and the other is another build's: taking
+        # the free one would leave this build holding it on memory it may
+        # not have when a second share frees.
+        other = self.hold(self.share(3))
+        build = self.held_build("pair", 2)
+        self.wait_for(lambda: self.is_locked(f"{self.lock}.queue"), "the build to queue")
+        self.assert_waits("pair", "a build started on one share of two")
+        self.assertFalse(self.is_locked(self.share(2)), "a partial extra share was held")
+        other.close()
+        self.wait_for(lambda: self.started("pair"), "the build once both extra shares freed")
+        self.assertEqual(self.finish(build, "pair")[0], 0)
+
+    def test_a_build_that_need_not_wait_takes_an_extra_share_only_if_memory_allows(self):
+        env = {"CAGENTS_BUILD_LOCK": str(self.lock), "CAGENTS_BUILD_SLOTS": str(self.slots),
+               "CAGENTS_BUILD_EXTRA_SHARES": "2", "CAGENTS_BUILD_SCOPE": "0",
+               "CAGENTS_BUILD_PROC": str(self.proc)}
+        said = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, env), contextlib.redirect_stderr(said):
+            self.memory(available=(4 + 8) * self.GiB - 1)
+            with self.assertRaises(build_host.Busy):
+                with build_host.shares(1, None, queue_up=False):
+                    self.fail("admitted without the memory for an extra share")
+            self.assertFalse(self.is_locked(self.share(2)))
+            self.memory(available=(4 + 8) * self.GiB)
+            with build_host.shares(1, None, queue_up=False):
+                self.assertTrue(self.is_locked(self.share(2)))
+            self.assertFalse(self.is_locked(self.share(2)))
+        self.assertIn("admitted on 1 extra build memory share", said.getvalue())
+
+    def test_the_build_slices_room_under_its_cap_bounds_extra_shares(self):
+        stat = self.root / "memory.stat"
+        budget = 32 * self.GiB
+        with unittest.mock.patch.object(build_host, "budget", return_value=budget):
+            for anonymous, allowed in ((budget - 8 * self.GiB, True), (budget - 8 * self.GiB + 1, False)):
+                with self.subTest(anonymous=anonymous):
+                    self.write(stat, f"anon {anonymous}\nfile 123456789\nfile_dirty 0\n")
+                    with unittest.mock.patch.dict(os.environ, {"CAGENTS_BUILD_PROC": str(self.proc)}):
+                        self.assertEqual(build_host.memory_allows(8 * self.GiB, str(stat)), allowed)
+            with unittest.mock.patch.dict(os.environ, {"CAGENTS_BUILD_PROC": str(self.proc)}):
+                # A slice no build has started holds nothing; one where no
+                # user manager is, or an unreadable one, bars them.
+                (self.root / "manager/background.slice").mkdir(parents=True)
+                self.assertTrue(build_host.memory_allows(
+                    8 * self.GiB, str(self.root / "manager/background.slice/builds.slice/memory.stat")))
+                self.assertFalse(build_host.memory_allows(
+                    8 * self.GiB, str(self.root / "elsewhere/background.slice/builds.slice/memory.stat")))
+                self.write(stat, "file 1\n")
+                self.assertFalse(build_host.memory_allows(8 * self.GiB, str(stat)))
+
+    def test_the_host_has_two_extra_shares_unless_its_share_count_is_configured(self):
+        for env, extra in (({}, 2), ({"CAGENTS_BUILD_SLOTS": "1"}, 0),
+                           ({"CAGENTS_BUILD_SLOTS": "1", "CAGENTS_BUILD_EXTRA_SHARES": "3"}, 3)):
+            with self.subTest(env=env), unittest.mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(build_host.extra_share_count(), extra)
+
+    def test_a_configured_share_count_has_no_extra_shares_unless_they_are_set(self):
+        env = {key: value for key, value in self.env.items() if key != "CAGENTS_BUILD_EXTRA_SHARES"}
+        result = self.run_host("build", "--wait-seconds", "1", "--", str(self.cargo), "mutex", env=env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertEqual(self.calls(), [])
+        result = self.run_host("build", "--", "true", env=self.env | {"CAGENTS_BUILD_EXTRA_SHARES": "x"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("CAGENTS_BUILD_EXTRA_SHARES must be a whole number", result.stderr)
 
 
 class CargoPhases(BuildHostFixture):
@@ -869,6 +1056,166 @@ class Slice(unittest.TestCase):
                          (False, []))
 
 
+class CacheTrimming(unittest.TestCase):
+    """Near its cap, the build slice drops page cache rather than letting the
+    kernel swap builds out."""
+
+    GiB = 2**30
+
+    def setUp(self):
+        self.scope = FixtureDirectory(prefix="cagents-cache-trim-")
+        self.addCleanup(self.scope.close)
+        self.slice = Path(self.scope.name) / "background-cagents.slice"
+        self.slice.mkdir()
+        self.lock = str(Path(self.scope.name) / "reclaim.lock")
+        tick = unittest.mock.patch.object(build_host, "RECLAIM_TICK", 0.005)
+        tick.start()
+        self.addCleanup(tick.stop)
+
+    def memory(self, current, cache, high, shmem=0):
+        """The slice's memory as cgroup v2 shows it: `cache` inactive page
+        cache, as much again active, and `shmem` of tmpfs counted as file."""
+        stat = (f"anon {max(0, current - 2 * cache - shmem)}\nfile {2 * cache + shmem}\n"
+                f"shmem {shmem}\nfile_dirty 0\ninactive_anon 0\nactive_anon 0\n"
+                f"inactive_file {cache}\nactive_file {cache}\n")
+        for name, value in (("memory.high", str(high)), ("memory.current", str(current)),
+                            ("memory.stat", stat)):
+            (self.slice / f".{name}").write_text(value + "\n")
+            (self.slice / f".{name}").replace(self.slice / name)
+
+    def trimmer(self):
+        trimmer = build_host.CacheTrimmer(str(self.slice), self.lock)
+        self.addCleanup(trimmer.close)
+        return trimmer
+
+    def asked(self):
+        reclaim = self.slice / "memory.reclaim"
+        return reclaim.read_text() if reclaim.exists() else None
+
+    def wait_for(self, predicate, label):
+        deadline = time.monotonic() + HANG_GUARD
+        while not predicate():
+            self.assertLess(time.monotonic(), deadline, f"timed out waiting for {label}")
+            time.sleep(0.002)
+
+    def test_cache_is_dropped_only_near_the_cap_and_only_when_enough_is_inactive(self):
+        G, high = self.GiB, 32 * self.GiB
+        self.assertEqual(build_host.cache_to_drop(30 * G, 8 * G, high), 0)
+        self.assertEqual(build_host.cache_to_drop(30 * G + 1, 8 * G, high), G + 1)
+        self.assertEqual(build_host.cache_to_drop(31 * G, 8 * G, high), 2 * G)
+        self.assertEqual(build_host.cache_to_drop(31 * G, 2 * G, high), 2 * G)
+        # Builds' own memory near the cap: dropping every inactive page would
+        # not reach the target, so the cache they use is left alone.
+        self.assertEqual(build_host.cache_to_drop(31 * G, 2 * G - 1, high), 0)
+        self.assertEqual(build_host.cache_to_drop(33 * G, G // 2, high), 0)
+        self.assertEqual(build_host.cache_to_drop(40 * G, 8 * G, None), 0)
+
+    def test_near_its_cap_the_slice_is_asked_to_drop_cache_alone(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        trimmer = self.trimmer()
+        self.wait_for(lambda: self.asked() == f"{2 * self.GiB} swappiness=0", "a reclaim of cache alone")
+        self.assertTrue(trimmer.thread.is_alive())
+
+    def test_far_from_its_cap_or_without_one_nothing_is_reclaimed(self):
+        for high in (32 * self.GiB, "max"):
+            with self.subTest(high=high):
+                self.memory(20 * self.GiB, 8 * self.GiB, high)
+                trimmer = self.trimmer()
+                self.wait_for(lambda: trimmer.leading is not None, "the trimmer to start")
+                time.sleep(0.05)
+                trimmer.close()
+                self.assertIsNone(self.asked())
+
+    def test_a_slice_that_is_not_there_yet_is_watched_for(self):
+        trimmer = self.trimmer()
+        self.wait_for(lambda: trimmer.leading is not None, "the trimmer to start")
+        time.sleep(0.05)
+        self.assertTrue(trimmer.thread.is_alive())
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        self.wait_for(lambda: self.asked() is not None, "a reclaim once the slice is there")
+
+    def test_one_build_host_trims_at_a_time_and_another_takes_over(self):
+        first = self.trimmer()
+        self.wait_for(lambda: first.leading is not None, "the first to lead")
+        second = self.trimmer()
+        time.sleep(0.05)
+        self.assertIsNone(second.leading)
+        first.close()
+        self.wait_for(lambda: second.leading is not None, "the second to take over")
+
+    def test_tmpfs_and_active_cache_are_not_counted_as_droppable(self):
+        # 2.5 GiB over the target, 1 GiB of it inactive cache: not enough.
+        self.memory(31 * self.GiB + self.GiB // 2, self.GiB, 32 * self.GiB, shmem=8 * self.GiB)
+        trimmer = self.trimmer()
+        self.wait_for(lambda: trimmer.leading is not None, "the trimmer to start")
+        time.sleep(0.05)
+        self.assertIsNone(self.asked())
+        self.assertTrue(trimmer.thread.is_alive())
+
+    def test_a_reclaim_the_kernel_could_not_finish_keeps_the_trimming(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        refused = threading.Event()
+        real_open = open
+
+        def partial(path, *arguments, **options):
+            if str(path).endswith("memory.reclaim"):
+                refused.set()
+                raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+            return real_open(path, *arguments, **options)
+
+        with unittest.mock.patch("builtins.open", partial):
+            trimmer = self.trimmer()
+            self.wait_for(refused.is_set, "a reclaim the kernel could not finish")
+            time.sleep(0.05)
+            self.assertTrue(trimmer.thread.is_alive())
+
+    def test_a_build_in_a_scope_trims_while_it_runs_and_one_in_place_does_not(self):
+        made = []
+
+        class Recorder:
+            def __init__(self, directory, lock):
+                self.closed = False
+                made.append(self)
+
+            def close(self):
+                self.closed = True
+
+        class NoJobserver:
+            def __init__(self, *arguments):
+                self.auth = None
+
+            def close(self):
+                pass
+
+        for scoped in (True, False):
+            with self.subTest(scoped=scoped), \
+                    unittest.mock.patch.object(build_host, "CacheTrimmer", Recorder), \
+                    unittest.mock.patch.object(build_host, "Jobserver", NoJobserver), \
+                    unittest.mock.patch.object(build_host, "prepare_slice", lambda: scoped), \
+                    unittest.mock.patch.object(build_host, "within_build", lambda: False), \
+                    unittest.mock.patch.object(build_host, "slice_directory", lambda: str(self.slice)):
+                made.clear()
+                with build_host.Build(0, None).admitted():
+                    self.assertEqual([trimmer.closed for trimmer in made], [False] if scoped else [])
+                self.assertEqual([trimmer.closed for trimmer in made], [True] if scoped else [])
+
+    def test_a_kernel_that_cannot_drop_cache_alone_ends_the_trimming(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        # Writing it fails as a kernel without swappiness= refuses it.
+        (self.slice / "memory.reclaim").mkdir()
+        trimmer = self.trimmer()
+        trimmer.thread.join(HANG_GUARD)
+        self.assertFalse(trimmer.thread.is_alive())
+
+    def test_unreadable_memory_ends_the_trimming(self):
+        self.memory(31 * self.GiB, 8 * self.GiB, 32 * self.GiB)
+        (self.slice / "memory.current").write_text("lots\n")
+        trimmer = self.trimmer()
+        trimmer.thread.join(HANG_GUARD)
+        self.assertFalse(trimmer.thread.is_alive())
+        self.assertIsNone(self.asked())
+
+
 def waiting(descriptor):
     count = array.array("i", [0])
     fcntl.ioctl(descriptor, termios.FIONREAD, count)
@@ -1019,9 +1366,15 @@ class Jobserver(unittest.TestCase):
         self.at_build_pace()
         idle = self.join()
         busy = self.join()
-        # The idle build keeps one in its pipe.
-        [held] = self.compiling([busy])
-        self.assertGreaterEqual(held, self.TOKENS - 2, held)
+        self.wait_for(lambda: waiting(idle.give) == 1, "the idle build's token in its pipe")
+        # Every token the idle build leaves comes to the busy one, each waited
+        # for rather than sampled, and comes back as its jobs end and start.
+        self.take(busy, self.TOKENS - 1)
+        for _ in range(20):
+            self.give_back(busy, 1)
+            self.take(busy, 1)
+        self.settle(idle, busy)
+        self.assertEqual(self.counts(idle, busy), (0, [1, self.TOKENS - 1]))
 
     def test_what_a_killed_build_host_took_is_given_back_by_another(self):
         other = self.join()

@@ -94,6 +94,29 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// The conversation as its actor now holds it: the source it started
+    /// from, with the provider conversation ID and continuity the actor has
+    /// learned since. A new conversation learns its ID only after it starts,
+    /// so `session` alone may name none.
+    pub(in crate::host) fn current_session(&self) -> Session {
+        let mut session = self.session.clone();
+        session.launch.session_id = self.handle.session_id();
+        session.native_continuity = self.handle.native_continuity();
+        session
+    }
+
+    /// `source` as its provider has named it since: this conversation's
+    /// current session when `source` is the one it started from. Any other
+    /// source, such as an alias an upgrade left, names an older identity
+    /// and keeps its own.
+    pub(in crate::host) fn names(&self, source: &Session) -> Session {
+        if self.session == *source {
+            self.current_session()
+        } else {
+            source.clone()
+        }
+    }
+
     /// The private recipe is installed only by the execution service after
     /// accepting this actor. A CLI basename or user-supplied argv is no proof.
     pub(super) fn owns_execution_console(&self) -> bool {
@@ -1975,16 +1998,22 @@ pub(super) fn shared_removal_in_transition(
             .values()
             .filter(|session| claims(session))
             .any(|session| {
-                state.chat_close_reservations.get(&session.id) != Some(session) || !same(session)
+                // An explicit Close's pane may name the conversation as it
+                // started or as its provider has named it since.
+                state
+                    .chat_close_reservations
+                    .get(&session.id)
+                    .is_none_or(|removal| {
+                        removal.source != *session || !(same(session) || same(&removal.current))
+                    })
             })
         || state
             .native_actor_startups
             .values()
             .any(|startup| claims(&startup.source) || claims(&startup.requested))
-        || state
-            .native_closing
-            .values()
-            .any(|closing| claims(closing.source()) && !same(closing.source()))
+        || state.native_closing.values().any(|closing| {
+            claims(closing.source()) && !(same(closing.source()) || same(closing.named()))
+        })
 }
 
 /// Why a native start that built its provider may no longer publish it.
@@ -3025,6 +3054,7 @@ fn start_publishing(
         }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);
+        state.chat_added(id);
         if let Some(context) = &execution {
             context.installed();
         }
@@ -4128,12 +4158,7 @@ fn process_inner(
                                     .is_some_and(|target| target.matches(record))
                             })
                 })
-                .map(|record| {
-                    let mut session = record.session.clone();
-                    session.launch.session_id = record.handle.session_id();
-                    session.native_continuity = record.handle.native_continuity();
-                    session
-                })
+                .map(Record::current_session)
                 .collect::<Vec<_>>();
             sessions.extend(
                 state
@@ -4774,16 +4799,17 @@ pub(super) fn close_captured(
     let source = target.source.clone();
     let closing = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if !state
+        let Some(current) = state
             .chats
             .get(&chat_id)
-            .is_some_and(|record| target.matches(record))
-        {
+            .filter(|record| target.matches(record))
+            .map(Record::current_session)
+        else {
             return Err(unavailable(
                 "The exact native attachment changed before close",
             ));
-        }
-        capacity::Reservation::removing(host, &mut state, &source)?
+        };
+        capacity::Reservation::removing(host, &mut state, &source, current)?
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
@@ -4941,9 +4967,7 @@ pub(super) fn resolve_upgrade(
                 "Restored native provider has closed; no writer was restarted",
             ));
         }
-        let mut session = record.session.clone();
-        session.launch.session_id = record.handle.session_id();
-        session.native_continuity = record.handle.native_continuity();
+        let session = record.current_session();
         (
             state.upgrade_chats.get(&source.id).cloned(),
             state.upgrade_evidence.clone(),

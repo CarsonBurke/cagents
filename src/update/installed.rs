@@ -74,7 +74,7 @@ pub(super) fn perform(
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &mut floor::Survivors,
     terminal: bool,
-) -> Result<(), UpdateError> {
+) -> Result<Handoff, UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
@@ -308,7 +308,7 @@ pub(super) fn perform(
     let reopened = guard
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    verify_reopened_service(&recovery, state, job)?;
+    let handoff_kind = verify_reopened_service(&recovery, state, job)?;
     if let Err(error) = reopened {
         return report_recovery_failure(
             state,
@@ -318,7 +318,7 @@ pub(super) fn perform(
             )),
         );
     }
-    result
+    result.map(|()| handoff_kind)
 }
 
 /// Store maintenance receives the reservation intentionally; status probes

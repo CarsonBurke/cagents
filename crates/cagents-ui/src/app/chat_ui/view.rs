@@ -532,13 +532,44 @@ fn composer_placeholder(mode: Option<PromptMode>, busy: bool) -> &'static str {
     }
 }
 
+/// What the composer says when it's empty. Nothing can be typed while the
+/// conversation changes hands, so it says nothing then. A refused
+/// conversation's box, read-only or not, says why it sends nothing, rather
+/// than inviting a message that has nowhere to go. Otherwise it names what
+/// the field is for.
+fn composer_hint(
+    transitioning: bool,
+    unsendable: Option<blocked_recovery::Unsendable>,
+    main_agent: bool,
+    mode: Option<PromptMode>,
+    busy: bool,
+) -> &'static str {
+    if transitioning {
+        ""
+    } else if let Some(unsendable) = unsendable {
+        unsendable.placeholder
+    } else if main_agent {
+        "Message main agent"
+    } else {
+        composer_placeholder(mode, busy)
+    }
+}
+
 /// The icon and tooltip for a submit control.
 ///
 /// `slot` is the control's place among the modes the provider currently
 /// allows, and `enter_sends` decides which chord the first of them answers to,
 /// so the tooltip names the key the composer is actually bound to rather than
 /// a fixed one.
-fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, String) {
+/// A submit control's icon and its name, which is also its tooltip. The name
+/// ends with the chord that presses it, or with `unsendable`, why it can't be
+/// pressed in a refused conversation, where no chord sends either.
+fn submit_control(
+    mode: PromptMode,
+    slot: usize,
+    enter_sends: bool,
+    unsendable: Option<blocked_recovery::Unsendable>,
+) -> (Icon, String) {
     let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
     let (name, verb, chord) = match (mode, slot) {
         (PromptMode::Send, _) => (Icon::Send, "Send message", primary),
@@ -547,7 +578,8 @@ fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (Icon, St
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
         (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", "Ctrl+Shift+Enter"),
     };
-    (name, format!("{verb} — {chord}"))
+    let tail = unsendable.map_or(chord, |unsendable| unsendable.reason);
+    (name, format!("{verb} — {tail}"))
 }
 /// The submit mode a composer key press asks for, or `None` when the press is
 /// ordinary editing.
@@ -959,10 +991,14 @@ fn bounded<'a>(
     }
 }
 
+/// How a turn the person stopped ended, in the words its stopped step and
+/// the timeline's marker use.
+pub(super) const TURN_STOPPED: &str = "Stopped";
+
 /// How a turn that finished with `snapshot` ended, as its provider said.
 pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
     match snapshot.detail.as_str() {
-        chat::TURN_INTERRUPTED => "Interrupted",
+        chat::TURN_INTERRUPTED => TURN_STOPPED,
         "Turn failed" => "Failed",
         _ => "Finished",
     }
@@ -2301,7 +2337,7 @@ impl Runtime {
             let label = self.finished_label();
             (
                 Some(match label {
-                    "Interrupted" => Icon::Cancel,
+                    TURN_STOPPED => Icon::Stop,
                     "Finished" => Icon::Check,
                     _ => Icon::Warning,
                 }),
@@ -3326,18 +3362,28 @@ impl Runtime {
             )
         };
         // Keep the transcript mounted in its original layer slot while the
-        // chooser is open, preserving its native scroll and selection state.
+        // chooser or the image viewer covers it, preserving its native scroll
+        // and selection state, and what arrives meanwhile, such as a message
+        // sent while looking at an image. Either holds the slot's extent, so
+        // the composer below doesn't move as it opens or closes. The chooser
+        // is the transient one, opened over the viewer and closed back to it.
         content.push(crate::interaction::exclusive_layer(
             transcript_layer,
-            self.child_picker_view().map(|picker| {
-                widget::container(
-                    widget::container(picker)
-                        .width(Length::Fill)
-                        .max_width(super::layout::READING_COLUMN),
-                )
-                .center_x(Length::Fill)
-                .into()
-            }),
+            self.child_picker_view()
+                .map(|picker| {
+                    widget::container(
+                        widget::container(picker)
+                            .width(Length::Fill)
+                            .max_width(super::layout::READING_COLUMN),
+                    )
+                    .center_x(Length::Fill)
+                    .into()
+                })
+                .or_else(|| {
+                    self.image_viewer.as_ref().map(|gallery| {
+                        gallery.pane_view(target, content_width, transcript_clearance)
+                    })
+                }),
         ));
         if selected.is_none() && self.unseen_activity && !self.active_scroll().at_bottom() {
             content.push(
@@ -3668,18 +3714,23 @@ impl Runtime {
         // the moment the preference changed. The steering and queueing modes
         // still say so, because there the mode is not what a reader expects
         // Enter to do.
-        let placeholder = if selected.is_some() {
-            "Message main agent"
-        } else {
-            composer_placeholder(modes.first().copied(), self.turn_running())
-        };
+        let unsendable = self
+            .start_blocked
+            .map(|reopen| reopen.unsendable(fresh_available));
+        let placeholder = composer_hint(
+            transitioning,
+            unsendable,
+            selected.is_some(),
+            modes.first().copied(),
+            self.turn_running(),
+        );
         // Key bindings must remain available while the editor changes its own
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
         // inserting a newline until another pointer event redraws the pane.
         // A first message still on its way keeps the binding too: Enter then
         // sends nothing, rather than breaking the line of the next draft.
-        let key_submit = if (available || self.queued.is_some()) && !self.start_blocked.is_some() {
+        let key_submit = if (available || self.queued.is_some()) && self.start_blocked.is_none() {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -3729,8 +3780,7 @@ impl Runtime {
                 && !self.is_draft());
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
-            // Nothing can be typed while the conversation changes hands.
-            .placeholder(if read_only { "" } else { placeholder })
+            .placeholder(placeholder)
             .size(design::TEXT_PROSE)
             .height(Length::Shrink)
             .max_height(composer_ceiling)
@@ -3760,11 +3810,15 @@ impl Runtime {
             // the queue, and is not left to fall through to that walk.
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
+            let viewing = self.image_viewer.is_some() && self.child_picker.is_none();
             editor
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
-                    if press.modifiers.command()
+                    // The transcript is under the viewer, so Ctrl+End stays
+                    // in the draft rather than scroll what can't be seen.
+                    if !viewing
+                        && press.modifiers.command()
                         && matches!(press.key, keyboard::Key::Named(keyboard::key::Named::End))
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
@@ -3808,11 +3862,23 @@ impl Runtime {
                             Action::AcceptSuggestion(target, suggestion.clone()),
                         )));
                     }
+                    let picking = self.model_picker.is_some()
+                        || self.account_picker
+                        || self.permission_picker;
+                    // Escape closes the topmost layer first: an open image
+                    // above the draft goes before a running turn, which the
+                    // next Escape interrupts.
+                    if viewing
+                        && !picking
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(Action::CloseImage(
+                            images::ViewerHost::Pane(target),
+                        ))));
+                    }
                     if snapshot.busy
                         && available
-                        && self.model_picker.is_none()
-                        && !self.account_picker
-                        && !self.permission_picker
+                        && !picking
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
                     {
                         return Some(text_editor::Binding::Custom(action(Action::Interrupt(
@@ -3822,9 +3888,20 @@ impl Runtime {
                     if let Some(mode) =
                         submit_chord(&press, key_submit.0, key_submit.1, enter_sends)
                     {
-                        return Some(text_editor::Binding::Custom(action(Action::Submit(
-                            target, mode,
-                        ))));
+                        let submit =
+                            text_editor::Binding::Custom(action(Action::Submit(target, mode)));
+                        // Once the question about the image is sent, the
+                        // keyboard goes back to the image, so the next Escape
+                        // closes it rather than interrupt the reply. Typing
+                        // still reaches the composer.
+                        return Some(if viewing {
+                            text_editor::Binding::Sequence(vec![
+                                submit,
+                                text_editor::Binding::Custom(action(Action::FocusImage(target))),
+                            ])
+                        } else {
+                            submit
+                        });
                     }
                     if take_back && queue_key(&press, self.composer.is_empty()) {
                         return Some(text_editor::Binding::Custom(action(
@@ -3863,7 +3940,7 @@ impl Runtime {
                             PromptMode::Steer if !self.turn_running() => PromptMode::Send,
                             mode => mode,
                         };
-                        let (name, tooltip) = submit_control(shown, slot, enter_sends);
+                        let (name, tooltip) = submit_control(shown, slot, enter_sends, unsendable);
                         crate::ui_controls::icon_button(name, tooltip)
                             .id(card_control_id(target.card, &format!("chat-submit-{slot}")))
                             .selected(slot == 0)
@@ -4005,7 +4082,7 @@ impl Runtime {
         let cost = usage
             .cost_microusd
             .map(|cost| {
-                let cost = format!("${:.2}", cost as f64 / 1_000_000.0);
+                let cost = dollars(cost);
                 (cost.clone(), cost)
             })
             .or_else(|| usage.cost_estimate.map(cost_estimate_label));
@@ -4470,7 +4547,14 @@ impl Runtime {
                                     (
                                         Icon::List,
                                         "Leave plan mode".into(),
-                                        format!("Return to {}", permission_mode_label(back)).into(),
+                                        format!(
+                                            "Return to {}",
+                                            permission_mode_label(
+                                                self.session.launch.provider,
+                                                back,
+                                            )
+                                        )
+                                        .into(),
                                         None,
                                     )
                                 }
@@ -4639,10 +4723,9 @@ impl Runtime {
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
                 controls.push(
-                    design::caption(
-                        selected
-                            .map_or("Permissions", |index| permission_mode_label(&modes[index])),
-                    )
+                    design::caption(selected.map_or("Permissions", |index| {
+                        permission_mode_label(self.session.launch.provider, &modes[index])
+                    }))
                     .into(),
                 );
             } else {
@@ -4652,11 +4735,12 @@ impl Runtime {
                     // the leading group little room; the chevron that says
                     // this is a picker keeps its place either way.
                     crate::ui_controls::trailing(
-                        crate::ui_controls::FadeText::caption(
-                            selected.map_or("Permissions", |index| {
-                                permission_mode_label(&modes[index])
-                            }),
-                        ),
+                        crate::ui_controls::FadeText::caption(selected.map_or(
+                            "Permissions",
+                            |index| {
+                                permission_mode_label(self.session.launch.provider, &modes[index])
+                            },
+                        )),
                         widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
                         step::GAP_XS,
                     ),
@@ -6757,7 +6841,20 @@ impl Runtime {
     }
 }
 
-pub(super) fn permission_mode_label(mode: &str) -> &str {
+/// The name of `provider`'s permission mode `mode`, which cagents knows by
+/// what it means. Muse's modes correspond only roughly to Claude's: they
+/// work by Muse's permission rules, so they keep Muse's own names, shortened.
+pub(super) fn permission_mode_label(provider: Provider, mode: &str) -> &str {
+    match (provider, mode) {
+        (Provider::Muse, "manual") => "Ask before unmatched",
+        (Provider::Muse, "auto") => "Ask on request",
+        (Provider::Muse, "dontAsk") => "Deny unmatched",
+        (Provider::Muse, "bypassPermissions") => "Allow all",
+        _ => generic_permission_mode_label(mode),
+    }
+}
+
+fn generic_permission_mode_label(mode: &str) -> &str {
     match mode {
         "default" | "manual" => "Ask before edits",
         "readOnly" => "Read only",
@@ -7072,12 +7169,18 @@ fn fast_mode_tooltip(mode: &crate::chat::FastMode) -> String {
     }
 }
 
-fn cost_estimate_label(estimate: crate::chat::pricing::CostEstimate) -> (String, String) {
-    let amount = if estimate.microusd > 0 && estimate.microusd < 10_000 {
+/// An amount in whole cents. A spend too small to round to one cent is
+/// still a spend, so it never reads as `$0.00`.
+fn dollars(microusd: u64) -> String {
+    if microusd > 0 && microusd < 10_000 {
         "<$0.01".to_owned()
     } else {
-        format!("${:.2}", estimate.microusd as f64 / 1_000_000.0)
-    };
+        format!("${:.2}", microusd as f64 / 1_000_000.0)
+    }
+}
+
+fn cost_estimate_label(estimate: crate::chat::pricing::CostEstimate) -> (String, String) {
+    let amount = dollars(estimate.microusd);
     let label = format!(
         "{amount} est.{}",
         if estimate.partial { " · observed" } else { "" }
@@ -7283,9 +7386,24 @@ fn footer_model_label<'a>(
             },
         }
     };
+    // A level the chosen model doesn't offer is not one it will run at: the
+    // conversation drops it when it switches to that model. An ACP agent's
+    // list names each model's levels as far as the agent has said, so a
+    // model listing none is not known to offer the level; other providers'
+    // lists can be missing.
+    let offered = |effort: &&str| {
+        selected.is_none_or(|model| {
+            if model.reasoning.is_empty() {
+                provider.acp().is_none()
+            } else {
+                model.reasoning.iter().any(|level| level == effort)
+            }
+        })
+    };
     let chosen = (active.is_none() || provider == Provider::Omp)
         .then_some(chosen.reasoning)
         .flatten()
+        .filter(offered)
         .filter(|effort| Some(*effort) != draft_default_effort);
     let effort = active.map_or(chosen, |active| {
         active
@@ -7584,6 +7702,9 @@ mod issue1506_tests;
 
 #[cfg(test)]
 mod user_image_preview_tests;
+
+#[cfg(test)]
+mod image_viewer_tests;
 
 #[cfg(test)]
 mod figure_tests;

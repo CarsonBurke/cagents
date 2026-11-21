@@ -8,7 +8,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefTip {
     /// The full ref name, such as `refs/heads/fix/login`.
-    pub refname: String,
+    pub refname: OsString,
     pub oid: String,
     pub committed_at_unix_ms: Option<u64>,
     /// The worktree that has this branch checked out.
@@ -55,8 +55,6 @@ pub fn parse_ref_tips(output: &[u8]) -> Result<Vec<RefTip>, GitParseError> {
                 format!("expected {TIP_FIELDS} fields, found {}", fields.len()),
             ));
         };
-        let refname = std::str::from_utf8(refname)
-            .map_err(|_| malformed(FORMAT, index, "ref name is not UTF-8"))?;
         if refname.is_empty() {
             return Err(malformed(FORMAT, index, "empty ref name"));
         }
@@ -68,7 +66,7 @@ pub fn parse_ref_tips(output: &[u8]) -> Result<Vec<RefTip>, GitParseError> {
             .map(|seconds| seconds.saturating_mul(1000));
         let worktree = (!worktree.is_empty()).then(|| bytes_path(worktree));
         tips.push(RefTip {
-            refname: refname.to_owned(),
+            refname: bytes_path(refname).into_os_string(),
             oid: oid.as_str().to_owned(),
             committed_at_unix_ms,
             worktree,
@@ -78,7 +76,7 @@ pub fn parse_ref_tips(output: &[u8]) -> Result<Vec<RefTip>, GitParseError> {
 }
 
 /// Parses `%(refname)%00%(ahead-behind:BASE)%00` records.
-pub fn parse_divergence(output: &[u8]) -> Result<BTreeMap<String, Divergence>, GitParseError> {
+pub fn parse_divergence(output: &[u8]) -> Result<BTreeMap<OsString, Divergence>, GitParseError> {
     const FORMAT: &str = "git for-each-ref ahead-behind";
     let mut counts = BTreeMap::new();
     for (index, record) in records(output).enumerate() {
@@ -89,11 +87,9 @@ pub fn parse_divergence(output: &[u8]) -> Result<BTreeMap<String, Divergence>, G
         else {
             return Err(malformed(FORMAT, index, "missing ahead-behind field"));
         };
-        let refname = std::str::from_utf8(refname)
-            .map_err(|_| malformed(FORMAT, index, "ref name is not UTF-8"))?;
         let divergence = parse_counts(counts_field)
             .ok_or_else(|| malformed(FORMAT, index, "ahead-behind is not two counts"))?;
-        counts.insert(refname.to_owned(), divergence);
+        counts.insert(bytes_path(refname).into_os_string(), divergence);
     }
     Ok(counts)
 }
@@ -121,7 +117,7 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
 }
 
 /// Keeps each argv far below `ARG_MAX`; refs are listed as patterns.
-fn ref_batches(refs: &[String]) -> impl Iterator<Item = &[String]> {
+fn ref_batches(refs: &[OsString]) -> impl Iterator<Item = &[OsString]> {
     const BUDGET: usize = 32 * 1024;
     let mut remaining = refs;
     std::iter::from_fn(move || {
@@ -230,9 +226,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         repository: &Path,
         base: &str,
-        refs: &[String],
+        refs: &[OsString],
         cancellation: &CancellationToken,
-    ) -> Result<BTreeMap<String, Divergence>, RepositoryError> {
+    ) -> Result<BTreeMap<OsString, Divergence>, RepositoryError> {
         let mut counts = BTreeMap::new();
         let format = format!("--format=%(refname)%00%(ahead-behind:{base})%00");
         for batch in ref_batches(refs) {
@@ -240,7 +236,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 repository,
                 ["for-each-ref".into(), OsString::from(&format)]
                     .into_iter()
-                    .chain(batch.iter().map(OsString::from)),
+                    .chain(batch.iter().cloned()),
             );
             let output = self.run_checked(&command, cancellation)?;
             // A pattern also matches refs below it (`refs/heads/fix` matches
@@ -260,9 +256,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         &self,
         repository: &Path,
         base: &str,
-        revision: &str,
+        revision: impl AsRef<OsStr>,
         cancellation: &CancellationToken,
     ) -> Result<Divergence, RepositoryError> {
+        let mut range = OsString::from(format!("{base}..."));
+        range.push(revision);
         let command = self
             .git_read(
                 repository,
@@ -270,7 +268,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     "rev-list".into(),
                     "--left-right".into(),
                     "--count".into(),
-                    OsString::from(format!("{base}...{revision}")),
+                    range,
                     "--".into(),
                 ],
             )
@@ -314,6 +312,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         match output.exit_code {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
+            _ => Err(git_failure(&command, output).into()),
+        }
+    }
+
+    /// The current branch's exact bytes, including an unborn branch. A
+    /// detached head has no branch; unlike status, this read never decodes
+    /// the ref name for display.
+    pub fn symbolic_branch(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<OsString>, RepositoryError> {
+        let command = self.git_read(worktree, ["symbolic-ref", "--quiet", "HEAD"]);
+        let output = self.run(&command, cancellation)?;
+        match output.exit_code {
+            Some(0) => {
+                let refname = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+                let branch = refname.strip_prefix(b"refs/heads/").unwrap_or(refname);
+                Ok(Some(bytes_path(branch).into_os_string()))
+            }
+            Some(1) => Ok(None),
             _ => Err(git_failure(&command, output).into()),
         }
     }
@@ -439,17 +458,72 @@ mod tests {
     }
 
     #[test]
+    fn ref_tips_keep_non_utf8_names_without_aliasing_supported_refs() {
+        let mut output = b"refs/heads/legacy-\xff\0".to_vec();
+        output.extend_from_slice(
+            format!(
+                "{A}\0\0\0\nrefs/heads/main\0{A}\0\0\0\n\
+                 refs/heads/legacy-\u{fffd}\0{B}\0\0\0\n"
+            )
+            .as_bytes(),
+        );
+        let tips = parse_ref_tips(&output).unwrap();
+        assert_eq!(tips.len(), 3);
+        assert_eq!(
+            tips[0].refname.as_encoded_bytes(),
+            b"refs/heads/legacy-\xff"
+        );
+        assert_eq!(tips[0].oid, A);
+        assert_eq!(tips[1].refname, "refs/heads/main");
+        assert_eq!(tips[2].refname, "refs/heads/legacy-\u{fffd}");
+        assert_eq!(tips[2].oid, B);
+    }
+
+    #[test]
+    fn divergence_keeps_non_utf8_names_without_aliasing_supported_refs() {
+        let mut output = "refs/heads/main\x000 0\0\nrefs/heads/legacy-\u{fffd}\x001 2\0\n"
+            .as_bytes()
+            .to_vec();
+        // Keep the invalid name last so a lossy key would overwrite the
+        // literal replacement-character branch's counts.
+        output.extend_from_slice(b"refs/heads/legacy-\xff\x009 77\0\n");
+        let counts = parse_divergence(&output).unwrap();
+        assert_eq!(counts.len(), 3);
+        assert_eq!(
+            counts[OsStr::new("refs/heads/main")],
+            Divergence {
+                ahead: 0,
+                behind: 0
+            }
+        );
+        assert_eq!(
+            counts[OsStr::new("refs/heads/legacy-\u{fffd}")],
+            Divergence {
+                ahead: 1,
+                behind: 2
+            }
+        );
+        assert_eq!(
+            counts[bytes_path(b"refs/heads/legacy-\xff").as_os_str()],
+            Divergence {
+                ahead: 9,
+                behind: 77
+            }
+        );
+    }
+
+    #[test]
     fn divergence_counts_parse_per_ref() {
         let counts = parse_divergence(b"refs/heads/a\x009 77\0\nrefs/heads/b\x000 0\0\n").unwrap();
         assert_eq!(
-            counts["refs/heads/a"],
+            counts[OsStr::new("refs/heads/a")],
             Divergence {
                 ahead: 9,
                 behind: 77
             }
         );
         assert_eq!(
-            counts["refs/heads/b"],
+            counts[OsStr::new("refs/heads/b")],
             Divergence {
                 ahead: 0,
                 behind: 0
@@ -461,11 +535,101 @@ mod tests {
     #[test]
     fn ref_batches_cover_every_ref_in_order() {
         let refs = (0..5000)
-            .map(|index| format!("refs/heads/branch-{index:05}"))
+            .map(|index| OsString::from(format!("refs/heads/branch-{index:05}")))
             .collect::<Vec<_>>();
         let batches = ref_batches(&refs).collect::<Vec<_>>();
         assert!(batches.len() > 1);
         assert_eq!(batches.concat(), refs);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compares_non_utf8_revision_without_aliasing_lossy_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |arguments: &[OsString]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=Test", "-c", "user.email=me@example.com"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(arguments)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {arguments:?}: {output:?}");
+            output.stdout
+        };
+        git(&["init".into(), "-q".into()]);
+        git(&[
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "base".into(),
+        ]);
+        let base = String::from_utf8(git(&["rev-parse".into(), "HEAD".into()]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        git(&[
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "raw branch".into(),
+        ]);
+        let raw_ref = bytes_path(b"refs/heads/legacy-\xff").into_os_string();
+        git(&["update-ref".into(), raw_ref.clone(), "HEAD".into()]);
+        git(&[
+            "commit".into(),
+            "-q".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            "literal branch".into(),
+        ]);
+        let literal_ref = OsStr::new("refs/heads/legacy-\u{fffd}");
+        git(&["update-ref".into(), literal_ref.into(), "HEAD".into()]);
+
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::new();
+        // This is also the board's per-ref compare fallback. Distinct
+        // counts prove the Git revision argument retained the invalid byte.
+        assert_eq!(
+            service
+                .revision_divergence(root, &base, &raw_ref, &cancellation)
+                .unwrap(),
+            Divergence {
+                ahead: 1,
+                behind: 0
+            }
+        );
+        assert_eq!(
+            service
+                .revision_divergence(root, &base, literal_ref, &cancellation)
+                .unwrap(),
+            Divergence {
+                ahead: 2,
+                behind: 0
+            }
+        );
+        assert_eq!(
+            git(&[
+                "for-each-ref".into(),
+                "--format=%(refname)".into(),
+                raw_ref.clone()
+            ]),
+            [raw_ref.as_encoded_bytes(), b"\n"].concat()
+        );
     }
 
     /// Exercises the real Git commands against a throwaway repository with a
@@ -589,13 +753,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            counts.get("refs/heads/main"),
+            counts.get(OsStr::new("refs/heads/main")),
             Some(&Divergence {
                 ahead: 1,
                 behind: 0
             })
         );
-        assert!(!counts.contains_key("refs/heads/missing"));
+        assert!(!counts.contains_key(OsStr::new("refs/heads/missing")));
         // The per-ref fallback for Git older than 2.41 agrees.
         assert_eq!(
             service
@@ -606,7 +770,7 @@ mod tests {
                     &cancellation
                 )
                 .unwrap(),
-            counts["refs/heads/main"]
+            counts[OsStr::new("refs/heads/main")]
         );
         assert_eq!(
             service
