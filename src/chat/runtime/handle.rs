@@ -606,6 +606,17 @@ impl Handle {
             Owner::Remote(remote) => remote.state().finished_at,
         }
     }
+    /// The conversation's prompt cache activity, and the context its next
+    /// request reads, as of the latest observation.
+    pub(crate) fn prompt_cache(&self) -> (chat::prompt_cache::Activity, u64) {
+        match &self.0 {
+            Owner::Local(local) => (local.prompt_cache(), local.context_tokens()),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                (state.prompt_cache.clone(), state.usage.context_tokens)
+            }
+        }
+    }
     pub fn owns_work(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.owns_work(),

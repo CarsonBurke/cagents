@@ -2011,6 +2011,7 @@ fn codex_cost_estimate_keeps_active_turn_tariff_through_model_and_fast_changes()
 
 fn adapter() -> Codex {
     Codex {
+        cache_reading_total: 0,
         server_identity: None,
         retained_identity: None,
         thread: Some("thread-exact".into()),
@@ -6491,4 +6492,59 @@ fn a_stopped_turn_settles_its_command_and_marks_the_stop_once() {
     // The same marker as the live one, so reading history again does not
     // add a second.
     assert_eq!(last.id, markers[0].id);
+}
+
+#[test]
+fn codex_reports_each_request_and_what_the_cache_served() {
+    use crate::chat::prompt_cache::Evidence;
+    let evidence = |step: Step| {
+        step.events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PromptCache(evidence) => Some(evidence),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let usage = |total: u64, last: u64, cached: u64| {
+        json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-exact",
+            "turnId":"turn","tokenUsage":{
+                "total":{"inputTokens":total,"cachedInputTokens":0,"outputTokens":300},
+                "last":{"inputTokens":last,"cachedInputTokens":cached,"outputTokens":300}}}})
+    };
+    let mut adapter = adapter();
+    let started = adapter
+        .receive(
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn","status":"inProgress","items":[]}}}),
+        )
+        .unwrap();
+    assert_eq!(evidence(started), [Evidence::Request]);
+    // Codex reports the first request's usage only after its command ran,
+    // and the command's output goes back in a request that continues it;
+    // the user's own message is not one.
+    let command = adapter
+        .receive(
+            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn",
+            "item":{"id":"c","type":"commandExecution","command":"ls","cwd":"/repo",
+                "status":"completed","aggregatedOutput":""}}}),
+        )
+        .unwrap();
+    assert_eq!(evidence(command), [Evidence::Continued]);
+    let user = adapter
+        .receive(
+            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn",
+            "item":{"id":"u","type":"userMessage","content":[{"type":"text","text":"Go on"}]}}}),
+        )
+        .unwrap();
+    assert!(evidence(user).is_empty());
+    assert_eq!(
+        evidence(adapter.receive(usage(80_000, 80_000, 70_000)).unwrap()),
+        [Evidence::Read {
+            prompt: 80_000,
+            cached: 70_000,
+        }]
+    );
+    // A failed request repeats the latest reading.
+    assert!(evidence(adapter.receive(usage(80_000, 80_000, 70_000)).unwrap()).is_empty());
 }

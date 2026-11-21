@@ -389,6 +389,8 @@ pub(crate) struct HostState {
     published_terminal_workers: removal::PublishedWorkers,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) native_chat_capacity: usize,
+    /// How long each provider account's prompt caches last, as observed.
+    pub(super) prompt_cache: Arc<super::agent_execution::prompt_cache::Calibration>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
@@ -538,6 +540,7 @@ impl HostState {
             published_terminal_workers: Default::default(),
             shutdown_capabilities: VecDeque::new(),
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
+            prompt_cache: Arc::new(super::agent_execution::prompt_cache::Calibration::in_memory()),
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
