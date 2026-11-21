@@ -4247,6 +4247,38 @@ fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
     assert!(!app.chat_start_pending(card), "no switch was attempted");
 }
 
+#[test]
+fn omp_snapshot_error_renders_provider_reason_once_while_idle() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat_for_provider(&mut app, Provider::Omp, Some("omp-error"));
+    show_chat_snapshot_for_test(
+        &mut app,
+        card,
+        Snapshot {
+            ready: true,
+            busy: false,
+            error: Some("API quota exhausted".into()),
+            ..Snapshot::default()
+        },
+    );
+
+    let text = visible_text(&app, card);
+    assert_eq!(
+        text.iter()
+            .map(|text| text.matches("API quota exhausted").count())
+            .sum::<usize>(),
+        1,
+        "the provider reason must appear once in the chat view: {text:#?}"
+    );
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.snapshot.ready);
+    assert!(!runtime.snapshot.busy);
+    assert_eq!(
+        runtime.snapshot.activity(),
+        crate::agent::ActivityState::Idle
+    );
+}
+
 /// The text `card`'s view lays out within 900 by 980, in order. The
 /// footer's fit follows the workspace's geometry for the card, not this
 /// limit, so a test of the wide footer resizes the workspace first.
