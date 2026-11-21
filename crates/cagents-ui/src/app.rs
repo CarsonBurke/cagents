@@ -11017,7 +11017,7 @@ impl Cagents {
         // early and so skip the check at the end of `update`.
         tasks.push(self.flush_settings_on_blur());
         let mut schedule_delayed_sweep = false;
-        let mut reconcile_now = false;
+        let mut reconcile_now = focus_changed;
         for transition in update.transitions {
             tracing::debug!(target: "cagents::pane_open", stage = "visibility", card = ?transition.id, to = ?transition.to);
             self.set_exposure(transition.id, transition.to.into());
@@ -11326,9 +11326,13 @@ impl Cagents {
         prefetch: &HashSet<CardId>,
     ) -> (Task<Message>, Projection) {
         let now = Instant::now();
-        let actions = self
-            .lifecycle
-            .reconcile_in_flight(visible, passing, prefetch, now);
+        let actions = self.lifecycle.reconcile_focused_in_flight(
+            visible,
+            passing,
+            prefetch,
+            self.workspace.focused(),
+            now,
+        );
         let projection = if actions
             .iter()
             .all(|action| matches!(action, LifecycleAction::SetExposure { .. }))
