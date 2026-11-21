@@ -436,7 +436,15 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
         b"trap 'exit 3' HUP; bash -c 'trap \"printf hup > graceful-hup; exit 0\" HUP; echo $$ > child.pid; printf READY_GRACEFUL; while :; do sleep 0.05; done' &\n",
         "bash",
     );
+    let started = Instant::now();
     let outcome = shell.terminal.shutdown();
+    // A family that exits on hangup closes the PTY at once; shutdown must not
+    // wait out the drain budget kept for jobs that linger.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a family that exits on hangup must not wait for the drain deadline: {elapsed:?}"
+    );
     assert!(
         outcome.is_ok(),
         "shutdown: {outcome:?}; HUP marker: {:?}; events: {:?}",
@@ -478,8 +486,14 @@ fn ordinary_shutdown_leaves_a_process_that_left_the_session_holding_the_pty() {
         b"setsid -f sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60'\n",
         "sleep",
     );
+    let started = Instant::now();
     let outcome = shell.terminal.shutdown();
+    let elapsed = started.elapsed();
     assert!(outcome.is_ok(), "shutdown: {outcome:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a PTY held outside the family must not delay shutdown: {elapsed:?}"
+    );
     assert!(
         !holder::exits_within(&outside.0, Duration::ZERO).unwrap(),
         "ordinary shutdown must not stop a process outside the terminal's family"

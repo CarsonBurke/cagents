@@ -519,7 +519,9 @@ fn this_daemon() -> libc::pid_t {
 /// without a session of their own. Neither is ever that terminal's job:
 /// stopping them would stop the daemon itself. Descent stops where a child
 /// leaves the daemon's session, so every terminal holder, and the family
-/// each holder's root leads, remains outside this set.
+/// each holder's root leads, remains outside this set. A helper's child that
+/// outlived its parent was reparented away and is no longer recognizable as
+/// the daemon's; it is treated like any other session member.
 fn daemon_subtree(
     daemon: libc::pid_t,
     processes: &[CloseProcess],

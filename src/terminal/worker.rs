@@ -6068,7 +6068,7 @@ fn shutdown_child_exit(
                         if let Err(error) = stopped {
                             tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
                             if let Err(error) = child.force_kill() {
-                                tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
+                                tracing::warn!(%error, "could not kill the pinned terminal root");
                             }
                         }
                     }
@@ -6092,7 +6092,7 @@ fn shutdown_child_exit(
                 {
                     tracing::warn!(%error, "could not stop terminal family; escalating only the pinned root");
                     if let Err(error) = child.kill() {
-                        tracing::warn!(%error, "could not hang up the complete terminal family");
+                        tracing::warn!(%error, "could not hang up the pinned terminal root");
                     }
                     if !child
                         .exited_within(
@@ -6135,18 +6135,27 @@ fn confirm_exited_family(
     master: &holder::PtyMaster,
     deadline: Instant,
 ) -> Result<(), String> {
-    // Reconcile natural completion if the shell is already gone. A job can
-    // fork between thaw and HUP, so give the PTY's last holders the bounded
-    // budget to close it. The hangup only ends that wait: a process outside
-    // the family (one that left the session, such as `setsid -f`) may keep
-    // the PTY open, and cleanup never claims or depends on it.
+    let ended = |deadline| -> Result<bool, String> {
+        Ok(child
+            .exited_within(Duration::ZERO)
+            .map_err(|error| format!("observe child exit: {error}"))?
+            && close_processes::session_is_empty(child.pid(), deadline)?)
+    };
+    // Usually the family is already gone. A process outside it (one that left
+    // the session, such as `setsid -f`) may keep the PTY open indefinitely;
+    // cleanup never claims or depends on it, so its PTY is no reason to wait.
+    if ended(deadline)? {
+        return Ok(());
+    }
+    // A job can fork between thaw and HUP, outside the tracked set. Give the
+    // session's last members the bounded budget to finish, ending early once
+    // nothing holds the PTY, and keep the final census its own time.
     let master = master.duplicate().map_err(|error| error.to_string())?;
     let mut target = libc::pollfd {
         fd: master.as_raw_fd(),
         events: 0,
         revents: 0,
     };
-    // Leave the final census its own time, whatever the wait consumed.
     let drained = deadline
         .checked_sub(CHILD_SHUTDOWN_CENSUS_RESERVE)
         .unwrap_or(deadline);
@@ -6168,11 +6177,7 @@ fn confirm_exited_family(
             _ => break,
         }
     }
-    if child
-        .exited_within(Duration::ZERO)
-        .map_err(|error| format!("observe child exit: {error}"))?
-        && close_processes::session_is_empty(child.pid(), deadline)?
-    {
+    if ended(deadline)? {
         Ok(())
     } else {
         Err("Terminal process cleanup remains unconfirmed".into())
