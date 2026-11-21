@@ -13842,16 +13842,18 @@ mod row_interaction {
     use cosmic::{Element, Renderer, Theme};
     use std::{cell::Cell, rc::Rc};
 
-    /// Whether a row scrolled out of the list's view can let `event` pass it
-    /// by. These are what every widget in the window receives on each frame
-    /// or message: a redraw, the runtime's resize request, and pointer
-    /// motion. A row out of view can't be under the pointer, and either isn't
-    /// drawn or, as a member passing under its group's pinned header, is
-    /// drawn hidden by it. Whatever its widgets would note from these, such as
-    /// their hover status, they note from the redraw that precedes their next
-    /// visible draw. Keys, modifier changes, presses and releases still reach
-    /// every row, since a focused or pressed row may be scrolled away.
-    fn unseen_rows_may_skip(event: &Event) -> bool {
+    /// Whether `event` is one every widget in the window receives on each
+    /// frame or message: a redraw, the runtime's resize request, or pointer
+    /// motion. None of these moves focus.
+    ///
+    /// A row scrolled out of the list's view can let these pass it by. It
+    /// can't be under the pointer, and either isn't drawn or, as a member
+    /// passing under its group's pinned header, is drawn hidden by it.
+    /// Whatever its widgets would note from these, such as their hover
+    /// status, they note from the redraw that precedes their next visible
+    /// draw. Keys, modifier changes, presses and releases still reach every
+    /// row, since a focused or pressed row may be scrolled away.
+    fn routine(event: &Event) -> bool {
         matches!(
             event,
             Event::Window(window::Event::RedrawRequested(_))
@@ -13973,7 +13975,9 @@ mod row_interaction {
     #[derive(Default)]
     struct State {
         modifiers: keyboard::Modifiers,
-        selection_bounds: Option<Rectangle>,
+        /// Where the row's own target sits, relative to the row, so that it
+        /// follows the row when a pinned header or the list moves it.
+        selection_area: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
         dragging: bool,
         drop: Option<(Option<super::SelectionRow>, f32)>,
@@ -13982,6 +13986,11 @@ mod row_interaction {
         /// Whether any control in the row has focus, such as its delete
         /// button, not only the row's own target.
         focus_within: bool,
+        /// Whether `focused`, `focus_within` and `selection_area` are
+        /// current: they are found again after each event that may move
+        /// focus and each operation, and lapse when the row is rebuilt or
+        /// laid out again.
+        focus_known: bool,
         /// Whether the last layout narrowed the base row for its actions.
         revealed: bool,
         /// Whether something in the row, such as a menu, was open the last
@@ -13989,6 +13998,14 @@ mod row_interaction {
         overlaid: Cell<bool>,
         header_node: Option<layout::Node>,
         scroll: Option<Box<FilterScrollState>>,
+    }
+
+    impl State {
+        /// Where the row's own target is drawn in `layout`.
+        fn selection_bounds(&self, layout: Layout<'_>) -> Option<Rectangle> {
+            self.selection_area
+                .map(|area| area + (layout.position() - Point::ORIGIN))
+        }
     }
 
     struct FilterScrollState {
@@ -14175,8 +14192,11 @@ mod row_interaction {
             }
             let state = tree.state.downcast_mut::<State>();
             state.focused = focus.0;
-            state.selection_bounds = focus.2;
+            state.selection_area = focus
+                .2
+                .map(|bounds| bounds - (layout.position() - Point::ORIGIN));
             state.focus_within = focus.3;
+            state.focus_known = true;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -14300,6 +14320,7 @@ mod row_interaction {
                 }
             }
             tree.diff_children(&mut self.children);
+            tree.state.downcast_mut::<State>().focus_known = false;
             if let Kind::Reorder {
                 ids,
                 disabled,
@@ -14332,6 +14353,8 @@ mod row_interaction {
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
+            // Where the row's target sits may change with the layout.
+            tree.state.downcast_mut::<State>().focus_known = false;
             // Overlay controls are on screen only while the row is hovered or
             // focused, so only then does the base row lose the width they
             // cover. Every other frame the title is measured against the whole
@@ -14464,7 +14487,7 @@ mod row_interaction {
             viewport: &Rectangle,
         ) {
             // Without this, every frame and every message walks each of a
-            // long list's rows and their focus, however few are in view. A
+            // long list's rows, however few are in view. A
             // row that last saw the pointer, or that a drag started in, still
             // hears the event that tells it the pointer has gone. A row with
             // focus anywhere in it keeps every frame: its focused control may
@@ -14477,17 +14500,22 @@ mod row_interaction {
             // So does a row whose tooltip or menu is still on screen: a
             // tooltip fades out over the frames after the pointer leaves, and
             // would stay frozen there without them.
+            let routine = routine(event);
             let state = tree.state.downcast_ref::<State>();
             if !layout.bounds().intersects(viewport)
                 && !state.hovered
                 && !state.focus_within
                 && !state.overlaid.get()
                 && state.origin.is_none()
-                && unseen_rows_may_skip(event)
+                && routine
             {
                 return;
             }
-            self.focus(tree, layout, renderer);
+            // Finding focus walks the row's controls, so a frame that moves
+            // no focus relies on what the last event or operation found.
+            if !routine || !state.focus_known {
+                self.focus(tree, layout, renderer);
+            }
             if let Kind::Reorder {
                 viewport: sticky, ..
             } = &self.kind
@@ -14564,7 +14592,7 @@ mod row_interaction {
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                         if hovered
                             && state
-                                .selection_bounds
+                                .selection_bounds(layout)
                                 .is_some_and(|bounds| cursor.is_over(bounds)) =>
                     {
                         // A plain click is navigation: the row's own button
@@ -14822,10 +14850,12 @@ mod row_interaction {
                     break;
                 }
             }
-            let focused = tree.state.downcast_ref::<State>().focused;
-            self.focus(tree, layout, renderer);
-            if reserves && tree.state.downcast_ref::<State>().focused != focused {
-                shell.invalidate_layout();
+            if !routine {
+                let focused = tree.state.downcast_ref::<State>().focused;
+                self.focus(tree, layout, renderer);
+                if reserves && tree.state.downcast_ref::<State>().focused != focused {
+                    shell.invalidate_layout();
+                }
             }
         }
 
@@ -14981,7 +15011,7 @@ mod row_interaction {
             if matches!(self.kind, Kind::Selectable { selected: true, .. }) {
                 // The row's own button, not the indented slot around it, so
                 // the mark lines up with the active row's highlight.
-                let bounds = state.selection_bounds.unwrap_or(layout.bounds());
+                let bounds = state.selection_bounds(layout).unwrap_or(layout.bounds());
                 if let Some(clip) = bounds.intersection(viewport) {
                     renderer.with_layer(clip, |renderer| {
                         renderer.fill_quad(
