@@ -169,6 +169,37 @@ impl Homes {
             .join(key.hyphenated().to_string())
     }
 
+    #[cfg(any(feature = "host", test))]
+    fn released_marker(&self, provider: Provider, key: Uuid) -> PathBuf {
+        self.provider_directory(provider)
+            .join(format!(".released-{}", key.hyphenated()))
+    }
+
+    /// Records that this home's sign-in was given up beside the home rather
+    /// than in the account list, so it survives that list's loss. The marker
+    /// is never removed while the home exists.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn mark_released(&self, provider: Provider, key: Uuid) -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        crate::secure_file::prepare_private_directory(&self.provider_directory(provider))?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(self.released_marker(provider, key))?;
+        Ok(())
+    }
+
+    /// Whether a regular marker beside the home records that its sign-in
+    /// was given up, even if the account list was lost.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn is_released(&self, provider: Provider, key: Uuid) -> bool {
+        fs::symlink_metadata(self.released_marker(provider, key))
+            .is_ok_and(|metadata| metadata.is_file())
+    }
+
     /// Whether `key` names a home of `provider` that exists as this user's
     /// own real directory, reached through no link. A removed home is parked
     /// and then deleted, so it never is.
@@ -195,7 +226,8 @@ impl Homes {
     /// A registry that was lost or reset leaves its homes here with their
     /// logins and histories. Only directories named exactly by a key are
     /// candidates: a parked removal (`.removing-<key>`) is on its way out,
-    /// and anything else in the directory is not a home cagents made.
+    /// and anything else in the directory is not a home cagents made. A home
+    /// with a released-sign-in marker (`.released-<key>`) is not offered.
     #[cfg(any(feature = "host", test))]
     pub(crate) fn unregistered(
         &self,
@@ -223,6 +255,7 @@ impl Homes {
                 // `parse_str` also accepts braced, simple and URN spellings,
                 // which are not the name cagents gives a home.
                 if entry.path() != self.path(provider, key)
+                    || self.is_released(provider, key)
                     || !self.is_unregistered(registry, provider, key)
                 {
                     continue;

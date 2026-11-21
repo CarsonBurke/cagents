@@ -226,8 +226,8 @@ resume where their history is:
 - A home whose provider reports no sign-in, such as a sign-in that never
   finished, is left exactly as it is.
 - A home left by a sign-in that was not kept, because it duplicated a listed
-  account or was cancelled, is not an account the list lost. The list records
-  it, and it is left as it is while that record remains.
+  account or was cancelled, is not an account the list lost. A marker beside
+  the home records it, so it is left as it is even if the account list is lost.
 - Partly removed homes (`.removing-*`), linked homes, and homes under an
   account list written by a newer cagents are never touched.
 - If the provider cannot be asked, for example because it timed out, the
