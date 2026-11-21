@@ -1,4 +1,4 @@
-//! Focused contracts against the UI's vendored iced core.
+//! Focused contracts against the UI's vendored iced core and graphics.
 
 // Keep shared-cache artifacts tied to the checkout even outside the test harness.
 const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
@@ -289,5 +289,99 @@ mod native_identity {
         assert!(click(&mut replacement, &mut tree, retired).is_empty());
         let current = published_id(&replacement, &tree);
         assert_eq!(click(&mut replacement, &mut tree, current), vec![100]);
+    }
+}
+
+/// The renderer keeps a group's prepared glyphs while its paragraphs and
+/// editors are the ones it last drew. One reshaped, edited or dropped since is
+/// not. Cached text the group drew stays shaped while the group is kept.
+#[cfg(test)]
+mod drawn_identity {
+    use iced_core::text::{self, Editor as _, Paragraph as _, editor};
+    use iced_core::{Font, Pixels, Size, alignment};
+    use iced_graphics::text::{Editor, Paragraph, cache};
+
+    fn paragraph(content: &str) -> Paragraph {
+        Paragraph::with_text(text::Text {
+            content,
+            bounds: Size::new(200.0, 100.0),
+            size: Pixels(14.0),
+            line_height: text::LineHeight::default(),
+            font: Font::DEFAULT,
+            align_x: text::Alignment::Default,
+            align_y: alignment::Vertical::Top,
+            shaping: text::Shaping::Basic,
+            wrapping: text::Wrapping::Word,
+            ellipsize: text::Ellipsize::default(),
+        })
+    }
+
+    #[test]
+    fn a_drawn_paragraph_stays_the_same_only_until_reshaped_or_dropped() {
+        let mut current = paragraph("Parser cache work");
+        let drawn = current.downgrade();
+        assert!(current.downgrade().is_same_live(&drawn));
+        assert!(
+            !paragraph("Parser cache work")
+                .downgrade()
+                .is_same_live(&drawn)
+        );
+
+        // Reshaping while the last frame still refers to the paragraph must
+        // not leave that frame's glyphs looking current.
+        current.resize(Size::new(80.0, 100.0));
+        assert!(!current.downgrade().is_same_live(&drawn));
+
+        let reshaped = current.downgrade();
+        drop(current);
+        assert!(!reshaped.is_same_live(&reshaped.clone()));
+    }
+
+    #[test]
+    fn a_drawn_editor_stays_the_same_only_until_edited_or_dropped() {
+        let mut current = Editor::with_text("Parser cache work");
+        let drawn = current.downgrade();
+        assert!(current.downgrade().is_same_live(&drawn));
+        assert!(
+            !Editor::with_text("Parser cache work")
+                .downgrade()
+                .is_same_live(&drawn)
+        );
+
+        current.perform(editor::Action::Edit(editor::Edit::Insert('!')));
+        assert!(!current.downgrade().is_same_live(&drawn));
+
+        let edited = current.downgrade();
+        drop(current);
+        assert!(!edited.is_same_live(&edited.clone()));
+    }
+
+    #[test]
+    fn kept_cached_text_survives_a_trim() {
+        let mut font_system = iced_graphics::text::font_system()
+            .write()
+            .expect("Write font system");
+        let mut cache = iced_graphics::text::Cache::new();
+        let key = |content| cache::Key {
+            content,
+            size: 14.0,
+            line_height: 18.0,
+            font: Font::DEFAULT,
+            bounds: Size::new(200.0, 100.0),
+            shaping: text::Shaping::Basic,
+            align_x: text::Alignment::Default,
+        };
+
+        let (kept, _) = cache.allocate(font_system.raw(), key("Kept"));
+        let (dropped, _) = cache.allocate(font_system.raw(), key("Dropped"));
+        cache.trim();
+
+        cache.keep(kept);
+        cache.trim();
+        assert!(cache.get(&kept).is_some());
+        assert!(cache.get(&dropped).is_none());
+
+        cache.trim();
+        assert!(cache.get(&kept).is_none());
     }
 }

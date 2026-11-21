@@ -25,3 +25,7 @@ it, so they agree. Spans without these are shaped as upstream shapes them.
 # Editor overscan (#2824)
 
 `Editor::set_overscan` forwards to cosmic-text's `Buffer::set_overscan`, and `Editor::overflow` reports how far the drawn runs reach above and below the text area, clamped to the overscan. Selection regions, the caret and the highlighter window cover the overscan bands too, so a selection or highlight continues into the padding. See vendor/cosmic-text/LOCAL_CHANGES.md; the app regression is `editor_widget::tests::native_overscan_draws_text_past_the_viewport_and_reports_how_far`.
+
+# Drawn-text identity (#3564)
+
+`paragraph::Weak::is_same_live` and `editor::Weak::is_same_live` tell whether two weak references refer to the same live paragraph or editor. A paragraph is reshaped with `Arc::make_mut` and an editor is edited by unwrapping and rewrapping its `Arc`, so either moves to a new allocation while a frame's weak reference is outstanding; the same reference therefore means the same contents. iced_wgpu uses this to reuse a frame's prepared text (vendor/iced-wgpu/README.cagents.md). `cache::Cache::keep` keeps an entry through the next trim without allocating it, so a group whose glyphs are reused keeps its shaped cached text. `drawn_identity` in `crates/iced-contracts` covers both.

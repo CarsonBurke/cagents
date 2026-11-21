@@ -315,6 +315,10 @@ harfrust = { path = "vendor/harfrust" }
 accesskit_unix = { path = "vendor/accesskit-unix" }
 accesskit_atspi_common = { path = "vendor/accesskit-atspi-common" }
 
+# Keep an unchanged text area's prepared glyphs across frames; see vendor/cryoglyph/README.cagents.md.
+[patch."https://github.com/iced-rs/cryoglyph.git"]
+cryoglyph = { path = "vendor/cryoglyph" }
+
 # Keep the clipboard worker alive when an input device is removed (#1464).
 [patch."https://github.com/pop-os/smithay-clipboard"]
 smithay-clipboard = { path = "vendor/smithay-clipboard" }
