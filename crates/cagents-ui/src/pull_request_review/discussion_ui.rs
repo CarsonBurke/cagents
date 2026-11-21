@@ -1397,10 +1397,10 @@ impl State {
     }
 }
 
-/// Where the submission popover opens, below its anchor button.
 /// Why a cached review's thread controls are disabled, in the words of its
 /// "read only until GitHub refreshes" notice.
 const READ_ONLY_UNTIL_REFRESH: &str = "Read only until GitHub refreshes";
+/// Where the submission popover opens, below its anchor button.
 const REVIEW_POPUP_OFFSET: f32 = 30.0;
 const REVIEW_POPUP_WIDTH: f32 = 380.0;
 
