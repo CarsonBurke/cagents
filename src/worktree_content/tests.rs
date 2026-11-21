@@ -1284,3 +1284,32 @@ fn a_read_only_directory_blocks() {
         &Blocker::Unremovable("cache/module/".into())
     );
 }
+
+#[test]
+fn non_utf8_branch_inspection_refuses_lossy_fences() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let fixture = Fixture::new();
+    let raw = OsStr::from_bytes(b"legacy-\xff");
+    let output = command(&fixture.repository)
+        .args([
+            OsStr::new("branch"),
+            OsStr::new("-m"),
+            OsStr::new("feature"),
+            raw,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let request = Request {
+        path: fixture.worktree.clone(),
+        targets: vec![],
+        merged_head: None,
+    };
+    let error = inspect(&request, &CancellationToken::new()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("git printed non-UTF-8 where a name was due"),
+        "{error}"
+    );
+}
