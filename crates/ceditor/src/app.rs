@@ -1367,9 +1367,7 @@ impl Editor {
 
     /// Resolves one file of the last session, set to the language chosen for
     /// it, with whether it takes focus.
-    fn resolve_startup(
-        start: crate::preferences::StartupPath,
-    ) -> (bool, Result<Opened, String>) {
+    fn resolve_startup(start: crate::preferences::StartupPath) -> (bool, Result<Opened, String>) {
         let language = start.language;
         let opened = Self::resolve_open(start.path).map(|opened| Opened { language, ..opened });
         (start.focus, opened)
@@ -1380,8 +1378,7 @@ impl Editor {
             // Resolve in durable order, not background-task completion order.
             // An unavailable entry never prevents the remaining files opening.
             let opened = tokio::task::spawn_blocking(move || {
-                paths.into_iter().map(Self::resolve_startup)
-                    .collect()
+                paths.into_iter().map(Self::resolve_startup).collect()
             })
             .await
             .unwrap_or_else(|error| vec![(false, Err(error.to_string()))]);
@@ -8879,7 +8876,7 @@ mod tests {
                 active: Some(1),
                 sidebar_open: true,
                 expanded_directories: Default::default(),
-            languages: Default::default(),
+                languages: Default::default(),
             }
         );
     }
@@ -8959,7 +8956,7 @@ mod tests {
                 active: Some(0),
                 sidebar_open: true,
                 expanded_directories: Default::default(),
-            languages: Default::default(),
+                languages: Default::default(),
             }
         );
     }
@@ -9973,10 +9970,12 @@ mod tests {
     }
 
     fn choose_language(app: &mut Editor, id: CardId, language: Option<DocumentLanguage>) {
-        drop(app.update(Message::Repository(RepositoryAction::ChooseLanguage {
-            card: id,
-            language,
-        })));
+        drop(
+            app.update(Message::Repository(RepositoryAction::ChooseLanguage {
+                card: id,
+                language,
+            })),
+        );
     }
 
     fn shown_language(app: &Editor, id: CardId) -> Option<DocumentLanguage> {
