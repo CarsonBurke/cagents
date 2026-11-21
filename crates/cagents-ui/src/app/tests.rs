@@ -260,7 +260,10 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
         &mut project,
         &[(record.clone(), None)],
         std::slice::from_ref(&open),
-        &[merged],
+        &[ArchivedWorktreePr {
+            pull_request: merged,
+            validated_head: record.head_oid.clone().unwrap(),
+        }],
     );
     assert_eq!(
         project.worktrees[0].pull_request_state,
