@@ -197,16 +197,20 @@ impl State {
     }
 }
 
-/// The next step for an uncertain reset whose login is no longer the
-/// current one: only that login can retry its original request.
-fn sign_in_to_retry(attempt: &Attempt) -> String {
-    match attempt
+/// The login an attempt was requested as, by its email.
+fn requested_as(attempt: &Attempt) -> Option<&str> {
+    attempt
         .identity
         .as_ref()
         .and_then(|identity| identity.email.as_deref())
         .map(str::trim)
         .filter(|email| !email.is_empty())
-    {
+}
+
+/// The next step for an uncertain reset whose login is no longer the
+/// current one: only that login can retry its original request.
+fn sign_in_to_retry(attempt: &Attempt) -> String {
+    match requested_as(attempt) {
         Some(email) => format!("Sign in as {email} again to retry this reset."),
         None => "Sign in to the account that requested this reset to retry it.".into(),
     }
@@ -631,20 +635,26 @@ impl Controls {
         if self.state.pending.is_none() {
             for attempt in self.state.uncertain.values() {
                 let recurring = attempt.reset.kind == account::resets::ResetKind::WeeklySession;
+                // The original request is bound to the login it was made
+                // as; a retry under another one would be refused anyway.
+                let login_changed =
+                    !recurring && !may_act_for(self.identity.as_ref(), attempt.identity.as_ref());
+                // The account's name follows its current login, so name the
+                // login the request was made as once that has changed.
+                let requester = login_changed
+                    .then(|| requested_as(attempt))
+                    .flatten()
+                    .unwrap_or(&self.name);
                 rows.push(
                     design::caption(format!(
                         "Requested {} for {} · {} available when confirmed.",
                         attempt.reset.reset_phrase(),
-                        self.name,
+                        requester,
                         attempt.total_count,
                     ))
                     .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                     .into(),
                 );
-                // The original request is bound to the login it was made
-                // as; a retry under another one would be refused anyway.
-                let login_changed =
-                    !recurring && !may_act_for(self.identity.as_ref(), attempt.identity.as_ref());
                 if login_changed {
                     rows.push(
                         design::caption(sign_in_to_retry(attempt))
@@ -1561,6 +1571,13 @@ pub(in crate::app) mod tests {
                 .iter()
                 .any(|caption| caption == "Sign in as reset@example.com again to retry this reset."),
             "a disabled Retry same reset names the login that can retry it: {captions:?}"
+        );
+        assert!(
+            captions
+                .iter()
+                .any(|caption| caption.starts_with("Requested")
+                    && caption.contains("for reset@example.com ·")),
+            "the request names the login it was made as, not the current one: {captions:?}"
         );
         assert!(
             !captions
