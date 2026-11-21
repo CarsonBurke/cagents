@@ -2411,6 +2411,33 @@ scripts/native-evidence stop
 - **Login shells.** Every script travels to `bash -s` on standard input, so the
   host's login shell may be fish. Commands get no standard input from here.
 
+To capture a theme in a steps file, set `app_theme` in the fixture's settings.toml and
+relaunch the app, which reads it only at startup. The daemon and its terminals
+keep running across `relaunch`. Close the window first, since `relaunch`
+refuses while the app is still running, and wait for the new window before the
+next shot:
+
+```sh
+evidence drive click X,Y   # the close button, from `drive --json observe`
+evidence drive wait --gone Projects
+sleep 1
+evidence env sed -i '/^app_theme *=/d; 1i app_theme = "dark"' \
+    '{fixture}/config/cagents-development/settings.toml'
+evidence relaunch &
+evidence drive wait Projects
+evidence shot sidebar-dark
+```
+
+A backgrounded `relaunch` that was refused shows up only as the next
+`drive wait` timing out. Under `start --instance NAME` the directory is
+`cagents-development-NAME`. `app_theme` takes the values listed under
+[Settings keys](configuration.md#settings-keys); `system`, the
+fixture's default, draws light. Set it back the same way if a later step
+expects the System theme. In a session started with `--portal gtk`,
+`evidence nested gsettings set org.gnome.desktop.interface color-scheme
+prefer-dark` changes what the portal reports. A relaunched app then drew dark,
+but the running app stayed light when this was tested, so prefer `app_theme`.
+
 ## Installer and package checks
 
 Repeatable upgrade-policy checks:
