@@ -2893,6 +2893,7 @@ exec /bin/sleep 60
         )));
         let spec = ProcessSpec {
             stdout_noise: None,
+            followed: false,
             execution: Some(context.clone()),
             messages: None,
             transport: TransportSpec::OwnedUnixWebSocket { socket },
