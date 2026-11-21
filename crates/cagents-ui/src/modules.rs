@@ -15,6 +15,7 @@ pub(crate) mod desktop_cursor_blink;
 pub mod diff_view;
 pub mod document_render;
 pub mod editor;
+pub(crate) mod editor_assistance;
 pub(crate) mod editor_history;
 pub mod editor_search;
 pub mod external_editor;

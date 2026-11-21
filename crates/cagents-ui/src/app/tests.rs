@@ -3295,10 +3295,13 @@ pub(super) fn editing_repository_app() -> (Cagents, CardId) {
         CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
     );
     let state = lsp_state(&mut app, card);
-    state.document = Some(LspDocumentId(1));
-    state.context.status = Some(crate::lsp::LspStatus::Ready);
-    state.context.diagnostics = vec![diagnostic("first"), diagnostic("second")];
-    state.diagnostics_version = Some(0);
+    state.attachment.document = Some(LspDocumentId(1));
+    state.attachment.context.status = Some(crate::lsp::LspStatus::Ready);
+    assert!(state.attachment.accept_diagnostics(
+        vec![diagnostic("first"), diagnostic("second")],
+        0,
+        Some(0)
+    ));
     app.lsp_documents.insert(LspDocumentId(1), card);
     (app, card)
 }
@@ -8790,7 +8793,9 @@ fn editor_language_results_expand_their_section() {
     let doc = LspDocumentId(1);
     let request = crate::lsp::LspRequestId(1);
     app.lsp_documents.insert(doc, card);
-    lsp_state(&mut app, card).editor_navigation = Some(request);
+    lsp_state(&mut app, card)
+        .attachment
+        .navigation_requested(request);
     app.context_sections.set_open(Section::Locations, false);
     // A response that cannot jump opens the closed inspector from a handler
     // that returns before its message's projection; the inspector still
@@ -8839,7 +8844,7 @@ fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
         .unwrap();
     app.workspace.request_close(card).unwrap();
     let state = lsp_state(&mut app, card);
-    state.document = Some(LspDocumentId(1));
+    state.attachment.document = Some(LspDocumentId(1));
     state.path = Some(PathBuf::from("/repo/a.rs"));
     app.lsp_documents.insert(LspDocumentId(1), card);
     app.lsp_pending_jumps.insert(
@@ -8857,26 +8862,6 @@ fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
     assert!(!app.lsp_contexts.contains_key(&card));
     assert!(!app.lsp_documents.contains_key(&LspDocumentId(1)));
     assert!(!app.lsp_pending_jumps.contains_key(&card));
-}
-
-/// Diagnostics are unsolicited and replace each other wholesale, so a list
-/// on screen can outlive the text it describes. Jumping into a stale one
-/// puts the caret on a line the server never named.
-/// The two versions are equal only when both are known. An application
-/// that kept a count of its own would satisfy this predicate while the
-/// manager had silently moved on - a restart, a crash-respawn, or a second
-/// card opening the same file all bump the manager's version without any
-/// edit having been made.
-#[test]
-fn diagnostics_are_current_only_when_both_versions_are_known_and_equal() {
-    assert!(diagnostics_are_current(Some(4), Some(4)));
-    assert!(!diagnostics_are_current(Some(4), Some(5)));
-    assert!(!diagnostics_are_current(Some(5), Some(4)));
-    // No document: nothing published for it can still describe it.
-    assert!(!diagnostics_are_current(Some(4), None));
-    // Nothing published: there is no list to jump into.
-    assert!(!diagnostics_are_current(None, Some(4)));
-    assert!(!diagnostics_are_current(None, None));
 }
 
 #[test]
@@ -8910,7 +8895,17 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
         drop(app.update(publish(1)));
         // A manager reopen can advance beyond the standing publication before
         // the next edit. Its old coordinates must not become current again.
-        app.lsp_contexts.get_mut(&card).unwrap().diagnostics_version = Some(published_version);
+        assert!(
+            app.lsp_contexts
+                .get_mut(&card)
+                .unwrap()
+                .attachment
+                .accept_diagnostics(
+                    vec![diagnostic("standing error")],
+                    published_version,
+                    Some(published_version)
+                )
+        );
         let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
             unreachable!()
         };
@@ -8924,16 +8919,22 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
         drop(app.drain_lsp_intents(card));
         assert_eq!(app.lsp.document_version(doc), Some(2));
         assert_eq!(
-            app.lsp_contexts[&card].context.diagnostics.is_empty(),
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .diagnostics
+                .is_empty(),
             !preserves
         );
         assert_eq!(
-            app.lsp_contexts[&card].diagnostics_version,
+            app.lsp_contexts[&card].attachment.diagnostics_version(),
             preserves.then_some(2)
         );
         if preserves {
             assert_eq!(
-                app.lsp_contexts[&card].context.diagnostics[0].range.start,
+                app.lsp_contexts[&card].attachment.context.diagnostics[0]
+                    .range
+                    .start,
                 LspPosition::new(1, 0)
             );
         }
@@ -8944,7 +8945,11 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
         // A late publication cannot reinstall marks for the old coordinates.
         drop(app.update(publish(1)));
         assert_eq!(
-            app.lsp_contexts[&card].context.diagnostics.is_empty(),
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .diagnostics
+                .is_empty(),
             !preserves
         );
         drop(app.update(publish(2)));
@@ -8952,7 +8957,10 @@ fn inexact_editor_changes_invalidate_diagnostics_through_the_real_drain() {
             unreachable!()
         };
         assert!(runtime.diagnostic_navigation_available());
-        assert_eq!(app.lsp_contexts[&card].diagnostics_version, Some(2));
+        assert_eq!(
+            app.lsp_contexts[&card].attachment.diagnostics_version(),
+            Some(2)
+        );
     }
 }
 
@@ -8964,8 +8972,8 @@ fn resource_events_refresh_every_document_even_when_the_routing_document_closed(
         let last = repository_card(&mut app, "/repo");
         for (card, doc) in [(first, LspDocumentId(1)), (last, LspDocumentId(2))] {
             let state = lsp_state(&mut app, card);
-            state.document = Some(doc);
-            state.context.status = Some(LspStatus::Ready);
+            state.attachment.document = Some(doc);
+            state.attachment.context.status = Some(LspStatus::Ready);
             app.lsp_documents.insert(doc, card);
         }
         if close_routing_document {
@@ -8978,12 +8986,12 @@ fn resource_events_refresh_every_document_even_when_the_routing_document_closed(
             doc: LspDocumentId(2),
         })));
         assert_eq!(
-            app.lsp_contexts[&first].context.status,
+            app.lsp_contexts[&first].attachment.context.status,
             Some(app.lsp.status(LspDocumentId(1)))
         );
         if !close_routing_document {
             assert_eq!(
-                app.lsp_contexts[&last].context.status,
+                app.lsp_contexts[&last].attachment.context.status,
                 Some(app.lsp.status(LspDocumentId(2)))
             );
         }
@@ -8996,8 +9004,8 @@ fn resource_updates_clear_refusals_without_a_registered_document() {
     let card = repository_card(&mut app, "/repo");
     let doc = LspDocumentId(1);
     let state = lsp_state(&mut app, card);
-    state.document = Some(doc);
-    state.context.status = Some(LspStatus::Unavailable {
+    state.attachment.document = Some(doc);
+    state.attachment.context.status = Some(LspStatus::Unavailable {
         reason: "admission refused before document registration".into(),
     });
     app.lsp_documents.insert(doc, card);
@@ -9018,7 +9026,7 @@ async fn resource_updates_preserve_cap_refusal_and_retry_after_edit_and_holder_c
     app.settings.lsp_max_sessions = 1;
     app.next_lsp_document = holder.doc.0 + 1;
     let holder_card = repository_card(&mut app, "/holder");
-    lsp_state(&mut app, holder_card).document = Some(holder.doc);
+    lsp_state(&mut app, holder_card).attachment.document = Some(holder.doc);
     app.lsp_documents.insert(holder.doc, holder_card);
     assert!(app.lsp.event_is_current(&holder.ready));
     app.apply_lsp_event(holder.ready.clone());
@@ -9169,8 +9177,12 @@ fn a_jump_into_stale_diagnostics_is_refused() {
     let card = repository_card(&mut app, "/repo");
     // A published list, and a document the manager does not hold, which is
     // exactly the shape the predicate refuses.
-    lsp_state(&mut app, card).document = Some(LspDocumentId(1));
-    lsp_state(&mut app, card).diagnostics_version = Some(6);
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
+    assert!(
+        lsp_state(&mut app, card)
+            .attachment
+            .accept_diagnostics(Vec::new(), 6, Some(6))
+    );
 
     let _ = app.update_lsp(InspectorAction::JumpToLspDiagnostic {
         card,
@@ -9207,8 +9219,8 @@ fn publish_test_completions(
     );
     let intent = runtime.editor_completion_intent();
     let state = lsp_state(app, card);
-    state.completion_intent = intent;
-    state.context.completions = targets.clone();
+    assert_eq!(state.attachment.reconcile_completion_intent(intent), None);
+    state.attachment.context.completions = targets.clone();
     targets
 }
 
@@ -9247,7 +9259,10 @@ fn request_test_completion(
     card: CardId,
 ) -> (crate::lsp::LspRequestId, LspPosition) {
     drop(app.request_lsp(card, LspRequestKind::Completion));
-    app.lsp_contexts[&card].completion_request.unwrap()
+    app.lsp_contexts[&card]
+        .attachment
+        .completion_request()
+        .unwrap()
 }
 
 fn navigate_find_key(app: &mut Cagents, backwards: bool) {
@@ -9294,8 +9309,19 @@ fn find_navigation_retires_shown_and_pending_completion_across_caret_round_trip(
     };
     assert_ne!(runtime.cursor_position(), Some(pending.1));
     assert!(runtime.editor_completion_targets(card).is_empty());
-    assert!(app.lsp_contexts[&card].completion_request.is_none());
-    assert!(app.lsp_contexts[&card].context.completions.is_empty());
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .completion_request()
+            .is_none()
+    );
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .context
+            .completions
+            .is_empty()
+    );
     navigate_find_key(&mut app, true);
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
         unreachable!()
@@ -9327,13 +9353,16 @@ fn find_navigation_retires_shown_and_pending_completion_across_caret_round_trip(
         doc,
         items: vec![completion_item("late")],
     });
-    assert_eq!(app.lsp_contexts[&card].completion_request, Some(fresh));
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.completion_request(),
+        Some(fresh)
+    );
     app.apply_lsp_event(LspEvent::Completion {
         request: fresh.0,
         doc,
         items: vec![completion_item("fresh")],
     });
-    let target = app.lsp_contexts[&card].context.completions[0].clone();
+    let target = app.lsp_contexts[&card].attachment.context.completions[0].clone();
     drop(app.update_editor_lsp(
         card,
         repository_widget::EditorLspAction::Choose { index: 0, target },
@@ -9388,8 +9417,19 @@ fn same_text_find_replacement_retires_completion_without_advancing_text_version(
         assert_eq!(runtime.is_dirty(), dirty);
         assert_eq!(app.lsp.document_version(doc), version);
         assert!(runtime.editor_completion_targets(card).is_empty());
-        assert!(app.lsp_contexts[&card].completion_request.is_none());
-        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        assert!(
+            app.lsp_contexts[&card]
+                .attachment
+                .completion_request()
+                .is_none()
+        );
+        assert!(
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .completions
+                .is_empty()
+        );
         app.apply_lsp_event(LspEvent::Completion {
             request: pending.0,
             doc,
@@ -9466,8 +9506,14 @@ fn deferred_find_selection_retires_completion_only_for_accepted_visible_callback
         };
         *foreign_card = CardId::new();
         drop(app.update(Message::Repository(foreign)));
-        assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
-        assert_eq!(app.lsp_contexts[&card].context.completions, shown);
+        assert_eq!(
+            app.lsp_contexts[&card].attachment.completion_request(),
+            Some(pending)
+        );
+        assert_eq!(
+            app.lsp_contexts[&card].attachment.context.completions,
+            shown
+        );
         if hidden {
             let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) else {
                 unreachable!()
@@ -9483,19 +9529,42 @@ fn deferred_find_selection_retires_completion_only_for_accepted_visible_callback
         assert_eq!(runtime.editor_text().as_deref(), Some("tail tail\n"));
         if hidden {
             assert_eq!(runtime.cursor_position(), Some(pending.1));
-            assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
-            assert_eq!(app.lsp_contexts[&card].context.completions, shown);
+            assert_eq!(
+                app.lsp_contexts[&card].attachment.completion_request(),
+                Some(pending)
+            );
+            assert_eq!(
+                app.lsp_contexts[&card].attachment.context.completions,
+                shown
+            );
         } else {
             assert_ne!(runtime.cursor_position(), Some(pending.1));
             assert!(runtime.editor_completion_targets(card).is_empty());
-            assert!(app.lsp_contexts[&card].completion_request.is_none());
-            assert!(app.lsp_contexts[&card].context.completions.is_empty());
+            assert!(
+                app.lsp_contexts[&card]
+                    .attachment
+                    .completion_request()
+                    .is_none()
+            );
+            assert!(
+                app.lsp_contexts[&card]
+                    .attachment
+                    .context
+                    .completions
+                    .is_empty()
+            );
             app.apply_lsp_event(LspEvent::Completion {
                 request: pending.0,
                 doc,
                 items: vec![completion_item("late")],
             });
-            assert!(app.lsp_contexts[&card].context.completions.is_empty());
+            assert!(
+                app.lsp_contexts[&card]
+                    .attachment
+                    .context
+                    .completions
+                    .is_empty()
+            );
         }
     }
 }
@@ -9546,8 +9615,19 @@ fn completion_caret_round_trip_retires_old_answer_and_accepts_a_fresh_request() 
         items: vec![completion_item("old")],
     };
     app.apply_lsp_event(old_answer());
-    assert!(app.lsp_contexts[&card].completion_request.is_none());
-    assert!(app.lsp_contexts[&card].context.completions.is_empty());
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .completion_request()
+            .is_none()
+    );
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .context
+            .completions
+            .is_empty()
+    );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
         unreachable!()
     };
@@ -9556,13 +9636,16 @@ fn completion_caret_round_trip_retires_old_answer_and_accepts_a_fresh_request() 
     let pending = request_test_completion(&mut app, card);
     assert_ne!(pending.0, old);
     app.apply_lsp_event(old_answer());
-    assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.completion_request(),
+        Some(pending)
+    );
     app.apply_lsp_event(LspEvent::Completion {
         request: pending.0,
         doc,
         items: vec![completion_item("fresh")],
     });
-    let target = app.lsp_contexts[&card].context.completions[0].clone();
+    let target = app.lsp_contexts[&card].attachment.context.completions[0].clone();
     drop(app.update_editor_lsp(
         card,
         repository_widget::EditorLspAction::Choose { index: 0, target },
@@ -9571,7 +9654,13 @@ fn completion_caret_round_trip_retires_old_answer_and_accepts_a_fresh_request() 
         unreachable!()
     };
     assert_eq!(runtime.editor_text().as_deref(), Some("freshtail\n"));
-    assert!(app.lsp_contexts[&card].context.completions.is_empty());
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .context
+            .completions
+            .is_empty()
+    );
 }
 
 #[test]
@@ -9591,8 +9680,9 @@ fn no_change_editor_intent_retires_shown_inspector_candidates_and_pending_reques
         let version = app.lsp.document_version(doc);
         let pending = request_test_completion(&mut app, card);
         let state = app.lsp_contexts.get_mut(&card).unwrap();
-        state.context.locations = Some((crate::lsp::LocationKind::References, Vec::new()));
-        state.context.diagnostics = vec![diagnostic("standing diagnostic")];
+        state.attachment.context.locations =
+            Some((crate::lsp::LocationKind::References, Vec::new()));
+        state.attachment.context.diagnostics = vec![diagnostic("standing diagnostic")];
         drop(
             app.update(Message::Repository(RepositoryAction::EditorAction {
                 card,
@@ -9601,10 +9691,10 @@ fn no_change_editor_intent_retires_shown_inspector_candidates_and_pending_reques
         );
         assert_eq!(app.lsp.document_version(doc), version);
         let state = &app.lsp_contexts[&card];
-        assert!(state.completion_request.is_none());
-        assert!(state.context.completions.is_empty());
-        assert!(state.context.locations.is_some());
-        assert_eq!(state.context.diagnostics.len(), 1);
+        assert!(state.attachment.completion_request().is_none());
+        assert!(state.attachment.context.completions.is_empty());
+        assert!(state.attachment.context.locations.is_some());
+        assert_eq!(state.attachment.context.diagnostics.len(), 1);
         app.apply_lsp_event(LspEvent::Completion {
             request: pending.0,
             doc,
@@ -9620,7 +9710,13 @@ fn no_change_editor_intent_retires_shown_inspector_candidates_and_pending_reques
         assert_eq!(runtime.cursor_position(), Some(pending.1));
         assert_eq!(runtime.editor_text().as_deref(), Some("tail\n"));
         assert!(runtime.editor_completion_targets(card).is_empty());
-        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        assert!(
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .completions
+                .is_empty()
+        );
     }
 }
 
@@ -9640,16 +9736,19 @@ fn scroll_preserves_pending_and_shown_completion_and_inspector_activation() {
         })
     };
     drop(app.update(scroll()));
-    assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.completion_request(),
+        Some(pending)
+    );
     app.apply_lsp_event(LspEvent::Completion {
         request: pending.0,
         doc,
         items: vec![completion_item("scroll")],
     });
-    let target = app.lsp_contexts[&card].context.completions[0].clone();
+    let target = app.lsp_contexts[&card].attachment.context.completions[0].clone();
     drop(app.update(scroll()));
     assert_eq!(
-        app.lsp_contexts[&card].context.completions,
+        app.lsp_contexts[&card].attachment.context.completions,
         vec![target.clone()]
     );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
@@ -9711,8 +9810,14 @@ fn rejected_hidden_and_foreign_editor_actions_preserve_completion_intents() {
                 action: widget::text_editor::Action::Move(widget::text_editor::Motion::Right),
             })),
         );
-        assert_eq!(app.lsp_contexts[&card].completion_request, Some(pending));
-        assert_eq!(app.lsp_contexts[&card].context.completions, targets);
+        assert_eq!(
+            app.lsp_contexts[&card].attachment.completion_request(),
+            Some(pending)
+        );
+        assert_eq!(
+            app.lsp_contexts[&card].attachment.context.completions,
+            targets
+        );
     }
 }
 
@@ -9757,7 +9862,10 @@ fn a_completion_whose_label_moved_is_not_applied() {
             notice(&app),
             Some("the completion list changed; nothing was applied")
         );
-        assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+        assert_eq!(
+            app.lsp_contexts[&card].attachment.context.completions.len(),
+            1
+        );
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
             unreachable!()
         };
@@ -9779,7 +9887,13 @@ fn a_completion_whose_label_moved_is_not_applied() {
             unreachable!()
         };
         assert_eq!(runtime.editor_text().as_deref(), Some(expected.as_str()));
-        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        assert!(
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .completions
+                .is_empty()
+        );
     }
 }
 
@@ -9789,13 +9903,16 @@ fn a_completion_index_past_the_end_applies_nothing() {
     let mut app = lsp_test_app();
     let card = repository_card(&mut app, "/repo");
     let target = completion_targets_for_test(card, vec![completion_item("alpha")]).remove(0);
-    lsp_state(&mut app, card).context.completions = vec![target.clone()];
+    lsp_state(&mut app, card).attachment.context.completions = vec![target.clone()];
     drop(app.update_editor_lsp(
         card,
         repository_widget::EditorLspAction::Choose { index: 4, target },
     ));
     assert_eq!(notice(&app), None);
-    assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.context.completions.len(),
+        1
+    );
 }
 
 /// A card the saved state could not restore is reported until the card
@@ -9871,7 +9988,7 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
         let doc = app.lsp_document(card).unwrap();
         assert_eq!(app.lsp.document_version(doc), Some(1));
         assert_eq!(app.lsp_documents.get(&doc), Some(&card));
-        assert_eq!(app.lsp_contexts[&card].document, Some(doc));
+        assert_eq!(app.lsp_contexts[&card].attachment.document, Some(doc));
     }
     let first_doc = app.lsp_document(first).unwrap();
     let second_doc = app.lsp_document(second).unwrap();
@@ -9885,12 +10002,24 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
     };
     drop(app.update(publish(second_doc, "second diagnostic")));
     assert_eq!(
-        app.lsp_contexts[&second].context.diagnostics,
+        app.lsp_contexts[&second].attachment.context.diagnostics,
         vec![diagnostic("second diagnostic")]
     );
-    assert_eq!(app.lsp_contexts[&second].diagnostics_version, Some(1));
-    assert!(app.lsp_contexts[&first].context.diagnostics.is_empty());
-    assert_eq!(app.lsp_contexts[&first].diagnostics_version, None);
+    assert_eq!(
+        app.lsp_contexts[&second].attachment.diagnostics_version(),
+        Some(1)
+    );
+    assert!(
+        app.lsp_contexts[&first]
+            .attachment
+            .context
+            .diagnostics
+            .is_empty()
+    );
+    assert_eq!(
+        app.lsp_contexts[&first].attachment.diagnostics_version(),
+        None
+    );
     for (card, expected) in [(first, false), (second, true)] {
         let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
             unreachable!()
@@ -9900,12 +10029,15 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
 
     drop(app.update(publish(first_doc, "first diagnostic")));
     assert_eq!(
-        app.lsp_contexts[&first].context.diagnostics,
+        app.lsp_contexts[&first].attachment.context.diagnostics,
         vec![diagnostic("first diagnostic")]
     );
-    assert_eq!(app.lsp_contexts[&first].diagnostics_version, Some(1));
     assert_eq!(
-        app.lsp_contexts[&second].context.diagnostics,
+        app.lsp_contexts[&first].attachment.diagnostics_version(),
+        Some(1)
+    );
+    assert_eq!(
+        app.lsp_contexts[&second].attachment.context.diagnostics,
         vec![diagnostic("second diagnostic")]
     );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&first) else {
@@ -9917,14 +10049,23 @@ fn diagnostics_land_on_the_card_that_owns_the_document() {
     assert_eq!(app.lsp.document_version(second_doc), None);
     assert!(!app.lsp_documents.contains_key(&second_doc));
     drop(app.update(publish(second_doc, "late closed diagnostic")));
-    assert!(app.lsp_contexts[&second].context.diagnostics.is_empty());
-    assert_eq!(app.lsp_contexts[&second].diagnostics_version, None);
+    assert!(
+        app.lsp_contexts[&second]
+            .attachment
+            .context
+            .diagnostics
+            .is_empty()
+    );
+    assert_eq!(
+        app.lsp_contexts[&second].attachment.diagnostics_version(),
+        None
+    );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&second) else {
         unreachable!()
     };
     assert!(!runtime.diagnostic_navigation_available());
     assert_eq!(
-        app.lsp_contexts[&first].context.diagnostics,
+        app.lsp_contexts[&first].attachment.context.diagnostics,
         vec![diagnostic("first diagnostic")]
     );
 }
@@ -9940,7 +10081,7 @@ fn diagnostics_for_an_unregistered_document_cannot_install_answers() {
         .insert(card, CardRuntime::Repository(Box::new(runtime)));
     // Deliberately retain the old test's incomplete App-only registration.
     // It is not authority to publish when the manager has no document.
-    lsp_state(&mut app, card).document = Some(doc);
+    lsp_state(&mut app, card).attachment.document = Some(doc);
     app.lsp_documents.insert(doc, card);
     assert_eq!(app.lsp.document_version(doc), None);
     drop(app.update(Message::Lsp(LspEvent::Diagnostics {
@@ -9948,8 +10089,17 @@ fn diagnostics_for_an_unregistered_document_cannot_install_answers() {
         version: 1,
         items: vec![diagnostic("unregistered diagnostic")],
     })));
-    assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
-    assert_eq!(app.lsp_contexts[&card].diagnostics_version, None);
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .context
+            .diagnostics
+            .is_empty()
+    );
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.diagnostics_version(),
+        None
+    );
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
         unreachable!()
     };
@@ -9961,7 +10111,7 @@ fn diagnostics_for_an_unregistered_document_cannot_install_answers() {
 fn an_event_for_a_closed_document_is_dropped() {
     let mut app = lsp_test_app();
     let card = repository_card(&mut app, "/repo");
-    lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
     app.lsp_documents.insert(LspDocumentId(1), card);
 
     app.apply_lsp_event(LspEvent::Diagnostics {
@@ -9970,7 +10120,13 @@ fn an_event_for_a_closed_document_is_dropped() {
         items: vec![diagnostic("undefined name")],
     });
 
-    assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
+    assert!(
+        app.lsp_contexts[&card]
+            .attachment
+            .context
+            .diagnostics
+            .is_empty()
+    );
 }
 
 /// A desync means the two sides disagreed about the text every answer was
@@ -9987,10 +10143,10 @@ fn a_desync_drops_the_answers_and_keeps_the_diagnostics() {
         .insert(card, CardRuntime::Repository(Box::new(runtime)));
     app.lsp_documents.insert(LspDocumentId(1), card);
     let state = lsp_state(&mut app, card);
-    state.document = Some(LspDocumentId(1));
-    state.context.completions = vec![target.clone()];
-    state.context.locations = Some((crate::lsp::LocationKind::Definition, Vec::new()));
-    state.context.diagnostics = vec![diagnostic("undefined name")];
+    state.attachment.document = Some(LspDocumentId(1));
+    state.attachment.context.completions = vec![target.clone()];
+    state.attachment.context.locations = Some((crate::lsp::LocationKind::Definition, Vec::new()));
+    state.attachment.context.diagnostics = vec![diagnostic("undefined name")];
 
     app.apply_lsp_event(LspEvent::DocumentDesynced {
         doc: LspDocumentId(1),
@@ -9999,12 +10155,12 @@ fn a_desync_drops_the_answers_and_keeps_the_diagnostics() {
     });
 
     let state = &app.lsp_contexts[&card];
-    assert!(state.context.completions.is_empty());
-    assert!(state.context.locations.is_none());
+    assert!(state.attachment.context.completions.is_empty());
+    assert!(state.attachment.context.locations.is_none());
     // Diagnostics are the server's own standing answer, replaced on its
     // schedule, and are refused by version at the point of use instead.
-    assert_eq!(state.context.diagnostics.len(), 1);
-    assert!(state.context.notice.is_some());
+    assert_eq!(state.attachment.context.diagnostics.len(), 1);
+    assert!(state.attachment.context.notice.is_some());
     let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
         unreachable!()
     };
@@ -10034,18 +10190,28 @@ fn dismiss_and_restart_retire_native_completion_answers_with_the_inspector() {
         app.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
         let state = lsp_state(&mut app, card);
-        state.document = Some(LspDocumentId(1));
-        state.context.completions = vec![target.clone()];
-        state.context.diagnostics = vec![diagnostic("standing")];
+        state.attachment.document = Some(LspDocumentId(1));
+        state.attachment.context.completions = vec![target.clone()];
+        state.attachment.context.diagnostics = vec![diagnostic("standing")];
         let action = if restart {
             InspectorAction::RestartLanguageServer(card)
         } else {
             InspectorAction::DismissLspResults(card)
         };
         drop(app.update_lsp(action));
-        assert!(app.lsp_contexts[&card].context.completions.is_empty());
+        assert!(
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .completions
+                .is_empty()
+        );
         assert_eq!(
-            app.lsp_contexts[&card].context.diagnostics.is_empty(),
+            app.lsp_contexts[&card]
+                .attachment
+                .context
+                .diagnostics
+                .is_empty(),
             restart
         );
         drop(app.update_editor_lsp(
@@ -10067,7 +10233,7 @@ fn dismiss_and_restart_retire_native_completion_answers_with_the_inspector() {
 fn a_cancelled_request_is_not_reported() {
     let mut app = lsp_test_app();
     let card = repository_card(&mut app, "/repo");
-    lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
     app.lsp_documents.insert(LspDocumentId(1), card);
 
     app.apply_lsp_event(LspEvent::RequestFailed {
@@ -10075,14 +10241,14 @@ fn a_cancelled_request_is_not_reported() {
         doc: LspDocumentId(1),
         error: LspError::Cancelled,
     });
-    assert!(app.lsp_contexts[&card].context.notice.is_none());
+    assert!(app.lsp_contexts[&card].attachment.context.notice.is_none());
 
     app.apply_lsp_event(LspEvent::RequestFailed {
         request: crate::lsp::LspRequestId(2),
         doc: LspDocumentId(1),
         error: LspError::NoServer,
     });
-    assert!(app.lsp_contexts[&card].context.notice.is_some());
+    assert!(app.lsp_contexts[&card].attachment.context.notice.is_some());
 }
 
 #[tokio::test]
@@ -10092,13 +10258,13 @@ async fn a_queued_ready_cannot_replace_starting_after_restart() {
     app.lsp = manager;
     let card = repository_card(&mut app, "/repo");
     let doc = publisher.doc;
-    lsp_state(&mut app, card).document = Some(doc);
+    lsp_state(&mut app, card).attachment.document = Some(doc);
     app.lsp_documents.insert(doc, card);
     app.lsp.restart(doc);
-    lsp_state(&mut app, card).context.status = Some(LspStatus::Starting);
+    lsp_state(&mut app, card).attachment.context.status = Some(LspStatus::Starting);
     app.apply_lsp_event(publisher.ready.clone());
     assert_eq!(
-        app.lsp_contexts[&card].context.status,
+        app.lsp_contexts[&card].attachment.context.status,
         Some(LspStatus::Starting)
     );
     let events = app.lsp.events();
@@ -10119,7 +10285,7 @@ async fn a_queued_ready_cannot_replace_starting_after_restart() {
         }
     }
     assert_eq!(
-        app.lsp_contexts[&card].context.status,
+        app.lsp_contexts[&card].attachment.context.status,
         Some(LspStatus::Ready)
     );
     app.lsp.begin_shutdown().await;
@@ -10131,7 +10297,7 @@ fn a_current_unbacked_refusal_keeps_its_reason_and_a_closed_one_is_ignored() {
     app.lsp = LspManager::new(AppSettings::default().language_servers);
     let card = repository_card(&mut app, "/repo");
     let doc = LspDocumentId(1);
-    lsp_state(&mut app, card).document = Some(doc);
+    lsp_state(&mut app, card).attachment.document = Some(doc);
     app.lsp_documents.insert(doc, card);
     let language = app.lsp.language_for(Path::new("/repo/a.rs")).unwrap();
     // This real admission refusal has no backing session or snapshot.
@@ -10147,12 +10313,15 @@ fn a_current_unbacked_refusal_keeps_its_reason_and_a_closed_one_is_ignored() {
     assert_eq!(app.lsp.status(doc), LspStatus::Disabled);
     let event = app.lsp.events().try_recv().unwrap();
     app.apply_lsp_event(event.clone());
-    assert_eq!(app.lsp_contexts[&card].context.status, Some(status));
+    assert_eq!(
+        app.lsp_contexts[&card].attachment.context.status,
+        Some(status)
+    );
     app.lsp.close(doc);
-    lsp_state(&mut app, card).context.status = Some(LspStatus::Starting);
+    lsp_state(&mut app, card).attachment.context.status = Some(LspStatus::Starting);
     app.apply_lsp_event(event);
     assert_eq!(
-        app.lsp_contexts[&card].context.status,
+        app.lsp_contexts[&card].attachment.context.status,
         Some(LspStatus::Starting)
     );
 }
@@ -10164,7 +10333,7 @@ async fn progress_occupies_the_notice_slot_until_it_is_done() {
     let mut app = lsp_test_app();
     app.lsp = manager;
     let card = repository_card(&mut app, "/repo");
-    lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
     app.lsp_documents.insert(LspDocumentId(1), card);
 
     app.apply_lsp_event(
@@ -10179,7 +10348,7 @@ async fn progress_occupies_the_notice_slot_until_it_is_done() {
             .await,
     );
     assert_eq!(
-        app.lsp_contexts[&card].context.notice.as_deref(),
+        app.lsp_contexts[&card].attachment.context.notice.as_deref(),
         Some("Indexing (40%)")
     );
 
@@ -10194,7 +10363,7 @@ async fn progress_occupies_the_notice_slot_until_it_is_done() {
             })
             .await,
     );
-    assert!(app.lsp_contexts[&card].context.notice.is_none());
+    assert!(app.lsp_contexts[&card].attachment.context.notice.is_none());
     app.lsp.begin_shutdown().await;
 }
 
@@ -11282,7 +11451,7 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
     let mut app = lsp_test_app();
     app.lsp = manager;
     let card = repository_card(&mut app, "/repo");
-    lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
     app.lsp_documents.insert(LspDocumentId(1), card);
 
     app.apply_lsp_event(LspEvent::DocumentDesynced {
@@ -11291,6 +11460,7 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
         error: LspError::NoServer,
     });
     let failure = app.lsp_contexts[&card]
+        .attachment
         .context
         .notice
         .clone()
@@ -11309,7 +11479,7 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
                 .await,
         );
         assert_eq!(
-            app.lsp_contexts[&card].context.notice.as_deref(),
+            app.lsp_contexts[&card].attachment.context.notice.as_deref(),
             Some(failure.as_str()),
             "progress with done={done} replaced the failure"
         );
@@ -11330,7 +11500,7 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
             .await,
     );
     assert_eq!(
-        app.lsp_contexts[&card].context.notice.as_deref(),
+        app.lsp_contexts[&card].attachment.context.notice.as_deref(),
         Some("Indexing (10%)")
     );
     app.lsp.begin_shutdown().await;
@@ -11360,8 +11530,8 @@ fn a_file_with_no_server_reports_disabled_and_clears_a_parked_jump() {
     );
 
     let state = &app.lsp_contexts[&card];
-    assert_eq!(state.context.status, Some(LspStatus::Disabled));
-    assert!(state.document.is_none());
+    assert_eq!(state.attachment.context.status, Some(LspStatus::Disabled));
+    assert!(state.attachment.document.is_none());
     // Recorded even with no server: the file *is* open, and a later jump
     // compares against this path to decide whether it must open anything.
     assert_eq!(
@@ -11377,7 +11547,7 @@ fn a_file_with_no_server_reports_disabled_and_clears_a_parked_jump() {
 fn closing_a_document_retracts_it_from_the_routing_map() {
     let mut app = lsp_test_app();
     let card = repository_card(&mut app, "/repo");
-    lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
     lsp_state(&mut app, card).path = Some(PathBuf::from("/repo/a.rs"));
     app.lsp_documents.insert(LspDocumentId(1), card);
 
@@ -11385,9 +11555,9 @@ fn closing_a_document_retracts_it_from_the_routing_map() {
 
     assert!(app.lsp_documents.is_empty());
     let state = &app.lsp_contexts[&card];
-    assert!(state.document.is_none());
+    assert!(state.attachment.document.is_none());
     assert!(state.path.is_none());
-    assert_eq!(state.diagnostics_version, None);
+    assert_eq!(state.attachment.diagnostics_version(), None);
 }
 
 /// The shell re-runs one `RedrawRequested` through update and layout while

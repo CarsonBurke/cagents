@@ -5731,21 +5731,10 @@ struct PendingLspJump {
     coordinates: LspCoordinates,
 }
 
-/// One card's language-server results, with the buffer version each describes.
-///
-/// A server answers the text it was given. Keeping the version beside the
-/// answer is what lets a stale one be refused instead of applied to text that
-/// has since moved: a caret jump to a line that no longer exists, or a
-/// completion whose edit range describes characters the user has already
-/// replaced, are both silent corruptions, and neither is recoverable by
-/// looking at the answer alone.
+/// ADE policy and presentation around one buffer's attachment.
 #[derive(Debug, Default)]
 struct LspInspectorState {
-    context: inspector::LspInspectorContext,
-    /// The document, once opened. `None` while no file is open, or when no
-    /// configured server claims this file's extension, or another independent
-    /// buffer already owns its language-server attachment.
-    document: Option<LspDocumentId>,
+    attachment: crate::editor_assistance::AttachmentState,
     /// Independent editor buffers cannot share one language-server URI.
     /// Keep the refused buffer editable and let Restart retry after its owner
     /// closes, without registering its text over the other pane's snapshot.
@@ -5754,57 +5743,19 @@ struct LspInspectorState {
     /// claims it. A jump target arrives absolute while the card's file list is
     /// worktree-relative, so this is the only side both can be compared on.
     path: Option<PathBuf>,
-    /// The version the diagnostics were computed for, as the manager stamped
-    /// them. Compared against [`LspManager::document_version`] and never
-    /// against a count of this side's own: the manager re-opens a document on
-    /// a restart, a crash-respawn, or a second card opening the same file, and
-    /// none of those are edits this side made.
-    diagnostics_version: Option<i32>,
     /// A failure the user has not dismissed. Outranks `progress`, because an
     /// indexing report arriving a second later must not erase the one message
     /// saying their hover and completions were thrown away.
     failure: Option<String>,
     /// The server's current progress report, if it is still working.
     progress: Option<String>,
-    completion_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
-    /// Last observed runtime intent; a request is captured against this value.
-    completion_intent: u64,
-    editor_hover_request: Option<(crate::lsp::LspRequestId, LspPosition)>,
-    editor_navigation: Option<crate::lsp::LspRequestId>,
 }
 
 impl LspInspectorState {
-    /// Drops every answer that describes text the buffer no longer holds.
-    ///
-    /// Diagnostics are kept and re-dated instead of dropped: the server
-    /// replaces them wholesale on its own schedule, and blanking them on each
-    /// keystroke would make the list flicker empty while the user typed. They
-    /// are refused at the point of use by version rather than erased here.
-    fn invalidate_answers(&mut self) {
-        self.context.locations = None;
-        self.context.completions.clear();
-        self.completion_request = None;
-        self.editor_hover_request = None;
-        self.editor_navigation = None;
-    }
-
     /// Recomputes the single notice the surface renders from the two
     /// independent things that can want it.
     fn refresh_notice(&mut self) {
-        self.context.notice = self.failure.clone().or_else(|| self.progress.clone());
-    }
-}
-
-/// Whether a published diagnostics list still describes the buffer on screen.
-///
-/// `published` is the version the manager stamped the list with; `document` is
-/// the version its snapshot holds now. Both must be known and equal: an
-/// unknown document has no diagnostics worth jumping into, and an unstamped
-/// list is one this side never received.
-const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) -> bool {
-    match (published, document) {
-        (Some(published), Some(document)) => published == document,
-        _ => false,
+        self.attachment.context.notice = self.failure.clone().or_else(|| self.progress.clone());
     }
 }
 
@@ -13329,15 +13280,11 @@ impl Cagents {
             return;
         };
         let intent = runtime.editor_completion_intent();
-        let pending = self.lsp_contexts.get_mut(&card).and_then(|state| {
-            if state.completion_intent == intent {
-                return None;
-            }
-            state.completion_intent = intent;
-            state.context.completions.clear();
-            state.completion_request.take()
-        });
-        if let Some((request, _)) = pending {
+        let pending = self
+            .lsp_contexts
+            .get_mut(&card)
+            .and_then(|state| state.attachment.reconcile_completion_intent(intent));
+        if let Some(request) = pending {
             self.lsp.cancel(request);
         }
     }
@@ -13407,22 +13354,17 @@ impl Cagents {
                     }
                     let synchronized_version = self.lsp.document_version(doc);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                        state.invalidate_answers();
-                        if !edits.is_empty()
-                            && diagnostics_are_current(state.diagnostics_version, previous_version)
-                        {
-                            crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);
-                            state.diagnostics_version = synchronized_version;
-                        } else {
-                            // A full-text transition carries no safe coordinate mapping.
-                            // Clear native marks too, since F8 navigates those directly.
-                            state.context.diagnostics.clear();
-                            state.diagnostics_version = None;
-                        }
+                        state.attachment.document_changed(
+                            previous_version,
+                            synchronized_version,
+                            &edits,
+                        );
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                         if let Some(state) = self.lsp_contexts.get(&card) {
-                            runtime.set_editor_diagnostics(state.context.diagnostics.clone());
+                            runtime.set_editor_diagnostics(
+                                state.attachment.context.diagnostics.clone(),
+                            );
                         }
                         runtime.dismiss_editor_results();
                     }
@@ -13452,7 +13394,7 @@ impl Cagents {
     }
 
     fn lsp_document(&self, card: CardId) -> Option<LspDocumentId> {
-        self.lsp_contexts.get(&card)?.document
+        self.lsp_contexts.get(&card)?.attachment.document
     }
 
     /// Opens `path` at the LSP boundary and answers any jump parked on it.
@@ -13477,15 +13419,17 @@ impl Cagents {
             // configuration, not a failure, so the surface says the file has
             // no server rather than reporting one that is broken.
             let state = self.lsp_contexts.entry(card).or_default();
-            state.context.status = Some(LspStatus::Disabled);
+            state.attachment.context.status = Some(LspStatus::Disabled);
             return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
         };
         if self.lsp_contexts.iter().any(|(other, state)| {
-            *other != card && state.document.is_some() && state.path.as_deref() == Some(path)
+            *other != card
+                && state.attachment.document.is_some()
+                && state.path.as_deref() == Some(path)
         }) {
             let state = self.lsp_contexts.entry(card).or_default();
             state.blocked_by_other_buffer = true;
-            state.context.status = Some(LspStatus::Unavailable {
+            state.attachment.context.status = Some(LspStatus::Unavailable {
                 reason: "This file is already open for language tools in another pane. Close that file there, then restart the language server here.".into(),
             });
             return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
@@ -13506,8 +13450,8 @@ impl Cagents {
         }
         self.lsp_documents.insert(doc, card);
         let state = self.lsp_contexts.entry(card).or_default();
-        state.document = Some(doc);
-        state.context.status = Some(status);
+        state.attachment.document = Some(doc);
+        state.attachment.context.status = Some(status);
         self.flush_pending_lsp_jump(card, path)
     }
 
@@ -13519,7 +13463,7 @@ impl Cagents {
                 continue;
             };
             if let Some(state) = self.lsp_contexts.get_mut(&card)
-                && state.document == Some(doc)
+                && state.attachment.document == Some(doc)
             {
                 *state = LspInspectorState::default();
                 self.lsp_pending_jumps.remove(&card);
@@ -13534,7 +13478,7 @@ impl Cagents {
 
     fn close_lsp_document(&mut self, card: CardId) {
         if let Some(state) = self.lsp_contexts.get_mut(&card)
-            && let Some(doc) = state.document.take()
+            && let Some(doc) = state.attachment.document.take()
         {
             self.lsp.close(doc);
             self.lsp_documents.remove(&doc);
@@ -13543,8 +13487,7 @@ impl Cagents {
             runtime.set_lsp_document(None);
         }
         if let Some(state) = self.lsp_contexts.get_mut(&card) {
-            state.context = inspector::LspInspectorContext::default();
-            state.diagnostics_version = None;
+            state.attachment.clear_results();
             state.path = None;
             state.blocked_by_other_buffer = false;
         }
@@ -13691,14 +13634,14 @@ impl Cagents {
                 && let Some(card) = self.lsp_documents.get(&doc)
                 && let Some(state) = self.lsp_contexts.get_mut(card)
             {
-                state.context.status = Some(status);
+                state.attachment.context.status = Some(status);
             }
             return;
         }
         if matches!(event, LspEvent::Resources { .. } | LspEvent::Status { .. }) {
             for state in self.lsp_contexts.values_mut() {
                 if matches!(event, LspEvent::Resources { .. })
-                    && let Some(doc) = state.document
+                    && let Some(doc) = state.attachment.document
                 {
                     // A shared session can retire after its last routing document
                     // closed. Refresh every attachment before resolving that identity.
@@ -13708,12 +13651,12 @@ impl Cagents {
                     // replace that actionable refusal with "not configured".
                     let retained_refusal = matches!(status, LspStatus::Disabled)
                         && matches!(
-                            state.context.status.as_ref(),
+                            state.attachment.context.status.as_ref(),
                             Some(LspStatus::Unavailable { .. })
                         )
                         && self.lsp.document_version(doc).is_some();
                     if !retained_refusal {
-                        state.context.status = Some(status);
+                        state.attachment.context.status = Some(status);
                     }
                 }
             }
@@ -13746,40 +13689,40 @@ impl Cagents {
             LspEvent::Diagnostics { version, items, .. } => {
                 // A delayed publication must not erase the shifted standing
                 // set for a newer buffer revision.
-                if self.lsp.document_version(doc) != Some(version) {
+                if !state.attachment.accept_diagnostics(
+                    items,
+                    version,
+                    self.lsp.document_version(doc),
+                ) {
                     return;
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                    runtime.set_editor_diagnostics(items.clone());
+                    runtime.set_editor_diagnostics(state.attachment.context.diagnostics.clone());
                 }
-                state.context.diagnostics = items;
-                state.diagnostics_version = Some(version);
             }
             LspEvent::Completion { request, items, .. } => {
-                if let Some((expected, at)) = state.completion_request
-                    && request == expected
-                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-                    && runtime.cursor_position() == Some(at)
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    && state
+                        .attachment
+                        .accept_completion(request, runtime.cursor_position())
                 {
-                    state.completion_request = None;
                     runtime.set_editor_completions(items);
-                    state.context.completions = runtime.editor_completion_targets(card);
+                    state.attachment.context.completions = runtime.editor_completion_targets(card);
                 }
             }
             LspEvent::Hover {
                 request, markdown, ..
             } => {
-                if let Some((expected, at)) = state.editor_hover_request
-                    && request == expected
+                if let Some(at) = state.attachment.hover_position(request)
                     && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
                 {
                     runtime.set_editor_hover(markdown.as_deref(), Some(at));
                 }
             }
             LspEvent::Locations { kind, items, .. } => {
-                state.context.locations = Some((kind, items));
+                state.attachment.context.locations = Some((kind, items));
             }
-            LspEvent::Status { status, .. } => state.context.status = Some(status),
+            LspEvent::Status { status, .. } => state.attachment.context.status = Some(status),
             LspEvent::Progress { progress, .. } => {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
@@ -13809,7 +13752,7 @@ impl Cagents {
                 // The buffer is intact and the manager has already resent it;
                 // what is gone is every answer computed against the text the
                 // two sides disagreed about.
-                state.invalidate_answers();
+                state.attachment.invalidate_answers();
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.dismiss_editor_results();
                 }
@@ -13823,7 +13766,9 @@ impl Cagents {
 
     /// The LSP results to render beside `card`, if it is showing any.
     fn lsp_context(&self, card: CardId) -> Option<&inspector::LspInspectorContext> {
-        self.lsp_contexts.get(&card).map(|state| &state.context)
+        self.lsp_contexts
+            .get(&card)
+            .map(|state| &state.attachment.context)
     }
 
     /// Handles the inspector's language-server actions.
@@ -13837,11 +13782,11 @@ impl Cagents {
                 // so the list on screen can describe text the buffer has moved
                 // past. Jumping into it would land the caret on a line the
                 // diagnostic never named.
-                let published = state.diagnostics_version;
                 let current = state
+                    .attachment
                     .document
                     .and_then(|doc| self.lsp.document_version(doc));
-                if !diagnostics_are_current(published, current) {
+                if !state.attachment.diagnostics_are_current(current) {
                     self.status = Some(TransientNotice::warning(
                         "these diagnostics describe an earlier version of the file",
                     ));
@@ -13873,13 +13818,12 @@ impl Cagents {
                     // The replacement process republishes from scratch. Keeping
                     // the dead session's diagnostics on screen would show the
                     // user results from a server that no longer exists.
-                    state.invalidate_answers();
-                    state.context.diagnostics.clear();
-                    state.diagnostics_version = None;
+                    state.attachment.invalidate_answers();
+                    state.attachment.clear_diagnostics();
                     state.failure = None;
                     state.progress = None;
                     state.refresh_notice();
-                    state.context.status = Some(self.lsp.status(doc));
+                    state.attachment.context.status = Some(self.lsp.status(doc));
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.dismiss_editor_results();
@@ -13889,7 +13833,7 @@ impl Cagents {
             }
             InspectorAction::DismissLspResults(card) => {
                 if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                    state.invalidate_answers();
+                    state.attachment.invalidate_answers();
                     state.failure = None;
                     state.refresh_notice();
                 }
@@ -13990,7 +13934,7 @@ impl Cagents {
         let Some(state) = self.lsp_contexts.get(&card) else {
             return Task::none();
         };
-        let Some(current) = state.context.completions.get(index) else {
+        let Some(current) = state.attachment.context.completions.get(index) else {
             return Task::none();
         };
         // A queued action names the exact publication, document revision and
@@ -14022,7 +13966,7 @@ impl Cagents {
         // exists, and the edit itself produces a `Change` intent that must
         // reach the server before the next request is answered against it.
         if let Some(state) = self.lsp_contexts.get_mut(&card) {
-            state.context.completions.clear();
+            state.attachment.context.completions.clear();
         }
         self.drain_lsp_intents(card)
     }
@@ -14045,7 +13989,8 @@ impl Cagents {
                 self.lsp_contexts
                     .entry(card)
                     .or_default()
-                    .completion_request = Some((request, at));
+                    .attachment
+                    .completion_requested(request, at);
                 request
             }
             LspRequestKind::References => self.lsp.request_references(doc, at),
@@ -14070,7 +14015,7 @@ impl Cagents {
             }
             Action::Hover(at) => {
                 if let Some(state) = self.lsp_contexts.get_mut(&card)
-                    && let Some((request, _)) = state.editor_hover_request.take()
+                    && let Some(request) = state.attachment.take_hover_request()
                 {
                     self.lsp.cancel(request);
                 }
@@ -14084,7 +14029,8 @@ impl Cagents {
                     self.lsp_contexts
                         .entry(card)
                         .or_default()
-                        .editor_hover_request = Some((request, at));
+                        .attachment
+                        .hover_requested(request, at);
                 }
                 Task::none()
             }
@@ -14098,7 +14044,11 @@ impl Cagents {
                 });
                 if let Some(at) = at {
                     let request = self.lsp.request_definition(doc, at);
-                    self.lsp_contexts.entry(card).or_default().editor_navigation = Some(request);
+                    self.lsp_contexts
+                        .entry(card)
+                        .or_default()
+                        .attachment
+                        .navigation_requested(request);
                 }
                 Task::none()
             }
@@ -14115,7 +14065,7 @@ impl Cagents {
                 if matches!(action, Action::Dismiss)
                     && let Some(state) = self.lsp_contexts.get_mut(&card)
                 {
-                    state.invalidate_answers();
+                    state.attachment.invalidate_answers();
                 }
                 match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
@@ -19546,10 +19496,9 @@ impl Cagents {
                 {
                     self.lsp_documents.get(doc).copied().and_then(|card| {
                         let state = self.lsp_contexts.get_mut(&card)?;
-                        if state.editor_navigation != Some(*request) {
+                        if !state.attachment.accept_navigation(*request) {
                             return None;
                         }
-                        state.editor_navigation = None;
                         Some((card, items.clone()))
                     })
                 } else {
