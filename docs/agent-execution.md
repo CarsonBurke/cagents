@@ -271,7 +271,7 @@ A delivered message is a prompt framed for the agent:
 ```text
 [cagents message from session 3e81d0aa "Fix flaky login test"]
 I am refactoring src/auth.rs; hold edits there until I report back
-[Reply: cagents reply 9a41c2e7 "…" · seal 5f0c…]
+[Reply in a shell: cagents reply 9a41c2e7 "…" · seal 5f0c…]
 ```
 
 The daemon seals each frame with a keyed hash under a secret it keeps in its registry. Windows show a sealed prompt as a message from its sender, both when it is delivered and when the transcript is read back from provider history; a prompt that only looks like one stays the user's own words. The seal proves who wrote a frame, not what its sender may ask for: a message is as trustworthy as a prompt from the session that sent it, and the recipient decides what to do with it. Nor does it bind a frame to the conversation it was delivered to; a sealed frame pasted into another conversation shows there as the same message. A caller without a daemon-issued capability is the user, so a process that drops its capability speaks as the user, as any program the user runs can.
