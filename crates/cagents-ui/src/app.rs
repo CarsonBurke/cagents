@@ -12563,9 +12563,7 @@ impl Cagents {
                 .view(
                     &self.sidebar_model.projects,
                     &self.sidebar_model.external_editors,
-                    self.sidebar_state
-                        .followed_worktree()
-                        .map(|key| (key.project_id, key.worktree_id)),
+                    self.worktrees_current(),
                     self.modal_is_open(),
                 )
                 .map(Message::WorktreesUi),

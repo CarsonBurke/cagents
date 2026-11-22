@@ -3,6 +3,7 @@
 //! the sidebar's own handlers.
 use super::worktree_ui::{ResolveRoot, card_directory};
 use super::*;
+use crate::model::{ProjectId, WorktreeId};
 use crate::worktrees_ui::{Action, Agent, AgentState, Agents, Effect};
 
 impl Cagents {
@@ -44,6 +45,18 @@ impl Cagents {
             .refresh(revision, &self.sidebar_model.projects);
         let agents = self.worktree_agents();
         self.worktrees_ui.set_agents(agents);
+    }
+
+    /// The checkout of the pane the user was last in. Not the sidebar's
+    /// followed worktree: a channel scoped to a project's main checkout binds
+    /// that one whichever worktree its focused pane works in.
+    pub(super) fn worktrees_current(&self) -> Option<(ProjectId, WorktreeId)> {
+        self.worktrees_ui.current(
+            self.workspace
+                .focused()
+                .into_iter()
+                .chain(self.tab_history.recent().iter().copied()),
+        )
     }
 
     /// Carries a pane's new title to its chips, for a projection that moved
@@ -161,7 +174,7 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChannelId, ProjectChannel, ProjectId, WorktreeId};
+    use crate::model::{ChannelId, ProjectChannel};
     use crate::repository::RepositoryId;
     use crate::sidebar::{SidebarProject, SidebarWorktree};
 
@@ -269,6 +282,15 @@ mod tests {
         // Pressing it goes to the pane.
         drop(app.update(Message::WorktreesUi(Action::FocusPane(shell))));
         assert_eq!(app.workspace.focused(), Some(shell));
+
+        // Back in the view, which is now the focused pane, the checkout that
+        // pane works in is the current one.
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::OpenWorktrees,
+        )));
+        drop(app.project_workspace(false));
+        assert_ne!(app.workspace.focused(), Some(shell));
+        assert_eq!(app.worktrees_current(), Some((project, main)));
     }
 
     #[test]

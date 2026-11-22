@@ -165,6 +165,8 @@ pub struct State {
     /// The projects revision and query the entries were listed from.
     listed: Option<(u64, String)>,
     agents: Agents,
+    /// The checkout each listed pane works in, for finding the current one.
+    homes: HashMap<CardId, (ProjectId, WorktreeId)>,
 }
 
 impl State {
@@ -174,6 +176,7 @@ impl State {
         self.entries.clear();
         self.listed = None;
         self.agents.clear();
+        self.homes.clear();
     }
 
     /// Lists the rows again if the projects or the query changed since.
@@ -207,8 +210,28 @@ impl State {
 
     pub fn set_agents(&mut self, agents: Agents) {
         if self.agents != agents {
+            self.homes.clear();
+            for (row, listed) in &agents {
+                for agent in listed {
+                    // A directory two projects share lists under both; the
+                    // first is as current as the other.
+                    self.homes.entry(agent.card).or_insert(*row);
+                }
+            }
             self.agents = agents;
         }
+    }
+
+    /// The checkout the user is working in: that of the most recently
+    /// focused pane listed here. The view itself is focused while it is
+    /// used, so the pane in focus alone would never name one.
+    pub fn current(
+        &self,
+        recent: impl IntoIterator<Item = CardId>,
+    ) -> Option<(ProjectId, WorktreeId)> {
+        recent
+            .into_iter()
+            .find_map(|card| self.homes.get(&card).copied())
     }
 
     #[cfg(test)]
@@ -376,8 +399,10 @@ impl<'a> View<'a> {
                 // The switch sends nothing else.
                 _ => Action::Layout(Layout::Worktrees),
             }),
-            widget::button::standard("Open project…")
-                .leading_icon(Icon::OpenFolder.handle())
+            // An icon beside the layout switch, as the board's own controls
+            // are: a labelled button wrapped onto two lines in a pane beside
+            // a chat.
+            icon_button(Icon::OpenFolder, "Open project…")
                 .on_press_maybe(self.sidebar(SidebarAction::OpenRepositoryPicker))
                 .into(),
         ])
@@ -1275,6 +1300,31 @@ mod tests {
         )]));
         state.retitle(|listed| (listed == card).then(|| "Fix the flaky test".to_owned()));
         assert_eq!(state.agents()[&row][0].title, "Fix the flaky test");
+    }
+
+    #[test]
+    fn the_current_checkout_is_the_last_listed_pane_the_user_was_in() {
+        let agent = |card| Agent {
+            card,
+            title: "pane".into(),
+            provider: None,
+            state: AgentState::Shell,
+            channel: None,
+        };
+        let (older, newer, unlisted) = (CardId::new(), CardId::new(), CardId::new());
+        let (main, feature) = (
+            (ProjectId::new(), WorktreeId::new()),
+            (ProjectId::new(), WorktreeId::new()),
+        );
+        let mut state = State::default();
+        state.set_agents(Agents::from([
+            (main, vec![agent(older)]),
+            (feature, vec![agent(newer)]),
+        ]));
+        // The view's own pane, focused now, lists nowhere and is passed over.
+        assert_eq!(state.current([unlisted, newer, older]), Some(feature));
+        assert_eq!(state.current([older, newer]), Some(main));
+        assert_eq!(state.current([unlisted]), None);
     }
 
     #[test]

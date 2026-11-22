@@ -4556,13 +4556,6 @@ impl SidebarState {
         self.active_worktree.as_ref()
     }
 
-    /// The worktree focus names, or the last one it named while the focused
-    /// pane names none; unlike [`Self::active_worktree`], never the panel's
-    /// pinned one.
-    pub fn followed_worktree(&self) -> Option<&ActiveWorktreeKey> {
-        self.followed_worktree.as_ref()
-    }
-
     /// Binds the source-control and file panels to the worktree at `path`
     /// rather than the one focus names, or follows focus again with `None`.
     /// The list's selection keeps following focus either way. Takes effect at
