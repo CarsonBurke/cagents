@@ -33,7 +33,7 @@ command -v jq >/dev/null || { printf '%s\n' 'The fixture provider needs jq' >&2;
 case $frame_bytes in
     '' | *[!0-9]*) printf '%s\n' 'CAGENTS_IDLE_ACTOR_FRAME_BYTES must be a non-negative integer' >&2; exit 2 ;;
 esac
-[ "$frame_bytes" -le $((32 * 1024 * 1024)) ] || {
+[ "$frame_bytes" -le $((31 * 1024 * 1024)) ] || {
     printf '%s\n' 'CAGENTS_IDLE_ACTOR_FRAME_BYTES exceeds the provider frame limit' >&2
     exit 2
 }
@@ -105,6 +105,6 @@ for pid in $(fixture_processes); do
 done
 printf 'build=%s actors=%s; settling 10 s\n' "$bin" "$actors"
 sleep 10
-"$checkout/scripts/measure-cagents-memory" --environ "XDG_RUNTIME_DIR=$runtime"
+/usr/bin/python3 -I "$checkout/scripts/measure-cagents-memory" --environ "XDG_RUNTIME_DIR=$runtime"
 /usr/bin/python3 -I "$checkout/scripts/measure-idle-wakeups" --seconds "$seconds" \
     --environ "XDG_RUNTIME_DIR=$runtime"

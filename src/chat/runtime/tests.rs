@@ -1353,6 +1353,131 @@ fn a_settled_actor_releases_large_json_frame_slack() {
 }
 
 #[test]
+fn actor_reclaims_a_large_frame_when_an_already_ready_turn_blocks() {
+    struct LargeFrame {
+        received: Arc<Mutex<Vec<Value>>>,
+    }
+    impl Adapter for LargeFrame {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                // Prompt availability becomes true before the provider echoes
+                // the large frame, so only the later indefinite-poll boundary
+                // can release its framing allocation.
+                events: vec![Event::Ready(true)],
+                writes: vec![json!({"result": "x".repeat(2 * 1024 * 1024)})],
+                ..Default::default()
+            })
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Err("fixture accepts no commands".into())
+        }
+        fn receive(&mut self, frame: Value) -> Result<Step, String> {
+            self.received.lock().unwrap().push(frame);
+            Ok(Step {
+                // A permission wait cannot become prompt-ready, so it used
+                // to miss the prompt-availability reclamation path entirely.
+                events: vec![Event::Waiting(true)],
+                ..Default::default()
+            })
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: directory.path().into(),
+        environment: BTreeMap::new(),
+    };
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let mut adapter = Box::new(LargeFrame {
+        received: received.clone(),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while handle.idle_frame_buffer_capacity() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let capacity = handle.idle_frame_buffer_capacity();
+    let frames = received.lock().unwrap().len();
+    let closed = handle.close();
+    closed.unwrap();
+    assert_eq!(frames, 1, "the actor must decode the echoed large frame");
+    assert!(
+        capacity <= IDLE_FRAME_BUFFER_CAPACITY,
+        "the indefinite idle poll retained {capacity} bytes"
+    );
+}
+
+#[test]
+fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() {
+    struct SplitFrames {
+        received: Arc<Mutex<Vec<Value>>>,
+    }
+    impl Adapter for SplitFrames {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Err("fixture accepts no commands".into())
+        }
+        fn receive(&mut self, frame: Value) -> Result<Step, String> {
+            let events = if frame == json!({"result": 1}) {
+                vec![Event::Ready(true)]
+            } else {
+                Vec::new()
+            };
+            self.received.lock().unwrap().push(frame);
+            Ok(Step {
+                events,
+                ..Default::default()
+            })
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        // The first write holds a complete result and an incomplete next
+        // frame. Handling the result makes the actor prompt-ready, but the
+        // partial suffix must survive that publication until this second write.
+        program: "/bin/sh".into(),
+        arguments: vec![
+            "-c".into(),
+            "printf '{\"result\":1}\\n{\"partial\":'; sleep 0.1; printf '2}\\n'; exec cat".into(),
+        ],
+        working_directory: directory.path().into(),
+        environment: BTreeMap::new(),
+    };
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let mut adapter = Box::new(SplitFrames {
+        received: received.clone(),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while received.lock().unwrap().len() != 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let frames = received.lock().unwrap().clone();
+    let closed = handle.close();
+    closed.unwrap();
+    assert_eq!(frames, vec![json!({"result": 1}), json!({"partial": 2})]);
+}
+
+#[test]
 fn refusals_name_a_waiting_subagent_and_how_to_let_it_go() {
     let mut state = Snapshot::default();
     let subagent = |id: &str, description: &str, status| super::super::Subagent {

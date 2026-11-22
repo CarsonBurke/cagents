@@ -380,6 +380,8 @@ struct Inner {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     /// What became of the messages sent under a key.
     deliveries: delivery::Deliveries,
+    #[cfg(test)]
+    idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
 enum NativeOwnership {
@@ -408,6 +410,11 @@ impl From<QueueRefusal> for String {
 }
 
 impl LocalHandle {
+    #[cfg(test)]
+    fn idle_frame_buffer_capacity(&self) -> usize {
+        self.0.idle_frame_buffer_capacity.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,
@@ -619,6 +626,8 @@ impl LocalHandle {
         let native_installed = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(0));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
@@ -688,6 +697,8 @@ impl LocalHandle {
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
             deliveries: delivery::Deliveries::default(),
+            #[cfg(test)]
+            idle_frame_buffer_capacity: idle_frame_buffer_capacity.clone(),
         });
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -746,6 +757,8 @@ impl LocalHandle {
                     stdout_noise: spec.stdout_noise,
                     started: Instant::now(),
                     write_started: None,
+                    #[cfg(test)]
+                    idle_frame_buffer_capacity,
                 };
                 let result = {
                     let _recovered = crate::instance::recovered_panic_scope();
@@ -2462,6 +2475,8 @@ struct Actor {
     stdout_noise: Option<fn(&[u8]) -> bool>,
     started: Instant,
     write_started: Option<Instant>,
+    #[cfg(test)]
+    idle_frame_buffer_capacity: Arc<AtomicUsize>,
 }
 
 /// Each valid frame earns a fresh `IO_TIMEOUT`, up to `STARTUP_LIMIT` overall.
@@ -2980,6 +2995,12 @@ impl Actor {
             } else {
                 -1
             };
+            // The -1 branch proves the parser drained every complete frame
+            // and no partial line remains. It also covers a conversation
+            // parked on a permission request, which cannot become prompt-ready.
+            if timeout == -1 {
+                self.reclaim_idle_frame_buffer();
+            }
             if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
@@ -3978,16 +3999,12 @@ impl Actor {
 
     fn reclaim_idle_frame_buffer(&mut self) {
         if release_idle_frame_buffer(&mut self.output) {
-            // `Vec::shrink_to` returns its allocation to Rust, but glibc can
-            // retain a freed small arena. Trim only after actually releasing
-            // a large protocol buffer, and only on the actor worker, never
-            // on the UI or daemon control thread.
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
-            unsafe {
-                // SAFETY: `malloc_trim` takes no pointers and acts only on
-                // this process's glibc allocator state.
-                libc::malloc_trim(0);
-            }
+            // Do not call process-wide malloc_trim here: ordinary ACP/OMP
+            // actors share cagentsd's allocator and would serialize its
+            // unrelated arenas.
+            #[cfg(test)]
+            self.idle_frame_buffer_capacity
+                .store(self.output.capacity(), Ordering::Release);
         }
     }
 }

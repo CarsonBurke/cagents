@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Report cagents processes' RSS/PSS from /proc/PID/smaps_rollup.
 
 Use --environ to select one private development or fixture runtime without
@@ -8,45 +8,97 @@ sampling unrelated cagents instances:
 """
 import argparse
 import os
-import sys
+from pathlib import Path
 
 
-def processes(environment):
+ROLLUP_FIELDS = (
+    "Rss",
+    "Pss",
+    "Private_Clean",
+    "Private_Dirty",
+    "Anonymous",
+    "Swap",
+    "SwapPss",
+)
+
+
+def process(pid):
+    """Return stable identity data, or None for a vanished/zombie process."""
+    base = Path("/proc") / str(pid)
+    try:
+        stat = (base / "stat").read_text()
+        # comm may contain spaces and parentheses, so split only after its end.
+        state, parent = stat.rsplit(")", 1)[1].split()[:2]
+        if state == "Z":
+            return None
+        command = (base / "cmdline").read_bytes().split(b"\0")
+        executable = (base / "exe").resolve().name
+    except (FileNotFoundError, PermissionError, ProcessLookupError, IndexError):
+        return None
+    return {"pid": str(pid), "parent": parent, "command": command, "exe": executable}
+
+
+def selected_processes(environment):
     wanted = environment.encode() if environment else None
+    result = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
-        base = f"/proc/{name}"
-        try:
-            if wanted is not None:
-                with open(f"{base}/environ", "rb") as file:
-                    if wanted not in file.read().split(b"\0"):
-                        continue
-            with open(f"{base}/cmdline", "rb") as file:
-                command = file.read().replace(b"\0", b" ")
-        except OSError:
+        if wanted is not None:
+            try:
+                if wanted not in (Path("/proc") / name / "environ").read_bytes().split(b"\0"):
+                    continue
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+        item = process(name)
+        if item is not None:
+            result.append(item)
+    return result
+
+
+def role_samples(environment):
+    records = selected_processes(environment)
+    actors = {
+        record["pid"]
+        for record in records
+        if b"--cagents-native-actor" in record["command"]
+    }
+    roles = {"ui": [], "daemon": [], "actors": [], "providers": []}
+    for record in records:
+        executable = record["exe"]
+        if record["pid"] in actors:
+            role = "actors"
+        elif executable == "cagents-ui":
+            role = "ui"
+        elif executable == "cagentsd":
+            role = "daemon"
+        # A provider is the executable child the retained actor spawned, not
+        # a process whose command line merely mentions ~/.claude or ~/.codex.
+        # Tool commands are descendants of that provider, not direct children.
+        elif record["parent"] in actors:
+            role = "providers"
+        else:
             continue
-        if b"--cagents-native-actor" in command:
-            yield "actors", name
-        elif b"cagents-ui" in command:
-            yield "ui", name
-        elif b"cagentsd" in command:
-            yield "daemon", name
-        elif b"claude" in command or b"codex" in command:
-            yield "providers", name
+        sample = rollup(record["pid"])
+        if sample is not None:
+            roles[role].append(sample)
+    return roles
 
 
 def rollup(pid):
-    values = {}
+    values = {field: 0 for field in ROLLUP_FIELDS}
     try:
-        with open(f"/proc/{pid}/smaps_rollup") as file:
-            for line in file:
-                key, _, value = line.partition(":")
-                if key in ("Rss", "Pss", "Private_Clean", "Private_Dirty"):
-                    values[key] = int(value.split()[0])
-    except (OSError, IndexError, ValueError):
+        for line in (Path("/proc") / pid / "smaps_rollup").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in values:
+                values[key] = int(value.split()[0])
+    except (FileNotFoundError, PermissionError, ProcessLookupError, IndexError, ValueError):
         return None
     return values
+
+
+def total(samples, field):
+    return sum(sample[field] for sample in samples)
 
 
 def main():
@@ -57,31 +109,28 @@ def main():
         help="only processes whose environment holds exactly this entry",
     )
     arguments = parser.parse_args()
-    roles = {"ui": [], "daemon": [], "actors": [], "providers": []}
-    for role, pid in processes(arguments.environ):
-        sample = rollup(pid)
-        if sample is not None:
-            roles[role].append(sample)
+    roles = role_samples(arguments.environ)
 
     print("resident KiB from /proc/PID/smaps_rollup")
-    print(f"{'role':12} {'processes':>9} {'RSS':>12} {'PSS':>12} {'private':>12}")
-    totals = []
-    for role, samples in roles.items():
-        rss = sum(sample.get("Rss", 0) for sample in samples)
-        pss = sum(sample.get("Pss", 0) for sample in samples)
-        private = sum(
-            sample.get("Private_Clean", 0) + sample.get("Private_Dirty", 0)
-            for sample in samples
-        )
-        totals.extend(samples)
-        print(f"{role:12} {len(samples):9} {rss:12} {pss:12} {private:12}")
-    rss = sum(sample.get("Rss", 0) for sample in totals)
-    pss = sum(sample.get("Pss", 0) for sample in totals)
-    private = sum(
-        sample.get("Private_Clean", 0) + sample.get("Private_Dirty", 0)
-        for sample in totals
+    print(
+        f"{'role':12} {'processes':>9} {'RSS':>10} {'PSS':>10} "
+        f"{'private-dirty':>15} {'anonymous':>11} {'swap':>10} {'swap-pss':>10}"
     )
-    print(f"{'total':12} {len(totals):9} {rss:12} {pss:12} {private:12}")
+    samples = []
+    for role, entries in roles.items():
+        samples.extend(entries)
+        print(
+            f"{role:12} {len(entries):9} {total(entries, 'Rss'):10} "
+            f"{total(entries, 'Pss'):10} {total(entries, 'Private_Dirty'):15} "
+            f"{total(entries, 'Anonymous'):11} {total(entries, 'Swap'):10} "
+            f"{total(entries, 'SwapPss'):10}"
+        )
+    print(
+        f"{'total':12} {len(samples):9} {total(samples, 'Rss'):10} "
+        f"{total(samples, 'Pss'):10} {total(samples, 'Private_Dirty'):15} "
+        f"{total(samples, 'Anonymous'):11} {total(samples, 'Swap'):10} "
+        f"{total(samples, 'SwapPss'):10}"
+    )
 
 
 if __name__ == "__main__":
