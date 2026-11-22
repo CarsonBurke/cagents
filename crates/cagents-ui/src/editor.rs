@@ -313,15 +313,16 @@ impl FileRead {
     pub fn worktree(&self) -> &Path {
         &self.worktree
     }
-    /// Whether the read opened a Markdown buffer for editing.
-    pub(crate) fn is_markdown(&self) -> bool {
-        matches!(
-            self.result,
+    /// Whether the read opened a buffer for editing that is Markdown, or
+    /// that may become Markdown because its content decides.
+    pub(crate) fn may_be_markdown(&self) -> bool {
+        match &self.result {
             Ok(LoadedFile {
-                content: FileContent::Editable { markdown: true, .. },
-                ..
-            })
-        )
+                source,
+                content: FileContent::Editable { markdown, .. },
+            }) => *markdown || language::markdown_by_name(source).is_none(),
+            _ => false,
+        }
     }
     pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) {
         (self.root, self.result)

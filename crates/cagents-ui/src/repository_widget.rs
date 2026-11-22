@@ -1007,6 +1007,11 @@ struct EditorDocument {
     /// last decided.
     markdown: bool,
     language: LanguageSource,
+    /// The grammar the Markdown highlighter is built from, held while the
+    /// buffer's language can change, so that turning to Markdown at the
+    /// edit debounce or by the reader's choice never loads it on the UI
+    /// thread.
+    _markdown_grammar: Option<crate::diff_view::SyntaxLease>,
     /// How many times the content was read to infer its language.
     #[cfg(test)]
     inferences: usize,
@@ -1096,6 +1101,10 @@ impl EditorDocument {
         } else {
             LanguageSource::Content { stale: false }
         };
+        // The load warmed the grammar for a buffer whose content decides, so
+        // joining it here costs nothing.
+        let markdown_grammar =
+            (language != LanguageSource::Name).then(crate::diff_view::syntax_lease);
         Self {
             path,
             source,
@@ -1106,6 +1115,7 @@ impl EditorDocument {
             disk_hash,
             markdown,
             language,
+            _markdown_grammar: markdown_grammar,
             #[cfg(test)]
             inferences: 0,
             // Source editing does not consume the preview AST. Parse only
@@ -1504,11 +1514,13 @@ impl EditorDocument {
     /// both its colours and whether it wraps as prose.
     fn syntax_token(&self) -> String {
         match self.language {
-            LanguageSource::Chosen(DocumentLanguage::PlainText) => "txt".to_owned(),
+            // A `README` is Markdown by its name, though no grammar goes by it.
             _ if self.markdown => "md".to_owned(),
-            // A buffer read as plain text keeps whatever its name highlights
-            // as, which for a name no grammar knows is plain text.
-            _ => crate::diff_view::syntax_token(&self.source),
+            LanguageSource::Name => crate::diff_view::syntax_token(&self.source),
+            // No grammar goes by the name of a buffer whose language is not
+            // its name's, so read as plain text it is plain text, and wraps
+            // as prose however it came to be so.
+            LanguageSource::Content { .. } | LanguageSource::Chosen(_) => "txt".to_owned(),
         }
     }
 
@@ -9089,11 +9101,12 @@ fn file_task(
                 }
                 if let Ok(read) = &mut result {
                     read.watch_revision = revision;
-                    if read.is_markdown() {
+                    if read.may_be_markdown() {
                         // The editor builds its Markdown highlighter on the
                         // UI thread, where loading the grammar would stall a
                         // frame. Load it here; the shared cache keeps it
-                        // long enough for the highlighter to join it.
+                        // long enough for the highlighter, or a buffer whose
+                        // content decides, to join it.
                         drop(crate::diff_view::syntax_lease());
                     }
                 }

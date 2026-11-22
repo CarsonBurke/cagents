@@ -11695,6 +11695,9 @@ fn a_nameless_buffer_reads_as_its_content_once_typing_settles_never_per_frame() 
     let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "Untitled", "");
     assert!(!editable(&runtime).markdown);
     assert_eq!(runtime.language_offer(), Some((false, None)));
+    // It holds the Markdown grammar it may turn to, so that turning never
+    // loads it on the UI thread.
+    assert!(editable(&runtime)._markdown_grammar.is_some());
 
     // Pasting a reply in pieces, in the edit surface, reads nothing yet: the
     // language waits for the debounce, which is armed even though nothing
@@ -11710,11 +11713,12 @@ fn a_nameless_buffer_reads_as_its_content_once_typing_settles_never_per_frame() 
     for _ in 0..3 {
         drop(view(card, &runtime));
         drop(selected_file_toolbar(card, &runtime));
-        assert_eq!(highlight_token(&runtime), "Untitled");
+        assert_eq!(highlight_token(&runtime), "txt");
     }
     assert_eq!(editable(&runtime).inferences, 0);
 
-    assert!(!editable(&runtime).is_prose());
+    // Plain text until then, which wraps as prose as Markdown will.
+    assert!(editable(&runtime).is_prose());
     settle(&mut runtime, card);
     assert_eq!(editable(&runtime).inferences, 1);
     assert!(editable(&runtime).markdown);
@@ -11767,7 +11771,8 @@ fn a_markdown_buffer_holds_while_an_edit_is_half_typed() {
     paste(&mut runtime, card, "Remember to call the dentist.\n");
     settle(&mut runtime, card);
     assert!(!editable(&runtime).markdown);
-    assert_eq!(highlight_token(&runtime), "Untitled");
+    assert_eq!(highlight_token(&runtime), "txt");
+    assert!(editable(&runtime).is_prose());
 }
 
 #[test]
@@ -11845,6 +11850,7 @@ fn a_named_buffer_offers_no_language_and_highlights_by_its_name() {
     let card = CardId::new();
     let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", AGENT_REPLY);
     assert_eq!(runtime.language_offer(), None);
+    assert!(editable(&runtime)._markdown_grammar.is_none());
     drop(runtime.update(RepositoryAction::ChooseLanguage {
         card,
         language: Some(DocumentLanguage::Markdown),
