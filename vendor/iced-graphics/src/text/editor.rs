@@ -528,13 +528,31 @@ impl editor::Editor for Editor {
     }
 
     fn caret(&self) -> Option<Rectangle> {
-        match self.selection() {
-            editor::Selection::Caret(position) => Some(Rectangle::new(
-                position,
-                Size::new(1.0, self.buffer().metrics().line_height),
-            )),
-            editor::Selection::Range(_) => None,
+        let internal = self.internal();
+
+        if internal.editor.selection_bounds().is_some() {
+            return None;
         }
+
+        // Only a caret on a drawn line, unlike `selection`, which estimates
+        // where a caret off every drawn line would be and can count lines
+        // that are not laid out as nothing: a caret that is not drawn is
+        // not in view.
+        let cursor = internal.editor.cursor();
+        let buffer = buffer_from_editor(&internal.editor);
+        let line_height = buffer.metrics().line_height;
+
+        buffer
+            .draw_runs()
+            .filter(|run| run.line_i == cursor.line)
+            .find_map(|run| {
+                run.cursor_position(&cursor).map(|x| {
+                    Rectangle::new(
+                        Point::new(x, run.line_top),
+                        Size::new(1.0, line_height),
+                    )
+                })
+            })
     }
 
     fn min_bounds(&self) -> Size {

@@ -597,7 +597,8 @@ where
     }
 
     /// cagents: the line the caret is on, relative to the text area of the
-    /// [`TextEditor`] that last laid it out, while nothing is selected.
+    /// [`TextEditor`] that last laid it out, while nothing is selected and
+    /// that line is drawn.
     pub fn caret(&self) -> Option<Rectangle> {
         self.0.borrow().editor.caret()
     }

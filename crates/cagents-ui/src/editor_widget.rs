@@ -4329,6 +4329,27 @@ mod tests {
         editor.set_overscan(8.0, 8.0);
         lay_out(&mut editor);
         assert_eq!(editor.overflow(), (0.0, 0.0));
+
+        // The caret is reported on its line, relative to the scrolled text
+        // area, only while it is drawn and nothing is selected (#3077).
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        editor.perform(Action::Click(Point::new(5.0, 45.0)));
+        lay_out(&mut editor);
+        let caret = editor.caret().expect("a caret on line 2");
+        assert_eq!((caret.y, caret.height), (40.0, 20.0));
+        // Scrolled to the line above the viewport, it is in the band.
+        editor.perform(Action::Scroll { lines: 3 });
+        lay_out(&mut editor);
+        assert_eq!(editor.caret().map(|caret| caret.y), Some(-20.0));
+        // Scrolled further, and after a new width discards every layout, it
+        // is not drawn and so not reported.
+        editor.perform(Action::Scroll { lines: 7 });
+        lay_out_at(&mut editor, 600.0);
+        assert_eq!(editor.caret(), None);
+        editor.perform(Action::SelectAll);
+        assert_eq!(editor.caret(), None);
     }
 
     /// An overscan only adds what is drawn: where the editor scrolls, where

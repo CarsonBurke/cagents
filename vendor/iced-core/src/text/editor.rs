@@ -79,7 +79,7 @@ pub trait Editor: Sized + Default {
     }
 
     /// cagents: the line the caret is on, relative to the [`Editor`]'s
-    /// bounds, while nothing is selected.
+    /// bounds, while nothing is selected and that line is drawn.
     fn caret(&self) -> Option<Rectangle> {
         None
     }
