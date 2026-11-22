@@ -539,28 +539,66 @@ cargo clean && cargo build --locked
         }
     }
 
-    /// Every highlighted span of `text`, as (line, text, highlight).
-    fn highlights(settings: &Settings, text: &str) -> Vec<(usize, String, Highlight)> {
-        let mut highlighter = Highlighter::new(settings);
-        let mut spans = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            for (range, highlight) in highlighter.highlight_line(line) {
-                spans.push((index, line[range].to_owned(), highlight));
-            }
-        }
-        spans
+    /// One highlighted range of `lines[line]`.
+    struct Span {
+        line: usize,
+        range: Range<usize>,
+        highlight: Highlight,
     }
 
-    /// The style of the span on `line` (counting from 0) that is exactly
-    /// `text`; spans the highlighter leaves out are plain text.
-    fn style(spans: &[(usize, String, Highlight)], line: usize, text: &str) -> Style {
-        spans
-            .iter()
-            .find(|(at, span, _)| *at == line && span == text)
-            .map_or(Style::TEXT, |(_, _, highlight)| match highlight {
-                Highlight::Markdown(highlight) => highlight.style,
-                Highlight::Code(_) => panic!("Markdown is drawn as code"),
+    struct Highlights {
+        lines: Vec<String>,
+        spans: Vec<Span>,
+    }
+
+    impl Highlights {
+        fn text(&self, span: &Span) -> &str {
+            &self.lines[span.line][span.range.clone()]
+        }
+    }
+
+    /// Every highlighted span of `text`, with its lines.
+    fn highlights(settings: &Settings, text: &str) -> Highlights {
+        let mut highlighter = Highlighter::new(settings);
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let mut spans = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            spans.extend(
+                highlighter
+                    .highlight_line(line)
+                    .map(|(range, highlight)| Span {
+                        line: index,
+                        range,
+                        highlight,
+                    }),
+            );
+        }
+        Highlights { lines, spans }
+    }
+
+    /// The style of the first `text` on `line` (counting from 0), which every
+    /// byte of it must share; bytes no span covers are plain text.
+    fn style(highlights: &Highlights, line: usize, text: &str) -> Style {
+        let start = highlights.lines[line]
+            .find(text)
+            .unwrap_or_else(|| panic!("{text:?} is not on line {line}"));
+        let styles: Vec<Style> = (start..start + text.len())
+            .map(|byte| {
+                highlights
+                    .spans
+                    .iter()
+                    .find(|span| span.line == line && span.range.contains(&byte))
+                    .map_or(Style::TEXT, |span| match &span.highlight {
+                        Highlight::Markdown(highlight) => highlight.style,
+                        Highlight::Code(_) => panic!("Markdown is drawn as code"),
+                    })
             })
+            .collect();
+        assert!(
+            styles.iter().all(|style| *style == styles[0]),
+            "{text:?} on line {line} is drawn in several styles: {styles:?}"
+        );
+        styles[0]
     }
 
     fn tone(tone: Tone) -> Style {
@@ -671,7 +709,8 @@ cargo clean && cargo build --locked
                 assert!(!inks.contains(&red), "{red:?} in {name}");
             }
             let spans = highlights(&settings(true, "md"), DOCUMENT);
-            for (_, text, highlight) in &spans {
+            for span in &spans.spans {
+                let (text, highlight) = (spans.text(span), &span.highlight);
                 let format = format(highlight, &theme);
                 if let Highlight::Markdown(MarkdownHighlight {
                     style:
@@ -699,11 +738,12 @@ cargo clean && cargo build --locked
         let spans = highlights(&settings, "## Plan\n\n**bold** and *slant*\n");
         let theme = cosmic::Theme::dark();
         let font = |line: usize, text: &str| {
-            let (_, _, highlight) = spans
+            let span = spans
+                .spans
                 .iter()
-                .find(|(at, span, _)| *at == line && span == text)
+                .find(|span| span.line == line && spans.text(span) == text)
                 .unwrap();
-            format(highlight, &theme).font.unwrap()
+            format(&span.highlight, &theme).font.unwrap()
         };
         assert_eq!(font(0, "Plan").family, settings.font.family);
         assert_eq!(font(0, "Plan").weight, font::Weight::Bold);
@@ -721,13 +761,20 @@ cargo clean && cargo build --locked
         let mut theirs = Vec::new();
         for (index, line) in source.lines().enumerate() {
             for (range, highlight) in iced.highlight_line(line) {
-                theirs.push((index, line[range].to_owned(), highlight.to_format()));
+                theirs.push((index, range, highlight.to_format()));
             }
         }
         let theme = cosmic::Theme::dark();
         let ours: Vec<_> = ours
+            .spans
             .iter()
-            .map(|(line, text, highlight)| (*line, text.clone(), format(highlight, &theme)))
+            .map(|span| {
+                (
+                    span.line,
+                    span.range.clone(),
+                    format(&span.highlight, &theme),
+                )
+            })
             .collect();
         assert!(!ours.is_empty());
         assert_eq!(ours, theirs);
@@ -787,20 +834,25 @@ cargo clean && cargo build --locked
         }
         highlighter.change_line(75);
         assert_eq!(highlighter.current_line(), 50);
+        let theme = cosmic::Theme::dark();
         let mut again = Vec::new();
         for (index, line) in lines.iter().enumerate().skip(50) {
             for (range, highlight) in highlighter.highlight_line(line) {
-                again.push((index, line[range].to_owned(), highlight));
+                again.push((index, range, format(&highlight, &theme)));
             }
         }
-        let theme = cosmic::Theme::dark();
-        let formats = |spans: &[(usize, String, Highlight)]| -> Vec<_> {
-            spans
-                .iter()
-                .filter(|(line, ..)| *line >= 50)
-                .map(|(line, text, highlight)| (*line, text.clone(), format(highlight, &theme)))
-                .collect()
-        };
-        assert_eq!(formats(&again), formats(&fresh));
+        let fresh: Vec<_> = fresh
+            .spans
+            .iter()
+            .filter(|span| span.line >= 50)
+            .map(|span| {
+                (
+                    span.line,
+                    span.range.clone(),
+                    format(&span.highlight, &theme),
+                )
+            })
+            .collect();
+        assert_eq!(again, fresh);
     }
 }

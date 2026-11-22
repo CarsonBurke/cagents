@@ -8887,11 +8887,24 @@ fn markdown_and_plain_text_buffers_wrap_as_prose() {
     }
 }
 
-#[test]
-fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
+/// Opens `name` holding one long line and a second, edits it, and for each
+/// wrap setting asserts on which logical line a click below the first visual
+/// row lands: 1 unwrapped, 0 wrapped. Each step reflows the mounted editor.
+fn assert_wrap_reflows(name: &str, steps: &[(crate::settings::EditorWrap, u32)]) {
     let card = CardId::new();
     let text = format!("{}\nsecond line", "x".repeat(256));
-    let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", &text);
+    let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, name);
+    drop(runtime.update(RepositoryAction::FileLoaded {
+        identity: identity.clone(),
+        result: Ok(LoadedFile {
+            source: identity.path.clone(),
+            content: FileContent::Editable {
+                content_hash: blake3::hash(text.as_bytes()),
+                text,
+                markdown: name.ends_with(".md"),
+            },
+        }),
+    }));
     drop(runtime.update(RepositoryAction::EditorAction {
         card,
         action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
@@ -8903,15 +8916,9 @@ fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
     let renderer = headless_renderer();
     let mut tree = Tree::new(editor_surface(card, &runtime).as_widget());
 
-    // Hit below the first visual row. Without wrapping it lands on the
-    // second logical line; with wrapping it is still inside the long token.
-    // Toggling back exercises reflow of an already mounted editor.
-    for (wrap, expected_line) in [(false, 1), (true, 0), (false, 1)] {
+    for &(wrap, expected_line) in steps {
         let cursor = runtime.cursor_position();
-        runtime.set_wrap(crate::settings::EditorWrap {
-            lines: wrap,
-            prose: false,
-        });
+        runtime.set_wrap(wrap);
         assert_eq!(runtime.cursor_position(), cursor);
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
@@ -8930,12 +8937,47 @@ fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
             card,
             action: text_editor::Action::Click(iced::Point::new(20.0, 40.0)),
         }));
-        assert_eq!(runtime.cursor_position().unwrap().line, expected_line);
+        assert_eq!(
+            runtime.cursor_position().unwrap().line,
+            expected_line,
+            "{name} with {wrap:?}"
+        );
         let DocumentState::Editable(document) = &runtime.document else {
             panic!("changing presentation must keep the document open");
         };
         assert_eq!(document.content.text(), edited);
         assert!(document.dirty);
+    }
+}
+
+#[test]
+fn wrapping_reflows_an_open_dirty_buffer_without_changing_its_text() {
+    use crate::settings::EditorWrap;
+    let lines = |lines| EditorWrap {
+        lines,
+        prose: false,
+    };
+    assert_wrap_reflows(
+        "notes.txt",
+        &[(lines(false), 1), (lines(true), 0), (lines(false), 1)],
+    );
+}
+
+#[test]
+fn prose_wrapping_reflows_markdown_and_text_but_not_code() {
+    use crate::settings::EditorWrap;
+    let prose = |prose| EditorWrap {
+        lines: false,
+        prose,
+    };
+    for name in ["notes.md", "notes.txt"] {
+        assert_wrap_reflows(
+            name,
+            &[(prose(true), 0), (prose(false), 1), (prose(true), 0)],
+        );
+    }
+    for name in ["src/main.rs", "CMakeLists.txt"] {
+        assert_wrap_reflows(name, &[(prose(true), 1)]);
     }
 }
 
