@@ -316,10 +316,30 @@ fn can_offer(snapshot: &UsageSnapshot, state: &State, reset: &UsageReset, now: M
     actionable(snapshot, reset, now) && !state.uncertain.contains_key(&reset.id)
 }
 
-/// The reset offered first relieves the tightest limit. Among resets that do,
-/// the narrowest wins, so a Fable limit suggests the Fable reset before a
-/// Weekly reset that also clears Fable, while a nearly spent weekly limit is
-/// never answered with a Session reset.
+/// The order resets are offered in: the one relieving the tightest limit
+/// first, then the narrowest of those, so a Fable limit suggests the Fable
+/// reset before a Weekly reset that also clears Fable, while a nearly spent
+/// weekly limit is answered with a reset that clears Weekly unless an equally
+/// tight binding limit is relieved by a narrower one.
+fn offer_order(
+    snapshot: &UsageSnapshot,
+    left: &UsageReset,
+    right: &UsageReset,
+    now: Millis,
+) -> std::cmp::Ordering {
+    let (left_binding, left_used) = relief(snapshot, left, now);
+    let (right_binding, right_used) = relief(snapshot, right, now);
+    right_binding
+        .cmp(&left_binding)
+        .then_with(|| right_used.total_cmp(&left_used))
+        .then_with(|| {
+            normalized_scopes(left)
+                .len()
+                .cmp(&normalized_scopes(right).len())
+        })
+        .then_with(|| reset_order(left, right))
+}
+
 fn next_reset<'a>(
     snapshot: &'a UsageSnapshot,
     state: &State,
@@ -329,19 +349,7 @@ fn next_reset<'a>(
         .resets
         .iter()
         .filter(|reset| can_offer(snapshot, state, reset, now))
-        .min_by(|left, right| {
-            let (left_binding, left_used) = relief(snapshot, left, now);
-            let (right_binding, right_used) = relief(snapshot, right, now);
-            right_binding
-                .cmp(&left_binding)
-                .then_with(|| right_used.total_cmp(&left_used))
-                .then_with(|| {
-                    normalized_scopes(left)
-                        .len()
-                        .cmp(&normalized_scopes(right).len())
-                })
-                .then_with(|| reset_order(left, right))
-        })
+        .min_by(|left, right| offer_order(snapshot, left, right, now))
 }
 
 struct ScopeChoice {
@@ -379,7 +387,7 @@ fn scope_choices(snapshot: &UsageSnapshot, state: &State, now: Millis) -> Vec<Sc
             });
         }
     }
-    choices.sort_by_key(|choice| choice.reset.label());
+    choices.sort_by(|left, right| offer_order(snapshot, &left.reset, &right.reset, now));
     choices
 }
 
@@ -2107,6 +2115,14 @@ pub(in crate::app) mod tests {
         assert_eq!(
             next_reset(&snapshot, &State::default(), now).unwrap().id,
             "both"
+        );
+        assert_eq!(
+            scope_choices(&snapshot, &State::default(), now)
+                .iter()
+                .map(|choice| choice.reset.id.as_str())
+                .collect::<Vec<_>>(),
+            ["both", "session"],
+            "the picker lists resets in the order they are offered"
         );
         snapshot.windows[0].binding = true;
         assert_eq!(

@@ -382,7 +382,7 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
                 .any(|window| {
                     used.get(window)
                         .and_then(Value::as_f64)
-                        .is_none_or(|used| used > 0.0)
+                        .is_none_or(|used| used != 0.0)
                 })
         });
         let usable = valid_times
@@ -1922,7 +1922,8 @@ mod reset_tests {
             (json!({"seven_day": 0, "five_hour": "12"}), true),
             (json!({"seven_day": 0, "five_hour": 3}), true),
             (json!({"seven_day": 0, "five_hour": 0}), false),
-            (json!({"seven_day": 0.0, "five_hour": -1}), false),
+            (json!({"seven_day": 0.0, "five_hour": -1}), true),
+            (json!({"seven_day": 0.0, "five_hour": 0.0}), false),
         ] {
             let mut grant = json!({"id":"grant","resets_left":1,"clears":["seven_day","five_hour"],
                 "usable_now":true,"use_requires_limit":false});

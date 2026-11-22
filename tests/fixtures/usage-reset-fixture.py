@@ -218,9 +218,12 @@ def served_usage(limits, user_agent):
                                       "next_available_at": None, "weekly_resets_at": None,
                                       "resets_per_week": 1, "event_props": None}
         return limits
-    used = {key: limits[key]["utilization"] for key in ("five_hour", "seven_day")}
-    used["seven_day_overage_included"] = next(model["utilization"] for model in limits["model_scoped"]
-                                              if model["display_name"] == "Fable")
+    used = {key: limits[key]["utilization"] for key in ("five_hour", "seven_day")
+            if isinstance(limits.get(key), dict)}
+    fable = next((model for model in limits.get("model_scoped") or []
+                  if model.get("display_name") == "Fable"), None)
+    if fable is not None:
+        used["seven_day_overage_included"] = fable["utilization"]
     for item in (limits.get("cedar_ember") or {}).get("grants", []):
         item["percent_used"] = {window: used[window] for window in item["clears"] if window in used}
     return limits
@@ -371,6 +374,9 @@ def server(root):
             size = int(self.headers.get("Content-Length", "0"))
             if size <= 0 or size > 8192:
                 self.response(400, {})
+                return
+            if not (self.headers.get("User-Agent") or "").startswith("claude-cli/"):
+                self.response(200, {"result": "ineligible", "reason": "surface"})
                 return
             try:
                 body = json.loads(self.rfile.read(size))
