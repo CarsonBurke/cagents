@@ -52,9 +52,9 @@ cp "$frames/launch.jsonl" "$config/fixture-frames.jsonl"
     --repository "$fixture/project" --prompt 'Review the release.' >/dev/null ||
     log "spawn failed"
 # Open the conversation from its channel's row once its first turn has said
-# the reviewers are running.
+# the reviewers are running. A busy build host can take a minute to show it.
 composer=
-for _ in 1 2 3 4 5 6 7 8; do
+for _ in $(seq 15); do
     sleep 4
     "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
@@ -75,7 +75,8 @@ for _ in 1 2 3 4 5 6 7 8; do
     break
 done
 if [ -z "$composer" ]; then
-    log "the conversation did not open"
+    log "the conversation did not open; the screen read:"
+    "$ne" drive observe 2>&1 | sed 's/^/   /'
     exit 1
 fi
 shot agents-running
