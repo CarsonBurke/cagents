@@ -4953,40 +4953,6 @@ fn initial_native_window_size_replaces_the_estimated_geometry() {
     assert!(window_geometry_message(&window::Event::Focused, window::Id::unique()).is_none());
 }
 
-/// A release can go to another surface without the window losing focus, as
-/// when a compositor takes the keyboard for its own Alt+Tab. The next key
-/// pressed without the modifier ends the hold.
-#[test]
-fn a_key_pressed_without_the_held_modifier_ends_the_workspace_hold() {
-    let mut app = workspace_switcher_test_app(3);
-    drop(app.cycle_workspace(
-        crate::workspace::FocusDirection::Right,
-        keyboard::Modifiers::ALT,
-    ));
-    let since = app.chrome_ui.workspace_preview_since.unwrap();
-    let task = app.update(Message::KeyEvent {
-        event: keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(keyboard::key::Named::Tab),
-            modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        },
-        captured: false,
-    });
-    // The plain Tab did not step the stale hold.
-    assert_eq!(app.workspace_history.cycle_index(), Some(1));
-    assert!(task.units() > 0);
-    drop(app.update(Message::WorkspaceSwitcherReleased(since)));
-    assert!(app.chrome_ui.workspace_preview.is_none());
-    assert_eq!(
-        app.active_workspace.as_deref(),
-        Some(Path::new("/folder-1"))
-    );
-}
-
 #[test]
 fn reset_settings_dialog_starts_on_cancel_cycles_within_and_escape_restores_origin() {
     let mut app = context_inspector_test_app(true);

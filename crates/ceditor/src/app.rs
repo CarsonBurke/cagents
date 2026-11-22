@@ -171,7 +171,9 @@ pub enum Message {
     CancelClose,
     Reaped,
     WindowFocused(window::Id, bool),
-    WindowResized(iced::Size),
+    /// A surface's logical size. On Wayland a popup, such as a text field's
+    /// context menu, reports one too; only the main window's sizes the editor.
+    WindowResized(window::Id, iced::Size),
     RefreshVisible,
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -3430,8 +3432,10 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Checkout(action) => self.checkout_action(action),
-                Message::WindowResized(size) => {
-                    self.window_size = size;
+                Message::WindowResized(window, size) => {
+                    if self.core.main_window_id() == Some(window) {
+                        self.window_size = size;
+                    }
                     Task::none()
                 }
                 Message::WindowFocused(window, focused) => {
@@ -4900,7 +4904,9 @@ impl Application for Editor {
             iced::Event::Window(window::Event::Focused) => {
                 Some(Message::WindowFocused(window, true))
             }
-            iced::Event::Window(window::Event::Resized(size)) => Some(Message::WindowResized(size)),
+            iced::Event::Window(
+                window::Event::Opened { size, .. } | window::Event::Resized(size),
+            ) => Some(Message::WindowResized(window, size)),
             iced::Event::Window(window::Event::Unfocused) => {
                 Some(Message::WindowFocused(window, false))
             }
@@ -6982,6 +6988,21 @@ mod tests {
             app.tab(id).unwrap().runtime.editor_text().is_some(),
             "the buffer for {file} never opened",
         );
+    }
+
+    #[test]
+    fn only_the_main_window_sizes_the_editor() {
+        let mut app = editor();
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        let size = iced::Size::new(1_600.0, 1_000.0);
+        drop(app.update(Message::WindowResized(main, size)));
+        // A text field's context menu is a popup surface with its own size.
+        drop(app.update(Message::WindowResized(
+            window::Id::unique(),
+            iced::Size::new(240.0, 72.0),
+        )));
+        assert_eq!(app.window_size, size);
     }
 
     #[test]
