@@ -513,3 +513,175 @@ mod present_timing {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+mod subscription_events {
+    //! The runtime's subscription tracker keeps every event for a listener
+    //! whose stream waits on the runtime (#3644).
+
+    use futures::channel::mpsc;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use iced_core::event::{self, Status};
+    use iced_core::keyboard::{self, Key, Location, Modifiers, key};
+    use iced_core::{Point, mouse, window};
+    use iced_futures::subscription::{self, Event, Tracker};
+    use std::time::{Duration, Instant};
+
+    fn press(window: window::Id, index: usize) -> Event {
+        Event::Interaction {
+            window,
+            event: event::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: Key::Character("a".into()),
+                modified_key: Key::Character("a".into()),
+                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: Some(index.to_string().into()),
+                repeat: false,
+            }),
+            status: Status::Ignored,
+        }
+    }
+
+    fn redraw(window: window::Id, at: Instant) -> Event {
+        Event::Interaction {
+            window,
+            event: event::Event::Window(window::Event::RedrawRequested(at)),
+            status: Status::Ignored,
+        }
+    }
+
+    fn cursor(window: window::Id, x: f32, status: Status) -> Event {
+        Event::Interaction {
+            window,
+            event: event::Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, 0.0),
+            }),
+            status,
+        }
+    }
+
+    /// A listener that forwards every event to a runtime that accepts one
+    /// message at a time, as the shell's proxy does when it is full.
+    struct Listener {
+        tracker: Tracker,
+        pool: LocalPool,
+        messages: mpsc::Receiver<Event>,
+    }
+
+    impl Listener {
+        fn new() -> Self {
+            let (sender, messages) = mpsc::channel(0);
+            let mut tracker = Tracker::new();
+            let pool = LocalPool::new();
+            let recipes = subscription::into_recipes(subscription::filter_map("listener", Some));
+
+            for future in tracker.update(recipes.into_iter(), sender) {
+                pool.spawner().spawn_local(future).unwrap();
+            }
+
+            Self {
+                tracker,
+                pool,
+                messages,
+            }
+        }
+
+        /// Runs the listener until it waits, without accepting anything.
+        fn stall(&mut self) {
+            self.pool.run_until_stalled();
+        }
+
+        /// Accepts messages until the listener has nothing more to send.
+        fn drain(&mut self) -> Vec<Event> {
+            let mut received = Vec::new();
+
+            loop {
+                self.pool.run_until_stalled();
+
+                match self.messages.try_recv() {
+                    Ok(message) => received.push(message),
+                    Err(_) => return received,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_listener_waiting_on_the_runtime_loses_no_key() {
+        let window = window::Id::unique();
+        let start = Instant::now();
+        let mut listener = Listener::new();
+
+        listener.tracker.broadcast(press(window, 0));
+        listener.stall();
+
+        // The upstream tracker held 101 events here and dropped the rest.
+        for index in 1..=300 {
+            listener.tracker.broadcast(press(window, index));
+            listener
+                .tracker
+                .broadcast(redraw(window, start + Duration::from_millis(index as u64)));
+        }
+
+        let keys: Vec<_> = listener
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Interaction {
+                    event: event::Event::Keyboard(keyboard::Event::KeyPressed { text, .. }),
+                    ..
+                } => text.map(|text| text.parse::<usize>().unwrap()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(keys, (0..=300).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn redraws_and_cursor_moves_coalesce_only_across_each_other() {
+        let window = window::Id::unique();
+        let other = window::Id::unique();
+        let start = Instant::now();
+        let later = start + Duration::from_millis(16);
+        let mut listener = Listener::new();
+
+        listener.tracker.broadcast(press(window, 0));
+        listener.stall();
+
+        // A pointer moving during an animation alternates the two kinds.
+        let queued = [
+            cursor(window, 1.0, Status::Ignored),
+            redraw(window, start),
+            cursor(window, 2.0, Status::Ignored),
+            redraw(other, start),
+            cursor(window, 3.0, Status::Captured),
+            redraw(window, later),
+            press(window, 1),
+            cursor(window, 4.0, Status::Captured),
+            Event::SystemThemeChanged(iced_core::theme::Mode::Dark),
+            Event::SystemThemeChanged(iced_core::theme::Mode::Dark),
+        ];
+
+        for event in queued {
+            listener.tracker.broadcast(event);
+        }
+
+        assert_eq!(
+            listener.drain(),
+            [
+                press(window, 0),
+                cursor(window, 2.0, Status::Ignored),
+                redraw(other, start),
+                cursor(window, 3.0, Status::Captured),
+                redraw(window, later),
+                press(window, 1),
+                cursor(window, 4.0, Status::Captured),
+                Event::SystemThemeChanged(iced_core::theme::Mode::Dark),
+                Event::SystemThemeChanged(iced_core::theme::Mode::Dark),
+            ]
+        );
+    }
+}
