@@ -7,20 +7,18 @@ pub(super) fn read(root: &Path) -> Result<Option<UpdateJob>, UpdateError> {
     };
     let job: UpdateJob = serde_json::from_slice(&bytes)?;
     // The non-UUID identity makes every decision fail before it can look up
-    // an installation. A blocked preview disables the committing control,
-    // and a review that has ended has nothing left to decide.
-    let blocked_review = job.phase == UpdatePhase::AwaitingConfirmation
-        && job.active_confirmation().is_some_and(|confirmation| {
-            confirmation
-                .preview
-                .daemon
-                .as_ref()
-                .is_some_and(|daemon| daemon.blocked())
-        });
+    // an installation, so the review stays read-only whether or not anything
+    // still holds it back: replacing a blocked review with one whose blocker
+    // cleared shows the update becoming available. A review that has ended
+    // has nothing left to decide.
+    let review = job.phase == UpdatePhase::AwaitingConfirmation
+        && job
+            .active_confirmation()
+            .is_some_and(|confirmation| confirmation.preview.daemon.is_some());
     let ended = job.phase.is_terminal() && job.confirmation.is_none();
-    if job.id != "fixture-update-review" || !(blocked_review || ended) {
+    if job.id != "fixture-update-review" || !(review || ended) {
         return Err(invalid(
-            "update review fixture must be blocked and read-only",
+            "update review fixture must review the terminal service or have ended, and be read-only",
         ));
     }
     Ok(Some(job))
@@ -74,14 +72,36 @@ mod tests {
             serde_json::to_writer(&mut file, job).unwrap();
         };
         publish(&job);
+        let refuses_decisions = |loaded: &UpdateJob| {
+            let confirmation = loaded.active_confirmation().unwrap();
+            for choice in [UpdateChoice::Confirm, UpdateChoice::Cancel] {
+                assert!(matches!(
+                    decide(&loaded.id, &confirmation.nonce, choice),
+                    Err(UpdateError::Invalid(message)) if message == "invalid update confirmation identifier"
+                ));
+            }
+        };
+        let blocked = |job: &UpdateJob| {
+            job.active_confirmation()
+                .and_then(|confirmation| confirmation.preview.daemon.as_ref())
+                .is_some_and(crate::update::impact::DaemonImpact::blocked)
+        };
         let loaded = read(root.path()).unwrap().unwrap();
-        let confirmation = loaded.active_confirmation().unwrap();
-        for choice in [UpdateChoice::Confirm, UpdateChoice::Cancel] {
-            assert!(matches!(
-                decide(&loaded.id, &confirmation.nonce, choice),
-                Err(UpdateError::Invalid(message)) if message == "invalid update confirmation identifier"
-            ));
+        assert!(blocked(&loaded));
+        refuses_decisions(&loaded);
+        // Once nothing holds the review back the update is offered, and
+        // confirming it still decides nothing.
+        let mut resolved = job.clone();
+        let confirmation = resolved.confirmation.as_mut().unwrap();
+        let daemon = confirmation.preview.daemon.as_mut().unwrap();
+        daemon.blockers.clear();
+        for session in &mut daemon.sessions {
+            session.disposition = crate::update::impact::Disposition::Continues;
         }
+        publish(&resolved);
+        let loaded = read(root.path()).unwrap().unwrap();
+        assert!(!blocked(&loaded));
+        refuses_decisions(&loaded);
         job.id = uuid::Uuid::new_v4().to_string();
         publish(&job);
         assert!(read(root.path()).is_err());

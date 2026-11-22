@@ -6,6 +6,7 @@
   "log_path": "/fixture/update.log",
   "confirmation": {
     "nonce": "fixture-review-nonce",
+    "terminal_command": "cagents daemon upgrade --version 9.8.7",
     "expires_at_unix_ms": 18446744073709551615,
     "preview": {
       "candidate": {

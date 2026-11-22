@@ -7,6 +7,10 @@ pub struct Confirmation {
     pub nonce: String,
     #[serde(default)]
     pub stop: Option<floor_display::StopList>,
+    /// The command that reviews stopping blocked work from a terminal, for a
+    /// window's review: a window cannot confirm that stop itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_command: Option<String>,
     pub preview: impact::Preview,
     pub expires_at_unix_ms: u64,
 }
@@ -282,35 +286,52 @@ pub(super) fn resume_cancellation(state: &Path, job: &UpdateJob) -> Result<(), U
 
 /// Keep the verified assets and worker lease alive while any window may resume
 /// this preview. Neither helper death nor an expired choice permits installation.
+///
+/// `terminal` is whether the update runs from a terminal, the only place
+/// that can confirm stopping the work a blocked review names. Started from a
+/// window, a blocked review is never approved into closing windows: the
+/// stop it would need is refused anyway, after every window was saved and
+/// frozen for nothing.
 pub(super) fn wait(
     state: &Path,
     job: &mut UpdateJob,
+    terminal: bool,
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    wait_with(state, job, None, observe)
+    wait_with(state, job, terminal, None, observe)
 }
 
 pub(super) fn wait_approved(
     state: &Path,
     job: &mut UpdateJob,
+    terminal: bool,
     reviewed: impact::Preview,
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    wait_with(state, job, Some(reviewed), observe)
+    wait_with(state, job, terminal, Some(reviewed), observe)
 }
 
 fn wait_with(
     state: &Path,
     job: &mut UpdateJob,
+    terminal: bool,
     reviewed: Option<impact::Preview>,
     observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    wait_for(state, job, reviewed, CONFIRMATION_LIFETIME, observe)
+    wait_for(
+        state,
+        job,
+        terminal,
+        reviewed,
+        CONFIRMATION_LIFETIME,
+        observe,
+    )
 }
 
 fn wait_for(
     state: &Path,
     job: &mut UpdateJob,
+    terminal: bool,
     reviewed: Option<impact::Preview>,
     lifetime: Duration,
     mut observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
@@ -327,6 +348,7 @@ fn wait_for(
         None => observe(policy)?,
     };
     let mut nonce = uuid::Uuid::new_v4().to_string();
+    let mut handoff = None;
     loop {
         if Instant::now() >= deadline {
             return Err(refused(&preview, true).unwrap_or_else(|| {
@@ -338,8 +360,24 @@ fn wait_for(
             // before refreshing its nonce, including while observe was busy.
             let _decisions = DecisionLease::acquire(state, &job.id)?;
             check_review_closed(state, job)?;
+            // A window's review of blocked work says where it can be stopped.
+            // The job's request never changes, so it is read at most once.
+            let terminal_command = if !terminal
+                && preview
+                    .daemon
+                    .as_ref()
+                    .is_some_and(impact::DaemonImpact::blocked)
+            {
+                if handoff.is_none() {
+                    handoff = Some(floor::terminal_command(state, job)?);
+                }
+                handoff.clone()
+            } else {
+                None
+            };
             job.confirmation = Some(Confirmation {
                 stop: None,
+                terminal_command,
                 nonce: nonce.clone(),
                 preview: preview.clone(),
                 expires_at_unix_ms: expires,
@@ -372,12 +410,22 @@ fn wait_for(
                 fs::remove_file(&path)?;
                 match decision.choice {
                     Choice::Cancel => return Err(closed(&preview)),
-                    Choice::Confirm => approved = true,
+                    Choice::Confirm => {
+                        // A window cannot confirm stopping blocked work:
+                        // refuse now rather than wait on idle sessions first.
+                        if !terminal && let Some(refused) = refused(&preview, false) {
+                            return Err(refused);
+                        }
+                        approved = true;
+                    }
                     Choice::StopListed { .. } => (),
                     Choice::Policy(next) => {
                         policy = next;
                         let current = observe(policy)?;
-                        approved = policy_choice_approves_service_floor(&preview, &current, next);
+                        // Only a terminal can confirm the service stop
+                        // this choice advances to.
+                        approved = terminal
+                            && policy_choice_approves_service_floor(&preview, &current, next);
                         preview = current;
                         nonce = uuid::Uuid::new_v4().to_string();
                         continue;
@@ -409,9 +457,15 @@ fn wait_for(
                     .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
             })
         {
+            check_review_closed(state, job)?;
+            // Approved from a window, a blocked review would save and freeze
+            // every window, and might interrupt turns, before refusing the
+            // stop only a terminal can confirm. Refuse it before any of that.
+            if !terminal && let Some(refused) = refused(&preview, false) {
+                return Err(refused);
+            }
             // Preserve this exact nonce until the source accepts prepare, so
             // Ctrl-C still cancels while windows are saving and closing.
-            check_review_closed(state, job)?;
             return Ok(preview);
         }
         thread::sleep(Duration::from_millis(500));
@@ -538,6 +592,7 @@ pub(super) fn wait_stop(
                 nonce: nonce.clone(),
                 preview: preview.clone(),
                 stop: Some(list.clone()),
+                terminal_command: None,
                 expires_at_unix_ms: expires,
             });
             set_phase(
@@ -740,7 +795,7 @@ mod tests {
         let initial = working_preview();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            let outcome = wait(&path, &mut job, |policy| {
+            let outcome = wait(&path, &mut job, true, |policy| {
                 Ok(if policy == impact::Policy::Interrupt {
                     super::super::review::interruption_review(&initial)
                 } else {
@@ -844,6 +899,7 @@ mod tests {
                 confirmation: Some(Confirmation {
                     nonce: "first".into(),
                     stop: None,
+                    terminal_command: None,
                     preview,
                     expires_at_unix_ms: u64::MAX,
                 }),
@@ -947,6 +1003,7 @@ mod tests {
             confirmation: Some(Confirmation {
                 nonce: "first".into(),
                 stop: None,
+                terminal_command: None,
                 preview,
                 expires_at_unix_ms: u64::MAX,
             }),
@@ -989,7 +1046,7 @@ mod tests {
         let (finished, result) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            let outcome = wait(&path, &mut job, |policy| {
+            let outcome = wait(&path, &mut job, true, |policy| {
                 let mut current = initial.clone();
                 if policy == impact::Policy::Interrupt {
                     current = super::super::review::interruption_review(&current);
@@ -1102,7 +1159,7 @@ mod tests {
         let path = directory.path().to_owned();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait(&path, &mut job, |_| {
+            wait(&path, &mut job, false, |_| {
                 Ok(preview(worker_changed.load(Ordering::Acquire)))
             })
         });
@@ -1138,7 +1195,7 @@ mod tests {
         let path = directory.path().to_owned();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait(&path, &mut job, |_| Ok(preview(false)))
+            wait(&path, &mut job, false, |_| Ok(preview(false)))
         });
         let current = published(directory.path(), None);
         publish_decision(
@@ -1164,7 +1221,9 @@ mod tests {
             let worker = thread::spawn(move || {
                 let mut job = job(&path);
                 initialize(&path, &job.id).unwrap();
-                wait(&path, &mut job, |_| Ok(impact::tests::blocked_preview()))
+                wait(&path, &mut job, false, |_| {
+                    Ok(impact::tests::blocked_preview())
+                })
             });
             let current = published(directory.path(), None);
             if whole_update {
@@ -1228,9 +1287,14 @@ mod tests {
     fn a_blocked_review_that_expires_records_its_reasons() {
         let directory = tempfile::tempdir().unwrap();
         let mut job = job(directory.path());
-        let result = wait_for(directory.path(), &mut job, None, Duration::ZERO, |_| {
-            Ok(impact::tests::blocked_preview())
-        });
+        let result = wait_for(
+            directory.path(),
+            &mut job,
+            false,
+            None,
+            Duration::ZERO,
+            |_| Ok(impact::tests::blocked_preview()),
+        );
         let Err(UpdateError::Refused(refusal)) = result else {
             panic!("a blocked review expired as something other than a refusal: {result:?}");
         };
@@ -1240,9 +1304,14 @@ mod tests {
                 .message()
                 .starts_with("Update not installed: the review expired while ")
         );
-        let unblocked = wait_for(directory.path(), &mut job, None, Duration::ZERO, |_| {
-            Ok(preview(false))
-        });
+        let unblocked = wait_for(
+            directory.path(),
+            &mut job,
+            false,
+            None,
+            Duration::ZERO,
+            |_| Ok(preview(false)),
+        );
         assert!(
             matches!(unblocked, Err(UpdateError::Invalid(message)) if message.contains("expired"))
         );
@@ -1254,6 +1323,7 @@ mod tests {
         let mut job = job(directory.path());
         job.confirmation = Some(Confirmation {
             stop: None,
+            terminal_command: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: preview(false),
             expires_at_unix_ms: now_ms() + 60_000,
@@ -1296,6 +1366,7 @@ mod tests {
         let nonce = uuid::Uuid::new_v4().to_string();
         job.confirmation = Some(Confirmation {
             stop: None,
+            terminal_command: None,
             nonce: nonce.clone(),
             preview: preview(false),
             expires_at_unix_ms: now_ms() + 60_000,
@@ -1312,7 +1383,7 @@ mod tests {
         let path = directory.path().to_owned();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait(&path, &mut job, |_| Ok(preview(false))).unwrap();
+            wait(&path, &mut job, false, |_| Ok(preview(false))).unwrap();
             job
         });
         let current = published(directory.path(), None);
@@ -1337,7 +1408,7 @@ mod tests {
         let worker = thread::spawn(move || {
             let mut job = job(&path);
             let mut first = true;
-            wait(&path, &mut job, |_| {
+            wait(&path, &mut job, false, |_| {
                 if first {
                     first = false;
                     Ok(preview(false))
@@ -1687,8 +1758,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn interruption_choice_advances_only_the_same_service_floor_owners() {
+    /// A review whose blocked terminal needs the whole service stopped, with
+    /// a conversation that waits for idle until interruption is chosen.
+    fn service_floor_preview() -> impact::Preview {
         use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalId};
         let mut previous = preview(false);
         previous.daemon = Some(impact::DaemonImpact {
@@ -1726,6 +1798,121 @@ mod tests {
             })
             .collect(),
         });
+        previous
+    }
+
+    /// `preview`, a [`service_floor_preview`], as the worker observes it
+    /// under `policy`: choosing interruption turns the waiting conversation's
+    /// turn into one the update interrupts.
+    fn service_floor_under(preview: &impact::Preview, policy: impact::Policy) -> impact::Preview {
+        let mut preview = preview.clone();
+        if policy == impact::Policy::Interrupt {
+            let daemon = preview.daemon.as_mut().unwrap();
+            daemon.policy = impact::Policy::Interrupt;
+            daemon.sessions[1].disposition = impact::Disposition::Interrupted;
+        }
+        preview
+    }
+
+    /// Started from a window, confirming a blocked review refuses it at once,
+    /// for what holds it back: going on would save and freeze every window
+    /// only to reach the stop that a terminal alone can confirm. Started from
+    /// a terminal, confirming goes on to that stop.
+    #[test]
+    fn confirming_a_blocked_review_from_a_window_refuses_it_before_closing_windows() {
+        for terminal in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_owned();
+            // One observation of the same panes throughout: a preview built
+            // afresh names new panes, which is a different review.
+            let mut blocked = impact::tests::blocked_preview();
+            if !terminal {
+                // A window refuses at once, without first waiting for a
+                // conversation that is finishing its turn.
+                blocked.daemon.as_mut().unwrap().sessions[1].disposition =
+                    impact::Disposition::WaitsForIdle;
+            }
+            let expected = blocked.refusal();
+            let worker = thread::spawn(move || {
+                let mut job = job(&path);
+                wait(&path, &mut job, terminal, |_| Ok(blocked.clone()))
+            });
+            let current = published(directory.path(), None);
+            let review = current.confirmation.as_ref().unwrap();
+            // Only a window's review needs to say where blocked work can be
+            // stopped: a terminal's review goes on to its stop list.
+            assert_eq!(
+                review.terminal_command.as_deref(),
+                (!terminal).then_some("cagents daemon upgrade")
+            );
+            decide_at(
+                directory.path(),
+                &current.id,
+                &review.nonce,
+                Choice::Confirm,
+            )
+            .unwrap();
+            match worker.join().unwrap() {
+                Err(UpdateError::Refused(refusal)) if !terminal => {
+                    assert_eq!(Some(*refusal), expected);
+                }
+                Ok(_) if terminal => {}
+                other => panic!("terminal {terminal}: {other:?}"),
+            }
+        }
+    }
+
+    /// Choosing interruption on a review that needs the service stopped
+    /// approves it into that stop only from a terminal, which can confirm the
+    /// stop. From a window, the review stays open for a decision.
+    #[test]
+    fn choosing_interruption_from_a_window_leaves_a_service_floor_review_open() {
+        for terminal in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let observations = Arc::new(AtomicUsize::new(0));
+            let worker_observations = observations.clone();
+            let path = directory.path().to_owned();
+            let floor = service_floor_preview();
+            let worker = thread::spawn(move || {
+                let mut job = job(&path);
+                initialize(&path, &job.id).unwrap();
+                wait(&path, &mut job, terminal, |policy| {
+                    worker_observations.fetch_add(1, Ordering::Release);
+                    Ok(service_floor_under(&floor, policy))
+                })
+            });
+            let current = published(directory.path(), None);
+            decide_at(
+                directory.path(),
+                &current.id,
+                &current.confirmation.as_ref().unwrap().nonce,
+                Choice::Policy(impact::Policy::Interrupt),
+            )
+            .unwrap();
+            if terminal {
+                assert!(
+                    worker.join().unwrap().is_ok(),
+                    "a terminal goes on to the stop list"
+                );
+                continue;
+            }
+            still_waiting(directory.path(), &current, &observations, &worker);
+            let reopened = published(
+                directory.path(),
+                Some(&current.confirmation.as_ref().unwrap().nonce),
+            );
+            assert_eq!(reopened.phase, UpdatePhase::AwaitingConfirmation);
+            assert!(cancel_at(directory.path(), &reopened.id).unwrap());
+            assert!(matches!(
+                worker.join().unwrap(),
+                Err(UpdateError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn interruption_choice_advances_only_the_same_service_floor_owners() {
+        let previous = service_floor_preview();
         let mut current = previous.clone();
         let daemon = current.daemon.as_mut().unwrap();
         daemon.policy = impact::Policy::Interrupt;
@@ -1754,7 +1941,7 @@ mod tests {
                 "extra pane" => {
                     let daemon = changed.daemon.as_mut().unwrap();
                     let mut extra = daemon.sessions[1].clone();
-                    extra.id = TerminalId::new();
+                    extra.id = crate::model::TerminalId::new();
                     daemon.sessions.push(extra);
                 }
                 "new work" => {
@@ -1788,7 +1975,7 @@ mod tests {
         let pane = crate::model::TerminalId::new();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
-            wait(&path, &mut job, |_| {
+            wait(&path, &mut job, false, |_| {
                 let mut preview = preview(false);
                 preview.labels.names.insert(pane, "reviewed pane".into());
                 preview.labels.details.panes.insert(
