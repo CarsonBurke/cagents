@@ -75,7 +75,7 @@ impl Runtime {
             && self.commands.is_idle()
             && self.attachment_chooser_pending.is_none()
             && self.pastes_pending == 0;
-        if self.capacity_refused {
+        if self.capacity_refused() {
             return if idle {
                 Readiness::Recovers(Press::Reconnect)
             } else {

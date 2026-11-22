@@ -3726,7 +3726,7 @@ impl Runtime {
                     .on_press_maybe(enabled.then(|| action(Action::RetryRefusedView(target))))
                     .into(),
             );
-        } else if self.capacity_refused {
+        } else if self.capacity_refused() {
             let enabled = !transitioning
                 && self.commands.is_idle()
                 && self.attachment_chooser_pending.is_none()

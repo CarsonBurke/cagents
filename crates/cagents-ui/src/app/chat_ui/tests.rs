@@ -19581,7 +19581,7 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
     );
     let runtime = chat_runtime(&app, card);
     assert!(runtime.is_draft());
-    assert!(runtime.capacity_refused);
+    assert!(runtime.capacity_refused());
     assert_eq!(runtime.error.as_deref(), Some(message));
     assert_eq!(runtime.composer.text(), "hello");
     assert!(runtime.queued.is_none());
@@ -19605,7 +19605,7 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
     submit_target(&mut app, retry);
     let attempt = chat_runtime_attempt(&app, card);
     let runtime = chat_runtime(&app, card);
-    assert!(!runtime.capacity_refused);
+    assert!(!runtime.capacity_refused());
     assert_eq!(
         runtime.queued.as_ref().unwrap().prompt.source.text(),
         "hello"
@@ -19624,6 +19624,36 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
             .source
             .text(),
         "hello"
+    );
+}
+
+#[test]
+fn a_later_error_replaces_the_capacity_refusal_and_its_guidance() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target) = starting_chat(&mut app);
+    answer_start(
+        &mut app,
+        target,
+        Err(chat::StartFailure {
+            message: "No room for another chat".into(),
+            recovery: chat::Recovery::Capacity,
+        }),
+    );
+    assert!(chat_runtime(&app, card).capacity_refused());
+    // A failure of something else in the pane, such as saving the draft,
+    // takes the refusal's place; its notice must not tell the user to close
+    // a chat.
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("chat card");
+    };
+    runtime.error = Some("Couldn't save the draft".into());
+    assert!(!chat_runtime(&app, card).capacity_refused());
+    let labels = capacity_refusal_labels(&mut app, card);
+    assert!(
+        labels
+            .iter()
+            .all(|label| !label.contains("Close a chat you have finished with")),
+        "{labels:?}"
     );
 }
 
@@ -19682,7 +19712,7 @@ fn capacity_refusal_on_cold_restore_keeps_guidance_identity_and_stashed_draft() 
         chat_runtime(&app, card).composer.text(),
         "saved capacity draft"
     );
-    assert!(!chat_runtime(&app, card).capacity_refused);
+    assert!(!chat_runtime(&app, card).capacity_refused());
     assert_eq!(app.chat_capacity_guidance(card), None);
     // A delayed old failure cannot replace the recovered attachment or
     // re-offer capacity recovery for its superseded attempt.
@@ -19694,7 +19724,7 @@ fn capacity_refusal_on_cold_restore_keeps_guidance_identity_and_stashed_draft() 
             recovery: chat::Recovery::Capacity,
         }),
     );
-    assert!(!chat_runtime(&app, card).capacity_refused);
+    assert!(!chat_runtime(&app, card).capacity_refused());
     assert_eq!(app.chat_capacity_guidance(card), None);
     assert_eq!(
         chat_runtime(&app, card).composer.text(),
@@ -19722,7 +19752,7 @@ fn capacity_refusal_retry_preserves_saved_identity_and_unsent_draft() {
         }),
     );
     let runtime = chat_runtime(&app, card);
-    assert!(runtime.capacity_refused);
+    assert!(runtime.capacity_refused());
     assert!(runtime.disconnected);
     assert_eq!(runtime.session, source);
     assert_eq!(runtime.composer.text(), "unsent capacity draft");
@@ -19745,7 +19775,7 @@ fn capacity_refusal_retry_preserves_saved_identity_and_unsent_draft() {
     let retry = chat_runtime(&app, card).target;
     drop(app.handle_chat_ui(Action::Reconnect(retry)));
     assert_eq!(app.chat_ui.attempt(card).unwrap().session, source);
-    assert!(!chat_runtime(&app, card).capacity_refused);
+    assert!(!chat_runtime(&app, card).capacity_refused());
     assert_eq!(
         chat_runtime(&app, card).composer.text(),
         "unsent capacity draft"

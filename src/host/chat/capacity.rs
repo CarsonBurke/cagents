@@ -92,8 +92,8 @@ fn refusal(used: usize, starting: usize, limit: usize) -> String {
     };
     format!(
         "No room for another chat: {running}{starting}, and the limit is {limit}.\n\n\
-         Close a chat you have finished with, then try again. Chats that only show saved \
-         history don't count.{more}"
+         Close a chat you have finished with, then try again; `cagents chat capacity` lists \
+         the open ones. Chats that only show saved history don't count.{more}"
     )
 }
 
@@ -1402,7 +1402,8 @@ mod tests {
             "No room for another chat: 128 chats are open, and the limit is 128."
         );
         assert!(headline.chars().count() <= 160);
-        assert!(detail.starts_with("Close a chat you have finished with, then try again."));
+        assert!(detail.starts_with("Close a chat you have finished with, then try again;"));
+        assert!(detail.contains("`cagents chat capacity` lists the open ones"));
         assert!(detail.ends_with("run `cagents chat capacity set 160`."));
         // A lowered limit suggests room above what already runs.
         assert!(refusal(130, 2, 1).contains("(2 of them starting), and the limit is 1."));

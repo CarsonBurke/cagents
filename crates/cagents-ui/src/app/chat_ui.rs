@@ -3404,8 +3404,11 @@ pub(super) struct Runtime {
     /// changes or goes, the model or launch it answered changes, or a real
     /// failure of the same attachment replaces it on the error card.
     composer_note: Option<String>,
-    /// A typed admission refusal, independent of provider/account failures.
-    capacity_refused: bool,
+    /// The message of a typed admission refusal, independent of
+    /// provider/account failures. The pane is refused only while that
+    /// message is still its error, so a later failure that replaces it is
+    /// never guided as a refusal.
+    capacity_refusal: Option<String>,
     /// A first message came back because the shared workspace refused to
     /// load this channel or project; Retry loads it and sends again.
     view_refused: Option<crate::workspace_model::views::Scope>,
@@ -4637,7 +4640,7 @@ impl Runtime {
             warm: None,
             error: None,
             composer_note: None,
-            capacity_refused: false,
+            capacity_refusal: None,
             view_refused: None,
             close_refusal: None,
             resume_failed: false,
@@ -5209,6 +5212,12 @@ impl Runtime {
     /// included.
     fn is_draft(&self) -> bool {
         matches!(self.connection, Connection::Draft)
+    }
+
+    /// Whether the daemon's refusal of a new chat is still what this pane
+    /// shows; any later error replaces it.
+    fn capacity_refused(&self) -> bool {
+        self.capacity_refusal.is_some() && self.capacity_refusal == self.error
     }
     /// The draft's own model and effort, once chosen or restored. A draft
     /// still on its provider's remembered choice keeps following that.
@@ -11023,7 +11032,7 @@ impl Cagents {
         }
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
-            runtime.capacity_refused = false;
+            runtime.capacity_refusal = None;
             runtime.view_refused = None;
             if intent == chat::Intent::Resume && runtime.resumes_in_place() {
                 runtime.freeze_resume_source();
@@ -13347,7 +13356,7 @@ impl Cagents {
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                             runtime.error = None;
-                            runtime.capacity_refused = false;
+                            runtime.capacity_refusal = None;
                             runtime.resume_failed = false;
                             runtime.start_blocked = None;
                             runtime.logical_prose.release();
@@ -13503,7 +13512,9 @@ impl Cagents {
                         // each one asks for its account to be restored.
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.unqueue();
-                            runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
+                            runtime.capacity_refusal = (failure.recovery
+                                == chat::Recovery::Capacity)
+                                .then(|| failure.message.clone());
                             runtime.start_blocked = blocked_recovery::Reopen::of(failure.recovery);
                             runtime.error = Some(failure.message);
                         }
@@ -13671,7 +13682,9 @@ impl Cagents {
                             self.chat_ui.fresh_offers.remove(&target.card);
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
+                            runtime.capacity_refusal = (failure.recovery
+                                == chat::Recovery::Capacity)
+                                .then(|| failure.message.clone());
                             runtime.error = Some(failure.message);
                             runtime.start_blocked = blocked;
                             // A resume that failed leaves its card where it

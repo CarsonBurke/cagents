@@ -973,7 +973,7 @@ impl State {
                 };
                 // A refused admission is answered by closing a chat, not by
                 // reading the daemon's details; the pane's Retry follows.
-                let capacity = runtime.capacity_refused && matches!(source, Source::Local(_));
+                let capacity = runtime.capacity_refused() && matches!(source, Source::Local(_));
                 if capacity {
                     state.push_guided(provider, text, source, scope, CAPACITY_GUIDANCE);
                 } else {
