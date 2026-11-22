@@ -935,6 +935,9 @@ impl Cagents {
         let update = match self.workspace.commit_close(id) {
             Ok(update) => {
                 self.hidden_closes.remove(&id);
+                if !replacing {
+                    self.forget_stop_of_removed(id);
+                }
                 update
             }
             Err(error) => {
