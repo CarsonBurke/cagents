@@ -293,9 +293,9 @@ refuse_running_side() {
     fi
 }
 
-# The executables a build makes, one per line.
+# The executables a build of CHECKOUT makes, one per line.
 built_executables() {
-    build_arguments | sed 's/.* //'
+    build_arguments browserless "$1" | sed 's/.* //'
 }
 
 # Whether the caller changed how Rust compiles, as a measurement at another
@@ -351,7 +351,7 @@ take_built() {
             mv -f -- "$from/$executable" "$target/dev-runtime/$executable" ||
                 die "could not move $from/$executable into $target"
         fi
-    done < <(built_executables)
+    done < <(built_executables "$checkout")
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed while its executables were taken; build it again"
     {
