@@ -54,9 +54,13 @@ fn child_icon(child: &chat::Subagent) -> Icon {
         chat::ToolStatus::Waiting => Icon::AgentBackground,
         chat::ToolStatus::Running if child.waiting => Icon::AgentWaiting,
         chat::ToolStatus::Running => Icon::AgentWorking,
-        chat::ToolStatus::Failed | chat::ToolStatus::Denied => Icon::Warning,
+        // As its row and report mark it.
+        chat::ToolStatus::Failed => Icon::Error,
+        chat::ToolStatus::Denied => Icon::Unavailable,
         chat::ToolStatus::Succeeded => Icon::Check,
-        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Icon::Cancel,
+        // Stopped, or done without a word on how it went: neither a success
+        // nor a failure, and not the Stop control.
+        chat::ToolStatus::Stopped | chat::ToolStatus::Ended => Icon::Ended,
     }
 }
 
@@ -189,6 +193,24 @@ impl Ordinals {
     }
 }
 
+/// The number `child` goes by among children of its name, 1 for the first.
+/// A publication the pane has not installed yet, such as one a test built
+/// in place, numbers by earlier namesakes: one pass with no allocation.
+fn child_ordinal(
+    children: &[chat::Subagent],
+    ordinals: &Ordinals,
+    child: &chat::Subagent,
+) -> usize {
+    ordinals.get(child).unwrap_or_else(|| {
+        let namesake = tab_namesake(Runtime::native_child_name(child));
+        1 + children
+            .iter()
+            .take_while(|other| other.id != child.id)
+            .filter(|other| tab_namesake(Runtime::native_child_name(other)) == namesake)
+            .count()
+    })
+}
+
 /// `child`'s name as it is listed among `children`, cut to `limit`
 /// characters before its number so the number always shows.
 pub(super) fn child_label<'a>(
@@ -198,16 +220,7 @@ pub(super) fn child_label<'a>(
     limit: usize,
 ) -> Cow<'a, str> {
     let name = Runtime::native_child_name(child);
-    // A publication the pane has not installed yet, such as one a test built
-    // in place, numbers by earlier namesakes: one pass with no allocation.
-    let ordinal = ordinals.get(child).unwrap_or_else(|| {
-        let namesake = tab_namesake(name);
-        1 + children
-            .iter()
-            .take_while(|other| other.id != child.id)
-            .filter(|other| tab_namesake(Runtime::native_child_name(other)) == namesake)
-            .count()
-    });
+    let ordinal = child_ordinal(children, ordinals, child);
     let cut = name.chars().nth(limit).is_some();
     match (ordinal, cut) {
         (1, false) => Cow::Borrowed(name),
@@ -236,6 +249,7 @@ impl Picker {
         &self,
         children: &'a [chat::Subagent],
         ordinals: &Ordinals,
+        work: &super::view::AgentWork,
     ) -> Vec<&'a chat::Subagent> {
         let query = self.query.trim().to_lowercase();
         let mut rows: Vec<_> = children
@@ -256,7 +270,7 @@ impl Picker {
                             Runtime::native_child_task(child).unwrap_or_default(),
                             &child.id,
                             child.model.as_deref().unwrap_or_default(),
-                            Runtime::native_child_status(child),
+                            work.caption(child),
                         ]
                         .iter()
                         .any(|part| part.to_lowercase().contains(&query)))
@@ -309,10 +323,16 @@ impl Runtime {
         child_label(&self.snapshot.subagents, &self.child_ordinals, child, limit)
     }
 
+    /// The number `child` goes by among children of its name; see
+    /// [`Self::child_label`].
+    pub(super) fn child_ordinal(&self, child: &chat::Subagent) -> usize {
+        child_ordinal(&self.snapshot.subagents, &self.child_ordinals, child)
+    }
+
     /// A chooser row's accessible name. It ends with the exact child ID,
     /// which tells apart rows whose names and tasks read the same.
-    pub(super) fn child_choice_name(child: &chat::Subagent, label: &str) -> String {
-        let status = Self::native_child_status(child);
+    pub(super) fn child_choice_name(&self, child: &chat::Subagent, label: &str) -> String {
+        let status = self.native_child_status(child);
         match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
                 "{label} · {status} · Task: {} · {}",
@@ -456,7 +476,11 @@ impl Runtime {
         let target = self.target;
         let picker = self.child_picker.as_ref()?;
 
-        let matches = picker.rows(&self.snapshot.subagents, &self.child_ordinals);
+        let matches = picker.rows(
+            &self.snapshot.subagents,
+            &self.child_ordinals,
+            &self.agent_work,
+        );
         let page = picker.page.min(matches.len().saturating_sub(1) / PAGE_SIZE);
         let count = matches.len();
         let first = matches.get(page * PAGE_SIZE).map(|child| child.id.clone());
@@ -468,9 +492,9 @@ impl Runtime {
         let mut rows = Vec::with_capacity(PAGE_SIZE);
         for child in page_rows {
             let chosen = self.selected_subagent.as_ref() == Some(&child.id);
-            let status = Self::native_child_status(child);
+            let status = self.native_child_status(child);
             let label = self.child_label(child, 80);
-            let name = Self::child_choice_name(child, &label);
+            let name = self.child_choice_name(child, &label);
             let (heading, detail) = if picker.filter == Filter::Failed {
                 (
                     Self::agent_failure_task(child).to_owned(),
@@ -963,7 +987,9 @@ mod tests {
         );
         let picker = Picker::new(&children);
         assert_eq!(
-            picker.rows(&children, &Ordinals::default()).len(),
+            picker
+                .rows(&children, &Ordinals::default(), &Default::default())
+                .len(),
             1000,
             "the chooser keeps every child reachable"
         );
@@ -1024,48 +1050,50 @@ mod tests {
         ];
         let mut picker = Picker::new(&children);
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["first", "second", "waiting", "failed", "done"]
         );
         // Rows do not move under the pointer while the chooser is open.
         children[0].status = Running;
         children[1].status = Succeeded;
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["first", "second", "waiting", "failed", "done"]
         );
         picker.filter = Filter::Attention;
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["waiting", "failed"]
         );
         picker.filter = Filter::Working;
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["second", "done"]
         );
         picker.filter = Filter::All;
         picker.query = "Agent second".into();
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["second"]
         );
         children[3].description = "Audit the parser\nInternal prompt framing".into();
         picker.query = "audit".into();
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["second"],
             "the task stays searchable after leaving the label"
         );
         picker.query = "framing".into();
         assert!(
-            picker.rows(&children, &Ordinals::default()).is_empty(),
+            picker
+                .rows(&children, &Ordinals::default(), &Default::default())
+                .is_empty(),
             "only the task's first line is shown, so only it is searched"
         );
         children[4].kind = "Agent second".into();
         picker.query = "agent second 2".into();
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["failed"],
             "the visible number is searchable"
         );
@@ -1078,6 +1106,21 @@ mod tests {
         );
         children[0].description = " \n".into();
         assert_eq!(Runtime::native_child_name(&children[0]), "Subagent");
+    }
+
+    /// Only a failure is drawn as one, with the error mark its row and
+    /// report use; a stopped agent, and one that ended without saying how it
+    /// went, show the still "ended" mark rather than the Stop control's.
+    #[test]
+    fn only_a_failed_child_is_marked_as_failing() {
+        use chat::ToolStatus::*;
+        assert_eq!(child_icon(&child("failed", Failed, false)), Icon::Error);
+        assert_eq!(child_icon(&child("stopped", Stopped, false)), Icon::Ended);
+        assert_eq!(child_icon(&child("ended", Ended, false)), Icon::Ended);
+        assert_eq!(
+            child_icon(&child("finished", Succeeded, false)),
+            Icon::Check
+        );
     }
 
     #[test]
@@ -1098,7 +1141,7 @@ mod tests {
         let mut picker = Picker::new(&children);
         picker.filter = Filter::Working;
         assert_eq!(
-            ids(picker.rows(&children, &Ordinals::default())),
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
             ["working"]
         );
     }

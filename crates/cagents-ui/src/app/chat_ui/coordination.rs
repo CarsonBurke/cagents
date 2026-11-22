@@ -430,16 +430,16 @@ impl Recipient {
     }
 
     /// As a row draws it: the name cut to fit beside the session ID that
-    /// tells it apart, which is kept whole.
-    fn shown(&self) -> String {
+    /// tells it apart, and that ID, which the row keeps whole after it.
+    fn shown(&self) -> (String, String) {
         let cut = |name: &str, room: usize| Runtime::short_description(name, room);
         match (&self.session, self.name.is_empty()) {
             (Some(session), false) => {
                 let id = short_id(session);
                 let room = LABEL_CHARS.saturating_sub(id.chars().count() + 3).max(8);
-                format!("{} ({id})", cut(&self.name, room))
+                (cut(&self.name, room), format!(" ({id})"))
             }
-            _ => cut(&self.plain(), LABEL_CHARS),
+            _ => (cut(&self.plain(), LABEL_CHARS), String::new()),
         }
     }
 }
@@ -631,8 +631,17 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
 /// How many characters of a name that is not a listed agent's a row shows:
 /// few enough that, in the narrowest chat pane, the status after it keeps
 /// its place, and enough for "the conversation that started it". A listed
-/// agent goes by its tab's shorter words.
+/// agent's name is bounded by [`ROW_NAME_CHARS`] instead.
 const LABEL_CHARS: usize = 32;
+
+/// How much of a listed agent's name its row may show. The row fades it
+/// where it runs short; this bounds only the text shaped for it.
+const ROW_NAME_CHARS: usize = 80;
+
+/// How much of its status a row shows, a caption naming what an agent waits
+/// on included, so that the status leaves room for the agent's name. An
+/// agent's caption is already held to it, so the row and tab say the same.
+const STATUS_CHARS: usize = super::view::AGENT_CAPTION_CHARS;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
 /// and the gap before it, as a step row keeps for its chevron, so statuses
 /// end in line with step durations.
@@ -815,11 +824,17 @@ struct Row {
     verb: &'static str,
     /// Whom the step reached, whole.
     label: String,
-    /// The same as the row draws it: an agent in its tab's words, any
-    /// other name cut to fit the narrowest pane.
+    /// The same as the row draws it: an agent's name, any other name cut to
+    /// fit the narrowest pane. It fades where the row runs short.
     shown: String,
+    /// What follows the name and tells it apart, the number two agents of
+    /// one name go by or a session's ID, which the row keeps whole.
+    tag: String,
     /// The start of what was said, or the started agent's type.
     preview: String,
+    /// The preview is one term, the agent's type, which the row shows whole
+    /// or leaves out: the agent's name and how it stands come first.
+    term: bool,
     /// The whole of it, for the tooltip.
     full: String,
     state: RowStatus,
@@ -859,13 +874,13 @@ impl Row {
             (None, false) => OPENS_DETAIL,
             (None, true) => OPENS_DETAIL_OF_SEVERAL,
         };
-        let mut tip = Vec::new();
-        if matches!(&self.open, Some(Action::OpenAgent(_))) {
-            tip.push(format!("Open {}", self.label));
-        }
-        if self.shown != self.label {
-            tip.push(format!("{} {}", self.verb, self.label));
-        }
+        // The row fades its name where the pane runs short, so the tooltip
+        // names it whole.
+        let mut tip = vec![if matches!(&self.open, Some(Action::OpenAgent(_))) {
+            format!("Open {}", self.label)
+        } else {
+            format!("{} {}", self.verb, self.label)
+        }];
         tip.extend(reason);
         if self.open.is_none() {
             tip.push(pressing.to_owned());
@@ -875,7 +890,7 @@ impl Row {
         }
         let name = [
             format!("{} {}", self.verb, self.label),
-            self.state.text.to_owned(),
+            self.state.text.to_string(),
             self.state.detail.clone().unwrap_or_default(),
             if matches!(&self.open, Some(Action::OpenAgent(_))) {
                 format!("Open {}", self.label)
@@ -895,7 +910,7 @@ impl Row {
 /// A row's trailing status: a word or two, with the whole account of it in
 /// the tooltip.
 struct RowStatus {
-    text: &'static str,
+    text: Cow<'static, str>,
     tone: Tone,
     /// Still under way, which a still dot beside its caption marks.
     live: bool,
@@ -903,24 +918,24 @@ struct RowStatus {
 }
 
 impl RowStatus {
-    fn with(text: &'static str, tone: Tone, live: bool) -> Self {
+    fn with(text: impl Into<Cow<'static, str>>, tone: Tone, live: bool) -> Self {
         Self {
-            text,
+            text: text.into(),
             tone,
             live,
             detail: None,
         }
     }
-    fn plain(text: &'static str) -> Self {
+    fn plain(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Plain, false)
     }
-    fn live(text: &'static str) -> Self {
+    fn live(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Plain, true)
     }
-    fn warning(text: &'static str) -> Self {
+    fn warning(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Warning, false)
     }
-    fn error(text: &'static str) -> Self {
+    fn error(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Error, false)
     }
 }
@@ -995,30 +1010,89 @@ enum Tone {
     Error,
 }
 
+/// A row's words after its glyph, and what of them its state gives way to.
+///
+/// The words are the verb, the name with the `tag` that tells it apart kept
+/// whole after it, and the preview. The name takes its room before the
+/// preview has any, and a preview that is one term, an agent's type, is left
+/// out whole rather than cut, so the name fades only once nothing follows it.
+/// What must not be cut for the state's sake, the second element, is the
+/// verb, as much of the name as [`LABEL_CHARS`] allows and the tag, measured
+/// and never drawn: past that, a long name fades rather than hide the state.
+fn row_words(
+    verb: &'static str,
+    name: String,
+    tag: String,
+    preview: String,
+    term: bool,
+) -> (Element<'static, Message>, Element<'static, Message>) {
+    let measured = Runtime::short_description(&name, LABEL_CHARS);
+    let title = crate::ui_controls::FadeText::transcript(name).font(design::transcript_name_font());
+    let tagged =
+        |tag: String| design::transcript_name(tag).wrapping(iced::widget::text::Wrapping::None);
+    let title: Element<'static, Message> = if tag.is_empty() {
+        title.into()
+    } else {
+        crate::ui_controls::trailing(title, tagged(tag.clone()), 0.0)
+    };
+    let preview = crate::ui_controls::FadeText::transcript(preview)
+        .class(cosmic::theme::Text::Custom(design::muted_text))
+        .width(Length::Fill);
+    let words = widget::row::with_children(vec![
+        design::transcript(verb)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+        title,
+        if term { preview.whole() } else { preview }.into(),
+    ])
+    .spacing(step::GAP_S)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+    let kept = widget::row::with_children(vec![
+        design::transcript(verb)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+        widget::row::with_children(vec![
+            design::transcript_name(measured)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+            tagged(tag).into(),
+        ])
+        .into(),
+    ])
+    .spacing(step::GAP_S);
+    (words.into(), kept.into())
+}
+
 /// A tracked task's state is independent of the tool that launched it.
-#[derive(Clone, Copy)]
-enum BackgroundState {
+#[derive(Debug, PartialEq)]
+enum BackgroundState<'a> {
     Working,
     Waiting,
     /// Alive, with its result so far delivered: nothing is asked of anyone.
-    OnBackgroundWork,
+    /// It holds its agent's caption where that names what it waits on.
+    OnBackgroundWork(Option<&'a str>),
     Failed,
     Stopped,
+    Denied,
     Ended,
     Finished,
 }
 
-impl BackgroundState {
-    fn caption(self) -> &'static str {
-        match self {
+impl BackgroundState<'_> {
+    fn caption(self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
             Self::Working => "Working",
             Self::Waiting => "Waiting",
-            Self::OnBackgroundWork => "Waiting on background work",
+            Self::OnBackgroundWork(Some(caption)) => return Cow::Owned(caption.to_owned()),
+            Self::OnBackgroundWork(None) => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
+            Self::Denied => "Denied",
             Self::Ended => "Ended",
             Self::Finished => "Finished",
-        }
+        })
     }
 
     /// The row's status for this state: a live caption while the agent works,
@@ -1054,10 +1128,16 @@ impl Runtime {
             .map(|agent| self.child_label(agent, usize::MAX).into_owned())
     }
 
-    /// How a row names a listed agent: in its tab's words, number and all.
-    fn row_agent_name(&self, agent: &chat::Subagent) -> String {
-        self.child_label(agent, super::child_navigation::TAB_CHARS)
-            .into_owned()
+    /// How a row names a listed agent: as its tab does, but with as much of
+    /// its name as the row has room for, which comes before the agent's type
+    /// or the start of what was said, and apart from the number that tells
+    /// it from another of its name, which the row keeps whole.
+    fn row_agent_name(&self, agent: &chat::Subagent) -> (String, String) {
+        let name = Self::short_description(Self::native_child_name(agent), ROW_NAME_CHARS);
+        match self.child_ordinal(agent) {
+            1 => (name, String::new()),
+            ordinal => (name, format!(" {ordinal}")),
+        }
     }
 
     /// The agents a step names that this conversation lists, each once.
@@ -1131,11 +1211,20 @@ impl Runtime {
                 .map(|agent| self.child_label(agent, usize::MAX).into_owned())
         };
         let recipient_whole = recipient(message, reading, &whole);
-        let shown = recipient(message, reading, &|id| {
-            self.subagent(id).map(|agent| self.row_agent_name(agent))
-        })
-        .shown();
         let listed: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
+        let joined = |agent: &chat::Subagent| {
+            let (name, tag) = self.row_agent_name(agent);
+            name + &tag
+        };
+        let drawn = recipient(message, reading, &|id| self.subagent(id).map(joined));
+        // One listed agent is named apart from its number, as a started one
+        // is; a phrase for several fades as one.
+        let (shown, tag) = match listed.as_slice() {
+            [agent] if drawn.session.is_none() && drawn.name == joined(agent) => {
+                self.row_agent_name(agent)
+            }
+            _ => drawn.shown(),
+        };
         let open = match (listed.as_slice(), &recipient_whole.session) {
             ([agent], _) => Some(Action::SelectSubagent(self.target, Some(agent.id.clone()))),
             (_, Some(session)) if recipient_whole.live => {
@@ -1208,7 +1297,9 @@ impl Runtime {
             verb: message_verb(message.kind),
             label: recipient_whole.plain(),
             shown,
+            tag,
             preview,
+            term: false,
             full: full.join("\n\n").trim().to_owned(),
             state,
             several: open.is_none() && listed.len() > 1,
@@ -1242,8 +1333,8 @@ impl Runtime {
                 agent.and_then(|agent| agent.prompt.inline()),
             )
         });
-        let (label, shown) = if let Some((label, _)) = &cli_label {
-            (label.clone(), label.clone())
+        let (label, (shown, tag)) = if let Some((label, _)) = &cli_label {
+            (label.clone(), (label.clone(), String::new()))
         } else {
             match listed {
                 Some(agent) => (
@@ -1253,7 +1344,7 @@ impl Runtime {
                 None => {
                     let label = started(spawn);
                     let shown = Self::short_description(&label, LABEL_CHARS);
-                    (label, shown)
+                    (label, (shown, String::new()))
                 }
             }
         };
@@ -1268,11 +1359,15 @@ impl Runtime {
                 |title| format!("in channel “{title}”"),
             )
         });
+        let mut term = false;
         let mut preview = if let Some((_, task)) = &cli_label {
             task.clone().unwrap_or_default()
         } else {
             match spawn.agents.as_slice() {
-                [agent] if agent.kind.trim() != label => agent.kind.trim().to_owned(),
+                [agent] if agent.kind.trim() != label => {
+                    term = true;
+                    agent.kind.trim().to_owned()
+                }
                 [_] => String::new(),
                 agents => agents
                     .iter()
@@ -1299,6 +1394,7 @@ impl Runtime {
                         .as_deref()
                         == Some(title)
                 });
+            term = false;
             preview = if preview.is_empty() || duplicate_task {
                 destination.clone()
             } else {
@@ -1343,7 +1439,7 @@ impl Runtime {
             Some(state) => {
                 glyph = match state {
                     BackgroundState::Waiting => Icon::AgentWaiting,
-                    BackgroundState::OnBackgroundWork => Icon::AgentBackground,
+                    BackgroundState::OnBackgroundWork(_) => Icon::AgentBackground,
                     _ => Icon::Agent,
                 };
                 state.status()
@@ -1394,7 +1490,9 @@ impl Runtime {
             },
             label,
             shown,
+            tag,
             preview,
+            term,
             full: full.join("\n\n"),
             state,
             several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
@@ -1427,36 +1525,13 @@ impl Runtime {
             muted_glyph(row.glyph, design::LEADING_ICON_SIZE)
         };
         let (tip, name) = row.described();
-        let label = row.shown.clone();
-        // The preview fades out where the pane runs short, as a step row's
-        // summary does, on whatever the row is painted with; the agent keeps
-        // its tab's words, cut as the tab cuts them.
-        let words = widget::row::with_children(vec![
-            design::transcript(row.verb)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            design::transcript_name(label.clone())
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            crate::ui_controls::FadeText::transcript(row.preview.clone())
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(step::GAP_S)
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-        // What must not be cut for the state's sake: the verb and the agent.
-        let kept = widget::row::with_children(vec![
-            design::transcript(row.verb)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-            design::transcript_name(label)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        ])
-        .spacing(step::GAP_S);
+        let (words, kept) = row_words(
+            row.verb,
+            row.shown.clone(),
+            row.tag.clone(),
+            row.preview.clone(),
+            row.term,
+        );
         // Work under way is marked by a still dot beside its caption; the
         // transcript's one activity indicator says that something moves.
         let live = row.state.live && matches!(row.state.tone, Tone::Plain);
@@ -1464,8 +1539,10 @@ impl Runtime {
         if live {
             state.push(disclosure::state_dot(design::accent_color));
         }
+        // A caption naming what an agent waits on is held to the bound its
+        // tab's caption is, so the row says what the tab says.
         let status =
-            design::transcript(row.state.text).wrapping(iced::widget::text::Wrapping::None);
+            crate::ui_controls::FadeText::transcript(row.state.text.clone()).limit(STATUS_CHARS);
         let status = match row.state.tone {
             Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
             Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
@@ -1476,9 +1553,10 @@ impl Runtime {
         }
         // Where the agent's name and its state no longer both fit, the state
         // keeps only its mark: the dot of work under way, or one in the
-        // warning colour. A failure is told by the row's leading glyph, and
-        // a settled state by the absence of either. A warning's words stay
-        // in the row's tooltip, and every state's in its accessible name.
+        // warning colour. A failure keeps the row's leading glyph in the
+        // error colour, and a settled state is told by the absence of either.
+        // A warning's words stay in the row's tooltip, and every state's in
+        // its accessible name.
         let compact = match row.state.tone {
             Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
             Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
@@ -1579,7 +1657,7 @@ impl Runtime {
 
     /// How the agents a step left running in the background are doing now,
     /// for as long as this conversation tracks them.
-    fn background_state(&self, coordinated: &Coordinated) -> Option<BackgroundState> {
+    fn background_state(&self, coordinated: &Coordinated) -> Option<BackgroundState<'_>> {
         let Kind::Spawn(spawn) = &coordinated.reading.kind else {
             return None;
         };
@@ -1598,11 +1676,22 @@ impl Runtime {
         } else if any(ToolStatus::Running) {
             Some(BackgroundState::Working)
         } else if any(ToolStatus::Waiting) {
-            Some(BackgroundState::OnBackgroundWork)
+            // One agent's work can be named; several agents' are their own.
+            let mut waiting = agents
+                .iter()
+                .filter(|agent| agent.status == ToolStatus::Waiting);
+            let work = match (waiting.next(), waiting.next()) {
+                (Some(agent), None) => self.agent_work.get(&agent.id),
+                _ => None,
+            };
+            Some(BackgroundState::OnBackgroundWork(work))
         } else if any(ToolStatus::Failed) {
             Some(BackgroundState::Failed)
-        } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
+        } else if any(ToolStatus::Stopped) {
             Some(BackgroundState::Stopped)
+        } else if any(ToolStatus::Denied) {
+            // As its tab and report say it.
+            Some(BackgroundState::Denied)
         } else if any(ToolStatus::Ended) {
             Some(BackgroundState::Ended)
         } else {
@@ -1926,6 +2015,185 @@ mod identity_tests {
         }
     }
 
+    fn running_command(id: &str, command: &str) -> chat::Item {
+        chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: "Run the check".into(),
+                command: command.into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+            started_at: None,
+            at: None,
+        }
+    }
+
+    /// A background agent's row says what it waits on in the words its tab
+    /// uses, and shows its type whole or not at all.
+    #[test]
+    fn a_waiting_agents_row_names_what_it_waits_on_and_its_type_is_a_whole_term() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let reading = claude_step(
+            "Agent",
+            serde_json::json!({
+                "description": "Review restart safety",
+                "subagent_type": "general-purpose",
+                "prompt": "Review restart safety.",
+                "run_in_background": true
+            }),
+            "Async agent launched successfully.",
+        );
+        let Kind::Spawn(spawn) = reading.reading.kind.clone() else {
+            panic!("an Agent call starts an agent");
+        };
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "toolu_step".into(),
+            kind: String::new(),
+            description: "Review restart safety".into(),
+            status: ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: vec![running_command("check", "scripts/restart-check\n--verbose").into()],
+        }];
+        // Each change arrives as a publication, which names what each agent
+        // waits on once; drawing only looks it up.
+        let observe = |runtime: &mut Runtime| {
+            let mut snapshot = (*runtime.snapshot).clone();
+            snapshot.generation += 1;
+            runtime.install_snapshot(std::sync::Arc::new(snapshot), None);
+        };
+        observe(&mut runtime);
+        let row =
+            |runtime: &Runtime| runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
+        let started = row(&runtime);
+        assert_eq!(started.shown, "Review restart safety");
+        assert_eq!(started.preview, "general-purpose");
+        assert!(started.term, "the type is drawn whole or left out");
+        assert_eq!(started.state.text, "Waiting on scripts/restart-check");
+        let agent = &runtime.snapshot.subagents[0];
+        assert_eq!(
+            runtime.native_child_status(agent),
+            started.state.text,
+            "the row and the agent's tab say the same"
+        );
+        // The same publication installed again is not scanned again, though
+        // what is shown of it is its prose joined, not the publication.
+        let mut again = (*runtime.snapshot).clone();
+        again.generation += 1;
+        let message = "joined ".repeat(chat::TRANSCRIPT_PART_BYTES / 3);
+        let cut = super::super::logical_prose::parts("answer", &message, 0..usize::MAX);
+        assert!(cut.len() > 1, "the message is held in parts");
+        let source = chat::TextCopySource {
+            cache: uuid::Uuid::from_u128(7),
+            scope: chat::TextCopyScope::Conversation,
+            token: 3,
+            revision: 1,
+            bytes: message.len() as u64,
+        };
+        again.text_copy_sources.conversation = vec![Some(source); cut.len()];
+        again.items = cut;
+        let again = std::sync::Arc::new(again);
+        runtime.install_snapshot(again.clone(), None);
+        assert!(
+            !std::sync::Arc::ptr_eq(&runtime.snapshot, &again),
+            "the shown publication is the joined one"
+        );
+        runtime.agent_work = Default::default();
+        runtime.install_snapshot(again, None);
+        assert_eq!(runtime.agent_work.get("toolu_step"), None);
+        // Several commands are counted, and work it never showed is unnamed.
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
+            .items
+            .push(running_command("soak", "scripts/soak").into());
+        observe(&mut runtime);
+        assert_eq!(row(&runtime).state.text, "Waiting on 2 commands");
+        // A long command is cut once, where the tab cuts it, and the row's
+        // bound leaves that cut whole.
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].items =
+            vec![running_command("long", "scripts/restart-check-every-release-path").into()];
+        observe(&mut runtime);
+        let long = row(&runtime).state.text;
+        assert_eq!(long, "Waiting on scripts/restart-check-ev…");
+        assert_eq!(long.chars().count(), STATUS_CHARS);
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
+            .items
+            .clear();
+        observe(&mut runtime);
+        assert_eq!(row(&runtime).state.text, "Waiting on background work");
+        // Settled, it names no work.
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].status = ToolStatus::Succeeded;
+        observe(&mut runtime);
+        assert_eq!(row(&runtime).state.text, "Finished");
+    }
+
+    /// A row for several agents names what one waits on only when it is the
+    /// one waiting; the work of several is theirs to say on their own tabs.
+    #[test]
+    fn a_row_for_several_agents_names_work_only_when_one_waits() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let agent = |id: &str, status: ToolStatus, command: &str| chat::Subagent {
+            id: id.into(),
+            kind: id.into(),
+            description: String::new(),
+            status,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: vec![running_command(&format!("{id}-check"), command).into()],
+        };
+        let delegate = |name: &str| crate::chat::coordination::Delegate {
+            name: name.into(),
+            kind: String::new(),
+            description: String::new(),
+            prompt: Text::Inline(String::new()),
+        };
+        let reading = Coordinated::new(Coordination {
+            kind: Kind::Spawn(Spawn {
+                agents: vec![delegate("docs"), delegate("tests")],
+                ..Default::default()
+            }),
+            outcome: Default::default(),
+            subagents: vec!["docs".into(), "tests".into()],
+            cli: false,
+        });
+        let mut state = |docs: ToolStatus, tests: ToolStatus| {
+            std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
+                agent("docs", docs, "scripts/build-docs"),
+                agent("tests", tests, "scripts/test"),
+            ];
+            runtime.agent_work.observe(&runtime.snapshot.subagents);
+            runtime
+                .background_state(&reading)
+                .map(|state| state.caption().into_owned())
+        };
+        assert_eq!(
+            state(ToolStatus::Waiting, ToolStatus::Succeeded).as_deref(),
+            Some("Waiting on scripts/build-docs")
+        );
+        assert_eq!(
+            state(ToolStatus::Waiting, ToolStatus::Waiting).as_deref(),
+            Some("Waiting on background work")
+        );
+        // A refused agent reads as its tab says, not as a stopped one.
+        assert_eq!(
+            state(ToolStatus::Denied, ToolStatus::Succeeded).as_deref(),
+            Some("Denied")
+        );
+        assert_eq!(
+            state(ToolStatus::Denied, ToolStatus::Stopped).as_deref(),
+            Some("Stopped")
+        );
+    }
+
     fn claude_step(name: &str, input: serde_json::Value, output: &str) -> Coordinated {
         let item = chat::Item {
             id: "toolu_step".into(),
@@ -1992,7 +2260,11 @@ mod identity_tests {
             if worked {
                 assert_eq!(row.verb, "Started");
                 assert_eq!(row.state.text, "Failed");
-                assert!(tip.starts_with(&format!("Failed: {refusal}")), "{tip}");
+                // The tooltip names the agent whole, then how it stands.
+                assert!(
+                    tip.starts_with(&format!("Started {}\n\nFailed: {refusal}", row.label)),
+                    "{tip}"
+                );
                 assert!(row.open.is_some(), "its transcript opens");
             } else {
                 assert_eq!(row.verb, "Couldn't start");
@@ -2001,8 +2273,12 @@ mod identity_tests {
                 assert!(accessible.starts_with("Couldn't start "), "{accessible}");
                 assert!(tip.contains(OPENS_DETAIL), "{tip}");
                 assert_eq!(tip.matches(refusal).count(), 1, "the reason once: {tip}");
-                // A state with no words gives its bare reason, not ": reason".
-                assert!(tip.starts_with(refusal), "{tip}");
+                // A state with no words gives its bare reason, not ": reason",
+                // after what could not start.
+                assert!(
+                    tip.starts_with(&format!("Couldn't start {}\n\n{refusal}", row.label)),
+                    "{tip}"
+                );
             }
         }
     }
@@ -2111,6 +2387,86 @@ mod identity_tests {
         }
     }
 
+    /// Where a row runs short, its agent's type goes first, whole. The name
+    /// keeps its width until nothing follows it, then fades, and the number
+    /// that tells two agents of one name apart stays whole after it. What the
+    /// row's state gives way to is the verb, the name and the number, whole.
+    #[test]
+    fn a_rows_name_has_room_before_its_agents_type() {
+        use iced::advanced::{layout, widget::Tree};
+
+        let renderer = crate::app::tests::headless_renderer();
+        let lay = |element: Element<'static, Message>, width: f32| {
+            let mut element = element;
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 100.0)),
+            )
+        };
+        let words = |tag: &str, width: f32| {
+            let (words, _) = row_words(
+                "Started",
+                "Review restart safety".into(),
+                tag.into(),
+                "general-purpose".into(),
+                true,
+            );
+            lay(words, width)
+        };
+        let parts = |node: &layout::Node| {
+            node.children()
+                .iter()
+                .map(|child| child.size().width)
+                .collect::<Vec<_>>()
+        };
+        let gap = step::GAP_S;
+        // With room to spare, each part is laid out at its own width.
+        let wide = parts(&words("", 4000.0));
+        let (verb, name, kind) = (wide[0], wide[1], wide[2]);
+        assert!(verb > 0.0 && name > 0.0 && kind > 0.0, "{wide:?}");
+        // Room for the name but not the type: the type has only what is
+        // left, which is too little to draw it whole.
+        let short = parts(&words("", verb + name + 2.0 * gap + 20.0));
+        assert_eq!((short[0], short[1]), (verb, name), "{short:?}");
+        assert!(short[2] <= 20.0, "{short:?}");
+        // Less room: the type is gone and the name fades.
+        let room = verb + gap + name / 2.0;
+        let narrow = parts(&words("", room));
+        assert_eq!(narrow[0], verb, "{narrow:?}");
+        assert!(narrow[1] < name, "the name fades: {narrow:?}");
+        // The number stays whole where the name fades before it.
+        let number = |width: f32| parts(&words(" 2", width).children()[1]);
+        let whole = number(4000.0);
+        let cut = number(room);
+        assert!(whole[1] > 0.0, "{whole:?}");
+        assert_eq!(cut[1], whole[1], "the number keeps its room: {cut:?}");
+        assert!(cut[0] < whole[0], "the name fades before it: {cut:?}");
+        // The state gives way to the verb, the name and the number whole,
+        // however long the type that follows them.
+        let (_, kept) = row_words(
+            "Started",
+            "Review restart safety".into(),
+            " 2".into(),
+            "general-purpose ".repeat(40),
+            false,
+        );
+        let kept = lay(kept, 4000.0).size().width;
+        assert_eq!(kept, verb + gap + whole[0] + whole[1]);
+        // A long name is kept only as far as a recipient's would be: past
+        // that it fades, and the state keeps its place beside it.
+        let long = "Confirm every supported upgrade path still migrates from the oldest release";
+        let kept = |name: &str| {
+            let (_, kept) = row_words("Started", name.into(), String::new(), String::new(), true);
+            lay(kept, 4000.0).size().width
+        };
+        assert_eq!(
+            kept(long),
+            kept(&Runtime::short_description(long, LABEL_CHARS))
+        );
+    }
+
     /// Claude addresses an agent by the agent ID it gave it, never by the
     /// call that started it: the card names the agent as its tab does, and
     /// one the conversation does not list without showing its ID.
@@ -2215,15 +2571,15 @@ mod identity_tests {
     fn a_message_taken_as_a_run_reads_as_queued_or_delivered_and_an_unknown_end_is_unconfirmed() {
         let word = |arrival| {
             let status = received(arrival);
-            (status.text, status.tone == Tone::Warning)
+            (status.text.into_owned(), status.tone == Tone::Warning)
         };
         for waiting in [Arrival::Queued, Arrival::Behind, Arrival::NoSlot] {
-            assert_eq!(word(waiting), ("Queued", false));
+            assert_eq!(word(waiting), ("Queued".to_owned(), false));
         }
         for given in [Arrival::Started, Arrival::Ended] {
-            assert_eq!(word(given), ("Delivered", false));
+            assert_eq!(word(given), ("Delivered".to_owned(), false));
         }
-        assert_eq!(word(Arrival::Unknown), ("Not confirmed", true));
+        assert_eq!(word(Arrival::Unknown), ("Not confirmed".to_owned(), true));
         assert_eq!(
             received(Arrival::Unknown).detail.as_deref(),
             Some(arrival(Arrival::Unknown))
@@ -2307,7 +2663,9 @@ mod identity_tests {
             verb: "Message to",
             label: label.to_owned(),
             shown: shown.to_owned(),
+            tag: String::new(),
             preview: "The repo is now at /srv".to_owned(),
+            term: false,
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
             state,
             open,
@@ -2331,7 +2689,8 @@ mod identity_tests {
             name,
             format!("Message to {long} · Queued · Opens the agent · The repo is now at /srv")
         );
-        // A name the row draws whole is not repeated.
+        // A short name is named whole too: the row may still fade it where
+        // the pane runs short.
         let (tip, _) = row(
             "reviewer",
             "reviewer",
@@ -2339,7 +2698,10 @@ mod identity_tests {
             RowStatus::plain("Queued"),
         )
         .described();
-        assert_eq!(tip, "The repo is now at /srv/repos/t3code.");
+        assert_eq!(
+            tip,
+            "Message to reviewer\n\nThe repo is now at /srv/repos/t3code."
+        );
 
         // A row with no agent to open says so, after the outcome's reason.
         let refused = || RowStatus {
@@ -2350,7 +2712,8 @@ mod identity_tests {
         assert_eq!(
             tip,
             format!(
-                "Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_DETAIL}\n\n\
+                "Message to release-notes\n\n\
+                 Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_DETAIL}\n\n\
                  The repo is now at /srv/repos/t3code."
             )
         );
@@ -2374,8 +2737,8 @@ mod identity_tests {
         assert!(several.described().0.contains(OPENS_DETAIL_OF_SEVERAL));
     }
 
-    /// A row names an agent in its tab's words, so two whose tasks a tab
-    /// cuts to one text keep the number that tells them apart; a session it
+    /// A row names an agent as its tab does, so two whose tasks a tab cuts
+    /// to one text keep the number that tells them apart; a session it
     /// messaged keeps the ID that tells it apart, however long its title.
     #[test]
     fn a_rows_name_keeps_what_tells_its_agent_apart() {
@@ -2397,22 +2760,30 @@ mod identity_tests {
         let second = &runtime.snapshot.subagents[1];
         let tab = runtime.child_label(second, super::super::child_navigation::TAB_CHARS);
         assert!(tab.ends_with(" 2"), "{tab}");
-        assert_eq!(runtime.row_agent_name(second), tab);
+        // The row has room for more of the name than the tab, and keeps the
+        // number apart from it, whole where the name fades.
+        assert_eq!(
+            runtime.row_agent_name(second),
+            (task.to_owned(), " 2".to_owned())
+        );
 
         let titled = Recipient {
             name: "A session whose title runs on well past a row".into(),
             session: Some("95fcd1b9e3a4".into()),
             live: true,
         };
-        let shown = titled.shown();
-        assert!(shown.ends_with(" (95fcd1b9)"), "{shown}");
-        assert!(shown.chars().count() <= LABEL_CHARS + 1, "{shown}");
+        let (shown, id) = titled.shown();
+        assert_eq!(id, " (95fcd1b9)");
+        assert!(
+            shown.chars().count() + id.chars().count() <= LABEL_CHARS + 1,
+            "{shown}{id}"
+        );
         // A phrase the row draws whole.
         let report = Recipient {
             name: "the conversation that started it".into(),
             session: None,
             live: false,
         };
-        assert_eq!(report.shown(), report.name);
+        assert_eq!(report.shown(), (report.name.clone(), String::new()));
     }
 }

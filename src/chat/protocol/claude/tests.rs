@@ -13970,15 +13970,54 @@ fn the_nested_agents_scene_counts_only_the_leads_running_agents() {
         "toolu_audit",
         "toolu_trace",
         "toolu_rollback",
+        "toolu_migrate",
+        "toolu_index",
+        "toolu_upgrade",
+        "toolu_deploy",
     ];
     assert_eq!(subagent_ids(&lead.snapshot), direct);
-    assert_eq!(agent_counts(&lead.snapshot), (4, 0, 0, 0));
+    assert_eq!(agent_counts(&lead.snapshot), (8, 0, 0, 0));
     lead.replay(include_str!(
         "../../../../tests/fixtures/nested-agents-scene/settle.jsonl"
     ));
     assert_eq!(subagent_ids(&lead.snapshot), direct);
-    // Audit still works; Review waits on the check it started.
-    assert_eq!(agent_counts(&lead.snapshot), (1, 0, 1, 0));
+    // Audit still works. Review waits on the check it started and Deploy on
+    // the helper it started; Migrate failed and Index was stopped.
+    assert_eq!(agent_counts(&lead.snapshot), (1, 0, 2, 1));
+    let status = |id: &str| {
+        lead.snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.status)
+    };
+    assert_eq!(
+        direct.map(status),
+        [
+            ToolStatus::Waiting,
+            ToolStatus::Running,
+            ToolStatus::Succeeded,
+            ToolStatus::Succeeded,
+            ToolStatus::Failed,
+            ToolStatus::Stopped,
+            ToolStatus::Succeeded,
+            ToolStatus::Waiting,
+        ]
+        .map(Some)
+    );
+    // The check Review waits on is the one command of its own still running.
+    let review = lead
+        .snapshot
+        .subagents
+        .iter()
+        .find(|agent| agent.id == "toolu_review")
+        .unwrap();
+    let check = review
+        .items
+        .iter()
+        .find(|item| item.id == "toolu_review_bg")
+        .unwrap();
+    assert_eq!(check.content.status(), Some(ToolStatus::Running));
     let soak = lead
         .snapshot
         .items
