@@ -474,7 +474,8 @@ fn verify_tool_readers(
             verify_tool_reader(&item.id, &[5], output, proofs, verified);
         }
         ItemContent::Tool { input, output, .. } => {
-            verify_tool_reader(&item.id, &[4], input, proofs, verified);
+            let (input, _) = tool_text::tool_input(input);
+            verify_tool_reader(&item.id, &[4], &input, proofs, verified);
             verify_tool_reader(&item.id, &[5], output, proofs, verified);
         }
         ItemContent::Changes { changes, .. } => {

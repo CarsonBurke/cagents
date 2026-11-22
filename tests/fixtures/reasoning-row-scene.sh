@@ -24,8 +24,8 @@
 # stop the evidence session afterward. Commands only describe synthetic output.
 set -euo pipefail
 
-scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking}
-case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking) ;; *) exit 2 ;; esac
+scene=${1:?usage: reasoning-row-scene.sh wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking|tool-cards}
+case "$scene" in wide|narrow|web|coordination|diagnostics|refresh-core|refresh-notices|activity|agents|plan|contentless|hidden-subagent|lone-thinking|tool-cards) ;; *) exit 2 ;; esac
 transcript_right=810
 if [ "$scene" = narrow ]; then transcript_right=535; fi
 here=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -459,6 +459,37 @@ if [ "$scene" = agents ]; then
     scroll_top
     shot agents-idle
     printf '%s\n' 'Captured subagents working after the lead answered.'
+    exit 0
+fi
+
+# Generic tool cards opened to their input and output: a call to a tool
+# Claude Code doesn't have, an MCP call with list and multi-line arguments,
+# and a command the harness blocked. Both failures arrive wrapped in Claude
+# Code's <tool_use_error> tags.
+if [ "$scene" = tool-cards ]; then
+    cp "$here/reasoning-row-scene/tool-cards.jsonl" "$config/fixture-frames.jsonl.next"
+    mv "$config/fixture-frames.jsonl.next" "$config/fixture-frames.jsonl"
+    evidence cli project open "$fixture/project" >/dev/null
+    spawn_scene claude haiku 'Fixture: reply to the lead.' \
+        "$fixture/state/reasoning-tool-cards-spawn.json" 'Tool cards'
+    ready=false
+    for _ in $(seq 30); do
+        if rg -q '"uuid":"cards-answer-1"' "$config/projects"; then ready=true; break; fi
+        sleep 1
+    done
+    [ "$ready" = true ] || { printf '%s\n' 'reasoning-row-scene: the tool cards did not finish' >&2; exit 1; }
+    sleep 3
+    scroll_top
+    shot tool-cards-closed
+    # Open the lowest first, so the rows above it stay where they were read.
+    click_row 'sleep 30|Wait for the lead$'
+    click_row 'search docs|search_docs'
+    click_row 'Tried to use'
+    scroll_top
+    shot tool-cards-open
+    scroll_bottom
+    shot tool-cards-open-end
+    printf '%s\n' 'Captured the tool cards closed and open.'
     exit 0
 fi
 

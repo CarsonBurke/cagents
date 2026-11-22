@@ -250,8 +250,25 @@ impl RawTurn {
         };
         let call = &mut self.calls[*index];
         call.finished = true;
-        if let ItemContent::Tool { output, .. } = &mut call.item.content {
-            *output = bounded(&value_text(&payload["output"]));
+        if let ItemContent::Tool {
+            name,
+            output,
+            status,
+            ..
+        } = &mut call.item.content
+        {
+            let text = value_text(&payload["output"]);
+            // Codex's reply to a model that named a tool it doesn't have,
+            // which nothing ran: a failure, said in the reader's words.
+            if ["unsupported call: ", "unsupported custom tool call: "]
+                .iter()
+                .any(|prefix| text.trim().strip_prefix(prefix) == Some(name.as_str()))
+            {
+                *output = crate::chat::protocol::unknown_tool("Codex", name);
+                *status = ToolStatus::Failed;
+            } else {
+                *output = bounded(&text);
+            }
         }
     }
 
@@ -845,6 +862,42 @@ mod tests {
             ),
         ]);
         assert_eq!(tool_summary(&rollout), ["tool exec", "command cargo test"]);
+    }
+
+    #[test]
+    fn a_call_to_a_tool_codex_lacks_fails_and_says_so() {
+        for (call_type, output_type, reply) in [
+            ("function_call", "function_call_output", "unsupported call: cagents"),
+            (
+                "custom_tool_call",
+                "custom_tool_call_output",
+                "unsupported custom tool call: cagents",
+            ),
+        ] {
+            let rollout = lines(&[
+                json!({"type":"response_item","payload":{"type":call_type,"call_id":"invented","name":"cagents","arguments":"{\"command\":\"reply 67218a1b hi\"}"}}),
+                json!({"type":"response_item","payload":{"type":output_type,"call_id":"invented","output":reply}}),
+            ]);
+            let items = parse(rollout.as_bytes());
+            let [item] = items.as_slice() else {
+                panic!("{items:#?}")
+            };
+            let ItemContent::Tool { output, status, .. } = &item.content else {
+                panic!("{item:#?}")
+            };
+            assert_eq!(output, "Codex called a tool that doesn't exist: cagents");
+            assert_eq!(*status, ToolStatus::Failed);
+        }
+        // A tool that exists can say the same words about another one.
+        let rollout = lines(&[
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"real","name":"exec_command","arguments":"{}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"real","output":"unsupported call: cagents"}}),
+        ]);
+        let items = parse(rollout.as_bytes());
+        assert!(matches!(
+            &items[0].content,
+            ItemContent::Tool { output, status: ToolStatus::Succeeded, .. } if output == "unsupported call: cagents"
+        ));
     }
 
     #[test]

@@ -1098,6 +1098,14 @@ turn.
 CAGENTS_EVIDENCE_TASK=$task "$tool/tests/fixtures/reasoning-row-scene.sh" activity
 ```
 
+`tool-cards` replays
+[`tool-cards.jsonl`](../tests/fixtures/reasoning-row-scene/tool-cards.jsonl):
+a call to a tool named `cagents` that Claude Code doesn't have, an MCP call
+whose input has a list and multi-line text, and a `sleep` the harness
+blocked. Both failures come back wrapped in `<tool_use_error>` tags, as
+Claude Code sends them. It captures the turn with the cards closed, then
+open.
+
 `agents` has the lead start a background command and three background
 subagents, one of which finishes before the lead answers, so two subagents
 and the command are still working after the lead has finished. `plan` needs a session started with

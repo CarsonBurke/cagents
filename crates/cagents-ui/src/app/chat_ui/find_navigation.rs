@@ -1345,6 +1345,9 @@ fn contains_checked(
     pattern: &find::Pattern,
     current: &impl Fn() -> bool,
 ) -> Option<bool> {
+    // A tool's input is matched as its detail shows it, which is what a
+    // match is revealed in.
+    let shown_input;
     let mut texts: Vec<&str> = Vec::new();
     match content {
         ItemContent::Text { text, .. } => texts.push(text),
@@ -1365,7 +1368,10 @@ fn contains_checked(
             input,
             output,
             ..
-        } => texts.extend([name.as_str(), input.as_str(), output.as_str()]),
+        } => {
+            shown_input = tool_text::tool_input(input).0;
+            texts.extend([name.as_str(), &shown_input, output.as_str()])
+        }
         ItemContent::Changes { changes, .. } => {
             for change in changes {
                 texts.extend([change.path.as_str(), change.diff.as_str()]);

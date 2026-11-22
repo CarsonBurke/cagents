@@ -20791,10 +20791,9 @@ fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
         output: "done".to_owned(),
         status: chat::ToolStatus::Succeeded,
     };
-    assert_eq!(
-        copy_text(CopyPart::Text, &tool).as_deref(),
-        Some("{}\n\ndone")
-    );
+    // A call made without arguments copies its result alone.
+    assert_eq!(copy_text(CopyPart::Text, &tool).as_deref(), Some("done"));
+    assert_eq!(copy_text(CopyPart::Input, &tool), None);
     assert_eq!(
         copy_text(
             CopyPart::Text,
@@ -22031,7 +22030,7 @@ fn an_excerpted_output_copies_whole_from_its_source() {
     };
     assert_eq!(
         super::step_copy_prefix(&CopyPart::Text, &tool).as_deref(),
-        Some("{\"cmd\":\"ls\"}")
+        Some("ls")
     );
     assert_eq!(super::step_copy_prefix(&CopyPart::Input, &tool), None);
     let request = text_copy::Request::for_test(handle.clone(), excerpted.clone());

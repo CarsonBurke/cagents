@@ -6610,6 +6610,7 @@ fn apply_result(
         (true, Some(status)) => status,
         (true, None) => ToolStatus::Failed,
     };
+    let text = if failed { harness_error(text) } else { text };
     match content {
         ItemContent::Changes { changes, status } if !failed => {
             super::claude_edits::applied(changes, structured);
@@ -6672,6 +6673,27 @@ fn apply_result(
         | ItemContent::Delivery { .. } => {}
     }
 }
+/// A failed call's result without the `<tool_use_error>` tags Claude Code
+/// wraps around an error its harness raised, rather than the tool, such as
+/// a refused input or a blocked command. The tags and the `Error: ` they
+/// often hold are framing for the model; the reader is shown the sentence.
+/// A call to a tool Claude Code doesn't have says so plainly.
+fn harness_error(text: String) -> String {
+    let Some(inner) = text
+        .trim()
+        .strip_prefix("<tool_use_error>")
+        .and_then(|rest| rest.strip_suffix("</tool_use_error>"))
+    else {
+        return text;
+    };
+    let inner = inner.trim();
+    let inner = inner.strip_prefix("Error: ").unwrap_or(inner);
+    match inner.strip_prefix("No such tool available: ") {
+        Some(tool) if !tool.trim().is_empty() => super::unknown_tool("Claude", tool.trim()),
+        _ => inner.to_owned(),
+    }
+}
+
 /// Whether a user message is Claude Code's record that the person stopped
 /// the turn, which it adds as though the person had written it.
 fn stop_record(message: &Value) -> bool {
