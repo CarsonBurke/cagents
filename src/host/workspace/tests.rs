@@ -15,13 +15,35 @@ use crate::{
     workspace_model::views::{Pane, Scope},
 };
 use std::{
-    sync::mpsc,
+    sync::{Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 mod delta_delivery_tests;
 mod removal_tests;
+
+type BusyGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
+// The registry connection invokes this from its actual SQLite busy loop. The
+// test below uses it to distinguish an editor blocked in BEGIN IMMEDIATE from
+// one that merely acquired the Rust writer mutex but has not reached SQLite.
+static TITLE_BUSY_GATE: OnceLock<Mutex<Option<BusyGate>>> = OnceLock::new();
+
+fn title_busy_gate(attempt: i32) -> bool {
+    let gate = TITLE_BUSY_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some((entered, proceed)) = gate
+        && (entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err())
+    {
+        return false;
+    }
+    thread::sleep(Duration::from_millis(1));
+    attempt < 5_000
+}
 
 fn fixture() -> (tempfile::TempDir, SharedHost, Arc<DeliveryQueue>) {
     let directory = tempfile::tempdir().unwrap();
@@ -85,9 +107,193 @@ fn open_project(root: &std::path::Path) -> ModelEdit {
     }
 }
 
+/// A title suggestion has to authenticate against a resident conversation,
+/// rather than trusting a pane's stale serialized launch recipe.
+fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session {
+    use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+
+    struct Quiet;
+    impl Adapter for Quiet {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+
+        fn command(&mut self, _: crate::chat::Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+
+    let recipe = LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: root.to_owned(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let mut spec = ProcessSpec::from(&recipe);
+    spec.transport = TransportSpec::History;
+    let mut initial = Step::default();
+    let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle =
+        crate::chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {})
+            .unwrap();
+    let session = crate::chat::Session {
+        id: TerminalId::new(),
+        proof: Some(host.lock().unwrap().proof().clone()),
+        terminal: None,
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe,
+            session_id: None,
+        },
+    };
+    host.lock().unwrap().chats.insert(
+        session.id,
+        crate::host::chat::Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: session.clone(),
+            handle,
+            source_process: None,
+            subscribers: Default::default(),
+            observations: Default::default(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    session
+}
+
 #[test]
 fn sqlite_writer_contention_keeps_terminal_input_and_inventory_responsive() {
     assert_sqlite_progress(false);
+}
+
+#[test]
+fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
+    let (directory, host, _) = fixture();
+    let session = title_chat(&host, directory.path());
+    let channel = crate::model::ChannelId::new();
+    process_request(
+        &host,
+        1,
+        ClientRequest::ApplyWorkspaceEdit {
+            edit: open_project(directory.path()),
+        },
+    )
+    .unwrap();
+    process_request(
+        &host,
+        1,
+        ClientRequest::ApplyWorkspaceEdit {
+            edit: ModelEdit::CreateChannel {
+                id: channel,
+                repository: directory.path().to_owned(),
+                title: String::new(),
+                title_source: Default::default(),
+            },
+        },
+    )
+    .unwrap();
+    let card = CardId::new();
+    let response = process_request(
+        &host,
+        1,
+        ClientRequest::ApplyWorkspaceEdit {
+            edit: ModelEdit::SeedView {
+                scope: Scope::Channel(channel),
+                panes: vec![Pane {
+                    id: card,
+                    title: "Chat".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.,
+                    scope: Some(directory.path().to_owned()),
+                    kind: CardKind::Chat(session.clone()),
+                }],
+                closed: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let ServerResponse::WorkspaceEdit(receipt) = response.0 else {
+        panic!("seeding the conversation pane must return its delta receipt")
+    };
+    let revision = receipt.effects.views[0]
+        .after
+        .expect("newly seeded view has a revision");
+    let blocker = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let registry = writer(&host).unwrap();
+    let (entered, busy_wait) = mpsc::channel();
+    let (continue_busy_wait, proceed) = mpsc::channel();
+    *TITLE_BUSY_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((entered, proceed));
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_busy_handler_for_test(Some(title_busy_gate))
+        .unwrap();
+    let editor = {
+        let host = host.clone();
+        thread::spawn(move || {
+            process_request(
+                &host,
+                1,
+                ClientRequest::ApplyWorkspaceEdit {
+                    edit: ModelEdit::SuggestConversationTitle {
+                        id: channel,
+                        card,
+                        expected_revision: revision,
+                        title: "A prompt title".into(),
+                        source: crate::model::ChannelTitleSource::Prompt,
+                    },
+                },
+            )
+        })
+    };
+    busy_wait
+        .recv_timeout(Duration::from_secs(5))
+        .expect("title publication did not enter SQLite's BEGIN IMMEDIATE busy wait");
+    let (listed, response) = mpsc::channel();
+    let inspector = {
+        let host = host.clone();
+        thread::spawn(move || {
+            listed
+                .send(process_request(&host, 2, ClientRequest::List))
+                .unwrap();
+        })
+    };
+    let during_contention = response.recv_timeout(Duration::from_secs(1));
+    continue_busy_wait.send(()).unwrap();
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let result = editor.join().unwrap();
+    inspector.join().unwrap();
+    let (reply, _, _) = during_contention
+        .expect("terminal inventory blocked behind a title suggestion's SQLite wait")
+        .unwrap();
+    assert!(matches!(reply, ServerResponse::Listed { .. }));
+    assert!(matches!(
+        result.unwrap().0,
+        ServerResponse::WorkspaceEdit(_)
+    ));
+    host.lock()
+        .unwrap()
+        .chats
+        .remove(&session.id)
+        .unwrap()
+        .handle
+        .close()
+        .unwrap();
 }
 
 #[test]

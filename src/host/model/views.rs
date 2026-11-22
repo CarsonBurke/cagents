@@ -848,13 +848,27 @@ impl Registry {
         terminal_retention::pinned_terminals(&self.db, candidates)
     }
 
+    #[cfg(test)]
     pub(crate) fn title_conversation(
         &self,
         id: crate::model::ChannelId,
         card: crate::model::CardId,
         revision: u64,
     ) -> Result<crate::chat::Session, String> {
-        let view = read(&self.db, &Scope::Channel(id))?;
+        Self::title_conversation_at(&self.db, id, card, revision)
+    }
+
+    /// The chat source a title suggestion is still allowed to name, read from
+    /// the transaction that will commit that suggestion.  Workspace writes use
+    /// this through their independent connection so waiting for SQLite never
+    /// holds the daemon's global host lock.
+    pub(crate) fn title_conversation_at(
+        db: &rusqlite::Connection,
+        id: crate::model::ChannelId,
+        card: crate::model::CardId,
+        revision: u64,
+    ) -> Result<crate::chat::Session, String> {
+        let view = read(db, &Scope::Channel(id))?;
         if view.revision != revision || view.primary_chat() != Some(card) {
             return Err("The channel's primary conversation changed".into());
         }

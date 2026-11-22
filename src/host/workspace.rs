@@ -39,6 +39,17 @@ fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, message, false)
 }
 
+/// A title admission error stays structured until the request handler returns
+/// it to the window, while ordinary SQL failures retain their existing
+/// unavailable-store translation.
+struct TitleAdmission(ProtocolError);
+
+impl From<String> for TitleAdmission {
+    fn from(error: String) -> Self {
+        Self(unavailable(error))
+    }
+}
+
 pub(super) fn writer(host: &SharedHost) -> Result<Arc<Mutex<Registry>>, ProtocolError> {
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -137,15 +148,8 @@ fn edit_then<T>(
     // publication so concurrent layout requests publish in commit order.
     let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
     {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
         state.ensure_view_retention_available(&edit)?;
-        if matches!(&edit, ModelEdit::SuggestConversationTitle { .. }) {
-            // Inference authorizes against current resident chat metadata.
-            // Preserve its original identity/SQL guard; this is not a pane edit.
-            let receipt = state.edit_model_delta(origin, edit)?;
-            drop(state);
-            return Ok((receipt, then(&registry)?));
-        }
     }
     let replay = match &edit {
         ModelEdit::ChangeView { operation, .. } => registry
@@ -157,7 +161,33 @@ fn edit_then<T>(
     if !replay && super::chat::pane_start::requires_edit_check(&edit) {
         super::chat::pane_start::validate_edit(host, &registry, &edit)?;
     }
-    let applied = if matches!(
+    let applied = if let ModelEdit::SuggestConversationTitle {
+        id,
+        card,
+        expected_revision,
+        title,
+        source,
+    } = &edit
+    {
+        // BEGIN IMMEDIATE can wait for another SQLite writer for up to the
+        // registry busy timeout. Enter that wait before borrowing HostState;
+        // terminal delivery consequently stays live even while title inference
+        // is waiting to publish.
+        registry
+            .apply_delta_guarded_with(&edit, |_, sql| {
+                let expected = Registry::title_conversation_at(sql, *id, *card, *expected_revision)
+                    .map_err(TitleAdmission::from)?;
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state
+                    .validate_title_conversation(expected, title, *source)
+                    .map_err(TitleAdmission)?;
+                // Keep resident identity admission through COMMIT. A
+                // conflicting resident edit cannot slip between validation
+                // and the durable title change.
+                Ok(state)
+            })
+            .map_err(|error| error.0)?
+    } else if matches!(
         &edit,
         ModelEdit::ChangeView {
             change: Change::RemoveSource { .. } | Change::UpdateTerminalSource { .. },
