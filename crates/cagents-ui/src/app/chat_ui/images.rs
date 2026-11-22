@@ -742,13 +742,6 @@ fn retire(cached: &mut CachedItem, evicted: bool) {
     cached.image_evicted = evicted;
     cached.image_attempt = cached.image_attempt.wrapping_add(1);
 }
-/// The pane viewer covers the transcript its images came from, and keeps up
-/// with the images that arrive or finish decoding in it. Once the pane shows
-/// another transcript, such as a subagent's, the viewer no longer belongs
-/// there.
-///
-/// It also runs whenever the transcript lets pixels go, so the viewer stops
-/// holding them too.
 impl Runtime {
     /// Opens `gallery` in this pane's viewer. It is what the reader asked
     /// for last, so a draft image still loading from an earlier press on
@@ -759,6 +752,13 @@ impl Runtime {
     }
 }
 
+/// The pane viewer covers the transcript its images came from, and keeps up
+/// with the images that arrive or finish decoding in it. Once the pane shows
+/// another transcript, such as a subagent's, the viewer no longer belongs
+/// there.
+///
+/// It also runs whenever the transcript lets pixels go, so the viewer stops
+/// holding them too.
 pub(super) fn sync_viewer(runtime: &mut Runtime) {
     if let Some(mut gallery) = runtime.image_viewer.take()
         && gallery.transcript == runtime.selected_subagent

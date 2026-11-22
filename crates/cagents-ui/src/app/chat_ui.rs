@@ -16726,6 +16726,9 @@ impl Cagents {
             Action::ComposerUndo(target, redo) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.dismiss_suggestion();
+                    // As with any edit, the reader has moved on from what the
+                    // note said; a step that is refused again says so anew.
+                    runtime.composer_note = None;
                     runtime.undo_composer(redo);
                 }
             }

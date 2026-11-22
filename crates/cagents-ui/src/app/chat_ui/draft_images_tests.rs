@@ -219,6 +219,11 @@ fn undoing_a_removal_at_the_attachment_limit_brings_back_the_image_it_removed() 
         assert_eq!(chat_runtime(&app, card).attachments, images[1..]);
         drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
         assert_eq!(chat_runtime(&app, card).attachments, images);
+        assert_eq!(
+            chat_runtime(&app, card).composer_note,
+            None,
+            "the reader has moved on from the refusal"
+        );
     });
 }
 

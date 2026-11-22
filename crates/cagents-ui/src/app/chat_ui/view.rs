@@ -4101,16 +4101,7 @@ impl Runtime {
         } else {
             design::raised
         };
-        // A saved conversation the update refused takes no message in this
-        // pane until it reopens (#2905): the box would take typing with
-        // nowhere to send it. What it holds stays readable and copyable. A
-        // pane that can start a new conversation in its place, which takes
-        // the message along, and a refused first message stay editable.
-        let read_only = transitioning
-            || (self
-                .start_blocked
-                .is_some_and(|reopen| !reopen.offers_fresh())
-                && !self.is_draft());
+        let read_only = self.composer_read_only(transitioning);
         let editor = crate::ui_controls::field::editor("Message", &self.composer)
             .id(card_control_id(target.card, "chat-composer"))
             .placeholder(placeholder)
@@ -4802,6 +4793,21 @@ impl Runtime {
         )
     }
 
+    /// Whether the draft is fixed: while the provider starts or changes
+    /// session, and in a saved conversation the update refused, which takes
+    /// no message in this pane until it reopens (#2905), so the box would
+    /// take typing with nowhere to send it. What it holds stays readable and
+    /// copyable. A pane that can start a new conversation in its place,
+    /// which takes the message along, and a refused first message stay
+    /// editable.
+    fn composer_read_only(&self, transitioning: bool) -> bool {
+        transitioning
+            || (self
+                .start_blocked
+                .is_some_and(|reopen| !reopen.offers_fresh())
+                && !self.is_draft())
+    }
+
     /// The message's undo, or redo with `redo`, when its history has a step
     /// that way; a chord with none is left to the workspace.
     fn composer_history(&self, target: Target, redo: bool) -> Option<Message> {
@@ -4826,11 +4832,19 @@ impl Runtime {
             } else {
                 attachment.label()
             };
-        // While the provider starts or changes session the draft's
-        // attachments are fixed, for the keyboard as for the ×.
-        let removal = |removal| {
-            (!transitioning).then(|| action(Action::RemoveAttachment(target, index, removal)))
+        // While the draft is fixed, so are its attachments, for the keyboard
+        // as for the ×, and the message's history.
+        let fixed = self.composer_read_only(transitioning);
+        let (undo, redo) = if fixed {
+            (None, None)
+        } else {
+            (
+                self.composer_history(target, false),
+                self.composer_history(target, true),
+            )
         };
+        let removal =
+            |removal| (!fixed).then(|| action(Action::RemoveAttachment(target, index, removal)));
         let remove = removal(Removal::Key);
         let close = attachment_close(removal(Removal::Pointer));
         let id = attachment_tile_id(target.card, index);
@@ -4876,10 +4890,7 @@ impl Runtime {
                     label,
                     remove,
                 )
-                .on_history(
-                    self.composer_history(target, false),
-                    self.composer_history(target, true),
-                )
+                .on_history(undo.clone(), redo.clone())
                 .into(),
             );
         }
@@ -4938,10 +4949,7 @@ impl Runtime {
                 remove,
             )
             .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
-            .on_history(
-                self.composer_history(target, false),
-                self.composer_history(target, true),
-            )
+            .on_history(undo, redo)
             .marked(marked)
             .into(),
         )
