@@ -8873,6 +8873,8 @@ fn markdown_and_plain_text_buffers_wrap_as_prose() {
         ("notes.txt", false, true),
         ("NOTES.TEXT", false, true),
         ("src/main.rs", false, false),
+        ("CMakeLists.txt", false, false),
+        ("Dockerfile.txt", false, false),
         ("Makefile", false, false),
     ] {
         let document = EditorDocument::unlinked(

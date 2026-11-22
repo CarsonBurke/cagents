@@ -1055,9 +1055,10 @@ impl EditorDocument {
     /// [`crate::settings::EditorWrap::prose`] wraps.
     fn is_prose(&self) -> bool {
         self.markdown
-            || self.source.extension().is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("txt") || extension.eq_ignore_ascii_case("text")
-            })
+            || matches!(
+                crate::diff_view::syntax_token(&self.source).as_str(),
+                "txt" | "text"
+            )
     }
 
     fn durability_warning(&self) -> Option<&str> {
