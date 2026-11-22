@@ -28,6 +28,9 @@ use std::{
 // and a busy desktop scheduler.
 mod append;
 
+/// How long the agent's process may miss transcript reads before the reader
+/// shows that it is not responding.
+const UNANSWERED_GRACE: Duration = Duration::from_secs(15);
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
 pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
@@ -3051,6 +3054,8 @@ impl ClientHandle {
             let mut sent_read = SentRead { id: 0, hidings: 0 };
             let mut read_again = false;
             let mut resync = false;
+            // Since when the agent's process has been missing reads.
+            let mut unanswered_since: Option<Instant> = None;
             let failure = loop {
                 let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
                     Ok(Some(value)) => value,
@@ -3179,6 +3184,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
+                        unanswered_since = None;
                         if let Some(update) = update {
                             resync = false;
                             user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
@@ -3199,6 +3205,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
+                        unanswered_since = None;
                         let (base, revision) = publication.capture();
                         let observed_user = update.changes.iter().any(|change| {
                             let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
@@ -3252,7 +3259,14 @@ impl ClientHandle {
                         // the next read asks for everything, so an unchanged
                         // conversation still replaces it.
                         resync = true;
-                        loop {
+                        // A busy agent's process misses a read now and then,
+                        // and the daemon asks for another shortly. Keep
+                        // showing the conversation until it has missed them
+                        // for a while.
+                        let quiet = error.retryable
+                            && super::failure::actor_transport::timed_out(&error.message).is_some()
+                            && unanswered_since.get_or_insert_with(Instant::now).elapsed() < UNANSWERED_GRACE;
+                        if !quiet { loop {
                             let (base, revision) = publication.capture();
                             let mut snapshot = (*base.snapshot).clone();
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
@@ -3271,7 +3285,7 @@ impl ClientHandle {
                             let applied = old.is_some(); drop(old); drop(current);
                             if applied { break; }
                         }
-                        wake(Wake::Changed);
+                        wake(Wake::Changed); }
                     },
                     ServerMessage::HostShuttingDown => break "Chat daemon is shutting down".into(),
                     ServerMessage::Response { .. } => {},

@@ -71,15 +71,11 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(120);
 /// `TIMEOUT`, so a slow helper is not kept from serving state meanwhile.
 const OVERDUE_RETRY: Duration = Duration::from_secs(60);
 /// How long one read for a person looking at the chat may take, including
-/// any retries: the transcript, or the changed files panel. The helper
-/// answers requests one at a time, so on a heavily loaded computer a read can
-/// wait behind other work for several `TIMEOUT`s. Other requests can afford
-/// that bound because their callers poll again; these reads cannot, as the
-/// reader shows a failure in place of what it asked for. It is the startup
-/// handshake's budget, and within the 40 seconds the client waits for a file
-/// page. The daemon answers a connection's requests in order, so this also
-/// bounds how long the chat's other requests wait behind the read.
-const READ_WAIT: Duration = Duration::from_secs(30);
+/// any retries: the transcript, or the changed files panel. The daemon holds
+/// its control gate, and the chat's connection, while it waits, so a read
+/// takes no longer than any other request; a read that misses it is asked
+/// for again instead (see [`PRESENTATION_RETRY`]).
+const READ_WAIT: Duration = TIMEOUT;
 /// How long after a read failed while the helper was alive the reader is
 /// asked to read again, so a failure clears once the helper answers.
 const PRESENTATION_RETRY: Duration = Duration::from_secs(3);

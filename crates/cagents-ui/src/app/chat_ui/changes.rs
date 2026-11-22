@@ -7,7 +7,7 @@ use crate::chat::{FileChangeKey, FileChangeSource, FilePatchCursor};
 // must therefore belong to this process, rather than restart with each State.
 static NEXT_REVIEW_REQUEST: AtomicU64 = AtomicU64::new(1);
 /// Shown when the agent's process was too busy to answer a query in time.
-const UNANSWERED: &str = "The agent was too busy to answer. Refresh to try again.";
+const UNANSWERED: &str = "The agent was too busy to answer. Refresh again in a moment.";
 
 #[derive(Default)]
 pub(super) struct State {

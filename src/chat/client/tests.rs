@@ -3820,6 +3820,18 @@ fn a_read_refused_after_a_hide_the_chat_has_undone_is_made_again() {
 /// so the error clears even when nothing in the conversation changed.
 #[test]
 fn a_failed_read_clears_on_the_next_read_although_nothing_changed() {
+    read_fails_once(false);
+}
+
+/// A read the busy agent's process missed, and that the daemon will ask for
+/// again, leaves the conversation showing until it has missed reads for a
+/// while; the next read still asks for everything.
+#[test]
+fn a_read_the_busy_agent_missed_once_is_not_shown_as_a_failure() {
+    read_fails_once(true);
+}
+
+fn read_fails_once(retryable: bool) {
     use super::super::{Item, ItemContent, Role};
     use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
     let failed = format!(
@@ -3956,11 +3968,13 @@ fn a_failed_read_clears_on_the_next_read_although_nothing_changed() {
             ServerMessage::Error(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
                 reported,
-                true,
+                retryable,
             )),
         );
         // The helper answers again and its owner asks for another read.
-        advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if !retryable {
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         respond(
             &mut codec,
             &mut server,
@@ -4008,17 +4022,19 @@ fn a_failed_read_clears_on_the_next_read_although_nothing_changed() {
     .unwrap();
     handle.set_interest(true, true).unwrap();
     let shown = |handle: &ClientHandle| handle.resident_snapshot_with_clock().map(|(s, _)| s);
-    while shown(&handle).is_none_or(|snapshot| snapshot.error.is_none()) {
-        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    if !retryable {
+        while shown(&handle).is_none_or(|snapshot| snapshot.error.is_none()) {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let missed = shown(&handle).unwrap();
+        assert_eq!(missed.error.as_deref(), Some(failed.as_str()));
+        assert!(!missed.ready);
+        assert_eq!(
+            missed.items[0].content, answer.content,
+            "the transcript is kept"
+        );
+        advance_tx.send(()).unwrap();
     }
-    let missed = shown(&handle).unwrap();
-    assert_eq!(missed.error.as_deref(), Some(failed.as_str()));
-    assert!(!missed.ready);
-    assert_eq!(
-        missed.items[0].content, answer.content,
-        "the transcript is kept"
-    );
-    advance_tx.send(()).unwrap();
     stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     while shown(&handle).is_some_and(|snapshot| snapshot.error.is_some()) {
         wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();

@@ -366,9 +366,9 @@ impl<'a> Failure<'a> {
                 } else {
                     format!("{program} stopped responding partway through")
                 },
-                // The actor is still running: nothing was lost, and the
-                // request it missed can simply be made again.
-                "This can happen while the computer is very busy. The conversation is kept, so try again in a moment.",
+                // The actor is still running: nothing was lost, and a read
+                // it missed is asked for again until it answers.
+                "This can happen while the computer is very busy. The conversation is kept, and this clears once it answers.",
             ),
         };
         if let Some(reset) = &reset {
@@ -1408,7 +1408,7 @@ mod tests {
                 let failure = Failure::parse(Provider::Claude, &raw).unwrap();
                 assert_eq!(failure.kind, FailureKind::Unresponsive, "{raw}");
                 assert_eq!(failure.summary, summary, "{raw}");
-                assert!(failure.action.contains("try again"), "{raw}");
+                assert!(failure.action.contains("clears once it answers"), "{raw}");
                 assert!(!failure.summary.contains("Retained"), "{raw}");
                 assert_eq!(failure.details, raw);
                 assert_eq!(super::summary(Provider::Claude, &raw), summary);

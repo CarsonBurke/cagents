@@ -6,10 +6,10 @@ use crate::terminal_ipc::{PreparedResponse, ServerResponse};
 
 impl RemoteActor {
     /// The conversation as the reader should show it. A read changes nothing
-    /// in the helper, so a connection that fails while the helper is alive is
-    /// tried again within [`READ_WAIT`]. A read that still fails while
-    /// the helper is alive asks the reader to read again shortly, so its
-    /// failure clears once the helper answers.
+    /// in the helper, so a connection the live helper breaks off is tried
+    /// again within [`READ_WAIT`]. A read the live helper does not answer in
+    /// time asks the reader to read again shortly, so its failure clears once
+    /// the helper answers.
     pub(in crate::chat::runtime) fn presentation_wire(
         &self,
         id: crate::model::TerminalId,
@@ -23,19 +23,20 @@ impl RemoteActor {
         after: Option<u64>,
         deadline: Instant,
     ) -> Result<PreparedResponse, ReadFailure> {
-        self.read_by("presentation", deadline, |deadline| {
+        let read = self.read_by("presentation", deadline, |deadline| {
             self.presentation_until(id, after, deadline)
-        })
-        .inspect_err(|failure| {
-            if failure.transient {
-                self.reread_after(PRESENTATION_RETRY);
-            }
-        })
+        });
+        match &read {
+            Ok(_) => *self.0.reread_at.lock().unwrap_or_else(|p| p.into_inner()) = None,
+            Err(failure) if failure.transient => self.reread_after(PRESENTATION_RETRY),
+            Err(_) => {}
+        }
+        read
     }
     /// The changed files the panel asked for, from the helper's cached edit
     /// metadata. Like the transcript, the query changes nothing in the
-    /// helper, so it is tried again within [`READ_WAIT`] while the helper is
-    /// alive; the panel shows a failure that outlasts that.
+    /// helper, so a connection the live helper breaks off is tried again
+    /// within [`READ_WAIT`]; the panel shows a failure that outlasts that.
     pub(in crate::chat::runtime) fn file_query(
         &self,
         command: &crate::chat::Command,
@@ -53,7 +54,9 @@ impl RemoteActor {
     }
     /// Make a read-only request until it is answered or `deadline` passes.
     /// `attempt` keeps the helper's refusal, which is returned at once, apart
-    /// from a failed exchange, which is tried again while the helper is alive.
+    /// from a failed exchange. An exchange the live helper did not finish is
+    /// tried again and, if it still fails, reported as transient; any other
+    /// failure, such as an answer that does not decode, would only repeat.
     fn read_by<T>(
         &self,
         what: &str,
@@ -66,20 +69,21 @@ impl RemoteActor {
                 Ok(answer) => return answer.map_err(ReadFailure::from),
                 Err(error) => error,
             };
-            let alive =
-                !self.0.stop.load(Ordering::Acquire) && self.0.identity.record.holder.is_current();
-            if alive && deadline.saturating_duration_since(Instant::now()) > pause {
+            let transient = crate::chat::failure::actor_transport::timed_out(&error).is_some()
+                && !self.0.stop.load(Ordering::Acquire)
+                && self.0.identity.record.holder.is_current();
+            if transient && deadline.saturating_duration_since(Instant::now()) > pause {
                 tracing::debug!(%error, what, "a retained read failed; reading again");
                 thread::sleep(pause);
                 pause = pause.saturating_mul(2).min(Duration::from_secs(1));
                 continue;
             }
-            if alive {
-                tracing::warn!(%error, what, "a retained read failed while its helper is alive");
+            if transient {
+                tracing::warn!(%error, what, "the live retained helper did not answer a read");
             }
             return Err(ReadFailure {
                 message: error,
-                transient: alive,
+                transient,
             });
         }
     }
