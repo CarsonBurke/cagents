@@ -1,3 +1,4 @@
+use crate::clear;
 use crate::graphics::{Antialiasing, Shell};
 use crate::primitive;
 use crate::quad;
@@ -12,6 +13,7 @@ pub struct Engine {
     pub(crate) queue: wgpu::Queue,
     pub(crate) format: wgpu::TextureFormat,
 
+    pub(crate) clear_pipeline: clear::Pipeline,
     pub(crate) quad_pipeline: quad::Pipeline,
     pub(crate) text_pipeline: text::Pipeline,
     pub(crate) triangle_pipeline: triangle::Pipeline,
@@ -33,6 +35,7 @@ impl Engine {
         Self {
             format,
 
+            clear_pipeline: clear::Pipeline::new(&device, format),
             quad_pipeline: quad::Pipeline::new(&device, format),
             text_pipeline: text::Pipeline::new(&device, &queue, format),
             triangle_pipeline: triangle::Pipeline::new(

@@ -64,3 +64,16 @@ x11rb = { version = "0.13.1", features = [
 
 [build-dependencies]
 build_helpers = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+
+# The standalone tests build against the same patched renderer crates as the
+# application; see README.cagents.md.
+[patch."https://github.com/pop-os/libcosmic.git"]
+iced_core = { path = "../iced-core" }
+iced_graphics = { path = "../iced-graphics" }
+
+[patch."https://github.com/iced-rs/cryoglyph.git"]
+cryoglyph = { path = "../cryoglyph" }
+
+[patch.crates-io]
+cosmic-text = { path = "../cosmic-text" }
+harfrust = { path = "../harfrust" }

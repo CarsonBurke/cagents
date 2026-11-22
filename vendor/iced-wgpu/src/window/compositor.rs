@@ -20,6 +20,7 @@ pub struct Compositor {
     adapter: wgpu::Adapter,
     format: wgpu::TextureFormat,
     alpha_mode: wgpu::CompositeAlphaMode,
+    surface_usage: wgpu::TextureUsages,
     engine: Engine,
     settings: Settings,
 }
@@ -201,7 +202,7 @@ impl Compositor {
         };
         log::info!("Selected: {:#?}", adapter.get_info());
 
-        let (format, alpha_mode) = compatible_surface
+        let (format, alpha_mode, surface_usage) = compatible_surface
             .as_ref()
             .and_then(|surface: &wgpu::Surface<'_>| {
                 let capabilities = surface.get_capabilities(&adapter);
@@ -248,7 +249,12 @@ impl Compositor {
                     wgpu::CompositeAlphaMode::Auto
                 };
 
-                format.zip(Some(preferred_alpha))
+                // Copying a retained frame to the surface image needs
+                // COPY_DST, which not every surface offers.
+                let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | (capabilities.usages & wgpu::TextureUsages::COPY_DST);
+
+                format.map(|format| (format, preferred_alpha, usage))
             })
             .ok_or(Error::IncompatibleSurface)?;
 
@@ -311,6 +317,7 @@ impl Compositor {
                         adapter,
                         format,
                         alpha_mode,
+                        surface_usage,
                         engine,
                         settings,
                     });
@@ -354,16 +361,31 @@ pub fn present(
 
             let suboptimal = frame.suboptimal;
 
-            let view = &frame
+            // A surface that can be copied to gets frames drawn to a texture
+            // the renderer keeps, so a frame that only turns a spinner
+            // redraws the spinner and copies the rest.
+            let _submission = if frame
                 .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+                .usage()
+                .contains(wgpu::TextureUsages::COPY_DST)
+            {
+                renderer.present_retained(
+                    Some(background_color),
+                    &frame.texture,
+                    viewport,
+                )
+            } else {
+                let view = &frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
 
-            let _submission = renderer.present(
-                Some(background_color),
-                frame.texture.format(),
-                view,
-                viewport,
-            );
+                renderer.present(
+                    Some(background_color),
+                    frame.texture.format(),
+                    view,
+                    viewport,
+                )
+            };
 
             // Present the frame
             on_pre_present();
@@ -461,7 +483,7 @@ impl graphics::Compositor for Compositor {
         surface.configure(
             &self.engine.device,
             &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                usage: self.surface_usage,
                 format: self.format,
                 present_mode: self.settings.present_mode,
                 width,

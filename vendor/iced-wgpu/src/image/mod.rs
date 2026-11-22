@@ -32,6 +32,39 @@ pub fn is_animated(image: &Image) -> bool {
     }
 }
 
+/// The region a frame that only turns spinning drawings may change for
+/// `image`, in logical pixels, when its layer is prepared again.
+///
+/// A spinning drawing turns about its center, so it stays within the square
+/// around the circle through its corners. A raster image may have finished
+/// loading since the frame before, so its whole bounds may change. Any other
+/// vector drawing is rasterized as soon as it is prepared, so it looks as it
+/// did.
+pub fn damage(image: &Image) -> Option<Rectangle> {
+    match image {
+        Image::Vector {
+            svg,
+            bounds,
+            clip_bounds,
+        } if svg.spin.is_some() => {
+            let side = bounds.width.hypot(bounds.height);
+            let center = bounds.center();
+
+            Rectangle {
+                x: center.x - side / 2.0,
+                y: center.y - side / 2.0,
+                width: side,
+                height: side,
+            }
+            .intersection(clip_bounds)
+        }
+        Image::Raster { clip_bounds, .. } => {
+            image.bounds().intersection(clip_bounds)
+        }
+        Image::Vector { .. } => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     raw: wgpu::RenderPipeline,
@@ -853,8 +886,67 @@ fn add_instance(
 
 #[cfg(all(test, feature = "svg"))]
 mod tests {
-    use super::pixel_aligned;
-    use crate::core::{Rectangle, Size};
+    use super::{damage, pixel_aligned};
+    use crate::core::svg::{Handle, Spin, Svg};
+    use crate::core::time::{Duration, Instant};
+    use crate::core::{Radians, Rectangle, Size};
+    use crate::graphics::Image;
+
+    const WINDOW: Rectangle = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 800.0,
+        height: 600.0,
+    };
+
+    fn vector(svg: Svg, bounds: Rectangle, clip_bounds: Rectangle) -> Image {
+        Image::Vector {
+            svg,
+            bounds,
+            clip_bounds,
+        }
+    }
+
+    #[test]
+    fn a_spinning_vector_turns_within_its_damage() {
+        let bounds = Rectangle::new((40.0, 30.0).into(), Size::new(20.0, 8.0));
+        let svg = Svg::new(Handle::from_memory(&b"<svg/>"[..])).spin(Spin {
+            since: Instant::now(),
+            period: Duration::from_secs(1),
+        });
+
+        let region = damage(&vector(svg.clone(), bounds, WINDOW))
+            .expect("a spinning vector is damaged");
+
+        for step in 0..24 {
+            let turned = bounds
+                .rotate(Radians(step as f32 * std::f32::consts::TAU / 24.0));
+
+            assert!(
+                turned.x >= region.x
+                    && turned.y >= region.y
+                    && turned.x + turned.width
+                        <= region.x + region.width + 1e-4
+                    && turned.y + turned.height
+                        <= region.y + region.height + 1e-4,
+                "{step}: {turned:?} leaves {region:?}"
+            );
+        }
+
+        // Only what its clip shows can change.
+        let clip = Rectangle::new((0.0, 0.0).into(), Size::new(45.0, 100.0));
+        let clipped = damage(&vector(svg, bounds, clip)).unwrap();
+        assert_eq!(clipped.x + clipped.width, 45.0);
+    }
+
+    #[test]
+    fn a_still_vector_is_not_damaged() {
+        let bounds = Rectangle::new((0.0, 0.0).into(), Size::new(16.0, 16.0));
+        let svg = Svg::new(Handle::from_memory(&b"<svg/>"[..]))
+            .rotation(Radians(1.0));
+
+        assert_eq!(damage(&vector(svg, bounds, WINDOW)), None);
+    }
 
     #[test]
     fn an_upright_vector_covers_exactly_its_raster() {

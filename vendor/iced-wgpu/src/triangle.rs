@@ -496,6 +496,9 @@ impl Layer {
                         num_gradients += 1;
                     }
                 }
+                // Its indices stay in the buffer too: skip them, or every
+                // later mesh draws with another mesh's indices.
+                index_offset += mesh.indices().len();
                 continue;
             };
 

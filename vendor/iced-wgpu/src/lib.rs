@@ -33,6 +33,7 @@ pub mod window;
 pub mod geometry;
 
 mod buffer;
+mod clear;
 mod color;
 mod engine;
 mod quad;
@@ -101,7 +102,73 @@ pub struct Renderer {
     /// What the layers were last prepared for. Presenting them again,
     /// unchanged, for the same target prepares only what changes with time.
     prepared: Option<Prepared>,
+
+    /// The window's last frame, when its surface can be copied to. A frame
+    /// that only changes with time redraws just the regions that change and
+    /// copies the rest from here.
+    retained: Option<Retained>,
+    clear: clear::State,
 }
+
+/// A copy of the last frame presented, drawn first and then copied to the
+/// surface image.
+struct Retained {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// What the frame the texture holds was drawn from, and the color it
+    /// was cleared to, if it holds one.
+    drawn: Option<(Prepared, Option<Color>)>,
+}
+
+impl Retained {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        size: Size<u32>,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iced_wgpu.retained_frame"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Self {
+            texture,
+            view,
+            drawn: None,
+        }
+    }
+
+    fn size(&self) -> Size<u32> {
+        Size::new(self.texture.width(), self.texture.height())
+    }
+}
+
+/// What a render pass starts from.
+#[derive(Debug, Clone, Copy)]
+enum Load {
+    /// The whole target: cleared to the color, or kept.
+    Whole(Option<Color>),
+    /// Only this region of the target, in physical pixels, cleared to the
+    /// renderer's clear color; the rest keeps the last frame.
+    Region(Rectangle),
+}
+
+/// The share of the window above which a frame redraws everything rather
+/// than its damaged regions, which would then cost about as much.
+const MAX_DAMAGE_SHARE: f32 = 0.5;
 
 /// The target a layer stack was prepared for.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,16 +215,22 @@ impl Renderer {
             ),
 
             prepared: None,
+            retained: None,
+            clear: clear::State::new(&engine.device, &engine.clear_pipeline),
 
             engine,
         }
     }
 
+    /// Draws the layers to `target`. `retained` is what the frame `target`
+    /// already holds was drawn from, if anything; when that is what the
+    /// layers are prepared for now, only what changes with time is drawn.
     fn draw(
         &mut self,
         clear_color: Option<Color>,
         target: &wgpu::TextureView,
         viewport: &Viewport,
+        retained: Option<(Prepared, Option<Color>)>,
     ) -> wgpu::CommandEncoder {
         let mut encoder = self.engine.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor {
@@ -185,7 +258,40 @@ impl Renderer {
         if self.prepared == Some(prepared) {
             self.prepare_animations(&mut encoder, viewport, now);
             graphics::present::lap(graphics::present::Stage::Prepare);
-            self.render(&mut encoder, target, clear_color, viewport);
+
+            // The target holds the last frame of these same layers, so only
+            // what changes with time needs drawing again. Clearing a region
+            // takes the clear color; without one, the frame is drawn whole.
+            let damage = match clear_color {
+                Some(color) if retained == Some((prepared, clear_color)) => {
+                    self.damage(viewport).inspect(|_| {
+                        self.clear.prepare(&self.engine.queue, color)
+                    })
+                }
+                _ => None,
+            };
+
+            let layers = match damage {
+                Some(regions) => regions
+                    .into_iter()
+                    .map(|region| {
+                        self.render(
+                            &mut encoder,
+                            target,
+                            Load::Region(region),
+                            viewport,
+                        )
+                    })
+                    .sum(),
+                None => self.render(
+                    &mut encoder,
+                    target,
+                    Load::Whole(clear_color),
+                    viewport,
+                ),
+            };
+
+            graphics::present::layers(layers);
             graphics::present::lap(graphics::present::Stage::Render);
 
             return encoder;
@@ -194,7 +300,13 @@ impl Renderer {
         self.layers.merge();
         self.prepare(&mut encoder, viewport, now);
         graphics::present::lap(graphics::present::Stage::Prepare);
-        self.render(&mut encoder, target, clear_color, viewport);
+        let layers = self.render(
+            &mut encoder,
+            target,
+            Load::Whole(clear_color),
+            viewport,
+        );
+        graphics::present::layers(layers);
         graphics::present::lap(graphics::present::Stage::Render);
 
         self.quad.trim();
@@ -228,8 +340,72 @@ impl Renderer {
         frame: &wgpu::TextureView,
         viewport: &Viewport,
     ) -> wgpu::SubmissionIndex {
-        let encoder = self.draw(clear_color, frame, viewport);
+        let encoder = self.draw(clear_color, frame, viewport, None);
 
+        self.submit(encoder)
+    }
+
+    /// Presents to a surface image that can be copied to. While the layers
+    /// hold something that turns, such as a spinner, the frame is drawn to
+    /// a texture this renderer keeps and then copied to `frame`, so that a
+    /// following frame that only turns it redraws just the regions that
+    /// change. Otherwise the frame is drawn to `frame` directly.
+    pub fn present_retained(
+        &mut self,
+        clear_color: Option<Color>,
+        frame: &wgpu::Texture,
+        viewport: &Viewport,
+    ) -> wgpu::SubmissionIndex {
+        #[cfg(any(feature = "svg", feature = "image"))]
+        let animated = self
+            .layers
+            .iter()
+            .any(|layer| layer.images.iter().any(image::is_animated));
+
+        #[cfg(not(any(feature = "svg", feature = "image")))]
+        let animated = false;
+
+        if !animated {
+            // No following frame can redraw only part of this one, so the
+            // copy would be wasted, and so would the memory it is kept in.
+            self.retained = None;
+
+            let view =
+                frame.create_view(&wgpu::TextureViewDescriptor::default());
+
+            return self.present(clear_color, frame.format(), &view, viewport);
+        }
+
+        let size = viewport.physical_size();
+
+        let retained = match self.retained.take() {
+            Some(retained) if retained.size() == size => retained,
+            _ => Retained::new(&self.engine.device, self.engine.format, size),
+        };
+
+        let mut encoder =
+            self.draw(clear_color, &retained.view, viewport, retained.drawn);
+        let drawn = self.prepared.map(|prepared| (prepared, clear_color));
+
+        encoder.copy_texture_to_texture(
+            retained.texture.as_image_copy(),
+            frame.as_image_copy(),
+            wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.retained = Some(Retained { drawn, ..retained });
+
+        self.submit(encoder)
+    }
+
+    fn submit(
+        &mut self,
+        encoder: wgpu::CommandEncoder,
+    ) -> wgpu::SubmissionIndex {
         self.staging_belt.finish();
         let commands = encoder.finish();
         graphics::present::lap(graphics::present::Stage::Finish);
@@ -298,7 +474,8 @@ impl Renderer {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.draw(Some(background_color), &view, viewport);
+        let mut encoder =
+            self.draw(Some(background_color), &view, viewport, None);
 
         let texture = crate::color::convert(
             &self.engine.device,
@@ -555,16 +732,67 @@ impl Renderer {
         }
     }
 
+    /// The regions, in physical pixels, that change with time when these
+    /// layers are presented again: turning drawings, and custom primitives,
+    /// which are prepared again for every frame. `None` when they cover so
+    /// much of the window that drawing it whole costs about the same.
+    fn damage(&self, viewport: &Viewport) -> Option<Vec<Rectangle>> {
+        let scale_factor = viewport.scale_factor() as f32;
+        let window = Rectangle::<f32>::from(Rectangle::with_size(
+            viewport.physical_size(),
+        ));
+
+        let mut damage = Vec::new();
+
+        for layer in self.layers.iter() {
+            let Some(clip) =
+                window.intersection(&(layer.bounds * scale_factor))
+            else {
+                continue;
+            };
+
+            // A layer with a turning drawing has all its images prepared
+            // again (`prepare_animations`), so a raster image that finished
+            // loading since the last frame appears in it now.
+            #[cfg(any(feature = "svg", feature = "image"))]
+            if layer.images.iter().any(image::is_animated) {
+                // A pixel more for the edges' antialiasing.
+                damage.extend(layer.images.iter().filter_map(|drawing| {
+                    image::damage(drawing)
+                        .map(|region| (region * scale_factor).expand(1.0))
+                        .and_then(|region| region.intersection(&clip))
+                }));
+            }
+
+            damage.extend(layer.primitives.iter().filter_map(|instance| {
+                (instance.bounds * scale_factor).intersection(&clip)
+            }));
+        }
+
+        let damage = graphics::damage::group(damage, window);
+        let area: f32 = damage.iter().map(Rectangle::area).sum();
+
+        (area <= window.area() * MAX_DAMAGE_SHARE).then_some(damage)
+    }
+
+    /// Records the layers into render passes on `frame`, and returns how
+    /// many layers it drew. With [`Load::Region`], it clears that region and
+    /// draws only the layers that reach into it, clipped to it.
     fn render(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &wgpu::TextureView,
-        clear_color: Option<Color>,
+        load: Load,
         viewport: &Viewport,
-    ) {
+    ) -> usize {
         use std::mem::ManuallyDrop;
 
-        graphics::present::layers(self.layers.iter().count());
+        let (clear_color, region) = match load {
+            Load::Whole(clear_color) => (clear_color, None),
+            Load::Region(region) => (None, Some(region)),
+        };
+
+        let mut drawn = 0;
 
         let mut render_pass = ManuallyDrop::new(encoder.begin_render_pass(
             &wgpu::RenderPassDescriptor {
@@ -599,6 +827,17 @@ impl Renderer {
             },
         ));
 
+        if let Some(scissor) = region.and_then(Rectangle::snap) {
+            render_pass.set_scissor_rect(
+                scissor.x,
+                scissor.y,
+                scissor.width,
+                scissor.height,
+            );
+            self.clear
+                .render(&self.engine.clear_pipeline, &mut render_pass);
+        }
+
         let mut quad_layer = 0;
         let mut mesh_layer = 0;
         let mut text_layer = 0;
@@ -620,9 +859,44 @@ impl Renderer {
                 continue;
             };
 
+            // Skipped here, as when it was prepared.
             let Some(scissor_rect) = physical_bounds.snap() else {
                 continue;
             };
+
+            // A layer outside the region keeps what the last frame drew, but
+            // its prepared data still takes its place in each pipeline.
+            let Some((physical_bounds, scissor_rect)) = (match region {
+                Some(region) => physical_bounds
+                    .intersection(&region)
+                    .and_then(|bounds| Some((bounds, bounds.snap()?))),
+                None => Some((physical_bounds, scissor_rect)),
+            }) else {
+                if !layer.quads.is_empty() {
+                    quad_layer += 1;
+                }
+
+                mesh_layer += layer
+                    .triangles
+                    .iter()
+                    .filter(|item| matches!(item, triangle::Item::Group { .. }))
+                    .count();
+
+                #[cfg(any(feature = "svg", feature = "image"))]
+                if !layer.images.is_empty() {
+                    image_layer += 1;
+                }
+
+                text_layer += layer
+                    .text
+                    .iter()
+                    .filter(|item| matches!(item, text::Item::Group { .. }))
+                    .count();
+
+                continue;
+            };
+
+            drawn += 1;
 
             if !layer.quads.is_empty() {
                 let render_span = debug::render(debug::Primitive::Quad);
@@ -813,6 +1087,8 @@ impl Renderer {
                 })
                 .count()
         });
+
+        drawn
     }
 
     fn draw_overlay(

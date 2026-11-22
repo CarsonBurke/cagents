@@ -74,3 +74,25 @@ texture, and `Renderer::render` reports how many layers it draws
 (vendor/iced-graphics/README.cagents.md). Outside a timed
 presentation a lap touches one thread-local cell and nothing else. Remove it with
 the iced-graphics timing.
+
+# Redrawing only what turns (#3689)
+
+A frame that presents the same layers again still recorded every layer, and
+wgpu encodes each recorded pass in `CommandEncoder::finish`, so a spinner's
+frame cost grew with everything else in the window. When the surface offers
+`COPY_DST` and the layers hold a spinning SVG, `Renderer::present_retained`
+draws into a texture the renderer keeps and copies it to the surface image.
+The next frame of the same layers, cleared to the same color, then redraws
+only its damage: around each spinning SVG the square its turn stays within,
+the bounds of the raster images in the same image layer (one may have
+finished loading), and every custom primitive. Each damaged region is
+cleared with a scissored draw and then gets the layers that reach into it,
+clipped to it. Damage over half the window, a new layer stack, a resize or a
+frame with nothing turning draws the whole frame, and with nothing turning
+the frame is drawn straight to the surface image and the texture is
+released.
+
+Skipping a mesh outside the region now advances the index offset as well,
+which the pinned upstream renderer missed. `image::tests` covers the damage
+around a spinning drawing; native present traces with spinners over a long
+transcript cover the rest.
