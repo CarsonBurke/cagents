@@ -456,7 +456,15 @@ pub fn load() -> Result<Ledger, String> {
         .unwrap_or_else(|poison| poison.into_inner());
     #[cfg(any(test, feature = "test-support"))]
     INDEX_READS.with(|reads| reads.set(reads.get() + 1));
-    let ledger = load_at_with_cache(&directory()?, Some(&mut cache))?;
+    // A record changed within the last second may be rewritten in the same
+    // timestamp tick into a reused inode of equal length, which its stamp
+    // could not tell apart. Read such a record again until it settles.
+    let settled_before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MIN, |now| {
+            i64::try_from(now.as_secs()).unwrap_or(i64::MAX) - 1
+        });
+    let ledger = load_at_with_cache(&directory()?, Some((&mut cache, settled_before)))?;
     *display_index()
         .write()
         .unwrap_or_else(|poison| poison.into_inner()) = std::sync::Arc::new(ledger.clone());
@@ -541,7 +549,7 @@ fn read_record_with_cache(
     root: &crate::fs_safety::Root,
     path: &Path,
     snapshots: bool,
-    cache: Option<&mut IndexCache>,
+    cache: Option<(&mut IndexCache, i64)>,
 ) -> Result<Record, String> {
     let mut file = crate::fs_safety::open_beneath(
         root,
@@ -559,7 +567,7 @@ fn read_record_with_cache(
     }
     let stamp = FileStamp::from_metadata(&metadata);
     if !snapshots
-        && let Some(cache) = cache.as_deref()
+        && let Some((cache, _)) = cache.as_ref()
         && let Some(cached) = cache.get(path)
         && cached.stamp == stamp
     {
@@ -590,7 +598,10 @@ fn read_record_with_cache(
     {
         return Err("Stopped update pane record has invalid ownership".into());
     }
-    if !snapshots && let Some(cache) = cache {
+    if !snapshots
+        && let Some((cache, settled_before)) = cache
+        && stamp.mtime.max(stamp.ctime) < settled_before
+    {
         cache.insert(
             path.to_path_buf(),
             CachedRecord {
@@ -609,10 +620,10 @@ fn load_at(directory: &Path) -> Result<Ledger, String> {
 
 fn load_at_with_cache(
     directory: &Path,
-    mut cache: Option<&mut IndexCache>,
+    mut cache: Option<(&mut IndexCache, i64)>,
 ) -> Result<Ledger, String> {
     let Some(root) = open_directory(directory)? else {
-        if let Some(cache) = cache.as_deref_mut() {
+        if let Some((cache, _)) = cache {
             cache.retain(|path, _| path.parent() != Some(directory));
         }
         return Ok(Ledger::default());
@@ -621,11 +632,18 @@ fn load_at_with_cache(
     let mut seen = std::collections::HashSet::new();
     for path in record_paths(directory)? {
         let path = path?;
-        let record = read_record_with_cache(&root, &path, false, cache.as_deref_mut())?;
+        let record = read_record_with_cache(
+            &root,
+            &path,
+            false,
+            cache
+                .as_mut()
+                .map(|(cache, settled_before)| (&mut **cache, *settled_before)),
+        )?;
         seen.insert(path);
         ledger.records.push(record);
     }
-    if let Some(cache) = cache {
+    if let Some((cache, _)) = cache {
         cache.retain(|path, _| path.parent() != Some(directory) || seen.contains(path));
     }
     Ok(ledger)
@@ -1359,25 +1377,33 @@ mod compact_tests {
 
         let mut cache = IndexCache::new();
         let before = INDEX_CACHE_MISSES.with(std::cell::Cell::get);
-        let first = load_at_with_cache(dir.path(), Some(&mut cache)).unwrap();
+        // A record written just now is not settled, so it is read every time.
+        for _ in 0..2 {
+            load_at_with_cache(dir.path(), Some((&mut cache, i64::MIN))).unwrap();
+        }
+        assert!(cache.is_empty());
+        assert_eq!(INDEX_CACHE_MISSES.with(std::cell::Cell::get) - before, 2);
+
+        let before = INDEX_CACHE_MISSES.with(std::cell::Cell::get);
+        let first = load_at_with_cache(dir.path(), Some((&mut cache, i64::MAX))).unwrap();
         assert_eq!(first.records.len(), 1);
         assert_eq!(first.records[0].chats.len(), 1);
         assert_eq!(INDEX_CACHE_MISSES.with(std::cell::Cell::get) - before, 1);
 
-        let second = load_at_with_cache(dir.path(), Some(&mut cache)).unwrap();
+        let second = load_at_with_cache(dir.path(), Some((&mut cache, i64::MAX))).unwrap();
         assert_eq!(second.records.len(), 1);
         assert_eq!(INDEX_CACHE_MISSES.with(std::cell::Cell::get) - before, 1);
 
         let record_ab = Record::new(proof, vec![chat_a, chat_b], vec![]);
         record_ab.write_to(&root).unwrap();
-        let third = load_at_with_cache(dir.path(), Some(&mut cache)).unwrap();
+        let third = load_at_with_cache(dir.path(), Some((&mut cache, i64::MAX))).unwrap();
         assert_eq!(third.records.len(), 1);
         assert_eq!(third.records[0].chats.len(), 2);
         assert_eq!(INDEX_CACHE_MISSES.with(std::cell::Cell::get) - before, 2);
 
         let path = dir.path().join(record_ab.file_name().unwrap());
         std::fs::remove_file(&path).unwrap();
-        let fourth = load_at_with_cache(dir.path(), Some(&mut cache)).unwrap();
+        let fourth = load_at_with_cache(dir.path(), Some((&mut cache, i64::MAX))).unwrap();
         assert!(fourth.records.is_empty());
         assert!(cache.is_empty());
     }
