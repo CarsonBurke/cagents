@@ -1,6 +1,6 @@
 //! A draft's `[Image N]` references and its attachments stay one object
 //! through the composer's real edit, undo, paste and tray paths (#3259).
-use super::tests::{chat_runtime, composer_key_messages, draft_chat, write};
+use super::tests::{chat_runtime, composer_key_messages, draft_chat, task_focuses, write};
 use super::*;
 
 /// A draft chat holding `images` pasted at the end of `prefix`, through the
@@ -128,7 +128,7 @@ fn removing_a_tile_removes_every_reference_to_it_and_undo_restores_both() {
         );
         let full = runtime.composer.text();
 
-        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(!runtime.composer.text().contains(&token(&first)));
         assert!(runtime.composer.text().contains(&token(&second)));
@@ -143,6 +143,34 @@ fn removing_a_tile_removes_every_reference_to_it_and_undo_restores_both() {
 }
 
 #[test]
+fn a_key_keeps_the_keyboard_in_the_tray_and_the_x_returns_it_to_the_message() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|first| {
+        let second = chat::attachment_assets::test_image("second.png");
+        let third = chat::attachment_assets::test_image("third.png");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "Look ", &[first, second, third]);
+        let composer = card_control_id(target.card, "chat-composer");
+
+        // Delete on the first tile moves the keyboard to the one that took
+        // its place, so the next Delete removes that.
+        let task = app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key));
+        let tile = view::attachment_tile_id(target.card, 0);
+        assert_eq!(task_focuses(task, &tile), (true, false));
+
+        // A press of the × leaves the tray to the pointer: the next key
+        // edits the message, and Ctrl+Z there takes the removal back.
+        let task = app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Pointer));
+        assert_eq!(task_focuses(task, &composer), (true, false));
+        assert_eq!(app.chat_runtime_mut(target).unwrap().attachments.len(), 1);
+
+        // Emptying the tray by key returns the keyboard to the message too.
+        let task = app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key));
+        assert_eq!(task_focuses(task, &composer), (true, false));
+    });
+}
+
+#[test]
 fn a_file_tile_goes_without_touching_the_text() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = draft_chat(&mut app);
@@ -150,7 +178,7 @@ fn a_file_tile_goes_without_touching_the_text() {
     write(&mut app, card, "Read this");
     let runtime = app.chat_runtime_mut(target).unwrap();
     runtime.attach([PathBuf::from("/project/notes.pdf")]);
-    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
     let runtime = chat_runtime(&app, card);
     assert!(runtime.attachments.is_empty());
     assert_eq!(runtime.composer.text(), "Read this");

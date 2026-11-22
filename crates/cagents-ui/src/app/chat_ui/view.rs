@@ -4814,8 +4814,11 @@ impl Runtime {
             };
         // While the provider starts or changes session the draft's
         // attachments are fixed, for the keyboard as for the ×.
-        let remove = (!transitioning).then(|| action(Action::RemoveAttachment(target, index)));
-        let close = attachment_close(remove.clone());
+        let removal = |removal| {
+            (!transitioning).then(|| action(Action::RemoveAttachment(target, index, removal)))
+        };
+        let remove = removal(Removal::Key);
+        let close = attachment_close(removal(Removal::Pointer));
         let id = attachment_tile_id(target.card, index);
         // The file's own name, which the tile's short label leaves out, as
         // the attachment rows showed it.

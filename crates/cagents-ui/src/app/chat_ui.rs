@@ -280,6 +280,32 @@ pub enum ReturnRefused {
     Unconfirmed(String),
 }
 
+/// Why an image a draft's text names could not join a chat already at its
+/// provider's attachment limit.
+const ATTACHMENT_LIMIT_REACHED: &str = "this chat has reached its attachment limit.";
+
+/// The composer note for images whose references stay as text because
+/// they could not be attached, or `None` when every one was.
+fn not_attached(labels: Vec<String>, why: &str) -> Option<String> {
+    (!labels.is_empty()).then(|| {
+        format!(
+            "{} {} not attached: {why}",
+            labels.join(", "),
+            if labels.len() == 1 { "was" } else { "were" },
+        )
+    })
+}
+
+/// How a tile's removal was asked for, which decides where the keyboard
+/// goes after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// Delete or Backspace on the focused tile.
+    Key,
+    /// A press of the tile's ×.
+    Pointer,
+}
+
 #[derive(Clone)]
 pub enum Action {
     PreparationAvailable,
@@ -578,7 +604,7 @@ pub enum Action {
     ),
     /// Files or text dropped on the conversation.
     Dropped(Target, file_drop::Payload),
-    RemoveAttachment(Target, usize),
+    RemoveAttachment(Target, usize, Removal),
     /// Undo in the composer, or redo when `true`.
     ComposerUndo(Target, bool),
     /// The composer's selection is about to be copied or cut.
@@ -1150,7 +1176,7 @@ impl Action {
             | Self::Attach(target)
             | Self::Paste(target)
             | Self::Dropped(target, _)
-            | Self::RemoveAttachment(target, _)
+            | Self::RemoveAttachment(target, ..)
             | Self::ComposerUndo(target, _)
             | Self::TakeBackQueued(target, _)
             | Self::RemoveQueued(target, _)
@@ -3846,6 +3872,7 @@ impl Runtime {
     /// insertions follow it, and the images whose references it touched
     /// follow the text.
     fn composer_action(&mut self, action: text_editor::Action) {
+        let scrolled = matches!(action, text_editor::Action::Scroll { .. });
         match action {
             text_editor::Action::Edit(edit) => {
                 // An edit takes an image's reference whole or not at all.
@@ -3892,7 +3919,7 @@ impl Runtime {
             }
             other => {
                 // A step ends where the caret leaves it.
-                if !matches!(other, text_editor::Action::Scroll { .. }) {
+                if !scrolled {
                     self.composer_undo.seal();
                 }
                 let toward = match &other {
@@ -3918,7 +3945,10 @@ impl Runtime {
         }
         self.cancel_invalid_attachment_jobs();
         self.settle_restored_notice();
-        self.follow_caret_reference();
+        // Scrolling leaves the caret where it was.
+        if !scrolled {
+            self.follow_caret_reference();
+        }
     }
 
     /// The tokens of the draft's images, which the caret and selection keep
@@ -3971,38 +4001,40 @@ impl Runtime {
         } else {
             0
         };
-        let unattached = |images: &[Attachment], why: &str| {
-            let labels: Vec<String> = images.iter().map(Attachment::label).collect();
-            (!labels.is_empty()).then(|| {
-                format!(
-                    "{} {} not attached: {why}",
-                    labels.join(", "),
-                    if labels.len() == 1 { "was" } else { "were" },
-                )
-            })
-        };
+        let labels = |images: &[Attachment]| images.iter().map(Attachment::label).collect();
         let over = fits.get(room..).unwrap_or_default();
-        let note = unattached(
-            over,
-            if self.accepts_draft_attachments() {
-                "this chat has reached its attachment limit."
-            } else {
-                "the current model cannot accept images."
-            },
-        )
-        .or_else(|| unattached(&too_large, "too large for this chat's provider."));
-        if note.is_some() {
-            self.composer_note = note;
+        let notes: Vec<String> = [
+            not_attached(
+                labels(over),
+                if self.accepts_draft_attachments() {
+                    ATTACHMENT_LIMIT_REACHED
+                } else {
+                    "the current model cannot accept images."
+                },
+            ),
+            not_attached(labels(&too_large), "too large for this chat's provider."),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !notes.is_empty() {
+            self.composer_note = Some(notes.join(" "));
         }
         self.merge_attachments(fits.into_iter().take(room));
         self.follow_caret_reference();
     }
 
-    /// Which of the draft's images its references hold, before an edit that
-    /// may take one out; `None` when no edit can move an image.
+    /// Which of the draft's images, held or detached, its references name,
+    /// before an edit that may take one out or bring one back; `None` when
+    /// no edit can move an image.
     fn inline_references(&self) -> Option<HashSet<uuid::Uuid>> {
-        draft_images::tracked(&self.attachments, &self.detached_attachments)
-            .then(|| draft_images::inline(&self.composer.text(), &self.attachments))
+        draft_images::tracked(&self.attachments, &self.detached_attachments).then(|| {
+            draft_images::named(
+                &self.composer.text(),
+                &self.attachments,
+                &self.detached_attachments,
+            )
+        })
     }
 
     /// Brings the attachments in line with the text after an edit; `inline`
@@ -4011,12 +4043,24 @@ impl Runtime {
         let Some(inline) = inline else {
             return;
         };
-        if draft_images::reconcile(
+        // An image a reference brings back counts toward the provider's
+        // limit as a new one would, with the pastes still being saved.
+        let capacity = chat::AttachmentRules::for_provider(self.session.launch.provider)
+            .max_count
+            .map_or(usize::MAX, |limit| {
+                limit.saturating_sub(self.image_pastes_saving)
+            });
+        let reconciled = draft_images::reconcile(
             &self.composer.text(),
             &inline,
             &mut self.attachments,
             &mut self.detached_attachments,
-        ) {
+            capacity,
+        );
+        if let Some(note) = not_attached(reconciled.refused, ATTACHMENT_LIMIT_REACHED) {
+            self.composer_note = Some(note);
+        }
+        if reconciled.changed {
             self.thumbnails.sync(&self.attachments);
             self.revision = self.revision.wrapping_add(1);
         }
@@ -5533,10 +5577,13 @@ impl Runtime {
         };
         let before = self.composer.cursor();
         let inline = self.inline_references();
-        self.composer.move_to(text_editor::Cursor {
-            position: at,
-            selection: None,
-        });
+        attachment_draft::move_to(
+            &mut self.composer,
+            text_editor::Cursor {
+                position: at,
+                selection: None,
+            },
+        );
         let edited = attachment_draft::edit(
             &mut self.composer,
             text_editor::Edit::Paste(Arc::new(named.clone())),
@@ -16631,18 +16678,22 @@ impl Cagents {
                     cosmic::task::message(Message::FocusCard(target.card)),
                 ]);
             }
-            Action::RemoveAttachment(target, index) => {
+            Action::RemoveAttachment(target, index, removal) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 if !runtime.remove_attachment(index) {
                     return Task::none();
                 }
-                // The keyboard stays in the tray, on the tile that took the
-                // removed one's place, or goes back to the message.
-                let id = match runtime.attachments.len() {
-                    0 => card_control_id(target.card, "chat-composer"),
-                    len => view::attachment_tile_id(target.card, index.min(len - 1)),
+                // A key pressed in the tray keeps the keyboard there, on the
+                // tile that took the removed one's place. The × returns it to
+                // the message, where the next key edits text and Ctrl+Z can
+                // take the removal back; so does a tray left empty.
+                let id = match (removal, runtime.attachments.len()) {
+                    (Removal::Key, len) if len > 0 => {
+                        view::attachment_tile_id(target.card, index.min(len - 1))
+                    }
+                    _ => card_control_id(target.card, "chat-composer"),
                 };
                 return iced::widget::operation::focus(id).map(cosmic::Action::App);
             }

@@ -253,14 +253,32 @@ impl Copied {
 }
 
 /// The ids of `attachments` whose reference `text` holds.
-pub(super) fn inline(text: &str, attachments: &[Attachment]) -> HashSet<uuid::Uuid> {
+pub(super) fn inline<'a>(
+    text: &str,
+    attachments: impl IntoIterator<Item = &'a Attachment>,
+) -> HashSet<uuid::Uuid> {
     let present = tokens(text);
     attachments
-        .iter()
+        .into_iter()
         .filter_map(|attachment| attachment.reference.as_ref())
         .filter(|reference| present.contains(reference.token().as_str()))
         .map(|reference| reference.id)
         .collect()
+}
+
+/// The ids of the draft's images, held or `detached`, whose reference
+/// `text` holds.
+pub(super) fn named(
+    text: &str,
+    attachments: &[Attachment],
+    detached: &[Detached],
+) -> HashSet<uuid::Uuid> {
+    inline(
+        text,
+        attachments
+            .iter()
+            .chain(detached.iter().map(|entry| &entry.attachment)),
+    )
 }
 
 /// Whether anything can move between `attachments` and `detached`.
@@ -275,14 +293,18 @@ pub(super) fn tracked(attachments: &[Attachment], detached: &[Detached]) -> bool
 /// reference was in the draft before the edit (`before`) and is not now
 /// leaves; a detached image whose reference is back returns. An image whose
 /// reference was never in the draft, such as an image-only message brought
-/// back from history, stays: no edit removed anything of it. Answers whether
-/// the attachments changed.
+/// back from history, stays: no edit removed anything of it. No image comes
+/// back past `capacity` attachments; one that would waits, detached, while
+/// its reference stays as text, and returns once there is room. `before`
+/// also holds the detached images whose references the text held, so a
+/// waiting image is reported only when its reference first comes back.
 pub(super) fn reconcile(
     text: &str,
     before: &HashSet<uuid::Uuid>,
     attachments: &mut Vec<Attachment>,
     detached: &mut Vec<Detached>,
-) -> bool {
+    capacity: usize,
+) -> Reconciled {
     let present = tokens(text);
     let holds = |attachment: &Attachment| {
         attachment
@@ -317,6 +339,7 @@ pub(super) fn reconcile(
         }
         !back
     });
+    let mut refused = Vec::new();
     for entry in returning.into_iter().rev() {
         let id = entry
             .attachment
@@ -329,13 +352,39 @@ pub(super) fn reconcile(
         {
             continue;
         }
+        if attachments.len() >= capacity {
+            // Only a reference this edit brought back is news; one already
+            // in the text before it was refused, and said so, then.
+            let returned = id.is_some_and(|id| !before.contains(&id));
+            refused.push((entry, returned));
+            continue;
+        }
         attachments.insert(entry.index.min(attachments.len()), entry.attachment);
         changed = true;
     }
+    let refused = refused
+        .into_iter()
+        .rev()
+        .filter_map(|(entry, returned)| {
+            let label = returned.then(|| entry.attachment.label());
+            detached.push(entry);
+            label
+        })
+        .collect();
     if detached.len() > MAX_DETACHED {
         detached.drain(..detached.len() - MAX_DETACHED);
     }
-    changed
+    Reconciled { changed, refused }
+}
+
+/// What [`reconcile`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct Reconciled {
+    /// Whether the attachments changed.
+    pub changed: bool,
+    /// The labels of images whose references this edit brought back while
+    /// the draft was full, in the order they were detached.
+    pub refused: Vec<String>,
 }
 
 /// Forgets detached copies of images the draft holds again by other means.
@@ -457,15 +506,19 @@ mod tests {
             let mut detached = Vec::new();
             let before = inline(&full, &attachments);
             let without = format!("{} {}", token(&first), token(&third));
-            assert!(reconcile(
-                &without,
-                &before,
-                &mut attachments,
-                &mut detached
-            ));
+            assert!(
+                reconcile(
+                    &without,
+                    &before,
+                    &mut attachments,
+                    &mut detached,
+                    usize::MAX
+                )
+                .changed
+            );
             assert_eq!(attachments, [first.clone(), third.clone()]);
             let before = inline(&without, &attachments);
-            assert!(reconcile(&full, &before, &mut attachments, &mut detached));
+            assert!(reconcile(&full, &before, &mut attachments, &mut detached, usize::MAX).changed);
             assert_eq!(ids(&attachments), ids(&all), "same receipts, same labels");
             assert!(detached.is_empty());
         });
@@ -492,21 +545,73 @@ mod tests {
 
             let before = inline(&full, &attachments);
             let typed = format!("{full}and one more sentence");
-            assert!(!reconcile(&typed, &before, &mut attachments, &mut detached));
+            assert!(
+                !reconcile(&typed, &before, &mut attachments, &mut detached, usize::MAX).changed
+            );
             assert_eq!(attachments, all, "an edit elsewhere keeps every image");
 
             let without = draft(Some(4));
-            assert!(reconcile(
-                &without,
-                &before,
-                &mut attachments,
-                &mut detached
-            ));
+            assert!(
+                reconcile(
+                    &without,
+                    &before,
+                    &mut attachments,
+                    &mut detached,
+                    usize::MAX
+                )
+                .changed
+            );
             let mut expected = all.clone();
             let removed = expected.remove(4);
             assert_eq!(attachments, expected);
             assert_eq!(detached.len(), 1);
             assert_eq!(detached[0].attachment, removed);
+        });
+    }
+
+    #[test]
+    fn a_reference_brought_back_to_a_full_draft_waits_for_room() {
+        attachment_assets::with_test_image(|first| {
+            let second = attachment_assets::test_image("second.png");
+            let third = attachment_assets::test_image("third.png");
+            let token = |a: &Attachment| a.reference.as_ref().unwrap().token();
+            let mut attachments = vec![first.clone(), second.clone()];
+            let mut detached = Vec::new();
+            let full = format!("{} {}", token(&first), token(&second));
+            let cut = token(&first);
+            let reconciled =
+                |text: &str, before: &str, attachments: &mut Vec<_>, detached: &mut Vec<_>| {
+                    let before = named(before, attachments, detached);
+                    reconcile(text, &before, attachments, detached, 2)
+                };
+            assert!(reconciled(&cut, &full, &mut attachments, &mut detached).changed);
+            // A third image takes the freed place, at the provider's limit.
+            attachments.push(third.clone());
+
+            // Pasting the reference back leaves it text and says so once.
+            let back = format!("{full} {}", token(&third));
+            let pasted = reconciled(&back, &cut, &mut attachments, &mut detached);
+            assert_eq!(
+                pasted,
+                Reconciled {
+                    changed: false,
+                    refused: vec![second.label()],
+                }
+            );
+            assert_eq!(attachments, [first.clone(), third.clone()]);
+            let typed = format!("{back}.");
+            let later = reconciled(&typed, &back, &mut attachments, &mut detached);
+            assert_eq!(
+                later,
+                Reconciled::default(),
+                "a later edit says nothing new"
+            );
+
+            // Once a place frees up, the waiting image returns.
+            attachments.pop();
+            assert!(reconciled(&typed, &typed, &mut attachments, &mut detached).changed);
+            assert_eq!(attachments, [first.clone(), second.clone()]);
+            assert!(detached.is_empty());
         });
     }
 
@@ -523,10 +628,10 @@ mod tests {
             // One cut takes the first two.
             let before = inline(&full, &attachments);
             let cut = token(&third);
-            assert!(reconcile(&cut, &before, &mut attachments, &mut detached));
+            assert!(reconcile(&cut, &before, &mut attachments, &mut detached, usize::MAX).changed);
             assert_eq!(attachments, [third.clone()]);
             let before = inline(&cut, &attachments);
-            assert!(reconcile(&full, &before, &mut attachments, &mut detached));
+            assert!(reconcile(&full, &before, &mut attachments, &mut detached, usize::MAX).changed);
             assert_eq!(attachments, all);
         });
     }
@@ -550,11 +655,16 @@ mod tests {
                 for image in gone {
                     let before = inline(&text, &attachments);
                     text = text.replacen(&token(image), "", 1);
-                    assert!(reconcile(&text, &before, &mut attachments, &mut detached));
+                    assert!(
+                        reconcile(&text, &before, &mut attachments, &mut detached, usize::MAX)
+                            .changed
+                    );
                 }
                 assert_eq!(attachments.len(), 1);
                 let before = inline(&text, &attachments);
-                assert!(reconcile(&full, &before, &mut attachments, &mut detached));
+                assert!(
+                    reconcile(&full, &before, &mut attachments, &mut detached, usize::MAX).changed
+                );
                 assert_eq!(attachments, all);
                 assert!(detached.is_empty());
             }
@@ -616,12 +726,16 @@ mod tests {
             let mut attachments = vec![image.clone(), Attachment::file("/notes.txt")];
             let mut detached = Vec::new();
             let before = inline("", &attachments);
-            assert!(!reconcile(
-                "typed",
-                &before,
-                &mut attachments,
-                &mut detached
-            ));
+            assert!(
+                !reconcile(
+                    "typed",
+                    &before,
+                    &mut attachments,
+                    &mut detached,
+                    usize::MAX
+                )
+                .changed
+            );
             assert_eq!(attachments.len(), 2);
         });
     }
