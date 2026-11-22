@@ -295,7 +295,10 @@ long_history_turn() {
 # A frame with "_live": true is only emitted, as a subagent's
 # frames are, which Claude records in the subagent's own transcript. A line
 # {"_sleep": SECONDS} pauses while still servicing controls; interruption or
-# input EOF discards the remaining replay. A line
+# input EOF discards the remaining replay. A line {"_await": NAME} pauses the
+# same way until the file fixture-release.NAME exists in the config directory,
+# so a scene can shoot one state before letting the turn go on to the next;
+# after five minutes the replay goes on regardless. A line
 # {"_end": true} ends the turn there: the frames supply its closing result,
 # such as a failed one, and the fixture adds no answer of its own. A line
 # {"_exit": STATUS} ends the provider there, as a crash does, mid-turn and
@@ -325,6 +328,25 @@ frames_turn() {
                 frames_ended=1
                 return
             fi
+            continue
+        fi
+        release=$(printf '%s' "$spec" | jq -r '._await // empty')
+        if [ -n "$release" ]; then
+            if ! [[ $release =~ ^[A-Za-z0-9_-]+$ ]]; then
+                printf '%s\n' "fixture: line $frame_line of $frames_file: _await must name a release in letters, digits, - or _, not $release" >&2
+                exit 2
+            fi
+            awaited_until=$((${EPOCHREALTIME/./} + 300000000))
+            while [ ! -e "$config/fixture-release.$release" ]; do
+                if [ "${EPOCHREALTIME/./}" -ge "$awaited_until" ]; then
+                    printf '%s\n' "fixture: line $frame_line of $frames_file: fixture-release.$release did not appear; going on" >&2
+                    break
+                fi
+                if ! wait_stream_input 250000 cancel; then
+                    frames_ended=1
+                    return
+                fi
+            done
             continue
         fi
         if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then

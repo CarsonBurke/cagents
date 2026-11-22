@@ -2037,6 +2037,7 @@ struct Grouping<'c> {
     presentations: Presentations<'c>,
     provider: Provider,
     failures: &'c [failure::Note],
+    working: bool,
 }
 
 impl<'c> turn::Presented<'c> for Grouping<'c> {
@@ -2049,6 +2050,15 @@ impl<'c> turn::Presented<'c> for Grouping<'c> {
     fn separates(&self, typed: &chat::Item, incoming: &chat::Item) -> bool {
         failure::separates_prompt(self.provider, self.failures, &typed.id, &incoming.id)
     }
+    fn working(&self) -> bool {
+        self.working
+    }
+}
+
+/// Whether the agent is at work on the newest item `snapshot` holds, which a
+/// window that ends before the conversation does is not.
+fn working_on_newest(snapshot: &Snapshot) -> bool {
+    snapshot.busy && !snapshot.has_later
 }
 
 /// Format a recorded message time once when its metadata changes. The
@@ -4659,6 +4669,7 @@ impl Runtime {
                 presentations: Presentations(&self.cache),
                 provider: self.session.launch.provider,
                 failures: &self.failures,
+                working: working_on_newest(snapshot),
             },
         )
     }
@@ -6268,6 +6279,7 @@ impl Runtime {
         }
         self.source_clock = source_clock;
         let turns = (grouping_dirty
+            || working_on_newest(&self.snapshot) != working_on_newest(&snapshot)
             || !turn::same_structure(&self.snapshot.items, &snapshot.items))
         .then(|| self.transcript_turns(&snapshot));
         if let Some(turns) = &turns {
@@ -15217,6 +15229,14 @@ impl Cagents {
                     // remember explicit choices across paging. Ignore stale keys.
                     if let Some(turn) = runtime.turns.iter().find(|turn| turn.key == key) {
                         let open = !runtime.group_open(turn);
+                        // A strip that stands for its only step opens and
+                        // closes that step, as its own row does.
+                        if runtime.strip_stands_for_step(turn)
+                            && let Some(item) = runtime.snapshot.items.get(turn.steps[0].index)
+                        {
+                            let id = item.id.clone();
+                            return self.handle_chat_action(Action::Toggle(target, id));
+                        }
                         runtime.find_disclosure.manual_turn(&key);
                         runtime.opened.edit().insert(key, open);
                     }
