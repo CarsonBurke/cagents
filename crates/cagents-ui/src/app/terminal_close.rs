@@ -959,6 +959,9 @@ impl Cagents {
         if let Some(card) = closed_descriptor
             .filter(|_| !self.proven_gone_cards.remove(&id) && !self.reopen_superseded(id))
         {
+            // A pane closed again, as one a shared view put back is, is
+            // listed once, where it closed last.
+            self.recently_closed.retain(|(closed, _)| closed.id != id);
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
             if self.recently_closed.len() > 32 {

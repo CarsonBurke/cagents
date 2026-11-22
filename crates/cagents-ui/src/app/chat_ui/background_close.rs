@@ -290,12 +290,28 @@ impl Cagents {
         // still runs, which a reopen of the conversation then goes to.
         let mut reopens = closing.reopens;
         reopens.sort_by_key(|card| *card != closing.card);
+        // A closed pane its view fences is never admitted, so never attaches.
+        // When the stop is refused and the conversation was reopened, the
+        // reopen goes back to what still runs, taking what the closed pane
+        // had not sent while it is still out of sight, and the closed pane
+        // goes by identity after.
+        let fenced_gives_way = refused.is_some()
+            && returned
+            && self.shared_views.quarantined.contains(&closing.card)
+            && self.chat_awaiting_admission(closing.card)
+            && reopens
+                .iter()
+                .any(|card| *card != closing.card && self.reopen_awaits_stop(*card));
         for card in reopens {
             // A closed pane kept out of sight goes as it is, or comes back
             // into sight with the conversation it attaches to.
-            let goes = refused.is_none() && card == closing.card && returned;
+            let goes =
+                card == closing.card && ((refused.is_none() && returned) || fenced_gives_way);
             if !goes {
                 tasks.push(self.show_returned_close(card));
+            }
+            if fenced_gives_way && card == closing.card {
+                continue;
             }
             // One its view fences is never admitted, so never attaches: the
             // reopen goes back to what still runs instead.
@@ -362,7 +378,31 @@ impl Cagents {
                 },
             });
         }
+        if fenced_gives_way {
+            tasks.push(self.close_fenced_return(closing.card));
+        }
         Task::batch(tasks)
+    }
+
+    /// Closes by identity the closed pane `card` its view fences, which
+    /// never attaches: in its strip as any fenced pane closes, or from outside
+    /// it, its view hearing of the close as it would from the strip.
+    fn close_fenced_return(&mut self, card: CardId) -> Task<Message> {
+        if self.workspace.order().any(|placed| placed == card) {
+            return self.close_fenced_card(card).unwrap_or_else(Task::none);
+        }
+        Arc::make_mut(&mut self.durable)
+            .pending_chat_admissions
+            .remove(&card);
+        self.shared_views.fenced_closes.insert(card);
+        let task = self.retire_offstrip_card(card);
+        if self
+            .card_state(card)
+            .is_none_or(|state| state.existence.is_open())
+        {
+            self.shared_views.fenced_closes.remove(&card);
+        }
+        task
     }
 
     /// Whether a shared view put the pane `closing` closed back, still

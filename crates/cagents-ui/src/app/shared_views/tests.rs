@@ -8778,6 +8778,8 @@ fn a_kept_closed_pane_waits_for_the_strip_without_stopping_again() {
             .all(|stopping| stopping.stopped),
         "no new stop is saved"
     );
+    // The other removal finishes, and the close queue settles as each
+    // update ends.
     app.workspace.cancel_close(other).unwrap();
     drop(app.settle_close_queue());
     assert!(
@@ -8790,33 +8792,60 @@ fn a_kept_closed_pane_waits_for_the_strip_without_stopping_again() {
 }
 
 /// At the next launch, a closed pane its view kept stays out of sight even
-/// when the view admits it before the launch asks about its stop, and a
-/// conversation reopened while that stop is asked again, then refused, goes
-/// back to what still runs in the reopened pane when the view fences the
-/// closed one, which is never admitted.
+/// when the view admits it before the launch asks about its stop, and goes
+/// once it has. A conversation reopened while that stop is asked again, then
+/// refused, goes back to what still runs in the reopened pane, with what the
+/// closed pane had not sent, when the view fences the closed one, which is
+/// never admitted: that one goes, rather than stay beside it.
 #[test]
 fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
     let directory = tempfile::tempdir().unwrap();
-    let (mut app, pane, _stopping) = closed_chat_its_view_kept_from(Some(directory.path()), "");
+    let (mut app, pane, _stopping) =
+        closed_chat_its_view_kept_from(Some(directory.path()), "still writing");
     let CardKind::Chat(session) = app.card_state(pane.id).unwrap().kind.clone() else {
         panic!("a chat pane");
     };
     let saved = app.persistent_workspace();
     let launch = || {
         let mut next = crate::app::tests::context_inspector_test_app(false);
+        next.chat_ui = super::super::chat_ui::State::with_drafts(saved.chat_drafts.clone());
         next.durable = saved.clone();
         next.workspace = Cagents::rebuild_workspace(&next.durable);
         next
     };
 
-    // Admitted before the launch asks again: still out of sight.
+    // Admitted before the launch asks again: still out of sight, and gone
+    // once the stop settles.
     let mut next = launch();
-    drop(next.attach_shared_chat(pane.id, session.clone()));
+    next.await_shared_chat_admission(pane.id, session.clone());
+    let mut admitted = pane.clone();
+    admitted.kind = CardKind::Chat(session.clone());
+    drop(next.admit_shared_chat(&admitted));
     assert!(
         next.workspace.is_hidden(pane.id),
         "out of sight from the start"
     );
     assert!(!next.chat_start_pending(pane.id), "nothing attaches");
+    drop(next.resume_stopping_chats());
+    let target = next
+        .background_close_for_test(pane.id)
+        .expect("asked again");
+    assert!(
+        next.workspace.is_hidden(pane.id),
+        "out of sight while asked"
+    );
+    drop(
+        next.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            target,
+            Ok(()),
+        ))),
+    );
+    assert!(
+        !next
+            .card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "it goes"
+    );
 
     // Fenced while it awaits admission, with a reopen during the stop.
     let mut next = launch();
@@ -8851,11 +8880,33 @@ fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
         !next.reopen_superseded(reopened),
         "it does not give way to a pane that never attaches"
     );
-    assert!(
-        next.card_state(reopened)
-            .is_some_and(|state| state.existence.is_open())
-    );
     assert!(!next.holds_reopen(reopened));
+    assert!(
+        next.chat_start_pending(reopened),
+        "it goes back to what still runs"
+    );
+    assert_eq!(
+        next.draft_to_keep(reopened, None).text,
+        "still writing",
+        "with what the closed pane had not sent"
+    );
+    // Off the strip shown now, it goes at once; in it, as its close commits.
+    if next
+        .card_state(pane.id)
+        .is_some_and(|state| state.existence.is_open())
+    {
+        drop(next.update(Message::CommitClose(pane.id)));
+    }
+    assert!(
+        !next
+            .card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "the fenced pane goes, rather than stay beside it"
+    );
+    assert!(
+        !next.durable.kept_chat_drafts.contains_key(&pane.id),
+        "its draft is not kept twice"
+    );
 }
 
 /// What a closed chat had not sent comes back with the pane its view keeps
