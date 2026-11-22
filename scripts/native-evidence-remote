@@ -355,6 +355,18 @@ build_arguments() {
     (cd -- "$1" && "$tool_source/scripts/native-evidence" __build-arguments)
 }
 
+# Whether the caller changed how Rust compiles, as a measurement does with
+# RUSTFLAGS or a CARGO_PROFILE_* setting. Main's prebuilt executables were
+# built without either, so such a build compiles its own.
+build_environment_changed() {
+    local name
+    [ -z "${RUSTFLAGS-}${CARGO_ENCODED_RUSTFLAGS-}${CARGO_BUILD_RUSTFLAGS-}" ] || return 0
+    for name in $(compgen -e); do
+        [[ $name != CARGO_PROFILE_* ]] || return 0
+    done
+    return 1
+}
+
 # Builds what native-evidence runs from CHECKOUT's own gate, into its own
 # target and the build host's slot for it, as `mise run dev` does: what that
 # already built is reused, and Cargo rebuilds only what changed since. The
@@ -485,7 +497,7 @@ $remote_prelude"'
             exit 11
         fi
     ' "$side" "$source_commit" "$tool_commit") || running=$?
-    [ "$answer" != prebuilt ] || prebuilt=true
+    [ "$answer" != prebuilt ] || build_environment_changed || prebuilt=true
     case $running in
         0) ;;
         10) die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop" ;;

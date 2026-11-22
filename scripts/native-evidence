@@ -294,6 +294,18 @@ built_executables() {
     build_arguments | sed 's/.* //'
 }
 
+# Whether the caller changed how Rust compiles, as a measurement does with
+# RUSTFLAGS or a CARGO_PROFILE_* setting. Main's prebuilt executables were
+# built without either, so such a build compiles its own.
+build_environment_changed() {
+    local name
+    [ -z "${RUSTFLAGS-}${CARGO_ENCODED_RUSTFLAGS-}${CARGO_BUILD_RUSTFLAGS-}" ] || return 0
+    for name in $(compgen -e); do
+        [[ $name != CARGO_PROFILE_* ]] || return 0
+    done
+    return 1
+}
+
 # The directory of main's prebuilt executables for CHECKOUT: a clean checkout
 # of a commit scripts/main-build-sentinel built with these build arguments.
 main_build_of() {
@@ -397,7 +409,8 @@ cmd_build() {
         return
     fi
     local prebuilt
-    if [ "$lane" = browserless ] && prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
+    if [ "$lane" = browserless ] && ! build_environment_changed &&
+        prebuilt=$(main_build_of "$checkout") && [ -f "$main_builds/.lock" ]; then
         # The sentinel removes old builds only while nothing reads them. A
         # copy that fails says why, and the side is compiled instead.
         if (
