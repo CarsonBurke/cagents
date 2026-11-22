@@ -292,6 +292,9 @@ impl Cagents {
             // takes it away (see `attach_shared_chat`). Otherwise admission
             // puts it back on what still runs, as any pane a view shows is.
             if card == closing.card && self.chat_awaiting_admission(card) {
+                if goes && !self.awaits_admission_to_go(card) {
+                    tasks.push(self.take_away_returned_close(card, &closing.session));
+                }
                 continue;
             }
             if !self.awaits_attachment(card) {
@@ -428,12 +431,12 @@ impl Cagents {
                 .get(&card)
                 .is_some_and(|stopped| shares_conversation(stopped, &session))
             {
+                self.hold_returned_unsent(card);
                 if self.workspace.order().any(|placed| placed == card) {
                     return self.take_away_stopped_return(card);
                 }
                 // The view is still putting the pane in the strip, which
                 // removes it once it is there.
-                self.cards.remove(&card);
                 self.remove_when_placed(card, &session);
                 return Task::none();
             }
@@ -464,8 +467,7 @@ impl Cagents {
         }
         // It waits unattached, as a held reopen does, keeping what it had
         // not sent.
-        self.stash_unsent_chat(card);
-        self.cards.remove(&card);
+        self.hold_returned_unsent(card);
         Task::none()
     }
 
@@ -557,7 +559,7 @@ impl Cagents {
         }
         // Only an admitted pane's removal reaches its view, so one still
         // awaiting admission waits for it out of sight.
-        if self.chat_awaiting_admission(card) {
+        if self.awaits_admission_to_go(card) {
             self.chat_ui.hidden_returns.insert(card);
             return Task::none();
         }
@@ -581,6 +583,15 @@ impl Cagents {
             self.chat_ui.hidden_returns.insert(card);
         }
         task.unwrap_or_else(Task::none)
+    }
+
+    /// Holds `card` unattached, with what it had not sent: what its runtime
+    /// shows, and, for the closed pane itself, what its close kept, so a
+    /// save while it is back and its next close both keep it.
+    fn hold_returned_unsent(&mut self, card: CardId) {
+        self.stash_unsent_chat(card);
+        self.cards.remove(&card);
+        self.reclaim_kept_draft(card);
     }
 
     /// Keeps a pane that was to go because another window has put a
@@ -655,11 +666,32 @@ impl Cagents {
         }
     }
 
+    /// Whether the closed pane `card` waits for its view to admit it before
+    /// its removal can reach the view. A fenced pane's removal reaches it by
+    /// identity, so that one does not wait.
+    fn awaits_admission_to_go(&self, card: CardId) -> bool {
+        self.chat_awaiting_admission(card) && !self.shared_views.quarantined.contains(&card)
+    }
+
     /// Keeps out of sight each closed pane a shared view put back while its
     /// conversation stops, once the strip holds it, and brings back into
     /// sight one its close no longer holds.
     pub(in crate::app) fn hide_returned_closes(&mut self) -> Task<Message> {
         self.forget_stops_of_gone_returns();
+        // A pane waiting for admission to go that its view fences instead
+        // is never admitted: it goes now, by identity.
+        let fenced = self
+            .chat_ui
+            .hidden_returns
+            .iter()
+            .filter(|card| self.shared_views.quarantined.contains(card))
+            .filter_map(|card| Some((*card, self.chat_ui.stopped_closes.get(card)?.clone())))
+            .filter(|(card, _)| self.chat_awaiting_admission(*card))
+            .collect::<Vec<_>>();
+        let mut fenced_tasks = fenced
+            .into_iter()
+            .map(|(card, session)| self.take_away_returned_close(card, &session))
+            .collect::<Vec<_>>();
         let held = self
             .chat_ui
             .background_closes
@@ -698,6 +730,7 @@ impl Cagents {
                 tasks.push(self.apply_viewport(update, false, DurableChange::None));
             }
         }
+        tasks.append(&mut fenced_tasks);
         Task::batch(tasks)
     }
 

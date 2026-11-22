@@ -8502,6 +8502,74 @@ fn a_kept_closed_pane_another_window_reuses_stays() {
     );
 }
 
+/// What a closed chat had not sent comes back with the pane its view keeps
+/// while the conversation stops, and is kept again when the pane goes, so
+/// reopening the conversation still brings it back.
+#[test]
+fn a_kept_closed_pane_keeps_what_it_had_not_sent() {
+    let (mut app, _source, _destination, pane) = retained_chat_move_fixture();
+    let (tx, rx) = test_model_channel();
+    app.workspace_model_tx = tx;
+    drop(app.begin_chat_close(pane.id));
+    let stopping = app
+        .background_close_for_test(pane.id)
+        .expect("the conversation stops in the background");
+    // What the close kept.
+    let closed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    Arc::make_mut(&mut app.durable).kept_chat_drafts.insert(
+        pane.id,
+        crate::model::KeptChatDraft {
+            text: "still writing".into(),
+            closed_at_unix_ms,
+            ..Default::default()
+        },
+    );
+    let (operation, scope, change) = app
+        .shared_views
+        .pending
+        .iter()
+        .find(|(_, _, change)| {
+            matches!(change, Change::RemoveSource { before, .. } if before.id == pane.id)
+        })
+        .cloned()
+        .expect("its removal is published");
+    while rx.try_recv().is_ok() {}
+    drop(app.refuse_conflicting_view_change(
+        scope,
+        operation,
+        change,
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT.into(),
+    ));
+    assert!(app.workspace.is_hidden(pane.id), "back, out of sight");
+    assert_eq!(
+        app.draft_to_keep(pane.id, None).text,
+        "still writing",
+        "the pane holds it while it is back"
+    );
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Ok(()),
+        ))),
+    );
+    assert!(
+        !app.card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "it goes"
+    );
+    assert_eq!(
+        app.durable
+            .kept_chat_drafts
+            .get(&pane.id)
+            .map(|draft| draft.text.as_str()),
+        Some("still writing"),
+        "kept again as it goes"
+    );
+}
+
 /// Closing a retained native chat never opens a modal, and its cleanup is
 /// never overtaken by a channel move (#2327, #2593). The first close takes
 /// the pane away at once, so there is nothing left to move while the daemon
