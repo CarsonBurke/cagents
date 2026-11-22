@@ -3848,13 +3848,15 @@ impl Runtime {
     fn composer_action(&mut self, action: text_editor::Action) {
         match action {
             text_editor::Action::Edit(edit) => {
-                let before = self.composer.cursor();
                 // An edit takes an image's reference whole or not at all.
-                if let Some(live) = self.live_references() {
-                    self.keep_references_whole(draft_images::Toward::Nearer);
-                    if let Some(whole) = draft_images::deleted_whole(&self.composer, &live, &edit) {
-                        attachment_draft::move_to(&mut self.composer, whole);
-                    }
+                // Undo returns to the cursor as the edit found it once whole,
+                // not to the reference a Backspace beside it selects.
+                self.keep_references_whole(draft_images::Toward::Outward);
+                let before = self.composer.cursor();
+                if let Some(live) = self.live_references()
+                    && let Some(whole) = draft_images::deleted_whole(&self.composer, &live, &edit)
+                {
+                    attachment_draft::move_to(&mut self.composer, whole);
                 }
                 let selected = self
                     .composer
@@ -3895,12 +3897,23 @@ impl Runtime {
                 }
                 let toward = match &other {
                     text_editor::Action::Move(motion) | text_editor::Action::Select(motion) => {
-                        draft_images::Toward::of(*motion)
+                        Some(draft_images::Toward::of(*motion))
                     }
-                    _ => draft_images::Toward::Nearer,
+                    text_editor::Action::Click(_) | text_editor::Action::Drag(_) => {
+                        Some(draft_images::Toward::Nearer)
+                    }
+                    text_editor::Action::SelectWord
+                    | text_editor::Action::SelectLine
+                    | text_editor::Action::SelectAll => Some(draft_images::Toward::Outward),
+                    // Scrolling and clearing a selection move no end.
+                    text_editor::Action::Scroll { .. }
+                    | text_editor::Action::ClearSelection
+                    | text_editor::Action::Edit(_) => None,
                 };
                 self.composer.perform(other);
-                self.keep_references_whole(toward);
+                if let Some(toward) = toward {
+                    self.keep_references_whole(toward);
+                }
             }
         }
         self.cancel_invalid_attachment_jobs();
@@ -3915,9 +3928,9 @@ impl Runtime {
         (!live.is_empty()).then_some(live)
     }
 
-    /// Moves a caret that landed inside an image's reference `toward` one
-    /// of its sides, and grows a selection that took part of one to take
-    /// all of it.
+    /// Moves the end of the cursor the reader moved out of any image's
+    /// reference it landed inside, `toward` one of its sides, and the other
+    /// end of a selection outward, so a selection holds references whole.
     fn keep_references_whole(&mut self, toward: draft_images::Toward) {
         if let Some(live) = self.live_references()
             && let Some(whole) = draft_images::whole(&self.composer, &live, toward)
@@ -3943,29 +3956,45 @@ impl Runtime {
         if new.is_empty() {
             return;
         }
+        let rules = chat::AttachmentRules::for_provider(self.session.launch.provider);
+        // A size this device can't read is left for the provider to check
+        // when the message is sent, as with any image of another device.
+        let (fits, too_large): (Vec<_>, Vec<_>) = new.into_iter().partition(|image| {
+            std::fs::metadata(&image.path)
+                .ok()
+                .is_none_or(|metadata| metadata.len() <= rules.max_image_bytes)
+        });
         let room = if self.accepts_draft_attachments() {
-            chat::AttachmentRules::for_provider(self.session.launch.provider)
-                .max_count
-                .map_or(usize::MAX, |limit| {
-                    limit.saturating_sub(self.attachments.len() + self.image_pastes_saving)
-                })
+            rules.max_count.map_or(usize::MAX, |limit| {
+                limit.saturating_sub(self.attachments.len() + self.image_pastes_saving)
+            })
         } else {
             0
         };
-        let refused: Vec<String> = new.iter().skip(room).map(Attachment::label).collect();
-        if !refused.is_empty() {
-            self.composer_note = Some(format!(
-                "{} {} not attached: {}",
-                refused.join(", "),
-                if refused.len() == 1 { "was" } else { "were" },
-                if room == 0 && !self.accepts_draft_attachments() {
-                    "the current model cannot accept images."
-                } else {
-                    "this chat has reached its attachment limit."
-                }
-            ));
+        let unattached = |images: &[Attachment], why: &str| {
+            let labels: Vec<String> = images.iter().map(Attachment::label).collect();
+            (!labels.is_empty()).then(|| {
+                format!(
+                    "{} {} not attached: {why}",
+                    labels.join(", "),
+                    if labels.len() == 1 { "was" } else { "were" },
+                )
+            })
+        };
+        let over = fits.get(room..).unwrap_or_default();
+        let note = unattached(
+            over,
+            if self.accepts_draft_attachments() {
+                "this chat has reached its attachment limit."
+            } else {
+                "the current model cannot accept images."
+            },
+        )
+        .or_else(|| unattached(&too_large, "too large for this chat's provider."));
+        if note.is_some() {
+            self.composer_note = note;
         }
-        self.merge_attachments(new.into_iter().take(room));
+        self.merge_attachments(fits.into_iter().take(room));
         self.follow_caret_reference();
     }
 
@@ -14604,8 +14633,9 @@ impl Cagents {
             }
             Action::ComposerCursor(target, cursor) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.composer.move_to(cursor);
-                    runtime.keep_references_whole(draft_images::Toward::Nearer);
+                    // The cursor replaces any selection, as the one it names.
+                    attachment_draft::move_to(&mut runtime.composer, cursor);
+                    runtime.keep_references_whole(draft_images::Toward::Outward);
                     runtime.composer_undo.seal();
                     runtime.follow_caret_reference();
                     if runtime.completion.restart(false) {

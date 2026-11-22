@@ -82,6 +82,9 @@ pub(super) enum Toward {
     End,
     /// Whichever side is closer, as for a click or a move between lines.
     Nearer,
+    /// Away from the selection's other end, so the selection takes the
+    /// reference in; a caret with no selection goes to the nearer side.
+    Outward,
 }
 
 impl Toward {
@@ -104,8 +107,10 @@ fn outside(line: &str, live: &HashSet<String>, column: usize, toward: Toward) ->
         .map_or(column, |span| match toward {
             Toward::Start => span.start,
             Toward::End => span.end,
-            Toward::Nearer if column - span.start <= span.end - column => span.start,
-            Toward::Nearer => span.end,
+            Toward::Nearer | Toward::Outward if column - span.start <= span.end - column => {
+                span.start
+            }
+            Toward::Nearer | Toward::Outward => span.end,
         })
 }
 
@@ -124,9 +129,12 @@ fn moved_out(
 }
 
 /// The cursor the composer must take so that neither of its ends is inside
-/// one of the references `live` names, or `None` when it already is. A
-/// caret goes `toward` a side; a selection grows to take in every reference
-/// it touches, keeping the end the reader moves.
+/// one of the references `live` names, or `None` when it already is.
+///
+/// The caret is the end the reader moves, and goes `toward` a side: a
+/// selection shrinking back over a reference lets go of all of it, one
+/// growing over it takes all of it. The anchor, which the reader isn't
+/// moving, only ever grows the selection.
 pub(super) fn whole(
     content: &Content<cosmic::Renderer>,
     live: &HashSet<String>,
@@ -147,31 +155,27 @@ pub(super) fn whole(
     // ends; this reads the span it actually covers. A plain selection's
     // cursor is its span, so it stands in when that read is ambiguous.
     let span = super::attachment_draft::selection_span(content).unwrap_or(cursor);
-    let (position, anchor) = (span.position, span.selection?);
-    let forward = (anchor.line, anchor.column) <= (position.line, position.column);
-    let (low, high) = if forward {
-        (anchor, position)
+    let (caret, anchor) = (span.position, span.selection?);
+    let forward = (anchor.line, anchor.column) <= (caret.line, caret.column);
+    let (away, back) = if forward {
+        (Toward::End, Toward::Start)
     } else {
-        (position, anchor)
+        (Toward::Start, Toward::End)
     };
-    let (start, end) = (
-        moved_out(content, live, low, Toward::Start),
-        moved_out(content, live, high, Toward::End),
-    );
-    if (start, end) == (low, high) {
-        return None;
-    }
-    Some(if forward {
-        Cursor {
-            position: end,
-            selection: Some(start),
-        }
-    } else {
-        Cursor {
-            position: start,
-            selection: Some(end),
-        }
-    })
+    let moved = Cursor {
+        position: moved_out(
+            content,
+            live,
+            caret,
+            if toward == Toward::Outward {
+                away
+            } else {
+                toward
+            },
+        ),
+        selection: Some(moved_out(content, live, anchor, back)),
+    };
+    (moved != span).then_some(moved)
 }
 
 /// The selection `edit` must delete instead, when it is Backspace just after

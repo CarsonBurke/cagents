@@ -567,6 +567,20 @@ fn the_caret_steps_over_a_reference_and_never_stops_inside_it() {
         place(&mut app, target, start, None);
         let select = text_editor::Action::Select(text_editor::Motion::Right);
         assert_eq!(step(&mut app, select), (end, Some(start)));
+        // Selecting back lets go of all of it, rather than stick at its end.
+        let unselect = text_editor::Action::Select(text_editor::Motion::Left);
+        assert_eq!(step(&mut app, unselect.clone()).0, start);
+        let selected = |app: &mut Cagents| {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.composer.selection().filter(|text| !text.is_empty())
+        };
+        assert_eq!(selected(&mut app), None);
+        // And the same leftward: from the end, over it and back.
+        place(&mut app, target, end, None);
+        assert_eq!(step(&mut app, unselect), (start, Some(end)));
+        let reselect = text_editor::Action::Select(text_editor::Motion::Right);
+        assert_eq!(step(&mut app, reselect).0, end);
+        assert_eq!(selected(&mut app), None);
         assert_eq!(app.chat_runtime_mut(target).unwrap().attachments, [image]);
     });
 }
