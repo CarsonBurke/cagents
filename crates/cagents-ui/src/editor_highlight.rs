@@ -467,13 +467,16 @@ pub(crate) fn classify(scopes: &[parsing::Scope], code: &highlighting::Highlight
         {
             Some(Tone::Marker)
         } else if name.starts_with("markup.underline.link") {
-            // A destination recedes behind the words that name it; a bare
-            // or angle-bracketed URL has no other words, so it is the link.
-            Some(if has("meta.link.inline") || has("meta.link.reference") {
-                Tone::Dim
-            } else {
-                Tone::Link
-            })
+            // A destination recedes behind the words that name it, or an
+            // image's description; a bare or angle-bracketed URL has no
+            // other words, so it is the link.
+            Some(
+                if has("meta.link.inline") || has("meta.link.reference") || has("meta.image") {
+                    Tone::Dim
+                } else {
+                    Tone::Link
+                },
+            )
         } else if name.starts_with("punctuation.definition.link")
             || name.starts_with("punctuation.definition.metadata")
             || name.starts_with("punctuation.definition.string")
@@ -708,7 +711,8 @@ cargo clean && cargo build --locked
             "See <https://example.com/a> and https://example.com/b.\n\
              Read [the guide][guide] or [this](https://example.com/c).\n\
              \n\
-             [guide]: https://example.com/d\n",
+             [guide]: https://example.com/d\n\
+             ![A diagram](img/diagram.png)\n",
         );
         assert_eq!(style(&spans, 0, "https://example.com/a"), tone(Tone::Link));
         assert_eq!(style(&spans, 0, "https://example.com/b"), tone(Tone::Link));
@@ -716,6 +720,7 @@ cargo clean && cargo build --locked
         assert_eq!(style(&spans, 1, "this"), tone(Tone::Link));
         assert_eq!(style(&spans, 1, "https://example.com/c"), tone(Tone::Dim));
         assert_eq!(style(&spans, 3, "https://example.com/d"), tone(Tone::Dim));
+        assert_eq!(style(&spans, 4, "img/diagram.png"), tone(Tone::Dim));
     }
 
     #[test]
