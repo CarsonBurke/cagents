@@ -13,6 +13,7 @@ pub struct Shell<'a, Message> {
     messages: &'a mut Vec<Message>,
     event_status: event::Status,
     redraw_request: window::RedrawRequest,
+    animation_request: window::AnimationRequest,
     input_method: InputMethod,
     is_layout_invalid: bool,
     are_widgets_invalid: bool,
@@ -25,6 +26,7 @@ impl<'a, Message> Shell<'a, Message> {
             messages,
             event_status: event::Status::Ignored,
             redraw_request: window::RedrawRequest::Wait,
+            animation_request: window::AnimationRequest::None,
             is_layout_invalid: false,
             are_widgets_invalid: false,
             input_method: InputMethod::Disabled,
@@ -91,6 +93,26 @@ impl<'a, Message> Shell<'a, Message> {
         redraw_request: window::RedrawRequest,
     ) {
         shell.redraw_request = redraw_request;
+    }
+
+    /// Requests frames that present the window's last drawing again, at the
+    /// given cadence, for a drawing that the renderer animates by itself.
+    ///
+    /// See [`window::AnimationRequest`]. A request lasts until the window is
+    /// next drawn, so a widget renews it on every
+    /// [`window::Event::RedrawRequested`] that it still animates on.
+    pub fn request_animation(
+        &mut self,
+        animation_request: window::AnimationRequest,
+    ) {
+        self.animation_request =
+            self.animation_request.min(animation_request);
+    }
+
+    /// Returns the animation frames requested so far.
+    #[must_use]
+    pub fn animation_request(&self) -> window::AnimationRequest {
+        self.animation_request
     }
 
     /// Requests the current [`InputMethod`] strategy.
@@ -167,6 +189,8 @@ impl<'a, Message> Shell<'a, Message> {
             self.are_widgets_invalid || other.are_widgets_invalid;
 
         self.redraw_request = self.redraw_request.min(other.redraw_request);
+        self.animation_request =
+            self.animation_request.min(other.animation_request);
         self.event_status = self.event_status.merge(other.event_status);
         self.input_method.merge(&other.input_method);
     }

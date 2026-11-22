@@ -97,6 +97,21 @@ pub struct Renderer {
     image_cache: std::cell::RefCell<image::Cache>,
 
     staging_belt: wgpu::util::StagingBelt,
+
+    /// What the layers were last prepared for. Presenting them again,
+    /// unchanged, for the same target prepares only what changes with time.
+    prepared: Option<Prepared>,
+}
+
+/// The target a layer stack was prepared for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Prepared {
+    physical_size: Size<u32>,
+    scale_factor: f64,
+    revision: u64,
+    /// The shared text atlas's trim count once this renderer had trimmed.
+    /// Another renderer's trim may let glyphs these layers draw be evicted.
+    text_atlas_trims: u64,
 }
 
 impl Renderer {
@@ -132,6 +147,8 @@ impl Renderer {
                 buffer::MAX_WRITE_SIZE as u64,
             ),
 
+            prepared: None,
+
             engine,
         }
     }
@@ -148,7 +165,32 @@ impl Renderer {
             },
         );
 
-        self.prepare(&mut encoder, viewport);
+        // Drawings that change with time alone, such as a spinning SVG, are
+        // worked out for this instant. A window may present the same layers
+        // again for their next frame without drawing its widgets.
+        let now = core::time::Instant::now();
+
+        let prepared = Prepared {
+            physical_size: viewport.physical_size(),
+            scale_factor: viewport.scale_factor(),
+            revision: self.layers.revision(),
+            text_atlas_trims: self.engine.text_pipeline.trims(),
+        };
+
+        // Layers presented again for the same target keep everything they
+        // uploaded last time, so only what changes with time is prepared
+        // again. They are not merged again either: merging merged layers
+        // can still move primitives between them. Nothing was left unused,
+        // so nothing is trimmed: a trim would evict what they still draw.
+        if self.prepared == Some(prepared) {
+            self.prepare_animations(&mut encoder, viewport, now);
+            self.render(&mut encoder, target, clear_color, viewport);
+
+            return encoder;
+        }
+
+        self.layers.merge();
+        self.prepare(&mut encoder, viewport, now);
         self.render(&mut encoder, target, clear_color, viewport);
 
         self.quad.trim();
@@ -163,6 +205,13 @@ impl Renderer {
             self.image.trim();
             self.image_cache.borrow_mut().trim();
         }
+
+        // Merging and trimming leave the revision alone; the trim count is
+        // taken once this renderer's own trim has counted.
+        self.prepared = Some(Prepared {
+            text_atlas_trims: self.engine.text_pipeline.trims(),
+            ..prepared
+        });
 
         encoder
     }
@@ -304,6 +353,7 @@ impl Renderer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         viewport: &Viewport,
+        now: core::time::Instant,
     ) {
         let scale_factor = viewport.scale_factor();
 
@@ -313,8 +363,6 @@ impl Renderer {
         let physical_bounds = Rectangle::<f32>::from(Rectangle::with_size(
             viewport.physical_size(),
         ));
-
-        self.layers.merge();
 
         for layer in self.layers.iter() {
             let clip_bounds = layer.bounds * scale_factor as f32;
@@ -395,6 +443,7 @@ impl Renderer {
                     &layer.images,
                     viewport.projection(),
                     scale_factor as f32,
+                    now,
                 );
 
                 prepare_span.finish();
@@ -415,6 +464,85 @@ impl Renderer {
                 );
 
                 prepare_span.finish();
+            }
+        }
+    }
+
+    /// Prepares layers that were prepared for this viewport before, and not
+    /// reset since, for another frame: only their images that change with
+    /// time, and their custom primitives, which may expect a `prepare` per
+    /// frame. Everything else keeps what it uploaded last time.
+    ///
+    /// Images are prepared per layer in the order [`Self::prepare`] visits
+    /// them, so a layer's index here matches the one it had there and the
+    /// one [`Self::render`] draws.
+    fn prepare_animations(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: &Viewport,
+        now: core::time::Instant,
+    ) {
+        let scale_factor = viewport.scale_factor();
+
+        let physical_bounds = Rectangle::<f32>::from(Rectangle::with_size(
+            viewport.physical_size(),
+        ));
+
+        #[cfg(any(feature = "svg", feature = "image"))]
+        let mut image_layer = 0;
+
+        for layer in self.layers.iter() {
+            let clip_bounds = layer.bounds * scale_factor as f32;
+
+            if physical_bounds
+                .intersection(&clip_bounds)
+                .and_then(Rectangle::snap)
+                .is_none()
+            {
+                continue;
+            }
+
+            if !layer.primitives.is_empty() {
+                let mut primitive_storage = self
+                    .engine
+                    .primitive_storage
+                    .write()
+                    .expect("Write primitive storage");
+
+                for instance in &layer.primitives {
+                    instance.primitive.prepare(
+                        &mut primitive_storage,
+                        &self.engine.device,
+                        &self.engine.queue,
+                        self.engine.format,
+                        &instance.bounds,
+                        viewport,
+                    );
+                }
+            }
+
+            #[cfg(any(feature = "svg", feature = "image"))]
+            if !layer.images.is_empty() {
+                if layer.images.iter().any(image::is_animated) {
+                    let prepare_span = debug::prepare(debug::Primitive::Image);
+
+                    self.image.prepare_at(
+                        image_layer,
+                        &self.engine.image_pipeline,
+                        &self.engine.device,
+                        &mut self.staging_belt,
+                        encoder,
+                        &mut self.image_cache.borrow_mut(),
+                        &layer.images,
+                        viewport.projection(),
+                        scale_factor as f32,
+                        now,
+                    );
+
+                    prepare_span.finish();
+                }
+
+                image_layer += 1;
             }
         }
     }

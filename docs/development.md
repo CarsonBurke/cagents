@@ -2206,7 +2206,7 @@ harness, it provides:
   compositor presentation. Add `--ui-trace` to `start` for a live log of
   UI-thread work by phase and message; see "UI thread trace" in
   `docs/performance.md`. Add `--workspace-trace` to record shared-model update
-  timing, scope projection choices and activity redraw intervals. Add
+  timing and scope projection choices; `--ui-trace` gives frame pacing. Add
   `--daemon-trace FILTER` to write the daemon's tracing, at a `RUST_LOG`
   filter such as `cagents::chat::runtime=debug,warn`, to
   `logs/daemon-SIDE.log`; the app takes the same filter. Add

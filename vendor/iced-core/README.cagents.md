@@ -97,3 +97,33 @@ cargo test --manifest-path vendor/iced-core/Cargo.toml text::span_metrics_tests
 # Editor overscan (#2824)
 
 `text::Editor` has two default methods, `set_overscan` and `overflow`. They let the widget ask the renderer to lay out and draw lines into its padding, and report how far drawn text currently reaches past the text area. The defaults do nothing and report zero, so editors without overscan behave as upstream. See vendor/cosmic-text/LOCAL_CHANGES.md.
+
+## Animation frames that only present (#3581)
+
+A widget whose drawing changes with time alone can ask for frames that
+present the window's last drawing again instead of drawing its widgets:
+`Shell::request_animation` with a `window::AnimationRequest` (every display
+frame, or once per interval). Requests combine to the most frequent one,
+through `Shell::merge` like redraw requests, and last until the window next
+draws its widgets, so a widget renews its request on every
+`RedrawRequested` it still animates on.
+
+The renderer does the animating. `Svg::spin` takes a `svg::Spin`, a steady
+turn from an instant with a period; `Spin::angle` gives the turn at a given
+instant. The pinned wgpu renderer adds it to the SVG's rotation when it
+prepares a frame (see `vendor/iced-wgpu/README.cagents.md`). A renderer that
+ignores it, such as the software fallback, draws the SVG at its `rotation`,
+which the widget sets to the angle at its last redraw event, so between
+the frames that draw the widgets such a spinner holds still.
+
+The shell side is in `vendor/iced-runtime` (`UserInterface::is_drawn`) and
+`vendor/iced-winit` (when a frame may only present). The app's activity
+spinner (`crates/cagents-ui/src/ui_controls/gauge.rs`) is the user. Remove
+this when the pinned dependency offers an equivalent way to animate without
+drawing every widget.
+
+Run its standalone tests with:
+
+```sh
+scripts/cargo-gate test --manifest-path vendor/iced-core/Cargo.toml -- svg::tests window::animation_request
+```

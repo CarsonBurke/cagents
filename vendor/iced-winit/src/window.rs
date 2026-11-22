@@ -3,7 +3,9 @@ mod state;
 use state::State;
 use winit::dpi::PhysicalPosition;
 
-pub use crate::core::window::{Event, Id, RedrawRequest, Settings};
+pub use crate::core::window::{
+    AnimationRequest, Event, Id, RedrawRequest, Settings,
+};
 
 use crate::conversion;
 use crate::core::alignment;
@@ -92,6 +94,9 @@ where
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
+                needs_draw: true,
+                animation: AnimationRequest::None,
+                animation_at: None,
                 preedit: None,
                 ime_state: None,
                 prev_dnd_destination_rectangles_count: 0,
@@ -111,16 +116,23 @@ where
     }
 
     pub fn is_idle(&self) -> bool {
-        self.entries
-            .values()
-            .all(|window| window.redraw_at.is_none() && !window.resize_enabled)
+        self.entries.values().all(|window| {
+            window.next_redraw().is_none() && !window.resize_enabled
+        })
     }
 
     pub fn redraw_at(&self) -> Option<Instant> {
         self.entries
             .values()
-            .filter_map(|window| window.redraw_at)
+            .filter_map(Window::next_redraw)
             .min()
+    }
+
+    /// Requests the redraws and animation frames that are due at `now`.
+    pub fn request_due_redraws(&mut self, now: Instant) {
+        for window in self.entries.values_mut() {
+            window.request_due_redraw(now);
+        }
     }
 
     pub fn first(&self) -> Option<&Window<P, C>> {
@@ -201,6 +213,14 @@ where
     pub surface_version: u64,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,
+    /// Whether the next frame must draw the window's widgets, because a
+    /// widget or the shell asked for it, rather than only present the
+    /// renderer's retained drawing again for an animation.
+    pub needs_draw: bool,
+    /// The animation frames the widgets asked for when the window was last
+    /// drawn.
+    pub animation: AnimationRequest,
+    animation_at: Option<Instant>,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(Rectangle, input_method::Purpose)>,
     pub(crate) redraw_requested: bool,
@@ -233,6 +253,8 @@ where
     pub fn request_redraw(&mut self, redraw_request: RedrawRequest) {
         match redraw_request {
             RedrawRequest::NextFrame => {
+                self.needs_draw = true;
+
                 if !self.redraw_requested {
                     self.redraw_requested = true;
                     self.raw.request_redraw();
@@ -244,6 +266,53 @@ where
                 self.redraw_requested = false;
             }
             RedrawRequest::Wait => {}
+        }
+    }
+
+    /// Requests a frame that draws the window's widgets.
+    pub fn request_draw(&mut self) {
+        self.needs_draw = true;
+        self.raw.request_redraw();
+    }
+
+    /// When the next timed redraw or animation frame is due, if any.
+    pub fn next_redraw(&self) -> Option<Instant> {
+        match (self.redraw_at, self.animation_at) {
+            (Some(redraw), Some(animation)) => Some(redraw.min(animation)),
+            (redraw, animation) => redraw.or(animation),
+        }
+    }
+
+    /// Requests the frame for a timed redraw or animation frame that is due
+    /// at `now`. A widget's timed redraw draws the window; an animation frame
+    /// may only present it again.
+    pub fn request_due_redraw(&mut self, now: Instant) {
+        if self.redraw_at.is_some_and(|at| at <= now) {
+            self.redraw_at = None;
+            self.request_draw();
+        }
+
+        if self.animation_at.is_some_and(|at| at <= now) {
+            self.animation_at = None;
+            self.raw.request_redraw();
+        }
+    }
+
+    /// Asks for the next frame of the window's animation, if it has one,
+    /// after a frame presented at `now`.
+    pub fn schedule_animation(&mut self, now: Instant) {
+        match self.animation {
+            AnimationRequest::EveryFrame => {
+                // The compositor paces the frame after this one.
+                self.animation_at = None;
+                self.raw.request_redraw();
+            }
+            AnimationRequest::Every(interval) => {
+                self.animation_at = Some(now + interval);
+            }
+            AnimationRequest::None => {
+                self.animation_at = None;
+            }
         }
     }
 

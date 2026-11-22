@@ -59,12 +59,16 @@ coalesced move per frame saves over applying every wheel notch.
 
 ## Activity spinner cost
 
-Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (50 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
-focused. An unfocused window may still be in view, so its spinners keep turning,
-but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
-advance the arc thirty degrees per frame, `SPINNER_BACKGROUND_STEP`. Measure
-the UI process with one busy agent on screen:
+A visible activity spinner turns every display frame while the main window is
+focused (`SPINNER_ANIMATION` in `crates/cagents-ui/src/ui_controls/gauge.rs`).
+It does not redraw the window to do it: on its redraw event it asks for
+animation frames, and the window presents its last drawing again, turned by
+the renderer's clock, until something else needs the widgets drawn. See
+[What a spinner frame costs](#what-a-spinner-frame-costs). An unfocused window
+may still be in view, so its spinners keep turning, but slower: one frame
+every `SPINNER_BACKGROUND_FRAME` (500 ms), turning the arc thirty degrees,
+`SPINNER_BACKGROUND_STEP`. Measure the UI process with one busy agent on
+screen:
 
 1. Run `scripts/run-development --browserless` without `--debug` in a nested
    session, using the isolated environment from
@@ -103,42 +107,60 @@ that stopped them entirely measured 1.0-1.6% with another window focused
 
 ### What a spinner frame costs
 
-A frame that only turns spinners skips the application's update, view and
-layout, but it still walks the whole widget tree for the redraw event and
-for drawing, and it presents the whole window. Two changes made such a frame
-cheaper by a quarter to nearly a half (#3564):
+A spinner asks its window for animation frames (`Shell::request_animation`)
+and draws itself as an SVG that spins from an instant with a period
+(`Svg::spin`). While nothing else has changed since the window last drew its
+widgets, iced-winit answers such a frame without updating or drawing the
+widget tree, and iced_wgpu presents the layers it already has: it prepares
+only the image layers holding a spinning SVG, at the frame's instant, and
+renders. Anything else that needs a drawing, an event, a rebuild, a layout
+or a timed redraw, draws the window as before, and the spinners renew their
+requests on its redraw event. The vendored crates' READMEs (`iced-core`,
+`iced-runtime`, `iced-winit`, `iced-graphics`, `iced-wgpu`) describe each
+part (#3581).
 
-- iced_wgpu keeps a text group's prepared glyphs while the group draws the
-  same text in the same place (#3571). Before, every frame prepared every
-  visible glyph again, which took 22% of the UI thread.
-- A sidebar row looks for focus only after an event that may move it, an
-  operation, a rebuild or a layout (#3575). Before, every row in view walked
-  its controls twice on every redraw, which took 7% of the UI thread.
+Before that, every spinner step redrew the whole window: the redraw event and
+drawing walked the whole widget tree, and the present prepared every layer.
+Two changes had made that cheaper (#3564): iced_wgpu keeps a text group's
+prepared glyphs while it draws the same text in the same place (#3571), and a
+sidebar row looks for focus only after an event that may move it (#3575).
+Even so, a step cost about 3-4 ms of the UI thread, which held the cadence at
+50 ms, twenty frames a second.
 
 Workload: fw16 (Ryzen 7 7840HS), nested KWin at 1500x900, scale 1. The
 `realistic` seed, with four fixture Claude agents working in one channel, both
-chat panes showing long transcripts, the pointer still and the window
-focused. Every build is `dev-runtime` at opt-level 2 with frame pointers.
-Each row is one run: 30 s of `/proc` CPU time, plus the ranges of the
-`CAGENTS_UI_TRACE` frame lines (5 s windows) from the same run:
+chat panes showing long transcripts and the pointer still. Every build is
+`dev-runtime` at opt-level 2 with frame pointers. Each row is one run: 30 s of
+`/proc` CPU time for the UI's main thread, plus the ranges of the
+`CAGENTS_UI_TRACE` frame lines (5 s windows) from the same run. fw16 was
+shared and loaded (load average 13-21 on 16 threads), so compare rows taken
+back to back rather than with older tables:
 
-| Build | Cadence | UI main thread | Frame work p50 | Frame work p95 |
-| --- | --- | --- | --- | --- |
-| `2f49dc2f2`, before both changes | 100 ms | 3.4% | 2.8-3.1 ms | 6.3-7.4 ms |
-| `16e894234`, after both | 100 ms | 2.4% | 1.7-2.1 ms | 4.0-7.3 ms |
-| `16e894234` with a 50 ms cadence | 50 ms | 4.5% | 1.9-2.2 ms | 4.4-8.7 ms |
+| Build | Window | Frames | UI main thread | Frame work p50 | Frame work p95 | Interval p95 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `baad545db`, 50 ms steps | focused | 20/s | 8.5% | 3.0-3.5 ms | 5.9-17 ms | 51-55 ms |
+| animation frames only | focused | 60/s | 9.6% | 1.1-1.3 ms | 1.9-3.3 ms | 18-20 ms |
+| animation frames and retained layers | focused | 60/s | 7.3% | 0.71-0.81 ms | 0.8-1.9 ms | 17.5-19 ms |
+| `baad545db` | another window focused | 2/s | 1.9% | 5-13 ms | 15-16 ms | 501 ms |
+| animation frames and retained layers | another window focused | 2/s | 1.7% | 2.6-3.1 ms | 16-25 ms | 509-518 ms |
 
-The cadence is now 50 ms: fifteen degrees per step instead of thirty. That
-nearly doubles a spinner's cost on the UI thread against the 100 ms cadence
-on the same build (2.4% to 4.5% here), and it costs about one percentage
-point of a core more than the 100 ms cadence did before these changes. An
-unfocused window still asks for a frame every 500 ms and still moves the arc
-thirty degrees per frame, so its cost and look are unchanged.
+So spinners turn three times as often for less of the UI thread than before.
+The frames are paced by the compositor's frame callbacks (16.7 ms at 60 Hz).
+Frame work p99 stays at 12-16 ms because of the full draws in the window,
+about one or two a second from the chat's clock and the agents' output,
+which cost what they did before. A spinner-only frame now costs about
+0.7 ms, most of it encoding a render pass over every layer of the window:
+wgpu has no partial present, and keeping the rest of the window in an
+offscreen texture to composite spinners over is not done. An unfocused
+window keeps its 500 ms cadence; with the window hidden behind another one,
+the compositor sends no frame callbacks and the app drew once a second at
+1.5% of a core.
 
-The remaining per-frame cost is the widget-tree walks for the redraw event
-(about a third of a frame, including overlay collection) and the present
-(about a quarter). Repainting less than the whole window would need damage
-tracking that iced does not have.
+The software renderer (iced_tiny_skia) is not vendored and ignores
+`Svg::spin`, so under it a spinner turns only when the window draws its
+widgets, while the window still asks for a frame every display refresh. An
+accessible window finds its focused widget, an operation, before it draws,
+so it can still present between draws.
 
 ## Idle UI wakeups
 

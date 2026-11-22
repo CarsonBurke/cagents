@@ -28,3 +28,37 @@ The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so
 `text::State::prepare` keeps, for each text group it prepares, the group's text, clip bounds, transformation and the viewport resolution. When the next frame draws a group that matches at the same position in the frame, it asks the group's renderer to `reuse` its glyphs (vendor/cryoglyph/README.cagents.md) instead of preparing them again, and prepares them as before if that fails. Paragraphs, editors and raw buffers compare by identity, using `is_same_live` from vendor/iced-graphics: none is changed in place while a frame refers to it. Cached text compares by value, and a reused group keeps its shaped cached text with `Cache::keep` (vendor/iced-graphics), as preparing it would. A group that is not drawn again releases what it kept when the frame is trimmed.
 
 `drawn_identity` in `crates/iced-contracts` covers the identity contract; `mise run test:contracts` runs it. A native run with an activity spinner over a long transcript covers the reuse itself.
+
+# Spinning SVGs (#3581)
+
+A `Svg` with a `spin` (see `vendor/iced-core/README.cagents.md`, "Animation
+frames that only present") is rotated by `Spin::angle` at the instant the
+renderer prepares the frame, on top of its `rotation`. Every SVG in a frame
+uses the same instant, so spinners stay in phase. A spinning SVG always uses
+the filtered path for rotated vectors, even on the frame where its angle is
+upright, so its edges do not change sampling once a turn. A window can then
+present the same layers again for the next frame of the spin without drawing
+its widgets.
+
+# Presenting unchanged layers again (#3581)
+
+`Renderer::draw` remembers what it last prepared its layers for: the physical
+size, the scale factor, the layer `Stack::revision`
+(vendor/iced-graphics/README.cagents.md), and how many times the text atlas,
+which every window's renderer shares, had been trimmed. When a window presents
+the same layers again for the same target, as it does for a frame that only
+turns spinners, the renderer neither merges nor prepares them, except for the
+image layers holding a spinning SVG, prepared again at their own index, and
+the custom primitives, which may expect a `prepare` per frame. Quads, meshes,
+text and every other image layer render from what they uploaded last time.
+Nothing is trimmed, since a trim would release glyphs and atlas entries the
+retained layers still draw. Image layers therefore keep their instances
+through a trim, clearing each one when it is next prepared, and clear the
+layers a frame left unused. Another window's trim lets its next prepare evict
+glyphs this window's layers draw, so it makes this window prepare in full on
+its next frame.
+
+`layer_revision` in `crates/iced-contracts` covers the revision; native
+traces of a window with spinners over long transcripts cover the rest.
+iced_tiny_skia is not vendored, so the software fallback ignores `spin` and
+draws every frame in full.

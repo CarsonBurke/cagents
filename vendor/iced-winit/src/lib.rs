@@ -1120,16 +1120,7 @@ async fn run_instance<P>(
             Event::NewEvents(event::StartCause::ResumeTimeReached {
                 ..
             }) => {
-                let now = Instant::now();
-
-                for (_id, window) in window_manager.iter_mut() {
-                    if let Some(redraw_at) = window.redraw_at
-                        && redraw_at <= now
-                    {
-                        window.raw.request_redraw();
-                        window.redraw_at = None;
-                    }
-                }
+                window_manager.request_due_redraws(Instant::now());
 
                 if let Some(redraw_at) = window_manager.redraw_at() {
                     let _ = control_sender.start_send(Control::ChangeFlow(
@@ -1225,150 +1216,179 @@ async fn run_instance<P>(
                 let mut interface =
                     user_interfaces.get_mut(&id).expect("Get user interface");
 
-                let interact_span = debug::interact(id);
-                let mut redraw_count = 0;
+                // A frame that only an animation asked for, while the
+                // interface is exactly as it was last drawn, presents the
+                // renderer's retained drawing again, which the renderer
+                // animates from its clock. Any other reason for this frame
+                // draws the window, and the widgets renew their animation
+                // requests on its redraw event.
+                let retained = !window.needs_draw
+                    && window.animation.is_animating()
+                    && interface.is_drawn();
 
-                let state = loop {
-                    let message_count = messages.len();
-                    let (state, _) = interface.update(
-                        slice::from_ref(&redraw_event),
-                        cursor,
+                if !retained {
+                    window.needs_draw = false;
+
+                    let interact_span = debug::interact(id);
+                    let mut redraw_count = 0;
+
+                    let state = loop {
+                        let message_count = messages.len();
+                        let (state, _) = interface.update(
+                            slice::from_ref(&redraw_event),
+                            cursor,
+                            &mut window.renderer,
+                            &mut clipboard,
+                            &mut messages,
+                        );
+
+                        if message_count == messages.len()
+                            && !state.has_layout_changed()
+                        {
+                            break state;
+                        }
+
+                        if redraw_count >= 2 {
+                            log::warn!(
+                                "More than 3 consecutive RedrawRequested events \
+                                        produced layout invalidation"
+                            );
+
+                            break state;
+                        }
+
+                        redraw_count += 1;
+
+                        if !messages.is_empty() {
+                            let caches: FxHashMap<_, _> =
+                                ManuallyDrop::into_inner(user_interfaces)
+                                    .into_iter()
+                                    .map(|(id, interface)| {
+                                        (id, interface.into_cache())
+                                    })
+                                    .collect();
+
+                            let actions =
+                                update(&mut program, &mut runtime, &mut messages);
+
+                            user_interfaces =
+                                ManuallyDrop::new(build_user_interfaces(
+                                    &program,
+                                    &mut window_manager,
+                                    caches,
+                                    &mut clipboard,
+                                ));
+
+                            for action in actions {
+                                // Defer all window actions to avoid compositor
+                                // race conditions while redrawing
+                                if let Action::Window(_) = action {
+                                    proxy.send_action(action);
+                                    continue;
+                                }
+
+                                _ = run_action!(action);
+                            }
+
+                            for (window_id, window) in window_manager.iter_mut() {
+                                // We are already redrawing this window
+                                if window_id == id {
+                                    continue;
+                                }
+
+                                window.raw.request_redraw();
+                            }
+
+                            let Some(next_compositor) = compositor.as_mut() else {
+                                continue 'next_event;
+                            };
+
+                            current_compositor = next_compositor;
+                            window = window_manager.get_mut(id).unwrap();
+
+                            // Window scale factor changed during a redraw request
+                            if logical_size != window.state.logical_size() {
+                                logical_size = window.state.logical_size();
+
+                                log::debug!(
+                                    "Window scale factor changed during a redraw request"
+                                );
+
+                                let ui = user_interfaces
+                                    .remove(&id)
+                                    .expect("Remove user interface");
+
+                                let layout_span = debug::layout(id);
+                                let _ = user_interfaces.insert(
+                                    id,
+                                    ui.relayout(logical_size, &mut window.renderer),
+                                );
+                                layout_span.finish();
+                            }
+
+                            interface = user_interfaces.get_mut(&id).unwrap();
+                        }
+                    };
+                    interact_span.finish();
+
+                    let draw_span = debug::draw(id);
+                    // Finding the focused widget for the accessibility tree
+                    // is an operation, which leaves the interface undrawn,
+                    // so it runs before the draw: otherwise no frame of an
+                    // accessible window could only present.
+                    #[cfg(feature = "a11y")]
+                    let focused = a11y_enabled
+                        .contains(&id)
+                        .then(|| {
+                            let mut focused = crate::a11y::Focused::default();
+                            interface.operate(&window.renderer, &mut focused);
+                            focused
+                        });
+                    interface.draw(
                         &mut window.renderer,
-                        &mut clipboard,
-                        &mut messages,
+                        window.state.theme(),
+                        &renderer::Style {
+                            icon_color: window.state.icon_color(),
+                            text_color: window.state.text_color(),
+                            scale_factor: window.state.scale_factor(),
+                        },
+                        cursor,
                     );
+                    #[cfg(feature = "a11y")]
+                    if let Some(focused) = focused {
+                        if let Some(root) = a11y_roots.get(&id) {
+                            let update = crate::a11y::tree_update(
+                                *root,
+                                program.title(id),
+                                interface.a11y_nodes(cursor),
+                                focused.id,
+                                window.state.scale_factor(),
+                            );
+                            let _ = control_sender.unbounded_send(
+                                Control::UpdateAccessibility(id, update),
+                            );
+                        }
+                    }
+                    platform_specific_handler
+                        .update_subsurfaces(id, window.raw.rwh_06_window_handle());
+                    draw_span.finish();
 
-                    if message_count == messages.len()
-                        && !state.has_layout_changed()
+                    if let user_interface::State::Updated {
+                        redraw_request,
+                        animation_request,
+                        input_method,
+                        mouse_interaction,
+                        ..
+                    } = state
                     {
-                        break state;
+                        window.request_redraw(redraw_request);
+                        window.animation = animation_request;
+                        window.request_input_method(input_method);
+                        window.update_mouse(mouse_interaction);
+                    } else {
+                        window.animation = window::AnimationRequest::None;
                     }
 
-                    if redraw_count >= 2 {
-                        log::warn!(
-                            "More than 3 consecutive RedrawRequested events \
-                                    produced layout invalidation"
-                        );
-
-                        break state;
-                    }
-
-                    redraw_count += 1;
-
-                    if !messages.is_empty() {
-                        let caches: FxHashMap<_, _> =
-                            ManuallyDrop::into_inner(user_interfaces)
-                                .into_iter()
-                                .map(|(id, interface)| {
-                                    (id, interface.into_cache())
-                                })
-                                .collect();
-
-                        let actions =
-                            update(&mut program, &mut runtime, &mut messages);
-
-                        user_interfaces =
-                            ManuallyDrop::new(build_user_interfaces(
-                                &program,
-                                &mut window_manager,
-                                caches,
-                                &mut clipboard,
-                            ));
-
-                        for action in actions {
-                            // Defer all window actions to avoid compositor
-                            // race conditions while redrawing
-                            if let Action::Window(_) = action {
-                                proxy.send_action(action);
-                                continue;
-                            }
-
-                            _ = run_action!(action);
-                        }
-
-                        for (window_id, window) in window_manager.iter_mut() {
-                            // We are already redrawing this window
-                            if window_id == id {
-                                continue;
-                            }
-
-                            window.raw.request_redraw();
-                        }
-
-                        let Some(next_compositor) = compositor.as_mut() else {
-                            continue 'next_event;
-                        };
-
-                        current_compositor = next_compositor;
-                        window = window_manager.get_mut(id).unwrap();
-
-                        // Window scale factor changed during a redraw request
-                        if logical_size != window.state.logical_size() {
-                            logical_size = window.state.logical_size();
-
-                            log::debug!(
-                                "Window scale factor changed during a redraw request"
-                            );
-
-                            let ui = user_interfaces
-                                .remove(&id)
-                                .expect("Remove user interface");
-
-                            let layout_span = debug::layout(id);
-                            let _ = user_interfaces.insert(
-                                id,
-                                ui.relayout(logical_size, &mut window.renderer),
-                            );
-                            layout_span.finish();
-                        }
-
-                        interface = user_interfaces.get_mut(&id).unwrap();
-                    }
-                };
-                interact_span.finish();
-
-                let draw_span = debug::draw(id);
-                interface.draw(
-                    &mut window.renderer,
-                    window.state.theme(),
-                    &renderer::Style {
-                        icon_color: window.state.icon_color(),
-                        text_color: window.state.text_color(),
-                        scale_factor: window.state.scale_factor(),
-                    },
-                    cursor,
-                );
-                #[cfg(feature = "a11y")]
-                if a11y_enabled.contains(&id) {
-                    if let Some(root) = a11y_roots.get(&id) {
-                        let mut focused = crate::a11y::Focused::default();
-                        interface.operate(&window.renderer, &mut focused);
-                        let update = crate::a11y::tree_update(
-                            *root,
-                            program.title(id),
-                            interface.a11y_nodes(cursor),
-                            focused.id,
-                            window.state.scale_factor(),
-                        );
-                        let _ = control_sender.unbounded_send(
-                            Control::UpdateAccessibility(id, update),
-                        );
-                    }
-                }
-                platform_specific_handler
-                    .update_subsurfaces(id, window.raw.rwh_06_window_handle());
-                draw_span.finish();
-
-                if let user_interface::State::Updated {
-                    redraw_request,
-                    input_method,
-                    mouse_interaction,
-                    ..
-                } = state
-                {
-                    window.request_redraw(redraw_request);
-                    window.request_input_method(input_method);
-                    window.update_mouse(mouse_interaction);
                 }
 
                 runtime.broadcast(subscription::Event::Interaction {
@@ -1377,7 +1397,9 @@ async fn run_instance<P>(
                     status: core::event::Status::Ignored,
                 });
 
-                window.draw_preedit();
+                if !retained {
+                    window.draw_preedit();
+                }
 
                 let present_span = debug::present(id);
                 match current_compositor.present(
@@ -1436,6 +1458,10 @@ async fn run_instance<P>(
                             }
                         }
                     },
+                }
+
+                if let Some(window) = window_manager.get_mut(id) {
+                    window.schedule_animation(Instant::now());
                 }
             }
             Event::Winit(window_id, event) => {
@@ -1692,14 +1718,7 @@ async fn run_instance<P>(
                     }
                 }
 
-                for (_id, window) in window_manager.iter_mut() {
-                    if let Some(redraw_at) = window.redraw_at
-                        && redraw_at <= Instant::now()
-                    {
-                        window.raw.request_redraw();
-                        window.redraw_at = None;
-                    }
-                }
+                window_manager.request_due_redraws(Instant::now());
                 if let Some(redraw_at) = window_manager.redraw_at() {
                     let _ = control_sender.start_send(Control::ChangeFlow(
                         ControlFlow::WaitUntil(redraw_at),
@@ -1801,7 +1820,7 @@ async fn run_instance<P>(
                 if enabled {
                     a11y_enabled.insert(id);
                     if let Some(window) = window_manager.get_mut(id) {
-                        window.raw.request_redraw();
+                        window.request_draw();
                     }
                 } else {
                     a11y_enabled.remove(&id);
@@ -2587,7 +2606,7 @@ where
             }
             window::Action::RedrawAll => {
                 for (_id, window) in window_manager.iter_mut() {
-                    window.raw.request_redraw();
+                    window.request_draw();
                 }
             }
             window::Action::RelayoutAll => {
