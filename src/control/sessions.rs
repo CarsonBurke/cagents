@@ -211,7 +211,8 @@ pub(super) fn session_json(member: &Member, now: u64) -> Value {
 /// A session's prompt cache as `--json` reports it: whether it is `cold` at
 /// `now`, when it likely expires in Unix seconds, the context in tokens a
 /// message would read again were it cold, and whether its lifetime was
-/// `observed` or `assumed` from the provider's documentation.
+/// `reported` by the provider, `observed`, or `assumed` from the provider's
+/// documentation.
 pub(super) fn cache_json(member: &Member, now: u64, detail: Detail) -> Value {
     use crate::agent_execution::directory::{TtlBasis, Warmth};
     let Some(cache) = &member.cache else {
@@ -226,6 +227,7 @@ pub(super) fn cache_json(member: &Member, now: u64, detail: Detail) -> Value {
             match cache.basis {
                 TtlBasis::Assumed => "assumed",
                 TtlBasis::Observed => "observed",
+                TtlBasis::Reported => "reported",
             },
         )
         .into_value()
