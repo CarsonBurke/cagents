@@ -18955,6 +18955,19 @@ fn capacity_recovery_labels(app: &Cagents, card: CardId) -> Vec<String> {
     recovery_labels(app.card_view(card, true, false))
 }
 
+/// The card's controls and its failure notices, where a refusal's guidance
+/// stands.
+fn capacity_refusal_labels(app: &mut Cagents, card: CardId) -> Vec<String> {
+    let mut labels = capacity_recovery_labels(app, card);
+    if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+        runtime.refresh_failure_ui();
+        for incident in &runtime.failure_ui.incidents {
+            labels.extend(recovery_labels(runtime.failure_view(incident)));
+        }
+    }
+    labels
+}
+
 fn recovery_labels(mut element: Element<'_, Message>) -> Vec<String> {
     use iced::advanced::{Layout, layout, widget::Tree};
     let renderer = crate::app::tests::headless_renderer();
@@ -19573,7 +19586,7 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
     assert_eq!(runtime.composer.text(), "hello");
     assert!(runtime.queued.is_none());
     assert!(!app.chat_offers_fresh_conversation(card));
-    let labels = capacity_recovery_labels(&app, card);
+    let labels = capacity_refusal_labels(&mut app, card);
     assert!(labels.iter().any(|label| label == "Retry"), "{labels:?}");
     assert!(
         labels
@@ -19588,7 +19601,7 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
                 && !label.contains("Review the details")),
         "{labels:?}"
     );
-    let retry = runtime.target;
+    let retry = chat_runtime(&app, card).target;
     submit_target(&mut app, retry);
     let attempt = chat_runtime_attempt(&app, card);
     let runtime = chat_runtime(&app, card);
@@ -19637,7 +19650,7 @@ fn capacity_refusal_on_cold_restore_keeps_guidance_identity_and_stashed_draft() 
     );
     assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
     assert_eq!(app.chat_capacity_guidance(card), Some(CAPACITY_GUIDANCE));
-    let labels = capacity_recovery_labels(&app, card);
+    let labels = capacity_refusal_labels(&mut app, card);
     assert!(
         labels.iter().any(|label| label.contains("Retry")),
         "{labels:?}"
@@ -19714,7 +19727,7 @@ fn capacity_refusal_retry_preserves_saved_identity_and_unsent_draft() {
     assert_eq!(runtime.session, source);
     assert_eq!(runtime.composer.text(), "unsent capacity draft");
     assert!(!app.chat_offers_fresh_conversation(card));
-    let labels = capacity_recovery_labels(&app, card);
+    let labels = capacity_refusal_labels(&mut app, card);
     assert!(labels.iter().any(|label| label == "Retry"), "{labels:?}");
     assert!(
         labels
@@ -19729,7 +19742,7 @@ fn capacity_refusal_retry_preserves_saved_identity_and_unsent_draft() {
                 && !label.contains("Review the details")),
         "{labels:?}"
     );
-    let retry = runtime.target;
+    let retry = chat_runtime(&app, card).target;
     drop(app.handle_chat_ui(Action::Reconnect(retry)));
     assert_eq!(app.chat_ui.attempt(card).unwrap().session, source);
     assert!(!chat_runtime(&app, card).capacity_refused);
