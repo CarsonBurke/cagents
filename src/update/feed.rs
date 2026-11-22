@@ -123,14 +123,14 @@ impl Feed {
             cancellation,
         ) {
             Ok(file) => read_all(file)?,
-            Err(error @ (UpdateError::Cancelled | UpdateError::Timeout(_))) => return Err(error),
-            // Its metadata was just read from the same place, so this is
-            // almost always a release published without a signature.
-            Err(_) => {
+            // Its metadata was just read from the same place, so a missing
+            // signature is a release published without one.
+            Err(error) if self.missing(&error) => {
                 return Err(invalid(format!(
                     "cagents {version} is not signed, so this build will not install it"
                 )));
             }
+            Err(error) => return Err(error),
         };
         let signature = String::from_utf8(signature)
             .map_err(|_| invalid("the release signature is malformed"))?;
@@ -149,13 +149,19 @@ impl Feed {
         directory: &str,
         cancellation: &CancellationToken,
     ) -> Result<Vec<u8>, UpdateError> {
-        read_all(self.fetch(
+        match self.fetch(
             &format!("{directory}/{METADATA}"),
             "checking for a new release",
             METADATA_LIMIT,
             Duration::from_secs(60),
             cancellation,
-        )?)
+        ) {
+            Ok(file) => read_all(file),
+            Err(error) if self.missing(&error) => Err(invalid(
+                "no published release of cagents offers in-app updates yet",
+            )),
+            Err(error) => Err(error),
+        }
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Release, UpdateError> {
@@ -267,7 +273,46 @@ impl Feed {
             .arg("--")
             .arg(format!("{}/{path}", self.base))
             .env_remove("CURL_HOME");
-        bounded_command(&mut command, operation, limit, timeout, cancellation)
+        bounded_command(&mut command, operation, limit, timeout, cancellation).map_err(|error| {
+            match error {
+                UpdateError::Exited { status, .. } if !self.missing_status(status) => {
+                    curl_failure(operation, status)
+                }
+                error => error,
+            }
+        })
+    }
+
+    /// Whether the feed answered that the file does not exist: an HTTP error
+    /// under `--fail`, or an unreadable file in a file feed.
+    fn missing(&self, error: &UpdateError) -> bool {
+        matches!(error, UpdateError::Exited { status, .. } if self.missing_status(*status))
+    }
+
+    fn missing_status(&self, status: std::process::ExitStatus) -> bool {
+        match status.code() {
+            Some(22) => true,
+            Some(37) => self.local,
+            _ => false,
+        }
+    }
+}
+
+/// curl's failures, in words for the person checking for an update.
+fn curl_failure(operation: &'static str, status: std::process::ExitStatus) -> UpdateError {
+    match status.code() {
+        Some(5..=7) => invalid(format!(
+            "{operation} failed: cannot reach github.com; check the network connection"
+        )),
+        Some(28) => UpdateError::Timeout(operation),
+        Some(35 | 51 | 53 | 54 | 58 | 59 | 60 | 77 | 80 | 83 | 90 | 91) => invalid(format!(
+            "{operation} failed: no secure connection to github.com could be made"
+        )),
+        Some(56 | 52 | 18) => invalid(format!(
+            "{operation} failed: the connection to github.com broke off; try again"
+        )),
+        Some(63) => invalid(format!("{operation} exceeds its size limit")),
+        _ => UpdateError::Exited { operation, status },
     }
 }
 
@@ -495,6 +540,44 @@ mod tests {
             ..feed
         };
         assert!(untrusted.release(version, &cancellation).is_err());
+    }
+
+    #[test]
+    fn only_a_missing_file_reads_as_unpublished_and_other_curl_failures_say_why() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let exited = |code: i32| UpdateError::Exited {
+            operation: "reading the release's signature",
+            status: status(code),
+        };
+        let public = feed();
+        let local = Feed {
+            local: true,
+            ..feed()
+        };
+        assert!(public.missing(&exited(22)));
+        assert!(local.missing(&exited(22)) && local.missing(&exited(37)));
+        // A network failure on the signature is not an unsigned release.
+        for code in [6, 7, 35, 37, 56] {
+            assert!(!public.missing(&exited(code)), "curl exit {code}");
+        }
+        assert_eq!(
+            curl_failure("checking for a new release", status(6)).to_string(),
+            "checking for a new release failed: cannot reach github.com; check the network connection"
+        );
+        assert!(matches!(
+            curl_failure("checking for a new release", status(28)),
+            UpdateError::Timeout("checking for a new release")
+        ));
+        assert!(
+            curl_failure("downloading the release", status(60))
+                .to_string()
+                .contains("no secure connection")
+        );
+        assert_eq!(
+            curl_failure("downloading the release", status(99)).to_string(),
+            "downloading the release failed (exit status: 99)"
+        );
     }
 
     #[test]

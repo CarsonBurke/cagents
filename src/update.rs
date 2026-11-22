@@ -131,6 +131,13 @@ pub enum UpdateError {
     Refused(Box<impact::Refusal>),
     #[error("{0} timed out")]
     Timeout(&'static str),
+    /// A bounded subprocess exited unsuccessfully. Callers that know the
+    /// program, like the release feed's curl, turn its status into words.
+    #[error("{operation} failed ({status})")]
+    Exited {
+        operation: &'static str,
+        status: std::process::ExitStatus,
+    },
     /// The source daemon refused a request as busy each time it was asked,
     /// before admitting anything. `serving` is the authenticated daemon that
     /// answered, so a receipt can say a daemon is serving.
@@ -2859,7 +2866,7 @@ fn bounded_command(
             }
             if eof && let Some(status) = child.observed_exit_status()? {
                 if !status.success() {
-                    return Err(invalid(format!("{operation} failed ({status})")));
+                    return Err(UpdateError::Exited { operation, status });
                 }
                 break;
             }

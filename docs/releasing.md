@@ -180,7 +180,14 @@ long-lived `ssh-agent`, which would sign for any process of the user.
 To replace a key, publish a release signed by the old key whose
 `release-keys.pub` lists the new one. To withdraw a compromised key, publish a
 release, signed by a remaining key, that no longer lists it. A build trusts
-exactly the keys it was built with.
+exactly the keys it was built with, so builds that have not yet installed that
+release keep trusting the withdrawn key, and its holder can still sign updates
+for them until they do.
+
+A signature proves who made a release, not that it is the newest. Whoever can
+publish on GitHub can point `latest` at an older signed release: installed
+builds are then not offered anything newer, though never anything older than
+what they run.
 
 Development builds, and rehearsal builds compiled with
 `CAGENTS_UPDATE_REHEARSAL_KEYS` (extra public key lines), read releases from
