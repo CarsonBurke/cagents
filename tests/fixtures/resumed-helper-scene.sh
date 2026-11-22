@@ -30,10 +30,12 @@ mkdir -p "$config"
 # Skip from Outer's Agent call for Inner to just before its SendMessage. The
 # fixture closes the turn with its own reply, and the recording's session
 # belongs to another conversation.
-jq -c 'del(.session_id)' "$here/claude-nested-agent-resumed-live.jsonl" | awk '
+jq -c 'select(.type != "result") | del(.session_id)' \
+    "$here/claude-nested-agent-resumed-live.jsonl" | awk '
     /"name":"Agent"/ && /"parent_tool_use_id":"toolu_/ { skip = 1 }
     /"name":"SendMessage"/ { skip = 0 }
-    !skip && !/^\{"type":"result"/' >"$config/fixture-frames.jsonl"
+    !skip' >"$config/fixture-frames.jsonl"
+"$ne" cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project" >/dev/null || log "project open failed"
 printf '%s\n' 'Outer has finished.' >"$config/fixture-reply.md"
 "$ne" cli --json agent spawn --provider claude --model haiku --surface chat \
     --repository "$CAGENTS_EVIDENCE_TASK/fixture/project" --prompt 'Run the outer agent.' >/dev/null ||
