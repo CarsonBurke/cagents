@@ -6,6 +6,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CACHE=${CAGENTS_RELEASE_CACHE:-"$HOME/.cache/cagents-release/ubuntu-22.04-amd64"}
 OUTPUT=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
 REF=
+NOTES=
 BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz
 BASE_SHA256=242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a
 CACHE_ID="cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 $BASE_SHA256"
@@ -17,17 +18,20 @@ fail() {
 
 while (($#)); do
     case $1 in
-        --ref|--output)
+        --ref|--output|--notes)
             (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
-            case $1 in --ref) REF=$2 ;; --output) OUTPUT=$2 ;; esac
+            case $1 in --ref) REF=$2 ;; --output) OUTPUT=$2 ;; --notes) NOTES=$2 ;; esac
             shift 2
             ;;
         --help)
             printf '%s\n' \
-                'Usage: scripts/build-release-linux [--ref REF] [--output DIR]' \
+                'Usage: scripts/build-release-linux [--ref REF] [--output DIR] [--notes FILE]' \
                 'Build and verify Linux releases locally in rootless Ubuntu 22.04.' \
                 'REF defaults to v<Cargo.toml version>; only committed source is exported.' \
                 'DIR defaults to CAGENTS_DIST_DIR or dist and must be empty.' \
+                'FILE holds the release notes in Markdown; by default they are the features,' \
+                'fixes and speedups committed since the previous release tag.' \
+                'DIR also receives release-metadata.json, which must be signed before publishing.' \
                 'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
                 'Git, curl, GNU tar/coreutils, flock, network access, and ample disk space.' \
                 'CAGENTS_RELEASE_CACHE selects a private, marked cache (default:' \
@@ -43,7 +47,7 @@ done
 CALLER_UID=$(id -u)
 CALLER_GID=$(id -g)
 [[ $CALLER_UID != 0 ]] || fail 'run as your ordinary nonroot user, not root'
-for command in bwrap git curl tar sha256sum flock realpath stat mktemp install; do
+for command in bwrap git curl tar sha256sum flock realpath stat mktemp install python3; do
     command -v "$command" >/dev/null || fail "required command not found: $command"
 done
 if [[ -z ${CARGO_BUILD_JOBS:-} ]]; then
@@ -81,6 +85,13 @@ case $REF in
         [[ ${REF#refs/tags/} == "v$version" ]] || fail 'source tag and manifest versions do not match'
         ;;
 esac
+PROTOCOL=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:src/terminal/ipc.rs") || fail 'source ref has no src/terminal/ipc.rs'
+PROTOCOL=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "$PROTOCOL")
+[[ $PROTOCOL =~ ^[1-9][0-9]*$ ]] || fail 'cannot read the source daemon protocol'
+if [[ -n $NOTES ]]; then
+    [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
+    NOTES=$(realpath -- "$NOTES")
+fi
 for file in scripts/package-linux.sh scripts/package-ceditor-linux.sh install.sh; do
     git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:$file" || fail "missing source file: $file"
 done
@@ -223,6 +234,19 @@ bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
 SMOKE_ROOTFS=$("$ROOT_DIR/scripts/prepare-release-smoke-rootfs")
 VERSION=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:Cargo.toml" | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}')
 "$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
+# The signed metadata names every asset with its size and digest, so an
+# installed cagents trusts the release through one signature.
+if [[ -z $NOTES ]]; then
+    NOTES=$WORK/notes.md
+    previous=$(git -C "$ROOT_DIR" describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$SOURCE_COMMIT^" 2>/dev/null) || previous=
+    "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} \
+        --to "$SOURCE_COMMIT" > "$NOTES"
+fi
+"$ROOT_DIR/scripts/release-metadata" write --dir "$WORK/dist" --version "$VERSION" \
+    --source-commit "$SOURCE_COMMIT" --protocol "$PROTOCOL" --notes "$NOTES" >/dev/null \
+    || fail 'cannot write the release metadata; with long notes, pass a shorter --notes FILE'
 # Build or smoke failures leave public output empty. Only verified assets cross out.
 cp -- "$WORK/dist/"* "$OUTPUT/"
 printf 'Verified local release assets: %s\n' "$OUTPUT"
+printf 'Sign the metadata before publishing:\n  ssh-keygen -Y sign -n cagents-release -f KEY %q\n' \
+    "$OUTPUT/release-metadata.json"
