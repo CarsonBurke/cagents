@@ -8817,6 +8817,13 @@ fn file_task(
                 }
                 if let Ok(read) = &mut result {
                     read.watch_revision = revision;
+                    if read.is_markdown() {
+                        // The editor builds its Markdown highlighter on the
+                        // UI thread, where loading the grammar would stall a
+                        // frame. Load it here; the shared cache keeps it
+                        // long enough for the highlighter to join it.
+                        drop(crate::diff_view::syntax_lease());
+                    }
                 }
                 return result;
             }

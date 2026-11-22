@@ -312,6 +312,16 @@ impl FileRead {
     pub fn worktree(&self) -> &Path {
         &self.worktree
     }
+    /// Whether the read opened a Markdown buffer for editing.
+    pub(crate) fn is_markdown(&self) -> bool {
+        matches!(
+            self.result,
+            Ok(LoadedFile {
+                content: FileContent::Editable { markdown: true, .. },
+                ..
+            })
+        )
+    }
     pub(crate) fn into_parts(self) -> (std::sync::Arc<Root>, Result<LoadedFile, FileIoError>) {
         (self.root, self.result)
     }
