@@ -1332,6 +1332,18 @@ async fn run_instance<P>(
                     interact_span.finish();
 
                     let draw_span = debug::draw(id);
+                    // Finding the focused widget for the accessibility tree
+                    // is an operation, which leaves the interface undrawn,
+                    // so it runs before the draw: otherwise no frame of an
+                    // accessible window could only present.
+                    #[cfg(feature = "a11y")]
+                    let focused = a11y_enabled
+                        .contains(&id)
+                        .then(|| {
+                            let mut focused = crate::a11y::Focused::default();
+                            interface.operate(&window.renderer, &mut focused);
+                            focused
+                        });
                     interface.draw(
                         &mut window.renderer,
                         window.state.theme(),
@@ -1343,10 +1355,8 @@ async fn run_instance<P>(
                         cursor,
                     );
                     #[cfg(feature = "a11y")]
-                    if a11y_enabled.contains(&id) {
+                    if let Some(focused) = focused {
                         if let Some(root) = a11y_roots.get(&id) {
-                            let mut focused = crate::a11y::Focused::default();
-                            interface.operate(&window.renderer, &mut focused);
                             let update = crate::a11y::tree_update(
                                 *root,
                                 program.title(id),

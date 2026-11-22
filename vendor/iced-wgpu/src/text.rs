@@ -273,6 +273,11 @@ pub struct Pipeline {
     format: wgpu::TextureFormat,
     cache: cryoglyph::Cache,
     atlas: Arc<RwLock<cryoglyph::TextAtlas>>,
+    /// How many times the shared atlas has been trimmed. A trim lets the
+    /// next prepare of any renderer evict glyphs no renderer has prepared
+    /// since, including those of layers another renderer is presenting
+    /// again without preparing them.
+    trims: Arc<AtomicU64>,
 }
 
 impl Pipeline {
@@ -290,6 +295,7 @@ impl Pipeline {
             format,
             cache,
             atlas: Arc::new(RwLock::new(atlas)),
+            trims: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -299,6 +305,12 @@ impl Pipeline {
 
     pub fn trim(&self) {
         self.atlas.write().expect("Write text atlas").trim();
+        let _ = self.trims.fetch_add(1, atomic::Ordering::Relaxed);
+    }
+
+    /// Returns how many times the shared atlas has been trimmed.
+    pub fn trims(&self) -> u64 {
+        self.trims.load(atomic::Ordering::Relaxed)
     }
 }
 

@@ -42,17 +42,21 @@ its widgets.
 
 # Presenting unchanged layers again (#3581)
 
-`Renderer::draw` remembers the physical size, scale factor and layer
-`Stack::revision` (vendor/iced-graphics/README.cagents.md) it last prepared
-for. When a window presents the same layers again for the same target, as it
-does for a frame that only turns spinners, the renderer prepares only the
-image layers holding a spinning SVG, again at their own index, and the
-custom primitives, which may expect a `prepare` per frame. Quads, meshes,
-text and every other image layer render from what they uploaded last time,
-and nothing is trimmed: a trim would release glyphs and atlas entries the
+`Renderer::draw` remembers what it last prepared its layers for: the physical
+size, the scale factor, the layer `Stack::revision`
+(vendor/iced-graphics/README.cagents.md), and how many times the text atlas,
+which every window's renderer shares, had been trimmed. When a window presents
+the same layers again for the same target, as it does for a frame that only
+turns spinners, the renderer neither merges nor prepares them, except for the
+image layers holding a spinning SVG, prepared again at their own index, and
+the custom primitives, which may expect a `prepare` per frame. Quads, meshes,
+text and every other image layer render from what they uploaded last time.
+Nothing is trimmed, since a trim would release glyphs and atlas entries the
 retained layers still draw. Image layers therefore keep their instances
 through a trim, clearing each one when it is next prepared, and clear the
-layers a frame left unused.
+layers a frame left unused. Another window's trim lets its next prepare evict
+glyphs this window's layers draw, so it makes this window prepare in full on
+its next frame.
 
 `layer_revision` in `crates/iced-contracts` covers the revision; native
 traces of a window with spinners over long transcripts cover the rest.

@@ -109,6 +109,9 @@ struct Prepared {
     physical_size: Size<u32>,
     scale_factor: f64,
     revision: u64,
+    /// The shared text atlas's trim count once this renderer had trimmed.
+    /// Another renderer's trim may let glyphs these layers draw be evicted.
+    text_atlas_trims: u64,
 }
 
 impl Renderer {
@@ -167,18 +170,18 @@ impl Renderer {
         // again for their next frame without drawing its widgets.
         let now = core::time::Instant::now();
 
-        self.layers.merge();
-
         let prepared = Prepared {
             physical_size: viewport.physical_size(),
             scale_factor: viewport.scale_factor(),
             revision: self.layers.revision(),
+            text_atlas_trims: self.engine.text_pipeline.trims(),
         };
 
         // Layers presented again for the same target keep everything they
         // uploaded last time, so only what changes with time is prepared
-        // again. Nothing was left unused either, so nothing is trimmed: a
-        // trim would evict what the retained layers still draw.
+        // again. They are not merged again either: merging merged layers
+        // can still move primitives between them. Nothing was left unused,
+        // so nothing is trimmed: a trim would evict what they still draw.
         if self.prepared == Some(prepared) {
             self.prepare_animations(&mut encoder, viewport, now);
             self.render(&mut encoder, target, clear_color, viewport);
@@ -186,9 +189,9 @@ impl Renderer {
             return encoder;
         }
 
+        self.layers.merge();
         self.prepare(&mut encoder, viewport, now);
         self.render(&mut encoder, target, clear_color, viewport);
-        self.prepared = Some(prepared);
 
         self.quad.trim();
         self.triangle.trim();
@@ -202,6 +205,13 @@ impl Renderer {
             self.image.trim();
             self.image_cache.borrow_mut().trim();
         }
+
+        // Merging and trimming leave the revision alone; the trim count is
+        // taken once this renderer's own trim has counted.
+        self.prepared = Some(Prepared {
+            text_atlas_trims: self.engine.text_pipeline.trims(),
+            ..prepared
+        });
 
         encoder
     }

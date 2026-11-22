@@ -91,7 +91,9 @@ window's animation request with the one its widgets made on that frame's
 redraw event. After each presented frame the window asks for the next
 animation frame: at once for `EveryFrame`, which the compositor's frame
 callbacks pace, or after the interval for `Every`. Timed animation frames
-join widget redraws in the event loop's deadline. Remove this with the
+join widget redraws in the event loop's deadline. An accessible window
+finds its focused widget for the tree, an operation, before drawing rather
+than after, so the draw leaves the interface drawn. Remove this with the
 iced-core change.
 
 This standalone package is not a workspace member and does not see the root

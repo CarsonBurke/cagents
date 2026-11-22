@@ -158,8 +158,9 @@ the compositor sends no frame callbacks and the app drew once a second at
 
 The software renderer (iced_tiny_skia) is not vendored and ignores
 `Svg::spin`, so under it a spinner turns only when the window draws its
-widgets. An accessibility client makes the window draw on every frame,
-because its tree operations mark the widgets undrawn.
+widgets, while the window still asks for a frame every display refresh. An
+accessible window finds its focused widget, an operation, before it draws,
+so it can still present between draws.
 
 ## Idle UI wakeups
 

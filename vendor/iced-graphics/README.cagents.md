@@ -33,8 +33,10 @@ it, so they agree. Spans without these are shaped as upstream shapes them.
 # Layer stack revision (#3581)
 
 `layer::Stack::revision` changes whenever the stack's layers may have: on a
-reset, a pushed clip, or a borrow of the current layer to draw. Merging, which
-the renderer does before every present, leaves it alone. iced_wgpu presents
+reset, a pushed clip, or a borrow of the current layer to draw. Merging leaves
+it alone: the renderer reads the revision first and merges only what it is
+about to prepare, since merging merged layers can still move primitives
+between layers with different clips. iced_wgpu presents
 unchanged layers again without preparing them while it holds
 (vendor/iced-wgpu/README.cagents.md). `layer_revision` in
 `crates/iced-contracts` covers it.

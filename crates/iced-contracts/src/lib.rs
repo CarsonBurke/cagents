@@ -388,7 +388,8 @@ mod drawn_identity {
 
 /// The renderer presents a layer stack again without preparing it while the
 /// stack's revision holds, so the revision must change with anything drawn,
-/// clipped or reset, and hold through merging the already merged stack.
+/// clipped or reset. The renderer reads it before merging, the only other
+/// change it makes, so merging must leave it alone.
 #[cfg(test)]
 mod layer_revision {
     use iced_core::{Point, Rectangle, Size};
@@ -449,12 +450,9 @@ mod layer_revision {
         draw(&mut stack);
         stack.pop_clip();
 
-        // Preparing merges the layers, and presenting them again merges the
-        // merged layers; neither changes what is presented.
-        stack.merge();
         let drawn = stack.revision();
         stack.merge();
-        assert_eq!(stack.revision(), drawn);
+        assert_eq!(stack.revision(), drawn, "merging is the renderer's own");
 
         draw(&mut stack);
         assert_ne!(stack.revision(), drawn, "drawing changes the layers");
