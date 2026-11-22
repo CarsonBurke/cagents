@@ -1624,6 +1624,9 @@ impl Cagents {
                 Some(card.id) != except
                     && card.existence.is_open()
                     && !self.chat_awaiting_admission(card.id)
+                    // A closed pane a shared view put back, kept out of sight
+                    // until it goes, holds nothing to go to.
+                    && !self.returned_close_is_hidden(card.id)
                     && match &card.kind {
                         CardKind::Chat(current) => same_conversation(current, session),
                         CardKind::Terminal(current) => chat_ui::conversion(current)
@@ -1654,7 +1657,10 @@ impl Cagents {
         let local_pending = self.chat_awaiting_admission(entry.card)
             && matches!(self.card_state(entry.card).map(|card| &card.kind),
                 Some(CardKind::Chat(session)) if session == &entry.session);
-        if entry.open && !local_pending {
+        // Its own closed pane, kept out of sight while it goes, is not the
+        // conversation open elsewhere.
+        let returned = self.returned_close_is_hidden(entry.card);
+        if entry.open && !local_pending && !returned {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
             return Task::none();
         }

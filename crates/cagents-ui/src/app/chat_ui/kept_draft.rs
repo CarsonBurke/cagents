@@ -121,7 +121,13 @@ impl Cagents {
     /// Whether there was one.
     pub(in crate::app) fn reclaim_kept_draft(&mut self, closed: CardId) -> bool {
         if !self.durable.kept_chat_drafts.contains_key(&closed) {
-            return false;
+            // A closed pane a shared view put back already holds what its
+            // close kept, where a card without a runtime does.
+            return self.returned_close_is_hidden(closed)
+                && !self.cards.contains_key(&closed)
+                && (self.chat_ui.drafts.contains_key(&closed)
+                    || self.chat_ui.draft_attachments.contains_key(&closed)
+                    || self.chat_ui.waiting.contains_key(&closed));
         }
         let Some(draft) = Arc::make_mut(&mut self.durable)
             .kept_chat_drafts

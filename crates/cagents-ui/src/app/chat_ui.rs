@@ -16773,6 +16773,14 @@ pub(super) fn draft_error_for_test(app: &mut Cagents, card: CardId) -> &mut Opti
     &mut runtime.error
 }
 
+/// Gives `card`, which has no chat runtime, `text` written but not sent, as
+/// the last runtime it had left it.
+#[cfg(test)]
+pub(super) fn leave_unsent_for_test(app: &mut Cagents, card: CardId, text: &str) {
+    assert!(!matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+    app.chat_ui.drafts.insert(card, text.into());
+}
+
 /// Runs `during` while draft `card`'s file chooser is open, then dismisses the
 /// chooser as its dialog would.
 #[cfg(test)]
