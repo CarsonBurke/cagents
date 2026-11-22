@@ -136,8 +136,18 @@ check_checksums() {
     check_manifest "$1" SHA256SUMS-ceditor "$EDITOR_ARCHIVE"
 }
 
+# An allowed-signers file for the trusted key lines of a release-keys.pub.
+allowed_signers() {
+    sed -n 's/^[[:space:]]*\(ssh-ed25519\|sk-ssh-ed25519@openssh\.com\) \([A-Za-z0-9+/=]*\).*$/cagents-release namespaces="cagents-release" \1 \2/p' <<< "$1"
+}
+
+verify_signature() {
+    ssh-keygen -q -Y verify -f "$2" -I cagents-release -n cagents-release \
+        -s "$1/release-metadata.json.sig" < "$1/release-metadata.json" >/dev/null
+}
+
 check_metadata() {
-    local keys source protocol
+    local keys source protocol previous
     source=$(checkout_git show "$SOURCE_COMMIT:src/terminal/ipc.rs") || fail "$TAG has no src/terminal/ipc.rs"
     protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "$source")
     [[ $protocol =~ ^[1-9][0-9]*$ ]] || fail "cannot read the daemon protocol at $TAG"
@@ -150,12 +160,21 @@ check_metadata() {
     # hold the signing key, so the release's own build accepts its successor.
     keys=$(checkout_git show "$SOURCE_COMMIT:src/update/release-keys.pub") \
         || fail "$TAG has no src/update/release-keys.pub"
-    sed -n 's/^\(ssh-ed25519\|sk-ssh-ed25519@openssh\.com\) \([A-Za-z0-9+/=]*\).*$/cagents-release namespaces="cagents-release" \1 \2/p' \
-        <<< "$keys" > "$WORK_DIR/allowed-signers"
+    allowed_signers "$keys" > "$WORK_DIR/allowed-signers"
     [[ -s $WORK_DIR/allowed-signers ]] || fail "$TAG trusts no release signing key; see docs/releasing.md#signing"
-    ssh-keygen -q -Y verify -f "$WORK_DIR/allowed-signers" -I cagents-release -n cagents-release \
-        -s "$1/release-metadata.json.sig" < "$1/release-metadata.json" >/dev/null \
+    verify_signature "$1" "$WORK_DIR/allowed-signers" \
         || fail 'release-metadata.json.sig is not a signature by a key the tagged source trusts'
+    # Installed builds of the previous release verify this one with that
+    # release's keys, so a rotation must still be signed by a key it lists.
+    previous=$(checkout_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$SOURCE_COMMIT^" 2>/dev/null) \
+        || previous=
+    if [[ -n $previous ]] && keys=$(checkout_git show "$previous:src/update/release-keys.pub" 2>/dev/null); then
+        allowed_signers "$keys" > "$WORK_DIR/previous-signers"
+        if [[ -s $WORK_DIR/previous-signers ]]; then
+            verify_signature "$1" "$WORK_DIR/previous-signers" \
+                || fail "release-metadata.json.sig is not signed by a key $previous trusts, so its users could not update"
+        fi
+    fi
     [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
         || fail 'installer is not stamped for the canonical repository'
 }
@@ -315,7 +334,8 @@ BUNDLE_MARKER="<!-- source_commit=$SOURCE_COMMIT release-metadata.json=$BUNDLE_H
 NOTES=$WORK_DIR/release-notes.txt
 {
     printf '%s\n%s\n\n' "$RELEASE_MARKER" "$BUNDLE_MARKER"
-    jq -r '.notes' "$DIST_DIR/release-metadata.json"
+    # Commit subjects can name people; quoted, a name notifies no one.
+    jq -r '.notes' "$DIST_DIR/release-metadata.json" | sed 's/@\([A-Za-z0-9][-A-Za-z0-9]*\)/`@\1`/g'
     cat <<EOF
 
 ## Install

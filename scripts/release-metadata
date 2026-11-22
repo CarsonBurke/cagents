@@ -28,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCHEMA = 2
@@ -137,8 +138,9 @@ def check(directory: Path, version: str | None, source_commit: str | None) -> st
         raise Refused(f"{METADATA} names another source commit")
     notes = metadata.get("notes")
     protocol = metadata.get("protocol")
-    if not isinstance(notes, str) or not isinstance(protocol, int):
-        raise Refused(f"{METADATA} lacks its notes or protocol")
+    if (not isinstance(notes, str) or isinstance(protocol, bool) or not isinstance(protocol, int)
+            or not isinstance(metadata.get("assets"), dict)):
+        raise Refused(f"{METADATA} lacks its notes, protocol or assets")
     expected = build(directory, metadata.get("version", ""), metadata.get("source_commit", ""), protocol, notes)
     if metadata != expected:
         listed, present = set(metadata.get("assets", {})), set(expected["assets"])
@@ -185,23 +187,37 @@ def feed(directory: Path, destination: Path) -> None:
     if not (directory / SIGNATURE).is_file():
         raise Refused(f"{SIGNATURE} is missing; sign the metadata first")
     version = metadata["version"]
-    release = destination / "download" / f"v{version}"
+    downloads = destination / "download"
+    release = downloads / f"v{version}"
     if release.exists():
         raise Refused(f"{release} already exists; a feed never replaces a release")
-    release.mkdir(parents=True)
+    downloads.mkdir(parents=True, exist_ok=True)
+    # Each directory appears whole, so a reader never sees half a release.
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=downloads))
     for path in [*payloads(directory), directory / METADATA, directory / SIGNATURE]:
-        shutil.copyfile(path, release / path.name)
+        shutil.copyfile(path, staging / path.name)
+    staging.chmod(0o755)
+    staging.rename(release)
     published = sorted(
-        (path.name[1:] for path in (destination / "download").iterdir() if VERSION.match(path.name[1:])),
+        (path.name[1:] for path in downloads.iterdir()
+         if path.name.startswith("v") and VERSION.match(path.name[1:])),
         key=version_key,
     )
     if published[-1] == version:
-        latest = destination / "latest" / "download"
-        if latest.exists():
-            shutil.rmtree(latest)
-        latest.mkdir(parents=True)
+        latest = destination / "latest"
+        latest.mkdir(exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=latest))
         for name in (METADATA, SIGNATURE):
-            shutil.copyfile(release / name, latest / name)
+            shutil.copyfile(release / name, staging / name)
+        staging.chmod(0o755)
+        previous = latest / "download"
+        if previous.exists():
+            retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=latest))
+            previous.rename(retired / "download")
+            staging.rename(previous)
+            shutil.rmtree(retired)
+        else:
+            staging.rename(previous)
     print(f"Feed {destination} now offers {published[-1]}")
 
 

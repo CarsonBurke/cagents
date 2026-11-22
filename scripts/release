@@ -5,7 +5,7 @@ set -euo pipefail
 
 PROGRAM=release
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BUILD_HOST=${CAGENTS_BUILD_REMOTE:-fw16}
+BUILD_HOST=${CAGENTS_RELEASE_BUILD_HOST:-fw16}
 BUNDLES=${CAGENTS_RELEASE_BUNDLES:-"${XDG_STATE_HOME:-$HOME/.local/state}/cagents-release"}
 VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 # Workspace members that carry the product version.
@@ -24,13 +24,13 @@ Usage: scripts/release COMMAND VERSION [OPTIONS]
                    Commit it through a pull request, then tag the merged
                    commit: git tag -a vVERSION -m vVERSION COMMIT
   build VERSION [--notes FILE] [--build-host HOST]
-                   Build tag vVERSION on HOST (default: CAGENTS_BUILD_REMOTE
+                   Build tag vVERSION on HOST (default: CAGENTS_RELEASE_BUILD_HOST
                    or fw16) in the glibc-baseline environment, run its tests
                    and smoke checks, and bring the bundle back to
                    $CAGENTS_RELEASE_BUNDLES/VERSION (default under
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
-                   fixes and speedups since the previous tag.
+                   fixes and speedups since the previous tag here.
   feed VERSION --feed DIR
                    Add the signed bundle to a file feed, for rehearsing the
                    update before publishing (docs/releasing.md#rehearsing).
@@ -101,14 +101,24 @@ build() {
     relative=${ROOT_DIR#"$HOME"/}
     [[ $relative != "$ROOT_DIR" ]] || fail 'the repository must be under $HOME to locate it on the build host'
     # The build runs the tag's own scripts from a checkout this command owns.
+    # This checkout's tag is authoritative and replaces any other there.
     repository_git push --quiet --force "ssh://$BUILD_HOST/~/$relative" "refs/tags/$TAG:refs/tags/$TAG"
     remote_output=/var/tmp/cagents-release/$VERSION
-    if [[ -n $NOTES ]]; then
-        [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
-        [[ $(wc -c < "$NOTES") -le 65536 ]] || fail 'release notes exceed 64 KiB'
-        ssh "$BUILD_HOST" mkdir -p /var/tmp/cagents-release
-        scp -q -- "$NOTES" "$BUILD_HOST:/var/tmp/cagents-release/$VERSION-notes.md"
+    # Notes come from this checkout, which has every earlier tag, and are
+    # checked before hours of building rather than after.
+    if [[ -z $NOTES ]]; then
+        local previous
+        previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$commit^" 2>/dev/null) \
+            || previous=
+        NOTES=$(mktemp)
+        trap 'rm -f -- "$NOTES"' EXIT
+        "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} \
+            --to "$commit" > "$NOTES"
     fi
+    [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
+    [[ $(wc -c < "$NOTES") -le 65536 ]] || fail 'release notes exceed 64 KiB; pass a shorter --notes FILE'
+    ssh "$BUILD_HOST" mkdir -p /var/tmp/cagents-release
+    scp -q -- "$NOTES" "$BUILD_HOST:/var/tmp/cagents-release/$VERSION-notes.md"
     # The host's login shell may not be POSIX; bash reads the script instead.
     ssh "$BUILD_HOST" bash -s <<EOF
 set -euo pipefail
@@ -120,14 +130,13 @@ else
     git worktree add --quiet --detach "\$checkout" $(printf '%q' "$commit")
 fi
 rm -rf -- $(printf '%q' "$remote_output")
-notes=()
-[[ ! -f /var/tmp/cagents-release/$VERSION-notes.md ]] || notes=(--notes /var/tmp/cagents-release/$VERSION-notes.md)
 # The gate admits the build beside other agents' and holds its shares.
 CARGO_BUILD_JOBS=\${CARGO_BUILD_JOBS:-8} "\$checkout/scripts/cargo-gate" exec \
     "\$checkout/scripts/build-release-linux" --ref $(printf '%q' "$TAG") \
-    --output $(printf '%q' "$remote_output") "\${notes[@]}" </dev/null
+    --output $(printf '%q' "$remote_output") --notes /var/tmp/cagents-release/$VERSION-notes.md </dev/null
 EOF
     mkdir -p -- "$BUNDLES"
+    rm -rf -- "$bundle.partial"
     scp -q -r -- "$BUILD_HOST:$remote_output" "$bundle.partial"
     "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$commit" >/dev/null || fail 'the copied bundle does not match its metadata'

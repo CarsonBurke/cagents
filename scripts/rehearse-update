@@ -38,8 +38,8 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --expect-terminal-restart-failure (before example).
                        See run --help.
   feed DIR             Serve updates from the file feed DIR (see
-                       scripts/release feed): the private user's curl may read
-                       only file:///DIR, and CAGENTS_UPDATE_FEED names it.
+                       scripts/release feed): CAGENTS_UPDATE_FEED names it,
+                       and the private user's curl refuses other URLs.
                        Only rehearsal builds (CAGENTS_UPDATE_REHEARSAL_KEYS)
                        and development builds read that variable.
   compare A B          Compare record names, directories or snapshot JSON.
@@ -219,8 +219,10 @@ cmd_init() {
     printf 'initialized %s\n' "$root"
 }
 
-# Lets the private user's curl read one file feed and nothing else, so the
-# in-app updater finds and downloads releases there as it would on GitHub.
+# Points the private user's curl at one file feed, so the in-app updater finds
+# and downloads releases there as it would on GitHub. It refuses the URLs and
+# options that would reach anything else; it is a guard against mistakes in a
+# rehearsal, not a sandbox.
 cmd_feed() {
     require_init
     local feed
@@ -233,9 +235,14 @@ cmd_feed() {
 # Only file:///$feed/... URLs; anything else has no network here.
 for argument do
     case \$argument in
-        file://$feed/*) ;;
-        *://*) echo "curl: (7) the rehearsal has no network access" >&2; exit 7 ;;
+        *..*|-K|--config|--config=*) refused=1 ;;
+        file://$feed/*) continue ;;
+        *:*|*/*) refused=1 ;;
     esac
+    if [ -n "\${refused-}" ]; then
+        echo "curl: (7) the rehearsal reads only file://$feed/: \$argument" >&2
+        exit 7
+    fi
 done
 exec /usr/bin/curl "\$@"
 CURL
