@@ -81,7 +81,7 @@ command shown on the website:
 
   (
     cd "$download_dir"
-    curl -fsSL --proto '=https' --remote-name-all \
+    curl -fsSL --proto '=https' --fail-early --remote-name-all \
       "$releases/download/$tag/install.sh" "$releases/download/$tag/SHA256SUMS" \
       "$releases/download/$tag/$archive"
     awk -v archive="$archive" \
@@ -103,10 +103,7 @@ before the `CAGENTS_ARCHIVE` line. To pin a particular version, replace the
 
 SHA-256 confirms that the files match the release manifest. It does not protect
 against a compromised repository or release, so inspect the tag, release, and
-installer according to your own trust requirements. Releases with in-app
-updates also carry `release-metadata.json` and its signature
-`release-metadata.json.sig`; see [Releasing](releasing.md#signing) for what it
-covers.
+installer according to your own trust requirements.
 
 Supplying both `CAGENTS_ARCHIVE` and `CAGENTS_CHECKSUMS` keeps installation
 offline. Without them, the installer downloads the release itself with `curl`.
@@ -127,14 +124,18 @@ downloads. Use it only if you trust the repository and release:
   download_dir="$(mktemp -d)" || exit 1
   trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
-  curl -fsSL --proto '=https' -o "$download_dir/install.sh" \
-    https://github.com/CarsonBurke/cagents/releases/latest/download/install.sh &&
-    sh "$download_dir/install.sh"
+  releases='https://github.com/CarsonBurke/cagents/releases'
+  latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$releases/latest")" || exit 1
+  tag="${latest##*/}"
+  case "$tag" in v[0-9]*) ;; *) echo 'Expected a versioned release tag' >&2; exit 1 ;; esac
+  curl -fsSL --proto '=https' -o "$download_dir/install.sh" "$releases/download/$tag/install.sh" &&
+    sh "$download_dir/install.sh" --version "${tag#v}"
 )
 ```
 
-The installer resolves the latest release itself. To install a particular
-version instead, download that tag's installer and name the version:
+It looks up the latest release once, so the installer it runs and the version
+it installs always match. To install a particular version instead, download
+that tag's installer and name the version:
 
 ```sh
 (
@@ -156,7 +157,7 @@ resolve its shared-library dependencies:
 ```sh
 VERSION='0.1.2'
 base="https://github.com/CarsonBurke/cagents/releases/download/v${VERSION}"
-curl -fsSL --proto '=https' --remote-name-all "$base/cagents_${VERSION}_amd64.deb" "$base/SHA256SUMS"
+curl -fsSL --proto '=https' --fail-early --remote-name-all "$base/cagents_${VERSION}_amd64.deb" "$base/SHA256SUMS"
 sha256sum --ignore-missing --strict --check SHA256SUMS
 sudo apt install git "./cagents_${VERSION}_amd64.deb"
 ```
@@ -171,7 +172,7 @@ can be installed alongside the full package. It uses
 installs separately identified desktop and AppStream metadata:
 
 ```sh
-curl -fsSL --proto '=https' --remote-name-all \
+curl -fsSL --proto '=https' --fail-early --remote-name-all \
   "$base/cagents-browserless_${VERSION}_amd64.deb" "$base/SHA256SUMS-browserless"
 sha256sum --ignore-missing --strict --check SHA256SUMS-browserless
 sudo apt install git "./cagents-browserless_${VERSION}_amd64.deb"
@@ -198,7 +199,7 @@ executable. Keep its `bin` directory intact: `cagents`, `cagents-ui`, and
 ```sh
 VERSION='0.1.2'
 base="https://github.com/CarsonBurke/cagents/releases/download/v${VERSION}"
-curl -fsSL --proto '=https' --remote-name-all \
+curl -fsSL --proto '=https' --fail-early --remote-name-all \
   "$base/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" "$base/SHA256SUMS"
 sha256sum --ignore-missing --strict --check SHA256SUMS
 tar -xzf "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"

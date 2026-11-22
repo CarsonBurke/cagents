@@ -77,7 +77,7 @@ esac
     if (scenario === "success") {
       assert.equal(result.status, 0, result.stderr);
       assert.equal(calls.length, 2);
-      assert.match(calls[1], /--proto =https --remote-name-all /);
+      assert.match(calls[1], /--proto =https --fail-early --remote-name-all /);
       for (const name of ["install.sh", "SHA256SUMS", archive]) {
         assert.ok(calls[1].includes(`/releases/download/v9.8.7/${name}`), name);
       }

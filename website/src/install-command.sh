@@ -12,7 +12,7 @@
 
   (
     cd "$download_dir"
-    curl -fsSL --proto '=https' --remote-name-all \
+    curl -fsSL --proto '=https' --fail-early --remote-name-all \
       "$releases/download/$tag/install.sh" "$releases/download/$tag/SHA256SUMS" \
       "$releases/download/$tag/$archive"
     awk -v archive="$archive" \
