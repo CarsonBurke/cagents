@@ -288,7 +288,9 @@ fn identity(uuid: &str, block: usize) -> String {
 #[derive(Default)]
 pub(super) struct AgentCall {
     block: usize,
-    name: String,
+    /// What the call names its agent and its task, as the live call does,
+    /// so a resumed agent whose sidecar is out of reach keeps its name.
+    label: super::AgentLabel,
     background: bool,
 }
 #[derive(Default)]
@@ -316,7 +318,7 @@ pub(super) fn details(frame: &super::Value) -> (Vec<AgentCall>, ResultDetails) {
         })
         .map(|(block, value)| AgentCall {
             block,
-            name: string(&value["input"], "name").trim().to_owned(),
+            label: super::AgentLabel::of(&value["input"]),
             background: value["input"]["run_in_background"].as_bool() == Some(true),
         })
         .collect();
@@ -370,7 +372,7 @@ pub(super) fn details(frame: &super::Value) -> (Vec<AgentCall>, ResultDetails) {
 pub(super) fn details_bytes(agents: &[AgentCall], result: &ResultDetails) -> usize {
     agents
         .iter()
-        .map(|agent| agent.name.len() + 64)
+        .map(|agent| agent.label.len() + 64)
         .sum::<usize>()
         + result.agent.as_ref().map_or(0, String::len)
         + result
@@ -417,10 +419,10 @@ pub(super) fn index_activity(
             }
             if let Some(agent) = agents.next_if(|agent| agent.block == *block) {
                 agent_order.insert((node.first_order, *block), identity.clone());
-                if !agent.name.is_empty() {
+                if !agent.label.is_empty() {
                     history
-                        .agent_names
-                        .insert(identity.clone(), agent.name.clone());
+                        .agent_labels
+                        .insert(identity.clone(), agent.label.clone());
                 }
                 if agent.background {
                     history.background_agent_tools.insert(identity);

@@ -3664,9 +3664,27 @@ impl Adapter for Claude {
                     }
                 })
                 .collect::<HashMap<_, _>>();
+            // Agents the page shown already named keep its full words.
+            let named = history_step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Subagent { id, kind, .. } if !kind.is_empty() => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
             let mut statuses = history.agent_status.iter().collect::<Vec<_>>();
             statuses.sort_by_key(|(id, _)| history.agent_tools.get(*id));
             for (id, status) in statuses {
+                // Its name and task as the call gave them, for an agent the
+                // page shown does not reach back to: the sidecars read may
+                // not reach to it either.
+                let label = history
+                    .agent_labels
+                    .get(id)
+                    .filter(|_| !named.contains(id))
+                    .cloned()
+                    .unwrap_or_default();
                 let status = if self.is_superseded(id) {
                     &ToolStatus::Ended
                 } else {
@@ -3692,8 +3710,8 @@ impl Adapter for Claude {
                         None
                     },
                     id: id.clone(),
-                    kind: String::new(),
-                    description: String::new(),
+                    kind: label.kind,
+                    description: label.description,
                     status: Some(*status),
                     // Replayed launches say whether an agent ran in the
                     // background, but this process never started it, so its
@@ -4910,6 +4928,38 @@ fn choice(id: &str, label: &str) -> Choice {
 }
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
+}
+/// What an Agent call names its agent and its task: the name its tab goes
+/// by, as [`agent_label`] picks it, and the task's description, each as the
+/// live call reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentLabel {
+    kind: String,
+    description: String,
+}
+impl AgentLabel {
+    /// The most of each kept, so indexing thousands of calls stays small.
+    const LIMIT: usize = 256;
+
+    fn of(input: &Value) -> Self {
+        let bounded = |text: &str| text.chars().take(Self::LIMIT).collect::<String>();
+        Self {
+            kind: bounded(agent_label(
+                string(input, "name"),
+                string(input, "description"),
+                string(input, "subagent_type"),
+            )),
+            description: bounded(string(input, "description").trim()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.kind.len() + self.description.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.kind.is_empty() && self.description.is_empty()
+    }
 }
 /// What an agent goes by: the name its Agent call asked for, else the first
 /// line of the short task description it was given, else its agent type.
@@ -7713,9 +7763,10 @@ struct History {
     /// The agent ID Claude Code gave each agent, in the foreground or the
     /// background, which a later `SendMessage` or `TaskStop` addresses it by.
     agent_addresses: HashMap<String, String>,
-    /// The name each Agent call asked its agent to go by. A sidecar records
-    /// only the agent's type, which must not rename it on resume.
-    agent_names: HashMap<String, String>,
+    /// What each Agent call named its agent and its task. Every launch in
+    /// the history is listed on resume, and a sidecar out of reach, or one
+    /// that records only the agent's type, must not leave it nameless.
+    agent_labels: HashMap<String, AgentLabel>,
     agent_status: HashMap<String, ToolStatus>,
     /// Latest actual user prompt on the displayed chain; provider notices and
     /// tool-result carriers never advance the current failure scope.
@@ -8662,7 +8713,7 @@ impl History {
             agent_raw_tools: HashMap::new(),
             agent_ids: HashMap::new(),
             agent_addresses: HashMap::new(),
-            agent_names: HashMap::new(),
+            agent_labels: HashMap::new(),
             agent_status: HashMap::new(),
             latest_prompt,
             background_agent_tools: HashSet::new(),
@@ -8879,15 +8930,20 @@ impl History {
                     }
                 }
             }
+            let indexed = self.agent_labels.get(parent);
+            let description = Some(string(&meta, "description"))
+                .filter(|description| !description.trim().is_empty())
+                .or(indexed.map(|label| label.description.as_str()))
+                .unwrap_or_default();
             children.push((
                 parent.to_owned(),
                 agent_label(
-                    self.agent_names.get(parent).map_or("", String::as_str),
-                    string(&meta, "description"),
+                    indexed.map_or("", |label| label.kind.as_str()),
+                    description,
                     string(&meta, "agentType"),
                 )
                 .into(),
-                string(&meta, "description").into(),
+                description.into(),
                 frames.into_iter().map(|(frame, _)| frame).collect(),
                 outcomes,
             ));

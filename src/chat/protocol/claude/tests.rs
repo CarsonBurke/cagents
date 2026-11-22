@@ -11290,6 +11290,63 @@ fn history_one_async_agent_result_with_narration_keeps_its_launch_identity() {
     assert!(adapter.initialize().unwrap().events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Running), .. } if id == "unasked-background")));
 }
 
+/// A resumed conversation lists every agent its history launched, though
+/// neither the page shown nor the sidecars read reach back to the call. Each
+/// keeps the name and task the call gave it rather than going unnamed.
+#[test]
+fn history_agents_out_of_reach_keep_the_names_their_calls_gave_them() {
+    let mut frames = vec![
+        json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"described","name":"Agent","input":{"description":"Audit retry limits","subagent_type":"general-purpose","prompt":"Audit them.","run_in_background":true}},
+            {"type":"tool_use","id":"named","name":"Agent","input":{"name":"reviewer","description":"Review restart safety","prompt":"Review it."}},
+            {"type":"tool_use","id":"typed","name":"Agent","input":{"subagent_type":"Explore","prompt":"Look around."}}
+        ]}}),
+        json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"described","content":"Done"},
+            {"type":"tool_result","tool_use_id":"named","content":"Done"},
+            {"type":"tool_result","tool_use_id":"typed","content":"Done"}
+        ]}}),
+    ];
+    // A page of later conversation, so the calls are out of the page shown,
+    // and no sidecar transcripts to name the agents either.
+    for index in 0..120 {
+        frames.push(json!({"type":"user","uuid":format!("later-{index}"),"message":{"content":format!("Later {index}")}}));
+    }
+    let mut adapter = Claude {
+        history: Some(correlation_history(frames)),
+        ..Claude::default()
+    };
+    let events = adapter.initialize().unwrap().events;
+    assert!(
+        adapter.history.as_ref().unwrap().offset > 0,
+        "the Agent calls are before the page shown"
+    );
+    // The last thing said of each agent's name and task.
+    let labelled = |wanted: &str| {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Subagent {
+                    id,
+                    kind,
+                    description,
+                    ..
+                } if id == wanted && !kind.is_empty() => Some((kind.clone(), description.clone())),
+                _ => None,
+            })
+            .next_back()
+    };
+    assert_eq!(
+        labelled("described"),
+        Some(("Audit retry limits".into(), "Audit retry limits".into()))
+    );
+    assert_eq!(
+        labelled("named"),
+        Some(("reviewer".into(), "Review restart safety".into()))
+    );
+    assert_eq!(labelled("typed"), Some(("Explore".into(), String::new())));
+}
+
 #[test]
 fn history_many_agent_blocks_keep_order_and_metadata() {
     let blocks = (0..4096).map(|index| json!({"type":"tool_use","id":format!("agent-{index}"),"name":"Agent","input":{"name":format!("Worker {index}"),"run_in_background":true}})).collect::<Vec<_>>();
@@ -11298,7 +11355,7 @@ fn history_many_agent_blocks_keep_order_and_metadata() {
     ]);
     assert_eq!(history.agent_tools.len(), 4096);
     assert_eq!(history.agent_tools["agent-4095"], 4095);
-    assert_eq!(history.agent_names["agent-4095"], "Worker 4095");
+    assert_eq!(history.agent_labels["agent-4095"].kind, "Worker 4095");
 }
 
 #[test]
