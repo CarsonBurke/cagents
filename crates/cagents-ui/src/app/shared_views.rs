@@ -896,7 +896,11 @@ impl Cagents {
             .views
             .iter()
             .any(|view| view.panes.iter().any(|pane| pane.id == card));
-        if kept {
+        if kept && self.closes_in_background(card) {
+            // Its removal was judged against the conversation still running,
+            // which is stopping; the pane, out of sight, goes once it has.
+            tracing::debug!(?scope, %operation, %error, %card, "the registry kept a closed pane while its conversation stops");
+        } else if kept {
             tracing::warn!(?scope, %operation, %error, %card, "the registry refused a close and kept its pane");
             let shown = self.workspace.order().any(|id| id == card);
             self.notices.record(TransientNotice::warning(if shown {
@@ -3612,9 +3616,9 @@ impl Cagents {
         // A closed pane a view brought back after its conversation stopped
         // goes again, now that the views it is removed from are settled.
         tasks.push(self.remove_stopped_returns());
-        // A closed pane's conversation stops once the registry has answered
-        // its removal; a pane the registry kept is back, and goes on with it.
-        tasks.push(self.settle_stops_after_removal());
+        // A closed pane a view put back while its conversation stops stays
+        // out of sight, now that the strip holds it.
+        tasks.push(self.hide_returned_closes());
         // Presentation-only projection preserves every notification attribution
         // input: source, membership, ownership, placement and project identity.
         // Journal snapshots attribute their own new evidence independently.

@@ -269,10 +269,19 @@ impl Cagents {
         }
     }
 
+    /// Whether `card` is out of sight while its close is decided: a terminal
+    /// whose close the daemon is asked for, or a closed chat a shared view
+    /// put back while its conversation stops. As far as the reader knows it
+    /// is gone, so nothing may focus it or list it.
+    pub(super) fn closes_out_of_sight(&self, card: CardId) -> bool {
+        self.hidden_closes.contains(&card) || self.returned_close_is_hidden(card)
+    }
+
     /// Re-hides the panes still closing after the strip was rebuilt, as a
     /// worktree or project switch does.
     pub(super) fn rehide_closing_panes(&mut self) {
-        for card in &self.hidden_closes {
+        let returned = self.returned_closes();
+        for card in self.hidden_closes.iter().chain(&returned) {
             // A pane in another strip is hidden again when its strip is built.
             let _ = self.workspace.hide_card(*card);
         }

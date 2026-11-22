@@ -2759,7 +2759,7 @@ impl Cagents {
         // whichever workspace it is in.
         let stale = self.sidebar_model.stale_panes(&self.sidebar_state, |id| {
             self.card_state(id)
-                .filter(|_| !self.hidden_closes.contains(&id))
+                .filter(|_| !self.closes_out_of_sight(id))
                 .map(|card| self.pane_row_title(card))
         });
         if stale.is_empty() {
@@ -2768,7 +2768,7 @@ impl Cagents {
         let mut titles = self
             .sidebar_state
             .pane_cards()
-            .filter(|id| !self.hidden_closes.contains(id))
+            .filter(|id| !self.closes_out_of_sight(*id))
             .filter_map(|id| {
                 let card = self.card_state(id)?;
                 Some((id, self.pane_row_title(card).to_owned()))

@@ -13034,24 +13034,6 @@ fn published_removal(app: &mut Cagents, card: CardId) -> uuid::Uuid {
         .expect("the window published the removal")
 }
 
-/// The registry takes this window's removal of `card` from `channel`'s view,
-/// and answers with the view that no longer holds it.
-fn view_takes_removal(app: &mut Cagents, channel: crate::model::ChannelId, card: CardId) {
-    use super::super::workspace_model_sync::ModelUpdate;
-    use crate::workspace_model::views::Scope;
-    let operation = published_removal(app, card);
-    let mut model = app.workspace_model.clone();
-    let view = &mut model.views[0];
-    view.panes.retain(|pane| pane.id != card);
-    view.retired.push(card);
-    view.revision += 1;
-    drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
-        scope: Scope::Channel(channel),
-        operation: Some(operation),
-        model,
-    }));
-}
-
 /// `pane` holding another conversation, as another window may put in it.
 fn with_another_conversation(
     pane: &crate::workspace_model::views::Pane,
@@ -13141,97 +13123,30 @@ fn a_chat_close_removes_the_pane_its_view_holds_and_keeps_its_confirmed_identity
     }
 }
 
-/// A closed pane's conversation is asked to stop only once the registry has
-/// taken the pane from its view: asked meanwhile, the stop ends its turn and
-/// confirms its identity, and the registry refuses a removal of a pane that
-/// is not the one it holds.
-#[test]
-fn a_closed_chat_stops_once_its_view_has_taken_its_pane() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let channel = active_shared_channel(&mut app);
-    let card = live_chat(&mut app, Some(KNOWN_THREAD));
-    show_in_channel_view(&mut app, channel, card);
-    drop(app.update(Message::CloseCard(card)));
-    assert!(
-        !app.card_state(card).unwrap().existence.is_open(),
-        "it goes at once"
-    );
-    let target = app
-        .background_close_for_test(card)
-        .expect("it stops in the background");
-    assert!(
-        app.chat_ui.stops_after_removal.contains_key(&target),
-        "the stop waits for the registry"
-    );
-    view_takes_removal(&mut app, channel, card);
-    assert!(
-        app.chat_ui.stops_after_removal.is_empty(),
-        "the stop is asked once the pane is gone"
-    );
-    assert_eq!(app.background_close_for_test(card), Some(target));
-}
-
-/// A close whose removal the registry refuses closes nothing: the pane comes
-/// back with its conversation, which nothing asked to stop, and nothing is
-/// left to stop on the next launch.
-#[test]
-fn a_close_its_view_refuses_leaves_the_conversation_running_in_its_pane() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let channel = active_shared_channel(&mut app);
-    let card = live_chat(&mut app, Some(KNOWN_THREAD));
-    let session = app.chat_return_session(card).unwrap();
-    show_in_channel_view(&mut app, channel, card);
-    drop(app.update(Message::CloseCard(card)));
-    assert_eq!(stopping(&app), vec![(session.id, None)]);
-
-    view_refuses_removal(&mut app, channel, card);
-    assert!(
-        app.card_state(card).unwrap().existence.is_open(),
-        "the pane is back"
-    );
-    assert!(
-        app.background_close_for_test(card).is_none(),
-        "nothing stops"
-    );
-    assert!(app.chat_ui.stops_after_removal.is_empty());
-    assert!(
-        app.durable.stopping_chats.is_empty(),
-        "nor on the next launch"
-    );
-    assert!(!app.holds_reopen(card));
-    assert!(
-        app.chat_ui.attempt(card).is_some(),
-        "it attaches to the conversation"
-    );
-}
-
-/// A view that still shows a closed pane while its conversation stops keeps
-/// it waiting, as on the launch after a window that closed the pane and
-/// exited before the registry took it. When another window puts a different
-/// conversation in that pane meanwhile, the stop settling neither takes the
-/// pane away nor puts the closed conversation back in it: it attaches to the
-/// one it now holds, whether the stop succeeded or was refused.
+/// A view that brings a closed pane back while its conversation stops keeps
+/// it waiting. When another window puts a different conversation in that
+/// pane meanwhile, the stop settling neither takes the pane away nor puts the
+/// closed conversation back in it: it attaches to the one it now holds,
+/// whether the stop succeeded or was refused.
 #[test]
 fn a_stop_leaves_a_returned_pane_another_window_gave_a_new_conversation() {
     for refused in [false, true] {
-        let mut last = crate::app::tests::context_inspector_test_app(false);
-        let channel = active_shared_channel(&mut last);
-        let card = live_chat(&mut last, Some(KNOWN_THREAD));
-        let open = last.persistent_workspace();
-        drop(last.update(Message::CloseCard(card)));
-        // The next launch asks again to stop the conversation, and the view
-        // still shows the pane.
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        app.durable = last.persistent_workspace();
-        Arc::make_mut(&mut app.durable).cards = open.cards.clone();
-        app.workspace = Cagents::rebuild_workspace(&app.durable);
-        drop(app.resume_stopping_chats());
+        let channel = active_shared_channel(&mut app);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let original = show_in_channel_view(&mut app, channel, card);
+        drop(app.update(Message::CloseCard(card)));
         let target = app
             .background_close_for_test(card)
             .expect("it stops in the background");
-        let original = show_in_channel_view(&mut app, channel, card);
+        // The view refuses the removal, and still shows the pane.
+        view_refuses_removal(&mut app, channel, card);
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.holds_reopen(card), "refused={refused}");
+        assert!(
+            app.workspace.is_hidden(card),
+            "refused={refused}: out of sight"
+        );
         // Another window puts a new conversation in that pane.
         let (replacement, other) = with_another_conversation(&original);
         view_publishes(&mut app, vec![replacement]);
@@ -13256,14 +13171,16 @@ fn a_stop_leaves_a_returned_pane_another_window_gave_a_new_conversation() {
             app.chat_ui.attempt(card).is_some(),
             "refused={refused}: and attaches to it"
         );
+        assert!(
+            !app.workspace.is_hidden(card),
+            "refused={refused}: in sight"
+        );
     }
 }
 
-/// A view that brings a closed pane back after its conversation has stopped,
-/// as a launch's view does when the last window exited before the registry
-/// took the pane, puts it in the strip and takes it away again in the same
-/// reconciliation, leaving nothing loading in its place. A refusal of the
-/// removal, after the stop's answer, stands in for that view here.
+/// A view that brings a closed pane back after its conversation has stopped
+/// puts it in the strip and takes it away again in the same reconciliation,
+/// leaving nothing loading in its place.
 #[test]
 fn a_pane_a_view_brings_back_after_its_stop_goes_once_it_is_placed() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -13275,8 +13192,8 @@ fn a_pane_a_view_brings_back_after_its_stop_goes_once_it_is_placed() {
     drop(app.update(Message::ChatUi(Action::Retired(target, Ok(())))));
     assert!(!app.card_state(card).unwrap().existence.is_open());
 
-    // The view shows the pane again only now, with nothing left to stop, so
-    // the window removes it again.
+    // The view's refusal of the removal arrives only now, so the pane comes
+    // back with nothing left to stop, and the window removes it again.
     view_refuses_removal(&mut app, channel, card);
     app.publish_view_changes();
     assert!(
@@ -13304,11 +13221,10 @@ fn a_pane_a_view_brings_back_after_its_stop_goes_once_it_is_placed() {
     assert!(app.chat_ui.attempt(card).is_none());
 }
 
-/// A closed pane's conversation stopped, and a view then shows the pane with
-/// a different conversation another window put in it. The pane comes back
-/// with that conversation, which the stop was nothing to: it stays and
-/// attaches. A refusal of the removal, after the stop's answer, stands in for
-/// that view here.
+/// A closed pane's conversation stopped, and another window then put a
+/// different conversation in the pane before the view refused the removal.
+/// The pane comes back with that conversation, which the stop was nothing
+/// to: it stays and attaches.
 #[test]
 fn a_pane_given_a_new_conversation_after_its_stop_stays_when_it_comes_back() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -13344,8 +13260,7 @@ fn a_pane_given_a_new_conversation_after_its_stop_stays_when_it_comes_back() {
 
 /// A refused close's pane a view brings back under a successor's identity,
 /// the same provider conversation under a new session, attaches with that
-/// identity. A refusal of the removal, after the stop's answer, stands in
-/// for that view here. The refusal it shows, the provider it attaches to rather than
+/// identity. The refusal it shows, the provider it attaches to rather than
 /// a second one, and the wait its next close keeps follow it there.
 #[test]
 fn a_refused_close_back_under_a_successor_identity_keeps_its_refusal() {

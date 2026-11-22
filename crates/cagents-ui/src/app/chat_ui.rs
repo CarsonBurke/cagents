@@ -1335,10 +1335,6 @@ pub(super) struct State {
     retiring: HashSet<Target>,
     /// Conversations the reader closed, still stopping after their pane left.
     background_closes: HashMap<Target, background_close::Closing>,
-    /// Background closes whose stop waits for the registry to answer the
-    /// removal of their pane from a shared view, with the connection the
-    /// stop is asked on.
-    stops_after_removal: HashMap<Target, Option<Arc<ClientHandle>>>,
     /// Conversations whose last close was refused. Their next close waits on
     /// its pane for the daemon, so a refusal stays where it can be acted on.
     close_refused: HashSet<TerminalId>,
@@ -1353,6 +1349,9 @@ pub(super) struct State {
     /// Such panes a view brought back before putting them in the strip: they
     /// go once it has.
     stopped_returns: HashSet<CardId>,
+    /// Closed panes a shared view put back while their conversation stops,
+    /// kept out of sight until the stop settles.
+    hidden_returns: HashSet<CardId>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -1438,11 +1437,11 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             background_closes: HashMap::new(),
-            stops_after_removal: HashMap::new(),
             close_refused: HashSet::new(),
             refusals_to_show: HashMap::new(),
             stopped_closes: HashMap::new(),
             stopped_returns: HashSet::new(),
+            hidden_returns: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             draft_models: HashMap::new(),

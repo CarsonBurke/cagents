@@ -6225,7 +6225,7 @@ impl Cagents {
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
         // A pane hidden while it closes is gone as far as the reader knows;
         // asking for it does nothing, as asking for any closed pane does.
-        if self.hidden_closes.contains(&id) {
+        if self.closes_out_of_sight(id) {
             return Task::none();
         }
         match self.workspace.focus(id) {
@@ -9111,7 +9111,7 @@ impl Cagents {
         }
         let Some(card) = self
             .card_state(id)
-            .filter(|card| card.existence.is_open() && !self.hidden_closes.contains(&id))
+            .filter(|card| card.existence.is_open() && !self.closes_out_of_sight(id))
             .cloned()
         else {
             return Task::none();

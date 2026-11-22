@@ -15,11 +15,11 @@
 //! waits to attach until the stop settles, so no pane starts or attaches to a
 //! provider that is being ended.
 //!
-//! A pane a shared view holds leaves that view before its conversation is
-//! asked to stop. The registry judges a removal against the conversation the
-//! pane holds, so it is asked while that conversation is as the person left
-//! it, not while its stop is ending its turn and confirming its identity. A
-//! view that keeps the pane keeps the conversation running in it.
+//! A shared view can put the closed pane itself back while its conversation
+//! stops: the registry refuses a removal it judges against a conversation
+//! still running, which the stop then ends. That pane closed, so it stays out
+//! of sight, and no one is told to close it again: once the stop settles it
+//! goes, or comes back if the stop was refused.
 use super::*;
 use crate::model::StoppingChat;
 use crate::persistence::SavedConversation;
@@ -121,93 +121,7 @@ impl Cagents {
             dismissed: false,
         });
         self.persist();
-        if self.awaits_shared_removal(card) {
-            self.chat_ui.stops_after_removal.insert(target, handle);
-            return Task::none();
-        }
         ask_to_stop(target, handle, session, false)
-    }
-
-    /// Whether the removal of `card` from a shared view is still to be
-    /// published or answered.
-    fn awaits_shared_removal(&self, card: CardId) -> bool {
-        use crate::workspace_model::views::Change;
-        matches!(self.shared_views.removals.get(&card), Some(Some(_)))
-            || self
-                .shared_views
-                .pending
-                .iter()
-                .any(|(_, _, change)| match change {
-                    Change::Remove { id } => *id == card,
-                    Change::RemoveSource { before, .. } => before.id == card,
-                    _ => false,
-                })
-    }
-
-    /// Settles each stop held for its pane's removal once the registry has
-    /// answered it. A pane the registry no longer holds has gone, and its
-    /// conversation is asked to stop. A pane it kept closed nothing: the
-    /// close is given up, and the pane, back in the strip, goes on with the
-    /// conversation, which nothing asked to stop. Run once the views are
-    /// settled, which put a kept pane back.
-    pub(in crate::app) fn settle_stops_after_removal(&mut self) -> Task<Message> {
-        let background_closes = &self.chat_ui.background_closes;
-        self.chat_ui
-            .stops_after_removal
-            .retain(|target, _| background_closes.contains_key(target));
-        let settled = self
-            .chat_ui
-            .stops_after_removal
-            .keys()
-            .copied()
-            .filter(|target| {
-                !self.awaits_shared_removal(self.chat_ui.background_closes[target].card)
-            })
-            .collect::<Vec<_>>();
-        let mut tasks = Vec::new();
-        for target in settled {
-            let handle = self.chat_ui.stops_after_removal.remove(&target).flatten();
-            let closing = &self.chat_ui.background_closes[&target];
-            let kept = self
-                .workspace_model
-                .views
-                .iter()
-                .any(|view| view.panes.iter().any(|pane| pane.id == closing.card));
-            tasks.push(if kept {
-                self.give_up_background_close(target)
-            } else {
-                ask_to_stop(target, handle, closing.session.clone(), false)
-            });
-        }
-        Task::batch(tasks)
-    }
-
-    /// Gives up the close at `target`, never asked of the daemon, because a
-    /// shared view kept its pane. Each pane waiting on it attaches to the
-    /// conversation, still running.
-    fn give_up_background_close(&mut self, target: Target) -> Task<Message> {
-        let Some(closing) = self.chat_ui.background_closes.remove(&target) else {
-            return Task::none();
-        };
-        let id = closing.session.id;
-        Arc::make_mut(&mut self.durable)
-            .stopping_chats
-            .retain(|stopping| stopping.session.id != id);
-        self.persist();
-        let mut tasks = Vec::new();
-        if self.exit.is_some() && self.chat_ui.background_closes.is_empty() {
-            tasks.push(self.advance_exit(|exit| exit.chats_closed = true));
-        }
-        for card in closing.reopens {
-            if self.reopen_awaits_stop(card) {
-                tasks.push(self.reopen_once_stopped(card, Some(closing.session.clone())));
-            } else if self.awaits_attachment(card)
-                && let Some(session) = self.chat_return_session(card)
-            {
-                tasks.push(self.open_chat(card, session, chat::Intent::Restore));
-            }
-        }
-        Task::batch(tasks)
     }
 
     /// Whether `session` is a conversation the last window closed without
@@ -322,6 +236,19 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for card in closing.reopens {
+            // A closed pane kept out of sight goes as it is, or comes back
+            // into sight with the conversation it attaches to.
+            let goes = refused.is_none()
+                && card == closing.card
+                && self.awaits_attachment(card)
+                && self
+                    .chat_return_session(card)
+                    .is_some_and(|session| shares_conversation(&session, &closing.session));
+            if goes {
+                self.chat_ui.hidden_returns.remove(&card);
+            } else {
+                tasks.push(self.show_returned_close(card));
+            }
             if self.reopen_awaits_stop(card) {
                 // A refused stop leaves the conversation running: the reopen
                 // goes back to it, its notice going with that.
@@ -473,10 +400,13 @@ impl Cagents {
             }
             return self.open_chat(card, session, chat::Intent::Restore);
         };
-        if let Some(closing) = self.chat_ui.background_closes.get_mut(&target)
-            && !closing.reopens.contains(&card)
-        {
-            closing.reopens.push(card);
+        if let Some(closing) = self.chat_ui.background_closes.get_mut(&target) {
+            if !closing.reopens.contains(&card) {
+                closing.reopens.push(card);
+            }
+            if closing.card == card {
+                self.chat_ui.hidden_returns.insert(card);
+            }
         }
         // It waits unattached, as a held reopen does, keeping what it had
         // not sent.
@@ -504,6 +434,77 @@ impl Cagents {
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Keeps out of sight each closed pane a shared view put back while its
+    /// conversation stops, once the strip holds it, and brings back into
+    /// sight one its close no longer holds.
+    pub(in crate::app) fn hide_returned_closes(&mut self) -> Task<Message> {
+        let held = self
+            .chat_ui
+            .background_closes
+            .values()
+            .filter(|closing| closing.reopens.contains(&closing.card))
+            .map(|closing| closing.card)
+            .collect::<HashSet<_>>();
+        let released = self
+            .chat_ui
+            .hidden_returns
+            .iter()
+            .copied()
+            .filter(|card| {
+                !held.contains(card)
+                    || !self
+                        .card_state(*card)
+                        .is_some_and(|state| state.existence.is_open())
+            })
+            .collect::<Vec<_>>();
+        let mut tasks = released
+            .into_iter()
+            .map(|card| self.show_returned_close(card))
+            .collect::<Vec<_>>();
+        let shown = self
+            .workspace
+            .shown()
+            .filter(|card| self.chat_ui.hidden_returns.contains(card))
+            .collect::<Vec<_>>();
+        for card in shown {
+            if let Ok(update) = self.workspace.hide_card(card) {
+                tasks.push(self.apply_viewport(update, false, DurableChange::None));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// The closed panes kept out of sight while their conversation stops.
+    pub(in crate::app) fn returned_closes(&self) -> Vec<CardId> {
+        self.chat_ui.hidden_returns.iter().copied().collect()
+    }
+
+    /// Whether `card` is a closed pane kept out of sight while its
+    /// conversation stops.
+    pub(in crate::app) fn returned_close_is_hidden(&self, card: CardId) -> bool {
+        self.chat_ui.hidden_returns.contains(&card)
+    }
+
+    /// Whether `card` closed and its conversation is still stopping, so a
+    /// view that keeps it keeps nothing the person is to act on.
+    pub(in crate::app) fn closes_in_background(&self, card: CardId) -> bool {
+        self.chat_ui
+            .background_closes
+            .values()
+            .any(|closing| closing.card == card)
+    }
+
+    /// Brings a closed pane kept out of sight back into it.
+    fn show_returned_close(&mut self, card: CardId) -> Task<Message> {
+        if !self.chat_ui.hidden_returns.remove(&card) {
+            return Task::none();
+        }
+        match self.workspace.show_card(card) {
+            Some(update) => self.apply_viewport(update, false, DurableChange::None),
+            None => Task::none(),
+        }
     }
 
     /// Puts a pane that holds the conversation whose stop was refused back on
