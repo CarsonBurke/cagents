@@ -4,12 +4,15 @@
 //! show that JSON as it came: a prompt to a subagent was one line of `\n`
 //! escapes, and a command was quoted twice, once for the shell and once for
 //! JSON. A reader wants the values. An input that is only a command reads as
-//! the command; any other object reads as its members, one per line in the
-//! order the model wrote them, each value as the text it holds. Nothing is
-//! escaped: the lines are for reading, selecting and copying, not parsing.
+//! the command; any other object reads as its members, each value as the
+//! text it holds. Members that fit on their key's line come first, so a
+//! call's settings are not pushed below a long prompt; each group keeps the
+//! order the members arrived in, which for Claude is sorted by key. Nothing
+//! is escaped: the lines are for reading, selecting and copying, not parsing.
 //!
 //! ```text
 //! description: Review the change
+//! run_in_background: true
 //! prompt:
 //!   Read the diff.
 //!   Report what breaks.
@@ -165,7 +168,10 @@ fn block(out: &mut String, node: &Node, indent: usize) {
             }
         }
         Node::Map(members) if !members.is_empty() => {
-            for (key, value) in members {
+            let (short, long): (Vec<_>, Vec<_>) = members
+                .iter()
+                .partition(|(_, value)| value.inline().is_some());
+            for (key, value) in short.into_iter().chain(long) {
                 member(out, key, value, indent);
             }
         }
@@ -282,14 +288,14 @@ mod tests {
     }
 
     #[test]
-    fn members_keep_their_order_and_multiline_text_reads_as_lines() {
+    fn settings_come_before_long_values_and_multiline_text_reads_as_lines() {
         let input = r#"{"description":"Review","prompt":"Read the diff.\n\nReport what breaks.","subagent_type":"Explore","run_in_background":true}"#;
         assert_eq!(
             readable(input).unwrap().text,
             "description: Review\n\
-             prompt:\n  Read the diff.\n\n  Report what breaks.\n\
              subagent_type: Explore\n\
-             run_in_background: true"
+             run_in_background: true\n\
+             prompt:\n  Read the diff.\n\n  Report what breaks."
         );
     }
 
@@ -306,10 +312,10 @@ mod tests {
         }"#;
         assert_eq!(
             readable(input).unwrap().text,
-            "todos:\n  - content: Fix it\n    status: pending\n  - content: Test it\n    status: done\n\
-             paths:\n  - src/app.rs\n  - src/chat.rs\n\
-             options: (none)\n\
-             limit: null"
+            "options: (none)\n\
+             limit: null\n\
+             todos:\n  - content: Fix it\n    status: pending\n  - content: Test it\n    status: done\n\
+             paths:\n  - src/app.rs\n  - src/chat.rs"
         );
     }
 

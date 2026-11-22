@@ -4215,7 +4215,7 @@ fn a_harness_error_is_shown_without_its_framing() {
             "Tasks",
             json!({}),
             "\n<tool_use_error>Error: No such tool available: Tasks. Did you mean Task?</tool_use_error>\n",
-            "No such tool available: Tasks. Did you mean Task?",
+            "Claude called a tool that doesn't exist: Tasks\nDid you mean Task?",
         ),
     ];
     for (name, input, result, shown) in cases {

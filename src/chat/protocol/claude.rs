@@ -6690,9 +6690,13 @@ fn harness_error(text: String) -> String {
     };
     let inner = inner.trim();
     let inner = inner.strip_prefix("Error: ").unwrap_or(inner);
-    match inner
-        .strip_prefix("No such tool available: ")
-        .map(str::trim)
+    let Some(rest) = inner.strip_prefix("No such tool available: ") else {
+        return inner.to_owned();
+    };
+    // A suggestion may follow the name, as in `Tasks. Did you mean Task?`;
+    // a tool's name holds no `. `.
+    let (tool, hint) = rest.trim().split_once(". ").unwrap_or((rest.trim(), ""));
+    let said = match Some(tool)
         .filter(|tool| !tool.is_empty() && !tool.contains(char::is_whitespace))
     {
         Some(tool) if tool.starts_with("mcp__") => {
@@ -6701,7 +6705,12 @@ fn harness_error(text: String) -> String {
             )
         }
         Some(tool) => super::unknown_tool("Claude", tool),
-        None => inner.to_owned(),
+        None => return inner.to_owned(),
+    };
+    if hint.is_empty() {
+        said
+    } else {
+        format!("{said}\n{hint}")
     }
 }
 
