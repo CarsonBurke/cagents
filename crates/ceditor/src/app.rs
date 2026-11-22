@@ -720,8 +720,6 @@ const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 /// sidebar's file filter over the same helper.
 const QUICK_OPEN_SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
 
-/// Hands one captured preference write to the blocking pool and reports the
-/// outcome on a later frame.
 /// The logical size a surface reports: first as Opened, then as Resized.
 fn window_geometry(event: &window::Event) -> Option<iced::Size> {
     match event {
@@ -730,6 +728,8 @@ fn window_geometry(event: &window::Event) -> Option<iced::Size> {
     }
 }
 
+/// Hands one captured preference write to the blocking pool and reports the
+/// outcome on a later frame.
 fn preference_task(save: PreferenceSave) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || save.run())
