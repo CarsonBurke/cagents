@@ -143,9 +143,14 @@ impl Calibration {
         context_tokens: u64,
     ) -> Option<PromptCache> {
         let requested_at = activity.requested_at?;
-        let (ttl_ms, basis) = match activity.ttl_ms {
-            Some(ttl_ms) => (ttl_ms, TtlBasis::Reported),
-            None => self.calibrate(provider, account, activity.observations)?,
+        let (ttl_ms, basis) = match (activity.ttl_ms, provider) {
+            (Some(ttl_ms), _) => (ttl_ms, TtlBasis::Reported),
+            // Claude reports how long each cache write lasts; what it hasn't
+            // reported, such as for a prompt too short to cache, is unknown.
+            (None, Provider::Claude) => return None,
+            // Observations filed under no account would mix accounts.
+            (None, _) if account.is_none() => estimate(assumed_ttl(provider), &[])?,
+            (None, _) => self.calibrate(provider, account, activity.observations)?,
         };
         Some(PromptCache {
             requested_at,
@@ -202,9 +207,8 @@ impl Calibration {
             Some(index) => accounts.insert(index, known),
             None if known.observations.is_empty() => {}
             None => {
-                if accounts.len() == ACCOUNTS {
-                    accounts.remove(0);
-                }
+                let excess = (accounts.len() + 1).saturating_sub(ACCOUNTS);
+                accounts.drain(..excess);
                 accounts.push(known);
             }
         }
@@ -230,6 +234,11 @@ impl Calibration {
         };
         if let Err(error) = write_document(path, &document) {
             tracing::warn!(%error, "prompt cache observations were not saved");
+            // The next listing tries again.
+            self.accounts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .unsaved = true;
         }
     }
 }
@@ -409,7 +418,7 @@ mod tests {
         let activity = requested(vec![observation(100, 9, true), observation(200, 12, true)]);
         let calibration = Calibration::kept_at(Some(path.clone()));
         let estimated = calibration
-            .estimate(Provider::Codex, None, activity.clone(), 120_000)
+            .estimate(Provider::Codex, Some(&account()), activity.clone(), 120_000)
             .unwrap();
         assert_eq!(
             (estimated.ttl_ms, estimated.basis),
@@ -419,13 +428,18 @@ mod tests {
         calibration.save();
         let saved = std::fs::metadata(&path).unwrap().modified().unwrap();
         // Listing again collects nothing new, so nothing is written.
-        calibration.estimate(Provider::Codex, None, activity, 120_000);
+        calibration.estimate(Provider::Codex, Some(&account()), activity, 120_000);
         calibration.save();
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), saved);
 
         let restarted = Calibration::kept_at(Some(path.clone()));
         let estimated = restarted
-            .estimate(Provider::Codex, None, requested(Vec::new()), 1_000)
+            .estimate(
+                Provider::Codex,
+                Some(&account()),
+                requested(Vec::new()),
+                1_000,
+            )
             .unwrap();
         assert_eq!(estimated.ttl_ms, 12 * MINUTE_MS);
         let saved = read_document(&path).unwrap();
@@ -460,11 +474,11 @@ mod tests {
                 .map(|at| observation(1_000 + at, 3, true))
                 .collect(),
         );
-        calibration.estimate(Provider::Codex, None, newer, 0);
+        calibration.estimate(Provider::Codex, Some(&account()), newer, 0);
         calibration.save();
         std::fs::remove_file(&path).unwrap();
         let old = requested(vec![observation(5, 3, true)]);
-        calibration.estimate(Provider::Codex, None, old, 0);
+        calibration.estimate(Provider::Codex, Some(&account()), old, 0);
         calibration.save();
         assert!(!path.exists(), "nothing changed, so nothing was written");
     }

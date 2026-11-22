@@ -18,8 +18,9 @@ pub enum Evidence {
     /// A model request for the conversation started about now, and the next
     /// reading reports what the cache served it.
     Request,
-    /// A request continuing the turn started about now. It refreshes the
-    /// cache, but the provider may report its reading out of order, so it
+    /// A request continuing the turn started about now, unless the turn was
+    /// stopped first. It refreshes the cache once the provider reports on
+    /// it, but the provider may report its reading out of order, so it
     /// measures nothing.
     Continued,
     /// A request's prompt was `prompt` input tokens, of which the cache
@@ -106,9 +107,8 @@ impl Tracker {
                 false
             }
             Evidence::Continued => {
-                self.pending = None;
-                self.activity.requested_at = Some(now);
-                true
+                self.pending = Some(now);
+                false
             }
             Evidence::Written { ttl_ms } => {
                 let confirmed = self.confirm();
@@ -313,6 +313,22 @@ mod tests {
                 hit: false,
             }]
         );
+    }
+
+    #[test]
+    fn a_continuation_counts_once_the_provider_reports_on_it() {
+        let mut tracker = Tracker::default();
+        let read = |prompt, cached| Evidence::Read { prompt, cached };
+        tracker.observe(Evidence::Request, 0);
+        tracker.observe(read(40_000, 39_000), 0);
+        // A tool finished as its turn was stopped, so nothing followed.
+        tracker.observe(Evidence::Request, 10 * MINUTE);
+        tracker.observe(read(41_000, 40_000), 10 * MINUTE);
+        tracker.observe(Evidence::Continued, 30 * MINUTE);
+        assert_eq!(tracker.activity().requested_at, Some(10 * MINUTE));
+        tracker.observe(Evidence::Continued, 31 * MINUTE);
+        tracker.observe(read(43_000, 41_000), 31 * MINUTE);
+        assert_eq!(tracker.activity().requested_at, Some(31 * MINUTE));
     }
 
     #[test]
