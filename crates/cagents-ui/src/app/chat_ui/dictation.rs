@@ -547,6 +547,12 @@ impl Cagents {
             .dictation
             .progress
             .map(|(_, done, total)| (done, total));
+        // A model the app has not seen arrive may have been downloaded by
+        // another copy of cagents or from the command line; look again
+        // before asking to download it.
+        if !self.chat_ui.dictation.installed.contains(&model.id) {
+            self.chat_ui.dictation.installed = installed_models();
+        }
         let installed = self.chat_ui.dictation.installed.contains(&model.id);
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
@@ -685,7 +691,11 @@ impl Cagents {
     /// Sending `target`'s draft while it dictates: it stops listening if it
     /// still is, and sends once the last words are in. `None` when it is not
     /// dictating, and the draft goes now.
-    pub(super) fn dictation_send(&mut self, target: Target, mode: PromptMode) -> Option<Task<Message>> {
+    pub(super) fn dictation_send(
+        &mut self,
+        target: Target,
+        mode: PromptMode,
+    ) -> Option<Task<Message>> {
         let session = match &mut self.chat_runtime_mut(target)?.dictation {
             Some(Pane::Session(session)) => session,
             _ => return None,
@@ -936,12 +946,10 @@ impl Cagents {
             Some(id) => id,
             // A start the helper refused before it had a session: it is the
             // one listening now.
-            None if matches!(event, Event::Error { .. }) => {
-                match self.chat_ui.dictation.active {
-                    Some((_, id)) => id,
-                    None => return Task::none(),
-                }
-            }
+            None if matches!(event, Event::Error { .. }) => match self.chat_ui.dictation.active {
+                Some((_, id)) => id,
+                None => return Task::none(),
+            },
             None => return Task::none(),
         };
         let Some(&target) = self.chat_ui.dictation.sessions.get(&id) else {
@@ -1288,7 +1296,11 @@ mod tests {
         hear(&mut app, stopped(SESSION));
         assert_eq!(draft(&app, first), "One more");
         assert_eq!(draft(&app, second), "Two");
-        assert!(super::super::tests::chat_runtime(&app, first).dictation.is_none());
+        assert!(
+            super::super::tests::chat_runtime(&app, first)
+                .dictation
+                .is_none()
+        );
         assert_eq!(
             app.chat_ui.dictation.active.map(|(_, id)| id),
             Some(SESSION + 1)
