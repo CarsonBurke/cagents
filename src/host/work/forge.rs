@@ -4,8 +4,9 @@
 //! only when a free conditional probe says it may have changed; a checked-out
 //! branch whose pull request someone else opened costs one cached lookup.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -43,6 +44,11 @@ const SEARCH_LAG: Duration = Duration::from_secs(60);
 /// How many of the viewer's latest changes the probe names. Unchanged, a
 /// larger answer is as free; changed, it costs the same one request.
 const PROBE_PAGE: usize = 20;
+/// Projects which name the same GitHub repository are normally polled in one
+/// forge pass. Keep their conditional revalidation together too: otherwise
+/// each checkout spends a REST request to learn the same ETag has not moved.
+/// This also preserves the watched cadence for a single project.
+const PROBE_FOR: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Snapshot {
@@ -117,17 +123,25 @@ pub(super) struct Target {
 }
 
 /// Facts a poll reuses from earlier ones.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(super) struct Memory {
     /// The repository `gh` resolved, from which remotes, and when.
     repository: Option<(GitHubRepoKey, Vec<RemoteRecord>, Instant)>,
     /// Branch to when someone else's pull request was last looked up, at
     /// which head, and what was found.
     others: BTreeMap<String, (Instant, String, Option<PullRequest>)>,
-    listing: Option<Listing>,
+    listings: Listings,
 }
 
 impl Memory {
+    pub(super) fn with_listings(listings: Listings) -> Self {
+        Self {
+            repository: None,
+            others: BTreeMap::new(),
+            listings,
+        }
+    }
+
     /// The repository resolved from exactly these remotes, while it is fresh:
     /// changing `origin`, or `gh repo set-default`, asks `gh` again.
     fn repository_for(&self, remotes: &[RemoteRecord]) -> Option<&GitHubRepoKey> {
@@ -150,6 +164,61 @@ impl Memory {
     }
 }
 
+impl Default for Memory {
+    fn default() -> Self {
+        Self::with_listings(Listings::default())
+    }
+}
+
+/// Pull-request listings are facts about a GitHub repository and the active
+/// GitHub account, not a local checkout. The work service gives every tracked
+/// project this cache, so clones and worktree descriptors sharing a remote
+/// make one GraphQL listing and one conditional REST probe per period.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Listings(Arc<Mutex<HashMap<ListingKey, Listing>>>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ListingKey {
+    repository: GitHubRepoKey,
+    credential: Option<String>,
+}
+
+impl Listings {
+    fn get(&self, key: &ListingKey) -> Option<Listing> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .filter(|listing| {
+                listing.repository == key.repository && listing.credential == key.credential
+            })
+            .cloned()
+    }
+
+    fn put(&self, listing: Listing) {
+        let key = ListingKey {
+            repository: listing.repository.clone(),
+            credential: listing.credential.clone(),
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, listing);
+    }
+
+    #[cfg(test)]
+    fn listing_mut(&self, key: &ListingKey, change: impl FnOnce(&mut Listing)) {
+        if let Some(listing) = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(key)
+        {
+            change(listing);
+        }
+    }
+}
+
 /// The last listing read, and how to ask whether it is still current.
 #[derive(Debug, Clone)]
 struct Listing {
@@ -164,6 +233,10 @@ struct Listing {
     /// Who `@me` was, whose pull requests the probe asks about.
     viewer: String,
     probe: Probe,
+    /// The last REST revalidation. It is separate from `at`: several local
+    /// projects can share a listing, and only the first should spend a probe
+    /// in this cadence.
+    probed_at: Instant,
 }
 
 impl Listing {
@@ -403,11 +476,11 @@ fn listing<E: crate::repository::ProcessExecutor>(
     cancellation: &CancellationToken,
 ) -> Result<Vec<PullRequest>, String> {
     let credential = crate::github_status::credential_fingerprint().ok();
-    let Some(mut previous) = memory
-        .listing
-        .take()
-        .filter(|listing| listing.repository == *repository && listing.credential == credential)
-    else {
+    let key = ListingKey {
+        repository: repository.clone(),
+        credential: credential.clone(),
+    };
+    let Some(mut previous) = memory.listings.get(&key) else {
         let read = read_listing(
             gh,
             repository,
@@ -417,13 +490,19 @@ fn listing<E: crate::repository::ProcessExecutor>(
         )?;
         let pull_requests = read.pull_requests.clone();
         if crate::github_status::credential_fingerprint().ok() == credential {
-            memory.listing = Some(read);
+            memory.listings.put(read);
         }
         return Ok(pull_requests);
     };
+    if freshness != Freshness::Fresh && previous.probed_at.elapsed() < PROBE_FOR {
+        return Ok(previous.pull_requests.clone());
+    }
     // Asked before the listing is read, so a change landing between the two
     // shows as a change next time rather than hiding under a new validator.
     let answer = ask(gh, repository, &previous, cancellation);
+    // Do not let another local checkout immediately repeat an unavailable or
+    // failed revalidation. It can reuse this listing until the next cadence.
+    previous.probed_at = Instant::now();
     if let Answer::Current(probe) = &answer
         && freshness != Freshness::Fresh
         && previous.at.elapsed() < relist_after(freshness)
@@ -431,7 +510,7 @@ fn listing<E: crate::repository::ProcessExecutor>(
     {
         previous.probe = probe.clone();
         let pull_requests = previous.pull_requests.clone();
-        memory.listing = Some(previous);
+        memory.listings.put(previous);
         return Ok(pull_requests);
     }
     let (probe, recent) = match answer {
@@ -459,12 +538,12 @@ fn listing<E: crate::repository::ProcessExecutor>(
                 read.probe = Probe::Unknown;
             }
             let pull_requests = read.pull_requests.clone();
-            memory.listing = Some(read);
+            memory.listings.put(read);
             Ok(pull_requests)
         }
         Err(error) => {
             // Its validator still matches it, for when GitHub answers again.
-            memory.listing = Some(previous);
+            memory.listings.put(previous);
             Err(error)
         }
     }
@@ -530,6 +609,7 @@ fn read_listing<E: crate::repository::ProcessExecutor>(
         pull_requests: merge(read.all, read.open),
         viewer: read.viewer,
         probe,
+        probed_at: Instant::now(),
     })
 }
 
@@ -821,6 +901,13 @@ mod tests {
         let cancellation = CancellationToken::new();
         let mut memory = Memory::default();
         let mut poll = |freshness| {
+            let key = ListingKey {
+                repository: repository.clone(),
+                credential: crate::github_status::credential_fingerprint().ok(),
+            };
+            memory.listings.listing_mut(&key, |listing| {
+                listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+            });
             listing(&gh, &repository, &mut memory, freshness, &cancellation).unwrap();
             forge.take()
         };
@@ -857,10 +944,23 @@ mod tests {
 
         // An old listing is read again: soon while watched, rarely unwatched.
         let age = |memory: &mut Memory, by: Duration| {
-            let listing = memory.listing.as_mut().unwrap();
-            listing.at = Instant::now().checked_sub(by).unwrap();
+            let key = ListingKey {
+                repository: repository.clone(),
+                credential: crate::github_status::credential_fingerprint().ok(),
+            };
+            memory.listings.listing_mut(&key, |listing| {
+                listing.at = Instant::now().checked_sub(by).unwrap();
+                listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+            });
         };
         let poll = |memory: &mut Memory, freshness| {
+            let key = ListingKey {
+                repository: repository.clone(),
+                credential: crate::github_status::credential_fingerprint().ok(),
+            };
+            memory.listings.listing_mut(&key, |listing| {
+                listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+            });
             let read = listing(&gh, &repository, memory, freshness, &cancellation);
             (read.is_ok(), forge.take())
         };
@@ -914,7 +1014,14 @@ mod tests {
             );
         });
         assert!(matches!(
-            memory.listing.as_ref().unwrap().probe,
+            memory
+                .listings
+                .get(&ListingKey {
+                    repository: repository.clone(),
+                    credential: crate::github_status::credential_fingerprint().ok(),
+                })
+                .unwrap()
+                .probe,
             Probe::Validator(_)
         ));
         *forge.probe_fails.lock().unwrap() = None;
@@ -933,6 +1040,56 @@ mod tests {
             poll(&mut memory, Freshness::Watched),
             (true, vec!["listing"])
         );
+    }
+
+    #[test]
+    fn projects_with_the_same_remote_share_a_listing_and_probe() {
+        let forge = Forge::new();
+        let gh = GitHubService::new("gh", forge.clone());
+        let repository = key("me");
+        let cancellation = CancellationToken::new();
+        let listings = Listings::default();
+        let mut first = Memory::with_listings(listings.clone());
+        let mut second = Memory::with_listings(listings.clone());
+
+        listing(
+            &gh,
+            &repository,
+            &mut first,
+            Freshness::Watched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["listing"]);
+
+        // A second local project on this remote reuses the same GraphQL
+        // result and its recent conditional probe.
+        listing(
+            &gh,
+            &repository,
+            &mut second,
+            Freshness::Watched,
+            &cancellation,
+        )
+        .unwrap();
+        assert!(forge.take().is_empty());
+
+        let cache_key = ListingKey {
+            repository: repository.clone(),
+            credential: crate::github_status::credential_fingerprint().ok(),
+        };
+        listings.listing_mut(&cache_key, |listing| {
+            listing.probed_at = Instant::now().checked_sub(PROBE_FOR).unwrap();
+        });
+        listing(
+            &gh,
+            &repository,
+            &mut second,
+            Freshness::Watched,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(forge.take(), ["probe"]);
     }
 
     #[test]
@@ -994,7 +1151,13 @@ mod tests {
             &cancellation,
         )
         .unwrap();
-        memory.listing.as_mut().unwrap().credential = Some("another account".into());
+        let cache_key = ListingKey {
+            repository: key("me"),
+            credential: crate::github_status::credential_fingerprint().ok(),
+        };
+        memory.listings.listing_mut(&cache_key, |listing| {
+            listing.credential = Some("another account".into())
+        });
         listing(
             &gh,
             &key("me"),
@@ -1018,6 +1181,7 @@ mod tests {
                 .map(|&(number, updated)| pull_request(number, "a", "a", "OPEN", updated))
                 .collect(),
             viewer: "me".into(),
+            probed_at: Instant::now(),
             probe: Probe::Unknown,
         };
         let ahead = |body: serde_json::Value, seconds: i64| {
