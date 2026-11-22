@@ -891,6 +891,7 @@ mod tests {
                 confirmation: Some(Confirmation {
                     nonce: "first".into(),
                     stop: None,
+                    terminal_command: None,
                     preview,
                     expires_at_unix_ms: u64::MAX,
                 }),
