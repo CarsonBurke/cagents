@@ -210,13 +210,17 @@ fn converse(
     match client.wait(query, timeout)? {
         Some(replies) => {
             data["replies"] = json!(replies);
+            let replies = replies
+                .iter()
+                .map(message_lines)
+                .collect::<Vec<_>>()
+                .join("\n\n");
             Ok(CommandOutput {
                 command,
-                human: replies
-                    .iter()
-                    .map(message_lines)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
+                human: match cold_notice(&handed.delivery) {
+                    Some(cold) => format!("{cold}\n\n{replies}"),
+                    None => replies,
+                },
                 data,
             })
         }
@@ -242,7 +246,10 @@ fn delivery_json(handed: &Handed) -> Value {
     json!({
         "message": delivery.sent.message,
         "reach": delivery.sent.reach,
-        "recipient": delivery.recipient.as_ref().map(super::sessions::session_json),
+        "recipient": delivery
+            .recipient
+            .as_ref()
+            .map(|member| super::sessions::session_json(member, delivery.sent.message.created_ms)),
         "notice": notice(handed),
         "agent": handed.agent,
     })
@@ -285,6 +292,7 @@ fn delivery_lines(handed: &Handed) -> String {
     if let Some(notice) = notice(handed) {
         lines.push(format!("But {notice}"));
     }
+    lines.extend(cold_notice(&handed.delivery));
     lines.join("\n")
 }
 
@@ -328,6 +336,21 @@ fn recipient_notice(delivery: &Delivery) -> Option<String> {
             super::sessions::account_phrase(account, now)
         )
     })
+}
+
+/// That the message woke a recipient whose prompt cache had likely expired,
+/// so its provider reads the conversation's whole context again. It is
+/// judged as the daemon listed the recipient when it took the message, not
+/// when the sender reads this, which may be after waiting for a reply. A
+/// recipient a usage limit stops reads nothing until the limit lifts.
+fn cold_notice(delivery: &Delivery) -> Option<String> {
+    let recipient = delivery.recipient.as_ref()?;
+    if recipient.limit.is_some() {
+        return None;
+    }
+    let tokens = recipient.cold_context(delivery.sent.message.created_ms)?;
+    let whose = format!("Session {}'s", short(recipient.session.id));
+    Some(super::sessions::cold_wake(&whose, tokens))
 }
 
 /// When a sent message reaches its recipient, as a sent line tells it.
@@ -844,6 +867,41 @@ mod tests {
         );
         let value = delivery_json(&handed);
         assert_eq!(value["recipient"]["state"], "Limited");
+        let cache = crate::agent_execution::directory::PromptCache {
+            requested_at: 0,
+            ttl_ms: 60_000,
+            basis: crate::agent_execution::directory::TtlBasis::Observed,
+            context_tokens: 1_250_000,
+        };
+        // Judged when the daemon took the message, however long the sender
+        // then waited.
+        let mut delivery = handed.delivery.clone();
+        delivery.recipient.as_mut().unwrap().cache = Some(cache);
+        delivery.sent.message.created_ms = 60_000;
+        assert_eq!(
+            cold_notice(&delivery),
+            None,
+            "limited, so nothing reads it yet"
+        );
+        delivery.recipient.as_mut().unwrap().limit = None;
+        delivery.sent.message.created_ms = 30_000;
+        assert_eq!(cold_notice(&delivery), None, "still warm");
+        delivery.sent.message.created_ms = 60_000;
+        assert_eq!(
+            cold_notice(&delivery),
+            Some(format!(
+                "Session {}'s prompt cache had likely expired, so its provider reads all 1.2M tokens of its context again.",
+                short(id)
+            ))
+        );
+        assert_eq!(
+            delivery_json(&Handed {
+                delivery: delivery.clone(),
+                agent: None,
+            })["recipient"]["cache"]["cold"],
+            true,
+            "judged when the daemon took the message"
+        );
         assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());
         assert_eq!(
             value["message"]["id"],

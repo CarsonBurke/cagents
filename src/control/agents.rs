@@ -1422,9 +1422,22 @@ pub(super) fn execute_with_context(
         } => {
             let prompt = prompt.read()?;
             let agent = session.agent(&agent)?;
-            // Read before the run starts a turn, which clears the limit.
-            let limit = member_of(&session.members(&[agent]), agent)
-                .and_then(|member| member.limit.clone());
+            // Read before the run starts a turn, which clears the limit and
+            // refreshes the cache.
+            let members = session.members(&[agent]);
+            let member = member_of(&members, agent);
+            let limit = member.and_then(|member| member.limit.clone());
+            let read_at = super::sessions::now_ms();
+            // One a usage limit stops reads nothing until the limit lifts.
+            let cold = member
+                .filter(|member| member.limit.is_none())
+                .and_then(|member| {
+                    let tokens = member.cold_context(read_at)?;
+                    Some((
+                        tokens,
+                        super::sessions::cache_json(member, read_at, Detail::Sparse),
+                    ))
+                });
             let request = Submit {
                 name: None,
                 destination: Destination::Existing(agent),
@@ -1434,6 +1447,7 @@ pub(super) fn execute_with_context(
             // The daemon refuses an agent stopped until a known reset, after
             // answering a retry of an accepted submission with its acceptance.
             let now = super::sessions::now_ms();
+            let waited = wait.wait;
             let mut output = submitted(
                 &mut session,
                 "agent.send",
@@ -1451,6 +1465,18 @@ pub(super) fn execute_with_context(
                 output.human = format!("{}\n{notice}", output.human);
                 output.data["notice"] = json!(notice);
             }
+            if let Some((tokens, cache)) =
+                cold.filter(|(_, cache)| woke(waited.then_some(&output.data), cache))
+            {
+                // After the first line, which names the agent, rather than
+                // after whatever the run printed.
+                let line = super::sessions::cold_wake("Its", tokens);
+                output.human = match output.human.split_once('\n') {
+                    Some((head, rest)) => format!("{head}\n{line}\n{rest}"),
+                    None => format!("{}\n{line}", output.human),
+                };
+                output.data["cache"] = cache;
+            }
             Ok(output)
         }
         AgentCommand::Status { agent, show } => {
@@ -1460,12 +1486,14 @@ pub(super) fn execute_with_context(
             let handles = session.handles(&[agent.id.to_string(), run.id.to_string()]);
             let members = session.members(&[agent.id]);
             let member = member_of(&members, agent.id);
+            let now = super::sessions::now_ms();
             let human = with_standing(
                 status_lines(&agent, &run, false, show, handles, true),
                 member,
+                now,
             );
             let mut data = json!({"agent": agent, "run": run, "timed_out": false});
-            standing_json(&mut data, member);
+            standing_json(&mut data, member, now);
             Ok(CommandOutput {
                 command: "agent.status",
                 data,
@@ -1540,6 +1568,7 @@ pub(super) fn execute_with_context(
             // One run's hint goes with its status. Several runs share one
             // hint, after them all, so a wait prints one however many.
             let single = statuses.len() == 1;
+            let now = super::sessions::now_ms();
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
@@ -1553,6 +1582,7 @@ pub(super) fn execute_with_context(
                             single,
                         ),
                         member_of(&members, agent.id),
+                        now,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1880,10 +1910,11 @@ fn submitted(
     // A run that settled says what stops its provider now, and the account.
     let members = session.members(&[accepted.agent.id]);
     let member = member_of(&members, accepted.agent.id);
+    let now = super::sessions::now_ms();
     if wait.wait {
-        human = with_standing(human, member);
+        human = with_standing(human, member, now);
     }
-    standing_json(&mut data, member);
+    standing_json(&mut data, member, now);
     Ok(CommandOutput {
         command,
         data,
@@ -1902,13 +1933,21 @@ fn member_of(members: &[Member], agent: AgentId) -> Option<&Member> {
     })
 }
 
-/// A status with what stops the agent's provider and the account it runs
-/// on, after its first line, which readers of the output parse.
-fn with_standing(lines: String, member: Option<&Member>) -> String {
+/// Whether a send whose recipient's cache read `before` as cold woke it:
+/// unless the run it waited for left that same cache in place, as one that
+/// failed before reaching the provider does, which its standing in `after`
+/// already reports.
+fn woke(after: Option<&Value>, before: &Value) -> bool {
+    after.is_none_or(|after| after["cache"]["expires_at"] != before["expires_at"])
+}
+
+/// A status with what stops the agent's provider, the account it runs on
+/// and whether its prompt cache has likely expired, as of `now`, after its
+/// first line, which readers of the output parse.
+fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
     let Some(member) = member else {
         return lines;
     };
-    let now = super::sessions::now_ms();
     let mut standing = String::new();
     if let Some(limit) = &member.limit {
         standing.push_str(&format!(
@@ -1922,16 +1961,26 @@ fn with_standing(lines: String, member: Option<&Member>) -> String {
             super::sessions::account_phrase(account, now)
         ));
     }
+    if let Some(tokens) = member.cold_context(now) {
+        standing.push_str(&format!(
+            "\nPrompt cache likely expired: a message makes its provider read all {} tokens of its context again",
+            super::sessions::token_count(tokens)
+        ));
+    }
     match lines.split_once('\n') {
         Some((head, rest)) => format!("{head}{standing}\n{rest}"),
         None => format!("{lines}{standing}"),
     }
 }
 
-/// The agent's usage limit and account, as `sessions --json` reports them.
-fn standing_json(data: &mut Value, member: Option<&Member>) {
+/// The agent's usage limit and account, as `sessions --json` reports them,
+/// and its prompt cache where a message would find it cold.
+fn standing_json(data: &mut Value, member: Option<&Member>, now: u64) {
     data["limit"] = json!(member.and_then(|member| member.limit.as_ref()));
     data["account"] = json!(member.and_then(|member| member.account.as_ref()));
+    if let Some(member) = member.filter(|member| member.cold_context(now).is_some()) {
+        data["cache"] = super::sessions::cache_json(member, now, super::fields::Detail::Sparse);
+    }
 }
 
 /// A failed observation must not hide work the daemon already accepted.
@@ -4319,7 +4368,7 @@ mod tests {
         assert!(member_of(&members, AgentId::new()).is_none());
         let found = member_of(&members, agent);
         let status = "agent 1234 (claude) run 5678 Failed\n\nActual result";
-        let human = with_standing(status.into(), found);
+        let human = with_standing(status.into(), found, super::super::sessions::now_ms());
         assert_eq!(
             human,
             "agent 1234 (claude) run 5678 Failed\nStopped by a usage limit: Claude weekly limit reached, resets 3pm\nAccount claude/system: allowance unknown\n\nActual result"
@@ -4330,11 +4379,51 @@ mod tests {
             assert_eq!(run.state, Some(crate::agent_execution::State::Failed));
             assert_eq!(run.result, "Actual result");
         }
-        assert_eq!(with_standing(status.into(), None), status);
+        assert_eq!(
+            with_standing(status.into(), None, super::super::sessions::now_ms()),
+            status
+        );
         let mut data = json!({});
-        standing_json(&mut data, found);
+        standing_json(&mut data, found, super::super::sessions::now_ms());
         assert_eq!(data["limit"]["reset"], "3pm");
         assert_eq!(data["account"]["id"], "claude/system");
+        assert!(data.get("cache").is_none(), "no estimate");
+
+        // A cache that likely expired gets a line among the standing, and
+        // the same `now` decides the text and the JSON.
+        let mut cold = found.unwrap().clone();
+        cold.limit = None;
+        cold.account = None;
+        cold.cache = Some(crate::agent_execution::directory::PromptCache {
+            requested_at: 0,
+            ttl_ms: 60_000,
+            basis: crate::agent_execution::directory::TtlBasis::Reported,
+            context_tokens: 120_000,
+        });
+        assert_eq!(
+            with_standing(status.into(), Some(&cold), 60_000),
+            "agent 1234 (claude) run 5678 Failed\nPrompt cache likely expired: a message makes its provider read all 120k tokens of its context again\n\nActual result"
+        );
+        assert_eq!(with_standing(status.into(), Some(&cold), 59_999), status);
+        let mut data = json!({});
+        standing_json(&mut data, Some(&cold), 60_000);
+        assert_eq!(data["cache"]["cold"], true);
+        assert_eq!(data["cache"]["basis"], "reported");
+        let mut data = json!({});
+        standing_json(&mut data, Some(&cold), 59_999);
+        assert!(data.get("cache").is_none(), "warm");
+    }
+
+    #[test]
+    fn a_send_woke_its_agent_unless_the_waited_run_left_the_same_cache() {
+        let before = json!({"cold": true, "expires_at": 60});
+        assert!(woke(None, &before), "not waited");
+        assert!(woke(Some(&json!({})), &before), "warm after the run");
+        assert!(
+            woke(Some(&json!({"cache": {"expires_at": 900}})), &before),
+            "a later request, though cold again"
+        );
+        assert!(!woke(Some(&json!({"cache": before.clone()})), &before));
     }
 
     /// Each state suggests what follows from it, on a line the native app
