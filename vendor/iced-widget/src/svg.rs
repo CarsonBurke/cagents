@@ -341,6 +341,7 @@ where
                     rotation: self.rotation.radians(),
                     opacity: self.opacity,
                     border_radius: [0., 0., 0., 0.],
+                    spin: None,
                 },
                 drawing_bounds,
                 bounds,

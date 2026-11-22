@@ -1,4 +1,5 @@
 //! Load and draw vector graphics.
+use crate::time::{Duration, Instant};
 use crate::{Color, Radians, Rectangle, Size};
 
 use rustc_hash::FxHasher;
@@ -32,6 +33,45 @@ pub struct Svg<H = Handle> {
 
     /// The border radius for the svg
     pub border_radius: [f32; 4],
+
+    /// The turning of the [`Svg`] with time, on top of its `rotation`.
+    pub spin: Option<Spin>,
+}
+
+/// A steady turning of an [`Svg`] that its renderer works out from the clock
+/// whenever it presents a frame.
+///
+/// A spinning drawing keeps turning when its window presents its last drawing
+/// again, as it does for frames requested with a
+/// [`window::AnimationRequest`](crate::window::AnimationRequest). A renderer
+/// that cannot spin draws the [`Svg`] at its `rotation`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Spin {
+    /// The instant at which the [`Svg`] is at its `rotation`.
+    pub since: Instant,
+
+    /// How long a full turn takes. A zero period does not turn.
+    pub period: Duration,
+}
+
+impl Spin {
+    /// Returns how far the drawing has turned at `now`, within a single turn.
+    ///
+    /// The reduction to a single turn happens in `f64`, because a clock that
+    /// runs for days accumulates enough seconds that `f32` can no longer
+    /// resolve a frame.
+    pub fn angle(&self, now: Instant) -> Radians {
+        let period = self.period.as_secs_f64();
+
+        if period <= 0.0 {
+            return Radians(0.0);
+        }
+
+        let elapsed = now.saturating_duration_since(self.since).as_secs_f64();
+        let turns = (elapsed % period) / period;
+
+        Radians(turns as f32 * std::f32::consts::TAU)
+    }
 }
 
 impl Svg<Handle> {
@@ -43,6 +83,7 @@ impl Svg<Handle> {
             rotation: Radians(0.0),
             opacity: 1.0,
             border_radius: [0.0; 4],
+            spin: None,
         }
     }
 
@@ -61,6 +102,12 @@ impl Svg<Handle> {
     /// Sets the opacity of the [`Svg`].
     pub fn opacity(mut self, opacity: impl Into<f32>) -> Self {
         self.opacity = opacity.into();
+        self
+    }
+
+    /// Turns the [`Svg`] steadily with time; see [`Spin`].
+    pub fn spin(mut self, spin: impl Into<Option<Spin>>) -> Self {
+        self.spin = spin.into();
         self
     }
 
@@ -166,4 +213,35 @@ pub trait Renderer: crate::Renderer {
 
     /// Draws an SVG with the given [`Handle`], an optional [`Color`] filter, and inside the provided `bounds`.
     fn draw_svg(&mut self, svg: Svg, bounds: Rectangle, clip_bounds: Rectangle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spin_turns_once_per_period_from_its_instant() {
+        let since = Instant::now();
+        let spin = Spin {
+            since,
+            period: Duration::from_millis(1200),
+        };
+        let quarter = spin.angle(since + Duration::from_millis(300)).0;
+        let wrapped = spin.angle(since + Duration::from_millis(1500)).0;
+
+        assert_eq!(spin.angle(since).0, 0.0);
+        assert!((quarter - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((wrapped - quarter).abs() < 1e-4, "a full turn wraps");
+        assert_eq!(
+            spin.angle(since - Duration::from_millis(10)).0,
+            0.0,
+            "an instant before the spin began has not turned"
+        );
+        assert_eq!(
+            Spin { since, period: Duration::ZERO }
+                .angle(since + Duration::from_secs(1))
+                .0,
+            0.0
+        );
+    }
 }

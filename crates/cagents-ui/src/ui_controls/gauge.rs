@@ -13,20 +13,17 @@ use cosmic::{
 static SPINNER_EPOCH: std::sync::LazyLock<cosmic::iced::time::Instant> =
     std::sync::LazyLock::new(cosmic::iced::time::Instant::now);
 
-/// How often a visible spinner asks for a frame.
+/// How a visible spinner asks for frames while its window is focused: one per
+/// frame of the display.
 ///
-/// Every frame repaints the whole window, so this is the price of every
-/// working agent on screen, paid for as long as it works. A frame that only
-/// turns spinners reuses the window's prepared text and skips the sidebar's
-/// focus walks, which leaves it at about 2 ms on the reference machine
-/// (docs/performance.md, "What a spinner frame costs"). Twenty steps a second,
-/// fifteen degrees of a [`crate::design::SPINNER_PERIOD`] turn each, reads as
-/// a smoothly turning arc at indicator size.
-const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
-
-// The cadence is the whole cost of a working agent; it must not creep back
-// toward display refresh without measuring what a spinner frame costs.
-const _: () = assert!(SPINNER_FRAME.as_millis() >= 50);
+/// A spinner's frames neither update nor draw the window's widgets. The
+/// spinner draws its arc as a spinning SVG, the renderer turns it from the
+/// clock, and the window presents its retained drawing again for each frame
+/// (`AnimationRequest` in `vendor/iced-core`). Such a frame costs the present
+/// alone, which is what makes display refresh affordable (docs/performance.md,
+/// "What a spinner frame costs").
+const SPINNER_ANIMATION: cosmic::iced::window::AnimationRequest =
+    cosmic::iced::window::AnimationRequest::EveryFrame;
 
 /// How often a spinner asks for a frame while its window is unfocused.
 ///
@@ -39,7 +36,7 @@ const _: () = assert!(SPINNER_FRAME.as_millis() >= 50);
 const SPINNER_BACKGROUND_FRAME: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How far, in focused time, an unfocused spinner's arc moves each frame:
-/// thirty degrees, two focused steps. A smaller step would make the arc's
+/// thirty degrees. A smaller step would make the arc's
 /// edge on a 12 px indicator move barely a pixel and a half per frame, which
 /// reads as stalled.
 const SPINNER_BACKGROUND_STEP: std::time::Duration = std::time::Duration::from_millis(100);
@@ -48,15 +45,11 @@ const SPINNER_BACKGROUND_STEP: std::time::Duration = std::time::Duration::from_m
 const BACKGROUND_SLOWDOWN: u32 =
     (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_BACKGROUND_STEP.as_millis()) as u32;
 
-// Whole multiples keep the slowdown exact and each background step a whole
-// number of focused steps.
+// A whole multiple keeps the slowdown exact.
 const _: () = assert!(
     SPINNER_BACKGROUND_FRAME
         .as_millis()
         .is_multiple_of(SPINNER_BACKGROUND_STEP.as_millis())
-        && SPINNER_BACKGROUND_STEP
-            .as_millis()
-            .is_multiple_of(SPINNER_FRAME.as_millis())
         && BACKGROUND_SLOWDOWN > 1
 );
 
@@ -78,8 +71,7 @@ std::thread_local! {
 ///
 /// The application calls this for its main window's focus changes; spinners
 /// are drawn only there. While unfocused, spinners turn slowly and ask for a
-/// frame every [`SPINNER_BACKGROUND_FRAME`]. A background window with agents
-/// working still repaints, but ten times less often than a focused one. A
+/// frame every [`SPINNER_BACKGROUND_FRAME`] instead of every display frame. A
 /// window that is minimized, on another workspace or behind a lock screen has
 /// lost focus too, and the compositor's frame callbacks may throttle it
 /// further. Regaining focus restores the full cadence on the redraw that
@@ -91,33 +83,6 @@ pub fn animate_activity(focused: bool) {
 #[cfg(test)]
 pub(crate) fn activity_animates() -> bool {
     ANIMATE_ACTIVITY.get()
-}
-
-// Each visible spinner sees the same redraw event. Keep one timestamp per UI
-// thread so recording scales with frames, not the number of busy indicators.
-fn trace_activity_frame(now: cosmic::iced::time::Instant, focused: bool) {
-    std::thread_local! {
-        static LAST: std::cell::Cell<Option<(cosmic::iced::time::Instant, bool)>> = const { std::cell::Cell::new(None) };
-    }
-    LAST.with(|last| {
-        if let Some((previous, was_focused)) = last.get() {
-            if previous == now {
-                return;
-            }
-            // A focus transition changes the intended cadence. Do not count
-            // that interval as a steady focused or background frame interval.
-            if was_focused == focused {
-                tracing::debug!(
-                    target: "cagents::workspace_pipeline",
-                    stage = "activity_redraw",
-                    interval_ns = now.saturating_duration_since(previous).as_nanos().min(u64::MAX as u128) as u64,
-                    focused,
-                    "Observed a redraw with a visible activity indicator"
-                );
-            }
-        }
-        last.set(Some((now, focused)));
-    });
 }
 
 /// The arc the spinner draws `elapsed` after [`SPINNER_EPOCH`], as start and
@@ -192,10 +157,21 @@ struct ActivitySpinner {
 
 #[derive(Default)]
 struct SpinnerState {
-    /// Time since [`SPINNER_EPOCH`] as of the last frame, kept here because
-    /// `draw` is handed no clock of its own. While the window is unfocused
+    /// Where the arc stood at the window's last redraw event, kept here
+    /// because `draw` is handed no clock of its own.
+    turn: Option<Turn>,
+}
+
+/// The arc's motion as of one redraw event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Turn {
+    /// The redraw event's instant.
+    at: cosmic::iced::time::Instant,
+    /// Time since [`SPINNER_EPOCH`] at `at`. While the window is unfocused
     /// this is that time slowed by [`BACKGROUND_SLOWDOWN`].
     elapsed: std::time::Duration,
+    /// How long a turn takes from `at` on.
+    period: std::time::Duration,
 }
 
 impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
@@ -248,23 +224,34 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         if let cosmic::iced::Event::Window(cosmic::iced::window::Event::RedrawRequested(now)) =
             event
         {
-            if tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG) {
-                trace_activity_frame(*now, ANIMATE_ACTIVITY.get());
-            }
             let state = tree.state.downcast_mut::<SpinnerState>();
             let since = now.saturating_duration_since(*SPINNER_EPOCH);
-            // A redraw repaints the whole window, so the arc is stepped at a
-            // fixed cadence instead of holding the window at display refresh
-            // for as long as any agent is working. An unfocused window steps
-            // it slower still. The angle stays a function of the shared epoch,
-            // so every spinner in the window still draws the same arc.
-            let (elapsed, frame) = if ANIMATE_ACTIVITY.get() {
-                (since, SPINNER_FRAME)
+            // The renderer turns the arc from here on, until the window next
+            // draws its widgets and this runs again. An unfocused window turns
+            // it slower and presents fewer frames. The angle stays a function
+            // of the shared epoch, so every spinner in the window draws the
+            // same arc.
+            let (turn, animation) = if ANIMATE_ACTIVITY.get() {
+                (
+                    Turn {
+                        at: *now,
+                        elapsed: since,
+                        period: crate::design::SPINNER_PERIOD,
+                    },
+                    SPINNER_ANIMATION,
+                )
             } else {
-                (since / BACKGROUND_SLOWDOWN, SPINNER_BACKGROUND_FRAME)
+                (
+                    Turn {
+                        at: *now,
+                        elapsed: since / BACKGROUND_SLOWDOWN,
+                        period: crate::design::SPINNER_PERIOD * BACKGROUND_SLOWDOWN,
+                    },
+                    cosmic::iced::window::AnimationRequest::Every(SPINNER_BACKGROUND_FRAME),
+                )
             };
-            state.elapsed = elapsed;
-            shell.request_redraw_at(*now + frame);
+            state.turn = Some(turn);
+            shell.request_animation(animation);
         }
     }
 
@@ -288,19 +275,25 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         if bounds.width < 1.0 || bounds.height < 1.0 {
             return;
         }
-        let state = tree.state.downcast_ref::<SpinnerState>();
-        let (start, _) = spinner_arc(state.elapsed);
+        let turn = tree.state.downcast_ref::<SpinnerState>().turn;
+        let (start, _) = spinner_arc(turn.map_or(std::time::Duration::ZERO, |turn| turn.elapsed));
         let color = (self.tone)(theme);
-        // Rotate a stable SVG through the image pipeline. Dynamic canvas
-        // meshes in the pinned WGPU renderer retained arcs after their panes
-        // unmounted; sharing one icon per size also avoids retessellation on
-        // every animation frame. Keep the original phase, sweep and stroke.
+        // Rotate a stable SVG through the image pipeline, and let the
+        // renderer keep turning it from the clock between the frames that
+        // draw the window's widgets. Dynamic canvas meshes in the pinned WGPU
+        // renderer retained arcs after their panes unmounted; sharing one
+        // icon per size also avoids retessellation on every animation frame.
+        // Keep the original phase, sweep and stroke.
         renderer.with_layer(clip, |renderer| {
             renderer.draw_svg(
                 Svg::new(self.handle.clone())
                     .color(cosmic::iced::Color { a: 1.0, ..color })
                     .opacity(color.a)
-                    .rotation(cosmic::iced::Radians(start)),
+                    .rotation(cosmic::iced::Radians(start))
+                    .spin(turn.map(|turn| cosmic::iced::advanced::svg::Spin {
+                        since: turn.at,
+                        period: turn.period,
+                    })),
                 bounds,
                 clip,
             );
@@ -628,14 +621,18 @@ mod tests {
     }
 
     /// Delivers the window's redraw at `now` to a spinner laid out at
-    /// `origin` in a 400 x 300 window, returning the frame it asks for next
-    /// and the arc it will draw.
+    /// `origin` in a 400 x 300 window, returning the frames it asks for and
+    /// the motion it will draw.
     fn redraw(
         element: &mut Element<'_, ()>,
         tree: &mut cosmic::iced::advanced::widget::Tree,
         origin: cosmic::iced::Point,
         now: cosmic::iced::time::Instant,
-    ) -> (cosmic::iced::window::RedrawRequest, Duration) {
+    ) -> (
+        cosmic::iced::window::RedrawRequest,
+        cosmic::iced::window::AnimationRequest,
+        Option<Turn>,
+    ) {
         use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse};
         use cosmic::iced::{Event, Point, Rectangle, Size, window};
 
@@ -656,7 +653,8 @@ mod tests {
         );
         (
             shell.redraw_request(),
-            tree.state.downcast_ref::<SpinnerState>().elapsed,
+            shell.animation_request(),
+            tree.state.downcast_ref::<SpinnerState>().turn,
         )
     }
 
@@ -666,36 +664,43 @@ mod tests {
         (element, tree)
     }
 
-    /// A spinner mounted in an off-screen card or scrolled past the end of a
-    /// strip must not keep asking for the next frame: several of those at
-    /// once pin the whole window to the compositor's cadence for motion
-    /// nobody can see.
+    /// A visible spinner asks for a frame per display frame, and none of
+    /// them is a redraw of the window's widgets: the renderer turns the arc.
+    /// One mounted in an off-screen card or scrolled past the end of a strip
+    /// asks for nothing, since several of those at once would pin the whole
+    /// window to the compositor's cadence for motion nobody can see.
     #[test]
-    fn an_offscreen_spinner_stops_asking_for_frames() {
+    fn a_visible_spinner_asks_for_animation_frames_and_an_offscreen_one_for_none() {
         use cosmic::iced::{Point, window};
 
         animate_activity(true);
         let (mut element, mut tree) = mounted();
-        let (visible, advanced) =
+        let (redraw_request, animation, turn) =
             redraw(&mut element, &mut tree, Point::new(8.0, 8.0), half_turn());
-        // Stepped at the spinner's own cadence, not at display refresh.
+        assert_eq!(redraw_request, window::RedrawRequest::Wait);
+        assert_eq!(animation, window::AnimationRequest::EveryFrame);
         assert_eq!(
-            visible,
-            window::RedrawRequest::At(half_turn() + SPINNER_FRAME)
+            turn,
+            Some(Turn {
+                at: half_turn(),
+                elapsed: crate::design::SPINNER_PERIOD / 2,
+                period: crate::design::SPINNER_PERIOD,
+            })
         );
-        assert_ne!(advanced, Duration::ZERO, "the visible arc did not advance");
 
         let (mut element, mut tree) = mounted();
-        let (hidden, frozen) = redraw(&mut element, &mut tree, Point::new(8.0, 900.0), half_turn());
-        assert_eq!(hidden, window::RedrawRequest::Wait);
-        assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
+        let (redraw_request, animation, turn) =
+            redraw(&mut element, &mut tree, Point::new(8.0, 900.0), half_turn());
+        assert_eq!(redraw_request, window::RedrawRequest::Wait);
+        assert_eq!(animation, window::AnimationRequest::None);
+        assert_eq!(turn, None, "the hidden arc advanced anyway");
     }
 
     /// An unfocused window may still be in view, so its spinners keep moving,
     /// but slowly: one frame every background cadence, each advancing the arc
-    /// by one background step. That holds whether a spinner was turning when focus
-    /// left or was mounted after it did, and the full cadence returns on the
-    /// first redraw once the window has focus back.
+    /// by one background step. That holds whether a spinner was turning when
+    /// focus left or was mounted after it did, and the full rate returns on
+    /// the first redraw once the window has focus back.
     #[test]
     fn an_unfocused_window_turns_its_spinners_slowly_until_focus_returns() {
         use cosmic::iced::{Point, window};
@@ -703,36 +708,32 @@ mod tests {
         let origin = Point::new(8.0, 8.0);
         animate_activity(true);
         let (mut turning, mut turning_tree) = mounted();
-        let (request, _) = redraw(&mut turning, &mut turning_tree, origin, half_turn());
-        assert_eq!(
-            request,
-            window::RedrawRequest::At(half_turn() + SPINNER_FRAME)
-        );
+        let _ = redraw(&mut turning, &mut turning_tree, origin, half_turn());
 
         animate_activity(false);
-        // The frame the spinner had already asked for still arrives.
-        let later = half_turn() + SPINNER_FRAME;
+        let later = half_turn() + Duration::from_millis(16);
         let (mut fresh, mut fresh_tree) = mounted();
         for (element, tree) in [
             (&mut turning, &mut turning_tree),
             (&mut fresh, &mut fresh_tree),
         ] {
-            let (request, slow) = redraw(element, tree, origin, later);
+            let (_, animation, turn) = redraw(element, tree, origin, later);
             assert_eq!(
-                request,
-                window::RedrawRequest::At(later + SPINNER_BACKGROUND_FRAME),
+                animation,
+                window::AnimationRequest::Every(SPINNER_BACKGROUND_FRAME),
                 "an unfocused spinner kept the focused cadence or stopped"
             );
-            let next = later + SPINNER_BACKGROUND_FRAME;
-            let (request, stepped) = redraw(element, tree, origin, next);
-            assert_eq!(
-                request,
-                window::RedrawRequest::At(next + SPINNER_BACKGROUND_FRAME)
-            );
-            assert_eq!(
-                stepped - slow,
-                SPINNER_BACKGROUND_STEP,
-                "one background frame should advance the arc by one background step"
+            let turn = turn.expect("an unfocused spinner still turns");
+            // What the renderer turns the arc by over one background frame.
+            let spin = cosmic::iced::advanced::svg::Spin {
+                since: turn.at,
+                period: turn.period,
+            };
+            let step = spin.angle(later + SPINNER_BACKGROUND_FRAME).0;
+            assert!(
+                (step - span_per(SPINNER_BACKGROUND_STEP, crate::design::SPINNER_PERIOD)).abs()
+                    < 1e-4,
+                "one background frame should advance the arc by one background step, not {step}"
             );
             assert_eq!(
                 SPINNER_BACKGROUND_STEP * 12,
@@ -747,14 +748,90 @@ mod tests {
             (&mut turning, &mut turning_tree),
             (&mut fresh, &mut fresh_tree),
         ] {
-            let (request, elapsed) = redraw(element, tree, origin, resumed);
-            assert_eq!(request, window::RedrawRequest::At(resumed + SPINNER_FRAME));
+            let (_, animation, turn) = redraw(element, tree, origin, resumed);
+            assert_eq!(animation, window::AnimationRequest::EveryFrame);
             assert_eq!(
-                elapsed,
-                resumed.saturating_duration_since(*SPINNER_EPOCH),
+                turn.map(|turn| turn.elapsed),
+                Some(resumed.saturating_duration_since(*SPINNER_EPOCH)),
                 "a refocused spinner did not return to the shared full-speed arc"
             );
         }
+    }
+
+    /// A window may present its retained drawing for a spinner's frames only
+    /// while that drawing still shows the interface. The spinner's request
+    /// reaches the shell through containers, and anything that reaches the
+    /// interface after it is drawn, an event or an operation, means the next
+    /// frame draws the widgets again.
+    #[test]
+    fn a_drawn_interface_with_a_spinner_asks_for_frames_that_only_present() {
+        use cosmic::iced::advanced::widget::operation;
+        use cosmic::iced::runtime::user_interface::{Cache, State, UserInterface};
+        use cosmic::iced::{Event, Point, Size, mouse, window};
+
+        animate_activity(true);
+        let mut renderer = headless_renderer();
+        let view = || -> Element<'static, ()> {
+            cosmic::widget::container(cosmic::widget::row::with_children(vec![
+                cosmic::widget::text("Working").into(),
+                activity_spinner(16.0, crate::design::accent_color),
+            ]))
+            .into()
+        };
+        let mut ui = UserInterface::build(
+            view(),
+            Size::new(400.0, 300.0),
+            Cache::default(),
+            &mut renderer,
+        );
+        assert!(!ui.is_drawn(), "a new interface has not been drawn");
+
+        let mut messages = Vec::new();
+        let redraw = |ui: &mut UserInterface<'_, (), cosmic::Theme, cosmic::Renderer>,
+                      renderer: &mut cosmic::Renderer,
+                      messages: &mut Vec<()>| {
+            let (state, _) = ui.update(
+                &[Event::Window(window::Event::RedrawRequested(half_turn()))],
+                mouse::Cursor::Unavailable,
+                renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                messages,
+            );
+            ui.draw(
+                renderer,
+                &cosmic::Theme::default(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                mouse::Cursor::Unavailable,
+            );
+            state
+        };
+        let State::Updated {
+            redraw_request,
+            animation_request,
+            ..
+        } = redraw(&mut ui, &mut renderer, &mut messages)
+        else {
+            panic!("a spinner's redraw left the interface outdated")
+        };
+        assert_eq!(redraw_request, window::RedrawRequest::Wait);
+        assert_eq!(animation_request, window::AnimationRequest::EveryFrame);
+        assert!(ui.is_drawn());
+
+        let _ = ui.update(
+            &[Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(10.0, 10.0),
+            })],
+            mouse::Cursor::Available(Point::new(10.0, 10.0)),
+            &mut renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert!(!ui.is_drawn(), "an event left the drawing in place");
+
+        let _ = redraw(&mut ui, &mut renderer, &mut messages);
+        assert!(ui.is_drawn());
+        ui.operate(&renderer, &mut operation::focusable::unfocus::<()>());
+        assert!(!ui.is_drawn(), "an operation left the drawing in place");
     }
 
     #[test]
@@ -773,7 +850,11 @@ mod tests {
         let node = layout::Node::new(Size::new(24.0, 24.0)).move_to(Point::new(8.0, 8.0));
         let size = Size::new(64, 64);
         let mut draw = |viewport: Rectangle, elapsed: Duration| {
-            tree.state.downcast_mut::<SpinnerState>().elapsed = elapsed;
+            tree.state.downcast_mut::<SpinnerState>().turn = Some(Turn {
+                at: *SPINNER_EPOCH + elapsed,
+                elapsed,
+                period: crate::design::SPINNER_PERIOD,
+            });
             renderer.reset(extent);
             element.as_widget().draw(
                 &tree,

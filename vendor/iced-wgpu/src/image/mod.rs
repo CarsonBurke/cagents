@@ -244,6 +244,7 @@ impl State {
         images: &Batch,
         transformation: Transformation,
         scale: f32,
+        now: crate::core::time::Instant,
     ) {
         if self.layers.len() <= self.prepare_layer {
             self.layers.push(Layer::new(
@@ -340,7 +341,10 @@ impl State {
                             _ => {}
                         }
 
-                        let rotation = f32::from(svg.rotation);
+                        let rotation = f32::from(svg.rotation)
+                            + svg
+                                .spin
+                                .map_or(0.0, |spin| f32::from(spin.angle(now)));
 
                         // The raster was made for these bounds at this scale,
                         // so an upright vector maps one texel to one physical
@@ -351,7 +355,9 @@ impl State {
                         // A rotated raster no longer lines up with the pixel
                         // grid at all; nearest sampling turns its antialiased
                         // edges into steps, so it is filtered instead.
-                        if rotation == 0.0 {
+                        // A spinning vector passes upright for a single
+                        // frame per turn, so it stays filtered throughout.
+                        if rotation == 0.0 && svg.spin.is_none() {
                             add_instances(
                                 pixel_aligned(
                                     *bounds,

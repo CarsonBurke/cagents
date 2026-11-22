@@ -74,6 +74,26 @@ interval between them. Without an observer, which is the case unless the
 application's development UI trace is enabled, no clock is read. Remove this
 when the pinned dependency offers equivalent frame timing.
 
+A window whose widgets asked for animation frames
+(`Shell::request_animation`, see `vendor/iced-core/README.cagents.md`) gets
+them without drawing its widgets. When a frame arrives and nothing but the
+animation asked for it, the shell presents the renderer's retained drawing
+again: it dispatches no redraw event to the widgets, collects no overlays,
+draws nothing, publishes no accessibility snapshot and draws no preedit, but
+it still broadcasts the redraw event to subscriptions and reports the frame
+to the frame observer. A frame draws the widgets instead when the interface
+is not exactly as it was last drawn (`UserInterface::is_drawn`: an event, an
+operation, a rebuild or a relayout reached it), when a widget's redraw
+request is due, when `RedrawAll` asked for one (as the graphics shell does
+after loading an image), or when accessibility was just enabled; each of
+these sets the window's `needs_draw`. Every drawn frame replaces the
+window's animation request with the one its widgets made on that frame's
+redraw event. After each presented frame the window asks for the next
+animation frame: at once for `EveryFrame`, which the compositor's frame
+callbacks pace, or after the interval for `Every`. Timed animation frames
+join widget redraws in the event loop's deadline. Remove this with the
+iced-core change.
+
 This standalone package is not a workspace member and does not see the root
 manifest's patches. Run its tests against the vendored packages with a Cargo
 configuration that repeats the root `[patch]` entries as absolute paths, for

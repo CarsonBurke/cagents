@@ -28,3 +28,14 @@ The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so
 `text::State::prepare` keeps, for each text group it prepares, the group's text, clip bounds, transformation and the viewport resolution. When the next frame draws a group that matches at the same position in the frame, it asks the group's renderer to `reuse` its glyphs (vendor/cryoglyph/README.cagents.md) instead of preparing them again, and prepares them as before if that fails. Paragraphs, editors and raw buffers compare by identity, using `is_same_live` from vendor/iced-graphics: none is changed in place while a frame refers to it. Cached text compares by value, and a reused group keeps its shaped cached text with `Cache::keep` (vendor/iced-graphics), as preparing it would. A group that is not drawn again releases what it kept when the frame is trimmed.
 
 `drawn_identity` in `crates/iced-contracts` covers the identity contract; `mise run test:contracts` runs it. A native run with an activity spinner over a long transcript covers the reuse itself.
+
+# Spinning SVGs (#3581)
+
+A `Svg` with a `spin` (see `vendor/iced-core/README.cagents.md`, "Animation
+frames that only present") is rotated by `Spin::angle` at the instant the
+renderer prepares the frame, on top of its `rotation`. Every SVG in a frame
+uses the same instant, so spinners stay in phase. A spinning SVG always uses
+the filtered path for rotated vectors, even on the frame where its angle is
+upright, so its edges do not change sampling once a turn. A window can then
+present the same layers again for the next frame of the spin without drawing
+its widgets.

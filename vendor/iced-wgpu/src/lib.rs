@@ -148,7 +148,10 @@ impl Renderer {
             },
         );
 
-        self.prepare(&mut encoder, viewport);
+        // Drawings that change with time alone, such as a spinning SVG, are
+        // worked out for this instant. A window may present the same layers
+        // again for their next frame without drawing its widgets.
+        self.prepare(&mut encoder, viewport, core::time::Instant::now());
         self.render(&mut encoder, target, clear_color, viewport);
 
         self.quad.trim();
@@ -304,6 +307,7 @@ impl Renderer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         viewport: &Viewport,
+        now: core::time::Instant,
     ) {
         let scale_factor = viewport.scale_factor();
 
@@ -395,6 +399,7 @@ impl Renderer {
                     &layer.images,
                     viewport.projection(),
                     scale_factor as f32,
+                    now,
                 );
 
                 prepare_span.finish();

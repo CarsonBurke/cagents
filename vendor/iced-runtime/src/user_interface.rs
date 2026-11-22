@@ -33,6 +33,7 @@ pub struct UserInterface<'a, Message, Theme, Renderer> {
     overlay: Option<Overlay>,
     bounds: Size,
     cursor: Option<mouse::Cursor>,
+    is_drawn: bool,
 }
 
 struct Overlay {
@@ -164,6 +165,7 @@ where
             overlay: None,
             bounds,
             cursor,
+            is_drawn: false,
         }
     }
 
@@ -240,6 +242,10 @@ where
         clipboard: &mut dyn Clipboard,
         messages: &mut Vec<Message>,
     ) -> (State, Vec<event::Status>) {
+        if !events.is_empty() {
+            self.is_drawn = false;
+        }
+
         // The supplied cursor is the position at the END of this batch.
         // A later motion must not change the target of an earlier press.
         let has_motion = events.iter().any(|event| {
@@ -287,6 +293,7 @@ where
         let mut base_cursors = event_cursors.clone();
         let mut outdated = false;
         let mut redraw_request = window::RedrawRequest::Wait;
+        let mut animation_request = window::AnimationRequest::None;
         let mut input_method = InputMethod::Disabled;
         let mut has_layout_changed = false;
         let viewport = Rectangle::with_size(self.bounds);
@@ -336,6 +343,8 @@ where
 
                     event_statuses.push(shell.event_status());
                     redraw_request = redraw_request.min(shell.redraw_request());
+                    animation_request =
+                        animation_request.min(shell.animation_request());
                     input_method.merge(shell.input_method());
 
                     if shell.is_layout_invalid() {
@@ -441,6 +450,8 @@ where
                 }
 
                 redraw_request = redraw_request.min(shell.redraw_request());
+                animation_request =
+                    animation_request.min(shell.animation_request());
                 input_method.merge(shell.input_method());
 
                 shell.revalidate_layout(|| {
@@ -506,6 +517,7 @@ where
                 State::Updated {
                     mouse_interaction,
                     redraw_request,
+                    animation_request,
                     input_method,
                     has_layout_changed,
                 }
@@ -596,6 +608,7 @@ where
     ) {
         let viewport = Rectangle::with_size(self.bounds);
         renderer.reset(viewport);
+        self.is_drawn = true;
 
         let base_cursor = match &self.overlay {
             None
@@ -649,6 +662,8 @@ where
         renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
+        self.is_drawn = false;
+
         let viewport = Rectangle::with_size(self.bounds);
 
         self.root.as_widget_mut().operate(
@@ -683,6 +698,20 @@ where
                 operation,
             );
         }
+    }
+
+    /// Returns whether the last [`draw`] still shows the [`UserInterface`]:
+    /// no event or [`operate`] call has reached it since, and it has not been
+    /// rebuilt or relaid out.
+    ///
+    /// A shell may then present the renderer's retained drawing again instead
+    /// of drawing the interface, as it does for the frames of a
+    /// [`window::AnimationRequest`].
+    ///
+    /// [`draw`]: Self::draw
+    /// [`operate`]: Self::operate
+    pub fn is_drawn(&self) -> bool {
+        self.is_drawn
     }
 
     /// Relayouts and returns a new  [`UserInterface`] using the provided
@@ -782,6 +811,9 @@ pub enum State {
         mouse_interaction: mouse::Interaction,
         /// The [`window::RedrawRequest`] describing when a redraw should be performed.
         redraw_request: window::RedrawRequest,
+        /// The [`window::AnimationRequest`] describing how often the retained
+        /// drawing should be presented again while nothing else changes.
+        animation_request: window::AnimationRequest,
         /// The current [`InputMethod`] strategy of the user interface.
         input_method: InputMethod,
         /// Whether the layout of the [`UserInterface`] has changed.

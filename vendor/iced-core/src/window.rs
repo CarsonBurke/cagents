@@ -3,6 +3,7 @@ pub mod icon;
 pub mod screenshot;
 pub mod settings;
 
+mod animation_request;
 mod direction;
 mod event;
 mod id;
@@ -12,6 +13,7 @@ mod position;
 mod redraw_request;
 mod user_attention;
 
+pub use animation_request::AnimationRequest;
 pub use direction::Direction;
 pub use event::Event;
 pub use icon::Icon;
