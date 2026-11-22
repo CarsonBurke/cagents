@@ -27,18 +27,20 @@ fn show_images(runtime: &mut Runtime, count: u8) -> Vec<(String, iced::advanced:
                 reference: None,
             };
             let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![index, 0, 0, 255]);
+            let item = Arc::new(chat::Item {
+                id: id.clone(),
+                role: chat::Role::Assistant,
+                started_at: None,
+                at: None,
+                content: content.clone(),
+            });
+            // Decoded for its item, as a read leaves it, so a snapshot that
+            // carries the item over keeps its pixels.
             let mut cached = CachedItem::new(&content, runtime.syntax_theme);
             cached.image = Some(handle.clone());
+            cached.image_item = Some(item.clone());
             runtime.cache.insert(id.clone(), cached);
-            Arc::make_mut(&mut runtime.snapshot)
-                .items
-                .push(Arc::new(chat::Item {
-                    id: id.clone(),
-                    role: chat::Role::Assistant,
-                    started_at: None,
-                    at: None,
-                    content,
-                }));
+            Arc::make_mut(&mut runtime.snapshot).items.push(item);
             (id, handle.id())
         })
         .collect();
@@ -281,19 +283,20 @@ fn sending_and_new_activity_leave_the_viewer_open() {
         Some(images::ImageRef::Viewer(host, images[1].1))
     );
 
-    // An image in the reply joins the viewer once it is decoded, so it can be
-    // browsed to without closing it; the shown image stays.
+    // An image in the reply is another gallery's: the shown image stays, and
+    // the viewer still browses its own.
     let runtime = app.chat_runtime_mut(target).unwrap();
-    let arrived = show_images(runtime, 1).pop().unwrap();
+    let (_, arrived) = show_images(runtime, 1).pop().unwrap();
     images::sync(runtime);
     assert_eq!(
         shown(&app, target),
         Some(images::ImageRef::Viewer(host, images[1].1))
     );
     named(&mut app, Named::ArrowRight, false);
-    assert_eq!(
+    assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
+    assert_ne!(
         shown(&app, target),
-        Some(images::ImageRef::Viewer(host, arrived.1))
+        Some(images::ImageRef::Viewer(host, arrived))
     );
 }
 
@@ -403,8 +406,9 @@ fn an_image_decoded_after_its_snapshot_joins_the_viewer() {
 
 /// The viewer holds the pixels of the image it shows, even once newer items
 /// page it out of the transcript, and borrows the rest from the transcript:
-/// an image the transcript lets go leaves the viewer too, as does a paged-out
-/// one once the viewer moves off it.
+/// a paged-out image leaves the viewer once it moves off it, and one whose
+/// pixels the transcript let go holds none in the viewer either, until it is
+/// shown and read again whole.
 #[test]
 fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -415,11 +419,17 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     Arc::make_mut(&mut runtime.snapshot)
         .items
         .retain(|item| item.id != images[0].0);
+    runtime.turns = runtime.transcript_turns(&runtime.snapshot).into();
     images::sync(runtime);
     assert_eq!(
         shown(&app, target),
         Some(images::ImageRef::Viewer(host, images[0].1)),
         "the paged-out image stays shown"
+    );
+    assert_eq!(
+        app.image_viewer(host).unwrap().position(),
+        (1, 3),
+        "in its place"
     );
     assert_eq!(
         step(&mut app, target, 2),
@@ -443,9 +453,10 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     );
     assert_eq!(
         step(&mut app, target, 1),
-        Some(images::ImageRef::Viewer(host, arrived)),
-        "the image the transcript let go is gone from the viewer"
+        None,
+        "the image the transcript let go has no pixels in the viewer"
     );
+    assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
 }
 
 /// Pixels the transcript sheds, under memory pressure, once its pane is
@@ -472,10 +483,10 @@ fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
             gallery.selected_image(host),
             Some(images::ImageRef::Viewer(host, images[0].1))
         );
-        assert_eq!(
+        assert_ne!(
             step(&mut app, target, 1),
-            Some(images::ImageRef::Viewer(host, images[0].1)),
-            "the image the viewer doesn't show is gone from it"
+            Some(images::ImageRef::Viewer(host, images[1].1)),
+            "the image the viewer didn't show has no pixels in it"
         );
     }
 }
@@ -503,9 +514,10 @@ fn stepping_off_an_evicted_image_lets_its_pixels_go() {
     );
     assert_eq!(
         step(&mut app, target, 1),
-        Some(images::ImageRef::Viewer(host, images[1].1)),
-        "the evicted image left as the viewer moved off it"
+        None,
+        "the evicted image's pixels left as the viewer moved off it"
     );
+    assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
 }
 
 #[test]

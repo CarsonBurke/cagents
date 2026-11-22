@@ -1167,16 +1167,15 @@ impl Gallery {
     /// The other pictures borrow the transcript's previews, so the viewer
     /// holds no more than the transcript does beyond the picture it shows:
     /// one the transcript let go is read again whole when it is shown. The
-    /// shown picture keeps its pixels and zoom. Once the transcript no longer
-    /// holds it, as when newer items page it out, the gallery stays as it
-    /// was: the transcript under the viewer only moves on.
+    /// shown picture keeps its pixels and zoom, and its place in its gallery
+    /// once newer items page it out of the transcript.
     fn refresh(&mut self, runtime: &Runtime) {
         if !self.from_transcript {
             return;
         }
-        let Some(items) = Self::transcript(runtime) else {
+        if Self::transcript(runtime).is_none() {
             return;
-        };
+        }
         let mut old: Vec<_> = std::mem::take(&mut self.entries)
             .into_iter()
             .map(Some)
@@ -1189,19 +1188,34 @@ impl Gallery {
         let mut entries = Vec::with_capacity(old.len());
         let run = runtime.image_run(&id);
         if run.is_empty() {
-            for (position, entry) in old.into_iter().enumerate() {
-                match entry {
-                    None => {
-                        self.selected = entries.len();
-                        entries.extend(shown.take());
-                    }
-                    Some(entry) => entries.extend(
-                        items
-                            .iter()
-                            .find(|item| item.id == entry.id)
-                            .and_then(|item| Entry::of(runtime, item, position)),
-                    ),
+            // The shown picture was paged out of the transcript. It keeps its
+            // place among what remains of its gallery, which still takes the
+            // pictures that join it.
+            let rest = old
+                .iter()
+                .flatten()
+                .map(|entry| runtime.image_run(&entry.id))
+                .find(|run| !run.is_empty())
+                .unwrap_or_default();
+            let before = rest
+                .iter()
+                .filter(|item| {
+                    old[..self.selected]
+                        .iter()
+                        .flatten()
+                        .any(|entry| entry.id == item.id)
+                })
+                .count();
+            for (index, item) in rest.into_iter().enumerate() {
+                if index == before {
+                    self.selected = entries.len();
+                    entries.extend(shown.take());
                 }
+                entries.extend(Entry::of(runtime, item, entries.len()));
+            }
+            if let Some(entry) = shown.take() {
+                self.selected = entries.len();
+                entries.push(entry);
             }
         } else {
             for (position, item) in run.into_iter().enumerate() {

@@ -290,9 +290,15 @@ impl Runtime {
             return vec![&all[index]];
         };
         let side = if turn.prompt.contains(&index) {
-            turn.prompt.iter().map(|&index| &all[index]).collect()
+            turn.prompt
+                .iter()
+                .filter_map(|&index| all.get(index))
+                .collect()
         } else {
-            turn.prose.iter().map(|placed| &all[placed.index]).collect()
+            turn.prose
+                .iter()
+                .filter_map(|placed| all.get(placed.index))
+                .collect()
         };
         self.run_around(side, id)
     }
