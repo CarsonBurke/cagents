@@ -17,7 +17,6 @@ use crate::{
     notifications::Event,
 };
 
-pub(super) const IDLE: Duration = Duration::from_secs(60);
 pub(super) const RETRY: Duration = Duration::from_secs(5);
 const RECEIPT_POLL: Duration = Duration::from_millis(250);
 
@@ -51,7 +50,7 @@ impl Transfer {
         registry: &SharedRegistry,
         notifications: &Handle,
         event: impl FnOnce(&Registry, &Entry) -> Result<Event, String>,
-    ) -> Result<Duration, String> {
+    ) -> Result<Option<Duration>, String> {
         self.advance_at(Instant::now(), registry, notifications, event)
     }
 
@@ -61,10 +60,10 @@ impl Transfer {
         registry: &SharedRegistry,
         notifications: &Handle,
         event: impl FnOnce(&Registry, &Entry) -> Result<Event, String>,
-    ) -> Result<Duration, String> {
+    ) -> Result<Option<Duration>, String> {
         if let Some(retry_at) = self.retry_at {
             if now < retry_at {
-                return Ok(retry_at.duration_since(now));
+                return Ok(Some(retry_at.duration_since(now)));
             }
             self.retry_at = None;
         }
@@ -82,13 +81,13 @@ impl Transfer {
         registry: &SharedRegistry,
         notifications: &Handle,
         event: impl FnOnce(&Registry, &Entry) -> Result<Event, String>,
-    ) -> Result<Duration, String> {
+    ) -> Result<Option<Duration>, String> {
         if let Some(pending) = &mut self.pending {
             // No Registry/HostState/control guard is held while observing the
             // receiver. Empty retains this exact waiter, never another enqueue.
             if let Receipt::Waiting(receiver) = &pending.receipt {
                 match receiver.try_recv() {
-                    Err(mpsc::TryRecvError::Empty) => return Ok(RECEIPT_POLL),
+                    Err(mpsc::TryRecvError::Empty) => return Ok(Some(RECEIPT_POLL)),
                     Err(mpsc::TryRecvError::Disconnected) => {
                         self.pending = None;
                         return Err("Automation notification journal reply was lost".into());
@@ -107,7 +106,7 @@ impl Transfer {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .acknowledge_automation_notification(&pending.entry)?;
             self.pending = None;
-            return Ok(RECEIPT_POLL);
+            return Ok(Some(RECEIPT_POLL));
         }
 
         // This guard serializes only execution-connection users. A separate
@@ -122,14 +121,14 @@ impl Transfer {
             .into_iter()
             .next()
         else {
-            return Ok(IDLE);
+            return Ok(None);
         };
         let receiver = notifications.record_committed(event(&registry, &entry)?)?;
         self.pending = Some(Pending {
             entry,
             receipt: Receipt::Waiting(receiver),
         });
-        Ok(RECEIPT_POLL)
+        Ok(Some(RECEIPT_POLL))
     }
 }
 
@@ -236,6 +235,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_transfer_has_no_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(
+            Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        ));
+        let (notifications, _) = Handle::inert_for_test();
+        assert_eq!(
+            Transfer::default()
+                .advance(&registry, &notifications, no_enqueue)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn pending_journal_reply_retains_the_same_waiter_and_durable_entry() {
         let (_directory, registry, _automation, entry) = fixture();
         let (mut transfer, sender) = waiting(entry.clone());
@@ -245,7 +259,7 @@ mod tests {
                 transfer
                     .advance(&registry, &notifications, no_enqueue)
                     .unwrap(),
-                RECEIPT_POLL
+                Some(RECEIPT_POLL)
             );
             assert_eq!(
                 registry
@@ -261,7 +275,7 @@ mod tests {
             transfer
                 .advance(&registry, &notifications, no_enqueue)
                 .unwrap(),
-            RECEIPT_POLL
+            Some(RECEIPT_POLL)
         );
         assert!(
             registry
@@ -427,7 +441,7 @@ mod tests {
                 transfer
                     .advance_at(now + elapsed, &registry, &notifications, failed)
                     .unwrap(),
-                RETRY - elapsed
+                Some(RETRY - elapsed)
             );
         }
         assert_eq!(calls.get(), 1);
@@ -485,7 +499,7 @@ mod tests {
                     no_enqueue
                 )
                 .unwrap(),
-            RETRY - Duration::from_secs(1)
+            Some(RETRY - Duration::from_secs(1))
         );
         transfer
             .advance_at(now + RETRY, &registry, &notifications, no_enqueue)

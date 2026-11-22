@@ -441,9 +441,31 @@ impl Registry {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Called by the existing coordinator at most once a minute. The partial
-    /// deleted_ms index skips live automations; protected-only tombstones do
-    /// not monopolize the batch and starve later eligible removed history.
+    /// Return the next actual tombstone-pruning deadline. Protected rows are
+    /// deliberately excluded: their owner sends a wake edge when they become
+    /// eligible, so they must not keep an otherwise idle scheduler awake.
+    pub(crate) fn next_removed_automation_history_deadline(&self) -> Result<Option<u64>, String> {
+        let deleted: Option<u64> = self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT min(a.deleted_ms) FROM automations a WHERE a.deleted_ms IS NOT NULL AND (
+                        EXISTS(SELECT 1 FROM automation_firings f JOIN automation_revisions r
+                          ON r.automation=f.automation AND r.revision=f.revision
+                          WHERE f.automation=a.id AND {ELIGIBLE})
+                        OR EXISTS(SELECT 1 FROM automation_revisions r WHERE r.automation=a.id
+                          AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=r.automation AND f.revision=r.revision)))"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(deleted.map(|deleted| deleted.saturating_add(REMOVED_TTL_MS)))
+    }
+
+    /// The partial deleted_ms index skips live automations; protected-only
+    /// tombstones do not monopolize the batch and starve later eligible
+    /// removed history.
     pub(crate) fn maintain_removed_automation_history(
         &mut self,
         now_ms: u64,
