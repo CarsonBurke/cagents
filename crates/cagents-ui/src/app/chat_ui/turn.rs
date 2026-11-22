@@ -2652,7 +2652,7 @@ mod tests {
             command("m5", ToolStatus::Succeeded),
             text("a1", Role::Assistant, Phase::Final, false),
         ];
-        let turns = group(&items, &unasked(), &coordinated);
+        let turns = group(&items, &unasked(), coordinated);
         let shape: Vec<_> = turns
             .iter()
             .map(|turn| (turn.key.as_str(), turn.messages, steps(turn), slots(turn)))
