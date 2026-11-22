@@ -1011,19 +1011,20 @@ impl HostState {
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
         let edit = edit.committed();
+        let publication = Outbound::broadcast(
+            &self.proof,
+            ServerMessage::WorkspaceModelEdited {
+                sequence,
+                edit: edit.as_ref().clone(),
+                effects: effects.clone(),
+            },
+        );
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
             }
             if let Some(delivery) = self.clients.get(client_id) {
-                let _ = delivery.push(Outbound::broadcast(
-                    &self.proof,
-                    ServerMessage::WorkspaceModelEdited {
-                        sequence,
-                        edit: edit.as_ref().clone(),
-                        effects: effects.clone(),
-                    },
-                ));
+                let _ = delivery.push(publication.clone());
             }
         }
     }
@@ -1040,17 +1041,14 @@ impl HostState {
         let Ok(terminal) = self.descriptor_as(false, terminal_id) else {
             return;
         };
+        let publication =
+            Outbound::broadcast(&self.proof, ServerMessage::TerminalCreated { terminal });
         for client_id in &self.watchers {
             if *client_id == creator {
                 continue;
             }
             if let Some(delivery) = self.clients.get(client_id) {
-                let _ = delivery.push(Outbound::broadcast(
-                    &self.proof,
-                    ServerMessage::TerminalCreated {
-                        terminal: terminal.clone(),
-                    },
-                ));
+                let _ = delivery.push(publication.clone());
             }
         }
     }
@@ -5906,8 +5904,9 @@ fn record_event_from(
         sequence,
         event: wire_event,
     };
+    let publication = Outbound::broadcast(&proof, message);
     for delivery in deliveries {
-        let _ = delivery.push(Outbound::broadcast(&proof, message.clone()));
+        let _ = delivery.push(publication.clone());
     }
 }
 

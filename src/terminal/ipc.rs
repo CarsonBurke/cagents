@@ -2393,6 +2393,31 @@ impl FrameCodec {
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
     }
+
+    /// Write a complete length-prefixed frame made by another connection's
+    /// writer. The maximum stays per connection, so sharing a current-protocol
+    /// broadcast cannot bypass a caller's frame limit.
+    #[cfg(feature = "host")]
+    pub(crate) fn write_preframed(
+        &mut self,
+        writer: &mut impl Write,
+        frame: &[u8],
+    ) -> Result<(), FrameError> {
+        let payload_length = frame
+            .get(..LENGTH_PREFIX_BYTES)
+            .and_then(|prefix| <[u8; LENGTH_PREFIX_BYTES]>::try_from(prefix).ok())
+            .map(u32::from_be_bytes)
+            .and_then(|length| usize::try_from(length).ok())
+            .filter(|length| length.saturating_add(LENGTH_PREFIX_BYTES) == frame.len())
+            .ok_or(FrameError::InvalidLength {
+                actual: frame.len().saturating_sub(LENGTH_PREFIX_BYTES),
+                maximum: self.maximum,
+            })?;
+        validate_frame_length(payload_length, self.maximum)?;
+        writer.write_all(frame)?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 impl Drop for FrameCodec {

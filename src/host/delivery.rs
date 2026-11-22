@@ -39,6 +39,56 @@ pub(crate) struct Outbound {
     proof: Arc<HostSessionProof>,
     pub(crate) message: ServerMessage,
     encoded_response: Option<Vec<u8>>,
+    /// One current-protocol frame, filled by the first writer that needs it.
+    /// A notification is identical for every current watcher, so serializing it
+    /// once off the host lock avoids multiplying CPU by the watcher count.
+    shared_frame: Option<Arc<SharedFrame>>,
+}
+
+/// Lazily framed bytes shared by a fan-out notification's writer threads.
+///
+/// The mutex is only held while the first writer serializes. It never guards a
+/// socket write, and old clients opt out because their compatibility encoding
+/// is deliberately connection-specific.
+#[derive(Debug, Default)]
+struct SharedFrame {
+    frame: Mutex<Option<Arc<[u8]>>>,
+    #[cfg(test)]
+    encodes: std::sync::atomic::AtomicUsize,
+}
+
+impl SharedFrame {
+    fn frame(
+        &self,
+        envelope: ServerEnvelopeRef<'_>,
+    ) -> Result<Arc<[u8]>, crate::terminal_ipc::FrameError> {
+        Ok({
+            let mut cached = self
+                .frame
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(frame) = cached.as_ref() {
+                Arc::clone(frame)
+            } else {
+                let started = tracing::enabled!(
+                    target: "cagents::terminal_pipeline",
+                    tracing::Level::TRACE
+                )
+                .then(std::time::Instant::now);
+                let mut bytes = Vec::new();
+                crate::terminal_ipc::write_frame(&mut bytes, &envelope)?;
+                if let Some(started) = started {
+                    tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_encode_shared", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = bytes.len().saturating_sub(4));
+                }
+                #[cfg(test)]
+                self.encodes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let frame: Arc<[u8]> = bytes.into();
+                *cached = Some(Arc::clone(&frame));
+                frame
+            }
+        })
+    }
 }
 
 impl Outbound {
@@ -50,6 +100,7 @@ impl Outbound {
             proof: Arc::clone(proof),
             message,
             encoded_response: None,
+            shared_frame: Some(Arc::new(SharedFrame::default())),
         }
     }
 
@@ -75,6 +126,9 @@ impl Outbound {
             self.encoded_response = None;
         }
         self.version = client.protocol;
+        // A framed broadcast is current-protocol only. The old-client writer
+        // must serialize in its compatibility scope instead.
+        self.shared_frame = None;
         Some(self)
     }
 
@@ -99,6 +153,7 @@ impl Outbound {
             proof: Arc::new(proof.clone()),
             message: ServerMessage::Response { response },
             encoded_response,
+            shared_frame: None,
         }
     }
     pub(crate) fn write(
@@ -106,6 +161,9 @@ impl Outbound {
         codec: &mut crate::terminal_ipc::FrameCodec,
         writer: &mut impl std::io::Write,
     ) -> Result<(), crate::terminal_ipc::FrameError> {
+        if let Some(frame) = &self.shared_frame {
+            return codec.write_preframed(writer, &frame.frame(self.wire())?);
+        }
         match &self.encoded_response {
             Some(response) => codec.write_encoded_response(
                 writer,
@@ -135,6 +193,7 @@ impl From<ServerEnvelope> for Outbound {
             proof: Arc::new(value.proof),
             message: value.message,
             encoded_response: None,
+            shared_frame: None,
         }
     }
 }
@@ -501,6 +560,7 @@ impl DeliveryQueue {
         state.discarded = discarded;
         state.enqueue(Outbound {
             encoded_response: None,
+            shared_frame: None,
             version: PROTOCOL_VERSION,
             request_id: None,
             proof,
@@ -742,6 +802,47 @@ mod tests {
                 generation,
             },
         }
+    }
+
+    #[test]
+    fn broadcast_frame_is_shared_by_current_watchers() {
+        use crate::terminal_ipc::{FrameCodec, MAX_FRAME_BYTES, read_frame};
+
+        let expected = redraw(TerminalId::new(), 17);
+        let proof = Arc::new(expected.proof.clone());
+        let first = Outbound::broadcast(&proof, expected.message.clone());
+        let second = first.clone();
+        let mut first_bytes = Vec::new();
+        let mut second_bytes = Vec::new();
+        first
+            .write(&mut FrameCodec::new(MAX_FRAME_BYTES), &mut first_bytes)
+            .unwrap();
+        second
+            .write(&mut FrameCodec::new(MAX_FRAME_BYTES), &mut second_bytes)
+            .unwrap();
+
+        assert_eq!(first_bytes, second_bytes);
+        assert_eq!(
+            first
+                .shared_frame
+                .as_ref()
+                .unwrap()
+                .encodes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            read_frame::<ServerEnvelope>(&mut std::io::Cursor::new(first_bytes)).unwrap(),
+            Some(expected)
+        );
+
+        let mut limited = Vec::new();
+        assert!(
+            second
+                .write(&mut FrameCodec::new(second_bytes.len() - 5), &mut limited)
+                .is_err()
+        );
+        assert!(limited.is_empty());
     }
 
     fn board(marker: u64) -> crate::work::Board {
