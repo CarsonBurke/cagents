@@ -169,6 +169,53 @@ pub struct Member {
     pub limit: Option<UsageLimit>,
     /// The account the provider runs on, when the daemon can tell.
     pub account: Option<SessionAccount>,
+    /// The daemon's estimate of the conversation's prompt cache, when it
+    /// hosts the conversation and has seen it make a request.
+    pub cache: Option<PromptCache>,
+}
+
+/// When a conversation's prompt cache likely expires. A provider keeps a
+/// conversation's prompt cached for a while after each request; a message
+/// that wakes the conversation after that reads its whole context again at
+/// full price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCache {
+    /// Unix milliseconds at which the latest model request started.
+    pub requested_at: u64,
+    /// How long the provider likely keeps the cache after a request.
+    pub ttl_ms: u64,
+    pub basis: TtlBasis,
+    /// The conversation's context as of its latest request, in tokens: what
+    /// waking it cold reads again.
+    pub context_tokens: u64,
+}
+
+/// Where a cache lifetime estimate comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TtlBasis {
+    /// The provider's documented lifetime, which observation hasn't
+    /// contradicted.
+    Assumed,
+    /// What this account's conversations showed surviving.
+    Observed,
+    /// The lifetime the provider reported for the conversation's latest
+    /// cache write.
+    Reported,
+}
+
+/// Whether a conversation's prompt cache likely still holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warmth {
+    Warm,
+    Cold,
+    Unknown,
+}
+
+impl PromptCache {
+    /// Unix milliseconds at which the cache likely expires.
+    pub fn expires_at(&self) -> u64 {
+        self.requested_at.saturating_add(self.ttl_ms)
+    }
 }
 
 impl Member {
@@ -186,6 +233,24 @@ impl Member {
                 ActivityState::Working => "working",
                 ActivityState::Waiting => "waiting",
             }
+        }
+    }
+
+    /// Whether the conversation's prompt cache likely still holds at `now`,
+    /// in Unix milliseconds. A working conversation keeps refreshing it, and
+    /// an exited one is reopened with its system prompt rebuilt, so its cache
+    /// no longer matches.
+    pub fn warmth(&self, now: u64) -> Warmth {
+        if self.exited {
+            return Warmth::Cold;
+        }
+        if self.session.state == ActivityState::Working {
+            return Warmth::Warm;
+        }
+        match self.cache.as_ref().map(PromptCache::expires_at) {
+            Some(expires_at) if now < expires_at => Warmth::Warm,
+            Some(_) => Warmth::Cold,
+            None => Warmth::Unknown,
         }
     }
 }

@@ -190,6 +190,10 @@ pub(crate) struct Resident {
     pub active_model: Option<chat::ActiveModel>,
     #[serde(default)]
     pub active_model_revision: u64,
+    /// The conversation's prompt cache activity. A helper that predates it
+    /// reports none.
+    #[serde(default)]
+    pub prompt_cache: chat::prompt_cache::Activity,
     next_input: u64,
     acknowledged_input_count: usize,
     pub continuity_loss: Option<ContinuityLoss>,
@@ -514,6 +518,7 @@ impl RemoteActor {
             agent_addresses: Vec::new(),
             active_model: None,
             active_model_revision: 0,
+            prompt_cache: Default::default(),
             next_input: 1,
             acknowledged_input_count: 0,
             continuity_loss: None,
@@ -2901,6 +2906,7 @@ impl Server {
             agent_addresses: self.actor.agent_addresses(),
             active_model,
             active_model_revision,
+            prompt_cache: self.actor.prompt_cache(),
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
             continuity_loss,

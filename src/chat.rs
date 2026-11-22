@@ -11,6 +11,7 @@ pub(crate) mod fresh;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
+pub mod prompt_cache;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -3331,6 +3332,9 @@ pub enum Event {
     /// How the provider addresses a subagent, which it says only once the
     /// agent has started.
     AgentAddress(AgentAddress),
+    /// Live evidence about the main conversation's prompt cache. The
+    /// runtime keeps it beside the transcript, never in it.
+    PromptCache(prompt_cache::Evidence),
 }
 
 #[cfg(test)]

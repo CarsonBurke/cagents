@@ -281,7 +281,11 @@ use crate::{
 /// as terminals. An older client has no encoding for either: an optional value
 /// naming one reaches it as absent, and any other message naming one is
 /// refused or withheld.
-pub const PROTOCOL_VERSION: u16 = 191;
+///
+/// Version 193 appends `Member::cache`, the daemon's estimate of when a
+/// session's prompt cache expires. Every reply carrying a `Member` is already
+/// refused to the candidate line's CLI, so no older client decodes it.
+pub const PROTOCOL_VERSION: u16 = 193;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

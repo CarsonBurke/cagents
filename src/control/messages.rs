@@ -827,6 +827,7 @@ mod tests {
                         resets_at: None,
                     }),
                     account: None,
+                    cache: None,
                 }),
             },
             agent: None,

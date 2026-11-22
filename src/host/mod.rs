@@ -504,6 +504,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut initial = HostState::new(proof);
     initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
+    initial.prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()
         .unwrap_or_else(|p| p.into_inner())

@@ -3385,6 +3385,36 @@ impl Claude {
             .saturating_add(self.cache_write_tokens);
         step.events.push(Event::Usage(self.usage.clone()));
     }
+    /// A live `message_start` of the main conversation: its request started
+    /// about now, and its usage says how much of the prompt the cache served
+    /// and how long what it wrote to the cache lasts.
+    fn observe_request(&self, usage: &Value, step: &mut Step) {
+        use chat::prompt_cache::Evidence;
+        step.events.push(Event::PromptCache(Evidence::Request));
+        if let Some(input) = usage["input_tokens"].as_u64() {
+            step.events.push(Event::PromptCache(Evidence::Read {
+                prompt: input
+                    .saturating_add(self.cache_read_tokens)
+                    .saturating_add(self.cache_write_tokens),
+                cached: self.cache_read_tokens,
+            }));
+        }
+        // Claude Code writes to a one-hour cache on a subscription and to a
+        // five-minute one otherwise, such as in overage. A request that
+        // writes to both keeps its newest context only as long as the shorter.
+        let written = |key: &str| usage["cache_creation"][key].as_u64().unwrap_or(0) > 0;
+        let ttl_ms = if written("ephemeral_5m_input_tokens") {
+            Some(5 * 60 * 1000)
+        } else if written("ephemeral_1h_input_tokens") {
+            Some(60 * 60 * 1000)
+        } else {
+            None
+        };
+        if let Some(ttl_ms) = ttl_ms {
+            step.events
+                .push(Event::PromptCache(Evidence::Written { ttl_ms }));
+        }
+    }
     fn retract(&mut self, value: &Value, step: &mut Step) -> Result<(), String> {
         let Some(carriers) = value.as_array() else {
             return Ok(());
@@ -6932,6 +6962,7 @@ impl Claude {
                 if parent.is_empty() {
                     self.start_turn(step);
                     self.update_usage(&event["message"]["usage"], step);
+                    self.observe_request(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
                 } else {
                     // Only actual new child API activity clears a retryable

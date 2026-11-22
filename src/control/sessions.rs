@@ -913,7 +913,28 @@ mod tests {
             active_at: None,
             limit: None,
             account: None,
+            cache: None,
         }
+    }
+
+    #[test]
+    fn a_prompt_cache_is_warm_until_it_likely_expires() {
+        use crate::agent_execution::directory::{PromptCache, TtlBasis, Warmth};
+        let mut member = live(entry());
+        assert_eq!(member.warmth(0), Warmth::Unknown);
+        member.cache = Some(PromptCache {
+            requested_at: 1_000,
+            ttl_ms: 60_000,
+            basis: TtlBasis::Reported,
+            context_tokens: 50_000,
+        });
+        assert_eq!(member.warmth(60_999), Warmth::Warm);
+        assert_eq!(member.warmth(61_000), Warmth::Cold);
+        // Working keeps it warm; an exited session is reopened cold.
+        member.session.state = ActivityState::Working;
+        assert_eq!(member.warmth(120_000), Warmth::Warm);
+        member.exited = true;
+        assert_eq!(member.warmth(2_000), Warmth::Cold);
     }
 
     #[test]
@@ -1244,6 +1265,7 @@ mod tests {
             active_at: Some(0),
             limit: None,
             account: None,
+            cache: None,
         };
         let mut members = Members {
             channel,
