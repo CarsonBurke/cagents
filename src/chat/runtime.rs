@@ -265,11 +265,11 @@ impl PromptCache {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).activity()
     }
 
-    fn forget_prompt(&self) {
+    fn model(&self, model: Option<&str>) {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .forget_prompt();
+            .model(model);
     }
 }
 
@@ -3586,15 +3586,11 @@ impl Actor {
                 continue;
             }
             if let Event::ActiveModel(model) = event {
+                self.prompt_cache
+                    .model(model.as_ref().map(|model| model.id.as_str()));
                 let changed = {
                     let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     if state.active_model != model {
-                        let id = |model: &Option<crate::chat::ActiveModel>| {
-                            model.as_ref().map(|model| model.id.clone())
-                        };
-                        if state.active_model.is_some() && id(&state.active_model) != id(&model) {
-                            self.prompt_cache.forget_prompt();
-                        }
                         state.active_model = model.clone();
                         state.active_model_revision = state.active_model_revision.saturating_add(1);
                         Some(state.active_model_revision)

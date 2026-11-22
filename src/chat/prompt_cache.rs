@@ -81,6 +81,8 @@ pub(crate) struct Tracker {
     /// earlier request; it is pending once that reading arrives. Tools that
     /// finish together continue in one request, so only the latest is kept.
     continuation: Option<u64>,
+    /// The model the conversation last reported running.
+    model: Option<String>,
     /// The gap before the latest request, until a reading says whether the
     /// cache survived it.
     measuring: Option<(u64, u64)>,
@@ -161,11 +163,22 @@ impl Tracker {
         self.activity.clone()
     }
 
-    /// The conversation moved to another model, which keeps a cache of its
-    /// own, so the next request measures nothing about this one's.
-    pub(crate) fn forget_prompt(&mut self) {
-        self.prompt = None;
-        self.measuring = None;
+    /// The conversation reported running `model`, where it says. Another
+    /// model keeps a cache of its own, so the request after a switch
+    /// measures nothing about the earlier model's. Only the model is
+    /// compared: OpenAI caches across reasoning efforts, and Claude's
+    /// estimate rests on the lifetime it reports, not on measurement.
+    pub(crate) fn model(&mut self, model: Option<&str>) {
+        let Some(model) = model else {
+            // A provider may briefly not know, as Codex doesn't while a
+            // selection waits on its reply.
+            return;
+        };
+        if self.model.as_deref().is_some_and(|known| known != model) {
+            self.prompt = None;
+            self.measuring = None;
+        }
+        self.model = Some(model.to_owned());
     }
 
     /// The provider reported on the pending request, so it reached the
@@ -374,12 +387,20 @@ mod tests {
     fn a_new_model_measures_nothing_about_the_old_cache() {
         let mut tracker = Tracker::default();
         let read = |prompt, cached| Evidence::Read { prompt, cached };
+        tracker.model(Some("a"));
         tracker.observe(Evidence::Request, 0);
         tracker.observe(read(40_000, 39_000), 0);
+        // Briefly unknown, then the same model: nothing changed.
         tracker.observe(Evidence::Request, 3 * MINUTE);
-        tracker.forget_prompt();
+        tracker.model(None);
+        tracker.model(Some("a"));
         tracker.observe(read(41_000, 2_000), 3 * MINUTE);
-        assert!(tracker.activity().observations.is_empty());
+        assert_eq!(tracker.activity().observations.len(), 1);
+        tracker.observe(Evidence::Request, 6 * MINUTE);
+        tracker.model(None);
+        tracker.model(Some("b"));
+        tracker.observe(read(42_000, 2_000), 6 * MINUTE);
+        assert_eq!(tracker.activity().observations.len(), 1);
     }
 
     #[test]
