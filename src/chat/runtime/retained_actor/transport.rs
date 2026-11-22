@@ -3877,6 +3877,7 @@ impl Server {
                 }
             }
             while let Some(call) = connections.next() {
+                let _timing = call.timing();
                 // As before each accept: a hung-up uninstalled helper serves
                 // nothing more, so a queued `install` cannot outlive it.
                 if !self.installed && disconnected(&startup)? {

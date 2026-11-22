@@ -46,14 +46,20 @@ static SILENT_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// `deadline` comes first.
 pub(super) fn hold_read(deadline: Instant) -> Result<(), String> {
     match std::env::var_os("HOME") {
-        Some(home) => hold_read_in(Path::new(&home), deadline),
+        Some(home) => hold_read_in(Path::new(&home), &SILENT_UNTIL, deadline),
         None => Ok(()),
     }
 }
 
-fn hold_read_in(home: &Path, deadline: Instant) -> Result<(), String> {
+/// [`hold_read`] for the fixture in `home`, keeping the silence in
+/// `silent_until`.
+fn hold_read_in(
+    home: &Path,
+    silent_until: &Mutex<Option<Instant>>,
+    deadline: Instant,
+) -> Result<(), String> {
     let until = {
-        let mut until = SILENT_UNTIL.lock().unwrap_or_else(|p| p.into_inner());
+        let mut until = silent_until.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(silence) = take_seconds(home, UNANSWERED_READS) {
             tracing::warn!(
                 ?silence,
@@ -201,8 +207,10 @@ mod tests {
         let home = root.path().join("fixture");
         std::fs::create_dir(&home).unwrap();
         std::fs::write(home.join(UNANSWERED_READS), "60\n").unwrap();
+        // Its own silence, so the helper's reads in other tests go on.
+        let silent_until = Mutex::new(None);
         let soon = || Instant::now() + Duration::from_millis(50);
-        assert_eq!(hold_read_in(&home, soon()), Ok(()));
+        assert_eq!(hold_read_in(&home, &silent_until, soon()), Ok(()));
         assert!(home.join(UNANSWERED_READS).is_file());
 
         std::fs::write(root.path().join(".native-evidence"), "").unwrap();
@@ -210,7 +218,7 @@ mod tests {
         for _ in 0..2 {
             let started = Instant::now();
             assert_eq!(
-                hold_read_in(&home, soon()),
+                hold_read_in(&home, &silent_until, soon()),
                 Err(crate::chat::failure::actor_transport::DEADLINE.into())
             );
             assert!(started.elapsed() >= Duration::from_millis(50));
@@ -220,9 +228,13 @@ mod tests {
         // through, as do the reads after it.
         std::fs::write(home.join(UNANSWERED_READS), "0.05").unwrap();
         assert_eq!(
-            hold_read_in(&home, Instant::now() + Duration::from_secs(5)),
+            hold_read_in(
+                &home,
+                &silent_until,
+                Instant::now() + Duration::from_secs(5)
+            ),
             Ok(())
         );
-        assert_eq!(hold_read_in(&home, soon()), Ok(()));
+        assert_eq!(hold_read_in(&home, &silent_until, soon()), Ok(()));
     }
 }
