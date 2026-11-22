@@ -2834,7 +2834,7 @@ impl Runtime {
                 Provider::Muse => "Muse",
             };
             // A model the provider never reported is left out rather than
-            // announced; the tooltip says so for whoever asks.
+            // announced, here and in the tooltip.
             let model = agent
                 .model
                 .as_deref()
