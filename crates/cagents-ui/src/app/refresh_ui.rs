@@ -1264,12 +1264,16 @@ mod tests {
             "a refused due read must wait for the host budget rather than keep a past timer id"
         );
 
-        // An unrelated application update must keep the same one-shot
-        // identity; rebuilding it from the current wall clock would restart
-        // the sleep every frame during this backoff.
-        let before = app.refresh_deadline(Instant::now());
-        drop(app.update(Message::WindowScaleFactorChanged(app.window_scale_factor)));
-        assert_eq!(app.refresh_deadline(Instant::now()), before);
+        // Rebuilding subscriptions repeatedly runs this synchronizer. It must
+        // retain the original monotonic conversion rather than translating
+        // the same wall-clock deadline from a fresh `now` each time.
+        let before = app.refresh_ui.schedule.host_ready_at(project);
+        app.sync_refresh_reconciliation_deadline();
+        assert_eq!(app.refresh_ui.schedule.host_ready_at(project), before);
+        assert_eq!(
+            app.project_refresh_deadline(Instant::now(), false),
+            Some(expected)
+        );
     }
 
     #[test]
