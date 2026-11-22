@@ -7574,10 +7574,13 @@ fn refused_draft_publication_is_kept_without_claiming_another_client_closed_it()
         .unwrap();
     app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
     assert!(app.durable.local_only_cards.contains(&card));
+    // Said at the composer: the pane staying here is not the conversation
+    // failing.
     assert!(
-        super::super::chat_ui::chat_error_for_test(&app, card)
-            .is_some_and(|error| error.contains("could not be shared"))
+        super::super::chat_ui::chat_composer_note_for_test(&app, card)
+            .is_some_and(|note| note.contains("could not be shared"))
     );
+    assert_eq!(super::super::chat_ui::chat_error_for_test(&app, card), None);
     for _ in 0..3 {
         drop(app.reconcile_shared_views());
         assert!(app.card_state(card).unwrap().existence.is_open());

@@ -16620,6 +16620,14 @@ pub(super) fn chat_error_for_test(app: &Cagents, card: CardId) -> Option<&str> {
 }
 
 #[cfg(test)]
+pub(super) fn chat_composer_note_for_test(app: &Cagents, card: CardId) -> Option<&str> {
+    match app.cards.get(&card) {
+        Some(CardRuntime::Chat(runtime)) => runtime.composer_note.as_deref(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 pub(super) fn pending_switch_target(app: &Cagents, card: CardId) -> Target {
     app.chat_ui
         .attempt(card)
