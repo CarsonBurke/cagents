@@ -49,7 +49,7 @@ pub(super) fn fingerprint(
         }
         Provider::Muse => {
             // Its sign-in, then the catalog its models are read from.
-            paths.push(account.home_directory(environment)?.join("auth.json"));
+            paths.push(muse_sign_in(account, environment)?);
             let catalog = super::muse::data_home(environment)?.join("model-catalog");
             // Sorted before it is cut short, so a long catalog is read as
             // the same entries each time.
@@ -97,11 +97,20 @@ pub(super) fn fingerprint(
     )
 }
 
+/// Where Muse records its sign-in. Only the file's metadata is part of the
+/// fingerprint: cagents never opens it.
+pub(super) fn muse_sign_in(
+    account: &Account,
+    environment: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    Some(account.home_directory(environment)?.join("auth.json"))
+}
+
 /// Whether an unchanged fingerprint vouches for an answer of `status`.
 ///
 /// A working sign-in stands while nothing it depends on changed. A sign-in
 /// that does not work stands only where the fingerprint covers it: Muse's,
-/// in its `auth.json`, but not Antigravity's, in the keyring, so a
+/// in its sign-in file, but not Antigravity's, in the keyring, so a
 /// signed-out Antigravity is asked again on schedule, the moment it is most
 /// likely to be signed in from outside cagents. A login refused for having
 /// no allowance changes with a subscription bought elsewhere, and an answer
@@ -133,10 +142,11 @@ mod tests {
         std::fs::create_dir_all(root.join("config/muse")).unwrap();
         std::fs::create_dir_all(root.join("data/muse/model-catalog")).unwrap();
         let muse = Account::system(Provider::Muse);
+        let sign_in = muse_sign_in(&muse, &environment).unwrap();
         let of = || fingerprint(&muse, &program, &environment).unwrap();
         let signed_out = of();
         assert_eq!(of(), signed_out);
-        std::fs::write(root.join("config/muse/auth.json"), b"{}").unwrap();
+        std::fs::write(&sign_in, b"{}").unwrap();
         let signed_in = of();
         assert_ne!(signed_in, signed_out);
         std::fs::write(root.join("data/muse/model-catalog/models-v3.json"), b"{}").unwrap();
@@ -144,7 +154,7 @@ mod tests {
         assert_ne!(listed, signed_in);
         std::fs::write(&program, b"#!/bin/sh\n# updated\n").unwrap();
         assert_ne!(of(), listed);
-        std::fs::remove_file(root.join("config/muse/auth.json")).unwrap();
+        std::fs::remove_file(&sign_in).unwrap();
         assert_ne!(of(), listed);
 
         assert_eq!(

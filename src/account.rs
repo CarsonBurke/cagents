@@ -2433,6 +2433,54 @@ mod credential_guard {
         }
     }
 
+    /// Muse's sign-in record may be named in exactly two ways. The probe
+    /// fingerprints its metadata, never its contents, to learn whether a
+    /// sign-in changed (#3539), and names it in one function. A
+    /// native-evidence fixture writes and removes its own fake record under
+    /// its fixture root, where no real sign-in lives. Any other mention, or
+    /// these mentions in another file, is still a violation.
+    fn without_muse_sign_in_record(file: &std::path::Path, text: String) -> String {
+        let name = ["auth", ".json"].concat();
+        let allowed = if file.ends_with("src/account/probe/inputs.rs") {
+            // The whole of `muse_sign_in`'s answer, so a read wrapped
+            // around the path is still a violation.
+            format!("Some(account.home_directory(environment)?.join(\"{name}\"))")
+        } else if file.ends_with("tests/fixtures/fixture-acp.sh")
+            || file.ends_with("scripts/native-evidence")
+        {
+            format!("\"$fixture/config/muse/{name}\"")
+        } else {
+            return text;
+        };
+        text.replace(&allowed, "\"muse-sign-in-record\"")
+    }
+
+    #[test]
+    fn muse_sign_in_exception_allows_only_its_named_mentions() {
+        let name = ["auth", ".json"].concat();
+        let probe = std::path::Path::new("src/account/probe/inputs.rs");
+        let fixture = std::path::Path::new("tests/fixtures/fixture-acp.sh");
+        let evidence = std::path::Path::new("scripts/native-evidence");
+        let path = format!("account.home_directory(environment)?.join(\"{name}\")");
+        let join = format!("Some({path})");
+        let record = format!("\"$fixture/config/muse/{name}\"");
+        assert!(!without_muse_sign_in_record(probe, join.clone()).contains(&name));
+        assert!(!without_muse_sign_in_record(fixture, record.clone()).contains(&name));
+        assert!(!without_muse_sign_in_record(evidence, record.clone()).contains(&name));
+        for (file, source) in [
+            (probe, format!("std::fs::read(\"{name}\")")),
+            (probe, format!("Some(std::fs::read({path}))")),
+            (probe, format!("home.join(\"{name}\")")),
+            (probe, record.clone()),
+            (fixture, format!("\"$HOME/.codex/{name}\"")),
+            (fixture, join.clone()),
+            (std::path::Path::new("src/account.rs"), join),
+            (std::path::Path::new("scripts/other"), record),
+        ] {
+            assert!(without_muse_sign_in_record(file, source).contains(&name));
+        }
+    }
+
     #[test]
     fn native_refresh_exception_allows_only_the_boolean_request_expression() {
         let key = ["refresh", "Token"].concat();
@@ -2503,6 +2551,7 @@ mod credential_guard {
                 text = text.replace(&format!("\"{documentation}\""), "\"install-documentation\"");
             }
             text = without_native_refresh_request(&file, text);
+            text = without_muse_sign_in_record(&file, text);
             for needle in &forbidden {
                 if text.contains(needle.as_str()) {
                     violations.push(format!("{} names {needle}", file.display()));

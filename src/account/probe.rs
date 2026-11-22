@@ -2914,10 +2914,11 @@ cat >/dev/null
             std::fs::write(bin.join(program), "#!/bin/sh\nexit 99\n").unwrap();
             make_executable(&bin.join(program));
         }
-        std::fs::create_dir_all(root.join("config/muse")).unwrap();
-        std::fs::write(root.join("config/muse/auth.json"), b"{}").unwrap();
-        let cache = Cache::at(root.join("cache"));
         let muse = Account::system(Provider::Muse);
+        let sign_in = inputs::muse_sign_in(&muse, &|name| std::env::var(name).ok()).unwrap();
+        std::fs::create_dir_all(sign_in.parent().unwrap()).unwrap();
+        std::fs::write(&sign_in, b"{}").unwrap();
+        let cache = Cache::at(root.join("cache"));
         let key = muse.cache_key().unwrap();
         let path = Some(bin.as_os_str());
         let now = crate::chat::now_ms().unwrap();
@@ -2960,11 +2961,7 @@ cat >/dev/null
         store(UsageStatus::Limited);
         assert_eq!(reused(Reuse::Reading), None);
         store(UsageStatus::Ok);
-        std::fs::write(
-            root.join("config/muse/auth.json"),
-            b"{\"signed\": \"again\"}",
-        )
-        .unwrap();
+        std::fs::write(&sign_in, b"{\"signed\": \"again\"}").unwrap();
         assert_eq!(reused(Reuse::Reading), None);
 
         // Antigravity is installed, but has never run: no ~/.gemini.
