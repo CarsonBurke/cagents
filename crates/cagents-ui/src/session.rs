@@ -630,8 +630,9 @@ pub struct SessionRuntime {
 /// afterwards: the daemon names every terminal it holds or is starting, and the
 /// transcript each writes, which covers a terminal no window has saved yet, and
 /// the window databases name the rest. Owners claim files by name, because a
-/// terminal returned from a conversation appends to its predecessor's. If the daemon cannot answer, nothing is removed; if a window
-/// database cannot be read, no transcript is removed as orphaned.
+/// terminal returned from a conversation appends to its predecessor's. If the
+/// daemon cannot answer, nothing is removed; if a window database cannot be
+/// read, no transcript is removed as orphaned.
 pub struct TranscriptPruner {
     store: Arc<StateStore>,
     database_path: PathBuf,

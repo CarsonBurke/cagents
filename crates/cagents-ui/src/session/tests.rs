@@ -4502,7 +4502,7 @@ fn a_quarantine_change_never_repeats_a_recovery() {
 fn transcript_pruner_fixture() -> (tempfile::TempDir, SessionRuntime, PathBuf) {
     let root = tempdir().unwrap();
     let (runtime, _) = SessionRuntime::open(
-        &root.path().join("state.sqlite3"),
+        root.path().join("state.sqlite3"),
         BootId::new("boot-prune"),
     )
     .unwrap();
