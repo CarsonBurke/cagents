@@ -1010,8 +1010,12 @@ pub enum ServerMessage {
     /// apply the edit to its copy instead of reading the model.
     WorkspaceModelEdited {
         sequence: u64,
-        edit: crate::workspace_model::ModelEdit,
-        effects: crate::workspace_model::delta::EditEffects,
+        /// Shared among every daemon delivery queue. `Arc` serializes exactly
+        /// as its contents, so the wire frame stays the same incremental edge.
+        edit: Arc<crate::workspace_model::ModelEdit>,
+        /// As above: watcher fan-out shares one immutable effects allocation;
+        /// each client still decodes and applies its own value.
+        effects: Arc<crate::workspace_model::delta::EditEffects>,
     },
     /// What a native chat's provider reported about the account the chat runs
     /// on, delivered to every subscriber whatever its visibility. It names no

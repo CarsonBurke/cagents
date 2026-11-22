@@ -3902,7 +3902,11 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
                     sequence,
                     edit,
                     effects,
-                } => (sequence, edit, effects),
+                } => (
+                    sequence,
+                    std::sync::Arc::unwrap_or_clone(edit),
+                    std::sync::Arc::unwrap_or_clone(effects),
+                ),
                 message => panic!("expected an unsolicited delta edge, got {message:?}"),
             }
         }

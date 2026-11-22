@@ -397,8 +397,8 @@ async fn run(case: Case, renderer: cosmic::Renderer) {
                         proof: proof(),
                         message: ServerMessage::WorkspaceModelEdited {
                             sequence: index as u64 + 2,
-                            effects: canonical_effects(&edit),
-                            edit,
+                            effects: std::sync::Arc::new(canonical_effects(&edit)),
+                            edit: std::sync::Arc::new(edit),
                         },
                     },
                 )

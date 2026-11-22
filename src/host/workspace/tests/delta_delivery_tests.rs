@@ -356,8 +356,8 @@ fn an_older_client_keeps_legacy_reads_and_edits_but_receives_no_delta_notificati
             &proof,
             ServerMessage::WorkspaceModelEdited {
                 sequence: model.sequence,
-                edit: ModelEdit::AgentsChanged,
-                effects: Default::default(),
+                edit: std::sync::Arc::new(ModelEdit::AgentsChanged),
+                effects: std::sync::Arc::new(Default::default()),
             },
         ))
         .unwrap();

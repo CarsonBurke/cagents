@@ -263,7 +263,9 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     delivery.close_after_drain();
     let edges = std::iter::from_fn(|| delivery.pop())
         .filter_map(|envelope| match envelope.message {
-            ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => Some((sequence, edit)),
+            ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
+                Some((sequence, std::sync::Arc::unwrap_or_clone(edit)))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -276,6 +278,39 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
         "snapshot rows must match its sequence"
     );
     assert_eq!(edges, vec![(applied.model.sequence, edit)]);
+}
+
+#[test]
+fn workspace_edge_fanout_shares_its_incremental_payload() {
+    let (directory, host, first) = fixture();
+    let second = {
+        let mut state = host.lock().unwrap();
+        let second = state.register_client(3);
+        state.watch_model(2).unwrap();
+        state.watch_model(3).unwrap();
+        let edit = open_project(directory.path());
+        state.announce_model_edit(1, 1, &edit, &Default::default());
+        second
+    };
+    let first = first.pop().unwrap();
+    let second = second.pop().unwrap();
+    let (
+        ServerMessage::WorkspaceModelEdited {
+            edit: first_edit,
+            effects: first_effects,
+            ..
+        },
+        ServerMessage::WorkspaceModelEdited {
+            edit: second_edit,
+            effects: second_effects,
+            ..
+        },
+    ) = (first.message, second.message)
+    else {
+        panic!("model watchers must receive workspace edges");
+    };
+    assert!(std::sync::Arc::ptr_eq(&first_edit, &second_edit));
+    assert!(std::sync::Arc::ptr_eq(&first_effects, &second_effects));
 }
 
 #[test]
@@ -386,7 +421,10 @@ fn a_confirmed_project_close_cannot_take_a_channel_created_after_confirmation() 
     delivery.close_after_drain();
     let last = std::iter::from_fn(|| delivery.pop())
         .filter_map(|envelope| match envelope.message {
-            ServerMessage::WorkspaceModelEdited { edit, effects, .. } => Some((edit, effects)),
+            ServerMessage::WorkspaceModelEdited { edit, effects, .. } => Some((
+                std::sync::Arc::unwrap_or_clone(edit),
+                std::sync::Arc::unwrap_or_clone(effects),
+            )),
             _ => None,
         })
         .last()

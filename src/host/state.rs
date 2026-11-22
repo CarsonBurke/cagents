@@ -993,7 +993,8 @@ impl HostState {
         edit: &ModelEdit,
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
-        let edit = edit.committed();
+        let edit = std::sync::Arc::new(edit.committed().into_owned());
+        let effects = std::sync::Arc::new(effects.clone());
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
@@ -1003,7 +1004,7 @@ impl HostState {
                     &self.proof,
                     ServerMessage::WorkspaceModelEdited {
                         sequence,
-                        edit: edit.as_ref().clone(),
+                        edit: edit.clone(),
                         effects: effects.clone(),
                     },
                 ));

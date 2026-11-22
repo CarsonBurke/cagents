@@ -3523,7 +3523,9 @@ fn edges_through(
             if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited {
                 sequence, edit, ..
             } = queued.message
-                && sender.send((sequence, edit)).is_err()
+                && sender
+                    .send((sequence, std::sync::Arc::unwrap_or_clone(edit)))
+                    .is_err()
             {
                 return;
             }
@@ -3606,7 +3608,7 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     let edges = std::iter::from_fn(|| watcher.pop())
         .filter_map(|queued| match queued.message {
             crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
-                Some((sequence, edit))
+                Some((sequence, std::sync::Arc::unwrap_or_clone(edit)))
             }
             _ => None,
         })

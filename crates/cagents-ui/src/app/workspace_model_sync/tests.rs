@@ -817,8 +817,8 @@ fn agent_and_rank_edges_carry_canonical_rows_without_full_reads() {
                         proof: proof.clone(),
                         message: ServerMessage::WorkspaceModelEdited {
                             sequence,
-                            edit,
-                            effects,
+                            edit: std::sync::Arc::new(edit),
+                            effects: std::sync::Arc::new(effects),
                         },
                     },
                 )
@@ -1025,8 +1025,8 @@ fn a_view_edge_applies_to_the_held_view_and_reads_only_the_scope_it_cannot() {
                 None,
                 ServerMessage::WorkspaceModelEdited {
                     sequence,
-                    edit,
-                    effects: effects.clone(),
+                    edit: std::sync::Arc::new(edit),
+                    effects: std::sync::Arc::new(effects.clone()),
                 },
             );
             let Some(view) = read else {

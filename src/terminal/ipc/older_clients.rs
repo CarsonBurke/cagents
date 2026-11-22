@@ -1089,8 +1089,8 @@ mod tests {
         let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
         let edge = ServerMessage::WorkspaceModelEdited {
             sequence: 1,
-            edit: crate::workspace_model::ModelEdit::AgentsChanged,
-            effects: Default::default(),
+            edit: std::sync::Arc::new(crate::workspace_model::ModelEdit::AgentsChanged),
+            effects: std::sync::Arc::new(Default::default()),
         };
         // Its index predates the older protocol; its shape does not.
         assert!(variant_index(&edge).unwrap() < client.server_messages);

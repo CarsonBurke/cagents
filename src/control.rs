@@ -8,6 +8,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{ChildStdout, Command, ExitCode, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -1552,8 +1553,8 @@ impl ControlClient {
                 } => {
                     return Ok(ModelEdge {
                         sequence,
-                        edit,
-                        effects,
+                        edit: Arc::unwrap_or_clone(edit),
+                        effects: Arc::unwrap_or_clone(effects),
                     });
                 }
                 // The daemon is about to close this connection. Reporting it as
@@ -2693,8 +2694,8 @@ impl ControlClient {
             } => {
                 self.observed_model.push_back(ModelEdge {
                     sequence,
-                    edit,
-                    effects,
+                    edit: Arc::unwrap_or_clone(edit),
+                    effects: Arc::unwrap_or_clone(effects),
                 });
             }
             ServerMessage::NotificationsChanged => {
