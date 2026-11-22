@@ -3054,8 +3054,9 @@ impl ClientHandle {
             let mut sent_read = SentRead { id: 0, hidings: 0 };
             let mut read_again = false;
             let mut resync = false;
-            // Since when the agent's process has been missing reads.
-            let mut unanswered_since: Option<Instant> = None;
+            // Since when the agent's process has been missing reads, and when
+            // it last missed one.
+            let mut unanswered: Option<(Instant, Instant)> = None;
             let failure = loop {
                 let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
                     Ok(Some(value)) => value,
@@ -3184,7 +3185,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
-                        unanswered_since = None;
+                        unanswered = None;
                         if let Some(update) = update {
                             resync = false;
                             user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
@@ -3205,7 +3206,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
-                        unanswered_since = None;
+                        unanswered = None;
                         let (base, revision) = publication.capture();
                         let observed_user = update.changes.iter().any(|change| {
                             let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
@@ -3265,7 +3266,16 @@ impl ClientHandle {
                         // for a while.
                         let quiet = error.retryable
                             && super::failure::actor_transport::timed_out(&error.message).is_some()
-                            && unanswered_since.get_or_insert_with(Instant::now).elapsed() < UNANSWERED_GRACE;
+                            && {
+                                // Misses far apart, as across a while hidden,
+                                // start a new grace.
+                                let now = Instant::now();
+                                let (since, _) = unanswered
+                                    .filter(|(_, last)| now.duration_since(*last) < UNANSWERED_GRACE * 2)
+                                    .unwrap_or((now, now));
+                                unanswered = Some((since, now));
+                                now.duration_since(since) < UNANSWERED_GRACE
+                            };
                         if !quiet { loop {
                             let (base, revision) = publication.capture();
                             let mut snapshot = (*base.snapshot).clone();

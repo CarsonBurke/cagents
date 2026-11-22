@@ -26,10 +26,12 @@ impl RemoteActor {
         let read = self.read_by("presentation", deadline, |deadline| {
             self.presentation_until(id, after, deadline)
         });
-        match &read {
-            Ok(_) => *self.0.reread_at.lock().unwrap_or_else(|p| p.into_inner()) = None,
-            Err(failure) if failure.transient => self.reread_after(PRESENTATION_RETRY),
-            Err(_) => {}
+        // A read due after another reader's failure stays due after this one
+        // succeeds: that reader still needs it.
+        if let Err(failure) = &read
+            && failure.transient
+        {
+            self.reread_after(PRESENTATION_RETRY);
         }
         read
     }
