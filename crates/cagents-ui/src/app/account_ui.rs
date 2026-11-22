@@ -2078,6 +2078,127 @@ fn chip_with_window(
     }
 }
 
+/// What a conversation's footer shows of the account it runs on: the
+/// allowance the account has least of, as a ring in place of an avatar, and
+/// every window and limit reset behind it in words.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct AccountGauge {
+    /// The ring's fill, as the usage display setting states the window:
+    /// what is left, or what is used.
+    pub fraction: f32,
+    pub tone: ChipTone,
+    /// The ring's window and figure, such as `Weekly: 4% left`, for a
+    /// reader who hears the ring rather than sees it.
+    pub label: String,
+    /// One line for each window and each kind of limit reset available.
+    pub detail: String,
+}
+
+/// The gauge of `account` as of `now`, or `None` while there is no current
+/// figure to draw: before its first check, while it is signed out, or when
+/// its provider reports no windows.
+///
+/// The ring takes the account-wide window with the least left, whichever
+/// window the provider marks as binding: that mark has been missing even at
+/// 99% of a week used, and a ring that shows a roomy session while the week
+/// is all but gone tells the reader the opposite of the truth. One model's
+/// own allowance is listed but does not lead, since running out of it leaves
+/// every other model working. A window whose reset time has passed since its
+/// figure was read has been refilled, so its old figure neither leads nor
+/// reads as current.
+fn account_gauge(
+    account: &AccountState,
+    now: Millis,
+    mode: AccountUsageDisplay,
+) -> Option<AccountGauge> {
+    let snapshot = account.snapshot.as_ref()?;
+    if !matches!(
+        snapshot.status,
+        UsageStatus::Ok | UsageStatus::Warning | UsageStatus::Limited
+    ) {
+        return None;
+    }
+    let now_seconds = unix_seconds(now);
+    let reset_since = |window: &UsageWindow| {
+        window
+            .resets_at
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .map(|seconds| seconds.saturating_mul(1_000))
+            .is_some_and(|reset| reset > snapshot.observed_at && reset <= now)
+    };
+    let current = || {
+        snapshot
+            .windows
+            .iter()
+            .filter(|window| !reset_since(window))
+    };
+    let lead =
+        account::tightest(current().filter(|window| window.kind != account::WindowKind::Scoped))
+            .or_else(|| account::tightest(current()))?;
+    let refilled = snapshot.windows.iter().any(reset_since);
+    let old = now.saturating_sub(snapshot.observed_at) > schedule::DISPLAY_STALE_AFTER;
+    let tone = if old || account.failure.is_some() {
+        ChipTone::Stale
+    } else {
+        // A limit the provider reported before a window refilled may have
+        // been that window's, so only the figure itself speaks for it now.
+        ChipTone::of_usage(
+            if refilled {
+                UsageStatus::Ok
+            } else {
+                snapshot.status
+            },
+            lead.used,
+        )
+    };
+    let figure = usage_figure(lead.used, mode);
+    let line = |window: &UsageWindow| {
+        let mut line = format!("{}: ", window.label);
+        if reset_since(window) {
+            line.push_str("reset since last checked");
+            return line;
+        }
+        line.push_str(&usage_figure(window.used, mode).text);
+        if let Some(resets_at) = window.resets_at.filter(|at| *at > now_seconds) {
+            line.push_str(&format!(
+                " · resets in {} ({})",
+                account::format_remaining(resets_at - now_seconds),
+                account::format_local_moment(resets_at, now_seconds)
+            ));
+        }
+        line
+    };
+    // The ring's own window leads, then the rest as the provider lists them.
+    let mut lines: Vec<String> = std::iter::once(lead)
+        .chain(
+            snapshot
+                .windows
+                .iter()
+                .filter(|window| !std::ptr::eq(*window, lead)),
+        )
+        .map(line)
+        .collect();
+    let resets = account::resets::inventory_lines(&snapshot.resets, now_seconds);
+    if !resets.is_empty() {
+        lines.push(format!("Limit resets: {}", resets.join("; ")));
+    }
+    if old {
+        lines.push(format!(
+            "As of {}",
+            account::format_local_moment(unix_seconds(snapshot.observed_at), now_seconds)
+        ));
+    }
+    if let Some(failure) = &account.failure {
+        lines.push(format!("Last check failed: {failure}"));
+    }
+    Some(AccountGauge {
+        fraction: figure.fraction,
+        tone,
+        label: format!("{}: {}", lead.label, figure.text),
+        detail: lines.join("\n"),
+    })
+}
+
 /// How a provider's CLI signs in: through the browser by default, or, for
 /// Codex, with a device code a reader can finish on another machine.
 fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'static str]> {
@@ -2409,6 +2530,8 @@ struct Choice {
     detail: String,
     usage_fraction: Option<f32>,
     tone: ChipTone,
+    /// What a conversation running on the account shows of it.
+    gauge: Option<AccountGauge>,
     listed: bool,
     present: bool,
     system: bool,
@@ -2469,6 +2592,7 @@ impl ProviderChoices {
                 detail: detail.join(" · "),
                 usage_fraction: usage.map(|figure| figure.fraction),
                 tone,
+                gauge: account_gauge(account, state.now_ms, display),
                 listed,
                 present: account.present,
                 system,
@@ -2569,6 +2693,8 @@ pub(super) struct DefaultChoice {
 pub(super) struct ChatAccounts<'a> {
     /// What the picker's button says: the chosen account's name.
     pub current: &'a str,
+    /// The usage the chosen account has left, where known.
+    pub gauge: Option<&'a AccountGauge>,
     pub choices: AccountChoices<'a>,
 }
 
@@ -6309,6 +6435,7 @@ impl Cagents {
         }
         Some(ChatAccounts {
             current: current.map_or("Other home", |current| current.label.as_str()),
+            gauge: current.and_then(|current| current.gauge.as_ref()),
             choices: AccountChoices {
                 accounts: &offered.accounts,
                 current: running,
@@ -8220,6 +8347,101 @@ mod tests {
         assert_eq!(
             reset_countdown(&window(0.38, Some(reset)), NOW).as_deref(),
             Some("2h 14m")
+        );
+    }
+
+    /// The footer's ring leads with the account-wide window the account has
+    /// least of, even where the provider marked another window binding or
+    /// marked none at all (#3634).
+    #[test]
+    fn the_account_gauge_leads_with_the_least_left_whatever_is_marked_binding() {
+        let now = unix_seconds(NOW);
+        let mut session = window(0.2, Some(now + 3_600));
+        session.binding = true;
+        let mut weekly = window(0.99, Some(now + 2 * 86_400));
+        weekly.key = "seven_day".into();
+        weekly.kind = WindowKind::Weekly;
+        weekly.label = "Weekly".into();
+        let mut fable = window(1.0, Some(now + 2 * 86_400));
+        fable.key = "seven_day_fable".into();
+        fable.kind = WindowKind::Scoped;
+        fable.label = "Fable".into();
+        let state = state_with(Some(snapshot(vec![session, weekly, fable], NOW)));
+        for (mode, fraction, figure) in [
+            (AccountUsageDisplay::Left, 0.01, "1% left"),
+            (AccountUsageDisplay::Used, 0.99, "99% used"),
+        ] {
+            let gauge = account_gauge(&state, NOW, mode).expect("current figures have a gauge");
+            // One model's allowance running out is listed, not led with.
+            assert_eq!(gauge.label, format!("Weekly: {figure}"));
+            assert_eq!(gauge.fraction, fraction);
+            assert_eq!(gauge.tone, ChipTone::Exhausted);
+            let lines: Vec<&str> = gauge.detail.lines().collect();
+            assert!(lines[0].starts_with(&format!("Weekly: {figure} · resets in 2d")));
+            assert!(lines[1].starts_with("Session: "), "{lines:?}");
+            assert!(lines[2].starts_with("Fable: "), "{lines:?}");
+        }
+    }
+
+    /// A window whose reset passed since its figures were read has been
+    /// refilled: its old figure neither leads nor reads as current (#3635).
+    #[test]
+    fn the_account_gauge_does_not_present_a_refilled_window_as_current() {
+        let now = unix_seconds(NOW);
+        let observed = NOW - 120_000;
+        let mut weekly = window(0.98, Some(now - 60));
+        weekly.key = "seven_day".into();
+        weekly.kind = WindowKind::Weekly;
+        weekly.label = "Weekly".into();
+        let state = state_with(Some(snapshot(
+            vec![window(0.3, Some(now + 3_600)), weekly],
+            observed,
+        )));
+        let gauge = account_gauge(&state, NOW, AccountUsageDisplay::Left).unwrap();
+        assert_eq!(gauge.label, "Session: 70% left");
+        // The limit was the refilled week's, so it no longer colours the ring.
+        assert_eq!(gauge.tone, ChipTone::Current);
+        assert!(
+            gauge.detail.contains("Weekly: reset since last checked"),
+            "{}",
+            gauge.detail
+        );
+    }
+
+    #[test]
+    fn the_account_gauge_lists_available_limit_resets_and_needs_figures() {
+        let now = unix_seconds(NOW);
+        let mut usage = snapshot(vec![window(0.5, Some(now + 3_600))], NOW);
+        usage.resets = vec![account::resets::UsageReset {
+            id: "grant".into(),
+            kind: account::resets::ResetKind::Granted,
+            scopes: vec![account::resets::ResetScope::AccountWeekly],
+            available_count: 2,
+            expires_at: None,
+            usable: true,
+        }];
+        let gauge =
+            account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
+        assert!(
+            gauge
+                .detail
+                .lines()
+                .any(|line| line.starts_with("Limit resets: 2 ")),
+            "{}",
+            gauge.detail
+        );
+        assert_eq!(
+            account_gauge(&state_with(None), NOW, AccountUsageDisplay::Left),
+            None
+        );
+        let signed_out = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW);
+        assert_eq!(
+            account_gauge(
+                &state_with(Some(signed_out)),
+                NOW,
+                AccountUsageDisplay::Left
+            ),
+            None
         );
     }
 

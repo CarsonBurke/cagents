@@ -6632,6 +6632,7 @@ pub(super) fn furnished_runtime() -> (Runtime, Arc<ClientHandle>) {
 fn fixture_accounts() -> ChatAccounts<'static> {
     ChatAccounts {
         current: "Synthetic account with a long name",
+        gauge: None,
         choices: Default::default(),
     }
 }
