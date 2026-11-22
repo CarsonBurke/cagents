@@ -263,13 +263,30 @@ pub(in crate::app) struct Controls {
     identity: Option<Identity>,
 }
 
+/// The limits a reset would relieve now: ones near or at their limit, or
+/// the one holding the account back, that have not already reset.
+fn pressing_windows<'a>(
+    snapshot: &'a UsageSnapshot,
+    reset: &'a UsageReset,
+    now: Millis,
+) -> impl Iterator<Item = &'a UsageWindow> {
+    snapshot.windows.iter().filter(move |window| {
+        (window.used >= account::WARNING_FRACTION || window.binding)
+            && window.resets_at.is_none_or(|at| at > unix_seconds(now))
+            && reset.clears(window)
+    })
+}
+
 fn actionable(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> bool {
-    reset.is_available(unix_seconds(now))
-        && snapshot.windows.iter().any(|window| {
-            (window.used >= account::WARNING_FRACTION || window.binding)
-                && window.resets_at.is_none_or(|at| at > unix_seconds(now))
-                && reset.clears(window)
-        })
+    reset.is_available(unix_seconds(now)) && pressing_windows(snapshot, reset, now).next().is_some()
+}
+
+/// How badly the limits a reset clears hold the account back: a binding
+/// limit first, then the most used one.
+fn relief(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> (bool, f32) {
+    pressing_windows(snapshot, reset, now).fold((false, 0.0), |(binding, used), window| {
+        (binding || window.binding, used.max(window.used))
+    })
 }
 
 fn inventory(reset: &UsageReset, now: Millis) -> bool {
@@ -299,8 +316,10 @@ fn can_offer(snapshot: &UsageSnapshot, state: &State, reset: &UsageReset, now: M
     actionable(snapshot, reset, now) && !state.uncertain.contains_key(&reset.id)
 }
 
-/// The reset offered first: the narrowest one that helps, so a Fable limit
-/// suggests the Fable reset before a Weekly reset that also clears Fable.
+/// The reset offered first relieves the tightest limit. Among resets that do,
+/// the narrowest wins, so a Fable limit suggests the Fable reset before a
+/// Weekly reset that also clears Fable, while a nearly spent weekly limit is
+/// never answered with a Session reset.
 fn next_reset<'a>(
     snapshot: &'a UsageSnapshot,
     state: &State,
@@ -311,9 +330,16 @@ fn next_reset<'a>(
         .iter()
         .filter(|reset| can_offer(snapshot, state, reset, now))
         .min_by(|left, right| {
-            normalized_scopes(left)
-                .len()
-                .cmp(&normalized_scopes(right).len())
+            let (left_binding, left_used) = relief(snapshot, left, now);
+            let (right_binding, right_used) = relief(snapshot, right, now);
+            right_binding
+                .cmp(&left_binding)
+                .then_with(|| right_used.total_cmp(&left_used))
+                .then_with(|| {
+                    normalized_scopes(left)
+                        .len()
+                        .cmp(&normalized_scopes(right).len())
+                })
                 .then_with(|| reset_order(left, right))
         })
 }
@@ -2060,6 +2086,34 @@ pub(in crate::app) mod tests {
             ["Fable · 2 available", "Weekly + Fable · 2 available"]
         );
         assert_eq!(weekly.action_label(), "Use Weekly + Fable reset");
+    }
+
+    /// A Session reset doesn't help a nearly spent weekly limit, so the reset
+    /// that also clears Weekly is offered even though it clears more.
+    #[test]
+    fn the_offered_reset_relieves_the_tightest_limit_before_the_narrowest() {
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Session, "five_hour", 0.82),
+            window(account::WindowKind::Weekly, "weekly_all", 0.96),
+        ];
+        let mut session = reset(ResetScope::AccountSession);
+        session.id = "session".into();
+        let mut both = reset(ResetScope::AccountSession);
+        both.id = "both".into();
+        both.scopes.push(ResetScope::AccountWeekly);
+        snapshot.resets = vec![session, both];
+        assert_eq!(
+            next_reset(&snapshot, &State::default(), now).unwrap().id,
+            "both"
+        );
+        snapshot.windows[0].binding = true;
+        assert_eq!(
+            next_reset(&snapshot, &State::default(), now).unwrap().id,
+            "both",
+            "both clear the binding Session limit, so the tighter Weekly limit decides"
+        );
     }
 
     #[test]
