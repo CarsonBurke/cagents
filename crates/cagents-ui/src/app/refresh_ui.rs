@@ -1267,9 +1267,9 @@ mod tests {
         // An unrelated application update must keep the same one-shot
         // identity; rebuilding it from the current wall clock would restart
         // the sleep every frame during this backoff.
-        let before = recipe_identities(app.refresh_subscription());
+        let before = app.refresh_deadline(Instant::now());
         drop(app.update(Message::WindowScaleFactorChanged(app.window_scale_factor)));
-        assert_eq!(recipe_identities(app.refresh_subscription()), before);
+        assert_eq!(app.refresh_deadline(Instant::now()), before);
     }
 
     #[test]
