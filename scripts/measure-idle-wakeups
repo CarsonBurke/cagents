@@ -26,9 +26,18 @@ def matching(pattern, environ):
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as file:
                 command = file.read().replace(b"\0", b" ").decode(errors="replace")
+            with open(f"/proc/{pid}/comm") as file:
+                name = file.read().strip()
         except OSError:
             continue
-        if pattern not in command or int(pid) == os.getpid():
+        # The pattern names a cagents command-line mode. Do not let the shell
+        # which invoked this script become a false target merely because its
+        # own argv includes the cagentsd pattern.
+        if (
+            pattern not in command
+            or int(pid) == os.getpid()
+            or not name.startswith("cagents")
+        ):
             continue
         if environ is not None:
             try:
