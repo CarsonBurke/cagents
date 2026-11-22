@@ -729,8 +729,17 @@ pub(super) fn token_count(tokens: u64) -> String {
     match tokens {
         0..1_000 => tokens.to_string(),
         1_000..1_000_000 => format!("{}k", tokens / 1_000),
-        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+        _ => format!("{}.{}M", tokens / 1_000_000, tokens / 100_000 % 10),
     }
+}
+
+/// That a message woke a session whose prompt cache had likely expired, with
+/// the `tokens` of context its provider reads again.
+pub(super) fn cold_wake(tokens: u64) -> String {
+    format!(
+        "Its prompt cache had likely expired, so its provider reads all {} tokens of its context again.",
+        token_count(tokens)
+    )
 }
 
 /// What a row adds beyond its ID, provider, state and account, most

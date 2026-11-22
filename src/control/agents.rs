@@ -1422,9 +1422,22 @@ pub(super) fn execute_with_context(
         } => {
             let prompt = prompt.read()?;
             let agent = session.agent(&agent)?;
-            // Read before the run starts a turn, which clears the limit.
-            let limit = member_of(&session.members(&[agent]), agent)
-                .and_then(|member| member.limit.clone());
+            // Read before the run starts a turn, which clears the limit and
+            // refreshes the cache.
+            let members = session.members(&[agent]);
+            let member = member_of(&members, agent);
+            let limit = member.and_then(|member| member.limit.clone());
+            let read_at = super::sessions::now_ms();
+            // One a usage limit stops reads nothing until the limit lifts.
+            let cold = member
+                .filter(|member| member.limit.is_none())
+                .and_then(|member| {
+                    let tokens = member.cold_context(read_at)?;
+                    Some((
+                        tokens,
+                        super::sessions::cache_json(member, read_at, Detail::Sparse),
+                    ))
+                });
             let request = Submit {
                 name: None,
                 destination: Destination::Existing(agent),
@@ -1451,6 +1464,10 @@ pub(super) fn execute_with_context(
                 output.human = format!("{}\n{notice}", output.human);
                 output.data["notice"] = json!(notice);
             }
+            if let Some((tokens, cache)) = cold {
+                output.human = format!("{}\n{}", output.human, super::sessions::cold_wake(tokens));
+                output.data["cache"] = cache;
+            }
             Ok(output)
         }
         AgentCommand::Status { agent, show } => {
@@ -1460,12 +1477,14 @@ pub(super) fn execute_with_context(
             let handles = session.handles(&[agent.id.to_string(), run.id.to_string()]);
             let members = session.members(&[agent.id]);
             let member = member_of(&members, agent.id);
+            let now = super::sessions::now_ms();
             let human = with_standing(
                 status_lines(&agent, &run, false, show, handles, true),
                 member,
+                now,
             );
             let mut data = json!({"agent": agent, "run": run, "timed_out": false});
-            standing_json(&mut data, member);
+            standing_json(&mut data, member, now);
             Ok(CommandOutput {
                 command: "agent.status",
                 data,
@@ -1540,6 +1559,7 @@ pub(super) fn execute_with_context(
             // One run's hint goes with its status. Several runs share one
             // hint, after them all, so a wait prints one however many.
             let single = statuses.len() == 1;
+            let now = super::sessions::now_ms();
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
@@ -1553,6 +1573,7 @@ pub(super) fn execute_with_context(
                             single,
                         ),
                         member_of(&members, agent.id),
+                        now,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1880,10 +1901,11 @@ fn submitted(
     // A run that settled says what stops its provider now, and the account.
     let members = session.members(&[accepted.agent.id]);
     let member = member_of(&members, accepted.agent.id);
+    let now = super::sessions::now_ms();
     if wait.wait {
-        human = with_standing(human, member);
+        human = with_standing(human, member, now);
     }
-    standing_json(&mut data, member);
+    standing_json(&mut data, member, now);
     Ok(CommandOutput {
         command,
         data,
@@ -1902,13 +1924,13 @@ fn member_of(members: &[Member], agent: AgentId) -> Option<&Member> {
     })
 }
 
-/// A status with what stops the agent's provider and the account it runs
-/// on, after its first line, which readers of the output parse.
-fn with_standing(lines: String, member: Option<&Member>) -> String {
+/// A status with what stops the agent's provider, the account it runs on
+/// and whether its prompt cache has likely expired, as of `now`, after its
+/// first line, which readers of the output parse.
+fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
     let Some(member) = member else {
         return lines;
     };
-    let now = super::sessions::now_ms();
     let mut standing = String::new();
     if let Some(limit) = &member.limit {
         standing.push_str(&format!(
@@ -1936,10 +1958,9 @@ fn with_standing(lines: String, member: Option<&Member>) -> String {
 
 /// The agent's usage limit and account, as `sessions --json` reports them,
 /// and its prompt cache where a message would find it cold.
-fn standing_json(data: &mut Value, member: Option<&Member>) {
+fn standing_json(data: &mut Value, member: Option<&Member>, now: u64) {
     data["limit"] = json!(member.and_then(|member| member.limit.as_ref()));
     data["account"] = json!(member.and_then(|member| member.account.as_ref()));
-    let now = super::sessions::now_ms();
     if let Some(member) = member.filter(|member| member.cold_context(now).is_some()) {
         data["cache"] = super::sessions::cache_json(member, now, super::fields::Detail::Sparse);
     }
@@ -4330,7 +4351,7 @@ mod tests {
         assert!(member_of(&members, AgentId::new()).is_none());
         let found = member_of(&members, agent);
         let status = "agent 1234 (claude) run 5678 Failed\n\nActual result";
-        let human = with_standing(status.into(), found);
+        let human = with_standing(status.into(), found, super::super::sessions::now_ms());
         assert_eq!(
             human,
             "agent 1234 (claude) run 5678 Failed\nStopped by a usage limit: Claude weekly limit reached, resets 3pm\nAccount claude/system: allowance unknown\n\nActual result"
@@ -4341,9 +4362,12 @@ mod tests {
             assert_eq!(run.state, Some(crate::agent_execution::State::Failed));
             assert_eq!(run.result, "Actual result");
         }
-        assert_eq!(with_standing(status.into(), None), status);
+        assert_eq!(
+            with_standing(status.into(), None, super::super::sessions::now_ms()),
+            status
+        );
         let mut data = json!({});
-        standing_json(&mut data, found);
+        standing_json(&mut data, found, super::super::sessions::now_ms());
         assert_eq!(data["limit"]["reset"], "3pm");
         assert_eq!(data["account"]["id"], "claude/system");
     }
