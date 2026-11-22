@@ -407,7 +407,9 @@ pub enum Action {
     /// Opens a child agent's transcript, or returns to the main conversation.
     SelectSubagent(Target, Option<String>),
     SubagentPicker(Target, bool),
-    SubagentFailures(Target),
+    /// Opens the subagent chooser on one filter, such as the failed or the
+    /// finished subagents a closing row or the strip counts.
+    SubagentChooser(Target, child_navigation::Filter),
     SubagentQuery(Target, String),
     ToggleFailure(Target, String),
     CopyFailure(Target, String),
@@ -882,7 +884,7 @@ impl Action {
             Self::ToggleTurn(..) => "ToggleTurn",
             Self::SelectSubagent(..) => "SelectSubagent",
             Self::SubagentPicker(..) => "SubagentPicker",
-            Self::SubagentFailures(..) => "SubagentFailures",
+            Self::SubagentChooser(..) => "SubagentChooser",
             Self::SubagentQuery(..) => "SubagentQuery",
             Self::ToggleFailure(..) => "ToggleFailure",
             Self::CopyFailure(..) => "CopyFailure",
@@ -15459,11 +15461,23 @@ impl Cagents {
             Action::FailureCopied(target, key, request, result) => {
                 return self.finish_failure_copy(target, key, request, result);
             }
-            Action::SubagentFailures(target) => {
+            Action::SubagentChooser(target, filter) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let mut picker = child_navigation::Picker::new(&runtime.snapshot.subagents);
-                    picker.filter = child_navigation::Filter::Failed;
-                    runtime.child_picker = Some(picker);
+                    // Pressed again on the filter it shows, the chooser
+                    // closes, as its own toggle does.
+                    if runtime
+                        .child_picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.filter == filter)
+                    {
+                        return self.handle_chat_ui(Action::SubagentPicker(target, false));
+                    }
+                    // An open chooser keeps what the reader searched for.
+                    let picker = runtime.child_picker.get_or_insert_with(|| {
+                        child_navigation::Picker::new(&runtime.snapshot.subagents)
+                    });
+                    picker.filter = filter;
+                    picker.page = 0;
                     return widget::text_input::focus(card_control_id(
                         target.card,
                         "chat-subagent-search",

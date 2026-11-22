@@ -2039,7 +2039,7 @@ impl Runtime {
             || self.queued.is_some()
             || transitioning
             || self.attachment_chooser_pending.is_some()
-            || self.sending()
+            || self.says_sending()
             || self.disconnected
             || snapshot.exited
         {
@@ -2178,7 +2178,7 @@ impl Runtime {
             ),
             _ => (
                 format!("Choose from {} failed subagents", failed.len()),
-                Action::SubagentFailures(self.target),
+                Action::SubagentChooser(self.target, child_navigation::Filter::Failed),
             ),
         };
         let tooltip = failed
@@ -2307,7 +2307,7 @@ impl Runtime {
                 let snapshot = &self.snapshot;
                 snapshot.busy
                     && !snapshot.has_later
-                    && !self.sending()
+                    && !self.says_sending()
                     && snapshot
                         .items
                         .last()
@@ -2332,10 +2332,24 @@ impl Runtime {
                     && !reasoning::contentless(&item.content))
     }
 
+    /// The row that closes the transcript above the composer: what
+    /// [`Self::timeline_activity`] says, except a message the queue docked
+    /// on the composer already says is on its way, which is said there once.
+    fn closing_activity(
+        &self,
+        transitioning: bool,
+        selected: Option<&chat::Subagent>,
+    ) -> Option<(Icon, String)> {
+        if selected.is_none() && self.queue_sending() && !self.snapshot.is_working() {
+            return None;
+        }
+        self.timeline_activity(transitioning, selected)
+    }
+
     /// Whether the lead's closing line spins, as it does while subagents
     /// work after the lead has finished, or while a message is sent.
     fn closing_spins(&self) -> bool {
-        self.timeline_activity(false, None)
+        self.closing_activity(false, None)
             .is_some_and(|(glyph, _)| glyph == Icon::AgentWorking)
     }
 
@@ -2421,6 +2435,24 @@ impl Runtime {
         }
     }
 
+    /// Whether the queue docked on the composer says a message is on its way:
+    /// one joining the provider's queue or steering the turn, or held
+    /// follow-ups being sent. The conversation's status then says what the
+    /// agent is doing rather than saying "Sending" a second time.
+    pub(super) fn queue_sending(&self) -> bool {
+        self.followups_sending()
+            || self
+                .commands
+                .outgoing()
+                .any(|outgoing| !outgoing.in_transcript())
+    }
+
+    /// Whether the conversation's status reads "Sending": a message is on
+    /// its way, and the queue is not already saying so above a working agent.
+    fn says_sending(&self) -> bool {
+        self.sending() && !(self.queue_sending() && self.snapshot.is_working())
+    }
+
     /// Whether a message is on its way to the provider. Other commands -
     /// choosing a model or permissions, paging history, answering, stopping -
     /// leave what the conversation is doing as it was until it says otherwise.
@@ -2482,7 +2514,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Switching session")
         } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
-        } else if self.sending() {
+        } else if self.says_sending() {
             (Some(Icon::AgentWorking), "Sending")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
@@ -3370,7 +3402,7 @@ impl Runtime {
         // away with the turns it follows rather than holding a row above the
         // composer, and each change redraws this one row rather than adding
         // another.
-        if let Some((glyph, label)) = self.timeline_activity(transitioning, selected) {
+        if let Some((glyph, label)) = self.closing_activity(transitioning, selected) {
             let failure = selected
                 .is_none()
                 .then(|| self.agent_failure_control())
@@ -6337,7 +6369,6 @@ impl Runtime {
     fn queue_view(&self) -> Option<Element<'_, Message>> {
         let target = self.target;
         let caps = &self.snapshot.capabilities;
-        let sending = self.followups_sending();
         let available = !self.disconnected && !self.snapshot.exited;
         let control = |name, label: &'static str, enabled: bool, message: Action| {
             crate::ui_controls::icon_button(name, label)
@@ -6494,12 +6525,7 @@ impl Runtime {
                 .into(),
         ];
         // The one thing about the queue a reader cannot discover by looking.
-        if sending
-            || self
-                .commands
-                .outgoing()
-                .any(|outgoing| !outgoing.in_transcript())
-        {
+        if self.queue_sending() {
             header.push(design::caption("Sending…").into());
         } else if self.newest_take_back().is_some() {
             // Bare Up belongs to the caret once there is a draft.

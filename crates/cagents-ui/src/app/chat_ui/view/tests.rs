@@ -1664,7 +1664,10 @@ fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a
     let mut second = runtime.snapshot.subagents[0].clone();
     second.id = "second-failure".into();
     Arc::make_mut(&mut runtime.snapshot).subagents.push(second);
-    drop(app.handle_chat_ui(Action::SubagentFailures(target)));
+    drop(app.handle_chat_ui(Action::SubagentChooser(
+        target,
+        child_navigation::Filter::Failed,
+    )));
     let runtime = app.chat_runtime_mut(target).unwrap();
     let picker = runtime.child_picker.as_ref().unwrap();
     assert_eq!(picker.filter, child_navigation::Filter::Failed);
@@ -2189,18 +2192,59 @@ fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
     assert!(!runtime.sending());
     assert_eq!(activity(&runtime), None);
     runtime.commands = commands::Commands::default();
+    // A message for the provider's queue, given while the agent works, is
+    // listed in the queue docked on the composer, which says it is on its
+    // way. The closing row does not say so again: it keeps saying what the
+    // agent does, and nothing once the agent is idle.
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.busy = true;
+    snapshot.detail = "Reading the parser".into();
+    let snapshot = runtime.snapshot.clone();
     let message = Command::Prompt {
         text: "next".into(),
         attachments: Vec::new(),
         mode: PromptMode::Queue,
     };
-    let pending = commands::PendingCommand::new(1, &message);
+    let mut pending = commands::PendingCommand::new(1, &message);
+    pending.outgoing = Some(commands::Outgoing::new(
+        "next".into(),
+        Vec::new(),
+        PromptMode::Queue,
+        &snapshot,
+    ));
     assert!(runtime.commands.push(pending, message, &snapshot).is_some());
-    assert!(runtime.sending());
+    assert!(runtime.sending() && runtime.queue_sending());
+    assert_eq!(
+        runtime.closing_activity(false, None),
+        Some((Icon::AgentWorking, "Reading the parser".into()))
+    );
+    Arc::make_mut(&mut runtime.snapshot).busy = false;
+    assert_eq!(runtime.closing_activity(false, None), None);
+    // Views of the chat without its composer, such as the workspace
+    // switcher, still say it.
     assert_eq!(
         activity(&runtime),
         Some((Icon::AgentWorking, "Sending".into()))
     );
+    assert_eq!(runtime.conversation_status_base(false).1, "Sending");
+    // A message sent now is drawn in the transcript as on its way.
+    runtime.commands = commands::Commands::default();
+    let message = Command::Prompt {
+        text: "now".into(),
+        attachments: Vec::new(),
+        mode: PromptMode::Send,
+    };
+    let snapshot = runtime.snapshot.clone();
+    let mut pending = commands::PendingCommand::new(2, &message);
+    pending.outgoing = Some(commands::Outgoing::new(
+        "now".into(),
+        Vec::new(),
+        PromptMode::Send,
+        &snapshot,
+    ));
+    assert!(runtime.commands.push(pending, message, &snapshot).is_some());
+    assert!(runtime.sending() && !runtime.queue_sending());
+    assert_eq!(activity(&runtime), None);
 }
 
 #[test]
