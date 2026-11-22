@@ -407,6 +407,28 @@ fn update<Message: Clone, Theme, Renderer>(
 
     if cursor_position.is_none() {
         state.drag_initiated = None;
+        // The cursor left the window, or a parent withholds it: a scrollable
+        // does once the pointer is outside its viewport, and a layer above
+        // makes it levitate. Either way it is no longer over this area.
+        if state.is_hovered
+            && matches!(
+                event,
+                Event::Mouse(
+                    mouse::Event::CursorMoved { .. }
+                        | mouse::Event::CursorLeft
+                ) | Event::Touch(
+                    touch::Event::FingerMoved { .. }
+                        | touch::Event::FingerLost { .. }
+                )
+            )
+        {
+            state.is_hovered = false;
+            state.is_out_of_bounds = true;
+            state.cursor_position = None;
+            if let Some(on_exit) = widget.on_exit.as_ref() {
+                shell.publish(on_exit.clone());
+            }
+        }
         return;
     }
 
