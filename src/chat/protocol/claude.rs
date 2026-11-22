@@ -6696,7 +6696,9 @@ fn harness_error(text: String) -> String {
         .filter(|tool| !tool.is_empty() && !tool.contains(char::is_whitespace))
     {
         Some(tool) if tool.starts_with("mcp__") => {
-            format!("Claude called {tool}, which isn't available. Its MCP server may not be connected.")
+            format!(
+                "Claude called {tool}, which isn't available. Its MCP server may not be connected."
+            )
         }
         Some(tool) => super::unknown_tool("Claude", tool),
         None => inner.to_owned(),

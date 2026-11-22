@@ -153,7 +153,14 @@ fn block(out: &mut String, node: &Node, indent: usize) {
                 // A blank line within a prompt stays blank rather than
                 // holding the indent as trailing spaces. The first line
                 // always has one, which a list item's marker replaces.
-                line(out, if index > 0 && text.is_empty() { 0 } else { indent });
+                line(
+                    out,
+                    if index > 0 && text.is_empty() {
+                        0
+                    } else {
+                        indent
+                    },
+                );
                 out.push_str(text);
             }
         }

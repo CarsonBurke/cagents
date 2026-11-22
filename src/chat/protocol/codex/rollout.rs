@@ -867,7 +867,11 @@ mod tests {
     #[test]
     fn a_call_to_a_tool_codex_lacks_fails_and_says_so() {
         for (call_type, output_type, reply) in [
-            ("function_call", "function_call_output", "unsupported call: cagents"),
+            (
+                "function_call",
+                "function_call_output",
+                "unsupported call: cagents",
+            ),
             (
                 "custom_tool_call",
                 "custom_tool_call_output",
