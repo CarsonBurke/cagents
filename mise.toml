@@ -19,6 +19,9 @@ ui = "--locked --no-default-features --package cagents --package cagents-ui --fe
 # browser tests use, as main's build check selects it.
 browser = "--locked --no-default-features --package cagents-ui --features browser-protocol-fixture"
 editor = "--locked --package ceditor"
+# The dictation helper with its speech engine: onnxruntime, audio capture and
+# model downloads, which no other lane resolves.
+dictate = "--locked --no-default-features --package cagents-dictate --features engine"
 
 # Usage specs. A lane task forwards Cargo arguments; naming any replaces the
 # default target selection, so `-- --lib terminal::` narrows a lane instead of
@@ -96,6 +99,11 @@ description = "Type-check and lint the standalone ceditor package"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--bin=ceditor" help="Cargo arguments, after --; they replace the default --bin=ceditor"'
 run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.editor}} "$@"'
 
+[tasks."check:dictate"]
+description = "Type-check and lint the dictation helper lane"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = 'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane clippy {{vars.dictate}} "$@"'
+
 [tasks.check]
 description = "Type-check and lint every target of the CLI, host and UI lanes, each admitted on its own"
 usage = 'arg "[unexpected]..." var=#true hide=#true'
@@ -137,6 +145,14 @@ usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-t
 run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.host}} "$@"',
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.host}} --lib --bins --examples ;; esac',
+]
+
+[tasks."test:dictate"]
+description = "Test the dictation helper lane"
+usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
+run = [
+  'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.dictate}} "$@"',
+  'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.dictate}} --lib --bins --examples ;; esac',
 ]
 
 [tasks."test:ui"]

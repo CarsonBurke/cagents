@@ -29,8 +29,13 @@ LANES = {
     "ui": ["--features", "ui"],
     "app": ["-p", "cagents-ui"],
     "browser": ["-p", "cagents-ui", "--features", "browser-protocol-fixture"],
+    "dictate": ["-p", "cagents-dictate", "--features", "engine"],
 }
 APPLICATION_LANES = {"app", "browser"}
+# Lanes whose package an older commit may not have, and the manifest that
+# says it does.
+LANE_MANIFESTS = {lane: "crates/cagents-ui/Cargo.toml" for lane in APPLICATION_LANES}
+LANE_MANIFESTS["dictate"] = "crates/cagents-dictate/Cargo.toml"
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
 # native-evidence's task for these builds: its path must be short, for sockets.
@@ -117,8 +122,7 @@ def check_commit(repository, directory, sha, lanes):
     warnings = {}
     packages = workspace_packages(checkout)
     for lane in lanes:
-        if (lane in APPLICATION_LANES
-                and not (checkout / "crates/cagents-ui/Cargo.toml").exists()):
+        if lane in LANE_MANIFESTS and not (checkout / LANE_MANIFESTS[lane]).exists():
             continue
         command = [str(checkout / "scripts/cargo-gate"), "clippy", "--locked",
                    "--no-default-features", "--all-targets", *LANES[lane]]
@@ -199,8 +203,9 @@ def report(repository, directory, state):
             f"Last passing commit: `{state.get('last_good', 'none recorded')}`.\n\n"
             f"Commit, parents and subject:\n```text\n{details}\n```\n\n"
             "Checks use `scripts/cargo-gate clippy --locked --no-default-features --all-targets` "
-            "in separate CLI, host, shared UI (`--features ui`) and application "
-            "(`-p cagents-ui`) lanes.\n\n")
+            "in separate CLI, host, shared UI (`--features ui`), application "
+            "(`-p cagents-ui`), integrated browser and dictation helper "
+            "(`-p cagents-dictate --features engine`) lanes.\n\n")
     for lane, status in pending["lanes"].items():
         count = warnings.get(lane, 0)
         body += f"- {lane}: exit {status}" + (f", {count} warning{'s' * (count != 1)}" if count else "") + "\n"

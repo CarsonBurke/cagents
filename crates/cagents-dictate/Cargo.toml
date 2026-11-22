@@ -1,0 +1,58 @@
+[package]
+name = "cagents-dictate"
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The speech engine, audio capture and model downloads: only the
+# `cagents-dictate` executable selects it. The UI depends on this package
+# without it, for the protocol, the model catalog and where models live, so
+# its graph never resolves onnxruntime, ALSA or an HTTP client.
+engine = [
+    "dep:clap",
+    "dep:cpal",
+    "dep:hound",
+    "dep:rtrb",
+    "dep:rustix",
+    "dep:sha2",
+    "dep:sherpa-onnx",
+    "dep:ureq",
+]
+
+[lib]
+bench = false
+
+[[bin]]
+name = "cagents-dictate"
+path = "src/main.rs"
+required-features = ["engine"]
+test = false
+bench = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"], optional = true }
+# The pulseaudio host is a Rust implementation of the protocol, which
+# PipeWire's pulse server also speaks, so the system's chosen input is used
+# without linking libpulse or libpipewire. cpal falls back to ALSA itself.
+cpal = { version = "0.18.2", features = ["pulseaudio"], optional = true }
+hound = { version = "3.5", optional = true }
+# Carries samples out of the audio callback without locking or allocating.
+rtrb = { version = "0.4", optional = true }
+rustix = { version = "1.1.4", features = ["fs"], optional = true }
+sha2 = { version = "0.10", optional = true }
+# Statically links sherpa-onnx and onnxruntime: Parakeet's feature extraction,
+# TDT decoding, Silero VAD and resampling all live there.
+sherpa-onnx = { version = "=2.0.2", default-features = false, features = ["static"], optional = true }
+ureq = { version = "3.5", default-features = false, features = ["rustls"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.21"

@@ -72,6 +72,9 @@ if Path('broken-' + lane).exists():
         application = self.origin / "crates/cagents-ui/Cargo.toml"
         application.parent.mkdir(parents=True)
         application.write_text('[package]\nname = "cagents-ui"\n')
+        dictation = self.origin / "crates/cagents-dictate/Cargo.toml"
+        dictation.parent.mkdir(parents=True)
+        dictation.write_text('[package]\nname = "cagents-dictate"\n')
         self.first = self.commit("baseline")
         self.command("git", "clone", "-q", str(self.origin), str(self.repo))
         gh = self.bin / "gh"
@@ -141,7 +144,16 @@ if sys.argv[1:3] == ['issue', 'create']:
         self.now += 120
         self.tick()
         self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
-                         ["cli", "host", "ui"])
+                         ["cli", "host", "ui", "dictate"])
+
+    def test_commit_before_the_dictation_helper_skips_only_its_lane(self):
+        self.tick()
+        self.command("git", "-C", str(self.origin), "rm", "-q", "crates/cagents-dictate/Cargo.toml")
+        earlier = self.commit("before the dictation helper")
+        self.now += 120
+        self.tick()
+        self.assertEqual([entry[1] for entry in self.recorded() if entry[0] == earlier],
+                         ["cli", "host", "ui", "app", "browser"])
 
     def test_failure_is_reported_and_closed_issue_reopened_then_recovery_reported(self):
         self.tick()

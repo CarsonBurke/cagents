@@ -45,6 +45,7 @@ dependencies and compiles. Run tasks from anywhere in the checkout.
 | `dev:browser` | Run the development UI with the embedded browser |
 | `check:cli`, `check:host`, `check:ui`, `check:browser` | Type-check and lint one [lane](#feature-boundaries), all targets by default |
 | `check:editor` | Type-check and lint ceditor |
+| `check:dictate`, `test:dictate` | Type-check and lint, or test, the [dictation helper](#feature-boundaries) |
 | `check` | `check:cli`, `check:host` and `check:ui`, each admitted to the build host on its own |
 | `check:protocol` | The [IPC source contract](#testing) and its companion checks, against the merge base with `origin/main` or `--base REF` |
 | `test:cli`, `test:host`, `test:ui` | Test one lane, all targets by default |
@@ -83,7 +84,7 @@ combines the `host` and `ui` features, and none is cached by mise: Cargo decides
 what is stale, and a native run is never a build artifact.
 
 The lane tasks (`check:cli`, `check:host`, `check:ui`, `check:browser`,
-`check:editor` and the three `test:*` lanes) run the gate through
+`check:editor`, `check:dictate`, the three `test:*` lanes and `test:dictate`) run the gate through
 `scripts/cargo-lane`, which holds the workspace's crates to the rule [main's
 build check](#watching-main-after-merges) applies: a warning from one fails the
 task. It reads Cargo's JSON messages, which the gate relays from the build host,
@@ -133,7 +134,15 @@ sudo apt-get install --yes --no-install-recommends \
   libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
   libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
   libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
+
+# The dictation helper's microphone capture:
+sudo apt-get install --yes --no-install-recommends libasound2-dev
 ```
+
+The dictation helper links sherpa-onnx statically. Its build script downloads
+the prebuilt library from the sherpa-onnx release the crate pins, so the first
+build of `check:dictate` needs network access; set `SHERPA_ONNX_ARCHIVE_DIR` to
+a directory holding that archive to build without it.
 
 Install [rustup](https://rustup.rs/); `mise run setup` below installs the Rust
 toolchain `rust-toolchain.toml` pins, which rustup then selects in the checkout.
@@ -189,7 +198,21 @@ mise run check:browser
 
 # Standalone editor: separate package using the browserless UI graph.
 mise run check:editor
+
+# Dictation helper: speech recognition and microphone capture, no UI graph.
+mise run check:dictate
 ```
+
+The dictation helper, `crates/cagents-dictate`, is a separate executable the UI
+starts when someone dictates and stops when they have finished. Its `engine`
+feature brings in sherpa-onnx, ONNX Runtime and audio capture; without it the
+package is only the line protocol and model catalog, which the UI shares
+without compiling any of that. `cagents-dictate transcribe FILE` runs a WAV
+file through the same pipeline a session uses and reports its speed; with
+`CAGENTS_DICTATION_INPUT=wav:/absolute/path.wav` a session hears that file in
+place of the microphone. Models are downloaded on request into
+`$XDG_DATA_HOME/cagents-speech-models`, shared by every instance, or into
+`CAGENTS_DICTATION_MODELS`; `fixtures/dictation` has a recording to try.
 
 Without arguments, `check:cli`, `check:host`, `check:ui` and `check:browser`
 check all targets, tests included, and `check` runs the first three: what a
