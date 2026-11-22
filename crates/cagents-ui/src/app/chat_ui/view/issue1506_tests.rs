@@ -2431,7 +2431,7 @@ fn diagnostic_preview_widget_and_catalog_share_bounded_text_but_copy_keeps_full_
         let (start, end) = catalog.endpoints().unwrap();
         assert_eq!(catalog.copy(start, end).as_deref(), Some(preview.as_str()));
         let incident = &live.failure_ui.incidents[0];
-        let mut element = selection::transcript_virtualized(
+        let mut element = selection::transcript_catalogued(
             live.failure_view(incident),
             target,
             None,

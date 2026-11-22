@@ -149,7 +149,7 @@ fn in_place_resume_keeps_one_frozen_projection_without_old_source_owners() {
                     assert!(state.warm_stamp().is_none());
                     assert!(state.cache.is_empty());
                     assert!(state.child_cache.is_empty());
-                    assert!(state.selection_document.borrow().is_none());
+                    assert!(state.selection_document.borrow().is_empty());
                     assert!(state.failure_ui.incidents.is_empty());
                     assert!(state.history.is_empty());
                     assert!(state.history_images.is_empty());
@@ -419,7 +419,7 @@ fn the_warm_budget_cools_frozen_resume_rendering_without_losing_the_source() {
             );
             assert!(state.cache.is_empty());
             assert!(state.child_cache.is_empty());
-            assert!(state.selection_document.borrow().is_none());
+            assert!(state.selection_document.borrow().is_empty());
             assert!(state.failure_ui.incidents.is_empty());
             assert!(state.history.is_empty());
             assert!(state.history_images.is_empty());
@@ -678,7 +678,7 @@ fn reconnect_before_the_disconnect_wake_releases_only_the_retired_raw_source() {
             assert!(state.warm_stamp().is_none());
             assert!(state.cache.is_empty());
             assert!(state.child_cache.is_empty());
-            assert!(state.selection_document.borrow().is_none());
+            assert!(state.selection_document.borrow().is_empty());
             assert_source(&app);
             let state = app.chat_runtime_mut(target).unwrap();
             state.set_visible(true).unwrap();

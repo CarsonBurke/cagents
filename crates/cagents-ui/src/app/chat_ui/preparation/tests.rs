@@ -3812,7 +3812,7 @@ fn pending_status_is_not_copied_and_unrelated_selection_survives_ready() {
         keys: &[&str],
     ) {
         let (catalog, bookmark) = runtime.selection_document();
-        let mut element = selection::transcript_virtualized(
+        let mut element = selection::transcript_catalogued(
             runtime.find_turn_view_for_test(),
             runtime.target,
             None,
