@@ -161,7 +161,10 @@ impl Cagents {
                             if shares_conversation(&stopping.session, session))
                 })
                 .map(|state| state.id)
-                .filter(|card| self.awaits_attachment(*card))
+                .filter(|card| {
+                    self.awaits_attachment(*card)
+                        || (*card == stopping.card && self.chat_awaiting_admission(*card))
+                })
                 .collect();
             if stopping.refused.is_some() {
                 self.chat_ui.close_refused.insert(id);
@@ -274,6 +277,16 @@ impl Cagents {
                 tasks.push(self.reopen_once_stopped(card, still_running));
                 continue;
             }
+            // The closed pane itself, restored at launch from its view and
+            // showing saved text until the view admits it: it goes now if
+            // its conversation stopped; otherwise its admission puts it back
+            // on what still runs, as any pane a view shows is.
+            if card == closing.card && self.chat_awaiting_admission(card) {
+                if goes {
+                    tasks.push(self.take_away_returned_close(card, &closing.session));
+                }
+                continue;
+            }
             if !self.awaits_attachment(card) {
                 continue;
             }
@@ -297,12 +310,7 @@ impl Cagents {
                 // kept it, goes as it was asked to now that nothing runs. A
                 // pane outside the strip shown now goes once its strip is.
                 None if card == closing.card => {
-                    if self.workspace.order().any(|placed| placed == card) {
-                        self.take_away_stopped_return(card)
-                    } else {
-                        self.remove_when_placed(card, &closing.session);
-                        Task::none()
-                    }
+                    self.take_away_returned_close(card, &closing.session)
                 }
                 None => match self.chat_return_session(card) {
                     Some(session) => self.open_chat(card, session, chat::Intent::Restore),
@@ -318,7 +326,7 @@ impl Cagents {
     /// the stop to settle.
     fn returned_with(&self, closing: &Closing) -> bool {
         closing.reopens.contains(&closing.card)
-            && self.awaits_attachment(closing.card)
+            && (self.awaits_attachment(closing.card) || self.chat_awaiting_admission(closing.card))
             && self
                 .chat_return_session(closing.card)
                 .is_some_and(|session| shares_conversation(&session, &closing.session))
@@ -500,18 +508,40 @@ impl Cagents {
         self.persist();
     }
 
-    /// Takes away a closed pane a shared view brought back after its
-    /// conversation stopped.
-    fn take_away_stopped_return(&mut self, card: CardId) -> Task<Message> {
-        self.chat_ui.stopped_returns.remove(&card);
-        self.chat_ui.hidden_returns.remove(&card);
-        let open = self
-            .card_state(card)
-            .is_some_and(|state| state.existence.is_open());
-        if !open {
-            return Task::none();
+    /// Takes away the closed pane `card` a shared view put back, its
+    /// conversation `session` having stopped: now if the strip shows it, or
+    /// once its strip is shown.
+    fn take_away_returned_close(&mut self, card: CardId, session: &chat::Session) -> Task<Message> {
+        if self.workspace.order().any(|placed| placed == card) {
+            self.take_away_stopped_return(card)
+        } else {
+            self.remove_when_placed(card, session);
+            Task::none()
         }
-        self.remove_chat_card(card, None).unwrap_or_else(Task::none)
+    }
+
+    /// Takes away a closed pane a shared view brought back after its
+    /// conversation stopped. One whose removal waits its turn, or is turned
+    /// away, stays out of sight and is tried again when its strip is next
+    /// shown.
+    fn take_away_stopped_return(&mut self, card: CardId) -> Task<Message> {
+        let open = |app: &Self| {
+            app.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        };
+        let task = if open(self) {
+            self.remove_chat_card(card, None)
+        } else {
+            None
+        };
+        if !open(self) {
+            self.chat_ui.stopped_returns.remove(&card);
+            self.chat_ui.hidden_returns.remove(&card);
+        } else {
+            self.chat_ui.stopped_returns.insert(card);
+            self.chat_ui.hidden_returns.insert(card);
+        }
+        task.unwrap_or_else(Task::none)
     }
 
     /// Forgets the stop saved for the closed pane `card` once the pane is
@@ -542,10 +572,45 @@ impl Cagents {
         self.persist();
     }
 
+    /// Forgets each stop saved only for a closed pane that has since gone by
+    /// some other route, as another window closing it, or its worktree's
+    /// removal: nothing is left for the next launch to take away.
+    fn forget_stops_of_gone_returns(&mut self) {
+        let gone = |app: &Self, card: CardId| {
+            !app.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        };
+        let cards = self
+            .chat_ui
+            .stopped_returns
+            .iter()
+            .copied()
+            .filter(|card| gone(self, *card))
+            .collect::<Vec<_>>();
+        for card in &cards {
+            self.chat_ui.stopped_returns.remove(card);
+        }
+        let settled = self
+            .durable
+            .stopping_chats
+            .iter()
+            .filter(|stopping| {
+                stopping.refused.is_none()
+                    && self.heard_stopped(stopping.session.id)
+                    && gone(self, stopping.card)
+            })
+            .map(|stopping| stopping.card)
+            .collect::<Vec<_>>();
+        for card in settled {
+            self.forget_stop_of_removed(card);
+        }
+    }
+
     /// Keeps out of sight each closed pane a shared view put back while its
     /// conversation stops, once the strip holds it, and brings back into
     /// sight one its close no longer holds.
     pub(in crate::app) fn hide_returned_closes(&mut self) -> Task<Message> {
+        self.forget_stops_of_gone_returns();
         let held = self
             .chat_ui
             .background_closes

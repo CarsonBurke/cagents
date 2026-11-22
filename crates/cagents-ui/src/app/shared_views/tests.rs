@@ -8296,7 +8296,15 @@ fn closed_chat_its_view_kept() -> (Cagents, Pane, super::super::chat_ui::Target)
 /// The next launch, from what `app` saved: a closed pane its view kept,
 /// whose stop is still saved, stays out of sight while the launch asks again
 /// and goes once the daemon answers, rather than coming back as a chat.
+/// Restored from its view, the pane shows its saved text until the view
+/// admits it, and goes the same, whether or not the view has admitted it.
 fn next_launch_takes_away(app: &mut Cagents, pane: &Pane) {
+    for from_view in [false, true] {
+        next_launch_takes_away_as(app, pane, from_view);
+    }
+}
+
+fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
     let mut next = crate::app::tests::context_inspector_test_app(false);
     next.durable = app.persistent_workspace();
     next.workspace = Cagents::rebuild_workspace(&next.durable);
@@ -8309,8 +8317,16 @@ fn next_launch_takes_away(app: &mut Cagents, pane: &Pane) {
         panic!("a chat pane");
     };
     assert!(next.awaits_stop(&session), "it does not attach at launch");
+    if from_view {
+        // As the launch restores a pane its view holds.
+        next.await_shared_chat_admission(pane.id, session.clone());
+        assert!(next.chat_awaiting_admission(pane.id));
+    }
     drop(next.resume_stopping_chats());
-    assert!(next.workspace.is_hidden(pane.id), "it stays out of sight");
+    assert!(
+        next.workspace.is_hidden(pane.id),
+        "from_view={from_view}: it stays out of sight"
+    );
     assert!(next.closes_out_of_sight(pane.id));
     let target = next
         .background_close_for_test(pane.id)
@@ -8325,10 +8341,13 @@ fn next_launch_takes_away(app: &mut Cagents, pane: &Pane) {
         !next
             .card_state(pane.id)
             .is_some_and(|state| state.existence.is_open()),
-        "it goes"
+        "from_view={from_view}: it goes"
     );
     assert!(!next.chat_start_pending(pane.id));
-    assert!(next.durable.stopping_chats.is_empty());
+    assert!(
+        next.durable.stopping_chats.is_empty(),
+        "from_view={from_view}: nothing is left for a later launch"
+    );
     assert!(!next.has_close_failure_notices());
 }
 
