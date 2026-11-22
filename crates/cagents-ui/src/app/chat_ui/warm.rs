@@ -610,10 +610,6 @@ mod tests {
                 _: Rectangle,
                 state: &mut dyn std::any::Any,
             ) {
-                // Only messages laid out, not their placeholders' bounds.
-                if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
-                    policy.visit = false;
-                }
             }
             fn scrollable(
                 &mut self,

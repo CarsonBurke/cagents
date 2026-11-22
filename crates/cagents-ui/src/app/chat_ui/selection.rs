@@ -779,10 +779,6 @@ impl Operation for Read {
     }
 
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn Any) {
-        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
-            policy.visit = false;
-            return;
-        }
         if let Some(enter) = state.downcast_ref::<boundary::Enter>() {
             if let Kind::Table { columns, rows } = &enter.kind {
                 self.table_order.push(enter.identity);
@@ -957,11 +953,7 @@ struct DragScroll {
     bottom_id: Option<Id>,
 }
 impl Operation for DragScroll {
-    fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
-        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
-            policy.visit = false;
-        }
-    }
+    fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {}
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         if !self.visited {
             visit(self);
@@ -1025,10 +1017,6 @@ impl Operation for Apply<'_> {
         operate(self);
     }
     fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn Any) {
-        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
-            policy.visit = false;
-            return;
-        }
         if let Some(invalidation) = state.downcast_mut::<retained::LayoutInvalidation>() {
             match invalidation {
                 retained::LayoutInvalidation::Enter => self.exchanges.push(self.changed),

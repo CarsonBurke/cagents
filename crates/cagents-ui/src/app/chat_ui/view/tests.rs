@@ -2553,9 +2553,6 @@ fn selected_child_find_navigation_resolves_real_scoped_widget_anchors() {
                 _: iced::Rectangle,
                 state: &mut dyn std::any::Any,
             ) {
-                if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
-                    policy.visit = false;
-                }
             }
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);

@@ -611,6 +611,10 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
         }
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.include(self.item.clone());
+            return;
+        }
         if let Some(marker) = state.downcast_ref::<FindCorrection>() {
             self.scope.authorize(marker.target, self.target);
             return;
@@ -868,6 +872,10 @@ pub(super) fn find_anchor(
             }
         }
         fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                policy.include(self.anchor.clone());
+                return;
+            }
             if let Some(marker) = state.downcast_ref::<FindCorrection>() {
                 self.scope.authorize(marker.target, self.target);
             }
@@ -923,21 +931,22 @@ pub(super) fn find_anchor(
 }
 
 /// Row bounds for anchoring, and which of them only a placeholder reported.
-struct ItemBounds<'a> {
-    ids: std::collections::HashMap<Id, Vec<&'a str>>,
-    rows: std::collections::HashMap<&'a str, Rectangle>,
+struct ItemBounds<'item, 'pass> {
+    ids: &'pass std::collections::HashMap<Id, Vec<&'item str>>,
+    requested: &'pass HashSet<Id>,
+    rows: std::collections::HashMap<&'item str, Rectangle>,
     wanted: HashSet<u64>,
     /// Each fine-grained anchor, and whether its row is mounted.
     virtual_rows: Vec<(String, Rectangle, bool)>,
     /// Items whose bounds came from a virtual column's placeholder rather
     /// than their laid-out widget: an unmounted row's estimate, or the whole
     /// virtual row for each item it aliases.
-    placeholders: HashSet<&'a str>,
+    placeholders: HashSet<&'item str>,
     /// A virtual column reports its placeholder aliases between its
     /// [`virtualized::PlaceholderPolicy`] and its traversal of mounted rows.
     in_placeholders: bool,
 }
-impl Operation for ItemBounds<'_> {
+impl Operation for ItemBounds<'_, '_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         self.in_placeholders = false;
         visit(self);
@@ -945,9 +954,12 @@ impl Operation for ItemBounds<'_> {
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
         if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
-            // Restoring a reader's position compares rows across layouts, so
-            // it is the one operation that needs every offscreen alias.
-            policy.visit = true;
+            // Restoration needs only the previous reading window. Asking the
+            // column for those aliases keeps a multi-pass relayout bounded by
+            // the saved viewport instead of the whole history page.
+            for id in self.requested {
+                policy.include(id.clone());
+            }
             self.in_placeholders = true;
             return;
         }
@@ -1803,6 +1815,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             );
         }
         let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
+        // `Anchored::layout` can make four settling passes. Build the full
+        // descriptor lookup once, then each pass asks the virtual column only
+        // for aliases from the saved reading window.
+        let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
+        let mut item_aliases: std::collections::HashMap<&str, Vec<Id>> = Default::default();
+        for (id, item) in &self.items {
+            ids.entry(id.clone()).or_default().push(item);
+            item_aliases.entry(*item).or_default().push(id.clone());
+        }
         const PASSES: usize = 4;
         let mut settle = false;
         for pass in 0..PASSES {
@@ -1820,10 +1841,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         .map(|child| (*id, child.bounds()))
                 })
                 .collect();
-            let mut ids: std::collections::HashMap<Id, Vec<&str>> = Default::default();
-            for (id, item) in &self.items {
-                ids.entry(id.clone()).or_default().push(item);
-            }
+            let requested = anchor
+                .active
+                .into_iter()
+                .flat_map(|index| anchor.contexts[index].rows.iter())
+                .flat_map(|row| item_aliases.get(row.id.as_str()).into_iter().flatten())
+                .cloned()
+                .collect();
             let wanted = anchor
                 .active
                 .into_iter()
@@ -1835,7 +1859,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 })
                 .collect();
             let mut measured = ItemBounds {
-                ids,
+                ids: &ids,
+                requested: &requested,
                 rows: Default::default(),
                 wanted,
                 virtual_rows: vec![],

@@ -3060,6 +3060,188 @@ fn logical_find_realizes_a_distant_chunk_and_centers_its_mounted_glyph() {
 }
 
 #[test]
+fn find_operations_reach_an_unmounted_virtual_item() {
+    use iced::futures::StreamExt;
+
+    let renderer = crate::app::tests::headless_renderer();
+    let target = Target {
+        card: CardId::new(),
+        generation: 0,
+    };
+    let anchor = item_id("first");
+    let column = virtualized::column(
+        (0..1_000)
+            .map(|key| {
+                let anchor = anchor.clone();
+                virtualized::Row::new(key, 0, 40.0, (key == 0).then_some(anchor), move || {
+                    if key == 0 {
+                        item("first", widget::Space::new().height(40))
+                    } else {
+                        widget::Space::new().height(40).into()
+                    }
+                })
+            })
+            .collect(),
+        Default::default(),
+    );
+    let mut element = transcript_observed(
+        column,
+        target,
+        None,
+        vec![],
+        true,
+        vec![(anchor.clone(), "first")],
+        Observations::default(),
+        Memory::default(),
+        false,
+        HashSet::new(),
+        None,
+        History::default(),
+    );
+    let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 400.0));
+    let mut tree = Tree::new(&element);
+    let mut node = element
+        .as_widget_mut()
+        .layout(&mut tree, &renderer, &limits);
+    element.as_widget_mut().operate(
+        &mut tree,
+        Layout::new(&node),
+        &renderer,
+        &mut SetBottom(0.0),
+    );
+    node = element
+        .as_widget_mut()
+        .layout(&mut tree, &renderer, &limits);
+
+    let navigation = find_navigation::State::default();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut task =
+        iced::runtime::task::into_stream(find_anchor(target, anchor.clone(), navigation.guard()))
+            .unwrap();
+    let effect = executor.block_on(async { task.next().await.unwrap() });
+    let iced::runtime::Action::Widget(mut coarse) = effect else {
+        panic!("Find must produce its coarse anchor operation");
+    };
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, coarse.as_mut());
+    assert!(
+        matches!(coarse.finish(), operation::Outcome::Chain(_)),
+        "the first, unmounted virtual row supplies a coarse Find anchor"
+    );
+
+    let mut logical = LocateLogical {
+        target,
+        scroll: card_control_id(target.card, "chat-transcript"),
+        item: anchor,
+        identity: 0,
+        byte: 0,
+        content: None,
+        viewport: None,
+        found: None,
+        frames: Vec::new(),
+        pending: None,
+        horizontal: Vec::new(),
+        shape_pending: None,
+        scope: TranscriptScope::default(),
+    };
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut logical);
+    assert!(
+        matches!(logical.finish(), operation::Outcome::Some(Some(_))),
+        "the same unmounted row supplies LocateLogical's fallback bounds"
+    );
+    executor.shutdown_background();
+}
+
+/// Measures the reader path that runs on a resize or ordinary relayout, with
+/// a transcript long enough that enumerating every alias is visible in the
+/// result. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn anchored_layout_cost_for_ten_thousand_history_rows() {
+    const ROWS: usize = 10_000;
+    const PASSES: usize = 30;
+
+    let renderer = crate::app::tests::headless_renderer();
+    let target = Target {
+        card: CardId::new(),
+        generation: 0,
+    };
+    let entries: Vec<_> = (0..ROWS)
+        .map(|index| {
+            let name = Box::leak(format!("history-{index}").into_boxed_str()) as &str;
+            (item_id(name), name)
+        })
+        .collect();
+    let column = virtualized::column(
+        entries
+            .iter()
+            .enumerate()
+            .map(|(index, (id, name))| {
+                let id = id.clone();
+                virtualized::Row::new(index as u64, 0, 40.0, Some(id), move || {
+                    item(name, widget::Space::new().height(40))
+                })
+            })
+            .collect(),
+        Default::default(),
+    );
+    let mut element = transcript_observed(
+        column,
+        target,
+        None,
+        vec![],
+        true,
+        entries.clone(),
+        Observations::default(),
+        Memory::default(),
+        false,
+        HashSet::new(),
+        None,
+        History::default(),
+    );
+    let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, 600.0));
+    let mut tree = Tree::new(&element);
+    let mut node = element
+        .as_widget_mut()
+        .layout(&mut tree, &renderer, &limits);
+    element.as_widget_mut().operate(
+        &mut tree,
+        Layout::new(&node),
+        &renderer,
+        &mut SetBottom(0.0),
+    );
+    node = element
+        .as_widget_mut()
+        .layout(&mut tree, &renderer, &limits);
+    // The warmup records the current reading window. The measured passes use
+    // that small cache, just as a normal resize does.
+    let _ = node;
+    virtualized::reset_placeholder_reports();
+    let started = std::time::Instant::now();
+    for _ in 0..PASSES {
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+    }
+    let elapsed = started.elapsed();
+    let aliases = virtualized::placeholder_reports();
+    println!(
+        "Anchored layout: {ROWS} rows, {PASSES} passes, {aliases} placeholder aliases, {:.3} ms/pass",
+        elapsed.as_secs_f64() * 1e3 / PASSES as f64,
+    );
+    assert!(
+        aliases < PASSES * 100,
+        "a cached reader window, not all {ROWS} history aliases, is queried each pass"
+    );
+}
+
+#[test]
 fn native_geometry_updates_the_reader_without_echoing_a_model_message() {
     let renderer = crate::app::tests::headless_renderer();
     let observations: Observations = Default::default();

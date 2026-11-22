@@ -14,8 +14,18 @@ const OVERSCAN: f32 = 600.0;
 #[cfg(test)]
 thread_local! { static CONSTRUCTED: Cell<usize> = const { Cell::new(0) }; }
 #[cfg(test)]
+thread_local! { static PLACEHOLDER_REPORTS: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
 pub(super) fn constructed_rows() -> usize {
     CONSTRUCTED.with(Cell::get)
+}
+#[cfg(test)]
+pub(super) fn reset_placeholder_reports() {
+    PLACEHOLDER_REPORTS.with(|count| count.set(0));
+}
+#[cfg(test)]
+pub(super) fn placeholder_reports() -> usize {
+    PLACEHOLDER_REPORTS.with(Cell::get)
 }
 
 static NEXT_COLUMN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -28,11 +38,23 @@ pub(super) struct Viewport {
 }
 pub(super) type Window = Rc<Cell<Option<Viewport>>>;
 
-/// Offscreen aliases are expensive in a long transcript. Operations enumerate
-/// them only when they explicitly need history-anchor geometry; pointer,
-/// scroll and layout bookkeeping never do.
+/// Offscreen aliases are expensive in a long transcript. Operations name the
+/// aliases whose geometry they need; pointer, scroll and layout bookkeeping
+/// never enumerate them.
+#[derive(Default)]
 pub(super) struct PlaceholderPolicy {
-    pub visit: bool,
+    ids: std::collections::HashSet<Id>,
+    all: bool,
+}
+impl PlaceholderPolicy {
+    pub(super) fn include(&mut self, id: Id) {
+        self.ids.insert(id);
+    }
+
+    #[cfg(test)]
+    fn include_all(&mut self) {
+        self.all = true;
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -303,7 +325,7 @@ struct State {
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
     logical: HashMap<u64, Vec<(std::ops::Range<usize>, usize, bool)>>,
-    aliased: Vec<usize>,
+    aliases: HashMap<Id, Vec<usize>>,
 }
 
 /// Mutable measured heights with logarithmic corrections and prefix lookup.
@@ -463,12 +485,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 .filter(|row| row.anchor)
                 .map(|row| row.key)
                 .collect();
-            state.aliased = self
-                .rows
-                .iter()
-                .enumerate()
-                .filter_map(|(index, row)| (!row.aliases.is_empty()).then_some(index))
-                .collect();
+            state.aliases.clear();
+            for (index, row) in self.rows.iter().enumerate() {
+                for id in &row.aliases {
+                    state.aliases.entry(id.clone()).or_default().push(index);
+                }
+            }
             state.logical.clear();
             for (index, row) in self.rows.iter().enumerate() {
                 for logical in row.logical.iter().cloned().chain(row.descendants.iter()) {
@@ -632,34 +654,42 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
     ) {
         let state = tree.state.downcast_mut::<State>();
         operation.custom(None, layout.bounds(), state);
-        // Placeholder bounds make unloaded items addressable by find/history
-        // anchoring without constructing their text or widget trees.
-        // Most operations only need the mounted tree. A history-restoration
-        // operation opts in from its `custom` callback below; that keeps the
-        // steady wheel/resize path proportional to the mounted window rather
-        // than every alias in a loaded history page.
-        let mut placeholders = PlaceholderPolicy { visit: false };
+        // Placeholder bounds make unloaded items addressable without
+        // constructing their text or widget trees. The operation names the
+        // aliases it needs, so this remains proportional to its saved reading
+        // window rather than every alias in a loaded history page.
+        let mut placeholders = PlaceholderPolicy::default();
         operation.custom(None, layout.bounds(), &mut placeholders);
-        if placeholders.visit {
-            for &index in &state.aliased {
-                let row = &self.rows[index];
-                for id in &row.aliases {
-                    let start = state.offsets.prefix(index);
-                    let size = self.axis.size(
-                        state.offsets.values[index],
-                        self.axis.cross(layout.bounds().size()),
-                    );
-                    operation.container(
-                        Some(id),
-                        Rectangle::new(
-                            layout.bounds().position()
-                                + match self.axis {
-                                    Axis::Vertical => Vector::new(0.0, start),
-                                    Axis::Horizontal => Vector::new(start, 0.0),
-                                },
-                            size,
-                        ),
-                    );
+        let mut report = |id: &Id, indexes: &[usize]| {
+            for &index in indexes {
+                let start = state.offsets.prefix(index);
+                let size = self.axis.size(
+                    state.offsets.values[index],
+                    self.axis.cross(layout.bounds().size()),
+                );
+                operation.container(
+                    Some(id),
+                    Rectangle::new(
+                        layout.bounds().position()
+                            + match self.axis {
+                                Axis::Vertical => Vector::new(0.0, start),
+                                Axis::Horizontal => Vector::new(start, 0.0),
+                            },
+                        size,
+                    ),
+                );
+                #[cfg(test)]
+                PLACEHOLDER_REPORTS.with(|count| count.set(count.get() + 1));
+            }
+        };
+        if placeholders.all {
+            for (id, indexes) in &state.aliases {
+                report(id, indexes);
+            }
+        } else {
+            for id in &placeholders.ids {
+                if let Some((id, indexes)) = state.aliases.get_key_value(id) {
+                    report(id, indexes);
                 }
             }
         }
@@ -981,10 +1011,6 @@ impl Operation for UpdateViewport {
         self.pending = Some((bounds, translation));
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
-            policy.visit = false;
-            return;
-        }
         if let Some(invalidation) = state.downcast_mut::<retained::LayoutInvalidation>() {
             match invalidation {
                 retained::LayoutInvalidation::Enter => self.exchanges.push(self.touches),
@@ -1197,9 +1223,6 @@ mod tests {
                 visit(self);
             }
             fn custom(&mut self, _: Option<&Id>, _: Rectangle, value: &mut dyn std::any::Any) {
-                if let Some(policy) = value.downcast_mut::<PlaceholderPolicy>() {
-                    policy.visit = false;
-                }
                 if let Some(state) = value.downcast_ref::<State>() {
                     self.0 = Some((
                         state.realized.clone(),
@@ -1318,7 +1341,7 @@ mod tests {
             }
             fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
                 if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
-                    policy.visit = true;
+                    policy.include_all();
                 }
             }
             fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -1406,7 +1429,7 @@ mod tests {
             }
             fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
                 if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
-                    policy.visit = true;
+                    policy.include_all();
                 }
             }
             fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -1473,20 +1496,20 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_aliases_are_explicitly_opted_into() {
+    fn offscreen_aliases_are_selected_by_id() {
         struct Count {
             aliases: usize,
-            need_aliases: bool,
+            requested: Option<Id>,
         }
         impl Operation for Count {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
             fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
-                if self.need_aliases
+                if let Some(id) = &self.requested
                     && let Some(policy) = state.downcast_mut::<PlaceholderPolicy>()
                 {
-                    policy.visit = true;
+                    policy.include(id.clone());
                 }
             }
             fn container(&mut self, _: Option<&Id>, _: Rectangle) {
@@ -1519,7 +1542,7 @@ mod tests {
 
         let mut ordinary = Count {
             aliases: 0,
-            need_aliases: false,
+            requested: None,
         };
         element
             .as_widget_mut()
@@ -1531,12 +1554,12 @@ mod tests {
 
         let mut anchored = Count {
             aliases: 0,
-            need_aliases: true,
+            requested: Some(Id::from("row-7654")),
         };
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut anchored);
-        assert_eq!(anchored.aliases, ROWS as usize);
+        assert_eq!(anchored.aliases, 1);
     }
 
     /// Records the UI-thread cost of an operation over a long transcript.
