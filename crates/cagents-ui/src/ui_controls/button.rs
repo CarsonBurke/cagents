@@ -616,7 +616,7 @@ mod tests {
         // The button, its glyph and its label.
         let laid_out = |button: Button<'static, ()>| {
             let mut element: Element<'_, ()> = button
-                .icon(widget::icon::from_name("pan-down-symbolic"))
+                .icon(crate::ui_controls::Icon::ChevronDown)
                 .on_press(())
                 .into();
             let mut tree = Tree::new(element.as_widget());
