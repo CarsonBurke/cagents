@@ -6,6 +6,8 @@ use super::{
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
 use crate::daemon::owned_children::DetachedWork;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
@@ -16,7 +18,7 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
