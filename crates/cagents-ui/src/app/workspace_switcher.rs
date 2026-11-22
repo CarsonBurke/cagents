@@ -1364,26 +1364,17 @@ mod tests {
         let main = window::Id::unique();
         app.core.set_main_window_id(Some(main));
         let size = iced::Size::new(2_650.0, 1_530.0);
-        let geometry = |window, size| {
-            window_geometry_message(&window::Event::Resized(size), window)
-                .expect("native geometry event")
-        };
-        drop(app.update(geometry(main, size)));
+        let report =
+            |event, window| window_geometry_message(&event, window).expect("native geometry event");
+        drop(app.update(report(window::Event::Resized(size), main)));
         let popup = window::Id::unique();
         let menu = iced::Size::new(240.0, 72.0);
-        drop(
-            app.update(
-                window_geometry_message(
-                    &window::Event::Opened {
-                        size: menu,
-                        position: None,
-                    },
-                    popup,
-                )
-                .expect("native geometry event"),
-            ),
-        );
-        drop(app.update(geometry(popup, menu)));
+        let opened = window::Event::Opened {
+            size: menu,
+            position: None,
+        };
+        drop(app.update(report(opened, popup)));
+        drop(app.update(report(window::Event::Resized(menu), popup)));
         drop(app.update(Message::WindowScaleFactorChanged(popup, 2.0)));
         assert_eq!(
             (app.window_width, app.window_height),

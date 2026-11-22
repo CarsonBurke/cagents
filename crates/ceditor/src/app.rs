@@ -722,6 +722,14 @@ const QUICK_OPEN_SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
 
 /// Hands one captured preference write to the blocking pool and reports the
 /// outcome on a later frame.
+/// The logical size a surface reports: first as Opened, then as Resized.
+fn window_geometry(event: &window::Event) -> Option<iced::Size> {
+    match event {
+        window::Event::Opened { size, .. } | window::Event::Resized(size) => Some(*size),
+        _ => None,
+    }
+}
+
 fn preference_task(save: PreferenceSave) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || save.run())
@@ -4904,11 +4912,11 @@ impl Application for Editor {
             iced::Event::Window(window::Event::Focused) => {
                 Some(Message::WindowFocused(window, true))
             }
-            iced::Event::Window(
-                window::Event::Opened { size, .. } | window::Event::Resized(size),
-            ) => Some(Message::WindowResized(window, size)),
             iced::Event::Window(window::Event::Unfocused) => {
                 Some(Message::WindowFocused(window, false))
+            }
+            iced::Event::Window(event) => {
+                window_geometry(&event).map(|size| Message::WindowResized(window, size))
             }
             _ => None,
         });
@@ -6996,12 +7004,22 @@ mod tests {
         let main = window::Id::RESERVED;
         app.core.set_main_window_id(Some(main));
         let size = iced::Size::new(1_600.0, 1_000.0);
+        let opened = |size| window::Event::Opened {
+            size,
+            position: None,
+        };
+        // The first size comes as Opened, later ones as Resized.
+        assert_eq!(window_geometry(&opened(size)), Some(size));
+        assert_eq!(window_geometry(&window::Event::Resized(size)), Some(size));
+        assert_eq!(window_geometry(&window::Event::Focused), None);
         drop(app.update(Message::WindowResized(main, size)));
         // A text field's context menu is a popup surface with its own size.
-        drop(app.update(Message::WindowResized(
-            window::Id::unique(),
-            iced::Size::new(240.0, 72.0),
-        )));
+        let popup = window::Id::unique();
+        let menu = iced::Size::new(240.0, 72.0);
+        for event in [opened(menu), window::Event::Resized(menu)] {
+            let size = window_geometry(&event).expect("popup geometry");
+            drop(app.update(Message::WindowResized(popup, size)));
+        }
         assert_eq!(app.window_size, size);
     }
 
