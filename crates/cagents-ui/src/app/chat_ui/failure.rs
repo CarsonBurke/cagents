@@ -1631,6 +1631,8 @@ impl Runtime {
         let target = self.target;
         let open = self.failure_ui.expanded.contains(&incident.key);
         let mut rows = Vec::new();
+        // The notice's heading already marks the failure; a second failure
+        // glyph here would read as another problem.
         rows.push(disclosure::row(
             if open { "Hide details" } else { "Details" }.to_owned(),
             format!(
@@ -1638,8 +1640,8 @@ impl Runtime {
                 if open { "Hide" } else { "Show" },
                 incident.summary
             ),
-            Icon::Error,
-            Some(chat::ToolStatus::Failed),
+            Icon::Info,
+            None,
             None,
             Some(open),
             Some(Action::ToggleFailure(target, incident.key.clone())),

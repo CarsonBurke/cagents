@@ -416,6 +416,15 @@ impl Observation {
 fn error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
 }
+/// A read that failed while the conversation's owner was alive may succeed
+/// when the reader tries again.
+fn read_failure(failure: crate::chat::runtime::ReadFailure) -> ProtocolError {
+    if failure.transient {
+        retryable_unavailable(failure.message)
+    } else {
+        unavailable(failure.message)
+    }
+}
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, false)
 }
@@ -3875,9 +3884,11 @@ pub(super) fn read_presentation(
     }
     let handle = record.handle.clone();
     drop(state);
+    // The owner asks for another read after a failure it may recover from;
+    // until then the reader shows the failure.
     let response = handle
         .presentation_wire(chat_id, after_generation)
-        .map_err(unavailable)?;
+        .map_err(read_failure)?;
     // A close, detach, replacement actor, or visibility change during
     // hydration must not publish data under the old attachment.
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -4363,7 +4374,12 @@ fn process_inner(
                 let page = handle.text_copy(source, *offset).map_err(unavailable)?;
                 return Ok(ServerResponse::ChatTextCopy { chat_id, page });
             }
-            if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
+            // Only the changed files panel's queries go to the cache: asking
+            // the helper about any other command would hold a message or a
+            // stop behind a round trip it could fail. The panel shows a query
+            // that fails; the transcript does not.
+            if command.queries_file_changes() {
+                let reply = handle.file_query(&command).map_err(read_failure)?;
                 return Ok(match reply {
                     crate::chat::FileChangeReply::Files(summary) => {
                         ServerResponse::ChatFileChanges { chat_id, summary }

@@ -3248,6 +3248,10 @@ impl ClientHandle {
                     },
                     ServerMessage::Error(error) => {
                         read_pending = false;
+                        // The failure is this reader's, not the daemon's:
+                        // the next read asks for everything, so an unchanged
+                        // conversation still replaces it.
+                        resync = true;
                         loop {
                             let (base, revision) = publication.capture();
                             let mut snapshot = (*base.snapshot).clone();
@@ -3517,10 +3521,7 @@ impl ClientHandle {
     /// Read immutable cached edit data on this connection's own reply channel.
     /// Call off the UI thread; no watch publication or provider state is mutated.
     pub fn file_changes(&self, command: Command) -> Result<super::FileChangeReply, String> {
-        if !matches!(
-            &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
-        ) {
+        if !command.queries_file_changes() {
             return Err("Expected a file changes cache query".into());
         }
         if !self.inner.alive.load(Ordering::Acquire) {

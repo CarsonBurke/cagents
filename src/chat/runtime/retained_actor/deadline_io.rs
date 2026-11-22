@@ -1,6 +1,7 @@
 //! Absolute-budget framing for every retained actor request. Partial progress
 //! never renews its budget, and nonblocking descriptors keep socket syscalls
 //! finite.
+use crate::chat::failure::actor_transport;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},
@@ -12,7 +13,7 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|left| !left.is_zero())
-        .ok_or_else(|| "Retained actor socket deadline expired".into())
+        .ok_or_else(|| actor_transport::DEADLINE.into())
 }
 fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<(), String> {
     loop {
@@ -36,7 +37,7 @@ fn ready(control: &UnixStream, events: libc::c_short, deadline: Instant) -> Resu
             return Err(error.to_string());
         }
         if event.revents & libc::POLLNVAL != 0 {
-            return Err("Retained actor socket descriptor closed".into());
+            return Err(actor_transport::DESCRIPTOR_CLOSED.into());
         }
         return Ok(());
     }
@@ -50,7 +51,7 @@ fn write_exact_until(
     while !bytes.is_empty() {
         remaining(deadline)?;
         match writer.write(bytes) {
-            Ok(0) => return Err("Retained actor socket stopped accepting data".into()),
+            Ok(0) => return Err(actor_transport::STOPPED_ACCEPTING.into()),
             Ok(count) => bytes = &bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -70,7 +71,7 @@ fn read_exact_until(
     while !bytes.is_empty() {
         remaining(deadline)?;
         match reader.read(bytes) {
-            Ok(0) => return Err("Retained actor response ended early".into()),
+            Ok(0) => return Err(actor_transport::ENDED_EARLY.into()),
             Ok(count) => bytes = &mut bytes[count..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

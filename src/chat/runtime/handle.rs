@@ -9,6 +9,24 @@ use crate::chat::{
 use std::collections::BTreeMap;
 #[derive(Clone)]
 pub struct Handle(Owner);
+/// Why a read of the conversation or its changed files failed.
+#[derive(Debug)]
+pub(crate) struct ReadFailure {
+    pub message: String,
+    /// Whether the conversation's owner was alive when the read failed, so
+    /// reading again can succeed. For the transcript the owner then asks the
+    /// reader to.
+    pub transient: bool,
+}
+impl From<String> for ReadFailure {
+    /// A refusal, which reading again would repeat.
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            transient: false,
+        }
+    }
+}
 #[derive(Clone)]
 enum Owner {
     Local(LocalHandle),
@@ -416,14 +434,17 @@ impl Handle {
             Owner::Remote(remote) => remote.observe_next_update(),
         }
     }
+    /// Answer a changed files query from the cached edit metadata. Only
+    /// [`Command::queries_file_changes`] commands are queries.
     pub(crate) fn file_query(
         &self,
         command: &Command,
-    ) -> Result<Option<chat::FileChangeReply>, String> {
-        match &self.0 {
-            Owner::Local(local) => local.file_query(command),
-            Owner::Remote(remote) => remote.call("file_query", serde_json::json!([command])),
-        }
+    ) -> Result<chat::FileChangeReply, ReadFailure> {
+        let reply = match &self.0 {
+            Owner::Local(local) => local.file_query(command)?,
+            Owner::Remote(remote) => remote.file_query(command)?,
+        };
+        reply.ok_or_else(|| ReadFailure::from("Expected a changed files query".to_string()))
     }
     /// Copy is served by the same Store which published the immutable source.
     pub(crate) fn text_copy(
@@ -525,7 +546,7 @@ impl Handle {
         &self,
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
-    ) -> Result<crate::terminal_ipc::PreparedResponse, String> {
+    ) -> Result<crate::terminal_ipc::PreparedResponse, ReadFailure> {
         match &self.0 {
             Owner::Local(local) => Ok(local
                 .presentation(chat_id, after)

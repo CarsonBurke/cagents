@@ -28,6 +28,7 @@ pub(crate) mod courier_tests;
 mod execution;
 mod handle;
 pub use handle::Handle;
+pub(crate) use handle::ReadFailure;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
