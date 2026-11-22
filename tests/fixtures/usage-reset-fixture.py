@@ -248,7 +248,7 @@ def consume_claude(home, body):
         if item is None or item["resets_left"] == 0:
             return 200, {"result": "already_used", "resets_left": 0, "cleared": []}, False
         if not item.get("usable_now") or item.get("paused"):
-            return 200, {"result": "unavailable"}, False
+            return 200, {"result": "ineligible", "reason": "not_usable"}, False
         item["resets_left"] -= 1
         state["consume_count"] += 1
         for window in item["clears"]:

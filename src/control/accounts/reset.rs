@@ -215,10 +215,15 @@ fn prepare_selection(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopeMatch {
     /// The argument names every limit the reset clears, e.g. `Fable` for a
-    /// Fable-only reset or `Fable + Weekly` for one clearing both.
+    /// Fable-only reset or `Weekly + Fable` for one clearing both.
     Exact,
-    /// The reset also clears limits the argument does not name.
+    /// The reset also clears model allowances the argument does not name,
+    /// as `weekly` names Claude's Weekly reset that also refills Fable.
     Broader,
+    /// The reset also clears an account-wide limit the argument does not
+    /// name. Spending it takes its full label: `Fable` never spends a reset
+    /// that also clears the Weekly limit.
+    Wider,
 }
 
 fn names_scope(name: &str, scope: &ResetScope) -> bool {
@@ -251,17 +256,18 @@ fn scope_match(scope: &str, reset: &UsageReset) -> Option<ScopeMatch> {
     {
         return None;
     }
-    Some(
-        if reset
-            .scopes
-            .iter()
-            .all(|scope| names.iter().any(|name| names_scope(name, scope)))
-        {
-            ScopeMatch::Exact
-        } else {
-            ScopeMatch::Broader
-        },
-    )
+    let mut unnamed = reset
+        .scopes
+        .iter()
+        .filter(|scope| !names.iter().any(|name| names_scope(name, scope)))
+        .peekable();
+    Some(if unnamed.peek().is_none() {
+        ScopeMatch::Exact
+    } else if unnamed.all(|scope| matches!(scope, ResetScope::Model(_))) {
+        ScopeMatch::Broader
+    } else {
+        ScopeMatch::Wider
+    })
 }
 
 fn select_reset<'a>(
@@ -277,9 +283,10 @@ fn select_reset<'a>(
         return resets.iter().find(|reset| reset.id == id && (recovery || reset.is_available(now)))
             .ok_or_else(|| AppError::new("account_reset", "The original reset is no longer listed. Its result remains unconfirmed; do not spend a different reset with this key"));
     }
-    // A scope naming a reset exactly never falls through to a broader one:
-    // `--scope Fable` must not spend a Weekly reset that also clears Fable
-    // because the Fable reset itself cannot be used right now.
+    // A scope naming a reset exactly never falls through to a broader one,
+    // and none falls through to a reset clearing an unnamed account-wide
+    // limit: `--scope Fable` must not spend a Weekly reset that also clears
+    // Fable, whether or not a Fable reset is held.
     let exact = scope.and_then(|scope| {
         resets
             .iter()
@@ -293,7 +300,7 @@ fn select_reset<'a>(
                 && scope.is_none_or(|scope| match scope_match(scope, reset) {
                     Some(ScopeMatch::Exact) => true,
                     Some(ScopeMatch::Broader) => exact.is_none(),
-                    None => false,
+                    Some(ScopeMatch::Wider) | None => false,
                 })
         })
         .collect::<Vec<_>>();
@@ -307,32 +314,40 @@ fn select_reset<'a>(
     }
     match candidates.as_slice() {
         [reset] => Ok(reset),
-        [] => Err(AppError::new(
-            "account_reset",
-            match exact {
-                Some(held) => {
-                    let broader = resets
+        [] => {
+            // Usable resets that clear more than was named, offered by their
+            // full label so spending one is always an explicit choice.
+            let wider = scope
+                .map(|scope| {
+                    resets
                         .iter()
                         .filter(|reset| {
                             reset.is_available(now)
-                                && scope.and_then(|scope| scope_match(scope, reset))
-                                    == Some(ScopeMatch::Broader)
+                                && matches!(
+                                    scope_match(scope, reset),
+                                    Some(ScopeMatch::Broader | ScopeMatch::Wider)
+                                )
                         })
                         .map(|reset| format!("'{}'", reset.label()))
-                        .collect::<Vec<_>>();
-                    let label = held.label();
-                    if broader.is_empty() {
-                        format!("The {label} reset can't be used right now")
-                    } else {
-                        format!(
-                            "The {label} reset can't be used right now. To spend a broader reset instead, choose --scope {}",
-                            broader.join(" or ")
-                        )
-                    }
-                }
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let refusal = match exact {
+                Some(held) => format!("The {} reset can't be used right now", held.label()),
                 None => "No usable reset matches this account and scope".into(),
-            },
-        )),
+            };
+            Err(AppError::new(
+                "account_reset",
+                if wider.is_empty() {
+                    refusal
+                } else {
+                    format!(
+                        "{refusal}. To spend a reset that also clears other limits, choose --scope {}",
+                        wider.join(" or ")
+                    )
+                },
+            ))
+        }
         _ => Err(AppError::new(
             "account_reset",
             format!(
@@ -508,7 +523,7 @@ mod tests {
         let refused = select_reset(&resets, Some("Fable"), None, false, 100).unwrap_err();
         assert_eq!(
             refused.message,
-            "The Fable reset can't be used right now. To spend a broader reset instead, choose --scope 'Weekly + Fable'"
+            "The Fable reset can't be used right now. To spend a reset that also clears other limits, choose --scope 'Weekly + Fable'"
         );
         for exact in ["Weekly + Fable", "fable+weekly"] {
             assert_eq!(
@@ -521,7 +536,24 @@ mod tests {
         let selection = prepare_selection(&resets, Some("weekly"), None, false, 100).unwrap();
         assert_eq!(
             confirmation(&"claude/system".parse().unwrap(), "Plan", &selection, false),
-            "Use a Fable + Weekly reset for Plan (claude/system)? This clears the Fable weekly limit and the Weekly limit now. 1 available; this can’t be undone."
+            "Use a Weekly + Fable reset for Plan (claude/system)? This clears the Weekly limit and the Fable weekly limit now. 1 available; this can’t be undone."
+        );
+        assert_eq!(selection.scope, "Weekly + Fable", "one name everywhere");
+
+        // Without any Fable reset, `--scope Fable` still never spends the
+        // Weekly reset; its full label does.
+        let only_weekly = [weekly_and_fable()];
+        assert_eq!(
+            select_reset(&only_weekly, Some("Fable"), None, false, 100)
+                .unwrap_err()
+                .message,
+            "No usable reset matches this account and scope. To spend a reset that also clears other limits, choose --scope 'Weekly + Fable'"
+        );
+        assert_eq!(
+            select_reset(&only_weekly, Some("weekly"), None, false, 100)
+                .unwrap()
+                .id,
+            "cedar_ember/full-reset-2611"
         );
 
         held_fable.usable = true;

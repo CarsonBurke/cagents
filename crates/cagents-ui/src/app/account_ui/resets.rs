@@ -277,10 +277,7 @@ fn inventory(reset: &UsageReset, now: Millis) -> bool {
 }
 
 fn normalized_scopes(reset: &UsageReset) -> Vec<account::resets::ResetScope> {
-    let mut scopes = reset.scopes.clone();
-    scopes.sort_by_key(account::resets::ResetScope::label);
-    scopes.dedup();
-    scopes
+    account::resets::ordered_scopes(&reset.scopes)
 }
 
 fn scope_count(snapshot: &UsageSnapshot, reset: &UsageReset, now: Millis) -> u64 {
@@ -302,6 +299,8 @@ fn can_offer(snapshot: &UsageSnapshot, state: &State, reset: &UsageReset, now: M
     actionable(snapshot, reset, now) && !state.uncertain.contains_key(&reset.id)
 }
 
+/// The reset offered first: the narrowest one that helps, so a Fable limit
+/// suggests the Fable reset before a Weekly reset that also clears Fable.
 fn next_reset<'a>(
     snapshot: &'a UsageSnapshot,
     state: &State,
@@ -311,7 +310,12 @@ fn next_reset<'a>(
         .resets
         .iter()
         .filter(|reset| can_offer(snapshot, state, reset, now))
-        .min_by(|left, right| reset_order(left, right))
+        .min_by(|left, right| {
+            normalized_scopes(left)
+                .len()
+                .cmp(&normalized_scopes(right).len())
+                .then_with(|| reset_order(left, right))
+        })
 }
 
 struct ScopeChoice {
@@ -2024,6 +2028,38 @@ pub(in crate::app) mod tests {
             .collect();
         assert_eq!(inventory.len(), 1);
         assert!(inventory[0].contains("3 account resets · first expires"));
+    }
+
+    /// Claude's Weekly reset also clears Fable and usually expires first; at
+    /// a Fable limit the narrower Fable reset is still the one offered.
+    #[test]
+    fn a_fable_limit_offers_the_fable_reset_before_a_weekly_one_that_also_clears_it() {
+        let now = now_ms();
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Limited, "", now);
+        snapshot.windows = vec![
+            window(account::WindowKind::Scoped, "weekly_scoped:Fable", 1.0),
+            window(account::WindowKind::Weekly, "weekly_all", 0.5),
+        ];
+        let mut weekly = reset(ResetScope::AccountWeekly);
+        weekly.id = "weekly".into();
+        weekly.scopes.push(ResetScope::Model("Fable".into()));
+        weekly.expires_at = Some(unix_seconds(now) + 100);
+        let mut fable = reset(ResetScope::Model("Fable".into()));
+        fable.id = "fable".into();
+        fable.expires_at = Some(unix_seconds(now) + 1_000);
+        snapshot.resets = vec![weekly.clone(), fable];
+        assert_eq!(
+            next_reset(&snapshot, &State::default(), now).unwrap().id,
+            "fable"
+        );
+        assert_eq!(
+            scope_choices(&snapshot, &State::default(), now)
+                .iter()
+                .map(ScopeChoice::label)
+                .collect::<Vec<_>>(),
+            ["Fable · 2 available", "Weekly + Fable · 2 available"]
+        );
+        assert_eq!(weekly.action_label(), "Use Weekly + Fable reset");
     }
 
     #[test]

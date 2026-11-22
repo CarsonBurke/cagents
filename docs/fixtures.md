@@ -668,7 +668,8 @@ organization. Like Claude's service, it offers reset programs only to Claude
 Code's CLI surface: a usage read whose agent is not `claude-cli/…` gets
 `cedar_ember` and `juniper_tide` as ineligible with `ineligible_reason:
 "surface"` and no grants. Each served grant reports `percent_used` for the
-limits it clears, from the current usage. Its private HOME/runtime lets native-evidence stop identify and
+limits it clears, from the current usage. Its private HOME/runtime lets
+native-evidence stop identify and
 end it with the rest of the task. Start the listener again after restoring a
 seed, since an old port does not identify the new session.
 
@@ -708,7 +709,7 @@ grant clears both Session and Weekly; the Fable grant clears only its model
 window. The selector preserves usage, counts, claims and identity, and rejects
 missing, exhausted, paused or unusable grants. It does not submit a consume.
 As in Claude Code, the next grant is only the suggested one: the service
-accepts a claim for any usable grant and answers `unavailable` for a paused or
+accepts a claim for any usable grant and answers `ineligible` for a paused or
 unusable one.
 
 For Claude plan-label evidence, `usage-reset-scene.sh plan NAME` accepts

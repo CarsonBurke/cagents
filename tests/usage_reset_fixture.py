@@ -152,7 +152,7 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(self.claim("account-fixture", "another-key")[1]["result"], "already_used")
         self.assertEqual(self.read(self.claude)["consume_count"], 1)
 
-    def test_next_grant_selection_preserves_state_and_service_rejects_the_other_scope(self):
+    def test_next_grant_selection_preserves_state_and_leaves_both_grants_claimable(self):
         before = self.read(self.claude)
         server = FIXTURE.server(self.root)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -178,7 +178,19 @@ class UsageResetFixture(unittest.TestCase):
                 selected = next(item for item in program["grants"] if item["id"] == identifier)
                 self.assertEqual(selected["clears"], scopes)
                 self.assertEqual([item["resets_left"] for item in program["grants"]], [2, 1])
-                self.assertIn(other, [item["id"] for item in program["grants"]])
+                other_grant = next(item for item in program["grants"] if item["id"] == other)
+                self.assertTrue(other_grant["usable_now"])
+
+    def test_a_paused_or_unusable_grant_is_refused_without_spending(self):
+        for change in ("paused", "unusable"):
+            with self.subTest(change=change):
+                with FIXTURE.state_file(self.claude) as state:
+                    grant = state["usage"]["rate_limits"]["cedar_ember"]["grants"][1]
+                    grant["paused"] = change == "paused"
+                    grant["usable_now"] = change != "unusable"
+                self.assertEqual(self.claim("account-fixture", f"refused-{change}")[1],
+                                 {"result": "ineligible", "reason": "not_usable"})
+                self.assertEqual(self.read(self.claude)["consume_count"], 0)
 
     def test_next_grant_selection_refuses_invalid_unmarked_or_unavailable_state(self):
         before = self.read(self.claude)

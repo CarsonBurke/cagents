@@ -1814,7 +1814,7 @@ mod reset_tests {
     use serde_json::json;
 
     #[test]
-    fn reset_inventory_keeps_counts_scope_expiry_and_next_grant() {
+    fn reset_inventory_keeps_counts_scope_expiry_and_any_usable_grant() {
         let resets = parse_resets(
             &json!({"cedar_ember": {"eligible":true,"at_limit":true,
             "next_grant_id":"fable", "grants":[
@@ -1907,6 +1907,34 @@ mod reset_tests {
         let mut used = body.clone();
         used["cedar_ember"]["grants"][1]["percent_used"]["seven_day_overage_included"] = json!(40);
         assert!(parse_resets(&used, now as u64)[1].is_available(now));
+    }
+
+    /// Only a reported 0% on every cleared limit holds a grant; anything
+    /// unknown leaves the decision to the explicit, preflighted spend.
+    #[test]
+    fn percent_used_holds_a_grant_only_when_every_cleared_limit_is_unused() {
+        for (percent_used, usable) in [
+            (json!(null), true),
+            (json!("97"), true),
+            (json!({}), true),
+            (json!({"seven_day": 0}), true),
+            (json!({"seven_day": 0, "five_hour": null}), true),
+            (json!({"seven_day": 0, "five_hour": "12"}), true),
+            (json!({"seven_day": 0, "five_hour": 3}), true),
+            (json!({"seven_day": 0, "five_hour": 0}), false),
+            (json!({"seven_day": 0.0, "five_hour": -1}), false),
+        ] {
+            let mut grant = json!({"id":"grant","resets_left":1,"clears":["seven_day","five_hour"],
+                "usable_now":true,"use_requires_limit":false});
+            if !percent_used.is_null() {
+                grant["percent_used"] = percent_used.clone();
+            }
+            let resets = parse_resets(
+                &json!({"cedar_ember":{"eligible":true,"grants":[grant]}}),
+                1,
+            );
+            assert_eq!(resets[0].is_available(1), usable, "{percent_used}");
+        }
     }
 
     #[test]

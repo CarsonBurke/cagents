@@ -75,7 +75,13 @@ cagents account reset codex/system --yes
 The first command asks for confirmation. `--yes` explicitly confirms spending
 one reset. Without a terminal, confirmation requires `--yes`. If several resets
 cover different windows, select the scope rather than accepting an ambiguous
-choice. Spending a reset cannot be undone. Agent-authenticated sessions cannot
+choice. A scope selects a reset that clears what it names, plus at most other
+model allowances: `--scope weekly` selects Claude's Weekly reset, which also
+refills Fable, but `--scope Fable` never spends that Weekly reset. To spend a
+reset that clears more account limits than you named, give its full label,
+such as `--scope 'Weekly + Fable'` or `--scope 'Session + Weekly'`. A Claude
+reset with nothing to refill, such as a Fable reset while Fable is unused, is
+listed as not usable now. Spending a reset cannot be undone. Agent-authenticated sessions cannot
 spend resets.
 
 Each attempt has an idempotency key. If the result is uncertain, cagents reads
