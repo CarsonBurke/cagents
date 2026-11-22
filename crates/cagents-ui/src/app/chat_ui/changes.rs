@@ -977,7 +977,7 @@ mod tests {
             state.patch.is_none(),
             "a patch shown as rows is not also laid out as text"
         );
-        state.patch_view.apply(patch_view::Event::ShowAll);
+        state.patch_view.apply(patch_view::Event::ShowMore);
         state.patch_index = 1;
         state.sync();
         assert_eq!(state.patch_view, patch_view::ViewState::default());
@@ -993,7 +993,7 @@ mod tests {
         let id = state.request(true);
         let reply = page(id, key("src/lib.rs"), "@@ -1 +1 @@\n-old\n+new\n", 0);
         assert!(state.receive(id, Ok(reply)));
-        state.patch_view.apply(patch_view::Event::ShowAll);
+        state.patch_view.apply(patch_view::Event::ShowMore);
         let recoloured = prepare_page(
             state.page().unwrap(),
             crate::settings::EditorSyntaxTheme::default(),

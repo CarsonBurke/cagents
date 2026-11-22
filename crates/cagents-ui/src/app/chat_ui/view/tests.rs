@@ -12199,7 +12199,7 @@ fn a_reported_patch_is_drawn_as_rows_that_fit_and_name_their_controls() {
     runtime
         .changes
         .patch_view
-        .apply(crate::app::chat_ui::patch_view::Event::ShowAll);
+        .apply(crate::app::chat_ui::patch_view::Event::ShowMore);
     let labels = labels(&runtime, 960.0);
     assert!(
         !labels

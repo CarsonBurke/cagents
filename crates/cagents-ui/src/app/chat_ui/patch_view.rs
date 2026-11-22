@@ -15,9 +15,14 @@ use super::*;
 use crate::diff_view::{self, DiffPalette, DiffRowKind, DiffSyntax};
 use std::ops::Range;
 
-/// The rows a patch shows before the reader asks for all of it. A folded run
-/// is one row.
+/// The rows a patch shows before the reader asks for more. A folded run is
+/// one row.
 pub(super) const SHOWN_ROWS: usize = 14;
+/// The lines a patch shows for each time the reader asks for more. Every
+/// drawn line is a widget the window lays out and routes each event
+/// through, so a patch of thousands of lines grows by this much at a time
+/// rather than all at once.
+pub(super) const MORE_LINES: usize = 200;
 /// Below this width a patch keeps one line-number gutter and wraps its lines
 /// under their own text instead of scrolling sideways.
 pub(super) const NARROW_WIDTH: f32 = 480.0;
@@ -521,13 +526,15 @@ impl PatchModel {
     }
 }
 
-/// Which of a patch's folds are open and whether it is shown past its first
-/// rows. A view keeps one per patch it shows, and starts it again for a
+/// Which of a patch's folds are open and how far past its first rows it is
+/// shown. A view keeps one per patch it shows, and starts it again for a
 /// different patch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ViewState {
     unfolded: Vec<usize>,
-    all: bool,
+    /// How many times the reader asked for more: each shows up to
+    /// [`MORE_LINES`] lines in all, and the first opens every fold.
+    more: usize,
 }
 
 /// What a reader asked of a drawn patch.
@@ -535,9 +542,9 @@ pub(super) struct ViewState {
 pub enum Event {
     /// Show the unchanged lines a fold hides, by the fold's index.
     Unfold(usize),
-    /// Show every line: past the first [`SHOWN_ROWS`] rows, with every
-    /// fold open.
-    ShowAll,
+    /// Show more of the patch: past its first [`SHOWN_ROWS`] rows, up to
+    /// another [`MORE_LINES`] lines, with every fold open.
+    ShowMore,
 }
 
 impl ViewState {
@@ -548,12 +555,12 @@ impl ViewState {
                     self.unfolded.push(fold);
                 }
             }
-            Event::ShowAll => self.all = true,
+            Event::ShowMore => self.more += 1,
         }
     }
 
     fn folded(&self, fold: usize) -> bool {
-        !self.all && !self.unfolded.contains(&fold)
+        self.more == 0 && !self.unfolded.contains(&fold)
     }
 }
 
@@ -642,6 +649,18 @@ impl Gutters {
     }
 }
 
+/// The label of the control that shows more of a patch whose first `shown`
+/// of `total` lines are drawn, after the reader asked for more `more` times.
+fn more_label(shown: usize, total: usize, more: usize) -> String {
+    let next = ((more + 1) * MORE_LINES).saturating_sub(shown);
+    let left = total.saturating_sub(shown);
+    if next >= left {
+        format!("Show all {total} lines")
+    } else {
+        format!("Show {next} more lines")
+    }
+}
+
 fn tinted<'a, M: 'a>(
     content: impl Into<Element<'a, M>>,
     background: iced::Color,
@@ -664,7 +683,12 @@ impl PatchModel {
         let mut folds = rows.folds.iter().enumerate().peekable();
         let mut index = 0;
         while index < rows.rows.len() {
-            if !state.all && shown.len() == SHOWN_ROWS {
+            let full = if state.more == 0 {
+                shown.len() == SHOWN_ROWS
+            } else {
+                lines == state.more * MORE_LINES && matches!(rows.rows[index], Row::Line(_))
+            };
+            if full {
                 return (shown, lines, true);
             }
             while folds.next_if(|(_, fold)| fold.end <= index).is_some() {}
@@ -987,8 +1011,8 @@ impl PatchModel {
         if capped {
             parts.push(
                 widget::row::with_children(vec![
-                    widget::button::link(format!("Show all {} lines", rows.lines))
-                        .on_press(on_event(Event::ShowAll))
+                    widget::button::link(more_label(lines, rows.lines, state.more))
+                        .on_press(on_event(Event::ShowMore))
                         .into(),
                     widget::Space::new().width(Length::Fill).into(),
                     design::caption(format!("{lines} of {} lines shown", rows.lines)).into(),
@@ -1256,13 +1280,49 @@ mod tests {
         assert_eq!(shown.len(), SHOWN_ROWS);
         assert_eq!(lines, SHOWN_ROWS);
         assert!(capped);
-        state.apply(Event::ShowAll);
+        assert_eq!(more_label(lines, rows.lines, 0), "Show all 41 lines");
+        state.apply(Event::ShowMore);
         let (_, lines, capped) = patch.shown(rows, &state);
         assert_eq!((lines, capped), (41, false));
-        // Showing all opens the folds that were still closed.
+        // Showing more opens the folds that were still closed.
         let mut state = ViewState::default();
-        state.apply(Event::ShowAll);
+        state.apply(Event::ShowMore);
         let (shown, lines, capped) = patch.shown(rows, &state);
         assert_eq!((shown.len(), lines, capped), (41, 41, false));
+    }
+
+    #[test]
+    fn a_huge_patch_grows_a_step_at_a_time_and_says_by_how_much() {
+        let total = 2 * MORE_LINES + 50;
+        let mut text = format!("@@ -0,0 +1,{total} @@\n");
+        for line in 1..=total {
+            text += &format!("+line {line}\n");
+        }
+        let patch = file(&text);
+        let rows = patch.rows.as_ref().unwrap();
+        let mut state = ViewState::default();
+        let mut steps = Vec::new();
+        loop {
+            let (shown, lines, capped) = patch.shown(rows, &state);
+            assert_eq!(shown.len(), lines, "an added file has only lines");
+            if !capped {
+                steps.push((lines, String::new()));
+                break;
+            }
+            steps.push((lines, more_label(lines, rows.lines, state.more)));
+            state.apply(Event::ShowMore);
+        }
+        assert_eq!(
+            steps,
+            [
+                (
+                    SHOWN_ROWS,
+                    format!("Show {} more lines", MORE_LINES - SHOWN_ROWS)
+                ),
+                (MORE_LINES, format!("Show {MORE_LINES} more lines")),
+                (2 * MORE_LINES, format!("Show all {total} lines")),
+                (total, String::new()),
+            ]
+        );
     }
 }
