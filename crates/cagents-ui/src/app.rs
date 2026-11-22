@@ -19356,6 +19356,14 @@ impl Cagents {
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::TerminalFind(action) => self.handle_terminal_find(action),
             Message::ToggleContextInspector => match self.focused_inspector_pane() {
+                // The shortcut that expanded a rail collapses it again, as
+                // Escape does, rather than closing the inspector for good.
+                Some(card)
+                    if self.pane_inspectors.is_expanded(card)
+                        && self.pane_inspectors.is_open(card) =>
+                {
+                    self.close_pane_inspector_overlay(card)
+                }
                 Some(card) => self.toggle_pane_inspector(card),
                 None => Task::none(),
             },

@@ -96,8 +96,10 @@ impl PaneState {
 
     /// Whether the pane docks the inspector's rail: open, in a pane too
     /// narrow to dock it, whether collapsed or expanded over the content.
+    /// One opened over the content from a closed pane has no rail beneath
+    /// it, so the content keeps its width while it slides in and out.
     fn railed(&self) -> bool {
-        self.open && !self.unavailable && (self.narrowed || self.opened_narrow)
+        self.open && !self.unavailable && (self.narrowed || self.expanded)
     }
 }
 
@@ -840,6 +842,11 @@ impl Cagents {
         if open && !self.pane_has_inspector(card) {
             return Task::none();
         }
+        // A rail is an inspector already open, so opening it expands it
+        // without making the pane's choice, and Escape collapses it again.
+        if open && self.pane_inspectors.is_railed(card) && !self.pane_inspectors.is_open(card) {
+            return self.expand_pane_inspector(card);
+        }
         let closing_overlay =
             !open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay);
         let narrow = self.pane_too_narrow(card);
@@ -870,9 +877,6 @@ impl Cagents {
     /// collapsed for want of room, so toggling it shows the inspector over
     /// the pane rather than closing it.
     pub(super) fn toggle_pane_inspector(&mut self, card: CardId) -> Task<Message> {
-        if self.pane_inspectors.is_railed(card) && !self.pane_inspectors.is_open(card) {
-            return self.expand_pane_inspector(card);
-        }
         let open = !self.pane_inspectors.is_open(card);
         self.set_pane_inspector_open(card, open)
     }
@@ -1946,6 +1950,7 @@ mod tests {
         // Escape's collapse leaves it for closing instead.
         assert!(inspectors.set_open(pane, true, true, None, now));
         assert!(inspectors.is_open(pane) && !inspectors.is_expanded(pane));
+        assert!(!inspectors.is_railed(pane), "no rail beneath it");
         assert!(!inspectors.collapse(pane, None, now));
         assert!(inspectors.is_open(pane));
 
@@ -2335,15 +2340,28 @@ mod tests {
         assert_eq!(app.saved_inspector_choices(), choices);
 
         // The inspector shortcut expands it too, as the rail is an open
-        // inspector.
+        // inspector, and pressed again collapses it as Escape does.
         drop(app.update(Message::ToggleContextInspector));
         app.settle_pane_inspectors();
         assert_eq!(
             app.pane_inspector_layout(card),
             Some(InspectorLayout::Overlay)
         );
+        drop(app.update(Message::ToggleContextInspector));
+        app.settle_pane_inspectors();
+        assert_eq!(app.pane_inspector_layout(card), None);
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.saved_inspector_choices(), choices);
+
+        // A command that reveals a section there expands the rail, and
+        // leaves the pane's choice alone too.
+        drop(app.reveal_context_section(card, context_sections::Section::Problems));
+        app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_expanded(card));
         drop(app.update(Message::ClosePaneInspector(card)));
         app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.saved_inspector_choices(), choices);
 
         // Widening docks the inspector as it was.
         resize(&mut app, wide);
@@ -2366,13 +2384,15 @@ mod tests {
         assert!(mounted_toggle(&app, card, narrow).is_some());
 
         // Opened over the content from closed, Escape closes it again, as
-        // it was: no rail, and still closed once the pane widens.
+        // it was: no rail, and still closed once the pane widens. No rail
+        // lies beneath it either, so the content keeps its width.
         drop(app.update(Message::TogglePaneInspector(card)));
         app.settle_pane_inspectors();
         assert_eq!(
             app.pane_inspector_layout(card),
             Some(InspectorLayout::Overlay)
         );
+        assert!(!app.pane_inspectors.is_railed(card));
         drop(app.update(Message::ClosePaneInspector(card)));
         app.settle_pane_inspectors();
         assert!(!app.pane_inspectors.is_open(card));
