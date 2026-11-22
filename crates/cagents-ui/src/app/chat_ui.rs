@@ -515,14 +515,16 @@ pub enum Action {
     ChangeListScrolled(Target, u64, u64, bool, f32),
     ChangePatches(Target, Option<chat::FilePatchCursor>),
     ChangePatch(Target, usize),
-    /// A fold opened, or the whole patch asked for, in the selected patch.
+    /// A fold opened, or more of the patch asked for, in the selected patch.
     ChangePatchView(Target, patch_view::Event),
-    /// A reply, with a page's patches read for drawing.
+    /// A reply, with a page's patches read for drawing in the syntax theme
+    /// the request was sent in.
     ChangesLoaded(
         Target,
         u64,
         Result<chat::FileChangeReply, String>,
         Arc<[patch_view::PatchModel]>,
+        crate::settings::EditorSyntaxTheme,
     ),
     /// The shown page's patches, coloured again in a changed syntax theme.
     ChangesRecoloured(Target, u64, Arc<[patch_view::PatchModel]>),
@@ -15088,26 +15090,35 @@ impl Cagents {
                     runtime.changes.recoloured(id, models);
                 }
             }
-            Action::ChangesLoaded(target, id, result, models) => {
+            Action::ChangesLoaded(target, id, result, models, theme) => {
                 let files = matches!(&result, Ok(chat::FileChangeReply::Files(_)));
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && runtime.changes.complete(id, result, models)
                 {
-                    return iced::widget::scrollable::scroll_to(
-                        card_control_id(
-                            target.card,
-                            if files {
-                                "chat-changes-files"
-                            } else {
-                                "chat-changes-detail"
+                    // The theme changed while the page was on its way.
+                    let recolour = if files || theme == runtime.syntax_theme {
+                        Task::none()
+                    } else {
+                        runtime.recolour_changes()
+                    };
+                    return Task::batch([
+                        recolour,
+                        iced::widget::scrollable::scroll_to(
+                            card_control_id(
+                                target.card,
+                                if files {
+                                    "chat-changes-files"
+                                } else {
+                                    "chat-changes-detail"
+                                },
+                            ),
+                            iced::widget::scrollable::AbsoluteOffset {
+                                x: Some(0.0),
+                                y: Some(0.0),
                             },
-                        ),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: Some(0.0),
-                            y: Some(0.0),
-                        },
-                    )
-                    .map(cosmic::Action::App);
+                        )
+                        .map(cosmic::Action::App),
+                    ]);
                 }
             }
             Action::ComposerActions(target, open) => {

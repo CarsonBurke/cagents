@@ -897,7 +897,7 @@ fn send(
             Ok((reply, models)) => (Ok(reply), models),
             Err(error) => (Err(error), Arc::from([])),
         };
-        Message::ChatUi(Action::ChangesLoaded(target, id, result, models))
+        Message::ChatUi(Action::ChangesLoaded(target, id, result, models, theme))
     })
 }
 
