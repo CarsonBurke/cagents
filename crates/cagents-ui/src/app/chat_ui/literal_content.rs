@@ -324,7 +324,7 @@ pub(super) fn search_view(
     let item_id: Arc<str> = item.id.as_str().into();
     let revision = {
         use std::hash::{Hash, Hasher};
-        let mut hash = std::hash::DefaultHasher::new();
+        let mut hash = crate::fingerprint::hasher();
         (
             cached.revision,
             find.map(|_| find_navigation::render_revision(target)),

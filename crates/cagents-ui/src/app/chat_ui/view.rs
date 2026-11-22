@@ -757,7 +757,7 @@ fn visible_notice_body(body: &str, expanded: bool) -> String {
 #[cfg(test)]
 fn notice_identity(anchor: Option<&str>, message: &str) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hash = std::hash::DefaultHasher::new();
+    let mut hash = crate::fingerprint::hasher();
     ("transcript-notice", anchor, message).hash(&mut hash);
     hash.finish()
 }
@@ -2013,7 +2013,7 @@ impl Runtime {
             .collect::<Vec<_>>()
             .join("\n");
         use std::hash::{Hash, Hasher};
-        let mut identity = std::hash::DefaultHasher::new();
+        let mut identity = crate::fingerprint::hasher();
         for agent in &failed {
             agent.id.hash(&mut identity);
         }
@@ -2637,7 +2637,7 @@ impl Runtime {
         now: Option<u64>,
     ) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut revision = std::hash::DefaultHasher::new();
+        let mut revision = crate::fingerprint::hasher();
         (
             cached.revision,
             self.item_expanded(&item.id),
@@ -2890,7 +2890,7 @@ impl Runtime {
                     0.0
                 };
                 use std::hash::{Hash, Hasher};
-                let mut key = std::hash::DefaultHasher::new();
+                let mut key = crate::fingerprint::hasher();
                 ("selected-child-item", &item.id).hash(&mut key);
                 let revision = self.child_item_revision(
                     agent,
@@ -5272,7 +5272,7 @@ impl Runtime {
             // An exchange that draws nothing yet is still reached through a
             // row of its own, which takes no room: the rows around it are
             // spaced as if it were not there.
-            let mut key = std::hash::DefaultHasher::new();
+            let mut key = crate::fingerprint::hasher();
             (0u8, &turn.key).hash(&mut key);
             transcript.lazy(
                 key.finish(),
@@ -5461,7 +5461,7 @@ impl Runtime {
     /// it draws, or the exchange whose steps its strip folds.
     fn turn_row_key(&self, turn: &turn::Turn, part: TurnPart) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
+        let mut key = crate::fingerprint::hasher();
         match part {
             TurnPart::Steps => (1u8, &turn.key).hash(&mut key),
             TurnPart::Prompt(index) => (2u8, &self.snapshot.items[index].id).hash(&mut key),
@@ -5474,9 +5474,9 @@ impl Runtime {
 
     /// What every row of an exchange draws alike, ready for each row to add
     /// its own.
-    fn turn_common_hasher(&self, turn: &turn::Turn, dark: bool) -> std::hash::DefaultHasher {
+    fn turn_common_hasher(&self, turn: &turn::Turn, dark: bool) -> crate::fingerprint::Hasher {
         use std::hash::Hash;
-        let mut hasher = std::hash::DefaultHasher::new();
+        let mut hasher = crate::fingerprint::hasher();
         (
             self.target,
             dark,
@@ -5515,7 +5515,7 @@ impl Runtime {
         part: TurnPart,
         key: u64,
         cached: Option<&CachedItem>,
-        common: &std::hash::DefaultHasher,
+        common: &crate::fingerprint::Hasher,
         now: Option<u64>,
     ) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -5595,7 +5595,7 @@ impl Runtime {
         cached: Option<&CachedItem>,
         slot: Option<turn::Slot>,
         now: Option<u64>,
-        hasher: &mut std::hash::DefaultHasher,
+        hasher: &mut crate::fingerprint::Hasher,
     ) -> bool {
         use std::hash::Hash;
         let item = &self.snapshot.items[index];

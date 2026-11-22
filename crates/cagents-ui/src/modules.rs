@@ -23,6 +23,7 @@ pub mod external_editor;
 pub mod file_drop;
 pub mod file_icon;
 pub mod file_manager;
+pub(crate) mod fingerprint;
 pub mod inspector;
 pub mod interaction;
 #[cfg(feature = "latency-harness")]

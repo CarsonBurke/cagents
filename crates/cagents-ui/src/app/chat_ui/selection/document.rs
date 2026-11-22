@@ -152,7 +152,7 @@ impl Catalog {
 }
 
 pub(in crate::app::chat_ui) fn identity(item: &str, path: &[u32]) -> u64 {
-    let mut hash = std::hash::DefaultHasher::new();
+    let mut hash = crate::fingerprint::hasher();
     ("native-rendered-block", item, path).hash(&mut hash);
     hash.finish()
 }
