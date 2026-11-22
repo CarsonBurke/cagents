@@ -76,8 +76,8 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
 /// the CLI needs: what counts, and how to allow more.
 fn refusal(used: usize, starting: usize, limit: usize) -> String {
     let running = match used {
-        1 => "1 is running".to_owned(),
-        n => format!("{n} are running"),
+        1 => "1 chat is open".to_owned(),
+        n => format!("{n} chats are open"),
     };
     let starting = match starting {
         0 => String::new(),
@@ -359,7 +359,7 @@ pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatC
                 status: if state.chat_spawning.contains_key(&id) {
                     "starting".into()
                 } else if record.handle.is_read_only_history() {
-                    "read-only history".into()
+                    "saved history only (no slot)".into()
                 } else if record.handle.is_completed() {
                     "closed".into()
                 } else {
@@ -1100,11 +1100,9 @@ mod tests {
         rejected.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
         let failure = start(&host, 1, rejected, None, false, None, Default::default()).unwrap_err();
         assert_eq!(failure.code, ProtocolErrorCode::ChatCapacity);
-        assert!(
-            failure
-                .message
-                .starts_with("No room for another chat: 1 is running (1 of them starting), and the limit is 1.")
-        );
+        assert!(failure.message.starts_with(
+            "No room for another chat: 1 chat is open (1 of them starting), and the limit is 1."
+        ));
         assert_eq!(host.lock().unwrap().chat_spawning.len(), 1);
     }
 
@@ -1401,7 +1399,7 @@ mod tests {
         let (headline, detail) = text.split_once("\n\n").unwrap();
         assert_eq!(
             headline,
-            "No room for another chat: 128 are running, and the limit is 128."
+            "No room for another chat: 128 chats are open, and the limit is 128."
         );
         assert!(headline.chars().count() <= 160);
         assert!(detail.starts_with("Close a chat you have finished with, then try again."));

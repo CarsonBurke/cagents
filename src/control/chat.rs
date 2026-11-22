@@ -152,7 +152,7 @@ fn execute_requests(
 
 fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) -> CommandOutput {
     let suffix = if capacity.used >= capacity.limit {
-        "\nNew admissions are blocked. Existing work is unchanged. Check eligibility with cagents chat release ID --dry-run. Release requires supported, verified saved history and no protected work."
+        "\nFull: new chats are refused until one closes. Open chats keep working, and saved history still opens. Close a chat you have finished with, or raise the limit with cagents chat capacity set N."
     } else {
         ""
     };
