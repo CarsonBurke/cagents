@@ -821,7 +821,7 @@ impl Cagents {
                     "Not connected. Reconnect checks for the original terminal. cagents can't restart this agent, because its saved command may reopen a conversation the agent has since left."
                 }
                 Disposition::Dormant => {
-                    "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. The saved session runs again only when you choose."
+                    "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Nothing runs again until you choose."
                 }
                 Disposition::Unavailable => {
                     "The existing terminal could not be verified. Reconnect to check again; the saved command has not been restarted."

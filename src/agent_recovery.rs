@@ -2887,6 +2887,73 @@ mod tests {
         };
         use crate::persistence::{SnapshotBase, StateStore};
 
+        /// The hint version observation records for a Claude process launched
+        /// with `arguments` whose session record names `current`, which has
+        /// a transcript only when `materialized`.
+        fn observed_version(arguments: &[&str], current: &str, materialized: bool) -> u64 {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("claude-config");
+            let work = directory.path().join("work");
+            fs::create_dir_all(config.join("sessions")).unwrap();
+            fs::create_dir_all(&work).unwrap();
+            let mut recipe = launch("claude", arguments);
+            recipe.working_directory = work.clone();
+            recipe
+                .environment
+                .insert("HOME".into(), directory.path().to_str().unwrap().into());
+            recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into());
+            let proc_root = directory.path().join("proc");
+            process_fixture(&proc_root, 100, &recipe, &[]);
+            let project: String = work
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let history = config.join("projects").join(project);
+            fs::create_dir_all(&history).unwrap();
+            if materialized {
+                fs::write(history.join(format!("{current}.jsonl")), "{}\n").unwrap();
+            }
+            fs::write(
+                config.join("sessions/100.json"),
+                serde_json::json!({
+                    "pid": 100,
+                    "procStart": "0",
+                    "sessionId": current,
+                    "cwd": work,
+                    "kind": "interactive",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let hint = inspect_process(&proc_root, 100, 100, &recipe, &mut 64)
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&hint).unwrap()["version"]
+                .as_u64()
+                .unwrap()
+        }
+
+        #[test]
+        fn observation_confirms_only_the_conversation_a_launch_names() {
+            let named = "a1b2c3d4-1111-4111-8111-123456789abc";
+            let other = "a1b2c3d4-2222-4111-8111-123456789abc";
+            let unreplayable = ["--resume", named, "--fixture-unknown"];
+            // Still in the conversation it names: its command can run again.
+            assert_eq!(observed_version(&unreplayable, named, true), 3);
+            assert_eq!(observed_version(&["--fixture-unknown"], named, true), 3);
+            // In another conversation, or one /clear began, it can't.
+            assert_eq!(observed_version(&unreplayable, other, true), 2);
+            assert_eq!(observed_version(&unreplayable, other, false), 2);
+            // Options recovery replays bind the exact conversation instead.
+            assert_eq!(observed_version(&["--resume", named], other, true), 1);
+        }
+
         #[test]
         fn reboot_does_not_reauthorize_the_conversation_cleared_by_claude() {
             let directory = tempfile::tempdir().unwrap();

@@ -82,8 +82,7 @@ impl TerminalRelaunch {
                 display_path(&session.launch.working_directory)
             ),
             Self::NewTerminal => format!(
-                "Open a shell in {}: running {name} again could reopen a conversation it has since left",
-                display_path(&session.launch.working_directory)
+                "Open a new terminal: running {name} again could reopen a conversation it has since left"
             ),
         }
     }
