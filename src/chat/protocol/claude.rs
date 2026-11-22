@@ -2835,6 +2835,21 @@ impl Claude {
         {
             self.nested_calls.insert(string(frame, "tool_use_id"));
         }
+        // A helper resumed by message forwards its conversation under the
+        // call that first started it, which this conversation may never have
+        // seen: the worker started it before Claude Code restarted, or long
+        // enough ago that the call has left the tool cache. Each forwarded
+        // frame names the helper's task, which its resumed run's task_started
+        // has already shown to be nested.
+        if let Some(call) = frame["parent_tool_use_id"]
+            .as_str()
+            .filter(|call| !call.is_empty())
+            && frame["agent_id"]
+                .as_str()
+                .is_some_and(|task| self.nested_tasks.contains(task))
+        {
+            self.nested_calls.insert(call);
+        }
     }
 
     /// Whether a call started a conversation inside one of this

@@ -15011,3 +15011,62 @@ fn a_main_request_reports_its_start_and_what_the_cache_served() {
         .unwrap();
     assert!(evidence(step).is_empty());
 }
+
+/// Recorded from Claude Code 2.1.325 on the cheapest model: the lead starts a
+/// background agent, "Outer", which runs a foreground agent, "Inner", to the
+/// end and then resumes it with `SendMessage`. The resumed run's task names the
+/// message's call, but Claude Code forwards Inner's conversation under the
+/// `Agent` call that first started it, with Inner's task as its `agent_id`.
+const RESUMED_HELPER: &str =
+    include_str!("../../../../tests/fixtures/claude-nested-agent-resumed-live.jsonl");
+const RESUMED_OUTER: &str = "toolu_01L7yVqgWPaXHA9MUXPysRiz";
+const RESUMED_INNER_CALL: &str = "toolu_01D4f3tdnUHvNUWeYACuqUdQ";
+
+#[test]
+fn a_helper_resumed_by_its_worker_is_not_a_lead_agent() {
+    // Whether or not the lead saw the helper's first run: Claude Code may
+    // have restarted since, as it does when cagents resumes the conversation.
+    for first_run_seen in [true, false] {
+        let mut lead = Lead::default();
+        let mut skipping = false;
+        for line in RESUMED_HELPER.lines() {
+            let frame: Value = serde_json::from_str(line).unwrap();
+            let calls = |name: &str| {
+                frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|block| block["type"] == "tool_use" && block["name"] == name)
+                    })
+            };
+            if !first_run_seen {
+                skipping = (skipping
+                    || calls("Agent") && frame["parent_tool_use_id"] == RESUMED_OUTER)
+                    && !calls("SendMessage");
+                if skipping {
+                    continue;
+                }
+            }
+            lead.receive(frame);
+            assert!(
+                subagent_ids(&lead.snapshot)
+                    .iter()
+                    .all(|agent| *agent == RESUMED_OUTER),
+                "first run seen: {first_run_seen}: {:?}",
+                subagent_ids(&lead.snapshot)
+            );
+        }
+        assert_eq!(subagent_ids(&lead.snapshot), [RESUMED_OUTER]);
+        assert_eq!(lead.snapshot.subagents[0].status, ToolStatus::Succeeded);
+        assert_eq!(agent_counts(&lead.snapshot), (0, 0, 0, 0));
+        assert!(
+            !lead
+                .snapshot
+                .items
+                .iter()
+                .any(|item| item.id == RESUMED_INNER_CALL),
+            "the helper's call is its worker's row, not the lead's"
+        );
+    }
+}
