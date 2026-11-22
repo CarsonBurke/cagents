@@ -640,7 +640,14 @@ impl Cagents {
             }
             return match command {
                 Command::Reconnect if !pending => self.inspect_saved_terminal(card),
-                Command::Relaunch if !pending && dormant && relaunch_available => {
+                // As its disabled button says, a relaunch recovery refuses
+                // starts nothing, even from a click queued before it was.
+                Command::Relaunch
+                    if !pending
+                        && dormant
+                        && relaunch_available
+                        && super::terminal_relaunch_plan(&source).is_ok() =>
+                {
                     self.inspect_saved_terminal_for(card, true)
                 }
                 Command::CopyDetails => {
@@ -806,6 +813,7 @@ impl Cagents {
                 &format!("saved-terminal.{control}.{request}.{pending}"),
             )
         };
+        let relaunch_plan = super::terminal_relaunch_plan(&entry.source);
         let description = if entry.authority.token().is_some() {
             "Use the original workspace window to reconnect or manage this saved terminal. You can copy its details here."
         } else {
@@ -815,8 +823,12 @@ impl Cagents {
                 entry.disposition
             } {
                 Disposition::Pending => "Checking for the existing terminal…",
+                // The disabled relaunch says why only to assistive technology.
+                Disposition::Dormant if entry.show_relaunch && relaunch_plan.is_err() => {
+                    "Not connected. Reconnect checks for the original terminal. cagents can't restart this agent, because its saved command may reopen a conversation the agent has since left."
+                }
                 Disposition::Dormant => {
-                    "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Resume or Restart runs the saved session only when you choose."
+                    "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Nothing runs again until you choose."
                 }
                 Disposition::Unavailable => {
                     "The existing terminal could not be verified. Reconnect to check again; the saved command has not been restarted."
@@ -836,20 +848,24 @@ impl Cagents {
             };
         let mut controls = vec![reconnect.into()];
         if entry.show_relaunch {
-            let label = if entry.source.agent_resume_recipe().is_some() {
-                "Resume session"
-            } else {
-                "Restart"
+            let plan = relaunch_plan;
+            let label = match plan {
+                Ok(super::Relaunch::Resume) => "Resume session",
+                Ok(super::Relaunch::Picker(_)) => "Choose conversation",
+                Ok(super::Relaunch::Rerun) | Err(_) => "Restart",
             };
-            controls.push(
-                crate::ui_controls::button::secondary(label)
-                    .id(control_id("relaunch"))
-                    .name("Explicitly relaunch the saved terminal")
-                    .on_press_maybe(
-                        (relaunch_available && !closing).then(|| action(Command::Relaunch)),
-                    )
-                    .into(),
-            );
+            let mut relaunch = crate::ui_controls::button::secondary(label)
+                .id(control_id("relaunch"))
+                .name("Explicitly relaunch the saved terminal")
+                .on_press_maybe(
+                    (relaunch_available && !closing && plan.is_ok())
+                        .then(|| action(Command::Relaunch)),
+                );
+            // Disabled rather than hidden, so the pane still says why.
+            if let Err(reason) = plan {
+                relaunch = relaunch.description(reason);
+            }
+            controls.push(relaunch.into());
         }
         controls.extend([
             crate::ui_controls::button::secondary("Open another folder…")

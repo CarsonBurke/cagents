@@ -2177,8 +2177,64 @@ fn terminal_continuity(state: Option<&CardState>) -> Option<&TerminalContinuity>
     }
 }
 
-fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
-    let (recipe, last_exit) = match &session.continuity {
+/// What relaunching a terminal starts in its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Relaunch {
+    /// The agent's exact saved conversation.
+    Resume,
+    /// The agent's conversation picker, since the conversation its command
+    /// names may be one it has since left.
+    Picker(crate::agent::Provider),
+    /// The saved command, from the beginning.
+    Rerun,
+}
+
+/// The command that relaunches a terminal, given the one it saved. An exact
+/// conversation resumes. A saved command reruns, unless observation couldn't
+/// confirm the conversation it, or the agent observed inside it, names, as
+/// after `/clear`: rerunning it could reopen the conversation the agent left.
+/// Then the relaunch follows recovery's plan, the agent's picker, and refuses
+/// when there is none.
+fn terminal_relaunch(
+    session: &TerminalSession,
+    saved: &LaunchRecipe,
+) -> Result<(LaunchRecipe, Relaunch), String> {
+    if let Some(recipe) = session.agent_resume_recipe() {
+        return Ok((recipe, Relaunch::Resume));
+    }
+    if !session.resume_hint.as_deref().is_some_and(|hint| {
+        crate::model::agent_recovery::reopens_unconfirmed_conversation(hint, saved)
+    }) {
+        return Ok((saved.clone(), Relaunch::Rerun));
+    }
+    match crate::upgrade::recovery_plan(session) {
+        Ok((recipe, crate::upgrade::RecoveryKind::Picker)) => {
+            let provider = crate::agent::Provider::recognize_launch(&recipe)
+                .ok_or_else(|| terminal_failure::RETRY_UNAVAILABLE.to_owned())?;
+            Ok((recipe, Relaunch::Picker(provider)))
+        }
+        // A shell cagents made, which the agent ran inside.
+        Ok((recipe, crate::upgrade::RecoveryKind::Shell)) => Ok((recipe, Relaunch::Rerun)),
+        Ok((recipe, crate::upgrade::RecoveryKind::Exact)) => Ok((recipe, Relaunch::Resume)),
+        Err(_) => Err(terminal_failure::RETRY_UNAVAILABLE.into()),
+    }
+}
+
+fn terminal_relaunch_recipe(
+    session: &TerminalSession,
+    saved: &LaunchRecipe,
+) -> Result<LaunchRecipe, String> {
+    terminal_relaunch(session, saved).map(|(recipe, _)| recipe)
+}
+
+/// What relaunching this terminal starts, or why it starts nothing.
+pub(super) fn terminal_relaunch_plan(session: &TerminalSession) -> Result<Relaunch, String> {
+    terminal_relaunch(session, &saved_relaunch(session).0).map(|(_, relaunch)| relaunch)
+}
+
+/// The command a relaunch falls back to, and the last exit it carries.
+fn saved_relaunch(session: &TerminalSession) -> (LaunchRecipe, Option<TerminalExit>) {
+    match &session.continuity {
         TerminalContinuity::RelaunchAvailable { recipe, last_exit } => {
             (recipe.clone(), last_exit.clone())
         }
@@ -2188,14 +2244,18 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
         TerminalContinuity::Live { .. }
         | TerminalContinuity::DetachedSameBoot { .. }
         | TerminalContinuity::Failed { .. } => (session.launch.clone(), None),
-    };
+    }
+}
+
+fn fresh_terminal_relaunch(session: &TerminalSession) -> Result<TerminalSession, String> {
+    let (recipe, last_exit) = saved_relaunch(session);
     let resume_recipe = session.agent_resume_recipe();
     let resume_hint = resume_recipe
         .as_ref()
         .and_then(|_| session.resume_hint.clone());
-    let recipe = resume_recipe.unwrap_or(recipe);
+    let recipe = terminal_relaunch_recipe(session, &recipe)?;
     let id = TerminalId::new();
-    TerminalSession {
+    Ok(TerminalSession {
         owned_codex_listener: None,
         recovery_origin: Some(session.recovery_origin.unwrap_or(session.id)),
         predecessor: Some(session.id),
@@ -2204,7 +2264,7 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
         transcript_path: transcript_path_for(&recipe, id),
         resume_hint,
         continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit },
-    }
+    })
 }
 
 /// Where a new, relaunched or cloned terminal records its output: nowhere
@@ -10069,6 +10129,8 @@ impl Cagents {
             || self.pane_close_owned(card)
             || self.chat_start_pending(card)
             || self.chat_retry_blocked(card)
+            // Its pane says Retry can't start anything, and disables it.
+            || self.terminal_retry_unavailable(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
             || self.terminal_start_in_flight(card)
@@ -10134,7 +10196,13 @@ impl Cagents {
             && session.continuity.live_proof().is_none()
         {
             let expected_terminal_id = session.id;
-            let replacement = fresh_terminal_relaunch(session);
+            let replacement = match fresh_terminal_relaunch(session) {
+                Ok(replacement) => replacement,
+                Err(error) => {
+                    self.fail_runtime(card, error);
+                    return Task::none();
+                }
+            };
             *session = replacement.clone();
             Some((expected_terminal_id, replacement))
         } else {
@@ -12601,7 +12669,23 @@ impl Cagents {
                                     );
                                 }
                                 controls
-                            } else { vec![
+                            } else if self.terminal_retry_unavailable(id) { vec![
+                                // What the pane says to do instead.
+                                crate::ui_controls::button::primary("Open new terminal")
+                                    .id(card_control_id(id, "failure.new_terminal"))
+                                    .on_press_maybe((!self.terminal_close_in_progress(id)).then_some(
+                                        Message::TerminalFailure(terminal_failure::Action::NewTerminal(id)),
+                                    ))
+                                    .into(),
+                                // Disabled rather than hidden, so the pane
+                                // still says why Retry can't help: the
+                                // message above it, and its description.
+                                crate::ui_controls::button::secondary(retry_label)
+                                    .id(card_control_id(id, "retry"))
+                                    .name(format!("{retry_label} {}", labels.type_label))
+                                    .description(terminal_failure::RETRY_UNAVAILABLE)
+                                    .into(),
+                            ] } else { vec![
                                 (if self.terminal_retry_is_blocked(id) {
                                     crate::ui_controls::button::secondary(retry_label)
                                 } else {
@@ -20432,11 +20516,9 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
                 ))
             }
         }
-        TerminalContinuity::RelaunchAvailable { recipe, .. } => Ok(TerminalStartMode::Spawn(
-            session
-                .agent_resume_recipe()
-                .unwrap_or_else(|| recipe.clone()),
-        )),
+        TerminalContinuity::RelaunchAvailable { recipe, .. } => {
+            terminal_relaunch_recipe(session, recipe).map(TerminalStartMode::Spawn)
+        }
         TerminalContinuity::Exited { .. } => Err(format!(
             "terminal {} has exited; explicit relaunch is required",
             session.id

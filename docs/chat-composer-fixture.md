@@ -13,6 +13,20 @@ the fixture returns an empty effective settings object and no rule sources,
 matching its default permission setup. Reading settings keeps the turn active;
 this does not simulate editing permission rules or inherited configuration.
 
+In a terminal pane, such as one a native chat returns to, the same `claude`
+runs [`tests/fixtures/claude-terminal.js`](../tests/fixtures/claude-terminal.js)
+under `node` instead, which `native-evidence` installs beside it. That
+handoff happens when the terminal is the standard input and output and no
+`-p`, `--print`, `--input-format` or `--output-format` is given. Run under
+node, as an npm installation of Claude Code is, cagents recognizes and
+observes the terminal as Claude. `--resume ID` shows that saved conversation's
+last messages, or exits 1 if it has none. A bare `--resume` lists the
+project's saved conversations to pick from. `/clear` switches to a new
+conversation that has no transcript until its first message. Like Claude
+Code, it publishes the conversation it holds in `sessions/PID.json`, so
+cagents' recovery hint follows `/clear`. Any other line is a prompt that
+gets an invented reply in the transcript.
+
 From a shell without a desktop session, such as plain SSH,
 [`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
 you still open the project and start the conversation. From a session cagents

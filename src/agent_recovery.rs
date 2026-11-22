@@ -23,6 +23,16 @@ pub(crate) struct AgentProcess {
     pub launch: LaunchRecipe,
     pub recovery: LaunchRecipe,
 }
+/// A hint version: the exact conversation, ready to resume.
+const EXACT: u8 = 1;
+/// A hint version: the agent was recognized, but nothing confirmed which
+/// conversation it is in, so any conversation its launch names may be stale.
+const RECOGNIZED: u8 = 2;
+/// A hint version: observation confirmed the agent is still in the only
+/// conversation its launch names, if any, but the launch carries options exact
+/// recovery won't replay.
+const CONFIRMED: u8 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentResumeHint {
@@ -69,6 +79,54 @@ pub fn fresh_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
 /// search term or a latest-session shortcut, since the picker supersedes it.
 pub fn picker_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
     interactive_recipe(launch, Selector::Picker)
+}
+
+/// The conversations a launch names through its provider's selectors, each
+/// with the value it gives the selector. Options cagents doesn't know can't be
+/// parsed, so any argument that reads as a selector counts, wherever it falls.
+/// A selector without a value opens a picker or the latest conversation, which
+/// names none.
+fn named_conversations(launch: &LaunchRecipe) -> Vec<&str> {
+    let Some((provider, arguments)) = Provider::launched(launch) else {
+        return Vec::new();
+    };
+    let mut named = Vec::new();
+    let mut args = arguments.iter().peekable();
+    while let Some(argument) = args.next() {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        if !provider.is_identity_option(flag) {
+            continue;
+        }
+        if let Some(value) = inline.or_else(|| {
+            args.next_if(|value| !value.starts_with('-'))
+                .map(String::as_str)
+        }) {
+            named.push(value);
+        }
+    }
+    named
+}
+
+/// Whether rerunning a launch reopens a particular conversation.
+pub fn names_conversation(launch: &LaunchRecipe) -> bool {
+    !named_conversations(launch).is_empty()
+}
+
+/// Whether rerunning `launch` could reopen a conversation the agent has since
+/// left: the hint is recognition-only, observation never confirmed the
+/// conversation the launch, or the agent's observed launch, names.
+pub fn reopens_unconfirmed_conversation(hint: &str, launch: &LaunchRecipe) -> bool {
+    if hint.len() > MAX_HINT_BYTES {
+        return false;
+    }
+    serde_json::from_str::<AgentResumeHint>(hint).is_ok_and(|hint| {
+        hint.version == RECOGNIZED
+            && (names_conversation(launch) || names_conversation(&hint.recipe))
+    })
 }
 
 /// Whether `recipe` is exactly the picker `picker_recipe` builds for it.
@@ -209,7 +267,11 @@ pub fn bind_session(launch: &LaunchRecipe, id: &str) -> Option<LaunchRecipe> {
 
 pub fn hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
     let recipe = resume_recipe(launch)?;
-    let hint = serde_json::to_string(&AgentResumeHint { version: 1, recipe }).ok()?;
+    let hint = serde_json::to_string(&AgentResumeHint {
+        version: EXACT,
+        recipe,
+    })
+    .ok()?;
     (hint.len() <= MAX_HINT_BYTES).then_some(hint)
 }
 
@@ -218,7 +280,7 @@ pub fn recipe_from_hint(hint: &str) -> Option<LaunchRecipe> {
         return None;
     }
     let hint: AgentResumeHint = serde_json::from_str(hint).ok()?;
-    (hint.version == 1).then_some(())?;
+    (hint.version == EXACT).then_some(())?;
     resume_recipe(&hint.recipe)
 }
 
@@ -235,7 +297,7 @@ pub fn observed_hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
         return None;
     }
     let hint = serde_json::to_string(&AgentResumeHint {
-        version: 2,
+        version: RECOGNIZED,
         recipe: launch.clone(),
     })
     .ok()?;
@@ -248,8 +310,8 @@ pub fn observed_launch_from_hint(hint: &str) -> Option<LaunchRecipe> {
     }
     let hint: AgentResumeHint = serde_json::from_str(hint).ok()?;
     match hint.version {
-        1 => resume_recipe(&hint.recipe),
-        2 => (Provider::from_program(&hint.recipe.program).is_some()
+        EXACT => resume_recipe(&hint.recipe),
+        RECOGNIZED | CONFIRMED => (Provider::from_program(&hint.recipe.program).is_some()
             && hint.recipe.arguments.len() <= 128
             && hint.recipe.arguments.iter().map(String::len).sum::<usize>() <= MAX_ARGV_BYTES)
             .then_some(hint.recipe),
@@ -1456,16 +1518,20 @@ fn recovery_observation(
         return observed_hint_from_launch(&launch).map(Some).ok_or(());
     };
     // An option the resume cannot carry is no reason to forget the agent.
-    let bound = match identity {
-        SessionIdentity::Exact(id) => bind_session(&launch, &id),
+    let bound = match &identity {
+        SessionIdentity::Exact(id) => bind_session(&launch, id),
         SessionIdentity::Fresh(_) | SessionIdentity::Ambiguous => None,
     };
     if let Some(bound) = bound {
         return observed_hint_from_launch(&bound).map(Some).ok_or(());
     }
     // Recognition still exposes activation, but never stale resume authority.
+    // Rerunning the launch is still sound when the conversation it names, if
+    // any, is the one the agent is in.
+    let confirmed = matches!(&identity, SessionIdentity::Exact(id)
+        if named_conversations(&launch).iter().all(|named| *named == id.as_str()));
     let hint = serde_json::to_string(&AgentResumeHint {
-        version: 2,
+        version: if confirmed { CONFIRMED } else { RECOGNIZED },
         recipe: launch,
     })
     .map_err(|_| ())?;
@@ -2720,6 +2786,300 @@ mod tests {
         // Claude writes its start time as a string; anything else is not its record.
         write_record(100, "0", serde_json::json!({"procStart": 0}));
         assert_eq!(runtime_identity(&root, 100, &recipe, 0), None);
+    }
+
+    #[test]
+    fn a_launch_names_a_conversation_through_any_selector_that_takes_one() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let inline = format!("--resume={id}");
+        for (program, arguments) in [
+            ("claude", vec!["--unknown", "--resume", id]),
+            ("claude", vec![inline.as_str(), "--unknown"]),
+            ("claude", vec!["--session-id", id, "--unknown"]),
+            ("claude", vec!["--resume", "search term"]),
+            ("codex", vec!["--unknown", "resume", id]),
+            ("agy", vec!["--conversation", id]),
+        ] {
+            assert!(
+                names_conversation(&launch(program, &arguments)),
+                "{program} {arguments:?}"
+            );
+        }
+        let mut node = launch(
+            "node",
+            &[
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                "-r",
+                id,
+            ],
+        );
+        assert!(names_conversation(&node));
+        node.arguments.truncate(2);
+        // A picker or the latest conversation names none.
+        assert!(!names_conversation(&node));
+        for (program, arguments) in [
+            ("claude", vec!["--resume", "--unknown"]),
+            ("claude", vec!["--unknown", "--continue"]),
+            ("codex", vec!["resume", "--last"]),
+            ("agy", vec!["-c"]),
+            ("claude", vec!["--unknown", "fix the build"]),
+            // Another program's selector is not the agent's.
+            ("bash", vec!["--resume", id]),
+        ] {
+            assert!(
+                !names_conversation(&launch(program, &arguments)),
+                "{program} {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_recognition_only_hint_leaves_a_named_conversation_unconfirmed() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let named = launch("claude", &["--resume", id, "--unknown"]);
+        let plain = launch("claude", &["--unknown"]);
+        let hint = |version: u8, recipe: &LaunchRecipe| {
+            serde_json::to_string(&AgentResumeHint {
+                version,
+                recipe: recipe.clone(),
+            })
+            .unwrap()
+        };
+        assert!(reopens_unconfirmed_conversation(
+            &hint(RECOGNIZED, &named),
+            &named
+        ));
+        // An agent observed inside a wrapper whose launch names nothing.
+        let shell = launch("bash", &[]);
+        assert!(reopens_unconfirmed_conversation(
+            &hint(RECOGNIZED, &named),
+            &shell
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            &hint(RECOGNIZED, &plain),
+            &plain
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            &hint(CONFIRMED, &named),
+            &named
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            &hint(EXACT, &named),
+            &named
+        ));
+        assert!(!reopens_unconfirmed_conversation(
+            "legacy-provider-session",
+            &named
+        ));
+        assert_eq!(
+            observed_launch_from_hint(&hint(CONFIRMED, &named)),
+            Some(named.clone())
+        );
+        assert_eq!(recipe_from_hint(&hint(CONFIRMED, &named)), None);
+    }
+
+    #[cfg(feature = "host")]
+    mod cleared_conversation {
+        use super::*;
+        use crate::model::{
+            BootId, CardId, CardKind, CardState, Existence, HostIncarnation, HostSessionId,
+            TerminalContinuity, TerminalId, TerminalSession, WorkspaceState,
+        };
+        use crate::persistence::{SnapshotBase, StateStore};
+
+        /// The hint version observation records for a Claude process launched
+        /// with `arguments` whose session record names `current`, which has
+        /// a transcript only when `materialized`.
+        fn observed_version(arguments: &[&str], current: &str, materialized: bool) -> u64 {
+            let directory = tempfile::tempdir().unwrap();
+            let config = directory.path().join("claude-config");
+            let work = directory.path().join("work");
+            fs::create_dir_all(config.join("sessions")).unwrap();
+            fs::create_dir_all(&work).unwrap();
+            let mut recipe = launch("claude", arguments);
+            recipe.working_directory = work.clone();
+            recipe
+                .environment
+                .insert("HOME".into(), directory.path().to_str().unwrap().into());
+            recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into());
+            let proc_root = directory.path().join("proc");
+            process_fixture(&proc_root, 100, &recipe, &[]);
+            let project: String = work
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let history = config.join("projects").join(project);
+            fs::create_dir_all(&history).unwrap();
+            if materialized {
+                fs::write(history.join(format!("{current}.jsonl")), "{}\n").unwrap();
+            }
+            fs::write(
+                config.join("sessions/100.json"),
+                serde_json::json!({
+                    "pid": 100,
+                    "procStart": "0",
+                    "sessionId": current,
+                    "cwd": work,
+                    "kind": "interactive",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let hint = inspect_process(&proc_root, 100, 100, &recipe, &mut 64)
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&hint).unwrap()["version"]
+                .as_u64()
+                .unwrap()
+        }
+
+        #[test]
+        fn observation_confirms_only_the_conversation_a_launch_names() {
+            let named = "a1b2c3d4-1111-4111-8111-123456789abc";
+            let other = "a1b2c3d4-2222-4111-8111-123456789abc";
+            let unreplayable = ["--resume", named, "--fixture-unknown"];
+            // Still in the conversation it names: its command can run again.
+            assert_eq!(observed_version(&unreplayable, named, true), 3);
+            assert_eq!(observed_version(&["--fixture-unknown"], named, true), 3);
+            // In another conversation, or one /clear began, it can't.
+            assert_eq!(observed_version(&unreplayable, other, true), 2);
+            assert_eq!(observed_version(&unreplayable, other, false), 2);
+            // Options recovery replays bind the exact conversation instead.
+            assert_eq!(observed_version(&["--resume", named], other, true), 1);
+        }
+
+        #[test]
+        fn reboot_does_not_reauthorize_the_conversation_cleared_by_claude() {
+            let directory = tempfile::tempdir().unwrap();
+            let home = directory.path().join("home");
+            let config = directory.path().join("claude-config");
+            let work = directory.path().join("work");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(config.join("sessions")).unwrap();
+            fs::create_dir_all(&work).unwrap();
+            let launched = "a1b2c3d4-1111-4111-8111-123456789abc";
+            let current = "a1b2c3d4-2222-4111-8111-123456789abc";
+            let mut recipe = launch("claude", &["--resume", launched]);
+            recipe.working_directory = work.clone();
+            recipe
+                .environment
+                .insert("HOME".into(), home.to_str().unwrap().into());
+            recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), config.to_str().unwrap().into());
+            let proc_root = directory.path().join("proc");
+            process_fixture(&proc_root, 100, &recipe, &[]);
+            let project: String = work
+                .canonicalize()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let history = config.join("projects").join(project);
+            fs::create_dir_all(&history).unwrap();
+            fs::write(history.join(format!("{launched}.jsonl")), "{}\n").unwrap();
+            let write_record = |id: &str| {
+                fs::write(
+                    config.join("sessions/100.json"),
+                    serde_json::json!({
+                        "pid": 100,
+                        "procStart": "0",
+                        "sessionId": id,
+                        "cwd": work,
+                        "kind": "interactive",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            };
+            write_record(launched);
+            let before = inspect_process(&proc_root, 100, 100, &recipe, &mut 64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(recipe_from_hint(&before), Some(recipe.clone()));
+
+            // `/clear` changes the process record, but no message in B has
+            // created its transcript. Observe the real recovery decision.
+            write_record(current);
+            assert!(!history.join(format!("{current}.jsonl")).exists());
+            assert_eq!(
+                runtime_identity(&proc_root.join("100"), 100, &recipe, 0),
+                Some(SessionIdentity::Ambiguous)
+            );
+            let hint = inspect_process(&proc_root, 100, 100, &recipe, &mut 64)
+                .unwrap()
+                .unwrap();
+            assert!(recipe_from_hint(&hint).is_none());
+            assert_eq!(observed_launch_from_hint(&hint), Some(recipe.clone()));
+            let boot = BootId::new("before-reboot");
+            let card = CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: "Claude".into(),
+                width_fraction: 0.6,
+                existence: Existence::Open,
+                kind: CardKind::Terminal(TerminalSession {
+                    id: TerminalId::new(),
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    launch: recipe.clone(),
+                    transcript_path: None,
+                    resume_hint: Some(hint.clone()),
+                    continuity: TerminalContinuity::Live {
+                        host_session_id: HostSessionId::new("old-host"),
+                        boot_id: boot.clone(),
+                        host_incarnation: HostIncarnation::new("old-incarnation"),
+                    },
+                }),
+            };
+            let workspace = WorkspaceState {
+                focused: Some(card.id),
+                cards: vec![card].into(),
+                ..WorkspaceState::default()
+            };
+            let path = directory.path().join("state.sqlite3");
+            {
+                let store = StateStore::open(&path, boot).unwrap();
+                store
+                    .save_workspace(
+                        &workspace,
+                        SnapshotBase {
+                            workspace: 0,
+                            cards: &BTreeMap::new(),
+                        },
+                    )
+                    .unwrap();
+                store.shutdown().unwrap();
+            }
+            let store = StateStore::open(&path, BootId::new("after-reboot")).unwrap();
+            assert!(store.recovery_report().boot_changed);
+            let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+            let CardKind::Terminal(session) = &restored.cards[0].kind else {
+                panic!("saved terminal expected");
+            };
+            assert!(matches!(
+                &session.continuity,
+                TerminalContinuity::RelaunchAvailable { recipe: saved, .. } if saved == &recipe
+            ));
+            assert_eq!(session.resume_hint.as_ref(), Some(&hint));
+            assert_eq!(session.agent_resume_recipe(), None);
+            assert_eq!(
+                crate::upgrade::recovery_plan(session).unwrap(),
+                (
+                    picker_recipe(&recipe).unwrap(),
+                    crate::upgrade::RecoveryKind::Picker
+                )
+            );
+        }
     }
 
     #[test]

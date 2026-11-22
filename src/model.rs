@@ -1044,10 +1044,17 @@ impl TerminalSession {
 
     /// An exact saved agent identity, never a newest-session guess.
     pub fn agent_resume_recipe(&self) -> Option<LaunchRecipe> {
-        self.resume_hint
-            .as_deref()
-            .and_then(agent_recovery::recipe_from_hint)
-            .or_else(|| agent_recovery::resume_recipe(&self.launch))
+        if let Some(hint) = self.resume_hint.as_deref() {
+            if let Some(recipe) = agent_recovery::recipe_from_hint(hint) {
+                return Some(recipe);
+            }
+            // Current recognition-only evidence withholds exact identity:
+            // the original argv may still name a conversation since cleared.
+            if agent_recovery::observed_launch_from_hint(hint).is_some() {
+                return None;
+            }
+        }
+        agent_recovery::resume_recipe(&self.launch)
     }
 }
 

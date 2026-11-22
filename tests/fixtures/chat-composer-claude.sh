@@ -21,6 +21,24 @@ if [ "${1:-}" = auth ]; then
     exit 0
 fi
 
+# A terminal pane runs Claude Code's interactive CLI rather than stream-json.
+# Hand a launch on a terminal that asks for no headless mode to the offline
+# terminal Claude, under node as an npm installation runs, so cagents
+# recognizes and observes it as Claude. See docs/chat-composer-fixture.md.
+terminal_claude=${0%/*}/../libexec/claude-terminal/claude
+if [ -t 0 ] && [ -t 1 ] && [ -f "$terminal_claude" ]; then
+    headless=false
+    for argument in "$@"; do
+        case $argument in
+            -p | --print | --input-format* | --output-format*) headless=true ;;
+        esac
+    done
+    if [ "$headless" = false ]; then
+        terminal_claude=$(cd -- "${terminal_claude%/*}" && pwd -P)/claude
+        exec node "$terminal_claude" "$@"
+    fi
+fi
+
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 resumed=
 launch_model=
