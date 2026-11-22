@@ -6610,6 +6610,7 @@ fn apply_result(
         (true, Some(status)) => status,
         (true, None) => ToolStatus::Failed,
     };
+    let text = if failed { harness_error(text) } else { text };
     match content {
         ItemContent::Changes { changes, status } if !failed => {
             super::claude_edits::applied(changes, structured);
@@ -6672,6 +6673,47 @@ fn apply_result(
         | ItemContent::Delivery { .. } => {}
     }
 }
+/// A failed call's result without the `<tool_use_error>` tags Claude Code
+/// wraps around an error its harness raised, rather than the tool, such as
+/// a refused input or a blocked command. The tags and the `Error: ` they
+/// often hold are framing for the model; the reader is shown the sentence.
+/// A call to a tool Claude Code doesn't have says so plainly. An MCP tool
+/// is missing the same way when its server failed to start or dropped, so
+/// that case points at the server rather than at the model.
+fn harness_error(text: String) -> String {
+    let Some(inner) = text
+        .trim()
+        .strip_prefix("<tool_use_error>")
+        .and_then(|rest| rest.strip_suffix("</tool_use_error>"))
+    else {
+        return text;
+    };
+    let inner = inner.trim();
+    let inner = inner.strip_prefix("Error: ").unwrap_or(inner);
+    let Some(rest) = inner.strip_prefix("No such tool available: ") else {
+        return inner.to_owned();
+    };
+    // A suggestion may follow the name, as in `Tasks. Did you mean Task?`;
+    // a tool's name holds no `. `.
+    let (tool, hint) = rest.trim().split_once(". ").unwrap_or((rest.trim(), ""));
+    let said = match Some(tool)
+        .filter(|tool| !tool.is_empty() && !tool.contains(char::is_whitespace))
+    {
+        Some(tool) if tool.starts_with("mcp__") => {
+            format!(
+                "Claude called {tool}, which isn't available. Its MCP server may not be connected."
+            )
+        }
+        Some(tool) => super::unknown_tool("Claude", tool),
+        None => return inner.to_owned(),
+    };
+    if hint.is_empty() {
+        said
+    } else {
+        format!("{said}\n{hint}")
+    }
+}
+
 /// Whether a user message is Claude Code's record that the person stopped
 /// the turn, which it adds as though the person had written it.
 fn stop_record(message: &Value) -> bool {

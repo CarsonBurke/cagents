@@ -813,7 +813,7 @@ impl Runtime {
                 rows.push(literal_content::search_view(self, item, cached, settings))
             }
             ItemContent::Tool { input, output, .. } => {
-                if !input.is_empty() {
+                if !super::tool_input::is_empty(input) {
                     rows.push(self.tool_code_surface(
                         item,
                         cached,

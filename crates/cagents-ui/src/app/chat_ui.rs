@@ -134,6 +134,7 @@ mod step;
 mod stopped;
 mod text_copy;
 mod thumbnails;
+mod tool_input;
 mod tool_text;
 mod tool_title;
 mod turn;
@@ -257,7 +258,9 @@ pub enum CopyPart {
 fn step_copy_prefix(part: &CopyPart, content: &ItemContent) -> Option<String> {
     match (part, content) {
         (CopyPart::Text, ItemContent::Command { command, .. }) => Some(command.clone()),
-        (CopyPart::Text, ItemContent::Tool { input, .. }) => Some(input.clone()),
+        (CopyPart::Text, ItemContent::Tool { input, .. }) => {
+            Some(tool_text::tool_input(input).0.into_owned())
+        }
         (CopyPart::Output, ItemContent::Command { .. } | ItemContent::Tool { .. }) => {
             Some(String::new())
         }
@@ -1891,7 +1894,9 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
             }
             Some(text)
         }
-        (CopyPart::Text, ItemContent::Tool { input, output, .. }) => joined(&[input, output]),
+        (CopyPart::Text, ItemContent::Tool { input, output, .. }) => {
+            joined(&[&tool_text::tool_input(input).0, output])
+        }
         (
             CopyPart::Text,
             ItemContent::Image {
@@ -1911,7 +1916,9 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         // A command has no separate input block, so its header offers the
         // command line under the same name the tool detail uses for one.
         (CopyPart::Input, ItemContent::Command { command, .. }) => joined(&[command]),
-        (CopyPart::Input, ItemContent::Tool { input, .. }) => joined(&[input]),
+        (CopyPart::Input, ItemContent::Tool { input, .. }) => {
+            joined(&[&tool_text::tool_input(input).0])
+        }
         (CopyPart::Output, ItemContent::Command { output, .. })
         | (CopyPart::Output, ItemContent::Tool { output, .. }) => joined(&[output]),
         // The code blocks of a Markdown answer are the cache's own, resolved
@@ -1949,7 +1956,7 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
             ..
         } => {
             find::contains(name, query)
-                || find::contains(input, query)
+                || find::contains(&tool_text::tool_input(input).0, query)
                 || find::contains(output, query)
         }
         ItemContent::WebSearch {
@@ -2474,16 +2481,13 @@ impl CachedItem {
                 output: result,
                 ..
             } => (
-                Some(prepare_text(
-                    input,
-                    text,
-                    if prepared_input.is_some() {
-                        Language::Plain
-                    } else {
-                        Language::structured(text)
-                    },
-                    prepared_input,
-                )),
+                Some(match prepared_input {
+                    Some(prepared) => ToolText::from_prepared(input, prepared),
+                    None => {
+                        let (text, language) = tool_text::tool_input(text);
+                        ToolText::update(input, &text, language)
+                    }
+                }),
                 Some(prepare_text(
                     output,
                     result,

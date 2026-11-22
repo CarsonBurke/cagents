@@ -4213,10 +4213,65 @@ fn a_failed_edit_is_the_tool_call_and_its_error() {
         vec![ItemContent::Tool {
             name: "MultiEdit".into(),
             input: input.to_string(),
-            output: "<tool_use_error>String to replace not found in file.</tool_use_error>".into(),
+            output: "String to replace not found in file.".into(),
             status: ToolStatus::Failed,
         }]
     );
+}
+
+/// Claude Code wraps an error its harness raised in tags for the model.
+/// The reader gets the sentence, and a tool the model made up is named as
+/// one rather than reported as missing from the harness.
+#[test]
+fn a_harness_error_is_shown_without_its_framing() {
+    let cases = [
+        (
+            "cagents",
+            json!({"command":"reply 67218a1b \"lead: noted\""}),
+            "<tool_use_error>Error: No such tool available: cagents</tool_use_error>",
+            "Claude called a tool that doesn't exist: cagents",
+        ),
+        (
+            "Monitor",
+            json!({"command":"sleep 30"}),
+            "<tool_use_error>Blocked: standalone sleep 30.</tool_use_error>",
+            "Blocked: standalone sleep 30.",
+        ),
+        (
+            "WebFetch",
+            json!({"url":"example"}),
+            "<tool_use_error>InputValidationError: Invalid URL</tool_use_error>",
+            "InputValidationError: Invalid URL",
+        ),
+        (
+            "mcp__docs__search",
+            json!({"query":"seal"}),
+            "<tool_use_error>Error: No such tool available: mcp__docs__search</tool_use_error>",
+            "Claude called mcp__docs__search, which isn't available. Its MCP server may not be connected.",
+        ),
+        (
+            "Tasks",
+            json!({}),
+            "\n<tool_use_error>Error: No such tool available: Tasks. Did you mean Task?</tool_use_error>\n",
+            "Claude called a tool that doesn't exist: Tasks\nDid you mean Task?",
+        ),
+    ];
+    for (name, input, result, shown) in cases {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"call","name":name,"input":input}]}})).unwrap();
+        let failed = adapter.receive(json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"call","is_error":true,"content":result}]}})).unwrap();
+        let [ItemContent::Tool { output, status, .. }] = &items(&failed)[..] else {
+            panic!("{name}: {:#?}", items(&failed))
+        };
+        assert_eq!(output, shown, "{name}");
+        assert_eq!(*status, ToolStatus::Failed, "{name}");
+    }
+    // A successful result is the tool's own text, even when it quotes tags.
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"call","name":"WebFetch","input":{"url":"https://example.com"}}]}})).unwrap();
+    let quoted = "<tool_use_error>Error: No such tool available: x</tool_use_error>";
+    let done = adapter.receive(json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"call","content":quoted}]}})).unwrap();
+    assert!(matches!(&items(&done)[..], [ItemContent::Tool { output, .. }] if output == quoted));
 }
 
 /// A write too large for its input to be held, and an edit whose input

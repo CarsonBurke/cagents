@@ -17,6 +17,14 @@ mod terminal_output;
 /// provider ran the hook.
 pub(crate) const HOOK_CONTEXT: &str = "Hook context";
 
+/// What a failed call says when the model named a tool its harness doesn't
+/// have, in place of the harness's reply to the model. Nothing ran, and the
+/// harness's wording ("No such tool available", "unsupported call") reads as
+/// though cagents or the tool were broken.
+pub(crate) fn unknown_tool(provider: &str, tool: &str) -> String {
+    format!("{provider} called a tool that doesn't exist: {tool}")
+}
+
 /// Startup recovery for the same card and exact conversation. Unavailable
 /// means another attempt may succeed after an external condition changes;
 /// it promises neither immediate success nor automatic replay of uncertain
