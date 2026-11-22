@@ -385,3 +385,86 @@ mod drawn_identity {
         assert!(cache.get(&kept).is_none());
     }
 }
+
+/// The renderer presents a layer stack again without preparing it while the
+/// stack's revision holds, so the revision must change with anything drawn,
+/// clipped or reset, and hold through merging the already merged stack.
+#[cfg(test)]
+mod layer_revision {
+    use iced_core::{Point, Rectangle, Size};
+    use iced_graphics::layer::{self, Stack};
+
+    #[derive(Debug, Default)]
+    struct Layer {
+        bounds: Rectangle,
+        primitives: usize,
+    }
+
+    impl layer::Layer for Layer {
+        fn with_bounds(bounds: Rectangle) -> Self {
+            Self {
+                bounds,
+                primitives: 0,
+            }
+        }
+
+        fn bounds(&self) -> Rectangle {
+            self.bounds
+        }
+
+        fn flush(&mut self) {}
+
+        fn resize(&mut self, bounds: Rectangle) {
+            self.bounds = bounds;
+        }
+
+        fn reset(&mut self) {
+            self.primitives = 0;
+        }
+
+        fn start(&self) -> usize {
+            usize::from(self.primitives > 0)
+        }
+
+        fn end(&self) -> usize {
+            usize::from(self.primitives > 0)
+        }
+
+        fn merge(&mut self, layer: &mut Self) {
+            self.primitives += std::mem::take(&mut layer.primitives);
+        }
+    }
+
+    fn draw(stack: &mut Stack<Layer>) {
+        stack.current_mut().0.primitives += 1;
+    }
+
+    #[test]
+    fn a_stack_revision_changes_only_when_its_layers_may_have() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(8.0, 8.0));
+        let mut stack = Stack::<Layer>::new();
+
+        draw(&mut stack);
+        stack.push_clip(bounds);
+        draw(&mut stack);
+        stack.pop_clip();
+
+        // Preparing merges the layers, and presenting them again merges the
+        // merged layers; neither changes what is presented.
+        stack.merge();
+        let drawn = stack.revision();
+        stack.merge();
+        assert_eq!(stack.revision(), drawn);
+
+        draw(&mut stack);
+        assert_ne!(stack.revision(), drawn, "drawing changes the layers");
+
+        let drawn = stack.revision();
+        stack.push_clip(bounds);
+        assert_ne!(stack.revision(), drawn, "a clip adds a layer");
+
+        let drawn = stack.revision();
+        stack.reset(bounds);
+        assert_ne!(stack.revision(), drawn, "a reset clears the layers");
+    }
+}

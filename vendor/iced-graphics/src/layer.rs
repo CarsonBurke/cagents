@@ -51,6 +51,7 @@ pub struct Stack<T: Layer> {
     previous: Vec<usize>,
     current: usize,
     active_count: usize,
+    revision: u64,
 }
 
 impl<T: Layer> Stack<T> {
@@ -62,6 +63,7 @@ impl<T: Layer> Stack<T> {
             previous: vec![],
             current: 0,
             active_count: 1,
+            revision: 0,
         }
     }
 
@@ -70,6 +72,7 @@ impl<T: Layer> Stack<T> {
     #[inline]
     pub fn current_mut(&mut self) -> (&mut T, Transformation) {
         let transformation = self.transformation();
+        self.revision = self.revision.wrapping_add(1);
 
         (&mut self.layers[self.current], transformation)
     }
@@ -93,6 +96,7 @@ impl<T: Layer> Stack<T> {
             });
 
         self.previous.push(self.current);
+        self.revision = self.revision.wrapping_add(1);
 
         self.current = self.active_count;
         self.active_count += 1;
@@ -218,6 +222,15 @@ impl<T: Layer> Stack<T> {
         self.current = 0;
         self.active_count = 1;
         self.previous.clear();
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Returns a value that changes whenever the layers of the [`Stack`] may
+    /// have: when they are reset, a clip is pushed, or the current layer is
+    /// borrowed to draw. A renderer can present layers again without
+    /// preparing them while it holds.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 }
 

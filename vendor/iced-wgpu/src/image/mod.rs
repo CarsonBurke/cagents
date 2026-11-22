@@ -23,6 +23,15 @@ pub use crate::graphics::Image;
 
 pub type Batch = Vec<Image>;
 
+/// Whether the [`Image`] looks different from one instant to the next, so a
+/// layer presented again must prepare it again.
+pub fn is_animated(image: &Image) -> bool {
+    match image {
+        Image::Raster { .. } => false,
+        Image::Vector { svg, .. } => svg.spin.is_some(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     raw: wgpu::RenderPipeline,
@@ -234,6 +243,7 @@ impl State {
         Self::default()
     }
 
+    /// Prepares the next layer of the frame.
     pub fn prepare(
         &mut self,
         pipeline: &Pipeline,
@@ -246,7 +256,38 @@ impl State {
         scale: f32,
         now: crate::core::time::Instant,
     ) {
-        if self.layers.len() <= self.prepare_layer {
+        self.prepare_at(
+            self.prepare_layer,
+            pipeline,
+            device,
+            belt,
+            encoder,
+            cache,
+            images,
+            transformation,
+            scale,
+            now,
+        );
+
+        self.prepare_layer += 1;
+    }
+
+    /// Prepares the layer at `index` again, replacing what it held, while
+    /// the other layers keep theirs.
+    pub fn prepare_at(
+        &mut self,
+        index: usize,
+        pipeline: &Pipeline,
+        device: &wgpu::Device,
+        belt: &mut wgpu::util::StagingBelt,
+        encoder: &mut wgpu::CommandEncoder,
+        cache: &mut Cache,
+        images: &Batch,
+        transformation: Transformation,
+        scale: f32,
+        now: crate::core::time::Instant,
+    ) {
+        while self.layers.len() <= index {
             self.layers.push(Layer::new(
                 device,
                 &pipeline.constant_layout,
@@ -255,7 +296,8 @@ impl State {
             ));
         }
 
-        let layer = &mut self.layers[self.prepare_layer];
+        let layer = &mut self.layers[index];
+        layer.clear();
 
         let mut atlas: Option<Arc<wgpu::BindGroup>> = None;
 
@@ -405,7 +447,6 @@ impl State {
             &self.linear_instances,
         );
 
-        self.prepare_layer += 1;
         self.nearest_instances.clear();
         self.linear_instances.clear();
     }
@@ -431,8 +472,12 @@ impl State {
         }
     }
 
+    /// Ends a frame. Prepared layers keep their instances, so a frame that
+    /// presents the same layers again can render them without preparing
+    /// them; each is cleared when it is next prepared. Layers this frame
+    /// left unused are cleared now, releasing their atlases.
     pub fn trim(&mut self) {
-        for layer in &mut self.layers[..self.prepare_layer] {
+        for layer in &mut self.layers[self.prepare_layer..] {
             layer.clear();
         }
 

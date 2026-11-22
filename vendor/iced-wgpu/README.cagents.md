@@ -39,3 +39,22 @@ the filtered path for rotated vectors, even on the frame where its angle is
 upright, so its edges do not change sampling once a turn. A window can then
 present the same layers again for the next frame of the spin without drawing
 its widgets.
+
+# Presenting unchanged layers again (#3581)
+
+`Renderer::draw` remembers the physical size, scale factor and layer
+`Stack::revision` (vendor/iced-graphics/README.cagents.md) it last prepared
+for. When a window presents the same layers again for the same target, as it
+does for a frame that only turns spinners, the renderer prepares only the
+image layers holding a spinning SVG, again at their own index, and the
+custom primitives, which may expect a `prepare` per frame. Quads, meshes,
+text and every other image layer render from what they uploaded last time,
+and nothing is trimmed: a trim would release glyphs and atlas entries the
+retained layers still draw. Image layers therefore keep their instances
+through a trim, clearing each one when it is next prepared, and clear the
+layers a frame left unused.
+
+`layer_revision` in `crates/iced-contracts` covers the revision; native
+traces of a window with spinners over long transcripts cover the rest.
+iced_tiny_skia is not vendored, so the software fallback ignores `spin` and
+draws every frame in full.
