@@ -601,9 +601,9 @@ mod subscription_events {
             loop {
                 self.pool.run_until_stalled();
 
-                match self.messages.try_next() {
-                    Ok(Some(message)) => received.push(message),
-                    _ => return received,
+                match self.messages.try_recv() {
+                    Ok(message) => received.push(message),
+                    Err(_) => return received,
                 }
             }
         }

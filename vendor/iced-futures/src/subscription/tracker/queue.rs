@@ -87,14 +87,10 @@ impl Sender {
         shared.events.push_back(event);
 
         let queued = shared.events.len();
+        let backlog = queued >= shared.warn_at;
 
-        if queued >= shared.warn_at {
+        if backlog {
             shared.warn_at = queued * 2;
-
-            log::warn!(
-                "A subscription has {queued} runtime events waiting; \
-                 its stream has not read them"
-            );
         }
 
         let waker = shared.waker.take();
@@ -102,6 +98,13 @@ impl Sender {
 
         if let Some(waker) = waker {
             waker.wake();
+        }
+
+        if backlog {
+            log::warn!(
+                "A subscription has {queued} runtime events waiting; \
+                 its stream has not read them"
+            );
         }
     }
 
@@ -148,8 +151,11 @@ impl Stream for Receiver {
         let mut shared = lock(&self.0);
 
         if let Some(event) = shared.events.pop_front() {
-            if shared.events.is_empty() {
+            if shared.events.is_empty() && shared.warn_at > BACKLOG_WARNING {
+                // A backlog is over: let the warning sound again, and give
+                // back what it took.
                 shared.warn_at = BACKLOG_WARNING;
+                shared.events.shrink_to(BACKLOG_WARNING);
             }
 
             return Poll::Ready(Some(event));
