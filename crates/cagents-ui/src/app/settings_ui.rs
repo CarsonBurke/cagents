@@ -1,5 +1,6 @@
 use super::*;
 use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
+use notify::Watcher as _;
 
 fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a, Message> {
     static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
