@@ -1332,6 +1332,70 @@ mod tests {
         assert!(tiny.height <= 200.0);
     }
 
+    /// Every window the application can be has room for the footer and a
+    /// row above it.
+    #[test]
+    fn the_panel_holds_its_footer_and_a_row_in_any_window() {
+        for width in [900.0, 1_200.0, 1_600.0, 2_650.0, 4_000.0] {
+            for height in [600.0, 800.0, 1_530.0, 2_400.0] {
+                for rows in [1, 2, 3, 40] {
+                    let geometry = Geometry::new(iced::Size::new(width, height), rows);
+                    assert!(
+                        geometry.height >= FOOTER_HEIGHT + 2.0 * LIST_PADDING + ROW_HEIGHT,
+                        "{width}x{height}, {rows} rows: {geometry:?}"
+                    );
+                    assert_eq!(
+                        geometry.list_height,
+                        geometry.height - FOOTER_HEIGHT - 2.0 * LIST_PADDING
+                    );
+                    assert!(geometry.width >= LIST_WIDTH + DETAIL_MIN_WIDTH);
+                }
+            }
+        }
+    }
+
+    /// On Wayland a popup, such as a text field's context menu, is a surface
+    /// of its own and reports its size and scale as a window does. Taken for
+    /// the window's, its size laid the switcher out in the popup's few
+    /// hundred pixels, leaving a sliver of the footer over the scrim.
+    #[test]
+    fn a_popup_surface_leaves_the_switcher_sized_to_the_window() {
+        let mut app = super::super::tests::workspace_switcher_test_app(20);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        let size = iced::Size::new(2_650.0, 1_530.0);
+        let report =
+            |event, window| window_geometry_message(&event, window).expect("native geometry event");
+        drop(app.update(report(window::Event::Resized(size), main)));
+        let popup = window::Id::unique();
+        let menu = iced::Size::new(240.0, 72.0);
+        let opened = window::Event::Opened {
+            size: menu,
+            position: None,
+        };
+        drop(app.update(report(opened, popup)));
+        drop(app.update(report(window::Event::Resized(menu), popup)));
+        drop(app.update(Message::WindowScaleFactorChanged(popup, 2.0)));
+        assert_eq!(
+            (app.window_width, app.window_height),
+            (size.width, size.height)
+        );
+        assert_eq!(app.window_scale_factor, 1.0);
+
+        drop(app.cycle_workspace(
+            crate::workspace::FocusDirection::Right,
+            keyboard::Modifiers::ALT,
+        ));
+        let geometry = app.workspace_switcher_geometry();
+        assert_eq!(geometry, Geometry::new(size, 20));
+        assert_eq!(
+            (geometry.width, geometry.height),
+            (PANEL_MAX_WIDTH, PANEL_MAX_HEIGHT)
+        );
+        assert!(geometry.detail);
+        assert!(app.workspace_switcher_shows_row(1));
+    }
+
     #[test]
     fn only_the_rows_in_and_near_view_are_built() {
         let pitch = ROW_HEIGHT + ROW_GAP;

@@ -841,7 +841,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
     };
     app.sidebar_state.set_card_activity(card, working);
     app.sidebar_state.observe_card_update(card);
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert_eq!(
         app.sidebar_state.agent_activity(first, folder.worktree_id),
         Some(ActivityState::Working)
@@ -854,7 +854,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
     Arc::make_mut(&mut app.durable)
         .card_scopes
         .insert(card, root.clone());
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert_eq!(
         app.sidebar_state.agent_activity(first, folder.worktree_id),
         None
@@ -867,7 +867,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
     assert!(!app.sidebar_state.worktree_has_panes(first, first_row));
     assert!(app.sidebar_state.worktree_has_panes(second, nested_row));
     Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert_eq!(
         app.sidebar_state.agent_activity(second, nested_row),
         Some(ActivityState::Working)
@@ -887,7 +887,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
             cards: vec![card],
             focused: Some(card),
         });
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert!(!app.sidebar_state.worktree_has_panes(second, nested_row));
     assert_eq!(app.sidebar_state.agent_activity(second, nested_row), None);
     assert!(app.sidebar_state.has_card_update(card));
@@ -901,7 +901,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
     if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
         session.launch.working_directory = root.join("unregistered-child");
     }
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert!(app.known_worktree_roots.contains(&root));
     assert_eq!(app.worktree_owners.get(&card), Some(&root));
     assert_eq!(
@@ -927,7 +927,7 @@ fn indexed_owners_preserve_duplicate_rows_folder_precedence_and_explicit_filing(
     if let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind {
         session.launch.working_directory = outside.clone();
     }
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert_eq!(
         app.card_worktree(app.card_state(card).unwrap()),
         Some(outside.as_path())
@@ -1345,7 +1345,7 @@ fn unchanged_agent_output_reuses_ownership_and_topology_rebinds_attention() {
     // A real structural update rebinds both cached activity and unread
     // attention even though no new activity event arrives from the terminal.
     *app.sidebar_model.projects = vec![project(second, second_row)];
-    drop(app.update(Message::WindowResized(1200.0, 800.0)));
+    drop(app.resize_main_window(1200.0, 800.0));
     assert_eq!(app.sidebar_state.agent_activity(first, first_row), None);
     assert!(!app.sidebar_state.has_agent_update(first, first_row));
     assert_eq!(
@@ -2198,7 +2198,7 @@ fn passive_folder_loads_rebind_cached_attention_without_navigation_or_losing_exp
         // Repeated passive loads/ordinary layout and output events do not
         // repeat canonicalization or rescan all original card owners.
         passive_load(&mut app, &nested);
-        drop(app.update(Message::WindowResized(1200.0, 800.0)));
+        drop(app.resize_main_window(1200.0, 800.0));
         for _ in 0..4 {
             apply(&mut app, card, &mut peer, None);
         }
