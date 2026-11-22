@@ -312,7 +312,16 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
             .enumerate()
             .filter(|(_, worktree)| whole || worktree.matches(&folded))
             .collect::<Vec<_>>();
-        if !whole && worktrees.is_empty() {
+        // A creation is found by the name its worktree will have.
+        let operations = entity
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| {
+                whole || crate::sidebar::fold_query(&operation.label).contains(&*folded)
+            })
+            .collect::<Vec<_>>();
+        if !whole && worktrees.is_empty() && operations.is_empty() {
             continue;
         }
         worktrees.sort_by_key(|(_, worktree)| {
@@ -341,20 +350,16 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
         {
             entries.push(worktree_entry(main));
         }
-        if whole {
-            entries.extend(
-                entity
-                    .operations
-                    .iter()
-                    .enumerate()
-                    .map(|(operation, row)| Entry::Operation {
-                        project,
-                        id,
-                        operation,
-                        operation_id: row.id,
-                    }),
-            );
-        }
+        entries.extend(
+            operations
+                .into_iter()
+                .map(|(operation, row)| Entry::Operation {
+                    project,
+                    id,
+                    operation,
+                    operation_id: row.id,
+                }),
+        );
         entries.extend(worktrees.map(worktree_entry));
     }
     entries
@@ -367,13 +372,24 @@ fn row_name(
     primary: bool,
     current: bool,
     indicators: &crate::sidebar::WorktreeIndicators<'_>,
+    panes: usize,
 ) -> String {
-    let mut name = format!("Open {}", worktree.label());
+    let mut name = match &worktree.deletion {
+        // Pressing a row being deleted goes nowhere.
+        Some(RowDeletion::Deleting) => format!("{}, deleting", worktree.label()),
+        Some(RowDeletion::Failed(_)) => format!("Open {}, delete failed", worktree.label()),
+        None => format!("Open {}", worktree.label()),
+    };
     if primary {
         name.push_str(", main checkout");
     }
     if current {
         name.push_str(", current");
+    }
+    if let Some(dirty) = &worktree.dirty
+        && dirty.conflicted > 0
+    {
+        name.push_str(&format!(", {} conflicted", dirty.conflicted));
     }
     if let Some(dirty) = indicators.dirty {
         name.push_str(", ");
@@ -384,6 +400,14 @@ fn row_name(
         if let Some(state) = pr.state {
             name.push_str(&format!(" {}", state.label().to_lowercase()));
         }
+        if pr.review_requested() {
+            name.push_str(", review requested");
+        }
+    }
+    match panes {
+        0 => {}
+        1 => name.push_str(", 1 pane working in it"),
+        panes => name.push_str(&format!(", {panes} panes working in it")),
     }
     name
 }
@@ -947,7 +971,13 @@ impl<'a> View<'a> {
             path: worktree.path.clone(),
         });
         let button = widget::button::custom(lines)
-            .name(row_name(worktree, primary, current, &indicators))
+            .name(row_name(
+                worktree,
+                primary,
+                current,
+                &indicators,
+                agents.len(),
+            ))
             .class(crate::work_ui::card_style(selected))
             .padding([space::XS + space::XXS, space::S])
             .width(Length::Fill)
@@ -1333,6 +1363,14 @@ mod tests {
             worktree_labels(&state, &projects),
             ["# cagents", "old-fix", "# tools", "fix-a", "feat-index"],
             "a row spelling the query out leads one that only contains its letters"
+        );
+
+        drop(state.update(Action::Query("being".into())));
+        state.refresh(1, &projects);
+        assert_eq!(
+            worktree_labels(&state, &projects),
+            ["# cagents", "operation"],
+            "a creation is found by the name its worktree will have"
         );
 
         drop(state.update(Action::Query("new-feat".into())));
