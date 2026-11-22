@@ -8297,7 +8297,8 @@ fn closed_chat_its_view_kept() -> (Cagents, Pane, super::super::chat_ui::Target)
 /// whose stop is still saved, stays out of sight while the launch asks again
 /// and goes once the daemon answers, rather than coming back as a chat.
 /// Restored from its view, the pane shows its saved text until the view
-/// admits it, and goes the same, whether or not the view has admitted it.
+/// admits it; it stays out of sight, its stop saved, until admission lets
+/// its removal reach the view.
 fn next_launch_takes_away(app: &mut Cagents, pane: &Pane) {
     for from_view in [false, true] {
         next_launch_takes_away_as(app, pane, from_view);
@@ -8337,6 +8338,26 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
             Ok(()),
         ))),
     );
+    if from_view {
+        // Only an admitted pane's removal reaches its view: until then it
+        // stays out of sight, its stop saved for a launch that comes first.
+        assert!(
+            next.card_state(pane.id)
+                .is_some_and(|state| state.existence.is_open())
+        );
+        assert!(next.workspace.is_hidden(pane.id), "out of sight meanwhile");
+        assert!(next.closes_out_of_sight(pane.id));
+        assert!(!next.chat_start_pending(pane.id));
+        assert!(
+            !next.persistent_workspace().stopping_chats.is_empty(),
+            "a launch before admission still takes it away"
+        );
+        let mut admitted = pane.clone();
+        admitted.kind = CardKind::Chat(session.clone());
+        let (task, copy) = next.admit_shared_chat(&admitted);
+        drop(task);
+        assert_eq!(copy, None);
+    }
     assert!(
         !next
             .card_state(pane.id)
@@ -8440,6 +8461,45 @@ fn a_kept_closed_pane_whose_stop_settles_off_strip_goes_with_its_strip() {
         );
         assert!(!app.closes_out_of_sight(pane.id));
     }
+}
+
+/// A closed pane its view kept, whose conversation stopped while another
+/// strip was shown, stays when another window puts a different conversation
+/// in it meanwhile: it comes back into sight and is not taken away with its
+/// strip, nor is a stop saved for it.
+#[test]
+fn a_kept_closed_pane_another_window_reuses_stays() {
+    let (mut app, pane, stopping) = closed_chat_its_view_kept();
+    let strip = Cagents::rebuild_workspace(&app.durable);
+    app.workspace = Cagents::rebuild_workspace(&Default::default());
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Ok(()),
+        ))),
+    );
+    assert!(app.closes_out_of_sight(pane.id));
+    let CardKind::Chat(stopped) = app.card_state(pane.id).unwrap().kind.clone() else {
+        panic!("a chat pane");
+    };
+    let mut other = stopped.clone();
+    other.id = TerminalId::new();
+    other.launch.session_id = Some("another-conversation".into());
+    drop(app.attach_shared_chat(pane.id, other));
+    assert!(!app.closes_out_of_sight(pane.id), "back in sight");
+    assert!(
+        app.durable.stopping_chats.is_empty(),
+        "no stop is saved for a pane that stays"
+    );
+    app.workspace = strip;
+    app.rehide_closing_panes();
+    assert!(!app.workspace.is_hidden(pane.id));
+    drop(app.remove_stopped_returns());
+    assert!(
+        app.card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "it stays with its strip"
+    );
 }
 
 /// Closing a retained native chat never opens a modal, and its cleanup is

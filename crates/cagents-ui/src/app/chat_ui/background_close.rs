@@ -286,13 +286,12 @@ impl Cagents {
                 continue;
             }
             // The closed pane itself, restored at launch from its view and
-            // showing saved text until the view admits it: it goes now if
-            // its conversation stopped; otherwise its admission puts it back
-            // on what still runs, as any pane a view shows is.
+            // showing saved text until the view admits it. Only an admitted
+            // pane's removal reaches the view, so one whose conversation
+            // stopped stays out of sight, its stop saved, until admission
+            // takes it away (see `attach_shared_chat`). Otherwise admission
+            // puts it back on what still runs, as any pane a view shows is.
             if card == closing.card && self.chat_awaiting_admission(card) {
-                if goes {
-                    tasks.push(self.take_away_returned_close(card, &closing.session));
-                }
                 continue;
             }
             if !self.awaits_attachment(card) {
@@ -438,15 +437,22 @@ impl Cagents {
                 self.remove_when_placed(card, &session);
                 return Task::none();
             }
+            // A pane that was to go now holds another conversation, put there
+            // by another window: it stays, and attaches as any pane does.
+            let kept = if self.chat_ui.stopped_closes.contains_key(&card) {
+                self.keep_reused_return(card)
+            } else {
+                Task::none()
+            };
             // The last window closed before hearing the stop: the launch asks
             // again, and the pane waits for that answer, unattached (see
             // `resume_stopping_chats`).
             if self.awaits_stop(&session) {
                 self.stash_unsent_chat(card);
                 self.cards.remove(&card);
-                return Task::none();
+                return kept;
             }
-            return self.open_chat(card, session, chat::Intent::Restore);
+            return Task::batch([kept, self.open_chat(card, session, chat::Intent::Restore)]);
         };
         if let Some(closing) = self.chat_ui.background_closes.get_mut(&target) {
             if !closing.reopens.contains(&card) {
@@ -537,6 +543,24 @@ impl Cagents {
             app.card_state(card)
                 .is_some_and(|state| state.existence.is_open())
         };
+        // Another window put a different conversation in the pane since: it
+        // stays, and so does what runs it.
+        let holds_stopped = match (
+            self.chat_ui.stopped_closes.get(&card),
+            self.chat_return_session(card),
+        ) {
+            (Some(stopped), Some(current)) => shares_conversation(stopped, &current),
+            _ => false,
+        };
+        if open(self) && !holds_stopped {
+            return self.keep_reused_return(card);
+        }
+        // Only an admitted pane's removal reaches its view, so one still
+        // awaiting admission waits for it out of sight.
+        if self.chat_awaiting_admission(card) {
+            self.chat_ui.hidden_returns.insert(card);
+            return Task::none();
+        }
         let task = if open(self) {
             self.remove_chat_card(card, None)
         } else {
@@ -557,6 +581,16 @@ impl Cagents {
             self.chat_ui.hidden_returns.insert(card);
         }
         task.unwrap_or_else(Task::none)
+    }
+
+    /// Keeps a pane that was to go because another window has put a
+    /// different conversation in it, back in sight.
+    fn keep_reused_return(&mut self, card: CardId) -> Task<Message> {
+        // Forgotten while it is still known to have stopped.
+        self.forget_stop_of_removed(card);
+        self.chat_ui.stopped_returns.remove(&card);
+        self.chat_ui.stopped_closes.remove(&card);
+        self.show_returned_close(card)
     }
 
     /// Forgets the stop saved for the closed pane `card` once the pane is
@@ -633,6 +667,10 @@ impl Cagents {
             .filter(|closing| closing.reopens.contains(&closing.card))
             .map(|closing| closing.card)
             .chain(self.chat_ui.stopped_returns.iter().copied())
+            .chain(self.chat_ui.hidden_returns.iter().copied().filter(|card| {
+                self.chat_awaiting_admission(*card)
+                    && self.chat_ui.stopped_closes.contains_key(card)
+            }))
             .collect::<HashSet<_>>();
         let released = self
             .chat_ui
@@ -775,6 +813,25 @@ impl Cagents {
     /// still running it, on a pane that says why it could not be stopped. A
     /// conversation already open is brought into view instead.
     pub(in crate::app) fn reopen_refused_close(&mut self, id: TerminalId) -> Task<Message> {
+        // A pane its view holds goes back to the conversation once admitted,
+        // which takes the record then: Reopen goes to that pane.
+        let awaiting = self
+            .durable
+            .stopping_chats
+            .iter()
+            .find(|stopping| stopping.session.id == id && stopping.refused.is_some())
+            .and_then(|failure| {
+                self.durable.cards.iter().find(|state| {
+                    state.existence.is_open()
+                        && self.chat_awaiting_admission(state.id)
+                        && matches!(&state.kind, CardKind::Chat(session)
+                            if shares_conversation(&failure.session, session))
+                })
+            })
+            .map(|state| state.id);
+        if let Some(card) = awaiting {
+            return cosmic::task::message(Message::FocusCard(card));
+        }
         let Some((failure, reason)) = self.take_close_failure(id) else {
             return Task::none();
         };
