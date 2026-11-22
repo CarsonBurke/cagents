@@ -272,7 +272,11 @@ for line in sys.stdin:
         1,
         "an ambiguous HTTP 200 must reuse the original claim"
     );
-    change_state(&root, "claude", |state| state["mode"] = "disconnect".into());
+    // Fable is used again, so its remaining reset has something to refill.
+    change_state(&root, "claude", |state| {
+        state["mode"] = "disconnect".into();
+        state["usage"]["rate_limits"]["model_scoped"][0]["utilization"] = 100.into();
+    });
     let response = consume(
         claude.clone(),
         "cedar_ember/fable-fixture".into(),

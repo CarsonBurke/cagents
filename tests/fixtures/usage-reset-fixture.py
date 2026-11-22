@@ -198,6 +198,34 @@ def write_claude_frames(home, state):
     write_text(home / "fixture-frames.jsonl", "".join(json.dumps(frame) + "\n" for frame in frames))
 
 
+def served_usage(limits, user_agent):
+    """The usage read as Claude's service answers it.
+
+    Reset programs are offered only to Claude Code's own CLI surface; any
+    other agent reads them as ineligible with no grants. Each grant reports
+    how much of every limit it clears is used, as the service does.
+    """
+    limits = copy.deepcopy(limits)
+    if not (user_agent or "").startswith("claude-cli/"):
+        if isinstance(limits.get("cedar_ember"), dict):
+            limits["cedar_ember"] = {"eligible": False, "ineligible_reason": "surface",
+                                     "at_limit": False, "exhausted": [], "grants": [],
+                                     "next_grant_id": None, "weekly_resets_at": None,
+                                     "cooldown_until": None, "event_props": None}
+        if isinstance(limits.get("juniper_tide"), dict):
+            limits["juniper_tide"] = {"eligible": False, "ineligible_reason": "surface",
+                                      "in_experiment": False, "arm": None, "available": False,
+                                      "next_available_at": None, "weekly_resets_at": None,
+                                      "resets_per_week": 1, "event_props": None}
+        return limits
+    used = {key: limits[key]["utilization"] for key in ("five_hour", "seven_day")}
+    used["seven_day_overage_included"] = next(model["utilization"] for model in limits["model_scoped"]
+                                              if model["display_name"] == "Fable")
+    for item in (limits.get("cedar_ember") or {}).get("grants", []):
+        item["percent_used"] = {window: used[window] for window in item["clears"] if window in used}
+    return limits
+
+
 def consume_claude(home, body):
     if not isinstance(body, dict):
         return 400, {"error": "fixture request must be an object"}, False
@@ -219,8 +247,8 @@ def consume_claude(home, body):
         item = next((item for item in program["grants"] if item["id"] == identifier), None)
         if item is None or item["resets_left"] == 0:
             return 200, {"result": "already_used", "resets_left": 0, "cleared": []}, False
-        if program["next_grant_id"] != identifier:
-            return 200, {"result": "ineligible", "reason": "not_next_grant"}, False
+        if not item.get("usable_now") or item.get("paused"):
+            return 200, {"result": "unavailable"}, False
         item["resets_left"] -= 1
         state["consume_count"] += 1
         for window in item["clears"]:
@@ -331,7 +359,7 @@ def server(root):
                 self.response(404, {})
                 return
             with state_file(home, readonly=True) as state:
-                limits = copy.deepcopy(state["usage"]["rate_limits"])
+                limits = served_usage(state["usage"]["rate_limits"], self.headers.get("User-Agent"))
             self.response(200, limits)
 
         def do_POST(self):
@@ -364,16 +392,26 @@ def server(root):
 
 
 def configure(root, provider, mode):
-    if provider not in ("claude", "codex") or mode not in ("success", "error", "disconnect", "unconfirmed", "depleted", "limited"):
+    if provider not in ("claude", "codex") or mode not in (
+            "success", "error", "disconnect", "unconfirmed", "depleted", "limited", "fable-unused"):
         raise ValueError("unknown reset fixture provider or mode")
-    if mode == "unconfirmed" and provider != "claude":
-        raise ValueError("unconfirmed is a Claude-only mode")
+    if mode in ("unconfirmed", "fable-unused") and provider != "claude":
+        raise ValueError(f"{mode} is a Claude-only mode")
     root = private_directory(root)
     marker = root / ".cagents-reset-fixture"
     if not marker.is_file() or marker.is_symlink():
         raise ValueError("reset mode requires the private fixture marker")
     with state_file(root / "home" / ("." + provider)) as state:
-        state["mode"] = "success" if mode in ("depleted", "limited") else mode
+        state["mode"] = "success" if mode in ("depleted", "limited", "fable-unused") else mode
+        if mode == "fable-unused":
+            # Fable unused: its reset has nothing to refill and is held.
+            limits = state["usage"]["rate_limits"]
+            for model in limits["model_scoped"]:
+                if model["display_name"] == "Fable":
+                    model["utilization"] = 0
+            limits["cedar_ember"]["at_limit"] = False
+            limits["cedar_ember"]["exhausted"] = []
+            return
         if mode not in ("depleted", "limited"):
             return
         if provider == "claude":

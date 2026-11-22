@@ -370,9 +370,24 @@ pub fn parse_resets(body: &Value, now_secs: u64) -> Vec<super::UsageReset> {
                 value.is_null() || value.as_str().and_then(parse_rfc3339).is_some()
             })
         });
+        // Claude Code offers every usable grant, not only `next_grant_id`,
+        // which merely names the one it would suggest first. Like claude.ai,
+        // a grant is not offered while every limit it refills is unused.
+        let refills_usage = grant["percent_used"].as_object().is_none_or(|used| {
+            grant["clears"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|window| {
+                    used.get(window)
+                        .and_then(Value::as_f64)
+                        .is_none_or(|used| used > 0.0)
+                })
+        });
         let usable = valid_times
+            && refills_usage
             && program["eligible"].as_bool() == Some(true)
-            && program["next_grant_id"].as_str() == Some(id)
             && grant["usable_now"].as_bool() == Some(true)
             && grant["paused"].as_bool() != Some(true)
             && starts.is_none_or(|start| start <= now_secs as i64)
@@ -1817,11 +1832,81 @@ mod reset_tests {
         );
         assert_eq!(resets[0].expires_at, Some(1_893_456_000));
         assert!(resets[0].is_available(1_000));
-        assert!(!resets[1].is_available(1_000));
+        assert!(
+            resets[1].is_available(1_000),
+            "a usable grant need not be the suggested next one"
+        );
         assert_eq!(
             resets[2].available_count, 1,
             "weekly capacity is not current credit count"
         );
+    }
+
+    /// A redacted reading of a Max account at 97% of its weekly limit with no
+    /// Fable usage, as claude.ai shows it: a Weekly reset that can be used
+    /// and a Fable reset with nothing to refill.
+    #[test]
+    fn real_inventory_offers_the_weekly_reset_and_holds_the_unneeded_fable_one() {
+        let body = json!({"cedar_ember": {
+            "eligible": true, "ineligible_reason": null, "at_limit": false, "exhausted": [],
+            "grants": [
+                {"id": "full-reset-2611", "label": "One full limit reset (November 2026)",
+                 "resets_total": 1, "resets_left": 1,
+                 "starts_at": "2026-11-10T21:30:00+00:00", "ends_at": "2026-12-10T22:00:00+00:00",
+                 "clears": ["seven_day", "seven_day_overage_included"],
+                 "paused": false, "usable_now": true, "use_requires_limit": false,
+                 "percent_used": {"seven_day": 97, "seven_day_overage_included": 0},
+                 "blocking": [], "arm": null, "type": "weekly", "unavailable_reason": null,
+                 "gives_back_weekly": false},
+                {"id": "launch-2610-fable",
+                 "label": "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium",
+                 "resets_total": 1, "resets_left": 1,
+                 "starts_at": "2026-11-09T18:00:00+00:00", "ends_at": "2027-03-09T07:59:00+00:00",
+                 "clears": ["seven_day_overage_included"],
+                 "paused": false, "usable_now": true, "use_requires_limit": false,
+                 "percent_used": {"seven_day_overage_included": 0},
+                 "blocking": [], "arm": null, "type": "full", "unavailable_reason": null,
+                 "gives_back_weekly": true}
+            ],
+            "next_grant_id": "full-reset-2611",
+            "weekly_resets_at": "2026-11-26T12:00:00+00:00", "cooldown_until": null,
+            "event_props": {"surface": "claude_code_cli", "tier": "claude_max_20x"},
+            "paused_held": false
+        }, "juniper_tide": {
+            "eligible": false, "ineligible_reason": "not_at_wall", "in_experiment": false,
+            "arm": null, "available": false, "next_available_at": null,
+            "weekly_resets_at": null, "resets_per_week": 1, "event_props": null
+        }});
+        let now = 1_795_300_000; // 2026-11-21
+        let resets = parse_resets(&body, now as u64);
+        assert_eq!(resets.len(), 2);
+        let weekly = &resets[0];
+        assert_eq!(weekly.id, "cedar_ember/full-reset-2611");
+        assert_eq!(
+            weekly.scopes,
+            [
+                super::super::ResetScope::AccountWeekly,
+                super::super::ResetScope::Model("Fable".into())
+            ]
+        );
+        assert_eq!(weekly.expires_at, Some(1_796_940_000));
+        assert!(weekly.is_available(now));
+        let fable = &resets[1];
+        assert_eq!(fable.id, "cedar_ember/launch-2610-fable");
+        assert_eq!(
+            fable.scopes,
+            [super::super::ResetScope::Model("Fable".into())]
+        );
+        assert_eq!(fable.available_count, 1);
+        assert_eq!(fable.expires_at, Some(1_804_579_140));
+        assert!(
+            !fable.is_available(now),
+            "there is no Fable usage for it to refill"
+        );
+
+        let mut used = body.clone();
+        used["cedar_ember"]["grants"][1]["percent_used"]["seven_day_overage_included"] = json!(40);
+        assert!(parse_resets(&used, now as u64)[1].is_available(now));
     }
 
     #[test]
