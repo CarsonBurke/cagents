@@ -8311,6 +8311,8 @@ fn an_agents_report_says_how_the_agent_stands_now() {
     );
     assert_eq!(stopped.outcome.as_deref(), Some("stopped"));
     assert_eq!(stopped.heading, "Agent \"Review restart safety\" stopped");
+    // Marked as its row and tab mark a stopped agent.
+    assert_eq!(stopped.glyph, Icon::Ended);
     // Resumed after it was stopped, the notice keeps its own words.
     Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
     runtime.agent_work.observe(&runtime.snapshot.subagents);

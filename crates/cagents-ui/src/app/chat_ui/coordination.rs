@@ -1017,7 +1017,8 @@ enum Tone {
 /// preview has any, and a preview that is one term, an agent's type, is left
 /// out whole rather than cut, so the name fades only once nothing follows it.
 /// What must not be cut for the state's sake, the second element, is the
-/// verb, the name and the tag, measured and never drawn.
+/// verb, as much of the name as [`LABEL_CHARS`] allows and the tag, measured
+/// and never drawn: past that, a long name fades rather than hide the state.
 fn row_words(
     verb: &'static str,
     name: String,
@@ -1025,8 +1026,8 @@ fn row_words(
     preview: String,
     term: bool,
 ) -> (Element<'static, Message>, Element<'static, Message>) {
-    let title =
-        crate::ui_controls::FadeText::transcript(name.clone()).font(design::transcript_name_font());
+    let measured = Runtime::short_description(&name, LABEL_CHARS);
+    let title = crate::ui_controls::FadeText::transcript(name).font(design::transcript_name_font());
     let tagged =
         |tag: String| design::transcript_name(tag).wrapping(iced::widget::text::Wrapping::None);
     let title: Element<'static, Message> = if tag.is_empty() {
@@ -1053,7 +1054,7 @@ fn row_words(
             .wrapping(iced::widget::text::Wrapping::None)
             .into(),
         widget::row::with_children(vec![
-            design::transcript_name(name)
+            design::transcript_name(measured)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             tagged(tag).into(),
@@ -2109,6 +2110,14 @@ mod identity_tests {
             .push(running_command("soak", "scripts/soak").into());
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Waiting on 2 commands");
+        // A long command is cut once, where the tab cuts it, and the row's
+        // bound leaves that cut whole.
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].items =
+            vec![running_command("long", "scripts/restart-check-every-release-path").into()];
+        observe(&mut runtime);
+        let long = row(&runtime).state.text;
+        assert_eq!(long, "Waiting on scripts/restart-check-ev…");
+        assert_eq!(long.chars().count(), STATUS_CHARS);
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
             .items
             .clear();
@@ -2431,6 +2440,17 @@ mod identity_tests {
         );
         let kept = lay(kept, 4000.0).size().width;
         assert_eq!(kept, verb + gap + whole[0] + whole[1]);
+        // A long name is kept only as far as a recipient's would be: past
+        // that it fades, and the state keeps its place beside it.
+        let long = "Confirm every supported upgrade path still migrates from the oldest release";
+        let kept = |name: &str| {
+            let (_, kept) = row_words("Started", name.into(), String::new(), String::new(), true);
+            lay(kept, 4000.0).size().width
+        };
+        assert_eq!(
+            kept(long),
+            kept(&Runtime::short_description(long, LABEL_CHARS))
+        );
     }
 
     /// Claude addresses an agent by the agent ID it gave it, never by the

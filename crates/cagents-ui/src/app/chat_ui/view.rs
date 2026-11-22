@@ -1631,9 +1631,12 @@ const BACKGROUND_WORK_CHARS: usize = 24;
 /// How a caption naming one command an agent waits on starts.
 const WAITING_ON: &str = "Waiting on ";
 
-/// The longest an agent's caption runs: one naming the command it waits on.
-/// A row holds its status to this, so it says what the agent's tab says.
-pub(super) const AGENT_CAPTION_CHARS: usize = WAITING_ON.len() + BACKGROUND_WORK_CHARS;
+/// The longest an agent's caption runs: one naming the command it waits on,
+/// with the ellipsis a cut command ends with. A row holds its status to
+/// this, so it says what the agent's tab says. `WAITING_ON` is ASCII, so its
+/// length in bytes is its length in characters.
+pub(super) const AGENT_CAPTION_CHARS: usize = WAITING_ON.len() + BACKGROUND_WORK_CHARS + 1;
+const _: () = assert!(WAITING_ON.is_ascii());
 
 /// Whether a delivery draws its message actions: while its detail shows,
 /// or always when it cannot be opened, so a message that is only its row
@@ -6734,9 +6737,17 @@ impl Runtime {
         };
         // Where a turn was stopped is marked as other stopped work is, by a
         // still mark unlike the Stop control.
+        // An agent stopped, or ended without saying how it went, is marked
+        // as its row and tab mark it.
+        let ended = agent.is_some_and(|agent| {
+            matches!(
+                agent.status,
+                chat::ToolStatus::Stopped | chat::ToolStatus::Ended
+            )
+        });
         let glyph = if failed {
             Icon::Error
-        } else if stopped {
+        } else if stopped || ended {
             Icon::Ended
         } else if notice && delivery_command_outcome(heading).is_some() {
             Icon::Terminal
