@@ -409,7 +409,7 @@ impl WorktreePathIndex {
     }
 
     /// Every worktree row at `path`.
-    fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
+    pub(super) fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
         self.rows.get(path).map_or(&[], Vec::as_slice)
     }
 }

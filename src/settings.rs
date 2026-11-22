@@ -312,6 +312,8 @@ pub struct KeyboardShortcuts {
     pub focus_pane_9: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    /// Opens the Work pane on its Worktrees view.
+    pub open_worktrees: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -355,6 +357,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_9: vec!["Alt+9".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
+            open_worktrees: vec!["Ctrl+Shift+E".to_owned()],
         }
     }
 }
@@ -368,7 +371,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 39] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -408,6 +411,7 @@ impl KeyboardShortcuts {
             &self.focus_pane_9,
             &self.toggle_projects,
             &self.rename_pane,
+            &self.open_worktrees,
         ]
     }
 
@@ -452,6 +456,7 @@ impl KeyboardShortcuts {
             35 => self.focus_pane_9 = chords,
             36 => self.toggle_projects = chords,
             37 => self.rename_pane = chords,
+            38 => self.open_worktrees = chords,
             _ => panic!("unknown shortcut action"),
         }
     }
@@ -520,7 +525,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 39] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -559,6 +564,7 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_9",
     "toggle_projects",
     "rename_pane",
+    "open_worktrees",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1861,7 +1867,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 34] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1895,6 +1901,7 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "open_worktrees",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {

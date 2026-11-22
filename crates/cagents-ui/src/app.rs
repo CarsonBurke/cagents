@@ -74,6 +74,7 @@ mod update_resume;
 mod update_ui;
 mod work_ui;
 mod workspace_model_sync;
+mod worktrees_pane;
 #[cfg(test)]
 use workspace_model_sync::{TestModelRequests, test_model_channel};
 mod workspace_switcher;
@@ -3312,6 +3313,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AccountUi(action) => action.blocked_while_modal(),
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
+        // Its actions open dialogs of their own, which a dialog already open
+        // must refuse.
+        Message::WorktreesUi(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -3656,11 +3660,12 @@ pub enum SettingsField {
     ShortcutFocusPane9,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutOpenWorktrees,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 39] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3699,6 +3704,7 @@ impl SettingsField {
         Self::ShortcutFocusPane9,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutOpenWorktrees,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3751,6 +3757,7 @@ impl SettingsField {
             Self::ShortcutChatAccount => "Choose chat account",
             Self::ShortcutToggleInspector => "Toggle inspector",
             Self::ShortcutOpenSettings => "Open settings",
+            Self::ShortcutOpenWorktrees => "Open worktrees",
             Self::ShortcutMovePaneLeft => "Move pane left",
             Self::ShortcutMovePaneRight => "Move pane right",
             Self::ShortcutReopenPane => "Reopen closed pane",
@@ -3868,6 +3875,7 @@ impl SettingsField {
             | Self::ShortcutChatAccount
             | Self::ShortcutToggleInspector
             | Self::ShortcutOpenSettings
+            | Self::ShortcutOpenWorktrees
             | Self::ShortcutMovePaneLeft
             | Self::ShortcutMovePaneRight
             | Self::ShortcutReopenPane
@@ -3926,6 +3934,7 @@ struct ShortcutDraft {
     chat_account: String,
     toggle_inspector: String,
     open_settings: String,
+    open_worktrees: String,
     move_pane_left: String,
     move_pane_right: String,
     reopen_pane: String,
@@ -3969,6 +3978,7 @@ impl ShortcutDraft {
             chat_account: settings::format_chords(&shortcuts.chat_account),
             toggle_inspector: settings::format_chords(&shortcuts.toggle_inspector),
             open_settings: settings::format_chords(&shortcuts.open_settings),
+            open_worktrees: settings::format_chords(&shortcuts.open_worktrees),
             move_pane_left: settings::format_chords(&shortcuts.move_pane_left),
             move_pane_right: settings::format_chords(&shortcuts.move_pane_right),
             reopen_pane: settings::format_chords(&shortcuts.reopen_pane),
@@ -4257,6 +4267,7 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.toggle_inspector = value
             }
             SettingsField::ShortcutOpenSettings => self.keyboard_shortcuts.open_settings = value,
+            SettingsField::ShortcutOpenWorktrees => self.keyboard_shortcuts.open_worktrees = value,
             SettingsField::ShortcutMovePaneLeft => self.keyboard_shortcuts.move_pane_left = value,
             SettingsField::ShortcutMovePaneRight => self.keyboard_shortcuts.move_pane_right = value,
             SettingsField::ShortcutReopenPane => self.keyboard_shortcuts.reopen_pane = value,
@@ -4373,6 +4384,10 @@ fn settings_update(
         }
         SettingsField::ShortcutOpenSettings => {
             next.keyboard_shortcuts.open_settings = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenWorktrees => {
+            next.keyboard_shortcuts.open_worktrees = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutMovePaneLeft => {
@@ -5403,6 +5418,7 @@ pub enum Message {
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
+    WorktreesUi(crate::worktrees_ui::Action),
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -6060,6 +6076,7 @@ pub struct Cagents {
     sign_ins: account_ui::SignIns,
     automation_ui: crate::automation_ui::State,
     work_ui: crate::work_ui::State,
+    worktrees_ui: crate::worktrees_ui::State,
     automation_approval: automation_approval::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -9412,6 +9429,7 @@ impl Cagents {
             projection_stage!("row_selection", self.prune_sidebar_row_selection());
         }
         projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
+        projection_stage!("worktrees_pane", self.refresh_worktrees_pane());
         // Ahead of the rebind, which pins what the inspector drawing source
         // control chose: a pane that has just arrived, closed or taken focus
         // must not show the last binding for a frame.
@@ -9883,6 +9901,10 @@ impl Cagents {
     ) -> &'a str {
         if let Some(title) = self.chrome_ui.user_titles.get(&card.id) {
             return title;
+        }
+        // The Work pane is named for the view it shows.
+        if card.kind == CardKind::Work && self.work_ui.shows_worktrees() {
+            return "Worktrees";
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
@@ -12535,6 +12557,14 @@ impl Cagents {
             ),
             Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
+            Some(CardRuntime::Work) if self.work_ui.shows_worktrees() => self
+                .worktrees_ui
+                .view(
+                    &self.sidebar_model.projects,
+                    &self.sidebar_model.external_editors,
+                    self.modal_is_open(),
+                )
+                .map(Message::WorktreesUi),
             Some(CardRuntime::Work) => self.work_ui.view().map(Message::WorkUi),
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, self.ended_terminal(id))
@@ -16373,6 +16403,7 @@ impl Application for Cagents {
             sign_ins: account_ui::SignIns::default(),
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
+            worktrees_ui: crate::worktrees_ui::State::default(),
             automation_approval: automation_approval::State::default(),
             chrome_ui: chrome_ui::State::default()
                 .with_user_titles(
@@ -19563,6 +19594,7 @@ impl Cagents {
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
+            Message::WorktreesUi(action) => self.update_worktrees_ui(action),
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),

@@ -90,6 +90,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Choose native chat permission mode | `Ctrl+Shift+O` |
 | Command palette | `Ctrl+Shift+P` |
 | Open settings | `Ctrl+Comma` |
+| Open worktrees | `Ctrl+Shift+E` |
 | Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
 | Rename focused pane | `F2` |
 | Move pane left / right | `Alt+Shift+Left` / `Alt+Shift+Right` |
@@ -493,6 +494,23 @@ its pull request when it has no worktree. Its menu, also on right-click, opens
 either one or its Linear issue, copies the branch, and pins or unpins the card.
 A pin shows at once. A card's sessions are buttons that focus the session in
 whichever window shows it.
+
+### Worktrees
+
+The Work pane's third view lists every checkout of every open project. The
+**Worktrees** button at the top right of the tab bar, `Ctrl+Shift+E` and the
+command palette's **Open worktrees** open the pane on it. Each project lists its
+main checkout first, marked with a house, then its worktrees, under a heading
+that counts the worktrees and the agents working or waiting in them. A row shows
+the branch or pull request, uncommitted changes and conflicts, commits ahead of
+and behind its upstream, the pull request's state, checks and review, and the
+chats and terminals working in it; pressing one of those goes to it. Clicking a
+row opens the checkout. Its menu, also on right-click, starts a thread or
+terminal there, copies the branch or path, creates a worktree from the branch,
+opens or creates its pull request, opens the folder or an editor, and deletes the
+worktree after the usual checks. The project's own menu opens its folder,
+editors and GitHub repository, and removes the project; **Open project…** adds
+one.
 
 ```sh
 cagents work                      # this project, the newest 10 cards of each column

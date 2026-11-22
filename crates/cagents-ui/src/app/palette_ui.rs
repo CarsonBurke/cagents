@@ -1243,6 +1243,7 @@ impl Cagents {
             }
             Command::ToggleInspector => self.dispatch(Message::ToggleContextInspector),
             Command::OpenSettings => self.dispatch(Message::Sidebar(SidebarAction::OpenSettings)),
+            Command::OpenWorktrees => self.open_worktrees(),
             Command::NewTerminal => self.dispatch(Message::NewTerminal),
             Command::NewChannel => self.new_project_channel(),
             Command::ClonePane => self.clone_focused_pane(),
@@ -1401,6 +1402,7 @@ impl SettingsField {
             Self::ShortcutChatAccount => Some(Command::ChatAccount),
             Self::ShortcutToggleInspector => Some(Command::ToggleInspector),
             Self::ShortcutOpenSettings => Some(Command::OpenSettings),
+            Self::ShortcutOpenWorktrees => Some(Command::OpenWorktrees),
             Self::ShortcutMovePaneLeft => Some(Command::MovePaneLeft),
             Self::ShortcutMovePaneRight => Some(Command::MovePaneRight),
             Self::ShortcutReopenPane => Some(Command::ReopenPane),
@@ -1473,6 +1475,7 @@ impl ShortcutDraft {
             (Command::ChatAccount, self.chat_account.as_str()),
             (Command::ToggleInspector, self.toggle_inspector.as_str()),
             (Command::OpenSettings, self.open_settings.as_str()),
+            (Command::OpenWorktrees, self.open_worktrees.as_str()),
             (Command::MovePaneLeft, self.move_pane_left.as_str()),
             (Command::MovePaneRight, self.move_pane_right.as_str()),
             (Command::ReopenPane, self.reopen_pane.as_str()),

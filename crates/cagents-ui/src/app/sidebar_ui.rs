@@ -333,7 +333,10 @@ impl Cagents {
             }
             SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
             SidebarAction::OpenAutomations => self.open_automations(),
-            SidebarAction::OpenWork => self.open_utility_card(CardKind::Work),
+            SidebarAction::OpenWork => {
+                self.work_ui.show(false);
+                self.open_utility_card(CardKind::Work)
+            }
             // The handle clamps to its own rendered bounds, and the
             // settings file accepts a narrower range, so the width is
             // clamped again before it can reach a rejected save.

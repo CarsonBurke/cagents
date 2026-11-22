@@ -61,6 +61,7 @@ pub enum GlobalShortcut {
     ChatPermissions,
     ToggleInspector,
     OpenSettings,
+    OpenWorktrees,
     MovePaneLeft,
     MovePaneRight,
     ReopenPane,
@@ -213,6 +214,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::OpenSettings,
         label: "Open settings",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenWorktrees,
+        label: "Open worktrees",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -411,6 +418,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ChatAccount => &shortcuts.chat_account,
         GlobalShortcut::ToggleInspector => &shortcuts.toggle_inspector,
         GlobalShortcut::OpenSettings => &shortcuts.open_settings,
+        GlobalShortcut::OpenWorktrees => &shortcuts.open_worktrees,
         GlobalShortcut::MovePaneLeft => &shortcuts.move_pane_left,
         GlobalShortcut::MovePaneRight => &shortcuts.move_pane_right,
         GlobalShortcut::ReopenPane => &shortcuts.reopen_pane,

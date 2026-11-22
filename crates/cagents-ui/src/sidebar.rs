@@ -947,7 +947,9 @@ impl SidebarProject {
         self.github_ready = false;
     }
 
-    fn matches(&self, folded_query: &str) -> bool {
+    /// Whether a query, folded by [`fold_query`], finds this row as the
+    /// sidebar search does.
+    pub(crate) fn matches(&self, folded_query: &str) -> bool {
         self.search_rank(folded_query).is_some()
     }
 
@@ -1195,7 +1197,9 @@ impl SidebarWorktree {
         self.refresh_status_chrome();
     }
 
-    fn matches(&self, folded_query: &str) -> bool {
+    /// Whether a query, folded by [`fold_query`], finds this row as the
+    /// sidebar search does.
+    pub(crate) fn matches(&self, folded_query: &str) -> bool {
         self.search_rank(folded_query).is_some()
     }
 
@@ -1511,11 +1515,11 @@ impl SidebarPullRequest {
 
     // Keep the last remote facts for a later refresh or reopening, but do not
     // present them as outstanding work after the pull request has finished.
-    fn review_requested(&self) -> bool {
+    pub(crate) fn review_requested(&self) -> bool {
         self.needs_review && !self.is_terminal()
     }
 
-    fn active_checks(&self) -> Option<CheckStatus> {
+    pub(crate) fn active_checks(&self) -> Option<CheckStatus> {
         (!self.is_terminal()).then_some(self.checks)
     }
 
@@ -13574,6 +13578,11 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
 
 /// Case-folds a filter key. Entities store the result so the free-text filter
 /// never folds a candidate while rendering.
+/// A search query in the form row matchers compare it in.
+pub(crate) fn fold_query(query: &str) -> Box<str> {
+    fold(query.trim())
+}
+
 fn fold(value: &str) -> Box<str> {
     value.case_fold().collect::<String>().into_boxed_str()
 }
