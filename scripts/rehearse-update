@@ -37,6 +37,11 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        --new-terminal-after-restore, --natural-idle,
                        --expect-terminal-restart-failure (before example).
                        See run --help.
+  feed DIR             Serve updates from the file feed DIR (see
+                       scripts/release feed): the private user's curl may read
+                       only file:///DIR, and CAGENTS_UPDATE_FEED names it.
+                       Only rehearsal builds (CAGENTS_UPDATE_REHEARSAL_KEYS)
+                       and development builds read that variable.
   compare A B          Compare record names, directories or snapshot JSON.
   cleanup              Stop everything and remove this marked root.
   launch [--restore-existing-only] [main|NAME]
@@ -143,6 +148,10 @@ user_env() {
             die 'startup bind fixture must be an owned private regular library'
         passed+=("LD_PRELOAD=$root/.fixture/startup-bind.so")
     fi
+    # A file feed the in-app updater reads instead of github.com.
+    if [ -f "$root/feed" ]; then
+        passed+=("CAGENTS_UPDATE_FEED=file://$(cat -- "$root/feed")")
+    fi
     env -i -C "$user_home" "${passed[@]}" \
         HOME="$user_home" USER="$(id -un)" LOGNAME="$(id -un)" SHELL=/bin/bash \
         XDG_RUNTIME_DIR="$runtime" \
@@ -208,6 +217,30 @@ cmd_init() {
             commit --quiet --allow-empty --message "Rehearsal project $project"
     done
     printf 'initialized %s\n' "$root"
+}
+
+# Lets the private user's curl read one file feed and nothing else, so the
+# in-app updater finds and downloads releases there as it would on GitHub.
+cmd_feed() {
+    require_init
+    local feed
+    feed=$(realpath -e -- "${1:?feed needs a directory}") || die 'feed directory not found' 2
+    [ -d "$feed/latest/download" ] || die "not a release feed (no latest/download): $feed" 2
+    [[ $feed =~ ^/[A-Za-z0-9._/-]+$ ]] || die "feed path has unsupported characters: $feed" 2
+    printf '%s\n' "$feed" >"$root/feed"
+    cat >"$bin/curl" <<CURL
+#!/bin/sh
+# Only file:///$feed/... URLs; anything else has no network here.
+for argument do
+    case \$argument in
+        file://$feed/*) ;;
+        *://*) echo "curl: (7) the rehearsal has no network access" >&2; exit 7 ;;
+    esac
+done
+exec /usr/bin/curl "\$@"
+CURL
+    chmod 755 "$bin/curl"
+    printf 'updates now come from %s\n' "$feed"
 }
 
 cmd_install() {
@@ -761,6 +794,7 @@ command=${1:-}
 case $command in
     init) cmd_init ;;
     install) cmd_install "$@" ;;
+    feed) cmd_feed "$@" ;;
     stage) cmd_stage "$@" ;;
     update) cmd_update "$@" ;;
     seed) cmd_seed "$@" ;;
