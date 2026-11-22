@@ -1465,10 +1465,8 @@ pub(super) fn execute_with_context(
                 output.human = format!("{}\n{notice}", output.human);
                 output.data["notice"] = json!(notice);
             }
-            // A run that waited and left the cache cold says so in its
-            // standing already, and read nothing again.
             if let Some((tokens, cache)) =
-                cold.filter(|_| !(waited && output.data.get("cache").is_some()))
+                cold.filter(|(_, cache)| woke(waited.then_some(&output.data), cache))
             {
                 // After the first line, which names the agent, rather than
                 // after whatever the run printed.
@@ -1933,6 +1931,14 @@ fn member_of(members: &[Member], agent: AgentId) -> Option<&Member> {
             .as_ref()
             .is_some_and(|delegation| delegation.agent == agent)
     })
+}
+
+/// Whether a send whose recipient's cache read `before` as cold woke it:
+/// unless the run it waited for left that same cache in place, as one that
+/// failed before reaching the provider does, which its standing in `after`
+/// already reports.
+fn woke(after: Option<&Value>, before: &Value) -> bool {
+    after.is_none_or(|after| after["cache"]["expires_at"] != before["expires_at"])
 }
 
 /// A status with what stops the agent's provider, the account it runs on
@@ -4406,6 +4412,18 @@ mod tests {
         let mut data = json!({});
         standing_json(&mut data, Some(&cold), 59_999);
         assert!(data.get("cache").is_none(), "warm");
+    }
+
+    #[test]
+    fn a_send_woke_its_agent_unless_the_waited_run_left_the_same_cache() {
+        let before = json!({"cold": true, "expires_at": 60});
+        assert!(woke(None, &before), "not waited");
+        assert!(woke(Some(&json!({})), &before), "warm after the run");
+        assert!(
+            woke(Some(&json!({"cache": {"expires_at": 900}})), &before),
+            "a later request, though cold again"
+        );
+        assert!(!woke(Some(&json!({"cache": before.clone()})), &before));
     }
 
     /// Each state suggests what follows from it, on a line the native app
