@@ -20547,6 +20547,37 @@ fn auth_recovery_reconnect_preserves_session_and_draft_and_rejects_resolved_erro
     assert_eq!(chat_runtime(&app, card).composer.text(), "keep this unsent");
     assert!(chat_runtime(&app, card).queued.is_none());
 }
+/// A transcript read the agent's process did not answer shows its card
+/// while the read fails, and the card goes once a read succeeds. A
+/// provider's own failure stays.
+#[test]
+fn an_unanswered_read_is_withdrawn_once_a_read_succeeds() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, _) = history_fixture(&mut app);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let unanswered = format!(
+        "{} during the `presentation_binary` request",
+        chat::failure::actor_transport::DEADLINE
+    );
+    let provider = "Provider exited with status 1".to_owned();
+    for (error, kept) in [(unanswered, false), (provider, true)] {
+        let mut failed = (*runtime.snapshot).clone();
+        failed.error = Some(error.clone());
+        failed.ready = false;
+        runtime.install_snapshot(Arc::new(failed), None);
+        assert!(runtime.failures.iter().any(|note| note.text == error));
+        let mut read = (*runtime.snapshot).clone();
+        read.generation += 1;
+        read.error = None;
+        read.ready = true;
+        runtime.install_snapshot(Arc::new(read), None);
+        assert_eq!(
+            runtime.failures.iter().any(|note| note.text == error),
+            kept,
+            "{error}"
+        );
+    }
+}
 #[test]
 fn auth_recovery_notice_dedup_is_scoped_to_its_turn() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
