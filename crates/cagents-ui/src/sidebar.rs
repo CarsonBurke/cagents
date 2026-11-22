@@ -627,7 +627,16 @@ impl SidebarChannel {
             }
         );
         let members = self.members.description();
-        let attention = self.attention.description();
+        // The members already say who is working, waiting or stopped by a
+        // usage limit, so the attention line adds only what they don't:
+        // unread news, a failure, or an agent the members leave out.
+        let described = AttentionSummary {
+            working: self.members.agents_in(ChannelMemberState::Working),
+            waiting: self.members.agents_in(ChannelMemberState::Waiting),
+            limited: self.members.agents_in(ChannelMemberState::Limited),
+            ..AttentionSummary::default()
+        };
+        let attention = self.attention.without(described).description();
         for part in [Some(members.as_str()), Some(attention.as_str())]
             .into_iter()
             .chain(std::iter::once(self.notification_preview.as_deref()))

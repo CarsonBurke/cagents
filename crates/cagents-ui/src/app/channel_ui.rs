@@ -3674,6 +3674,14 @@ pub(in crate::app) mod tests {
             row.accessible_name_for_test()
                 .contains("Claude Code, working; Codex, idle; Terminal")
         );
+        // The members say who is working; the attention line doesn't again.
+        assert_eq!(row.attention.working, 1);
+        assert!(
+            !row.tooltip_for_test().contains("1 working"),
+            "{}",
+            row.tooltip_for_test()
+        );
+        assert!(!row.accessible_name_for_test().contains("1 working"));
 
         let durable = Arc::make_mut(&mut app.durable);
         let crate::model::CardKind::Terminal(session) = &mut durable.cards[0].kind else {

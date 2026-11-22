@@ -120,6 +120,18 @@ impl Members {
         self.len() == 0
     }
 
+    /// How many agents, of every provider, are in `state`.
+    pub fn agents_in(&self, state: MemberState) -> usize {
+        let index = MemberState::ALL
+            .iter()
+            .position(|known| *known == state)
+            .expect("every state is listed");
+        self.agents
+            .iter()
+            .map(|states| usize::from(states[index]))
+            .sum()
+    }
+
     /// Each kind of member with how many there are, in display order.
     fn groups(&self) -> impl Iterator<Item = (Member, u16)> + '_ {
         MemberState::ALL
