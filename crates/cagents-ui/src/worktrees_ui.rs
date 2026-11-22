@@ -298,74 +298,79 @@ impl State {
 
 /// Every project's lines in sidebar order: its heading, its main checkout, the
 /// creations under way, then its other checkouts, newest first. A query keeps
-/// the checkouts it finds, best match first, and every checkout of a project
-/// whose name it finds.
+/// the checkouts and creations it finds, best match first, and every line of a
+/// project whose name it finds.
 fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
+    /// Where a line sits among its project's lines of the same rank.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Slot {
+        Main,
+        Creation,
+        Worktree,
+    }
     let folded = crate::sidebar::fold_query(query);
     let mut entries = Vec::new();
     for (project, entity) in projects.iter().enumerate() {
         let id = entity.id;
         let whole = folded.is_empty() || entity.matches(&folded);
-        let mut worktrees = entity
-            .worktrees
-            .iter()
-            .enumerate()
-            .filter(|(_, worktree)| whole || worktree.matches(&folded))
-            .collect::<Vec<_>>();
-        // A creation is found by the name its worktree will have.
-        let operations = entity
-            .operations
-            .iter()
-            .enumerate()
-            .filter(|(_, operation)| {
-                whole
-                    || crate::search_match::score(
-                        &crate::sidebar::fold_query(&operation.label),
-                        &folded,
-                    )
-                    .is_some()
-            })
-            .collect::<Vec<_>>();
-        if !whole && worktrees.is_empty() && operations.is_empty() {
+        // Each line with how well the query finds it: `None` when the
+        // project is listed whole, so the slots alone order it.
+        let mut lines = Vec::new();
+        for (worktree, row) in entity.worktrees.iter().enumerate() {
+            let rank = if whole {
+                None
+            } else if let Some(rank) = row.search_rank(&folded) {
+                Some(rank)
+            } else {
+                continue;
+            };
+            let slot = if is_primary_worktree(&entity.repository, &row.path) {
+                Slot::Main
+            } else {
+                Slot::Worktree
+            };
+            let entry = Entry::Worktree {
+                project,
+                id,
+                worktree,
+                worktree_id: row.id,
+            };
+            lines.push((
+                (rank, slot, std::cmp::Reverse(row.created_at_unix_ms)),
+                entry,
+            ));
+        }
+        // A creation is found by the name its worktree will have, as a
+        // worktree is.
+        for (operation, row) in entity.operations.iter().enumerate() {
+            let rank = if whole {
+                None
+            } else if let Some(rank) =
+                crate::search_match::score(&crate::sidebar::fold_query(&row.label), &folded)
+            {
+                Some(rank)
+            } else {
+                continue;
+            };
+            let entry = Entry::Operation {
+                project,
+                id,
+                operation,
+                operation_id: row.id,
+            };
+            lines.push(((rank, Slot::Creation, std::cmp::Reverse(None)), entry));
+        }
+        if !whole && lines.is_empty() {
             continue;
         }
-        worktrees.sort_by_key(|(_, worktree)| {
-            (
-                // A subsequence match is kept, but below the rows that
-                // spell the query out.
-                (!whole).then(|| worktree.search_rank(&folded)),
-                !is_primary_worktree(&entity.repository, &worktree.path),
-                std::cmp::Reverse(worktree.created_at_unix_ms),
-            )
-        });
         entries.push(Entry::Project { project, id });
-        if worktrees.is_empty() && entity.operations.is_empty() {
+        if lines.is_empty() {
             entries.push(Entry::Empty { project, id });
             continue;
         }
-        let worktree_entry = |(worktree, row): (usize, &SidebarWorktree)| Entry::Worktree {
-            project,
-            id,
-            worktree,
-            worktree_id: row.id,
-        };
-        let mut worktrees = worktrees.into_iter().peekable();
-        if let Some(main) = worktrees
-            .next_if(|(_, row)| whole && is_primary_worktree(&entity.repository, &row.path))
-        {
-            entries.push(worktree_entry(main));
-        }
-        entries.extend(
-            operations
-                .into_iter()
-                .map(|(operation, row)| Entry::Operation {
-                    project,
-                    id,
-                    operation,
-                    operation_id: row.id,
-                }),
-        );
-        entries.extend(worktrees.map(worktree_entry));
+        // Stable, so creations keep the order they were started in.
+        lines.sort_by_key(|(key, _)| *key);
+        entries.extend(lines.into_iter().map(|(_, entry)| entry));
     }
     entries
 }
@@ -1378,6 +1383,14 @@ mod tests {
             worktree_labels(&state, &projects),
             ["# cagents", "operation"],
             "a creation is found by the name its worktree will have, as a worktree is"
+        );
+
+        drop(state.update(Action::Query("ne".into())));
+        state.refresh(1, &projects);
+        assert_eq!(
+            &worktree_labels(&state, &projects)[..3],
+            ["# cagents", "new-feature", "operation"],
+            "a creation that only contains the query's letters follows a worktree spelling it out"
         );
 
         drop(state.update(Action::Query("new-feat".into())));
