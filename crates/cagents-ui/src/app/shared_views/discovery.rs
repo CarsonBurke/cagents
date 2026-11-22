@@ -765,13 +765,15 @@ impl Cagents {
         assert_eq!(channels(projected), channels(&complete), "channel order");
         assert_eq!(projected.cards, complete.cards, "scope members");
         // A scope is settled exactly when it is seeded and its complete panes
-        // are its baseline, which then stands for them.
+        // are its baseline, which then stands for them, with no chat yet to
+        // be published among them.
         let settled = complete
             .panes
             .iter()
             .filter(|(scope, panes)| {
                 counters.initialized.contains(*scope)
                     && counters.baseline.get(*scope) == Some(panes)
+                    && !panes.iter().any(|pane| self.unpublished_chat(pane.id))
             })
             .map(|(scope, _)| scope.clone())
             .collect::<HashSet<_>>();
@@ -1477,12 +1479,48 @@ mod tests {
         published
     }
 
+    /// Whether `change` asks to insert one of `panes` into an empty view.
+    fn inserts_one_of(change: &Change, panes: &HashSet<CardId>) -> bool {
+        matches!(change, Change::InsertIfEmpty { pane } if panes.contains(&pane.id))
+    }
+
+    /// `published` without the `ignored` panes' `InsertIfEmpty` requests.
+    fn published_without(mut published: Published, ignored: &HashSet<CardId>) -> Published {
+        published.changes.retain(|_, changes| {
+            changes.retain(|(_, change)| !inserts_one_of(change, ignored));
+            !changes.is_empty()
+        });
+        published
+    }
+
+    /// The panes `published` asks to insert into an empty view.
+    fn inserted_if_empty(published: &Published) -> impl Iterator<Item = CardId> + '_ {
+        published
+            .changes
+            .values()
+            .flatten()
+            .filter_map(|(_, change)| match change {
+                Change::InsertIfEmpty { pane } => Some(pane.id),
+                _ => None,
+            })
+    }
+
     /// What a publication leaves of the state it writes, without operation
     /// identities.
     fn publication_state(views: &State) -> impl PartialEq + std::fmt::Debug {
+        publication_state_without(views, &HashSet::new())
+    }
+
+    /// [`publication_state`] without the `ignored` panes' `InsertIfEmpty`
+    /// requests and baseline entries.
+    fn publication_state_without(
+        views: &State,
+        ignored: &HashSet<CardId>,
+    ) -> impl PartialEq + std::fmt::Debug + use<> {
         let mut pending = views
             .pending
             .iter()
+            .filter(|(_, _, change)| !inserts_one_of(change, ignored))
             .map(|(_, scope, change)| format!("{scope:?} {change:?}"))
             .collect::<Vec<_>>();
         pending.sort();
@@ -1498,8 +1536,12 @@ mod tests {
             .map(|(_, repository)| repository.clone())
             .collect::<Vec<_>>();
         source_bases.sort();
+        let mut baseline = (*views.baseline).clone();
+        for panes in baseline.values_mut() {
+            panes.retain(|pane| !ignored.contains(&pane.id));
+        }
         (
-            (*views.baseline).clone(),
+            baseline,
             (*views.initialized).clone(),
             pending,
             transfers,
@@ -1576,6 +1618,117 @@ mod tests {
         );
         assert!(settled > compared, "{settled} over {compared}");
         assert!(reached > 0, "no transfer reached a settled scope");
+    }
+
+    /// A complete reconciliation takes each projected scope's panes as its
+    /// baseline and publishes against that. From the kept discovery, with
+    /// its settled scopes left alone, it publishes exactly what it does
+    /// when it projects and copies every scope, across randomized edits.
+    #[test]
+    fn reconciled_publication_agrees_with_a_complete_projection_across_random_edits() {
+        let (mut compared, mut settled, mut ambiguous) = (0, 0, 0);
+        for seed in 0..10 {
+            let (mut app, _, _directory) = large_workspace(&SMALL);
+            let (tx, requests) = crate::app::workspace_model_sync::test_model_channel();
+            app.workspace_model_tx = tx;
+            let mut rng = Rng(2_000 + seed);
+            for step in 0..120 {
+                let edit = if rng.below(2) == 0 {
+                    edit(&mut app, &mut rng)
+                } else {
+                    pane_edit(&mut app, &mut rng)
+                };
+                if rng.below(4) == 0 {
+                    settle_seeds(&mut app);
+                }
+                while requests.try_recv().is_ok() {}
+                let run = || {
+                    // The scopes a reconciliation projects: those listed
+                    // and seeded.
+                    let views = &app.shared_views;
+                    let scopes = app
+                        .workspace_model
+                        .views
+                        .iter()
+                        .map(|view| view.scope.clone())
+                        .filter(|scope| {
+                            views.initialized.contains(scope)
+                                && !views.seeding.contains(scope)
+                                && !views.seed_failures.contains_key(scope)
+                        })
+                        .collect::<Vec<_>>();
+                    // The exception the module documents: a view listed under
+                    // another repository than the topology resolves for its
+                    // path names that path with a second scope, and which of
+                    // the two takes a default card's request depends on the
+                    // order they were discovered in. Only in such a pass may
+                    // that request go to a different scope.
+                    let topology = app.borrowed_view_scope_topology();
+                    let two_scopes = app.workspace_model.views.iter().any(|view| {
+                        matches!(&view.scope, Scope::Worktree { repository, path }
+                            if topology.authorities.repository_for(path)
+                                .is_some_and(|resolved| resolved != repository))
+                    });
+                    drop(topology);
+                    let copy = app.shared_views.publication_copy();
+                    let original = std::mem::replace(&mut app.shared_views, copy);
+                    let complete = app.local_views();
+                    for scope in &scopes {
+                        let mut panes = complete.panes.get(scope).cloned().unwrap_or_default();
+                        panes.retain(|pane| !app.unpublished_chat(pane.id));
+                        app.shared_views.baseline.insert(scope.clone(), panes);
+                    }
+                    app.publish_projected_view_changes(complete, ViewProjection::All);
+                    let expected = published(&requests);
+                    let complete = std::mem::replace(&mut app.shared_views, original);
+                    let before = app.shared_views.settled_publications;
+                    let kept = app.kept_local_views();
+                    app.publish_reconciled_views(kept, ViewProjection::All, scopes);
+                    let reconciled = published(&requests);
+                    // There, only which scope requests a default card may
+                    // differ; everything else must agree.
+                    let ignored = if two_scopes {
+                        inserted_if_empty(&reconciled)
+                            .chain(inserted_if_empty(&expected))
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
+                    let differs = reconciled != expected;
+                    assert_eq!(
+                        published_without(reconciled, &ignored),
+                        published_without(expected, &ignored),
+                        "published edits"
+                    );
+                    assert_eq!(
+                        publication_state_without(&app.shared_views, &ignored),
+                        publication_state_without(&complete, &ignored),
+                        "publication state"
+                    );
+                    (app.shared_views.settled_publications - before, differs)
+                };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                    Ok((count, differs)) => {
+                        settled += count;
+                        ambiguous += usize::from(differs);
+                    }
+                    Err(panic) => {
+                        eprintln!("seed {seed}, step {step}: after {edit}");
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+                compared += 1;
+            }
+        }
+        eprintln!(
+            "{settled} scopes settled over {compared} reconciled publications, \
+             {ambiguous} requesting a default card from another scope"
+        );
+        assert!(settled > compared - ambiguous, "{settled} over {compared}");
+        assert!(
+            ambiguous < compared / 10,
+            "{ambiguous} of {compared} differ"
+        );
     }
 
     /// Settles every seed as the daemon would, acknowledging it and listing

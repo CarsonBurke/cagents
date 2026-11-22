@@ -4160,6 +4160,9 @@ fn a_structural_pass_releases_held_terminals_through_its_own_topology() {
     app.cards.insert(unlisted.id, CardRuntime::Loading);
     app.register_presence(unlisted.id, Exposure::Offscreen, Residency::Cold);
     app.shared_views.attached.insert(unlisted.id);
+    // The discovery a complete pass publishes through is kept between passes,
+    // so its topology is built once rather than for each.
+    app.prime_view_discovery();
     app.shared_views.topology_build_count.set(0);
     app.shared_views.held_descriptor_clones.set(0);
     drop(app.reconcile_shared_views());

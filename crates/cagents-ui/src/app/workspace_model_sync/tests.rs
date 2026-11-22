@@ -5682,6 +5682,9 @@ fn a_receipt_confirming_a_held_project_neither_reconciles_nor_projects() {
         edit: edit.clone(),
         views: ViewChanges::default(),
     };
+    // The discovery a complete pass publishes through is kept between passes,
+    // so its topology is built once rather than for each.
+    app.prime_view_discovery();
     app.shared_views.topology_build_count.set(0);
 
     let (_, projection) =
@@ -5744,6 +5747,9 @@ fn a_connection_while_loads_wait_reconciles_them_first() {
     app.workspace_model.projects.push(held_project(&repository));
     Arc::make_mut(&mut app.durable).workspace_model_identity = Some(app.workspace_model.identity);
     drop(app.defer_repository_reconciliation(repository.clone()));
+    // The discovery a complete pass publishes through is kept between passes,
+    // so its topology is built once rather than for each.
+    app.prime_view_discovery();
     app.shared_views.topology_build_count.set(0);
     let mut model = app.workspace_model.clone();
     model.sequence += 1;
