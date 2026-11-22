@@ -2067,7 +2067,7 @@ impl Runtime {
             ),
             _ => (
                 format!("Choose from {} failed subagents", failed.len()),
-                Action::SubagentFailures(self.target),
+                Action::SubagentChooser(self.target, child_navigation::Filter::Failed),
             ),
         };
         let tooltip = failed

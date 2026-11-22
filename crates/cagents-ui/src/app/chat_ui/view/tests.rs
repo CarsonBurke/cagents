@@ -1663,7 +1663,10 @@ fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a
     let mut second = runtime.snapshot.subagents[0].clone();
     second.id = "second-failure".into();
     Arc::make_mut(&mut runtime.snapshot).subagents.push(second);
-    drop(app.handle_chat_ui(Action::SubagentFailures(target)));
+    drop(app.handle_chat_ui(Action::SubagentChooser(
+        target,
+        child_navigation::Filter::Failed,
+    )));
     let runtime = app.chat_runtime_mut(target).unwrap();
     let picker = runtime.child_picker.as_ref().unwrap();
     assert_eq!(picker.filter, child_navigation::Filter::Failed);

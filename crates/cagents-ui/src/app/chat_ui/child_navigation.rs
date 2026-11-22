@@ -10,6 +10,7 @@ pub enum Filter {
     Working,
     Attention,
     Failed,
+    Finished,
 }
 
 #[derive(Default)]
@@ -45,8 +46,16 @@ fn rank(child: &chat::Subagent) -> u8 {
     }
 }
 
+/// The rank of a child that finished, stopped or ended. Finished children
+/// fold into one control on the strip rather than each keeping a tab.
+const FINISHED: u8 = 3;
+
 fn needs_attention(child: &chat::Subagent) -> bool {
     matches!(rank(child), 1 | 2)
+}
+
+fn finished(child: &chat::Subagent) -> bool {
+    rank(child) == FINISHED
 }
 
 fn child_icon(child: &chat::Subagent) -> Icon {
@@ -74,6 +83,9 @@ fn status_mark<'a>(child: &chat::Subagent) -> Element<'a, Message> {
 
 /// Keep metadata scanning cheap and mounted controls bounded. The chooser is
 /// the complete catalog; its selected child always keeps a direct tab.
+/// Finished children get no tab of their own, so the strip holds what is
+/// still live; a finished child keeps one only while it is selected or
+/// focused.
 fn direct_tabs<'a>(
     children: &'a [chat::Subagent],
     selected: Option<&str>,
@@ -81,12 +93,13 @@ fn direct_tabs<'a>(
 ) -> Vec<&'a chat::Subagent> {
     // Each rank needs at most one strip's prefix. Never allocate or sort a
     // reference for every child just to mount a bounded row of native tabs.
-    let mut groups: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut groups: [Vec<_>; FINISHED as usize] = std::array::from_fn(|_| Vec::new());
     let mut pins = [None, None];
     for (index, child) in children.iter().enumerate() {
         let row = (index, child);
-        let group = &mut groups[usize::from(rank(child))];
-        if group.len() < MAX_DIRECT_TABS {
+        if let Some(group) = groups.get_mut(usize::from(rank(child)))
+            && group.len() < MAX_DIRECT_TABS
+        {
             group.push(row);
         }
         for (pin, identity) in pins.iter_mut().zip([selected, focused]) {
@@ -246,6 +259,7 @@ impl Picker {
                     Filter::Working => child.status == chat::ToolStatus::Running && !child.waiting,
                     Filter::Attention => needs_attention(child),
                     Filter::Failed => child.status == chat::ToolStatus::Failed,
+                    Filter::Finished => finished(child),
                 };
                 // The reader searches what the chooser shows: the numbered
                 // name, the task's first line, the model and the state.
@@ -409,6 +423,34 @@ impl Runtime {
             self.child_picker.is_none(),
         )));
 
+        // Finished children share one control that opens the chooser on
+        // them, so finished work stays reachable without crowding the strip.
+        let done = children.iter().filter(|child| finished(child)).count();
+        let done = (done > 0).then(|| {
+            crate::ui_controls::view_tab(
+                crate::ui_controls::ViewTab {
+                    label: format!("{done} finished").into(),
+                    description: format!(
+                        "Choose from {done} finished {}",
+                        if done == 1 { "subagent" } else { "subagents" }
+                    )
+                    .into(),
+                    count: None,
+                    // A toggle like the chooser's own, so never the selected
+                    // tab, which would take its press away; the chooser's
+                    // filter row says what it shows.
+                    selected: false,
+                    id: Some(card_control_id(target.card, "chat-subagent-finished")),
+                    on_press: Some(action(Action::SubagentChooser(target, Filter::Finished))),
+                },
+                true,
+                Some(crate::ui_controls::passive_icon(
+                    Icon::Check,
+                    design::COMPACT_ICON_SIZE,
+                )),
+            )
+        });
+
         let parent = selected
             .and_then(|_| self.parent_tab_state())
             .map(|(glyph, label)| {
@@ -441,8 +483,12 @@ impl Runtime {
                     mark,
                 ),
                 crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(tabs)),
-                crate::interaction::tooltip(trigger, "Search and filter subagents"),
             ])
+            .push_maybe(done)
+            .push(crate::interaction::tooltip(
+                trigger,
+                "Search and filter subagents",
+            ))
             .spacing(space::XS)
             .align_y(Alignment::Center),
         )
@@ -524,6 +570,7 @@ impl Runtime {
             (Filter::Working, "Working"),
             (Filter::Attention, "Needs attention"),
             (Filter::Failed, "Failed"),
+            (Filter::Finished, "Finished"),
         ] {
             filters.push(crate::ui_controls::view_tab(
                 crate::ui_controls::ViewTab {
@@ -654,9 +701,12 @@ mod tests {
         rows.into_iter().map(|child| child.id.as_str()).collect()
     }
 
-    /// Mount the strip as the pane does and read each subagent tab's native
-    /// accessible name, in the order the tabs are laid out.
-    fn mounted_tabs(runtime: &Runtime) -> Vec<(String, String)> {
+    /// Mount the strip as the pane does and read the native position and
+    /// accessible name of each button whose control ID `controls` lists.
+    fn mounted_buttons<'a>(
+        runtime: &Runtime,
+        controls: impl IntoIterator<Item = (&'a str, String)>,
+    ) -> Vec<(f64, &'a str, String)> {
         use cosmic::iced::advanced::{Layout, layout, widget::Tree};
         let renderer = crate::app::tests::headless_renderer();
         let mut element = runtime.child_navigation(800.0);
@@ -671,14 +721,12 @@ mod tests {
             &tree,
             iced::mouse::Cursor::Unavailable,
         );
-        let mut tabs: Vec<_> = runtime
-            .snapshot
-            .subagents
-            .iter()
-            .filter_map(|child| {
+        let mut buttons: Vec<_> = controls
+            .into_iter()
+            .filter_map(|(key, control)| {
                 let id = iced_accessibility::A11yId::Widget(card_control_id(
                     runtime.target.card,
-                    &format!("chat-subagent-tab-{}", child.id),
+                    &control,
                 ));
                 let native =
                     accessible
@@ -693,13 +741,40 @@ mod tests {
                 assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
                 Some((
                     bounds.x0,
-                    child.id.clone(),
-                    native.node().label().expect("native tab name").to_owned(),
+                    key,
+                    native
+                        .node()
+                        .label()
+                        .expect("native button name")
+                        .to_owned(),
                 ))
             })
             .collect();
-        tabs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        tabs.into_iter().map(|(_, id, label)| (id, label)).collect()
+        buttons.sort_by(|a, b| a.0.total_cmp(&b.0));
+        buttons
+    }
+
+    /// Each mounted subagent tab's ID and native accessible name, in the
+    /// order the tabs are laid out.
+    fn mounted_tabs(runtime: &Runtime) -> Vec<(String, String)> {
+        mounted_buttons(
+            runtime,
+            runtime
+                .snapshot
+                .subagents
+                .iter()
+                .map(|child| (child.id.as_str(), format!("chat-subagent-tab-{}", child.id))),
+        )
+        .into_iter()
+        .map(|(_, id, label)| (id.to_owned(), label))
+        .collect()
+    }
+
+    /// The native name of the control finished subagents fold into.
+    fn mounted_finished(runtime: &Runtime) -> Option<String> {
+        mounted_buttons(runtime, [("finished", "chat-subagent-finished".to_owned())])
+            .pop()
+            .map(|(_, _, label)| label)
     }
 
     #[test]
@@ -717,8 +792,29 @@ mod tests {
         let tabs = mounted_tabs(&runtime);
         assert_eq!(
             tabs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["first", "second", "asking", "broken"],
+            "working first, then a question and a failure; provider order within each"
+        );
+        // Finished work folds into one control after the live tabs.
+        let strip = mounted_buttons(
+            &runtime,
+            tabs.iter()
+                .map(|(id, _)| (id.as_str(), format!("chat-subagent-tab-{id}")))
+                .chain([("finished", "chat-subagent-finished".to_owned())]),
+        );
+        let (_, last, finished) = strip.last().expect("a mounted strip");
+        assert_eq!(
+            *last, "finished",
+            "the finished control follows every live tab"
+        );
+        assert_eq!(finished, "Choose from 2 finished subagents");
+        // A finished child the reader opened or moved to keeps its tab.
+        runtime.selected_subagent = Some("unnamed".into());
+        *runtime.child_tab_focus.borrow_mut() = Some("done".into());
+        let tabs = mounted_tabs(&runtime);
+        assert_eq!(
+            tabs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             ["first", "second", "asking", "broken", "done", "unnamed"],
-            "working first, then a question, a failure and finished work; provider order within each"
         );
         for (id, starts) in [
             ("first", "Explore · Working · "),
@@ -754,6 +850,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_finished_control_opens_the_chooser_on_finished_subagents() {
+        use chat::ToolStatus::*;
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        runtime.target.card = app.workspace.focused().unwrap();
+        let target = runtime.target;
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
+            named("live", "Explore", Running, false),
+            named("done", "Reviewer", Succeeded, false),
+        ];
+        assert_eq!(
+            mounted_finished(&runtime).as_deref(),
+            Some("Choose from 1 finished subagent")
+        );
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            runtime.child_navigation(800.0),
+            iced::Size::new(800.0, 100.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let id = iced_accessibility::A11yId::Widget(card_control_id(
+            target.card,
+            "chat-subagent-finished",
+        ));
+        let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let bounds = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .find(|node| node.id() == &id)
+            .and_then(|node| node.node().bounds())
+            .expect("a mounted finished control");
+        let pointer = iced::Point::new(
+            (bounds.x0 + bounds.x1) as f32 / 2.0,
+            (bounds.y0 + bounds.y1) as f32 / 2.0,
+        );
+        let mut messages = Vec::new();
+        ui.update(
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ],
+            iced::mouse::Cursor::Available(pointer),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        drop(ui);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let open = messages
+            .into_iter()
+            .find_map(|message| match message {
+                Message::ChatUi(action @ Action::SubagentChooser(_, Filter::Finished)) => {
+                    Some(action)
+                }
+                _ => None,
+            })
+            .expect("pressing the finished control opens the chooser on finished subagents");
+        drop(app.handle_chat_ui(open));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let picker = runtime.child_picker.as_ref().unwrap();
+        assert_eq!(picker.filter, Filter::Finished);
+        assert_eq!(
+            ids(picker.rows(&runtime.snapshot.subagents, &runtime.child_ordinals)),
+            ["done"]
+        );
+        // Pressed again, it closes the chooser, as the chooser's toggle does.
+        drop(app.handle_chat_ui(Action::SubagentChooser(target, Filter::Finished)));
+        assert!(app.chat_runtime_mut(target).unwrap().child_picker.is_none());
+        // Pressed while the chooser is open on another filter, it keeps
+        // what the reader searched for.
+        drop(app.handle_chat_ui(Action::SubagentPicker(target, true)));
+        drop(app.handle_chat_ui(Action::SubagentQuery(target, "review".into())));
+        drop(app.handle_chat_ui(Action::SubagentChooser(target, Filter::Finished)));
+        let picker = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .child_picker
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            (picker.filter, picker.query.as_str()),
+            (Filter::Finished, "review")
+        );
+    }
+
     fn labels(children: &[chat::Subagent], ordinals: &Ordinals) -> Vec<String> {
         children
             .iter()
@@ -771,7 +961,7 @@ mod tests {
         ];
         let mut ordinals = Ordinals::default();
         ordinals.observe(&children);
-        assert_eq!(ids(direct_tabs(&children, None, None)), ["a", "b", "c"]);
+        assert_eq!(ids(direct_tabs(&children, None, None)), ["a", "b"]);
         assert_eq!(
             labels(&children, &ordinals),
             ["Explore", "Explore 2", "Explore 3"]
@@ -779,7 +969,11 @@ mod tests {
         children[0].status = Succeeded;
         children[2].status = Running;
         ordinals.observe(&children);
-        assert_eq!(ids(direct_tabs(&children, None, None)), ["b", "c", "a"]);
+        assert_eq!(ids(direct_tabs(&children, None, None)), ["b", "c"]);
+        assert_eq!(
+            ids(direct_tabs(&children, Some("a"), None)),
+            ["b", "c", "a"]
+        );
         assert_eq!(
             labels(&children, &ordinals),
             ["Explore", "Explore 2", "Explore 3"]
@@ -1044,6 +1238,8 @@ mod tests {
             ids(picker.rows(&children, &Ordinals::default())),
             ["second", "done"]
         );
+        picker.filter = Filter::Finished;
+        assert_eq!(ids(picker.rows(&children, &Ordinals::default())), ["first"]);
         picker.filter = Filter::All;
         picker.query = "Agent second".into();
         assert_eq!(
