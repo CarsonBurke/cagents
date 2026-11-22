@@ -203,10 +203,22 @@ impl Axis {
 }
 
 pub(super) fn column<'a>(rows: Vec<Row<'a>>, window: Window) -> Element<'a, Message> {
+    column_with_revision(rows, window, NEXT_COLUMN.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A column whose caller can prove that every descriptor's indexing data is
+/// unchanged. This avoids inspecting a long, settled history on redraws that
+/// only move the viewport. Callers must issue a fresh revision whenever a
+/// row's key, aliases, logical ranges, estimate, or revision changes.
+pub(super) fn column_with_revision<'a>(
+    rows: Vec<Row<'a>>,
+    window: Window,
+    revision: u64,
+) -> Element<'a, Message> {
     Element::new(Column {
         rows,
         window,
-        revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed),
+        revision,
         axis: Axis::Vertical,
         cross_estimate: 0.0,
     })
@@ -251,6 +263,9 @@ impl Height {
 thread_local! {
     /// How many times this thread's columns rebuilt every index.
     static REINDEXES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Descriptor comparisons are linear; settled transcript redraws should
+    /// not need any after their first layout.
+    static DESCRIPTOR_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a row last gave the column's indexes, so a column rebuilt with the
@@ -422,13 +437,18 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         // the same rows: a streaming answer changes one row's revision.
         // Rebuilding every index for that is work in the length of the
         // transcript on every frame, so only a changed row is corrected.
-        let reshaped = state.descriptors != self.revision
-            && (state.shapes.len() != self.rows.len()
+        let reshaped = if state.descriptors == self.revision {
+            false
+        } else {
+            #[cfg(test)]
+            DESCRIPTOR_SCANS.with(|count| count.set(count.get() + self.rows.len()));
+            state.shapes.len() != self.rows.len()
                 || !self
                     .rows
                     .iter()
                     .zip(&state.shapes)
-                    .all(|(row, shape)| shape.indexes(row)));
+                    .all(|(row, shape)| shape.indexes(row))
+        };
         if !width_changed && !reshaped && state.descriptors != self.revision {
             for (index, (row, shape)) in self.rows.iter().zip(&mut state.shapes).enumerate() {
                 if shape.revision != row.revision || shape.estimate != row.estimate {
@@ -1381,6 +1401,46 @@ mod tests {
         rows.remove(120);
         check(&rows);
         assert_eq!(reindexes(), indexed + 1, "new rows are indexed again");
+    }
+
+    #[test]
+    fn settled_history_reuses_its_descriptor_index() {
+        const ROWS: u64 = 10_000;
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY));
+        let build = |revision| {
+            column_with_revision(
+                (0..ROWS)
+                    .map(|key| {
+                        Row::new(key, 0, 20.0, None, || {
+                            widget::Space::new().height(20).into()
+                        })
+                    })
+                    .collect(),
+                Default::default(),
+                revision,
+            )
+        };
+        DESCRIPTOR_SCANS.with(|count| count.set(0));
+        let mut tree = Tree::new(build(7));
+        let mut layout = |revision| {
+            let mut element = build(revision);
+            tree.diff(element.as_widget_mut());
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        };
+
+        layout(7);
+        assert_eq!(DESCRIPTOR_SCANS.with(Cell::get), ROWS as usize);
+        layout(7);
+        assert_eq!(
+            DESCRIPTOR_SCANS.with(Cell::get),
+            ROWS as usize,
+            "a settled redraw must not walk every history descriptor"
+        );
+        layout(8);
+        assert_eq!(DESCRIPTOR_SCANS.with(Cell::get), 2 * ROWS as usize);
     }
 
     /// A row measured while mounted, then changed while offscreen, keeps

@@ -83,6 +83,24 @@ fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
 }
 
 #[test]
+fn settled_transcript_descriptor_revision_changes_with_reading_width() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some("settled-descriptor-revision"));
+    let target = chat_runtime(&app, card).target;
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    // Fixture chats begin cold because nothing has rendered them yet. This
+    // test describes the ordinary completed, visible transcript instead.
+    runtime.presentation_evicted = false;
+    let narrow = runtime
+        .settled_transcript_descriptor_revision(&runtime.snapshot, None, 640.0)
+        .expect("a settled parent transcript has a stable descriptor revision");
+    let wide = runtime
+        .settled_transcript_descriptor_revision(&runtime.snapshot, None, 960.0)
+        .expect("a settled parent transcript has a stable descriptor revision");
+    assert_ne!(narrow, wide, "a resize must refresh offscreen estimates");
+}
+
+#[test]
 fn accepting_next_prompt_suggestion_preserves_newer_user_input_and_requires_exact_observation() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat(&mut app, Some("session"));

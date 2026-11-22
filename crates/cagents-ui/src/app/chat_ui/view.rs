@@ -2743,6 +2743,51 @@ impl Runtime {
         })
     }
 
+    /// The descriptor identity of a transcript that cannot change outside a
+    /// deliberate reader action. A stable identity lets the virtual column
+    /// retain its all-history index while a wheel event moves the viewport.
+    ///
+    /// Active, paging, queued, and child transcripts deliberately return no
+    /// identity: their offscreen rows can change size before they mount, and
+    /// the normal column path adjusts those estimates on every new view.
+    pub(super) fn settled_transcript_descriptor_revision(
+        &self,
+        snapshot: &Snapshot,
+        selected: Option<&chat::Subagent>,
+        content_width: f32,
+    ) -> Option<u64> {
+        if selected.is_some()
+            || snapshot.busy
+            || snapshot.activity() != crate::agent::ActivityState::Idle
+            || snapshot.history_loading
+            || self.paging().is_some()
+            || self.deferred_page.is_some()
+            || self.queued.is_some()
+            || !self.followups.is_empty()
+            || self.sending()
+            || self.presentation_evicted
+        {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut revision = crate::fingerprint::hasher();
+        (
+            self.presentation_revision,
+            self.turns.stamp(),
+            self.opened.stamp(),
+            self.expanded.stamp(),
+            self.failure_ui.exposure(),
+            self.tool_groups_expanded,
+            snapshot.has_earlier,
+            snapshot.has_later,
+            snapshot.finished_at,
+            self.disconnected,
+            content_width.to_bits(),
+        )
+            .hash(&mut revision);
+        Some(revision.finish())
+    }
+
     #[cfg(test)]
     fn view<'a>(
         &'a self,
@@ -3291,16 +3336,30 @@ impl Runtime {
         // moves inside the viewport instead: it is the room the first and
         // last rows rest at, and scrolled content passes through it.
         let transcript_index = content.len();
+        // A completed parent transcript can redraw for unrelated window work
+        // while its descriptors stay identical. Give its virtual column a
+        // stable identity then, so it keeps the all-history indexes it already
+        // built. Live/paging transcripts retain the conservative fresh
+        // identity: their offscreen estimates may change before they mount.
+        let descriptor_revision =
+            self.settled_transcript_descriptor_revision(snapshot, selected, content_width);
         let transcript = widget::container(
-            widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(
-                    iced::Padding::new(step::GAP_M)
-                        .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
-                        .bottom(step::GAP_M + step::GAP_S)
-                        .right(step::GAP_M.max(transcript_clearance)),
-                )
-                .width(Length::Fill)
-                .max_width(super::layout::READING_COLUMN),
+            widget::container(match descriptor_revision {
+                Some(revision) => virtualized::column_with_revision(
+                    transcript.children,
+                    Default::default(),
+                    revision,
+                ),
+                None => virtualized::column(transcript.children, Default::default()),
+            })
+            .padding(
+                iced::Padding::new(step::GAP_M)
+                    .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
+                    .bottom(step::GAP_M + step::GAP_S)
+                    .right(step::GAP_M.max(transcript_clearance)),
+            )
+            .width(Length::Fill)
+            .max_width(super::layout::READING_COLUMN),
         )
         .center_x(Length::Fill);
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
