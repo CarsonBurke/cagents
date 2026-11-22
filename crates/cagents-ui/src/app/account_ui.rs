@@ -1609,13 +1609,19 @@ fn is_stale(snapshot: &UsageSnapshot, now: Millis) -> bool {
 /// Whether a window reset between the observation and `now`, which makes
 /// its figure wrong however recent the observation is.
 fn reset_since(snapshot: &UsageSnapshot, now: Millis) -> bool {
-    snapshot.windows.iter().any(|window| {
-        window
-            .resets_at
-            .and_then(|seconds| u64::try_from(seconds).ok())
-            .map(|seconds| seconds.saturating_mul(1_000))
-            .is_some_and(|reset| reset > snapshot.observed_at && reset <= now)
-    })
+    snapshot
+        .windows
+        .iter()
+        .any(|window| window_reset_since(window, snapshot.observed_at, now))
+}
+
+/// Whether `window` reset between its observation at `observed_at` and `now`.
+fn window_reset_since(window: &UsageWindow, observed_at: Millis, now: Millis) -> bool {
+    window
+        .resets_at
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(|seconds| seconds.saturating_mul(1_000))
+        .is_some_and(|reset| reset > observed_at && reset <= now)
 }
 
 /// One account usage figure: its label and gauge always describe the same
@@ -1706,6 +1712,15 @@ impl ChipTone {
             Self::Low | Self::Attention => Some(design::warning_color),
             Self::Exhausted => Some(design::destructive_color),
             Self::Current | Self::Stale => None,
+        }
+    }
+
+    /// The tone of a ring shown without the chip's text, which would
+    /// otherwise be what says a figure is out of date: muted when stale.
+    pub(super) fn ring_tone(self) -> Option<design::Tone> {
+        match self {
+            Self::Stale => Some(design::Tone::Themed(design::muted_color)),
+            tone => tone.color().map(design::Tone::Themed),
         }
     }
 
@@ -2119,43 +2134,44 @@ fn account_gauge(
         return None;
     }
     let now_seconds = unix_seconds(now);
-    let reset_since = |window: &UsageWindow| {
-        window
-            .resets_at
-            .and_then(|seconds| u64::try_from(seconds).ok())
-            .map(|seconds| seconds.saturating_mul(1_000))
-            .is_some_and(|reset| reset > snapshot.observed_at && reset <= now)
-    };
-    let current = || {
-        snapshot
-            .windows
-            .iter()
-            .filter(|window| !reset_since(window))
-    };
+    let refilled = |window: &UsageWindow| window_reset_since(window, snapshot.observed_at, now);
+    let current = || snapshot.windows.iter().filter(|window| !refilled(window));
     let lead =
         account::tightest(current().filter(|window| window.kind != account::WindowKind::Scoped))
-            .or_else(|| account::tightest(current()))?;
-    let refilled = snapshot.windows.iter().any(reset_since);
+            .or_else(|| account::tightest(current()));
+    let any_refilled = snapshot.windows.iter().any(refilled);
+    // As the status bar's chip reads it: a provider that says ordinary use is
+    // not allowed, or a limit with no window to show, is limited whatever
+    // the figures say.
+    let limited = snapshot.ordinary_usage_allowed == Some(false)
+        || (snapshot.status == UsageStatus::Limited && lead.is_none() && !any_refilled);
     let old = now.saturating_sub(snapshot.observed_at) > schedule::DISPLAY_STALE_AFTER;
-    let tone = if old || account.failure.is_some() {
+    // Every window refilled since the check leaves no current figure: they
+    // are as good as unused, but only the next check can say so.
+    let stale = old || account.failure.is_some() || (lead.is_none() && !limited);
+    if lead.is_none() && !limited && !any_refilled {
+        return None;
+    }
+    let tone = if stale {
         ChipTone::Stale
+    } else if limited {
+        ChipTone::Exhausted
     } else {
         // A limit the provider reported before a window refilled may have
         // been that window's, so only the figure itself speaks for it now.
         ChipTone::of_usage(
-            if refilled {
+            if any_refilled {
                 UsageStatus::Ok
             } else {
                 snapshot.status
             },
-            lead.used,
+            lead.map_or(0.0, |lead| lead.used),
         )
     };
-    let figure = usage_figure(lead.used, mode);
     let line = |window: &UsageWindow| {
         let mut line = format!("{}: ", window.label);
-        if reset_since(window) {
-            line.push_str("reset since last checked");
+        if refilled(window) {
+            line.push_str("refilled since last checked");
             return line;
         }
         line.push_str(&usage_figure(window.used, mode).text);
@@ -2168,19 +2184,25 @@ fn account_gauge(
         }
         line
     };
+    let mut lines = Vec::new();
+    if limited {
+        lines.push("Limited: this account can't be used until a limit resets".to_owned());
+    }
     // The ring's own window leads, then the rest as the provider lists them.
-    let mut lines: Vec<String> = std::iter::once(lead)
-        .chain(
-            snapshot
-                .windows
-                .iter()
-                .filter(|window| !std::ptr::eq(*window, lead)),
-        )
-        .map(line)
-        .collect();
+    lines.extend(
+        lead.into_iter()
+            .chain(
+                snapshot
+                    .windows
+                    .iter()
+                    .filter(|window| !lead.is_some_and(|lead| std::ptr::eq(*window, lead))),
+            )
+            .map(line),
+    );
     let resets = account::resets::inventory_lines(&snapshot.resets, now_seconds);
     if !resets.is_empty() {
-        lines.push(format!("Limit resets: {}", resets.join("; ")));
+        lines.push("Limit resets you can use:".to_owned());
+        lines.extend(resets.into_iter().map(|reset| format!("  {reset}")));
     }
     if old {
         lines.push(format!(
@@ -2191,10 +2213,32 @@ fn account_gauge(
     if let Some(failure) = &account.failure {
         lines.push(format!("Last check failed: {failure}"));
     }
+    let (fraction, mut label) = match lead {
+        Some(lead) => {
+            let figure = usage_figure(lead.used, mode);
+            (
+                figure.fraction,
+                format!("{} usage: {}", lead.label, figure.text),
+            )
+        }
+        // A limit with no figure reads as an empty allowance.
+        None if limited => (usage_figure(1.0, mode).fraction, "Limited".to_owned()),
+        // Refilled windows read as full ones until the next check.
+        None => (
+            usage_figure(0.0, mode).fraction,
+            "Usage refilled since last checked".to_owned(),
+        ),
+    };
+    if limited && lead.is_some() {
+        label = format!("Limited, {label}");
+    }
+    if stale && lead.is_some() {
+        label.push_str(", not current");
+    }
     Some(AccountGauge {
-        fraction: figure.fraction,
+        fraction,
         tone,
-        label: format!("{}: {}", lead.label, figure.text),
+        label,
         detail: lines.join("\n"),
     })
 }
@@ -2781,13 +2825,26 @@ impl Cagents {
                 .any(|provider| self.account_ui.registry.automatic(provider))
     }
 
+    /// Whether a chat footer may show an account's usage: some provider
+    /// has more than one account to choose between, as the footer's
+    /// account item needs.
+    fn footer_shows_account_usage(&self) -> bool {
+        self.account_ui
+            .choices(self.settings.account_usage_display)
+            .0
+            .values()
+            .any(|choices| choices.present > 1)
+    }
+
     /// Ticks while anything shows account usage. Unfocused, a tick only
     /// moves the clock the figures are read against - "resets in", "updated
     /// ... ago" - since [`Schedule::should_probe`] probes a focused window
     /// alone. A sign-in in progress ticks faster, to notice its terminal
     /// ending.
     pub(super) fn account_subscription(&self) -> Subscription<Message> {
-        let usage = if self.accounts_surface_visible() {
+        // A chat footer's account gauge reads the same clock, but only moves
+        // it: its figures are probed only where the accounts are on show.
+        let usage = if self.accounts_surface_visible() || self.footer_shows_account_usage() {
             cosmic::iced::time::every(TICK).map(|_| Message::AccountUi(Action::Tick))
         } else {
             Subscription::none()
@@ -8373,7 +8430,7 @@ mod tests {
         ] {
             let gauge = account_gauge(&state, NOW, mode).expect("current figures have a gauge");
             // One model's allowance running out is listed, not led with.
-            assert_eq!(gauge.label, format!("Weekly: {figure}"));
+            assert_eq!(gauge.label, format!("Weekly usage: {figure}"));
             assert_eq!(gauge.fraction, fraction);
             assert_eq!(gauge.tone, ChipTone::Exhausted);
             let lines: Vec<&str> = gauge.detail.lines().collect();
@@ -8398,14 +8455,53 @@ mod tests {
             observed,
         )));
         let gauge = account_gauge(&state, NOW, AccountUsageDisplay::Left).unwrap();
-        assert_eq!(gauge.label, "Session: 70% left");
+        assert_eq!(gauge.label, "Session usage: 70% left");
         // The limit was the refilled week's, so it no longer colours the ring.
         assert_eq!(gauge.tone, ChipTone::Current);
         assert!(
-            gauge.detail.contains("Weekly: reset since last checked"),
+            gauge.detail.contains("Weekly: refilled since last checked"),
             "{}",
             gauge.detail
         );
+
+        // With every window refilled there is no current figure, but the
+        // ring stays, as full and out of date, rather than vanishing.
+        let mut all = state;
+        all.snapshot.as_mut().unwrap().windows.remove(0);
+        let gauge = account_gauge(&all, NOW, AccountUsageDisplay::Left).unwrap();
+        assert_eq!(gauge.label, "Usage refilled since last checked");
+        assert_eq!(gauge.fraction, 1.0);
+        assert_eq!(gauge.tone, ChipTone::Stale);
+    }
+
+    /// A provider that says the account can't be used is believed, figures
+    /// or not, as the status bar's chip believes it; and figures that are
+    /// out of date say so to a reader who hears the ring.
+    #[test]
+    fn the_account_gauge_says_when_it_is_limited_or_out_of_date() {
+        let now = unix_seconds(NOW);
+        let mut usage = snapshot(vec![window(0.3, Some(now + 3_600))], NOW);
+        usage.ordinary_usage_allowed = Some(false);
+        let gauge =
+            account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
+        assert_eq!(gauge.tone, ChipTone::Exhausted);
+        assert_eq!(gauge.label, "Limited, Session usage: 70% left");
+        assert!(gauge.detail.starts_with("Limited: "), "{}", gauge.detail);
+
+        let mut usage = snapshot(vec![], NOW);
+        usage.status = UsageStatus::Limited;
+        let gauge =
+            account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Used).unwrap();
+        assert_eq!((gauge.label.as_str(), gauge.fraction), ("Limited", 1.0));
+        assert_eq!(gauge.tone, ChipTone::Exhausted);
+
+        let observed = NOW - schedule::DISPLAY_STALE_AFTER - 1;
+        let usage = snapshot(vec![window(0.3, Some(now + 3_600))], observed);
+        let gauge =
+            account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
+        assert_eq!(gauge.tone, ChipTone::Stale);
+        assert_eq!(gauge.label, "Session usage: 70% left, not current");
+        assert!(gauge.detail.contains("\nAs of "), "{}", gauge.detail);
     }
 
     #[test]
@@ -8426,7 +8522,9 @@ mod tests {
             gauge
                 .detail
                 .lines()
-                .any(|line| line.starts_with("Limit resets: 2 ")),
+                .skip_while(|line| *line != "Limit resets you can use:")
+                .nth(1)
+                .is_some_and(|line| line.starts_with("  2 ")),
             "{}",
             gauge.detail
         );

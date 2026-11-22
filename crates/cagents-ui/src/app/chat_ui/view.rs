@@ -5105,10 +5105,9 @@ impl Runtime {
         let gauge = accounts.gauge;
         let glyph = |passive: bool| -> Element<'a, Message> {
             match gauge {
-                Some(gauge) => crate::ui_controls::budget_radial_toned(
-                    gauge.fraction,
-                    gauge.tone.color().map(design::Tone::Themed),
-                ),
+                Some(gauge) => {
+                    crate::ui_controls::budget_radial_toned(gauge.fraction, gauge.tone.ring_tone())
+                }
                 None if passive => crate::ui_controls::passive_icon(
                     Icon::Avatar.handle(),
                     design::COMPACT_ICON_SIZE,
@@ -5139,7 +5138,7 @@ impl Runtime {
                 ),
                 (false, Some(gauge)) => crate::ui_controls::labelled(
                     glyph(true),
-                    format!("Account: {} · {}", accounts.current, gauge.label),
+                    format!("Account: {}, {}", accounts.current, gauge.label),
                 ),
             };
             return crate::interaction::tooltip_above(
@@ -5179,10 +5178,10 @@ impl Runtime {
         )
         .name(match (named, gauge) {
             (true, None) => Cow::Borrowed("Choose an account"),
-            (true, Some(gauge)) => Cow::Owned(format!("Choose an account · {}", gauge.label)),
+            (true, Some(gauge)) => Cow::Owned(format!("Choose an account, {}", gauge.label)),
             (false, None) => Cow::Owned(format!("Choose an account, now {}", accounts.current)),
             (false, Some(gauge)) => Cow::Owned(format!(
-                "Choose an account, now {} · {}",
+                "Choose an account, now {}, {}",
                 accounts.current, gauge.label
             )),
         })
