@@ -12949,6 +12949,10 @@ fn active_shared_channel(app: &mut Cagents) -> crate::model::ChannelId {
         focused: None,
     });
     durable.active_channel = Some(channel);
+    // The chat starts before the registry comes online in
+    // `show_in_channel_view`, so its first message does not wait for this
+    // channel to load.
+    app.shared_views.registry_unavailable = true;
     channel
 }
 
@@ -12982,6 +12986,7 @@ fn show_in_channel_view(
         ordinal: 1,
     }];
     app.workspace_model.views = vec![view.clone()];
+    app.shared_views.registry_unavailable = false;
     app.shared_views
         .initialize(Scope::Channel(channel), view.panes.clone());
     drop(app.reconcile_shared_views());
