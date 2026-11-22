@@ -196,7 +196,6 @@ pub fn outlined_control_style(selected: bool) -> cosmic::theme::Button {
 fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| {
         let component = &theme.current_container().component;
-        let raised = selected || focused;
         let border = if outlined {
             widget::button::Style {
                 border_width: design::BORDER_WIDTH,
@@ -206,24 +205,22 @@ fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic:
         } else {
             design::button_style()
         };
-        widget::button::Style {
-            background: raised
-                .then(|| iced::Background::Color(component.selected_state_color().into())),
-            icon_color: Some(match tone {
-                Some(tone) => tone.resolve(theme),
-                None if raised => component.on.into(),
-                None => design::muted_icon_color(theme),
-            }),
-            // A selected control is already raised, so focus also rings it,
-            // the way it rings a text button.
-            outline_width: if focused { design::BORDER_WIDTH } else { 0.0 },
-            outline_color: if focused {
-                design::accent_color(theme)
-            } else {
-                iced::Color::TRANSPARENT
+        // Only selection raises the control. Keyboard focus rings it and
+        // brings its glyph to full strength, so a focused peer never reads
+        // as a second selection.
+        focus_ring(
+            widget::button::Style {
+                background: selected.then(|| iced::Background::Color(selected_fill(theme))),
+                icon_color: Some(match tone {
+                    Some(tone) => tone.resolve(theme),
+                    None if selected || focused => component.on.into(),
+                    None => design::muted_icon_color(theme),
+                }),
+                ..border
             },
-            ..border
-        }
+            focused,
+            theme,
+        )
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
@@ -235,7 +232,11 @@ fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic:
         hovered: Box::new(move |focused, theme| {
             let component = &theme.current_container().component;
             widget::button::Style {
-                background: Some(iced::Background::Color(component.hover.into())),
+                background: Some(iced::Background::Color(if selected {
+                    selected_fill(theme)
+                } else {
+                    hover_fill(theme)
+                })),
                 icon_color: Some(tone.map_or(component.on.into(), |tone| tone.resolve(theme))),
                 ..appearance(focused, theme)
             }
@@ -246,6 +247,49 @@ fn styled_control(selected: bool, tone: Option<Tone>, outlined: bool) -> cosmic:
             )),
             ..appearance(focused, theme)
         }),
+    }
+}
+
+/// The fill of the selected control in a group: the chosen tab or view, or
+/// a toggle that is on.
+pub fn selected_fill(theme: &cosmic::Theme) -> iced::Color {
+    theme
+        .current_container()
+        .component
+        .selected_state_color()
+        .into()
+}
+
+/// The fill of a hovered control that is not selected.
+///
+/// COSMIC derives a component's selected color from the same overlay as its
+/// hover color, so the two are identical. A hovered peer drawn with it reads
+/// as a second selection beside the real one. Half the lift still answers
+/// the pointer while leaving the selected control the strongest surface in
+/// its group.
+pub fn hover_fill(theme: &cosmic::Theme) -> iced::Color {
+    let mut fill: iced::Color = theme.current_container().component.hover.into();
+    fill.a *= 0.5;
+    fill
+}
+
+/// `style` with the shell's keyboard focus ring: an accent outline outside
+/// the control, the same on a selected surface as on a quiet one. Focus is
+/// never drawn as a fill, which would make the focused control read as the
+/// selected one.
+pub fn focus_ring(
+    style: widget::button::Style,
+    focused: bool,
+    theme: &cosmic::Theme,
+) -> widget::button::Style {
+    widget::button::Style {
+        outline_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+        outline_color: if focused {
+            design::accent_color(theme)
+        } else {
+            iced::Color::TRANSPARENT
+        },
+        ..style
     }
 }
 
@@ -271,6 +315,32 @@ mod tests {
             assert_eq!(rest.outline_width, 0.0, "selected: {selected}");
             assert!(focused.outline_width > 0.0, "selected: {selected}");
             assert_eq!(focused.outline_color, design::accent_color(&theme));
+        }
+    }
+
+    #[test]
+    fn only_selection_draws_the_selected_fill() {
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let selected_fill = Some(iced::Background::Color(selected_fill(&theme)));
+            for selected in [false, true] {
+                let cosmic::theme::Button::Custom {
+                    active, hovered, ..
+                } = control_style(selected, None)
+                else {
+                    panic!("a custom style");
+                };
+                let expected = if selected { selected_fill } else { None };
+                assert_eq!(active(false, &theme).background, expected);
+                // Focus rings a control; it never raises it.
+                assert_eq!(active(true, &theme).background, expected);
+                let hover = hovered(false, &theme).background;
+                assert!(hover.is_some());
+                assert_eq!(
+                    hover == selected_fill,
+                    selected,
+                    "a hovered peer is not selected"
+                );
+            }
         }
     }
 }

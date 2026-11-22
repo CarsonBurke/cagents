@@ -11,6 +11,7 @@ use cosmic::{
 use crate::{
     design::{self, space},
     interaction::tooltip,
+    ui_controls::{hover_fill, selected_fill},
 };
 
 /// One entry of a [`view_tabs`] bar.
@@ -149,28 +150,38 @@ pub fn view_tab_height(compact: bool) -> f32 {
 
 /// [`control_style`]'s surface with a label tone: the selected tab keeps its
 /// fill and full-strength label even though it publishes nothing, and the
-/// rest read as quieter peers rather than as disabled controls.
+/// rest read as quieter peers rather than as disabled controls. A hovered
+/// peer lifts by less than the selected tab, and keyboard focus rings a tab
+/// rather than filling it, so only the selected tab reads as selected. The
+/// ring is drawn inside the tab: the row clips to the tabs' height, which
+/// would cut an outline drawn outside them.
+///
+/// [`control_style`]: crate::ui_controls::control_style
 fn view_tab_style(selected: bool) -> cosmic::theme::Button {
-    let appearance = move |focused: bool, theme: &cosmic::Theme| {
-        let component = &theme.current_container().component;
-        widget::button::Style {
-            background: (selected || focused)
-                .then(|| iced::Background::Color(component.selected_state_color().into())),
-            text_color: Some(if selected {
-                component.on.into()
-            } else {
-                design::muted_color(theme)
-            }),
-            ..design::button_style()
-        }
+    let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
+        background: selected.then(|| iced::Background::Color(selected_fill(theme))),
+        text_color: Some(if selected {
+            theme.current_container().component.on.into()
+        } else {
+            design::muted_color(theme)
+        }),
+        border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+        border_color: if focused {
+            design::accent_color(theme)
+        } else {
+            iced::Color::TRANSPARENT
+        },
+        ..design::button_style()
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
         disabled: Box::new(move |theme| appearance(false, theme)),
         hovered: Box::new(move |focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.hover.into(),
-            )),
+            background: Some(iced::Background::Color(if selected {
+                selected_fill(theme)
+            } else {
+                hover_fill(theme)
+            })),
             text_color: Some(theme.current_container().component.on.into()),
             ..appearance(focused, theme)
         }),
@@ -186,6 +197,35 @@ fn view_tab_style(selected: bool) -> cosmic::theme::Button {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_selected_tab_draws_the_selected_fill() {
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let selected_fill = Some(iced::Background::Color(selected_fill(&theme)));
+            for selected in [false, true] {
+                let cosmic::theme::Button::Custom {
+                    active, hovered, ..
+                } = view_tab_style(selected)
+                else {
+                    panic!("a custom style");
+                };
+                let expected = if selected { selected_fill } else { None };
+                let focused = active(true, &theme);
+                assert_eq!(focused.background, expected, "focus is not selection");
+                // Inside the tab, where the clipping row cannot cut it.
+                assert!(focused.border_width > 0.0, "focus rings the tab");
+                assert_eq!(focused.outline_width, 0.0);
+                assert_eq!(active(false, &theme).border_width, 0.0);
+                let hover = hovered(false, &theme).background;
+                assert!(hover.is_some());
+                assert_eq!(
+                    hover == selected_fill,
+                    selected,
+                    "a hovered peer is not selected"
+                );
+            }
+        }
+    }
     use crate::ui_controls::{accessibility_probe::headless_renderer, activity_spinner};
 
     #[test]

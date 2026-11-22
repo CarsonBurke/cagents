@@ -409,7 +409,9 @@ impl Cagents {
                     | Message::KeyEvent { .. }
                     | Message::LifecycleSweep
                     | Message::LifecycleSweepElapsed(_)
-                    | Message::ChromeUi(chrome_ui::Action::HoverTab(_))
+                    | Message::ChromeUi(
+                        chrome_ui::Action::HoverTab(_) | chrome_ui::Action::UnhoverTab(_)
+                    )
                     | Message::Frame(_)
                     | Message::Viewport { .. }
             )

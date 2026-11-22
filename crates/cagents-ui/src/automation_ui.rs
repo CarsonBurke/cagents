@@ -3455,13 +3455,17 @@ fn breadcrumb<'a>(
 /// is, and visibly unavailable while a command is in flight.
 fn crumb_style() -> cosmic::theme::Button {
     use cosmic::iced::Background;
+    // Focus rings the crumb rather than filling it: a filled crumb reads as
+    // the level the trail is on.
     let appearance = |focused: bool, theme: &cosmic::Theme| {
-        let component = &theme.current_container().component;
-        widget::button::Style {
-            background: focused.then(|| Background::Color(component.selected_state_color().into())),
-            text_color: Some(crate::design::muted_color(theme)),
-            ..crate::design::button_style()
-        }
+        crate::ui_controls::focus_ring(
+            widget::button::Style {
+                text_color: Some(crate::design::muted_color(theme)),
+                ..crate::design::button_style()
+            },
+            focused,
+            theme,
+        )
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
@@ -3470,9 +3474,7 @@ fn crumb_style() -> cosmic::theme::Button {
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
-            background: Some(Background::Color(
-                theme.current_container().component.hover.into(),
-            )),
+            background: Some(Background::Color(crate::ui_controls::hover_fill(theme))),
             text_color: Some(theme.current_container().component.on.into()),
             ..appearance(focused, theme)
         }),

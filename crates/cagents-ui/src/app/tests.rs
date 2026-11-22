@@ -1753,6 +1753,113 @@ fn real_tab_header_drag_survives_repaint_and_cannot_activate_destination_close()
     );
 }
 
+/// Moving onto a neighbouring tab can deliver its entry before the old tab's
+/// exit; that exit must not end the neighbour's hover.
+#[test]
+fn a_tab_exit_ends_only_its_own_hover() {
+    let mut app = context_inspector_test_app(true);
+    let (left, right) = (CardId::new(), CardId::new());
+    drop(app.update_chrome(chrome_ui::Action::HoverTab(Some(left))));
+    drop(app.update_chrome(chrome_ui::Action::UnhoverTab(right)));
+    assert_eq!(app.chrome_ui.hovered_tab, Some(left));
+    drop(app.update_chrome(chrome_ui::Action::UnhoverTab(left)));
+    assert_eq!(app.chrome_ui.hovered_tab, None);
+}
+
+/// A pane tab hovered on its way down into the pane must not stay hovered:
+/// the strip is a scrollable that withholds the cursor once it leaves, and a
+/// stale hover drew the tab like the selected one, close button and all.
+#[test]
+fn tab_hover_ends_when_the_pointer_leaves_the_strip() {
+    use cosmic::iced::advanced::{
+        Layout, Shell, clipboard, layout,
+        widget::{Operation, Tree, operation::Focusable, tree::NAMED},
+    };
+    use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+    struct Bounds(HashMap<String, Rectangle>);
+    impl Operation for Bounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+            if let Some(id) = id {
+                self.0.insert(id.to_string(), bounds);
+            }
+        }
+    }
+    let mut app = context_inspector_test_app(true);
+    let first = app.workspace.focused().unwrap();
+    let mut second = app.card_state(first).unwrap().clone();
+    second.id = CardId::new();
+    second.title = "Second".into();
+    let second_id = second.id;
+    Arc::make_mut(&mut app.durable).cards.push(second);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.workspace.resize_viewport(1600.0);
+    app.cards.insert(second_id, CardRuntime::Loading);
+    assert_eq!(app.workspace.focused(), Some(first));
+    let renderer = headless_renderer();
+    let window = Size::new(1600.0, 1200.0);
+    let mut tree = Tree::empty();
+    // Delivers one pointer event to a fresh frame, applies what it
+    // publishes, and returns the centre of the second tab's title.
+    let mut send = |app: &mut Cagents, event: mouse::Event, cursor: mouse::Cursor| {
+        let mut element = frame(app);
+        NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
+        tree.diff(element.as_widget_mut());
+        iced::runtime::user_interface::restore_cached_named_states(&mut tree);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, window),
+        );
+        NAMED.with(|named| named.borrow_mut().clear());
+        let mut bounds = Bounds(HashMap::new());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        let tab = bounds.0[&app.card_header_widget_id(second_id).to_string()].center();
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(event),
+            Layout::new(&node),
+            cursor,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::with_size(window),
+        );
+        drop(element);
+        for message in messages {
+            if let cosmic::Action::App(message) = message {
+                drop(app.update(message));
+            }
+        }
+        tab
+    };
+    let nowhere = mouse::Cursor::Unavailable;
+    let over = send(&mut app, mouse::Event::CursorLeft, nowhere);
+    let below = Point::new(over.x, over.y + 400.0);
+    for (leave, cursor, how) in [
+        (
+            mouse::Event::CursorMoved { position: below },
+            mouse::Cursor::Available(below),
+            "moving down into the pane",
+        ),
+        (mouse::Event::CursorLeft, nowhere, "leaving the window"),
+    ] {
+        send(
+            &mut app,
+            mouse::Event::CursorMoved { position: over },
+            mouse::Cursor::Available(over),
+        );
+        assert_eq!(app.chrome_ui.hovered_tab, Some(second_id));
+        send(&mut app, leave, cursor);
+        assert_eq!(app.chrome_ui.hovered_tab, None, "after {how}");
+    }
+}
+
 /// The custom `widget::Id`s that name more than one node in `element`.
 ///
 /// A custom id may name at most one node per frame: the pinned runtime

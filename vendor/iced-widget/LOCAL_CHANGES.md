@@ -71,3 +71,9 @@ Why: upstream's minimum is 2 pixels. A transcript sized for its whole conversati
 ## Grid accessibility (cagents #3153)
 
 `Grid` forwards its cells' accessibility nodes, in reading order, the way `Row` and `Column` do. Upstream's `Grid` has no `a11y_nodes`, so every control inside one was missing from the accessibility tree. The transcript's image gallery is a `Grid` of buttons, one per picture (crates/cagents-ui/src/app/chat_ui/images/tiles.rs); its tests read the tiles' names from that tree. Remove this when upstream's `Grid` forwards them.
+
+## Mouse area exit without a cursor (cagents #3637)
+
+`MouseArea` publishes `on_exit` when it was hovered and a pointer event arrives with no cursor position: the pointer left the window, a scrollable withholds the cursor because it is outside the scrollable's viewport, or a layer above makes it levitate. The area then counts as left, so moving back over it publishes `on_enter` again.
+
+Why: this copy returned early whenever the cursor had no position, before its hover bookkeeping, so none of those cases ended the hover. The workspace tab strip is a scrollable whose tabs track hover through `on_enter`/`on_exit`; moving the pointer from a tab down into the pane left that tab drawn hovered, with its close button, beside the selected tab (cagents #3637). Upstream iced compares the cursor position on every event and so ends the hover. Coverage: `app::tests::tab_hover_ends_when_the_pointer_leaves_the_strip` in crates/cagents-ui. Remove this when the pinned upstream mouse area ends hover without a cursor.
