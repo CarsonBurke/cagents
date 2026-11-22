@@ -667,7 +667,8 @@ credentials. The listener accepts only that bearer and the invented
 organization. Like Claude's service, it offers reset programs only to Claude
 Code's CLI surface: a usage read whose agent is not `claude-cli/…` gets
 `cedar_ember` and `juniper_tide` as ineligible with `ineligible_reason:
-"surface"` and no grants. Each served grant reports `percent_used` for the
+"surface"` and no grants, and a spend from such an agent is refused as
+`{"result": "ineligible", "reason": "surface"}`. Each served grant reports `percent_used` for the
 limits it clears, from the current usage. Its private HOME/runtime lets
 native-evidence stop identify and
 end it with the rest of the task. Start the listener again after restoring a

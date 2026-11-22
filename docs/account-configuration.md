@@ -81,8 +81,8 @@ refills Fable, but `--scope Fable` never spends that Weekly reset. To spend a
 reset that clears more account limits than you named, give its full label,
 such as `--scope 'Weekly + Fable'` or `--scope 'Session + Weekly'`. A Claude
 reset with nothing to refill, such as a Fable reset while Fable is unused, is
-listed as not usable now. Spending a reset cannot be undone. Agent-authenticated sessions cannot
-spend resets.
+listed as not usable now. Spending a reset cannot be undone.
+Agent-authenticated sessions cannot spend resets.
 
 Each attempt has an idempotency key. If the result is uncertain, cagents reads
 the account again and shows the reported state. It never automatically retries
