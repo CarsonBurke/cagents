@@ -273,12 +273,13 @@ impl Recorder {
         if self.presents.is_empty() {
             return;
         }
-        let stages: [(&str, fn(&Timing) -> Option<Duration>); 7] = [
+        let stages: [(&str, fn(&Timing) -> Option<Duration>); 8] = [
             ("total", |timing| Some(timing.total)),
             ("cpu", |timing| timing.cpu),
             ("acquire", |timing| Some(timing.acquire)),
             ("prepare", |timing| Some(timing.prepare)),
             ("render", |timing| Some(timing.render)),
+            ("finish", |timing| Some(timing.finish)),
             ("submit", |timing| Some(timing.submit)),
             ("swap", |timing| Some(timing.swap)),
         ];
@@ -291,6 +292,25 @@ impl Recorder {
                     quantiles(&mut values)
                 );
             }
+        }
+        let mut layers: Vec<_> = self
+            .presents
+            .iter()
+            .filter_map(|timing| timing.layers)
+            .collect();
+        if !layers.is_empty() {
+            layers.sort_unstable();
+            let at = |quantile: f64| {
+                let rank = (quantile * layers.len() as f64).ceil() as usize;
+                layers[rank.clamp(1, layers.len()) - 1]
+            };
+            eprintln!(
+                "ui-trace   Present layers n={} p50 {} p95 {} max {}",
+                layers.len(),
+                at(0.5),
+                at(0.95),
+                at(1.0)
+            );
         }
     }
 

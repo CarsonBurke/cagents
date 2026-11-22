@@ -268,9 +268,11 @@ that draws nothing stays silent. The shell reports frames through
 Beneath the frame lines, `ui-trace   Present STAGE n=N ...` gives the same
 quantiles for presenting each frame: `total` wall time, the UI thread's `cpu`
 time over it, and its stages, `acquire` (waiting for a surface image),
-`prepare` (uploading layer data), `render` (recording the render pass),
-`submit` (finishing and submitting the command buffer) and `swap` (handing
-the image back). Where `cpu` falls short of `total`, the thread waited on the
+`prepare` (uploading layer data), `render` (recording the render pass, which
+wgpu only queues), `finish` (wgpu validating and encoding the queued passes
+into a command buffer), `submit` (handing it to the GPU queue) and `swap`
+(handing the image back), and `Present layers` how many layers each frame
+drew. Where `cpu` falls short of `total`, the thread waited on the
 GPU or the compositor; see `vendor/iced-graphics/README.cagents.md`.
 Each key press logs `ui-trace latency key press MS`, the time from the shell
 handing the key to the window until the next frame is presented.

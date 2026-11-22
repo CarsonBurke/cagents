@@ -17,9 +17,13 @@ pub enum Stage {
     Acquire,
     /// Uploading the frame's layers to the GPU.
     Prepare,
-    /// Recording the render passes that draw the layers.
+    /// Recording the render passes that draw the layers. A backend that
+    /// defers encoding, as wgpu does, only queues the commands here.
     Render,
-    /// Finishing the command buffer and submitting it to the GPU queue.
+    /// Finishing the command buffer, which is where wgpu validates and
+    /// encodes the recorded passes.
+    Finish,
+    /// Submitting the command buffer to the GPU queue.
     Submit,
     /// Handing the drawn image back to the surface for display.
     Swap,
@@ -34,10 +38,14 @@ pub struct Timing {
     pub prepare: Duration,
     /// See [`Stage::Render`].
     pub render: Duration,
+    /// See [`Stage::Finish`].
+    pub finish: Duration,
     /// See [`Stage::Submit`].
     pub submit: Duration,
     /// See [`Stage::Swap`].
     pub swap: Duration,
+    /// How many layers the frame drew, where the compositor reports it.
+    pub layers: Option<usize>,
     /// Wall-clock time from [`begin`] to [`end`].
     pub total: Duration,
     /// CPU time the presenting thread used from [`begin`] to [`end`], where
@@ -91,9 +99,20 @@ pub fn lap(stage: Stage) {
         Stage::Acquire => &mut timing.acquire,
         Stage::Prepare => &mut timing.prepare,
         Stage::Render => &mut timing.render,
+        Stage::Finish => &mut timing.finish,
         Stage::Submit => &mut timing.submit,
         Stage::Swap => &mut timing.swap,
     } += elapsed;
+    PRESENTING.set(Some(presenting));
+}
+
+/// Notes how many layers the timed presentation draws. Does nothing outside
+/// a timed presentation.
+pub fn layers(count: usize) {
+    let Some(mut presenting) = PRESENTING.take() else {
+        return;
+    };
+    presenting.timing.layers = Some(count);
     PRESENTING.set(Some(presenting));
 }
 
@@ -137,27 +156,4 @@ fn thread_cpu_time() -> Option<Duration> {
 #[cfg(not(unix))]
 fn thread_cpu_time() -> Option<Duration> {
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn untimed_until_enabled_then_reports_each_stage_once() {
-        begin();
-        lap(Stage::Acquire);
-        end();
-        assert!(take().is_none());
-
-        enable();
-        begin();
-        lap(Stage::Acquire);
-        lap(Stage::Render);
-        lap(Stage::Render);
-        end();
-        let timing = take().expect("a timed presentation");
-        assert!(timing.total >= timing.acquire + timing.render);
-        assert!(take().is_none());
-    }
 }

@@ -230,7 +230,9 @@ impl Renderer {
         let encoder = self.draw(clear_color, frame, viewport);
 
         self.staging_belt.finish();
-        let submission = self.engine.queue.submit([encoder.finish()]);
+        let commands = encoder.finish();
+        graphics::present::lap(graphics::present::Stage::Finish);
+        let submission = self.engine.queue.submit([commands]);
         self.staging_belt.recall();
         graphics::present::lap(graphics::present::Stage::Submit);
         submission
@@ -560,6 +562,8 @@ impl Renderer {
         viewport: &Viewport,
     ) {
         use std::mem::ManuallyDrop;
+
+        graphics::present::layers(self.layers.iter().count());
 
         let mut render_pass = ManuallyDrop::new(encoder.begin_render_pass(
             &wgpu::RenderPassDescriptor {
