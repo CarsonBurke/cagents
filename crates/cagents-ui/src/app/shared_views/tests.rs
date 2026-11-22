@@ -8952,6 +8952,87 @@ fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
     }
 }
 
+/// A closed pane its view kept and then fences, whose stop is refused, does
+/// not come back on what still runs, which it could never attach to: it goes
+/// by identity, keeping what it had not sent. A reopen made during the stop
+/// goes back to what still runs and takes that; without one, the refusal's
+/// notice stays to reopen the conversation.
+#[test]
+fn a_kept_closed_pane_its_view_fences_goes_when_its_stop_is_refused() {
+    for reopen in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, pane, stopping) =
+            closed_chat_its_view_kept_from(Some(directory.path()), "still writing");
+        let CardKind::Chat(session) = app.card_state(pane.id).unwrap().kind.clone() else {
+            panic!("a chat pane");
+        };
+        app.shared_views.quarantined.insert(pane.id);
+        let reopened = reopen.then(|| {
+            drop(
+                app.resume_saved_conversation(crate::persistence::SavedConversation {
+                    card: pane.id,
+                    title: "Kept".into(),
+                    session: session.clone(),
+                    open: true,
+                    updated_at_unix_ms: 0,
+                }),
+            );
+            app.durable
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .find(|card| app.holds_reopen(*card) && *card != pane.id)
+                .expect("a new pane reopens it")
+        });
+        drop(
+            app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+                stopping,
+                Err("the provider did not exit".into()),
+            ))),
+        );
+        if app
+            .card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open())
+        {
+            drop(app.update(Message::CommitClose(pane.id)));
+        }
+        assert!(
+            !app.card_state(pane.id)
+                .is_some_and(|state| state.existence.is_open()),
+            "reopen={reopen}: the fenced pane goes"
+        );
+        assert!(
+            app.shared_views.fenced_closes.contains(&pane.id),
+            "reopen={reopen}: its view hears that it closed, by identity"
+        );
+        assert!(!app.chat_start_pending(pane.id), "it never attaches");
+        match reopened {
+            Some(reopened) => {
+                assert!(
+                    app.chat_start_pending(reopened),
+                    "the reopen goes back to what still runs"
+                );
+                assert_eq!(app.draft_to_keep(reopened, None).text, "still writing");
+                assert!(!app.durable.kept_chat_drafts.contains_key(&pane.id));
+            }
+            None => {
+                assert!(
+                    app.has_close_failure_notices(),
+                    "the refusal's notice stays to reopen it"
+                );
+                assert_eq!(
+                    app.durable
+                        .kept_chat_drafts
+                        .get(&pane.id)
+                        .map(|draft| draft.text.as_str()),
+                    Some("still writing"),
+                    "what it had not sent is kept for that"
+                );
+            }
+        }
+    }
+}
+
 /// What a closed chat had not sent comes back with the pane its view keeps
 /// while the conversation stops, and is kept again when the pane goes, so
 /// reopening the conversation still brings it back.

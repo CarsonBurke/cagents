@@ -290,18 +290,13 @@ impl Cagents {
         // still runs, which a reopen of the conversation then goes to.
         let mut reopens = closing.reopens;
         reopens.sort_by_key(|card| *card != closing.card);
-        // A closed pane its view fences is never admitted, so never attaches.
-        // When the stop is refused and the conversation was reopened, the
-        // reopen goes back to what still runs, taking what the closed pane
-        // had not sent while it is still out of sight, and the closed pane
-        // goes by identity after.
-        let fenced_gives_way = refused.is_some()
-            && returned
-            && self.shared_views.quarantined.contains(&closing.card)
-            && self.chat_awaiting_admission(closing.card)
-            && reopens
-                .iter()
-                .any(|card| *card != closing.card && self.reopen_awaits_stop(*card));
+        // A closed pane its view fences never attaches, so a refused stop
+        // does not bring it back on what still runs: it goes by identity
+        // after any reopen of the conversation has gone back to that, taking
+        // what the closed pane had not sent while it is still out of sight.
+        // Without one, the refusal's notice stays to reopen it.
+        let fenced_gives_way =
+            refused.is_some() && returned && self.shared_views.quarantined.contains(&closing.card);
         for card in reopens {
             // A closed pane kept out of sight goes as it is, or comes back
             // into sight with the conversation it attaches to.
@@ -410,6 +405,8 @@ impl Cagents {
             }
             self.remove_returned_pane(card)
         } else {
+            // Kept as its close in the strip keeps it.
+            self.keep_unsent_on_close(card);
             self.shared_views.fenced_closes.insert(card);
             let task = self.retire_offstrip_card(card);
             if self
