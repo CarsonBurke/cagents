@@ -318,7 +318,12 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
             .iter()
             .enumerate()
             .filter(|(_, operation)| {
-                whole || crate::sidebar::fold_query(&operation.label).contains(&*folded)
+                whole
+                    || crate::search_match::score(
+                        &crate::sidebar::fold_query(&operation.label),
+                        &folded,
+                    )
+                    .is_some()
             })
             .collect::<Vec<_>>();
         if !whole && worktrees.is_empty() && operations.is_empty() {
@@ -406,8 +411,10 @@ fn row_name(
     }
     match panes {
         0 => {}
-        1 => name.push_str(", 1 pane working in it"),
-        panes => name.push_str(&format!(", {panes} panes working in it")),
+        // Every pane in the checkout, idle ones too: the heading's counts are
+        // the ones that say who is working.
+        1 => name.push_str(", 1 pane open in it"),
+        panes => name.push_str(&format!(", {panes} panes open in it")),
     }
     name
 }
@@ -1365,12 +1372,12 @@ mod tests {
             "a row spelling the query out leads one that only contains its letters"
         );
 
-        drop(state.update(Action::Query("being".into())));
+        drop(state.update(Action::Query("bmade".into())));
         state.refresh(1, &projects);
         assert_eq!(
             worktree_labels(&state, &projects),
             ["# cagents", "operation"],
-            "a creation is found by the name its worktree will have"
+            "a creation is found by the name its worktree will have, as a worktree is"
         );
 
         drop(state.update(Action::Query("new-feat".into())));
@@ -1378,7 +1385,8 @@ mod tests {
         assert_eq!(
             worktree_labels(&state, &projects),
             ["# cagents", "new-feature"],
-            "a branch query keeps its project heading and the rows it finds"
+            "a branch query keeps its project heading and the rows it finds, and not the \
+             creation it does not find"
         );
 
         drop(state.update(Action::Query("notes".into())));
