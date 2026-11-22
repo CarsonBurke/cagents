@@ -1424,6 +1424,7 @@ fn actor_reclaims_a_large_frame_when_an_already_ready_turn_blocks() {
 
 #[test]
 fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() {
+    const READY_BYTES: usize = IDLE_FRAME_BUFFER_CAPACITY + 1;
     const PARTIAL_BYTES: usize = IDLE_FRAME_BUFFER_CAPACITY + 1;
     struct SplitFrames {
         received: Arc<Mutex<Vec<Value>>>,
@@ -1436,7 +1437,7 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
             Err("fixture accepts no commands".into())
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
-            let events = if frame == json!({"result": 1}) {
+            let events = if frame.get("result").is_some() {
                 vec![Event::Ready(true)]
             } else {
                 Vec::new()
@@ -1456,14 +1457,16 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
         messages: None,
         unset_environment: Default::default(),
         transport: TransportSpec::JsonLines,
-        // The first write holds a complete result and an incomplete next
-        // frame. Handling the result makes the actor prompt-ready, but the
-        // partial suffix must survive that publication until this second write.
+        // The first write holds a >64 KiB complete result and an incomplete
+        // next frame. The read which completes the result therefore also
+        // carries the partial suffix. Handling the result makes the actor
+        // prompt-ready, but that suffix must stop reclamation until this
+        // second write completes it.
         program: "/bin/sh".into(),
         arguments: vec![
             "-c".into(),
             format!(
-                "python3 -c 'import os, time; os.write(1, b\"{{\\\"result\\\":1}}\\n{{\\\"partial\\\":\\\"\" + b\"x\" * {PARTIAL_BYTES}); time.sleep(0.1); os.write(1, b\"\\\"}}\\n\")'; exec cat"
+                "/usr/bin/python3 -c 'import os, time; os.write(1, b\"{{\\\"result\\\":\\\"\" + b\"x\" * {READY_BYTES} + b\"\\\"}}\\n{{\\\"partial\\\":\\\"\"); time.sleep(1); os.write(1, b\"x\" * {PARTIAL_BYTES} + b\"\\\"}}\\n\")'; exec cat"
             ),
         ],
         working_directory: directory.path().into(),
@@ -1477,6 +1480,20 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
     let store = preflight(&spec, &mut initial).unwrap();
     let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
+    while received.lock().unwrap().len() != 1 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let first = received.lock().unwrap().first().cloned();
+    assert_eq!(
+        first,
+        Some(json!({"result": "x".repeat(READY_BYTES)})),
+        "the complete first frame must make the actor prompt-ready"
+    );
+    assert_eq!(
+        handle.idle_frame_buffer_capacity(),
+        usize::MAX,
+        "the partial suffix must prevent reclamation before its second write"
+    );
     while received.lock().unwrap().len() != 2 && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
@@ -1486,7 +1503,7 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
     assert_eq!(
         frames,
         vec![
-            json!({"result": 1}),
+            json!({"result": "x".repeat(READY_BYTES)}),
             json!({"partial": "x".repeat(PARTIAL_BYTES)}),
         ]
     );
