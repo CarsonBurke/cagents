@@ -16569,13 +16569,13 @@ impl Cagents {
                     }
                     images::Loaded::Failed(error) => runtime.error = Some(error),
                     images::Loaded::Unavailable => {
-                        runtime.error = Some(format!(
+                        runtime.composer_note = Some(format!(
                             "{} can't be shown: it is unsupported, damaged or too large to preview.",
                             attachment.label()
                         ));
                     }
                     images::Loaded::Deferred(_) => {
-                        runtime.error = Some(
+                        runtime.composer_note = Some(
                             "Image preview capacity is full. Close other image previews and try again."
                                 .into(),
                         );
