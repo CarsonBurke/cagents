@@ -466,3 +466,50 @@ mod layer_revision {
         assert_ne!(stack.revision(), drawn, "a reset clears the layers");
     }
 }
+
+#[cfg(test)]
+mod present_timing {
+    use iced_graphics::present::{self, Stage};
+
+    // A shell that does not trace frames never enables timing, and then
+    // presenting reads no clock and reports nothing.
+    #[test]
+    fn untimed_until_enabled() {
+        std::thread::spawn(|| {
+            present::begin();
+            present::lap(Stage::Acquire);
+            present::layers(3);
+            present::end();
+            assert!(present::take().is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    // Each stage accumulates its laps, the layer count is kept, and a
+    // presentation is reported once.
+    #[test]
+    fn reports_each_stage_once() {
+        std::thread::spawn(|| {
+            present::enable();
+            present::begin();
+            present::lap(Stage::Acquire);
+            present::lap(Stage::Render);
+            present::lap(Stage::Render);
+            present::lap(Stage::Finish);
+            present::layers(7);
+            present::end();
+            let timing = present::take().expect("a timed presentation");
+            assert!(timing.total >= timing.acquire + timing.render + timing.finish);
+            assert_eq!(timing.layers, Some(7));
+            assert!(timing.cpu.is_some());
+            assert!(present::take().is_none());
+
+            // Laps outside a presentation are ignored.
+            present::lap(Stage::Swap);
+            assert!(present::take().is_none());
+        })
+        .join()
+        .unwrap();
+    }
+}

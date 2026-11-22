@@ -71,8 +71,11 @@ install through `iced_runtime::frame::observe`, a module this patch adds to the
 vendored runtime. The event loop times its handling of each event and, on a
 successful presentation, reports the work since the previous one and the
 interval between them. Without an observer, which is the case unless the
-application's development UI trace is enabled, no clock is read. Remove this
-when the pinned dependency offers equivalent frame timing.
+application's development UI trace is enabled, no clock is read. With an
+observer, the shell also brackets each presentation with
+`iced_graphics::present::begin` and `end` (vendor/iced-graphics), so the
+observer can read how long presenting the frame took and which part of it
+waited. Remove this when the pinned dependency offers equivalent frame timing.
 
 A window whose widgets asked for animation frames
 (`Shell::request_animation`, see `vendor/iced-core/README.cagents.md`) gets

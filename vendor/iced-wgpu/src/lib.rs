@@ -184,14 +184,18 @@ impl Renderer {
         // so nothing is trimmed: a trim would evict what they still draw.
         if self.prepared == Some(prepared) {
             self.prepare_animations(&mut encoder, viewport, now);
+            graphics::present::lap(graphics::present::Stage::Prepare);
             self.render(&mut encoder, target, clear_color, viewport);
+            graphics::present::lap(graphics::present::Stage::Render);
 
             return encoder;
         }
 
         self.layers.merge();
         self.prepare(&mut encoder, viewport, now);
+        graphics::present::lap(graphics::present::Stage::Prepare);
         self.render(&mut encoder, target, clear_color, viewport);
+        graphics::present::lap(graphics::present::Stage::Render);
 
         self.quad.trim();
         self.triangle.trim();
@@ -205,6 +209,7 @@ impl Renderer {
             self.image.trim();
             self.image_cache.borrow_mut().trim();
         }
+        graphics::present::lap(graphics::present::Stage::Trim);
 
         // Merging and trimming leave the revision alone; the trim count is
         // taken once this renderer's own trim has counted.
@@ -226,8 +231,11 @@ impl Renderer {
         let encoder = self.draw(clear_color, frame, viewport);
 
         self.staging_belt.finish();
-        let submission = self.engine.queue.submit([encoder.finish()]);
+        let commands = encoder.finish();
+        graphics::present::lap(graphics::present::Stage::Finish);
+        let submission = self.engine.queue.submit([commands]);
         self.staging_belt.recall();
+        graphics::present::lap(graphics::present::Stage::Submit);
         submission
     }
 
@@ -555,6 +563,8 @@ impl Renderer {
         viewport: &Viewport,
     ) {
         use std::mem::ManuallyDrop;
+
+        graphics::present::layers(self.layers.iter().count());
 
         let mut render_pass = ManuallyDrop::new(encoder.begin_render_pass(
             &wgpu::RenderPassDescriptor {

@@ -978,6 +978,10 @@ async fn run_instance<P>(
     }
 
     let frame_clock = crate::runtime::frame::Clock::new();
+    if frame_clock.is_some() {
+        // The frame observer reads how presenting each frame went.
+        graphics::present::enable();
+    }
 
     'next_event: loop {
         // Empty the queue if possible
@@ -1402,13 +1406,16 @@ async fn run_instance<P>(
                 }
 
                 let present_span = debug::present(id);
-                match current_compositor.present(
+                graphics::present::begin();
+                let presented = current_compositor.present(
                     &mut window.renderer,
                     &mut window.surface,
                     window.state.viewport(),
                     window.state.background_color(),
                     || window.raw.pre_present_notify(),
-                ) {
+                );
+                graphics::present::end();
+                match presented {
                     Ok(()) => {
                         present_span.finish();
                         if let Some(clock) = &frame_clock {
