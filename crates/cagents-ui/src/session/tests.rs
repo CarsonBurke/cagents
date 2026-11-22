@@ -24,6 +24,8 @@ enum FakeWrite {
     FailStale,
     /// A write storage refuses by construction.
     Refuse,
+    /// Storage committed the workspace but refused one pane's content.
+    PartlyRefused,
     Panic,
 }
 
@@ -65,15 +67,17 @@ impl FakeStore {
         }
     }
 
-    fn write(&self) -> Result<(), StoreError> {
+    fn next_write(&self) -> FakeWrite {
         self.attempts.fetch_add(1, Ordering::Relaxed);
-        match self
-            .writes
+        self.writes
             .lock()
             .unwrap()
             .pop_front()
             .unwrap_or(self.exhausted)
-        {
+    }
+
+    fn write_result(write: FakeWrite) -> Result<(), StoreError> {
+        match write {
             FakeWrite::Succeed => Ok(()),
             FakeWrite::Fail => Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -88,8 +92,13 @@ impl FakeStore {
                 actual: 2,
             }),
             FakeWrite::Refuse => Err(invalid_state!("injected refusal")),
+            FakeWrite::PartlyRefused => unreachable!("partial refusal is a workspace commit"),
             FakeWrite::Panic => panic!("injected writer panic"),
         }
+    }
+
+    fn write(&self) -> Result<(), StoreError> {
+        Self::write_result(self.next_write())
     }
 }
 
@@ -147,8 +156,19 @@ impl SessionStore for FakeStore {
         _state: &WorkspaceState,
         _base: SnapshotBase<'_>,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
-        self.write()?;
-        Ok(crate::persistence::WorkspaceCommit::default())
+        match self.next_write() {
+            FakeWrite::PartlyRefused => Ok(crate::persistence::WorkspaceCommit {
+                refused: vec![StoreError::Card {
+                    card: CardId::new(),
+                    error: Box::new(invalid_state!("injected partial refusal")),
+                }],
+                ..Default::default()
+            }),
+            write => {
+                Self::write_result(write)?;
+                Ok(crate::persistence::WorkspaceCommit::default())
+            }
+        }
     }
 
     fn save_project(&self, _project: &ProjectState) -> Result<u64, StoreError> {
@@ -2378,6 +2398,65 @@ fn autosave_skips_a_snapshot_that_already_landed_unchanged() {
     let mut changed = snapshot;
     Arc::make_mut(&mut changed).cards[0].title = "changed after save".into();
     writes.workspace = Some(changed);
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn autosave_retries_a_previously_saved_snapshot_after_a_refusal() {
+    for refused in [FakeWrite::Refuse, FakeWrite::PartlyRefused] {
+        let store = FakeStore::new([FakeWrite::Succeed, refused, FakeWrite::Succeed]);
+        let attempts = Arc::clone(&store.attempts);
+        let saved = Arc::new(workspace());
+        let mut writes = empty_writes();
+
+        writes.workspace = Some(Arc::clone(&saved));
+        writes.flush_checkpoints(&store).unwrap();
+        let different_offer = Arc::new((*saved).clone());
+        writes.workspace = Some(different_offer);
+        writes.flush_checkpoints(&store).unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        // Storage may now hold only part of the intervening offer (or none of
+        // it). The older clean pointer must not hide this renewed offer.
+        writes.workspace = Some(Arc::clone(&saved));
+        writes.flush_checkpoints(&store).unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+}
+
+#[test]
+fn autosave_retries_a_previously_saved_snapshot_after_an_io_error() {
+    let store = FakeStore::new([FakeWrite::Succeed, FakeWrite::Fail, FakeWrite::Succeed]);
+    let attempts = Arc::clone(&store.attempts);
+    let saved = Arc::new(workspace());
+    let mut writes = empty_writes();
+
+    writes.workspace = Some(Arc::clone(&saved));
+    writes.flush_checkpoints(&store).unwrap();
+    writes.workspace = Some(Arc::new((*saved).clone()));
+    assert!(writes.flush_checkpoints(&store).is_err());
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+    // A retry may coalesce back to an earlier snapshot. Its previous clean
+    // pointer no longer proves storage holds it after a failed write.
+    writes.workspace = Some(Arc::clone(&saved));
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn a_conversion_of_the_last_clean_snapshot_is_never_skipped() {
+    let store = FakeStore::always(FakeWrite::Succeed);
+    let attempts = Arc::clone(&store.attempts);
+    let snapshot = Arc::new(workspace());
+    let mut writes = empty_writes();
+
+    writes.workspace = Some(Arc::clone(&snapshot));
+    writes.flush_checkpoints(&store).unwrap();
+    writes
+        .conversions
+        .push_back(ConversionCheckpoint::Snapshot(snapshot));
     writes.flush_checkpoints(&store).unwrap();
     assert_eq!(attempts.load(Ordering::Relaxed), 2);
 }

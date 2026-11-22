@@ -8572,10 +8572,12 @@ impl Cagents {
         terminal_output_tests::record_persist();
         let mut phase = WorkspaceProjectionTiming::new(true);
         phase.mark("save_prepare");
-        self.snapshot_workspace_scope();
+        let scope_changed = self.snapshot_workspace_scope();
+        let durable_before_publication = Arc::clone(&self.durable);
         phase.mark("save_scope_snapshot");
         publish(self);
         phase.mark("save_publish");
+        let publication_changed = !Arc::ptr_eq(&durable_before_publication, &self.durable);
         // Ordered identity work needs its exact complete snapshot now. Scope
         // projection alone is not authority to coalesce these checkpoints.
         tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_policy",
@@ -8588,7 +8590,13 @@ impl Cagents {
             && self.shared_views.restorations.is_empty()
             && self.shared_views.chat_adoptions.is_empty()
         {
-            self.mark_replica_snapshot(Instant::now());
+            if publication_changed {
+                self.mark_replica_snapshot(Instant::now());
+            } else if scope_changed {
+                // The active strip changed before the publication. It is not
+                // replica debt, but it still needs an ordinary saved snapshot.
+                self.capture_prepared_workspace(true);
+            }
         } else {
             self.capture_prepared_workspace(true);
         }

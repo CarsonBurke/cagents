@@ -2184,6 +2184,15 @@ impl PendingWrites {
         }
     }
 
+    /// Forget the pointer identity used only for a known-clean autosave.
+    ///
+    /// Any checkpoint that can change workspace rows makes the stored contents
+    /// diverge from that earlier snapshot, even when it later refuses only
+    /// part of its work. The next ordinary offer must therefore reach storage.
+    fn invalidate_saved_workspace(&mut self) {
+        self.saved_workspace = Weak::new();
+    }
+
     /// Whether storage holds every pending write it can currently accept.
     ///
     /// A worktree row waiting on a project storage has no row for is not one
@@ -2315,6 +2324,7 @@ impl PendingWrites {
             let stored = store.stored_generations(workspace)?;
             self.workspace_generation = stored.workspace;
             self.card_generations = stored.cards;
+            self.invalidate_saved_workspace();
         }
         // A catalog entity carries its base inside the state it writes, so
         // reseating it means replacing the remembered generation. No stored row
@@ -2462,30 +2472,33 @@ impl PendingWrites {
                         });
                     let result = match refused {
                         None => Err("The exact refused terminal pane changed; review the current save notice.".into()),
-                        Some(refused) => match store.recover_terminal_ownership(
-                            &snapshot,
-                            SnapshotBase {
-                                workspace: self.workspace_generation,
-                                cards: &self.card_generations,
-                            },
-                            recovery,
-                        ) {
-                            Ok(commit) => {
-                                self.workspace_generation = commit.generation;
-                                self.card_generations = commit.card_generations;
-                                // An explicit Retry may have rearmed this old
-                                // refused snapshot while the repair was queued.
-                                // Retire only that offer, preserving a newer
-                                // autosave that arrived during the repair.
-                                if self.workspace.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &refused)) {
-                                    self.workspace = None;
+                        Some(refused) => {
+                            self.invalidate_saved_workspace();
+                            match store.recover_terminal_ownership(
+                                &snapshot,
+                                SnapshotBase {
+                                    workspace: self.workspace_generation,
+                                    cards: &self.card_generations,
+                                },
+                                recovery,
+                            ) {
+                                Ok(commit) => {
+                                    self.workspace_generation = commit.generation;
+                                    self.card_generations = commit.card_generations;
+                                    // An explicit Retry may have rearmed this old
+                                    // refused snapshot while the repair was queued.
+                                    // Retire only that offer, preserving a newer
+                                    // autosave that arrived during the repair.
+                                    if self.workspace.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &refused)) {
+                                        self.workspace = None;
+                                    }
+                                    self.quarantine.snapshot_landed(&snapshot, &commit.refused);
+                                    self.acknowledge_retained_copy_closures(&snapshot);
+                                    Ok(())
                                 }
-                                self.quarantine.snapshot_landed(&snapshot, &commit.refused);
-                                self.acknowledge_retained_copy_closures(&snapshot);
-                                Ok(())
+                                Err(error) => Err(repair(&error)),
                             }
-                            Err(error) => Err(repair(&error)),
-                        },
+                        }
                     };
                     if result.is_err() {
                         // Preserve the work captured by the reviewed action,
@@ -2499,6 +2512,7 @@ impl PendingWrites {
                     let _ = reply.send(result);
                 }
                 ConversionCheckpoint::RetainedChatCopy { copy, reply } => {
+                    self.invalidate_saved_workspace();
                     match store.preserve_chat_copy(&copy) {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
@@ -2530,6 +2544,7 @@ impl PendingWrites {
                     }
                 }
                 ConversionCheckpoint::ChatRecovery(recovery) => {
+                    self.invalidate_saved_workspace();
                     let result = match recovery.kind {
                         ChatRecoveryKind::Account => store.rebind_chat_account(
                             recovery.card,
@@ -2576,6 +2591,7 @@ impl PendingWrites {
                 }
                 ConversionCheckpoint::IdentityReplacement(mut replacement) => {
                     self.quarantine.continue_refused(&mut replacement);
+                    self.invalidate_saved_workspace();
                     match replacement.apply(store) {
                         Ok(()) => self.quarantine.replacement_landed(replacement.card_id),
                         Err(error) if error.refuses_content() => {
@@ -2608,6 +2624,10 @@ impl PendingWrites {
                     {
                         continue;
                     }
+                    // A refused or partially refused commit can leave storage
+                    // at a different state than the last clean snapshot. Do
+                    // not let that old pointer suppress the next offer.
+                    self.invalidate_saved_workspace();
                     match store.save_workspace_with_terminal_panes(
                         &snapshot,
                         SnapshotBase {

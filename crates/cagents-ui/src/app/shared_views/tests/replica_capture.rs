@@ -270,6 +270,27 @@ fn presentation_replica_capture_has_one_trailing_timer_and_a_continuous_cap() {
 }
 
 #[test]
+fn unchanged_replica_publication_creates_no_snapshot_debt() {
+    let (mut app, _, _, _) = presentation_fixture();
+    let _directory = writer_fixture(&mut app);
+    let durable = Arc::clone(&app.durable);
+    let captures = app.replica_capture.captures;
+    let offers = app.replica_capture.offers;
+
+    // A reconnect or repeated publication can complete without changing this
+    // window's durable state. In particular, do not call
+    // `persistent_workspace`: it may build a fresh Arc for default panes even
+    // though there is nothing for this window's database to save.
+    app.save_projected_workspace(true, |_| {});
+
+    assert!(Arc::ptr_eq(&durable, &app.durable));
+    assert!(app.replica_capture.pending.is_none());
+    assert_eq!(app.replica_capture.captures, captures);
+    assert_eq!(app.replica_capture.offers, offers);
+    drop(app);
+}
+
+#[test]
 fn presentation_replica_capture_bare_flush_materializes_before_its_receipt() {
     let (mut app, source, _, pane) = presentation_fixture();
     let _directory = writer_fixture(&mut app);
