@@ -554,16 +554,24 @@ impl MessageRun {
             };
             let (status, output) = reported(item, coordinated);
             states.push(message_state(&coordinated.reading, message, status, output));
+            // Compared whole, as the agent wrote them: messages that open
+            // alike and differ further on are not one message.
             bodies.push(
                 message
                     .body
                     .inline()
-                    .and(coordinated.plain.said.first())
-                    .map(|said| one_line_of(said)),
+                    .map(|body| (body, coordinated.plain.said.first())),
             );
-            let address = match &coordinated.reading.outcome.receipt {
-                Some(receipt) => receipt.recipient.as_str(),
-                None => message.to.as_str(),
+            // The agent the provider resolved, which one addressed once by
+            // its ID and once by its name is to both, before the CLI's
+            // account of the session and the name the agent gave.
+            let address = match (
+                coordinated.reading.subagents.as_slice(),
+                &coordinated.reading.outcome.receipt,
+            ) {
+                ([agent], _) => agent.as_str(),
+                (_, Some(receipt)) => receipt.recipient.as_str(),
+                _ => message.to.as_str(),
             };
             if !addressed.contains(&address) {
                 addressed.push(address);
@@ -579,10 +587,10 @@ impl MessageRun {
         // told apart by whom they went to, each message's own row giving
         // its words.
         let shared = match bodies.split_first() {
-            Some((Some(first), rest)) if !first.is_empty() => rest
+            Some((Some((first, said)), rest)) if !first.trim().is_empty() => rest
                 .iter()
-                .all(|body| body.as_ref() == Some(first))
-                .then(|| first.clone()),
+                .all(|body| body.is_some_and(|(body, _)| body == *first))
+                .then(|| said.map(|said| one_line_of(said)).unwrap_or_default()),
             _ => None,
         };
         let shares = shared.is_some();

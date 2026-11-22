@@ -2743,4 +2743,30 @@ mod tests {
             "Messaged 2 agents: same · 1 sending · 1 queued"
         );
     }
+
+    /// Messages are one said to several only when the whole of each is the
+    /// same: a long one that differs past what a row shows is not.
+    #[test]
+    fn messages_that_differ_past_a_rows_reach_are_not_one() {
+        let opening = "Main's ui lane is broken. ".repeat(20);
+        let (first, second) = (
+            sent("docs-review", &format!("{opening}Rebase first.")),
+            sent("perf-audit", &format!("{opening}Wait for review.")),
+        );
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Succeeded),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(
+            turns[1].summary,
+            "Sent 2 messages to docs-review, perf-audit · Queued"
+        );
+    }
 }
