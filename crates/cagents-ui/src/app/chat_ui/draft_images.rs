@@ -6,12 +6,20 @@
 //! draft) brings the same receipt back, at the place in the tray it left.
 //! Nothing is renumbered: the label is the receipt's own.
 //!
+//! A reference is one piece of the draft, not nine characters: the caret
+//! never stops inside it, a selection that touches it takes all of it, and
+//! Backspace or Delete beside it removes it whole. No edit can leave half of
+//! one, such as `[Imag`, behind. Only the references of images the draft
+//! holds are pieces; other bracketed text is the reader's own.
+//!
 //! The composer's own undo history lives here too, since an image's removal
 //! and return are text edits it replays.
 use crate::chat::Attachment;
 use crate::editor_history::{EditBuffer, EditKind};
-use cosmic::widget::text_editor::{self, Content, Cursor, Position};
+use cosmic::iced::advanced::text::editor::Direction;
+use cosmic::widget::text_editor::{self, Content, Cursor, Motion, Position};
 use std::collections::HashSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// An image whose reference the draft no longer holds.
@@ -36,15 +44,208 @@ const MAX_TOKEN: usize = 32;
 /// of the whole draft per image. A token has no bracket inside it, so this
 /// finds every one a substring search would.
 fn tokens(text: &str) -> HashSet<&str> {
+    bracketed(text).map(|span| &text[span]).collect()
+}
+
+/// The byte span of each short bracketed run in `text`, from its `[` to the
+/// first `]` after it.
+fn bracketed(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let bytes = text.as_bytes();
-    let mut found = HashSet::new();
-    for (start, _) in text.match_indices('[') {
+    text.match_indices('[').filter_map(move |(start, _)| {
         let reach = bytes.len().min(start + MAX_TOKEN);
-        if let Some(end) = bytes[start + 1..reach].iter().position(|&b| b == b']') {
-            found.insert(&text[start..start + end + 2]);
+        bytes[start + 1..reach]
+            .iter()
+            .position(|&b| b == b']')
+            .map(|end| start..start + end + 2)
+    })
+}
+
+/// The tokens of the images `attachments` holds: the text that is one of
+/// the draft's pieces rather than the reader's own words.
+pub(super) fn live_tokens(attachments: &[Attachment]) -> HashSet<String> {
+    attachments
+        .iter()
+        .filter_map(|attachment| attachment.reference.as_ref())
+        .map(|reference| reference.token())
+        .collect()
+}
+
+/// Where in `line` the references `live` names stand.
+fn spans<'a>(line: &'a str, live: &'a HashSet<String>) -> impl Iterator<Item = Range<usize>> + 'a {
+    bracketed(line).filter(|span| live.contains(&line[span.clone()]))
+}
+
+/// Which side of a reference a caret that landed inside it goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Toward {
+    Start,
+    End,
+    /// Whichever side is closer, as for a click or a move between lines.
+    Nearer,
+}
+
+impl Toward {
+    /// The side a motion was heading for: across a reference, never back.
+    pub(super) fn of(motion: Motion) -> Self {
+        match motion {
+            Motion::Up | Motion::Down | Motion::PageUp | Motion::PageDown => Self::Nearer,
+            _ => match motion.direction() {
+                Direction::Left => Self::Start,
+                Direction::Right => Self::End,
+            },
         }
     }
-    found
+}
+
+/// `column` of `line`, moved out of the reference it falls inside, if any.
+fn outside(line: &str, live: &HashSet<String>, column: usize, toward: Toward) -> usize {
+    spans(line, live)
+        .find(|span| span.start < column && column < span.end)
+        .map_or(column, |span| match toward {
+            Toward::Start => span.start,
+            Toward::End => span.end,
+            Toward::Nearer if column - span.start <= span.end - column => span.start,
+            Toward::Nearer => span.end,
+        })
+}
+
+fn moved_out(
+    content: &Content<cosmic::Renderer>,
+    live: &HashSet<String>,
+    position: Position,
+    toward: Toward,
+) -> Position {
+    Position {
+        column: content.line(position.line).map_or(position.column, |line| {
+            outside(&line.text, live, position.column, toward)
+        }),
+        ..position
+    }
+}
+
+/// The cursor the composer must take so that neither of its ends is inside
+/// one of the references `live` names, or `None` when it already is. A
+/// caret goes `toward` a side; a selection grows to take in every reference
+/// it touches, keeping the end the reader moves.
+pub(super) fn whole(
+    content: &Content<cosmic::Renderer>,
+    live: &HashSet<String>,
+    toward: Toward,
+) -> Option<Cursor> {
+    let cursor = content.cursor();
+    let selecting = content
+        .selection()
+        .is_some_and(|selection| !selection.is_empty());
+    if !selecting {
+        let position = moved_out(content, live, cursor.position, toward);
+        return (position != cursor.position).then_some(Cursor {
+            position,
+            selection: None,
+        });
+    }
+    // A word or line selection reports the place it began rather than its
+    // ends; this reads the span it actually covers. A plain selection's
+    // cursor is its span, so it stands in when that read is ambiguous.
+    let span = super::attachment_draft::selection_span(content).unwrap_or(cursor);
+    let (position, anchor) = (span.position, span.selection?);
+    let forward = (anchor.line, anchor.column) <= (position.line, position.column);
+    let (low, high) = if forward {
+        (anchor, position)
+    } else {
+        (position, anchor)
+    };
+    let (start, end) = (
+        moved_out(content, live, low, Toward::Start),
+        moved_out(content, live, high, Toward::End),
+    );
+    if (start, end) == (low, high) {
+        return None;
+    }
+    Some(if forward {
+        Cursor {
+            position: end,
+            selection: Some(start),
+        }
+    } else {
+        Cursor {
+            position: start,
+            selection: Some(end),
+        }
+    })
+}
+
+/// The selection `edit` must delete instead, when it is Backspace just after
+/// a reference or Delete just before one: the whole reference, not its
+/// bracket.
+pub(super) fn deleted_whole(
+    content: &Content<cosmic::Renderer>,
+    live: &HashSet<String>,
+    edit: &text_editor::Edit,
+) -> Option<Cursor> {
+    let backward = match edit {
+        text_editor::Edit::Backspace => true,
+        text_editor::Edit::Delete => false,
+        _ => return None,
+    };
+    if content
+        .selection()
+        .is_some_and(|selection| !selection.is_empty())
+    {
+        return None;
+    }
+    let caret = content.cursor().position;
+    let line = content.line(caret.line)?;
+    let span = spans(&line.text, live).find(|span| {
+        if backward {
+            span.end == caret.column
+        } else {
+            span.start == caret.column
+        }
+    })?;
+    let at = |column| Position { column, ..caret };
+    Some(Cursor {
+        position: at(span.end),
+        selection: Some(at(span.start)),
+    })
+}
+
+/// Text the reader copied or cut from a draft, with the images whose
+/// references it holds. Pasted into another draft, it brings those images
+/// along, so the references there name the same pictures rather than none.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Copied {
+    text: String,
+    images: Vec<Attachment>,
+}
+
+impl Copied {
+    /// What copying `text` out of a draft holding `attachments` takes along;
+    /// `None` when it names none of them.
+    pub(super) fn of(text: String, attachments: &[Attachment]) -> Option<Self> {
+        let present = tokens(&text);
+        let images: Vec<_> = attachments
+            .iter()
+            .filter(|attachment| {
+                attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(|reference| present.contains(reference.token().as_str()))
+            })
+            .cloned()
+            .collect();
+        (!images.is_empty()).then_some(Self { text, images })
+    }
+
+    /// The images a paste of `pasted` brings: this copy's, when the paste is
+    /// this copy. The clipboard may since hold text from anywhere else,
+    /// whose `[Image N]` names nothing this draft can vouch for.
+    pub(super) fn carried(&self, pasted: &str) -> &[Attachment] {
+        if pasted == self.text {
+            &self.images
+        } else {
+            &[]
+        }
+    }
 }
 
 /// The ids of `attachments` whose reference `text` holds.
@@ -353,6 +554,41 @@ mod tests {
                 assert_eq!(attachments, all);
                 assert!(detached.is_empty());
             }
+        });
+    }
+
+    #[test]
+    fn a_caret_inside_a_reference_goes_to_the_side_it_was_heading_for() {
+        let live = HashSet::from(["[Image 2]".to_owned()]);
+        let line = "[Image 1] é[Image 2]x";
+        let start = line.find("[Image 2]").unwrap();
+        let end = start + "[Image 2]".len();
+        for column in start + 1..end {
+            assert_eq!(outside(line, &live, column, Toward::Start), start);
+            assert_eq!(outside(line, &live, column, Toward::End), end);
+        }
+        assert_eq!(outside(line, &live, start + 2, Toward::Nearer), start);
+        assert_eq!(outside(line, &live, end - 2, Toward::Nearer), end);
+        // Its edges are outside it, and text no image holds is text.
+        for column in [start, end, 3] {
+            assert_eq!(outside(line, &live, column, Toward::End), column);
+        }
+        assert_eq!(Toward::of(Motion::WordLeft), Toward::Start);
+        assert_eq!(Toward::of(Motion::End), Toward::End);
+        assert_eq!(Toward::of(Motion::Down), Toward::Nearer);
+    }
+
+    #[test]
+    fn a_copy_carries_the_images_it_names_only_into_its_own_paste() {
+        attachment_assets::with_test_image(|first| {
+            let second = attachment_assets::test_image("second.png");
+            let token = |a: &Attachment| a.reference.as_ref().unwrap().token();
+            let held = [first.clone(), second.clone()];
+            assert_eq!(Copied::of("plain words".into(), &held), None);
+            let text = format!("see {}", token(&second));
+            let copied = Copied::of(text.clone(), &held).unwrap();
+            assert_eq!(copied.carried(&text), [second.clone()]);
+            assert!(copied.carried(&token(&second)).is_empty());
         });
     }
 

@@ -4261,10 +4261,22 @@ impl Runtime {
                     }
                     let binding =
                         word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press));
-                    if matches!(binding, Some(text_editor::Binding::Paste)) {
-                        Some(text_editor::Binding::Custom(action(Action::Paste(target))))
-                    } else {
-                        binding
+                    match binding {
+                        Some(text_editor::Binding::Paste) => {
+                            Some(text_editor::Binding::Custom(action(Action::Paste(target))))
+                        }
+                        // What is copied is noted first, with the images its
+                        // references name, so a paste into another draft
+                        // brings them along.
+                        Some(copy @ (text_editor::Binding::Copy | text_editor::Binding::Cut)) => {
+                            Some(text_editor::Binding::Sequence(vec![
+                                text_editor::Binding::Custom(action(Action::ComposerCopied(
+                                    target,
+                                ))),
+                                copy,
+                            ]))
+                        }
+                        binding => binding,
                     }
                 })
                 .into()

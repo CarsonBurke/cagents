@@ -581,6 +581,8 @@ pub enum Action {
     RemoveAttachment(Target, usize),
     /// Undo in the composer, or redo when `true`.
     ComposerUndo(Target, bool),
+    /// The composer's selection is about to be copied or cut.
+    ComposerCopied(Target),
     /// Opens the tray's `index`th image in the image viewer.
     OpenAttachment(Target, usize),
     /// The full-size pixels of a draft image the tray asked to open.
@@ -1004,6 +1006,7 @@ impl Action {
             Self::Dropped(..) => "Dropped",
             Self::RemoveAttachment(..) => "RemoveAttachment",
             Self::ComposerUndo(..) => "ComposerUndo",
+            Self::ComposerCopied(..) => "ComposerCopied",
             Self::OpenAttachment(..) => "OpenAttachment",
             Self::AttachmentOpened(..) => "AttachmentOpened",
             Self::Model(..) => "Model",
@@ -1433,6 +1436,9 @@ pub(super) struct State {
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
+    /// What the reader last copied or cut from a composer, when it named the
+    /// draft's images, which pasting it into another draft brings along.
+    copied_images: Option<draft_images::Copied>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -1472,6 +1478,7 @@ impl Default for State {
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
+            copied_images: None,
         }
     }
 }
@@ -3842,6 +3849,13 @@ impl Runtime {
         match action {
             text_editor::Action::Edit(edit) => {
                 let before = self.composer.cursor();
+                // An edit takes an image's reference whole or not at all.
+                if let Some(live) = self.live_references() {
+                    self.keep_references_whole(draft_images::Toward::Nearer);
+                    if let Some(whole) = draft_images::deleted_whole(&self.composer, &live, &edit) {
+                        attachment_draft::move_to(&mut self.composer, whole);
+                    }
+                }
                 let selected = self
                     .composer
                     .selection()
@@ -3879,11 +3893,79 @@ impl Runtime {
                 if !matches!(other, text_editor::Action::Scroll { .. }) {
                     self.composer_undo.seal();
                 }
+                let toward = match &other {
+                    text_editor::Action::Move(motion) | text_editor::Action::Select(motion) => {
+                        draft_images::Toward::of(*motion)
+                    }
+                    _ => draft_images::Toward::Nearer,
+                };
                 self.composer.perform(other);
+                self.keep_references_whole(toward);
             }
         }
         self.cancel_invalid_attachment_jobs();
         self.settle_restored_notice();
+        self.follow_caret_reference();
+    }
+
+    /// The tokens of the draft's images, which the caret and selection keep
+    /// whole; `None` while it holds none.
+    fn live_references(&self) -> Option<HashSet<String>> {
+        let live = draft_images::live_tokens(&self.attachments);
+        (!live.is_empty()).then_some(live)
+    }
+
+    /// Moves a caret that landed inside an image's reference `toward` one
+    /// of its sides, and grows a selection that took part of one to take
+    /// all of it.
+    fn keep_references_whole(&mut self, toward: draft_images::Toward) {
+        if let Some(live) = self.live_references()
+            && let Some(whole) = draft_images::whole(&self.composer, &live, toward)
+        {
+            attachment_draft::move_to(&mut self.composer, whole);
+        }
+    }
+
+    /// Attaches the images a paste brought from another draft, whose
+    /// references it put in this one; see [`draft_images::Copied`]. Those
+    /// this chat can't take stay text, and the composer says why.
+    fn carry_images(&mut self, carried: &[Attachment]) {
+        let holds = |attachments: &[Attachment], image: &Attachment| {
+            attachments.iter().any(|held| {
+                held.reference.as_ref().map(|r| r.id) == image.reference.as_ref().map(|r| r.id)
+            })
+        };
+        let new: Vec<Attachment> = carried
+            .iter()
+            .filter(|image| !holds(&self.attachments, image))
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        let room = if self.accepts_draft_attachments() {
+            chat::AttachmentRules::for_provider(self.session.launch.provider)
+                .max_count
+                .map_or(usize::MAX, |limit| {
+                    limit.saturating_sub(self.attachments.len() + self.image_pastes_saving)
+                })
+        } else {
+            0
+        };
+        let refused: Vec<String> = new.iter().skip(room).map(Attachment::label).collect();
+        if !refused.is_empty() {
+            self.composer_note = Some(format!(
+                "{} {} not attached: {}",
+                refused.join(", "),
+                if refused.len() == 1 { "was" } else { "were" },
+                if room == 0 && !self.accepts_draft_attachments() {
+                    "the current model cannot accept images."
+                } else {
+                    "this chat has reached its attachment limit."
+                }
+            ));
+        }
+        self.merge_attachments(new.into_iter().take(room));
         self.follow_caret_reference();
     }
 
@@ -14523,6 +14605,7 @@ impl Cagents {
             Action::ComposerCursor(target, cursor) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer.move_to(cursor);
+                    runtime.keep_references_whole(draft_images::Toward::Nearer);
                     runtime.composer_undo.seal();
                     runtime.follow_caret_reference();
                     if runtime.completion.restart(false) {
@@ -14565,6 +14648,14 @@ impl Cagents {
             }
             Action::Composer(target, action) => {
                 let mut files = None;
+                // The editor's own menu pastes here rather than through
+                // `Action::Paste`.
+                let carried = match (&action, &self.chat_ui.copied_images) {
+                    (text_editor::Action::Edit(text_editor::Edit::Paste(text)), Some(copied)) => {
+                        copied.carried(text).to_vec()
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
                         // The reader has moved on from what it said.
@@ -14582,6 +14673,7 @@ impl Cagents {
                     let rescroll = !matches!(action, text_editor::Action::Scroll { .. })
                         && runtime.completion.restart(action.is_edit());
                     runtime.composer_action(action);
+                    runtime.carry_images(&carried);
                     if runtime.files.is_none() && runtime.composer.text().contains('@') {
                         runtime.files = Some(Arc::new(Vec::new()));
                         files = Some(runtime.session.launch.recipe.working_directory.clone());
@@ -14684,12 +14776,18 @@ impl Cagents {
                 });
             }
             Action::PastedText(target, id, text) => {
+                let text = text.unwrap_or_default();
+                let carried = self
+                    .chat_ui
+                    .copied_images
+                    .as_ref()
+                    .map(|copied| copied.carried(&text).to_vec())
+                    .unwrap_or_default();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let success = runtime.finish_attachment_insert(
-                        id.id,
-                        text.as_deref().unwrap_or_default(),
-                        Vec::new(),
-                    );
+                    let success = runtime.finish_attachment_insert(id.id, &text, Vec::new());
+                    if success {
+                        runtime.carry_images(&carried);
+                    }
                     if success
                         && runtime.pastes_pending == 0
                         && let Some(mode) = runtime.submit_after_paste.take()
@@ -16517,6 +16615,15 @@ impl Cagents {
                     len => view::attachment_tile_id(target.card, index.min(len - 1)),
                 };
                 return iced::widget::operation::focus(id).map(cosmic::Action::App);
+            }
+            Action::ComposerCopied(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let copied = runtime
+                        .composer
+                        .selection()
+                        .and_then(|text| draft_images::Copied::of(text, &runtime.attachments));
+                    self.chat_ui.copied_images = copied;
+                }
             }
             Action::ComposerUndo(target, redo) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {

@@ -74,23 +74,18 @@ fn deleting_a_reference_removes_its_image_and_undo_brings_both_back() {
         let full = runtime.composer.text();
         assert_eq!(numbers(&runtime.attachments), numbers(&all));
 
-        // One Backspace breaks the reference; the image goes with it, and
+        // One Backspace takes the whole reference, and its image with it;
         // the others keep their numbers.
         caret_after(runtime, &token(&second));
         edit(runtime, text_editor::Edit::Backspace);
-        assert_eq!(runtime.attachments, [first.clone(), third.clone()]);
-        assert_eq!(sent_attachments(runtime), [first.clone(), third.clone()]);
-        // The rest of the reference goes in the same run of deletes.
         let reference = token(&second);
-        for _ in 1..reference.len() {
-            edit(runtime, text_editor::Edit::Backspace);
-        }
         assert_eq!(
             runtime.composer.text(),
             full.replacen(&reference, "", 1),
             "the whole reference is gone"
         );
         assert_eq!(runtime.attachments, [first.clone(), third.clone()]);
+        assert_eq!(sent_attachments(runtime), [first.clone(), third.clone()]);
 
         // Undo restores the text and the same receipt, in its place.
         drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
@@ -511,5 +506,194 @@ fn a_tile_opens_in_its_own_pane_beside_another_panes_image() {
         }
         assert!(app.image_viewer(images::ViewerHost::Dialog).is_none());
         assert!(!app.modal_is_open());
+    });
+}
+
+/// Places the cursor at byte `position` of the one-line draft, selecting
+/// from `anchor` when given, as an assistive tool or a click would.
+fn place(app: &mut Cagents, target: Target, position: usize, anchor: Option<usize>) {
+    let at = |column| text_editor::Position { line: 0, column };
+    drop(app.handle_chat_ui(Action::ComposerCursor(
+        target,
+        text_editor::Cursor {
+            position: at(position),
+            selection: anchor.map(at),
+        },
+    )));
+}
+
+fn cursor(runtime: &Runtime) -> (usize, Option<usize>) {
+    let cursor = runtime.composer.cursor();
+    (
+        cursor.position.column,
+        cursor.selection.map(|anchor| anchor.column),
+    )
+}
+
+#[test]
+fn the_caret_steps_over_a_reference_and_never_stops_inside_it() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "See ", &[image.clone()]);
+        let reference = token(&image);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let start = runtime.composer.text().find(&reference).unwrap();
+        let end = start + reference.len();
+        let step = |app: &mut Cagents, action| {
+            drop(app.handle_chat_ui(Action::Composer(target, action)));
+            cursor(app.chat_runtime_mut(target).unwrap())
+        };
+        let right = text_editor::Action::Move(text_editor::Motion::Right);
+        let left = text_editor::Action::Move(text_editor::Motion::Left);
+
+        place(&mut app, target, start, None);
+        assert_eq!(
+            step(&mut app, right.clone()),
+            (end, None),
+            "Right crosses it"
+        );
+        assert_eq!(
+            step(&mut app, left.clone()),
+            (start, None),
+            "Left crosses back"
+        );
+        // A caret put inside goes to the nearer side.
+        place(&mut app, target, start + 2, None);
+        assert_eq!(cursor(app.chat_runtime_mut(target).unwrap()), (start, None));
+        place(&mut app, target, end - 2, None);
+        assert_eq!(cursor(app.chat_runtime_mut(target).unwrap()), (end, None));
+        // Selecting into it takes all of it.
+        place(&mut app, target, start, None);
+        let select = text_editor::Action::Select(text_editor::Motion::Right);
+        assert_eq!(step(&mut app, select), (end, Some(start)));
+        assert_eq!(app.chat_runtime_mut(target).unwrap().attachments, [image]);
+    });
+}
+
+#[test]
+fn delete_or_a_partial_selection_takes_the_whole_reference_and_its_image() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|first| {
+        let second = chat::attachment_assets::test_image("second.png");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "A ", &[first.clone(), second.clone()]);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let full = runtime.composer.text();
+        let (one, two) = (token(&first), token(&second));
+        let start = full.find(&one).unwrap();
+
+        // Forward Delete just before a reference takes all of it.
+        place(&mut app, target, start, None);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        edit(runtime, text_editor::Edit::Delete);
+        assert_eq!(runtime.composer.text(), full.replacen(&one, "", 1));
+        assert_eq!(runtime.attachments, [second.clone()]);
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), full);
+        assert_eq!(runtime.attachments, [first.clone(), second.clone()]);
+
+        // Typing over a selection that took the end of one reference and the
+        // start of the next replaces both whole: no `[Imag` is left.
+        let at = full.find(&two).unwrap();
+        place(&mut app, target, at + 3, Some(start + one.len() - 2));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        edit(runtime, text_editor::Edit::Insert('x'));
+        let typed = format!("{}x{}", &full[..start], &full[at + two.len()..]);
+        assert_eq!(runtime.composer.text(), typed);
+        assert!(runtime.attachments.is_empty());
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), full);
+        assert_eq!(runtime.attachments, [first, second]);
+    });
+}
+
+#[test]
+fn text_that_only_looks_like_a_reference_edits_as_text() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "[Image 999] and ", &[image.clone()]);
+        place(&mut app, target, "[Image 999]".len(), None);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        edit(runtime, text_editor::Edit::Backspace);
+        assert!(runtime.composer.text().starts_with("[Image 999 and "));
+        assert_eq!(runtime.attachments, [image]);
+    });
+}
+
+#[test]
+fn copying_a_reference_into_another_draft_brings_its_image() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let source = draft_with_images(&mut app, "Here ", &[image.clone()]);
+        let reference = token(&image);
+        let full = app.chat_runtime_mut(source).unwrap().composer.text();
+        let start = full.find(&reference).unwrap();
+        place(&mut app, source, start + reference.len(), Some(start));
+        drop(app.handle_chat_ui(Action::ComposerCopied(source)));
+
+        let card = draft_chat(&mut app);
+        let other = chat_runtime(&app, card).target;
+        let paste = |app: &mut Cagents, text: &str| {
+            let ticket = app
+                .chat_runtime_mut(other)
+                .unwrap()
+                .begin_attachment_insert();
+            drop(app.handle_chat_ui(Action::PastedText(other, ticket, Some(text.to_owned()))));
+        };
+        // Text from anywhere else that merely says the same names nothing.
+        paste(&mut app, &format!("{reference} too"));
+        let runtime = app.chat_runtime_mut(other).unwrap();
+        assert!(runtime.attachments.is_empty());
+        assert!(runtime.undo_composer(false));
+        paste(&mut app, &reference);
+        let runtime = app.chat_runtime_mut(other).unwrap();
+        assert_eq!(runtime.composer.text(), reference);
+        assert_eq!(runtime.attachments, [image.clone()]);
+        // Undoing the paste takes the image back out with its reference.
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), "");
+        assert!(runtime.attachments.is_empty());
+        assert!(runtime.undo_composer(true));
+        assert_eq!(runtime.attachments, [image.clone()]);
+        // The draft it came from still has it.
+        assert_eq!(app.chat_runtime_mut(source).unwrap().attachments, [image]);
+    });
+}
+
+#[test]
+fn copy_and_cut_chords_note_what_the_composer_copies() {
+    use iced::keyboard::{self, key::Code, key::Physical};
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let target = draft_with_images(&mut app, "Here ", &[image]);
+        let renderer = crate::app::tests::headless_renderer();
+        for (character, code) in [("c", Code::KeyC), ("x", Code::KeyX)] {
+            let messages = composer_key_messages(
+                &app,
+                target.card,
+                720.0,
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(character.into()),
+                    modified_key: keyboard::Key::Character(character.into()),
+                    physical_key: Physical::Code(code),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::CTRL,
+                    text: None,
+                    repeat: false,
+                },
+                &renderer,
+            );
+            assert!(
+                matches!(
+                    messages.first(),
+                    Some(Message::ChatUi(Action::ComposerCopied(found))) if *found == target
+                ),
+                "Ctrl+{character}"
+            );
+        }
     });
 }
