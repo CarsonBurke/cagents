@@ -519,7 +519,6 @@ mod subscription_events {
     //! The runtime's subscription tracker keeps every event for a listener
     //! whose stream waits on the runtime (#3644).
 
-    use futures::StreamExt;
     use futures::channel::mpsc;
     use futures::executor::LocalPool;
     use futures::task::LocalSpawnExt;
