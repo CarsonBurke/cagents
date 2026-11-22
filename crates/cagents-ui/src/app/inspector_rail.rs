@@ -51,7 +51,7 @@ impl Cagents {
             .flatten();
         // As the Work section's header counts it: only once listed, and
         // only when there is something to count.
-        let work = (self.work_reserved(card)
+        let work = (self.tracks_work(card)
             && self.work_phase(card) == pull_request_ui::WorkPhase::Listed)
             .then(|| self.work_count(card))
             .filter(|count| *count > 0);
