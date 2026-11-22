@@ -1335,6 +1335,7 @@ impl HostState {
         transcripts.extend(
             self.chat_close_reservations
                 .values()
+                .flat_map(|removal| [&removal.source, &removal.current])
                 .filter_map(conversation_transcript),
         );
         transcripts.extend(
