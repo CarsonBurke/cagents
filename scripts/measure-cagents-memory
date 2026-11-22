@@ -32,7 +32,7 @@ def process(pid):
         if state == "Z":
             return None
         command = (base / "cmdline").read_bytes().split(b"\0")
-        executable = (base / "exe").resolve().name
+        executable = (base / "exe").resolve().name.removesuffix(" (deleted)")
     except (FileNotFoundError, PermissionError, ProcessLookupError, IndexError):
         return None
     return {"pid": str(pid), "parent": parent, "command": command, "exe": executable}

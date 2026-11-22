@@ -1345,10 +1345,11 @@ fn a_settled_actor_releases_large_json_frame_slack() {
         frame.capacity()
     );
 
-    frame.extend_from_slice(b"incomplete");
+    let partial = vec![b'x'; IDLE_FRAME_BUFFER_CAPACITY + 1];
+    frame.extend_from_slice(&partial);
     let capacity = frame.capacity();
     assert!(!release_idle_frame_buffer(&mut frame));
-    assert_eq!(frame, b"incomplete");
+    assert_eq!(frame, partial);
     assert_eq!(frame.capacity(), capacity);
 }
 
@@ -1402,7 +1403,7 @@ fn actor_reclaims_a_large_frame_when_an_already_ready_turn_blocks() {
     let store = preflight(&spec, &mut initial).unwrap();
     let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while handle.idle_frame_buffer_capacity() == 0 && Instant::now() < deadline {
+    while handle.idle_frame_buffer_capacity() == usize::MAX && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
     let capacity = handle.idle_frame_buffer_capacity();
@@ -1410,6 +1411,11 @@ fn actor_reclaims_a_large_frame_when_an_already_ready_turn_blocks() {
     let closed = handle.close();
     closed.unwrap();
     assert_eq!(frames, 1, "the actor must decode the echoed large frame");
+    assert_ne!(
+        capacity,
+        usize::MAX,
+        "the actor must record its release at the indefinite idle poll"
+    );
     assert!(
         capacity <= IDLE_FRAME_BUFFER_CAPACITY,
         "the indefinite idle poll retained {capacity} bytes"
@@ -1418,6 +1424,7 @@ fn actor_reclaims_a_large_frame_when_an_already_ready_turn_blocks() {
 
 #[test]
 fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() {
+    const PARTIAL_BYTES: usize = IDLE_FRAME_BUFFER_CAPACITY + 1;
     struct SplitFrames {
         received: Arc<Mutex<Vec<Value>>>,
     }
@@ -1455,7 +1462,9 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
         program: "/bin/sh".into(),
         arguments: vec![
             "-c".into(),
-            "printf '{\"result\":1}\\n{\"partial\":'; sleep 0.1; printf '2}\\n'; exec cat".into(),
+            format!(
+                "python3 -c 'import os, time; os.write(1, b\"{{\\\"result\\\":1}}\\n{{\\\"partial\\\":\\\"\" + b\"x\" * {PARTIAL_BYTES}); time.sleep(0.1); os.write(1, b\"\\\"}}\\n\")'; exec cat"
+            ),
         ],
         working_directory: directory.path().into(),
         environment: BTreeMap::new(),
@@ -1474,7 +1483,13 @@ fn actor_preserves_a_partial_frame_following_a_ready_result_in_one_pipe_write() 
     let frames = received.lock().unwrap().clone();
     let closed = handle.close();
     closed.unwrap();
-    assert_eq!(frames, vec![json!({"result": 1}), json!({"partial": 2})]);
+    assert_eq!(
+        frames,
+        vec![
+            json!({"result": 1}),
+            json!({"partial": "x".repeat(PARTIAL_BYTES)}),
+        ]
+    );
 }
 
 #[test]

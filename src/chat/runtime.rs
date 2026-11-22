@@ -629,7 +629,7 @@ impl LocalHandle {
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
         #[cfg(test)]
-        let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(0));
+        let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
         let native_holder = match ownership {
             Some(NativeOwnership::New(source, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
