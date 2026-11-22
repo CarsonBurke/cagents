@@ -47,9 +47,11 @@ done
 CALLER_UID=$(id -u)
 CALLER_GID=$(id -g)
 [[ $CALLER_UID != 0 ]] || fail 'run as your ordinary nonroot user, not root'
-for command in bwrap git curl tar sha256sum flock realpath stat mktemp install python3; do
+for command in bwrap git curl tar sha256sum flock realpath stat mktemp install; do
     command -v "$command" >/dev/null || fail "required command not found: $command"
 done
+# scripts/release-metadata runs on the system Python.
+[[ -x /usr/bin/python3 ]] || fail 'required command not found: /usr/bin/python3'
 if [[ -z ${CARGO_BUILD_JOBS:-} ]]; then
     # Servo, SpiderMonkey and the final links each need gigabytes; leave every
     # job about 2 GiB of what is available now.

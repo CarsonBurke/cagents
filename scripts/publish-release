@@ -45,9 +45,11 @@ while (($#)); do
     esac
 done
 
-for command in git jq sed sort sha256sum tar mktemp cp cmp python3 ssh-keygen; do
+for command in git jq sed sort sha256sum tar mktemp cp cmp ssh-keygen; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+# scripts/release-metadata runs on the system Python.
+[[ -x /usr/bin/python3 ]] || fail 'required command not found: /usr/bin/python3'
 
 checkout_git() (
     # A caller's Git routing must not redirect this checkout's tag checks.
