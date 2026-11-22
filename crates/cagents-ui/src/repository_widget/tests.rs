@@ -9294,7 +9294,7 @@ fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
         ("deploy/Dockerfile.dev", "FROM scratch"),
         ("src/kernel.cu", "__global__ void kernel() { return; }"),
     ] {
-        let settings = highlighter_settings(
+        let settings = crate::diff_view::highlighter_settings(
             Path::new(path),
             crate::settings::EditorSyntaxTheme::Auto,
             true,
@@ -9315,7 +9315,7 @@ fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
     // reading a dark one off a light surface is what makes highlighted
     // text illegible.
     assert!(
-        highlighter_settings(
+        crate::diff_view::highlighter_settings(
             Path::new("main.rs"),
             crate::settings::EditorSyntaxTheme::Auto,
             true,
@@ -9325,7 +9325,7 @@ fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
         "a dark application must highlight with a dark scheme"
     );
     assert!(
-        !highlighter_settings(
+        !crate::diff_view::highlighter_settings(
             Path::new("main.rs"),
             crate::settings::EditorSyntaxTheme::Auto,
             false,
@@ -11714,11 +11714,14 @@ fn a_nameless_buffer_reads_as_its_content_once_typing_settles_never_per_frame() 
     }
     assert_eq!(editable(&runtime).inferences, 0);
 
+    assert!(!editable(&runtime).is_prose());
     settle(&mut runtime, card);
     assert_eq!(editable(&runtime).inferences, 1);
     assert!(editable(&runtime).markdown);
-    // Edit-mode highlighting follows the same language as the preview.
+    // Edit-mode highlighting and prose wrapping follow the same language as
+    // the preview.
     assert_eq!(highlight_token(&runtime), "md");
+    assert!(editable(&runtime).is_prose());
     // Edit mode does not pay for the preview's parse.
     assert!(editable(&runtime).markdown_items.is_empty());
 
@@ -11779,6 +11782,8 @@ fn a_chosen_language_wins_over_the_content_and_outlives_a_reload() {
     }));
     assert!(!editable(&runtime).markdown);
     assert_eq!(highlight_token(&runtime), "txt");
+    // Chosen plain text is prose, and wraps as prose does.
+    assert!(editable(&runtime).is_prose());
     assert_eq!(
         runtime.language_offer(),
         Some((false, Some(DocumentLanguage::PlainText)))

@@ -63,13 +63,13 @@ pub fn markdown_by_name(path: &Path) -> Option<bool> {
 /// Mirrors [`find_syntax_by_token`], which the highlighter resolves a
 /// nameless buffer's file name with: a grammar's file names first, then its
 /// own name, the later grammar winning each. The table is read once from
-/// the bundled grammars, on the loading worker that first asks.
+/// the shared bundled grammars, on the loading worker that first asks.
 ///
 /// [`find_syntax_by_token`]: two_face::re_exports::syntect::parsing::SyntaxSet::find_syntax_by_token
 fn grammar_named(name: &str) -> Option<bool> {
     static NAMES: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
-        let syntaxes = two_face::syntax::extra_no_newlines();
-        let syntaxes = syntaxes.syntaxes();
+        let lease = crate::diff_view::syntax_lease();
+        let syntaxes = lease.syntaxes().syntaxes();
         let markdown = |syntax: &SyntaxReference| syntax.name.eq_ignore_ascii_case("Markdown");
         let by_name = syntaxes
             .iter()

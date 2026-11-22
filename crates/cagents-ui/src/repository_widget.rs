@@ -38,7 +38,7 @@ use crate::{
     diff_view::{
         DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
         InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, build_document_diff,
-        highlighter_settings, load_repository_diff,
+        load_repository_diff,
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
@@ -1072,11 +1072,7 @@ impl EditorDocument {
     /// Whether the buffer is written as prose, Markdown or plain text, which
     /// [`crate::settings::EditorWrap::prose`] wraps.
     fn is_prose(&self) -> bool {
-        self.markdown
-            || matches!(
-                crate::diff_view::syntax_token(&self.source).as_str(),
-                "txt" | "text"
-            )
+        self.markdown || matches!(self.syntax_token().as_str(), "txt" | "text")
     }
 
     fn durability_warning(&self) -> Option<&str> {
@@ -1503,23 +1499,29 @@ impl EditorDocument {
         true
     }
 
-    /// The edit surface's syntax highlighting, which follows the language the
-    /// preview uses rather than the name alone.
+    /// The grammar the edit surface reads the buffer with, which follows the
+    /// language the preview uses rather than the name alone, and so decides
+    /// both its colours and whether it wraps as prose.
+    fn syntax_token(&self) -> String {
+        match self.language {
+            LanguageSource::Chosen(DocumentLanguage::PlainText) => "txt".to_owned(),
+            _ if self.markdown => "md".to_owned(),
+            // A buffer read as plain text keeps whatever its name highlights
+            // as, which for a name no grammar knows is plain text.
+            _ => crate::diff_view::syntax_token(&self.source),
+        }
+    }
+
+    /// The edit surface's code highlighting, in the grammar of
+    /// [`EditorDocument::syntax_token`].
     fn highlighter(
         &self,
         theme: crate::settings::EditorSyntaxTheme,
         dark: bool,
     ) -> cosmic::iced::highlighter::Settings {
-        let token = match self.language {
-            LanguageSource::Chosen(DocumentLanguage::PlainText) => "txt",
-            _ if self.markdown => "md",
-            // A buffer read as plain text keeps whatever its name highlights
-            // as, which for a name no grammar knows is plain text.
-            _ => return highlighter_settings(&self.source, theme, dark),
-        };
         cosmic::iced::highlighter::Settings {
             theme: crate::diff_view::syntax_highlighter_theme(theme, dark),
-            token: token.to_owned(),
+            token: self.syntax_token(),
         }
     }
 }
