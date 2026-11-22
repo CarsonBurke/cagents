@@ -35,8 +35,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long the courier sleeps when nothing wakes it. A conversation that
-/// turned idle wakes it at once; this only bounds a missed edge.
+/// A failed delivery pass retries at this rate. Normal delivery edges wake the
+/// courier directly, so an empty healthy courier has no periodic timeout.
 const FALLBACK: Duration = Duration::from_secs(15);
 /// How often the courier forgets messages past their retention.
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -895,16 +895,21 @@ impl Handle {
             let Some(host) = self.0.host.upgrade() else {
                 return;
             };
-            let delay = match crate::host::service::attempt("message delivery", || deliver(&host)) {
-                Ok(Some(released)) => {
-                    Duration::from_millis(released.saturating_sub(super::now())).min(FALLBACK)
-                }
-                Ok(None) => FALLBACK,
-                Err(error) => {
-                    tracing::warn!(%error, "cannot deliver messages");
-                    FALLBACK
-                }
-            };
+            let delivery_delay =
+                match crate::host::service::attempt("message delivery", || deliver(&host)) {
+                    Ok(Some(released)) => Some(
+                        Duration::from_millis(released.saturating_sub(super::now()))
+                            .max(Duration::from_millis(50)),
+                    ),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot deliver messages");
+                        Some(FALLBACK)
+                    }
+                };
+            let prune_delay =
+                pruned_at.map(|at| (at + PRUNE_EVERY).saturating_duration_since(Instant::now()));
+            let delay = [delivery_delay, prune_delay].into_iter().flatten().min();
             drop(host);
             #[cfg(test)]
             {
@@ -916,13 +921,24 @@ impl Handle {
                 self.0.scanned.notify_all();
             }
             let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-            let (state, _) = self
-                .0
-                .changed
-                .wait_timeout_while(state, delay, |state| {
-                    !state.stopped && state.generation == observed
-                })
-                .unwrap_or_else(|p| p.into_inner());
+            let state = match delay {
+                Some(delay) => {
+                    self.0
+                        .changed
+                        .wait_timeout_while(state, delay, |state| {
+                            !state.stopped && state.generation == observed
+                        })
+                        .unwrap_or_else(|p| p.into_inner())
+                        .0
+                }
+                None => self
+                    .0
+                    .changed
+                    .wait_while(state, |state| {
+                        !state.stopped && state.generation == observed
+                    })
+                    .unwrap_or_else(|p| p.into_inner()),
+            };
             if state.stopped {
                 return;
             }
@@ -1559,6 +1575,48 @@ mod tests {
                 },
             );
         });
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn empty_courier_waits_for_an_event_instead_of_the_fallback_tick() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = crate::host::service::test_host();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            )),
+            seal: Arc::new(Seal::new([7; 32])),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            limits: Mutex::default(),
+            scanned_generation: Mutex::new(None),
+            scanned: Condvar::new(),
+        }));
+        let wake = handle.clone();
+        let (reported, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut deliveries = 0;
+            handle.run_with(
+                || Ok(()),
+                |_| {
+                    deliveries += 1;
+                    reported.send(deliveries).unwrap();
+                    if deliveries == 2 {
+                        handle.0.state.lock().unwrap().stopped = true;
+                    }
+                    Ok(None)
+                },
+            );
+        });
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        assert!(
+            received.recv_timeout(Duration::from_millis(100)).is_err(),
+            "an empty courier must not create a periodic wake"
+        );
+        wake.wake();
         assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         thread.join().unwrap();
     }
