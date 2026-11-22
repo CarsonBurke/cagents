@@ -184,7 +184,7 @@ fn edit_then<T>(
                 // Keep resident identity admission through COMMIT. A
                 // conflicting resident edit cannot slip between validation
                 // and the durable title change.
-                Ok(state)
+                Ok::<_, TitleAdmission>(state)
             })
             .map_err(|error| error.0)?
     } else if matches!(
