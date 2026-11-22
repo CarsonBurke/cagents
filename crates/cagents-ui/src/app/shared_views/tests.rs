@@ -6095,7 +6095,8 @@ fn alias_adoption_carries_a_reopened_drafts_model_pick() {
         matches!(app.cards.get(&canonical.id), Some(CardRuntime::Chat(_))),
         "the canonical pane opens its draft"
     );
-    // Saved from the open draft only because it took the pick as its own.
+    // Only a draft that applied the carried pick counts it as its own.
+    assert!(!app.chat_is_unused(canonical.id));
     assert_eq!(
         app.persistent_workspace().chat_draft_models[&canonical.id],
         chosen

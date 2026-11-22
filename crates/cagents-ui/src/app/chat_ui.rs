@@ -11773,6 +11773,8 @@ impl Cagents {
                 );
             } else if !snapshot.models.is_empty() || waited >= MODEL_PATIENCE {
                 queued.model = None;
+                // A draft this message goes back to offers what it ran on.
+                queued.chosen = (None, None);
                 runtime.note(format!(
                     "This conversation does not offer {model}, so this message will use its default model."
                 ));
@@ -11852,6 +11854,9 @@ impl Cagents {
                             "{} couldn't be chosen, so this message won't use it.",
                             model.as_deref().unwrap_or("The model")
                         ));
+                        if let Some(queued) = runtime.queued.as_mut() {
+                            queued.chosen = (None, None);
+                        }
                         if let Some(model) = model {
                             self.forget_chat_model(provider, &model);
                         }

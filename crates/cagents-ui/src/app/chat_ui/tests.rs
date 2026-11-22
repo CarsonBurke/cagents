@@ -15740,6 +15740,34 @@ fn saved_draft_model_follows_retained_content_through_shared_startup() {
     );
 }
 
+/// Another window moving the draft to another provider leaves this window
+/// no pick of its own for that provider: the draft follows its preference.
+#[test]
+fn a_peer_provider_switch_clears_this_windows_model_pick() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    Arc::make_mut(&mut app.durable).workspace_model_identity = Some(uuid::Uuid::new_v4());
+    assert!(
+        app.persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
+    let CardKind::Chat(moved) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    moved.launch.provider = Provider::Codex;
+    let moved = moved.clone();
+    drop(app.adopt_shared_draft_session(card, &moved));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.session, moved);
+    assert!(!runtime.draft_model_chosen);
+    assert!(
+        !app.persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
+}
+
 #[test]
 fn a_model_only_draft_a_peer_replaced_is_neither_copied_nor_inherited() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -16433,6 +16461,11 @@ fn a_first_message_on_a_model_the_conversation_lacks_goes_to_its_default() {
                 == "This conversation does not offer gpt-b, so this message will use its default model."),
         "{:?}",
         runtime.failures
+    );
+    // Should the message not be taken, the draft returns on that default.
+    assert_eq!(
+        runtime.queued.as_ref().map(|queued| queued.chosen.clone()),
+        Some((None, None))
     );
 }
 
