@@ -640,7 +640,14 @@ impl Cagents {
             }
             return match command {
                 Command::Reconnect if !pending => self.inspect_saved_terminal(card),
-                Command::Relaunch if !pending && dormant && relaunch_available => {
+                // As its disabled button says, a relaunch recovery refuses
+                // starts nothing, even from a click queued before it was.
+                Command::Relaunch
+                    if !pending
+                        && dormant
+                        && relaunch_available
+                        && super::terminal_relaunch_plan(&source).is_ok() =>
+                {
                     self.inspect_saved_terminal_for(card, true)
                 }
                 Command::CopyDetails => {

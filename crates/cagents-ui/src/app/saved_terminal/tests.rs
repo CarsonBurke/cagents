@@ -516,6 +516,124 @@ fn a_missing_or_unverified_directory_has_no_enabled_relaunch_callback() {
 }
 
 #[test]
+fn a_saved_agent_offers_what_its_relaunch_will_start() {
+    use cosmic::iced::Size;
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+    use iced_accessibility::accesskit::Role;
+
+    const CONVERSATION: &str = "a1b2c3d4-1111-4111-8111-123456789abc";
+    const RELAUNCH: &str = "Explicitly relaunch the saved terminal";
+    let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+    // Every accessible label in the view, and the relaunch button's state.
+    let rendered = |app: &Cagents, card| {
+        let mut view = app.saved_terminal_view(card).unwrap();
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1400.0, 900.0)),
+        );
+        let accessible =
+            view.as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let nodes: Vec<_> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .map(|entry| entry.node().clone())
+            .collect();
+        let relaunch = nodes
+            .iter()
+            .find(|node| node.role() == Role::Button && node.label() == Some(RELAUNCH))
+            .map(|node| (!node.is_disabled(), node.description().map(str::to_owned)))
+            .expect("an absent terminal offers relaunch");
+        let labels: Vec<String> = nodes
+            .iter()
+            .filter_map(|node| node.label().or(node.value()).map(str::to_owned))
+            .collect();
+        (relaunch, labels)
+    };
+    for (arguments, hint, label, refused) in [
+        // The saved command names the conversation exactly.
+        (
+            vec!["--resume", CONVERSATION],
+            None,
+            "Resume session",
+            false,
+        ),
+        // Observation lost track of it, as after `/clear`: the picker.
+        (
+            vec!["--resume", CONVERSATION],
+            Some(2),
+            "Choose conversation",
+            false,
+        ),
+        // The same, with an option the picker won't replay: nothing safe.
+        (
+            vec!["--resume", CONVERSATION, "--unknown-option"],
+            Some(2),
+            "Restart",
+            true,
+        ),
+        // Observation confirmed the named conversation: the saved command.
+        (
+            vec!["--resume", CONVERSATION, "--unknown-option"],
+            Some(3),
+            "Restart",
+            false,
+        ),
+    ] {
+        let (mut app, card, mut source) = fixture();
+        source.launch.program = "claude".into();
+        source.launch.arguments = arguments.iter().map(|&argument| argument.into()).collect();
+        source.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: source.launch.clone(),
+            last_exit: None,
+        };
+        source.resume_hint = hint.map(|version| {
+            serde_json::json!({"version": version, "recipe": source.launch}).to_string()
+        });
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(source.clone());
+        let request = pending(&mut app, card, &source);
+        drop(app.update_saved_terminal(complete(card, source.clone(), request, Ok(None))));
+
+        let ((enabled, description), labels) = rendered(&app, card);
+        assert!(
+            labels.iter().any(|shown| shown == label),
+            "{arguments:?} v{hint:?} shows {label}: {labels:?}"
+        );
+        assert_eq!(enabled, !refused, "{arguments:?} v{hint:?}");
+        assert_eq!(
+            description.is_some(),
+            refused,
+            "only a refused relaunch says why: {description:?}"
+        );
+        assert_eq!(
+            labels
+                .iter()
+                .any(|shown| shown.contains("cagents can't restart this agent")),
+            refused,
+            "{arguments:?} v{hint:?}"
+        );
+
+        // A relaunch queued before the view disabled it starts nothing.
+        drop(app.update_saved_terminal(Action::User {
+            card,
+            request,
+            command: Command::Relaunch,
+        }));
+        assert_eq!(
+            app.terminal_start_in_flight(card),
+            !refused,
+            "{arguments:?} v{hint:?}"
+        );
+        if refused {
+            assert!(app.saved_terminal_view(card).is_some());
+        }
+    }
+}
+
+#[test]
 fn remote_user_keeps_its_existing_route_but_scoped_callers_cannot_fall_back_to_user() {
     let user = crate::agent_execution::Authority::default();
     let scoped = crate::agent_execution::Authority::session("synthetic-scoped-capability".into());
