@@ -359,12 +359,19 @@ fn prepare(
     let Some(program) = find_executable(account.provider.executable(), search_path) else {
         return unavailable(format!("{} is not installed", cli_name(account.provider)));
     };
+    let key = account.cache_key();
     // An ACP agent writes that home the first time it runs, so one
     // installed without it has never been signed in, which is what the
     // reader needs to do; there is nothing to start it for. A refresh the
     // reader asked for, or the check after a sign-in, asks the agent all
-    // the same, in case it signed in without writing there.
-    if !set_up && reuse != Reuse::Never {
+    // the same, in case it signed in without writing there; once the agent
+    // has answered, its answer is what stands.
+    if !set_up
+        && reuse != Reuse::Never
+        && !cache
+            .zip(key.as_ref())
+            .is_some_and(|(cache, key)| cache.load(now).contains_key(key))
+    {
         return Prepared::Done(answered(
             None,
             UsageSnapshot::state(
@@ -374,7 +381,6 @@ fn prepare(
             ),
         ));
     }
-    let key = account.cache_key();
     let Some(cache) = cache else {
         return Prepared::Probe {
             program,
@@ -2976,6 +2982,24 @@ cat >/dev/null
         // The reader asking, or a sign-in's check, asks the agent anyway.
         assert!(matches!(
             prepare(&agy, Some(&cache), Reuse::Never, now, path),
+            Prepared::Probe { .. }
+        ));
+        // Once such a check has answered, its answer stands rather than the
+        // missing home: a later scheduled read asks the agent again.
+        let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "probed", observed_at);
+        snapshot.source = UsageSource::Probe;
+        cache
+            .store(
+                &agy.cache_key().unwrap(),
+                Entry {
+                    identity: None,
+                    snapshot,
+                    inventory_observed_at: Some(observed_at),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            prepare(&agy, Some(&cache), Reuse::Reading, now, path),
             Prepared::Probe { .. }
         ));
     }

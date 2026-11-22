@@ -67,18 +67,27 @@ pub(super) async fn probe_antigravity(
 /// conversation.
 async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Probed, String> {
     let workspace = data.join("workspace");
-    let lock = {
+    // Waited for without blocking a thread, so a probe abandoned by its
+    // timeout stops waiting as well, whatever holds the lock.
+    let lock = loop {
         let (data, workspace) = (data.clone(), workspace.clone());
-        tokio::task::spawn_blocking(move || {
+        let attempt = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&data)?;
-            let lock = crate::instance::owned_lock(&data.join(PROBE_LOCK), libc::LOCK_EX)?;
+            let lock =
+                crate::instance::owned_lock(&data.join(PROBE_LOCK), libc::LOCK_EX | libc::LOCK_NB)?;
             forget(&data);
             std::fs::create_dir_all(&workspace)?;
             Ok::<_, std::io::Error>(lock)
         })
         .await
-        .map_err(|error| error.to_string())?
-        .map_err(|_| "Antigravity's probe directory could not be prepared".to_owned())?
+        .map_err(|error| error.to_string())?;
+        match attempt {
+            Ok(lock) => break lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(_) => return Err("Antigravity's probe directory could not be prepared".to_owned()),
+        }
     };
     command.current_dir(&workspace);
     // Declared before the session, so it is dropped after the session's
