@@ -2182,19 +2182,22 @@ fn column_title_style() -> cosmic::theme::Button {
     }
 }
 
+/// The focused pane's tab is the selected one. A hovered tab lifts by less,
+/// so the tab under the pointer never reads as a second focused pane.
 fn column_tab_style(
     theme: &cosmic::Theme,
     selected: bool,
     hovered: bool,
 ) -> iced::widget::container::Style {
-    let component = &theme.current_container().component;
     iced::widget::container::Style {
         background: if selected {
-            Some(iced::Background::Color(
-                component.selected_state_color().into(),
-            ))
+            Some(iced::Background::Color(crate::ui_controls::selected_fill(
+                theme,
+            )))
         } else if hovered {
-            Some(iced::Background::Color(component.hover.into()))
+            Some(iced::Background::Color(crate::ui_controls::hover_fill(
+                theme,
+            )))
         } else {
             None
         },
@@ -2210,21 +2213,15 @@ fn column_tab_style(
 mod tab_style_tests {
     #[test]
     fn whole_tab_hover_is_visible_and_preserves_selection() {
-        let theme = cosmic::Theme::dark();
-        assert!(
-            super::column_tab_style(&theme, false, false)
-                .background
-                .is_none()
-        );
-        assert!(
-            super::column_tab_style(&theme, false, true)
-                .background
-                .is_some()
-        );
-        assert_eq!(
-            super::column_tab_style(&theme, true, true).background,
-            super::column_tab_style(&theme, true, false).background,
-        );
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let style = |selected, hovered| super::column_tab_style(&theme, selected, hovered);
+            assert!(style(false, false).background.is_none());
+            assert!(style(false, true).background.is_some());
+            assert_eq!(style(true, true).background, style(true, false).background);
+            // The tab under the pointer must not look like the focused
+            // pane's: COSMIC derives both fills from the same color.
+            assert_ne!(style(false, true).background, style(true, false).background);
+        }
     }
 
     #[test]

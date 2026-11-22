@@ -12628,18 +12628,18 @@ fn row_button_style<const HOVER: bool>(selected: bool) -> theme::Button {
             design::muted_icon_color(theme)
         });
         style.border_radius = theme.cosmic().corner_radii.radius_s.into();
-        if selected || focused || alpha > 0.0 {
+        if selected || alpha > 0.0 {
             let mut surface = foreground;
             surface.a = if disabled {
                 0.04
             } else {
-                (if selected { SELECTED_ROW_ALPHA } else { 0.0 })
-                    + alpha
-                    + if focused { 0.06 } else { 0.0 }
+                (if selected { SELECTED_ROW_ALPHA } else { 0.0 }) + alpha
             };
             style.background = Some(cosmic::iced::Background::Color(surface));
         }
-        style
+        // Keyboard focus rings the row; a fill would read as hover or as a
+        // second selection.
+        crate::ui_controls::focus_ring(style, focused, theme)
     }
     // Noncapturing closures keep the boxed callbacks allocation-free for the
     // hundreds of file rows rebuilt on terminal wakes.
