@@ -1065,6 +1065,10 @@ struct Meter {
 /// often, and a frame that changes nothing else is cheap (see the activity
 /// spinner's `SPINNER_FRAME`).
 const METER_FRAME: Duration = Duration::from_millis(50);
+/// How often a meter with no bar lit looks again: a pause draws the same
+/// frame, so it costs fewer of them, and the first word still lights a bar
+/// well within a syllable.
+const METER_QUIET_FRAME: Duration = Duration::from_millis(150);
 const METER_BARS: usize = 5;
 const METER_SIZE: f32 = 16.0;
 
@@ -1120,7 +1124,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Meter {
             } else {
                 (state.shown * 0.6 + level * 0.4).max(level)
             };
-            shell.request_redraw_at(*now + METER_FRAME);
+            let next = if lit(state.shown, 0) {
+                METER_FRAME
+            } else {
+                METER_QUIET_FRAME
+            };
+            shell.request_redraw_at(*now + next);
         }
     }
 
@@ -1137,15 +1146,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Meter {
         use advanced::Renderer as _;
         let bounds = layout.bounds();
         let shown = tree.state.downcast_ref::<MeterState>().shown;
-        let lit = design::accent_color(theme);
+        let bright = design::accent_color(theme);
         let unlit = design::muted_color(theme);
         let gap = 1.5;
         let width = (bounds.width - gap * (METER_BARS - 1) as f32) / METER_BARS as f32;
         for bar in 0..METER_BARS {
             // The middle bar is tallest, as a voice meter is usually drawn.
             let reach = [0.45, 0.75, 1.0, 0.75, 0.45][bar];
-            let threshold = (bar as f32 + 0.5) / METER_BARS as f32;
-            let on = shown >= threshold * 0.8;
+            let on = lit(shown, bar);
             let height = bounds.height * reach * if on { 1.0 } else { 0.35 };
             renderer.fill_quad(
                 renderer::Quad {
@@ -1161,10 +1169,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Meter {
                     },
                     ..renderer::Quad::default()
                 },
-                if on { lit } else { unlit },
+                if on { bright } else { unlit },
             );
         }
     }
+}
+
+/// Whether `bar` is lit at the level `shown`.
+fn lit(shown: f32, bar: usize) -> bool {
+    shown >= (bar as f32 + 0.5) / METER_BARS as f32 * 0.8
 }
 
 #[cfg(test)]
