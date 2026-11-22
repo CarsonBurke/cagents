@@ -226,7 +226,7 @@ impl Cagents {
         if candidate.is_none() {
             let mut runtime = RepositoryRuntime::new_directory(view.clone());
             runtime.set_auto_save(self.settings.editor_auto_save);
-            runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+            runtime.set_wrap(self.settings.editor_wrap());
             runtime.set_syntax_theme(self.settings.editor_syntax_theme);
             runtime.set_external_editors(self.sidebar_model.external_editors.clone());
             self.cards

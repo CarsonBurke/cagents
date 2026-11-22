@@ -901,6 +901,26 @@ const fn default_diff_hide_unchanged() -> bool {
     true
 }
 
+const fn default_editor_wrap_prose() -> bool {
+    true
+}
+
+/// Which buffers the editor wraps to its width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EditorWrap {
+    /// Every buffer.
+    pub lines: bool,
+    /// Markdown and plain text.
+    pub prose: bool,
+}
+
+impl EditorWrap {
+    /// Whether a buffer wraps, given whether it is prose.
+    pub fn wraps(self, prose: bool) -> bool {
+        self.lines || (self.prose && prose)
+    }
+}
+
 const fn default_confirm_terminal_close() -> bool {
     true
 }
@@ -1203,6 +1223,11 @@ pub struct AppSettings {
     pub browser_search_url: String,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    /// Wraps Markdown and plain-text buffers even when
+    /// [`Self::editor_wrap_lines`] leaves code unwrapped: prose is written in
+    /// paragraphs a line long, which a horizontal scrollbar makes unreadable.
+    #[serde(default = "default_editor_wrap_prose")]
+    pub editor_wrap_prose: bool,
     #[serde(default = "default_diff_hide_unchanged")]
     pub diff_hide_unchanged: bool,
     #[serde(default)]
@@ -1377,6 +1402,7 @@ impl Default for AppSettings {
             confirm_multiline_paste: true,
             browser_search_url: default_browser_search_url(),
             editor_wrap_lines: false,
+            editor_wrap_prose: default_editor_wrap_prose(),
             diff_hide_unchanged: default_diff_hide_unchanged(),
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
@@ -2096,6 +2122,13 @@ impl AppSettings {
             self.sidebar_worktrees_when_shown
         } else {
             SidebarWorktrees::default()
+        }
+    }
+
+    pub fn editor_wrap(&self) -> EditorWrap {
+        EditorWrap {
+            lines: self.editor_wrap_lines,
+            prose: self.editor_wrap_prose,
         }
     }
 
@@ -4352,6 +4385,19 @@ mod tests {
     }
 
     #[test]
+    fn prose_wraps_by_default_and_code_only_when_every_line_wraps() {
+        let wrap = AppSettings::default().editor_wrap();
+        assert!(wrap.wraps(true));
+        assert!(!wrap.wraps(false));
+        let everything = EditorWrap {
+            lines: true,
+            prose: false,
+        };
+        assert!(everything.wraps(true) && everything.wraps(false));
+        assert!(!EditorWrap::default().wraps(true));
+    }
+
+    #[test]
     fn old_settings_keep_lines_unwrapped_and_wrap_choice_survives_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -4359,15 +4405,20 @@ mod tests {
         save(&path, &defaults).unwrap();
         let mut old = toml::Value::try_from(&defaults).unwrap();
         old.as_table_mut().unwrap().remove("editor_wrap_lines");
+        old.as_table_mut().unwrap().remove("editor_wrap_prose");
         old.as_table_mut().unwrap().remove("diff_hide_unchanged");
         fs::write(&path, toml::to_string(&old).unwrap()).unwrap();
         let mut settings = load(&path).unwrap();
         assert!(!settings.editor_wrap_lines);
+        // Prose wraps for a settings file from before the choice existed.
+        assert!(settings.editor_wrap_prose);
         assert!(settings.diff_hide_unchanged);
         settings.editor_wrap_lines = true;
+        settings.editor_wrap_prose = false;
         settings.diff_hide_unchanged = false;
         save(&path, &settings).unwrap();
         assert!(load(&path).unwrap().editor_wrap_lines);
+        assert!(!load(&path).unwrap().editor_wrap_prose);
         assert!(!load(&path).unwrap().diff_hide_unchanged);
     }
 

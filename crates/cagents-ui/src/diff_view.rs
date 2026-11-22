@@ -99,15 +99,10 @@ impl DiffSyntax {
     }
 }
 
-/// Native bundled grammar names are shared by the editable buffer and diffs.
-/// CUDA uses the bundled C++ grammar (there is no bundled CUDA grammar).
-pub(crate) fn highlighter_settings(
-    path: &Path,
-    theme: crate::settings::EditorSyntaxTheme,
-    dark: bool,
-) -> cosmic::iced::highlighter::Settings {
-    use cosmic::iced::highlighter;
-
+/// The bundled grammar token for `path`: named files that a bare extension
+/// would misread, then the lowercased extension, then the file name. CUDA uses
+/// the bundled C++ grammar (there is no bundled CUDA grammar).
+pub(crate) fn syntax_token(path: &Path) -> String {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -115,7 +110,7 @@ pub(crate) fn highlighter_settings(
     let extension = path
         .extension()
         .map(|extension| extension.to_string_lossy().to_lowercase());
-    let token = match name {
+    match name {
         "CMakeLists.txt" => "CMake".to_owned(),
         "Cargo.lock" => "TOML".to_owned(),
         ".bashrc" | ".bash_profile" | ".bash_login" => "Bash".to_owned(),
@@ -128,10 +123,18 @@ pub(crate) fn highlighter_settings(
             Some(extension) => extension.to_owned(),
             None => name.to_owned(),
         },
-    };
-    highlighter::Settings {
+    }
+}
+
+/// Native bundled grammar names are shared by the editable buffer and diffs.
+pub(crate) fn highlighter_settings(
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    dark: bool,
+) -> cosmic::iced::highlighter::Settings {
+    cosmic::iced::highlighter::Settings {
         theme: syntax_highlighter_theme(theme, dark),
-        token,
+        token: syntax_token(path),
     }
 }
 
@@ -385,6 +388,23 @@ impl Drop for SyntaxLease {
     }
 }
 
+impl SyntaxLease {
+    pub(crate) fn syntaxes(&self) -> &parsing::SyntaxSet {
+        &self.0
+    }
+}
+
+/// The syntect palette the `theme` setting selects for a light or dark
+/// application, from the same bundled set iced's highlighter loads.
+pub(crate) fn syntect_theme(
+    theme: crate::settings::EditorSyntaxTheme,
+    dark: bool,
+) -> &'static highlighting::Theme {
+    static THEMES: LazyLock<highlighting::ThemeSet> =
+        LazyLock::new(highlighting::ThemeSet::load_defaults);
+    &THEMES.themes[syntect_theme_name(theme, dark)]
+}
+
 pub(crate) fn syntax_lease() -> SyntaxLease {
     static CACHE: LazyLock<Arc<SyntaxCache>> = LazyLock::new(|| Arc::new(SyntaxCache::new(LINGER)));
     CACHE.acquire()
@@ -408,8 +428,6 @@ impl HighlightParser {
         theme: crate::settings::EditorSyntaxTheme,
         syntaxes: SyntaxLease,
     ) -> Self {
-        static THEMES: LazyLock<highlighting::ThemeSet> =
-            LazyLock::new(highlighting::ThemeSet::load_defaults);
         let syntax = syntaxes
             .0
             .find_syntax_by_token(token)
@@ -419,9 +437,8 @@ impl HighlightParser {
             syntaxes,
             parser,
             stack: parsing::ScopeStack::new(),
-            highlighters: [false, true].map(|dark| {
-                highlighting::Highlighter::new(&THEMES.themes[syntect_theme_name(theme, dark)])
-            }),
+            highlighters: [false, true]
+                .map(|dark| highlighting::Highlighter::new(syntect_theme(theme, dark))),
             styles: HashMap::new(),
         }
     }
