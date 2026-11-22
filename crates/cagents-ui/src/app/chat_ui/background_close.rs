@@ -161,11 +161,10 @@ impl Cagents {
                             if shares_conversation(&stopping.session, session))
                 })
                 .map(|state| state.id)
-                .filter(|card| {
-                    self.awaits_attachment(*card)
-                        || (*card == stopping.card && self.chat_awaiting_admission(*card))
-                })
+                .filter(|card| self.awaits_attachment(*card))
                 .collect();
+            // A refused stop's conversation still runs: a pane the view holds
+            // goes back to it once admitted, as `attach_shared_chat` does.
             if stopping.refused.is_some() {
                 self.chat_ui.close_refused.insert(id);
                 let mut reopened = reopened.into_iter();
@@ -188,7 +187,16 @@ impl Cagents {
                 continue;
             }
             let target = self.chat_ui.next_target(stopping.card);
-            let reopens = reopened;
+            let mut reopens = reopened;
+            // The closed pane itself, restored from its view and showing its
+            // saved text until the view admits it, is held with the stop too.
+            if self.chat_awaiting_admission(stopping.card)
+                && self
+                    .chat_return_session(stopping.card)
+                    .is_some_and(|session| shares_conversation(&session, &stopping.session))
+            {
+                reopens.push(stopping.card);
+            }
             // The closed pane itself, kept by a shared view, stays out of
             // sight from the start, as it did in the window that closed it.
             if reopens.contains(&stopping.card) {
@@ -537,6 +545,13 @@ impl Cagents {
         if !open(self) {
             self.chat_ui.stopped_returns.remove(&card);
             self.chat_ui.hidden_returns.remove(&card);
+            // Nothing is left for its view to admit.
+            if self.durable.pending_chat_admissions.contains_key(&card) {
+                Arc::make_mut(&mut self.durable)
+                    .pending_chat_admissions
+                    .remove(&card);
+                self.persist();
+            }
         } else {
             self.chat_ui.stopped_returns.insert(card);
             self.chat_ui.hidden_returns.insert(card);

@@ -8348,6 +8348,10 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
         next.durable.stopping_chats.is_empty(),
         "from_view={from_view}: nothing is left for a later launch"
     );
+    assert!(
+        next.durable.pending_chat_admissions.is_empty(),
+        "from_view={from_view}: nothing is left for its view to admit"
+    );
     assert!(!next.has_close_failure_notices());
 }
 
