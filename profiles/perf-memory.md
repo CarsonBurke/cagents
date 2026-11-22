@@ -7,12 +7,30 @@ across processes, while `Private_Dirty` is reclaimable only when that process
 exits. RSS is retained only as a pressure signal: it double-counts shared text
 and libraries.
 
-The 20-chat workload required by this profile is one streaming retained Claude
-chat and nineteen prompt-available retained Claude chats, in one isolated
-development runtime. It was **not running** when this profile was written:
-there were zero live retained actors and zero direct actor-child providers.
-This profile deliberately leaves those cells unfilled rather than turning the
-workstation's RSS observations into made-up PSS.
+The native 20-chat fixture evidence for #3613 uses twenty settled Claude
+chats, each with a 2 MiB tool-result frame. It is representative of the
+idle-retention memory problem, but it is not the separate one-streaming,
+nineteen-idle workload required to profile active streaming costs. The latter
+remains unmeasured; no number below is extrapolated from RSS.
+
+## Native 20-chat fixture census
+
+`native/3613/pair.log` compares `main` `83192f4f9` with the frame-slack
+release. All figures are KiB from the same isolated native fixture after every
+chat settled.
+
+| Role | Processes | PSS before → after | Private dirty before → after |
+| --- | ---: | ---: | ---: |
+| UI | 1 | 140,699 → 144,733 | 132,712 → 136,504 |
+| daemon | 1 | 45,269 → 43,225 | 42,288 → 40,212 |
+| retained actors | 20 | 257,061 → 211,945 | 208,812 → 163,824 |
+| fixture providers | 20 | 17,807 → 17,831 | 17,192 → 17,224 |
+| total | 42 | 460,836 → 417,734 | 401,004 → 357,764 |
+
+The release cuts actor PSS by 45,116 KiB and actor private memory by 44,988
+KiB: about 2.2 MiB per retained chat. Total private memory falls 43,240 KiB
+(10.8%). This is the measured basis for #3613. The fixture provider is a tiny
+shell process, so its row does not estimate a real Claude/Node provider.
 
 ## Corrected live census
 
@@ -61,10 +79,9 @@ twentieth streams. For allocator analysis, identify each 64 MiB glibc
 reservation by the adjacent-map sum rule above; do not infer stacks from
 anonymous-map adjacency.
 
-The same census must be taken before and after any proposed change. In
-particular, #3613 needs a 2 MiB result-frame before/after PSS comparison, and
-#3619 needs 1- and 20-chat PSS/private-dirty evidence before an allocator cap
-can be claimed as a memory win.
+The same census must be taken before and after any proposed change. #3613 now
+has its 2 MiB result-frame comparison above. #3619 is closed: allocator arena
+reservation alone is not a RAM win.
 
 ## Where memory is likely to go, and the systemic fix
 
@@ -73,22 +90,19 @@ systemic allocator effect: 1.69 GiB of virtual arena reservation can coexist
 with 41.26 MiB resident arena pages. Reservation is not resident memory, so
 `MALLOC_ARENA_MAX=1` is not a proven RAM optimization.
 
-The retained-actor model is per-chat process overhead: its historical sample
-is roughly 5.8 MiB PSS/actor. Replacing helpers with a shared actor process
-could remove that fixed multiplier, but it changes isolation, failure and
-resume contracts and is not justified before the 20-chat census.
+The retained-actor model is per-chat process overhead. In this fixture it is
+10.35 MiB PSS per actor after the frame release, and the release eliminates the
+largest measured private high-water allocation. Replacing helpers with a shared
+actor process could remove part of that fixed multiplier, but changes isolation,
+failure and resume contracts; it needs a separate design and the streaming
+workload before it is proposed.
 
-Provider processes are the stronger systemic candidate, but only as a
-hypothesis until their PSS is measured. If their per-provider PSS remains much
-larger than actor PSS, daemon-owned, verified-idle provider retirement removes
-an entire per-idle-chat provider process rather than shaving allocator metadata
-inside it. That is the design in #3630: generation-fenced retirement with a
-verified `claude --resume` successor, no UI polling, and no retirement for
-ambiguous writes, permission waits, pre-ID sessions, or background work.
+Provider retirement is withdrawn by the user and #3630 is not planned. No
+provider lifecycle implementation should be pursued from this profile.
 
-**Single highest-leverage systemic change:** retire verified-idle provider
-processes and resume them transactionally on the next prompt, if the required
-20-chat PSS census confirms providers dominate. It requires the #3630 design
-review, daemon-owned deadlines, resume/race tests, and before/after PSS plus
-first-prompt latency evidence. No lifecycle implementation should begin before
-those gates pass.
+**Single highest-leverage systemic change still worth evaluating:** consolidate
+the per-chat retained-actor helper model only if the streaming 20-chat census
+shows its fixed PSS multiplier remains dominant after #3613. It would require
+an explicit shared-process isolation/recovery design, not an idle-retirement
+policy. This document is a draft discussion artifact and is not intended to
+land on `main`.
