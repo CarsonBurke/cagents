@@ -172,16 +172,6 @@ pub struct Release {
     installer: Asset,
 }
 
-impl Release {
-    pub fn notice_identity(&self) -> String {
-        let metadata: String = self.metadata[..8]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        format!("release:{metadata}:{}", self.version)
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Asset {
     name: String,
@@ -508,15 +498,23 @@ fn is_newer(release: &str, installed: &str) -> Result<bool, UpdateError> {
 /// Installs another tool manages say which tool, rather than describing the
 /// layout this build looked for.
 fn unmanaged_reason(error: UpdateError) -> String {
+    // Only a layout install.sh did not make belongs to another tool; any
+    // other failure of a self-managed install is reported as it is.
+    if error.to_string() != unsupported_install().to_string() {
+        return error.to_string();
+    }
     let executable = std::env::current_exe().and_then(|path| path.canonicalize());
     match executable {
-        Ok(path) if path.starts_with("/usr") || path.starts_with("/opt") => {
-            "Installed by your system's package manager; update cagents with it, for example with sudo apt upgrade.".into()
-        }
         Ok(path) if path.components().any(|part| part.as_os_str() == "target") => {
             "This is a build from source. Install a release to receive updates.".into()
         }
-        _ => error.to_string(),
+        Ok(path)
+            if (path.starts_with("/usr") && !path.starts_with("/usr/local"))
+                || path.starts_with("/opt") =>
+        {
+            "Installed by your system's package manager. Update cagents with it.".into()
+        }
+        _ => "This copy of cagents was not installed by its installer, so it cannot update itself. Update it the way you installed it.".into(),
     }
 }
 

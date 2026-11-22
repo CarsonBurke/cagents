@@ -68,7 +68,7 @@ pub(crate) fn trusted_keys() -> Result<Vec<TrustedKey>, UpdateError> {
 
 /// Whether this build was made to rehearse updates against a private feed.
 pub(crate) fn rehearsal_build() -> bool {
-    option_env!("CAGENTS_UPDATE_REHEARSAL_KEYS").is_some()
+    option_env!("CAGENTS_UPDATE_REHEARSAL_KEYS").is_some_and(|keys| !keys.trim().is_empty())
 }
 
 /// Accepts `message` only when `armored` is a `cagents-release` signature of

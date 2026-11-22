@@ -153,6 +153,10 @@ stop verification. No package is installed on the host.
 
 ## Signing
 
+The release scripts do not write schema 2 yet; that follows in
+[#3703](https://github.com/CarsonBurke/cagents/issues/3703), and until then no
+published release is offered as an update.
+
 An installed build offers a release only when the release's
 `release-metadata.json` (schema 2) carries a valid signature,
 `release-metadata.json.sig`, made by a key listed in

@@ -85,7 +85,7 @@ impl Feed {
     }
 
     /// The newest published release, verified, when `newer` says it is an
-    /// update. Its version is read before its signature, so a routine check
+    /// update. Its version is read before anything else, so a routine check
     /// that finds nothing new makes one small request, and a release from
     /// before signed metadata reads as nothing new rather than a failure.
     pub(super) fn latest(
@@ -102,13 +102,9 @@ impl Feed {
         if !newer(&announced.version)? {
             return Ok(None);
         }
-        self.verified(
-            "latest/download",
-            metadata,
-            Some(&announced.version),
-            cancellation,
-        )
-        .map(Some)
+        // The tagged copy, so a release published between two requests
+        // cannot pair one release's metadata with another's signature.
+        self.release(&announced.version, cancellation).map(Some)
     }
 
     /// The release tagged `v{version}`, verified.
@@ -117,17 +113,35 @@ impl Feed {
         version: &str,
         cancellation: &CancellationToken,
     ) -> Result<Release, UpdateError> {
-        self.release_at(&format!("download/v{version}"), Some(version), cancellation)
-    }
-
-    fn release_at(
-        &self,
-        directory: &str,
-        expected: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<Release, UpdateError> {
-        let metadata = self.fetch_metadata(directory, cancellation)?;
-        self.verified(directory, metadata, expected, cancellation)
+        let directory = format!("download/v{version}");
+        let metadata = self.fetch_metadata(&directory, cancellation)?;
+        let signature = match self.fetch(
+            &format!("{directory}/{SIGNATURE}"),
+            "reading the release's signature",
+            SMALL_ASSET_LIMIT,
+            Duration::from_secs(60),
+            cancellation,
+        ) {
+            Ok(file) => read_all(file)?,
+            Err(error @ (UpdateError::Cancelled | UpdateError::Timeout(_))) => return Err(error),
+            // Its metadata was just read from the same place, so this is
+            // almost always a release published without a signature.
+            Err(_) => {
+                return Err(invalid(format!(
+                    "cagents {version} is not signed, so this build will not install it"
+                )));
+            }
+        };
+        let signature = String::from_utf8(signature)
+            .map_err(|_| invalid("the release signature is malformed"))?;
+        signature::verify(&metadata, &signature, &self.keys)?;
+        let release = self.parse(&metadata)?;
+        if release.version != version {
+            return Err(invalid(
+                "the release's signed metadata names a different version",
+            ));
+        }
+        Ok(release)
     }
 
     fn fetch_metadata(
@@ -137,36 +151,11 @@ impl Feed {
     ) -> Result<Vec<u8>, UpdateError> {
         read_all(self.fetch(
             &format!("{directory}/{METADATA}"),
+            "checking for a new release",
             METADATA_LIMIT,
             Duration::from_secs(60),
             cancellation,
         )?)
-    }
-
-    /// `metadata` from `directory`, once its signature there verifies.
-    fn verified(
-        &self,
-        directory: &str,
-        metadata: Vec<u8>,
-        expected: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<Release, UpdateError> {
-        let signature = read_all(self.fetch(
-            &format!("{directory}/{SIGNATURE}"),
-            SMALL_ASSET_LIMIT,
-            Duration::from_secs(60),
-            cancellation,
-        )?)?;
-        let signature = String::from_utf8(signature)
-            .map_err(|_| invalid("the release signature is malformed"))?;
-        signature::verify(&metadata, &signature, &self.keys)?;
-        let release = self.parse(&metadata)?;
-        if expected.is_some_and(|version| version != release.version) {
-            return Err(invalid(
-                "the release's signed metadata names a different version",
-            ));
-        }
-        Ok(release)
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<Release, UpdateError> {
@@ -234,6 +223,7 @@ impl Feed {
     ) -> Result<File, UpdateError> {
         let mut file = self.fetch(
             &format!("download/v{}/{}", release.version, asset.name),
+            "downloading the release",
             asset.size,
             Duration::from_secs(15 * 60),
             cancellation,
@@ -248,6 +238,7 @@ impl Feed {
     fn fetch(
         &self,
         path: &str,
+        operation: &'static str,
         limit: u64,
         timeout: Duration,
         cancellation: &CancellationToken,
@@ -276,13 +267,7 @@ impl Feed {
             .arg("--")
             .arg(format!("{}/{path}", self.base))
             .env_remove("CURL_HOME");
-        bounded_command(
-            &mut command,
-            "release download",
-            limit,
-            timeout,
-            cancellation,
-        )
+        bounded_command(&mut command, operation, limit, timeout, cancellation)
     }
 }
 
@@ -470,11 +455,19 @@ mod tests {
         let mut forged = value.clone();
         forged["notes"] = "forged".into();
         fs::write(
-            latest_dir.join(METADATA),
+            release_dir.join(METADATA),
             serde_json::to_vec(&forged).unwrap(),
         )
         .unwrap();
         assert!(feed.latest(newer, &cancellation).is_err());
+        // A release published without a signature says so.
+        fs::write(release_dir.join(METADATA), &bytes).unwrap();
+        fs::remove_file(release_dir.join(SIGNATURE)).unwrap();
+        assert_eq!(
+            feed.latest(newer, &cancellation).unwrap_err().to_string(),
+            "cagents 0.2.0 is not signed, so this build will not install it"
+        );
+        fs::write(release_dir.join(SIGNATURE), &signature).unwrap();
         // Nothing newer is decided from the version alone: a release from
         // before signed metadata, with no signature, is simply not an update.
         fs::write(
