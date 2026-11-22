@@ -3314,8 +3314,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
         // Its actions open dialogs of their own, which a dialog already open
-        // must refuse.
-        Message::WorktreesUi(_) => true,
+        // must refuse. A menu still closes: a dialog that opened over it
+        // hides it, and it must not come back when the dialog goes.
+        Message::WorktreesUi(action) => !action.closes_menu(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -12562,6 +12563,9 @@ impl Cagents {
                 .view(
                     &self.sidebar_model.projects,
                     &self.sidebar_model.external_editors,
+                    self.sidebar_state
+                        .followed_worktree()
+                        .map(|key| (key.project_id, key.worktree_id)),
                     self.modal_is_open(),
                 )
                 .map(Message::WorktreesUi),
@@ -19885,15 +19889,17 @@ impl Cagents {
         }
         let projected = match &projection {
             Projection::Unchanged => self.reconcile_notice_popup(),
-            // A reported title reaches the tabs, the window title and the
-            // Attention list's pane rows; nothing else in the sidebar, nor
-            // worktree ownership or protections, reads it.
+            // A reported title reaches the tabs, the window title, the
+            // Attention list's pane rows and the Worktrees view's pane chips;
+            // nothing else in the sidebar, nor worktree ownership or
+            // protections, reads it.
             Projection::Chrome | Projection::ScopedChrome(_) => {
                 #[cfg(test)]
                 if model_update {
                     self.shared_views.chrome_tail_count += 1;
                 }
                 projection_stage!("attention_card_rows", self.refresh_attention_card_rows());
+                projection_stage!("worktrees_pane_titles", self.retitle_worktrees_pane());
                 let notices = self.reconcile_notice_popup();
                 let mut phase = WorkspaceProjectionTiming::new(timed);
                 let chrome = match &projection {

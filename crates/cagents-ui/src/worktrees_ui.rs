@@ -94,6 +94,14 @@ pub enum Action {
     FocusPane(CardId),
 }
 
+impl Action {
+    /// Whether this only closes the open menu, which nothing ever needs to
+    /// refuse.
+    pub fn closes_menu(&self) -> bool {
+        matches!(self, Self::Menu(None))
+    }
+}
+
 /// What only the application can do for this view.
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -115,6 +123,7 @@ enum Entry {
         project: usize,
         id: ProjectId,
         operation: usize,
+        operation_id: crate::model::OperationId,
     },
     Worktree {
         project: usize,
@@ -134,7 +143,11 @@ impl Entry {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match self {
             Self::Project { id, .. } => (0u8, id).hash(&mut hasher),
-            Self::Operation { id, operation, .. } => (1u8, id, operation).hash(&mut hasher),
+            // By identity: the creation after a finished one must not inherit
+            // its key, and with it its measured height.
+            Self::Operation {
+                id, operation_id, ..
+            } => (1u8, id, operation_id).hash(&mut hasher),
             Self::Worktree {
                 id, worktree_id, ..
             } => (2u8, id, worktree_id).hash(&mut hasher),
@@ -180,6 +193,18 @@ impl State {
     }
 
     /// Replaces who works in each checkout, when it changed.
+    /// Renames the listed panes whose titles changed since they were
+    /// listed, without deriving who works where again.
+    pub fn retitle(&mut self, mut title: impl FnMut(CardId) -> Option<String>) {
+        for agent in self.agents.values_mut().flatten() {
+            if let Some(title) = title(agent.card)
+                && title != agent.title
+            {
+                agent.title = title;
+            }
+        }
+    }
+
     pub fn set_agents(&mut self, agents: Agents) {
         if self.agents != agents {
             self.agents = agents;
@@ -231,12 +256,14 @@ impl State {
         &'a self,
         projects: &'a [SidebarProject],
         editors: &'a [SidebarEditor],
+        current: Option<(ProjectId, WorktreeId)>,
         modal_open: bool,
     ) -> Element<'a, Action> {
         let view = View {
             state: self,
             projects,
             editors,
+            current,
             modal_open,
         };
         widget::column::with_children(vec![view.header(), design::horizontal_rule(), view.body()])
@@ -273,11 +300,16 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
         entries.push(Entry::Project { project, id });
         if whole {
             entries.extend(
-                (0..entity.operations.len()).map(|operation| Entry::Operation {
-                    project,
-                    id,
-                    operation,
-                }),
+                entity
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .map(|(operation, row)| Entry::Operation {
+                        project,
+                        id,
+                        operation,
+                        operation_id: row.id,
+                    }),
             );
         }
         if worktrees.is_empty() && entity.operations.is_empty() {
@@ -302,6 +334,8 @@ struct View<'a> {
     state: &'a State,
     projects: &'a [SidebarProject],
     editors: &'a [SidebarEditor],
+    /// The checkout the focused pane works in.
+    current: Option<(ProjectId, WorktreeId)>,
     modal_open: bool,
 }
 
@@ -427,9 +461,11 @@ impl<'a> View<'a> {
                 project,
                 id,
                 operation,
+                operation_id,
             } => self
                 .project(project, id)
                 .and_then(|project| project.operations.get(operation))
+                .filter(|operation| operation.id == operation_id)
                 .map_or_else(skipped, |operation| self.operation(operation)),
             Entry::Worktree {
                 project,
@@ -749,8 +785,15 @@ impl<'a> View<'a> {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
         ];
+        let current = self.current == Some((project.id, worktree.id));
         if primary {
             title.push(mark(Icon::Home, "Main checkout"));
+        }
+        if current {
+            title.push(crate::interaction::tooltip(
+                badge("Current", Tone::Themed(design::accent_color)),
+                "The checkout the focused pane works in",
+            ));
         }
         if worktree.detached {
             title.push(mark(Icon::Info, "Detached HEAD"));
@@ -832,7 +875,7 @@ impl<'a> View<'a> {
         ])
         .spacing(space::XS);
         let menu = Menu::Worktree(project.id, worktree.id);
-        let selected = self.state.menu == Some(menu);
+        let selected = current || self.state.menu == Some(menu);
         // A worktree on its way out is not somewhere to go: opening it would
         // start sessions in a directory Git is about to remove.
         let open = (!deleting).then(|| SidebarAction::OpenWorktree {
@@ -929,32 +972,25 @@ impl<'a> View<'a> {
                 .size(design::COMPACT_ICON_SIZE)
                 .into(),
         };
-        let place = agent.channel.as_deref().map_or_else(
-            || "in no channel".to_owned(),
-            |channel| format!("in #{channel}"),
-        );
+        let description = match agent.channel.as_deref() {
+            Some(channel) => format!("{}, {}, in #{channel}", agent.title, agent.state.label()),
+            None => format!("{}, {}", agent.title, agent.state.label()),
+        };
         let button = widget::button::custom(
             widget::row::with_children(vec![
                 glyph,
-                design::caption(agent.title.as_str())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
+                // A long title fades rather than widening its chip past a
+                // narrow pane.
+                crate::ui_controls::FadeText::caption(agent.title.as_str()).into(),
             ])
             .spacing(space::XXS)
             .align_y(Alignment::Center),
         )
-        .name(format!(
-            "Go to {}, {}, {place}",
-            agent.title,
-            agent.state.label()
-        ))
+        .name(format!("Go to {description}"))
         .class(crate::ui_controls::control_style(false, None))
         .padding([space::XXS, space::XS])
         .on_press_maybe(self.gated(Action::FocusPane(agent.card)));
-        crate::interaction::tooltip(
-            button,
-            format!("{}, {}, {place}", agent.title, agent.state.label()),
-        )
+        crate::interaction::tooltip(button, description)
     }
 
     fn worktree_menu(
@@ -1220,6 +1256,25 @@ mod tests {
             ["# notes", "trunk"],
             "a project's name keeps every checkout of it"
         );
+    }
+
+    #[test]
+    fn a_renamed_pane_is_renamed_where_it_is_listed() {
+        let card = CardId::new();
+        let mut state = State::default();
+        let row = (ProjectId::new(), WorktreeId::new());
+        state.set_agents(Agents::from([(
+            row,
+            vec![Agent {
+                card,
+                title: "New chat".into(),
+                provider: None,
+                state: AgentState::Idle,
+                channel: None,
+            }],
+        )]));
+        state.retitle(|listed| (listed == card).then(|| "Fix the flaky test".to_owned()));
+        assert_eq!(state.agents()[&row][0].title, "Fix the flaky test");
     }
 
     #[test]

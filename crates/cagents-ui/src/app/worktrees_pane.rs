@@ -46,6 +46,20 @@ impl Cagents {
         self.worktrees_ui.set_agents(agents);
     }
 
+    /// Carries a pane's new title to its chips, for a projection that moved
+    /// only titles.
+    pub(super) fn retitle_worktrees_pane(&mut self) {
+        if !self.worktrees_pane_open() {
+            return;
+        }
+        let mut state = std::mem::take(&mut self.worktrees_ui);
+        state.retitle(|card| {
+            self.card_state(card)
+                .map(|card| self.card_display_title(card).to_owned())
+        });
+        self.worktrees_ui = state;
+    }
+
     /// Every open chat and terminal, under each checkout row its directory is
     /// in, working agents first. A pane in a channel counts as much as one
     /// outside every channel: the view answers who works in a checkout, not
@@ -99,8 +113,18 @@ impl Cagents {
                 }
                 _ => continue,
             };
-            let Some(root) = card_directory(card).and_then(|directory| index.resolve(directory))
-            else {
+            // Where the sidebar files the pane: its matched owner or its
+            // explicit scope first, so a pane reached through a symlink or
+            // scoped to a checkout lists there too, then its directory.
+            let root = match self
+                .worktree_owners
+                .get(&card.id)
+                .or_else(|| self.durable.card_scopes.get(&card.id))
+            {
+                Some(scope) => Some(index.resolve(scope).unwrap_or(scope.as_path())),
+                None => card_directory(card).and_then(|directory| index.resolve(directory)),
+            };
+            let Some(root) = root else {
                 continue;
             };
             let rows = index.rows(root);
@@ -232,8 +256,28 @@ mod tests {
         assert_eq!(listed[0].channel.as_deref(), Some("release"));
         assert!(!agents.contains_key(&(project, main)));
 
+        // A pane scoped to a checkout lists there, as the sidebar files it,
+        // whatever directory it started in.
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(shell, "/repo".into());
+        drop(app.project_workspace(false));
+        let agents = app.worktrees_ui.agents();
+        assert_eq!(agents[&(project, main)][0].card, shell);
+        assert!(!agents.contains_key(&(project, feature)));
+
         // Pressing it goes to the pane.
         drop(app.update(Message::WorktreesUi(Action::FocusPane(shell))));
         assert_eq!(app.workspace.focused(), Some(shell));
+    }
+
+    #[test]
+    fn a_dialog_refuses_the_views_actions_but_not_closing_its_menu() {
+        assert!(super::super::user_workspace_message_blocked_while_modal(
+            &Message::WorktreesUi(Action::Query("x".into()))
+        ));
+        assert!(!super::super::user_workspace_message_blocked_while_modal(
+            &Message::WorktreesUi(Action::Menu(None))
+        ));
     }
 }
