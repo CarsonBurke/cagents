@@ -333,14 +333,14 @@ pub fn editor_options<'a, Message: Clone + 'static>(
         .keywords("Auto-save auto_save"),
         toggle(
             "Wrap long lines",
-            "Wrap long editor lines to the available width.",
+            "Wrap long lines in every file, code included, to the available width.",
             wrap.lines,
             on_wrap,
         )
         .keywords("Word wrap word_wrap"),
         toggle(
             "Wrap Markdown and text",
-            "Wrap Markdown and plain-text files even when other files keep long lines.",
+            "Wrap Markdown and plain-text files even while Wrap long lines is off.",
             wrap.prose,
             on_wrap_prose,
         )
