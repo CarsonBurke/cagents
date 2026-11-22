@@ -281,6 +281,13 @@ fn title(title: &str) -> String {
 
 const OPENING: &str = "[cagents ";
 const SEAL: &str = " · seal ";
+/// What the last line of a frame starts with. It says where the command
+/// runs: `[Reply: cagents reply …]` alone read like a call to a tool named
+/// `cagents`, and an agent once made that call.
+const REPLY: &str = "[Reply in a shell: ";
+/// The last line's start in frames from before it said so, which saved
+/// histories keep.
+const EARLIER_REPLY: &str = "[Reply: ";
 
 /// The prompt a message becomes at `now`, up to its seal. The first line says
 /// who sent it, the last how to answer; the body between them is the sender's
@@ -312,7 +319,7 @@ fn framed(message: &Message, waiting: bool) -> String {
         heading.push_str("; they are waiting for your reply");
     }
     format!(
-        "{heading}]\n{}\n[Reply: cagents reply {} \"…\"",
+        "{heading}]\n{}\n{REPLY}cagents reply {} \"…\"",
         message.body.trim_end(),
         short(message.id)
     )
@@ -341,7 +348,12 @@ pub fn open(text: &str, verify: impl FnOnce(&str, &str) -> bool) -> Option<Opene
         return None;
     }
     let (heading, rest) = framed.strip_prefix(OPENING)?.split_once("]\n")?;
-    let (body, _) = rest.rsplit_once("\n[Reply: ")?;
+    // The later of the two is the frame's own last line; the other, if
+    // present at all, is the sender's words.
+    let (body, _) = [REPLY, EARLIER_REPLY]
+        .into_iter()
+        .filter_map(|reply| rest.rsplit_once(&*format!("\n{reply}")))
+        .max_by_key(|(body, _)| body.len())?;
     let (kind, rest) = heading.split_once(" from ")?;
     // A title holds no `;`, so the first one ends the party.
     let party = rest.split_once("; ").map_or(rest, |(party, _)| party);
@@ -552,7 +564,7 @@ mod tests {
             format!(
                 "[cagents message from session {session} \"Fix login bug\"]\n\
                  Hold off on src/auth.rs\n[I am refactoring it]\n\
-                 [Reply: cagents reply {} \"…\"",
+                 [Reply in a shell: cagents reply {} \"…\"",
                 short(message.id)
             )
         );
@@ -600,6 +612,25 @@ mod tests {
                 .is_none()
         );
         assert!(seal.recognizer().open(&frame(&message, 0)).is_none());
+
+        // A frame from before the last line said where to run it, as saved
+        // histories hold, still opens; so does a body that quotes the new
+        // last line.
+        let earlier = frame(&message, 0).replace(REPLY, EARLIER_REPLY);
+        let earlier = format!("{earlier}{SEAL}{}]", seal.tag(&earlier));
+        assert_eq!(
+            seal.recognizer().open(&earlier).unwrap().body,
+            "Hold off on src/auth.rs\n[I am refactoring it]"
+        );
+        let mut quoting = message.clone();
+        quoting.body = format!("See this:\n{REPLY}cagents reply 1234abcd \"…\"]\nthen answer");
+        assert_eq!(
+            seal.recognizer()
+                .open(&seal.seal(&quoting, 0))
+                .unwrap()
+                .body,
+            quoting.body
+        );
 
         // A question taken as an agent run is still a question, but the run
         // may start after the asker stopped waiting, so it never says they

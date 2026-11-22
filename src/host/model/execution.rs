@@ -1689,7 +1689,17 @@ impl Registry {
             .optional()
             .map_err(|error| error.to_string())?;
         row.map(|(stored, run)| {
-            if decode::<Submit>(&stored)? != *request {
+            let mut stored: Submit = decode(&stored)?;
+            // A message's run is that message, by its key. Its prompt is the
+            // daemon's framing of it, whose wording a later version may
+            // change while the run it already became is still unfinished.
+            if request
+                .idempotency_key
+                .starts_with(crate::agent_execution::MESSAGE_RUN_KEY)
+            {
+                stored.prompt.clone_from(&request.prompt);
+            }
+            if stored != *request {
                 return Err(
                     "The idempotency key already identifies a different agent request".into(),
                 );
@@ -4343,6 +4353,46 @@ mod tests {
             message_state(&registry, &message),
             Mail::Pending,
             "the message was never sent, so it still arrives"
+        );
+    }
+
+    /// A daemon that frames messages in other words than the one that made
+    /// a message's run still finds that run, rather than refusing the key.
+    #[test]
+    fn a_message_run_is_found_by_its_message_whatever_its_prompt_says() {
+        let (mut registry, _directory, request) = fixture();
+        let (first, source) = agent_in_a_turn(&mut registry, &request);
+        let (message, queued) = message_run(&mut registry, &first.agent, &source, 3);
+        let reworded = Submit {
+            name: None,
+            destination: Destination::Existing(first.agent.id),
+            prompt: format!("{} (framed differently)", message.body),
+            idempotency_key: format!("{}{}", super::super::MESSAGE_RUN_KEY, message.id),
+        };
+        let found = registry
+            .previous_agent_acceptance(&first.agent.origin, &reworded)
+            .unwrap()
+            .expect("the message's run");
+        assert_eq!(found.run.id, queued.run.id);
+        // Only the prompt: another destination is other work.
+        let elsewhere = Submit {
+            destination: Destination::Existing(AgentId::new()),
+            ..reworded
+        };
+        assert!(
+            registry
+                .previous_agent_acceptance(&first.agent.origin, &elsewhere)
+                .is_err()
+        );
+        // Any other key still requires the same request.
+        let changed = Submit {
+            prompt: "Something else".into(),
+            ..request.clone()
+        };
+        assert!(
+            registry
+                .previous_agent_acceptance(&Origin::User, &changed)
+                .is_err()
         );
     }
 
