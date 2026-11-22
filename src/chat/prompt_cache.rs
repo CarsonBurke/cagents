@@ -171,7 +171,9 @@ impl Tracker {
     pub(crate) fn model(&mut self, model: Option<&str>) {
         let Some(model) = model else {
             // A provider may briefly not know, as Codex doesn't while a
-            // selection waits on its reply.
+            // selection waits on its reply. Should a turn's reading beat
+            // that reply, it is judged against the earlier model's prompt;
+            // calibration allows for one such stray miss.
             return;
         };
         if self.model.as_deref().is_some_and(|known| known != model) {
