@@ -45,7 +45,7 @@ mkdir -p "$root"/{home/.claude,data,config,cache,bin,project}
 ln -s "$checkout/tests/fixtures/chat-composer-claude.sh" "$root/bin/claude"
 printf '1\n' > "$root/home/.claude/fixture-first-turn-seconds"
 if [ "$frame_bytes" -gt 0 ]; then
-    /usr/bin/python3 - "$root/home/.claude/fixture-tools.jsonl" "$frame_bytes" <<'PY'
+    /usr/bin/python3 -I - "$root/home/.claude/fixture-tools.jsonl" "$frame_bytes" <<'PY'
 import json
 import sys
 
