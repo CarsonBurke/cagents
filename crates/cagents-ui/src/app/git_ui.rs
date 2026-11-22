@@ -652,10 +652,10 @@ impl Cagents {
                 generation,
                 result,
             } => {
+                self.refresh_ui.projects.remove(&project);
                 if self.repository_generations.get(&project) != Some(&generation) {
                     return Task::none();
                 }
-                self.refresh_ui.projects.remove(&project);
                 let (availability, archived) = result
                     .unwrap_or_else(|detail| (GitHubAvailability::Failed { detail }, Vec::new()));
                 self.refresh_ui
@@ -2094,6 +2094,24 @@ mod tests {
         assert!(!app.refresh_ui.git.entries.contains_key(&project));
         assert!(app.sidebar_model.project(project).is_none());
     }
+
+    #[test]
+    fn stale_remote_completion_releases_its_poll_fence() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.repository_generations.insert(project, 2);
+        app.refresh_ui
+            .projects
+            .insert(project, CancellationToken::new());
+
+        drop(app.update_git(Action::Remote {
+            project,
+            generation: 1,
+            result: Err("late reply".into()),
+        }));
+
+        assert!(!app.refresh_ui.projects.contains_key(&project));
+    }
     #[test]
     fn fallback_local_reads_are_bounded_and_do_not_schedule_remote_reads() {
         let directory = tempfile::tempdir().unwrap();
@@ -2164,6 +2182,45 @@ mod tests {
             state.fallback_refresh_deadline(now),
             Some(now + WATCH_RETRY_INTERVAL)
         );
+    }
+
+    #[test]
+    fn fallback_tick_does_not_retry_a_watcher_before_its_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let project = ProjectId::new();
+        let retry = Instant::now() + WATCH_RETRY_INTERVAL;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            snapshot.repository.id,
+            "Watched later".into(),
+            snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.refresh_ui.git.watch_retry_at = Some(retry);
+        app.refresh_ui.git.entries.insert(
+            project,
+            Entry {
+                snapshot,
+                generation: 1,
+                plan: None,
+                remote_started: false,
+                cancellation: None,
+                read_failure: None,
+                read_full_scan: false,
+                catalog_requested: false,
+                pending: Default::default(),
+                fallback: Some("watch setup failed".into()),
+                last_full_scan: Instant::now(),
+            },
+        );
+
+        drop(app.git_fallback_tick());
+
+        assert!(app.refresh_ui.git.watch.is_none());
+        assert_eq!(app.refresh_ui.git.watch_retry_at, Some(retry));
     }
 
     #[test]

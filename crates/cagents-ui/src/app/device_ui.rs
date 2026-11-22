@@ -244,10 +244,10 @@ impl Cagents {
         generation: u64,
         result: Result<crate::device_service::Navigation, String>,
     ) -> Task<Message> {
+        self.refresh_ui.projects.remove(&project_id);
         if self.repository_generations.get(&project_id) != Some(&generation) {
             return Task::none();
         }
-        self.refresh_ui.projects.remove(&project_id);
         let Some(project) = self
             .sidebar_model
             .projects

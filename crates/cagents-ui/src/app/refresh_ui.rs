@@ -29,20 +29,39 @@ pub(super) struct State {
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
+    /// The next retry for consumers which have no completion-driven wake.
+    /// This is state, rather than a fresh `now + interval` in
+    /// `subscription()`, so unrelated messages preserve the timer identity.
+    reconciliation_due: Option<Instant>,
     schedule: ProjectSchedule,
 }
 
 /// When each project was last read, which ones something has made worth
 /// reading before their interval is up, and how many reads in a row failed.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ProjectSchedule {
+    /// A project first seen in an update is immediately due, but that due
+    /// instant must remain stable while iced owns its one-shot subscription.
+    unread: HashMap<ProjectId, Instant>,
     read: HashMap<ProjectId, Instant>,
     stale: HashSet<ProjectId>,
     failures: HashMap<ProjectId, u32>,
 }
 
+impl Default for ProjectSchedule {
+    fn default() -> Self {
+        Self {
+            unread: HashMap::new(),
+            read: HashMap::new(),
+            stale: HashSet::new(),
+            failures: HashMap::new(),
+        }
+    }
+}
+
 impl ProjectSchedule {
     fn started(&mut self, project: ProjectId, now: Instant) {
+        self.unread.remove(&project);
         self.read.insert(project, now);
         self.stale.remove(&project);
     }
@@ -56,6 +75,7 @@ impl ProjectSchedule {
     }
 
     fn retain(&mut self, open: impl Fn(ProjectId) -> bool) {
+        self.unread.retain(|&project, _| open(project));
         self.read.retain(|&project, _| open(project));
         self.stale.retain(|&project| open(project));
         self.failures.retain(|&project, _| open(project));
@@ -63,6 +83,18 @@ impl ProjectSchedule {
 
     fn mark_stale(&mut self, project: ProjectId) {
         self.stale.insert(project);
+    }
+
+    /// Initialize a project's first wake in the update which introduced it,
+    /// never while `subscription()` is merely being recomputed. A direct
+    /// scheduler query may still report `now` for an unknown project, but
+    /// actual subscriptions always own a stored instant.
+    fn observe(&mut self, projects: impl IntoIterator<Item = ProjectId>, now: Instant) {
+        for project in projects {
+            if !self.read.contains_key(&project) {
+                self.unread.entry(project).or_insert(now);
+            }
+        }
     }
 
     /// How long `project` waits after its last read. Stale and regained
@@ -82,9 +114,10 @@ impl ProjectSchedule {
     }
 
     fn due_at(&self, project: ProjectId, interval: Duration, eager: bool, now: Instant) -> Instant {
-        self.read
-            .get(&project)
-            .map_or(now, |&read| read + self.wait(project, interval, eager))
+        self.read.get(&project).map_or_else(
+            || self.unread.get(&project).copied().unwrap_or(now),
+            |&read| read + self.wait(project, interval, eager),
+        )
     }
 
     /// The one project a refresh tick reads, if any. The selected project
@@ -120,6 +153,19 @@ impl ProjectSchedule {
 }
 
 impl State {
+    fn reconcile_deadline(&mut self, needed: bool) {
+        if needed {
+            self.reconciliation_due
+                .get_or_insert_with(|| Instant::now() + RECONCILIATION_RETRY);
+        } else {
+            self.reconciliation_due = None;
+        }
+    }
+
+    fn reconciliation_tick_fired(&mut self) {
+        self.reconciliation_due = None;
+    }
+
     pub(super) fn schedule_remote_started(&mut self, project_id: ProjectId) {
         self.schedule.started(project_id, Instant::now());
     }
@@ -237,12 +283,7 @@ impl Cagents {
             }
         };
 
-        if self.document_tone_stale {
-            include(Some(now));
-        }
-        if !self.pending_terminal_handoffs.is_empty() || !self.shared_views.blocked.is_empty() {
-            include(Some(now + RECONCILIATION_RETRY));
-        }
+        include(self.refresh_ui.reconciliation_due);
 
         if crate::device::is_remote() {
             include(self.project_refresh_deadline(now, true));
@@ -251,36 +292,48 @@ impl Cagents {
 
         include(self.refresh_ui.git.fallback_refresh_deadline(now));
 
-        // File-list, review-pane, and source-control refreshes are visible
-        // work. They retain their old cadence without making sidebar-only
-        // workspaces wake every ten seconds.
-        let visible_pane = self.cards.iter().any(|(&card, runtime)| {
-            self.workspace.visibility(card) == Some(VisibilityClass::Visible)
-                && matches!(
-                    runtime,
-                    CardRuntime::Repository(_) | CardRuntime::PullRequests(_)
-                )
-        });
-        let source_control = self.workspace_view_shown().is_some()
-            && self.refresh_ui.source_cancel.is_none()
-            && self
-                .sidebar_model
-                .source_control
-                .as_ref()
-                .is_some_and(|source| !source.busy());
-        if visible_pane || source_control {
-            include(Some(now + RECONCILIATION_RETRY));
-        }
-
         include(self.project_refresh_deadline(now, false));
         deadline
+    }
+
+    /// Consumers without their own event stream retry at a stored deadline.
+    /// Their cadence is visible-work-only; chats and terminals do not enter
+    /// this set once their handoff has settled.
+    fn reconciliation_refresh_needed(&self) -> bool {
+        !self.pending_terminal_handoffs.is_empty()
+            || !self.shared_views.blocked.is_empty()
+            || self.cards.iter().any(|(&card, runtime)| {
+                self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+                    && matches!(
+                        runtime,
+                        CardRuntime::Repository(_) | CardRuntime::PullRequests(_)
+                    )
+            })
+            || (self.workspace_view_shown().is_some()
+                && self.refresh_ui.source_cancel.is_none()
+                && self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .is_some_and(|source| !source.busy()))
+    }
+
+    pub(super) fn sync_refresh_reconciliation_deadline(&mut self) {
+        self.refresh_ui.schedule.observe(
+            self.sidebar_model.projects.iter().map(|project| project.id),
+            Instant::now(),
+        );
+        let needed = self.reconciliation_refresh_needed();
+        self.refresh_ui.reconcile_deadline(needed);
     }
 
     /// Compute the next selected/other project poll without turning a
     /// not-yet-due project into a fixed app tick. Local windows poll GitHub;
     /// device windows use the same scheduler to reload their daemon catalog.
     fn project_refresh_deadline(&self, now: Instant, remote: bool) -> Option<Instant> {
-        if !self.refresh_ui.projects.is_empty() {
+        if self.refresh_ui.projects.iter().any(|(id, cancellation)| {
+            self.repository_generations.contains_key(id) && !cancellation.is_cancelled()
+        }) {
             // A result message re-arms the subscription. Starting another
             // read while one is in flight was never useful.
             return None;
@@ -298,10 +351,10 @@ impl Cagents {
             }
             self.review_repositories
                 .get(&project.id)
-                .and_then(|repository| crate::github::polling::rate_limit(&repository.authority()))
-                .map(|limit| {
+                .and_then(|repository| crate::github::polling::ready_at(&repository.authority()))
+                .map(|ready_at| {
                     let wall_now = crate::github::polling::now();
-                    due.max(now + Duration::from_secs(limit.retry_at.saturating_sub(wall_now)))
+                    due.max(now + Duration::from_secs(ready_at.saturating_sub(wall_now)))
                 })
                 .unwrap_or(due)
         };
@@ -328,7 +381,10 @@ impl Cagents {
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Tick => self.refresh(false),
+            Action::Tick => {
+                self.refresh_ui.reconciliation_tick_fired();
+                self.refresh(false)
+            }
             Action::Focused(window, focused) if self.core.main_window_id() == Some(window) => {
                 self.main_window_focus_changed(focused)
             }
@@ -545,6 +601,20 @@ mod tests {
         projects.map(|project| (project, ACTIVE_PROJECT_INTERVAL))
     }
 
+    fn recipe_identities(subscription: Subscription<Message>) -> Vec<u64> {
+        use cosmic::iced::advanced::subscription::{Hasher, Recipe, into_recipes};
+        use std::hash::Hasher as _;
+
+        into_recipes(subscription)
+            .iter()
+            .map(|recipe| {
+                let mut hasher = Hasher::default();
+                Recipe::hash(&**recipe, &mut hasher);
+                hasher.finish()
+            })
+            .collect()
+    }
+
     /// Spinners take their cadence from the main window's focus and nothing
     /// else: another window's focus changes must neither slow nor restore it.
     #[test]
@@ -583,15 +653,12 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(true);
         app.refresh_ui.focused = true;
 
-        app.document_tone_stale = true;
-        assert_ne!(app.refresh_subscription().units(), 0);
-        app.document_tone_stale = false;
-
         app.shared_views
             .blocked
             .insert(crate::workspace_model::views::Scope::Channel(
                 crate::model::ChannelId::new(),
             ));
+        app.sync_refresh_reconciliation_deadline();
         assert_ne!(app.refresh_subscription().units(), 0);
         app.shared_views.blocked.clear();
 
@@ -600,7 +667,28 @@ mod tests {
             _ => unreachable!("test terminal card has a terminal session"),
         };
         app.pending_terminal_handoffs.insert(terminal.id, terminal);
+        app.sync_refresh_reconciliation_deadline();
         assert_ne!(app.refresh_subscription().units(), 0);
+    }
+
+    #[test]
+    fn reconciliation_deadline_keeps_its_subscription_identity_during_unrelated_updates() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
+        let card = app.workspace.focused().expect("fixture has a focused card");
+        app.workspace.resize_viewport(1_600.0);
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        app.sync_refresh_reconciliation_deadline();
+        let before = recipe_identities(app.refresh_subscription());
+        assert_eq!(before.len(), 1);
+
+        // A scale-factor event causes a normal app update without changing
+        // the visible repository consumer or its stored refresh deadline.
+        drop(app.update(Message::WindowScaleFactorChanged(app.window_scale_factor)));
+        assert_eq!(recipe_identities(app.refresh_subscription()), before);
     }
 
     #[test]
@@ -613,6 +701,7 @@ mod tests {
             card,
             CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
         );
+        app.sync_refresh_reconciliation_deadline();
 
         assert_ne!(app.refresh_subscription().units(), 0);
     }
@@ -632,10 +721,11 @@ mod tests {
         app.refresh_ui.focused = true;
         let now = Instant::now();
         app.refresh_ui.schedule.started(project, now);
+        app.sync_refresh_reconciliation_deadline();
 
         assert!(
-            app.refresh_deadline(now)
-                .is_some_and(|deadline| deadline <= now + RECONCILIATION_RETRY)
+            app.refresh_deadline(Instant::now())
+                .is_some_and(|deadline| deadline <= Instant::now() + RECONCILIATION_RETRY)
         );
     }
 
@@ -661,10 +751,11 @@ mod tests {
         for project in &app.sidebar_model.projects {
             app.refresh_ui.schedule.started(project.id, now);
         }
+        app.sync_refresh_reconciliation_deadline();
 
         assert!(
-            app.refresh_deadline(now)
-                .is_some_and(|deadline| deadline <= now + RECONCILIATION_RETRY)
+            app.refresh_deadline(Instant::now())
+                .is_some_and(|deadline| deadline <= Instant::now() + RECONCILIATION_RETRY)
         );
     }
 
@@ -673,14 +764,20 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.refresh_ui.focused = true;
         let project = ProjectId::new();
+        let repository = PathBuf::from("/repository");
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
             RepositoryId::new(),
             "repository".into(),
-            PathBuf::from("/repository"),
+            repository.clone(),
             Vec::new(),
             Vec::new(),
         ));
+        app.sidebar_state
+            .apply(&sidebar::SidebarAction::OpenRepository {
+                project_id: project,
+                repository,
+            });
         let started = Instant::now();
         app.refresh_ui.schedule.started(project, started);
         app.refresh_ui.schedule.finished(project, false);
@@ -690,10 +787,10 @@ mod tests {
         assert_eq!(app.next_github_project(None, false, Instant::now()), None);
         assert_ne!(app.refresh_subscription().units(), 0);
         let now = Instant::now();
-        assert!(
-            app.refresh_deadline(now)
-                .is_some_and(|deadline| { deadline >= started + SELECTED_PROJECT_INTERVAL * 2 }),
-            "the backoff contributes a future wake; GitHub's shared budget may defer it further"
+        assert_eq!(
+            app.refresh_deadline(now),
+            Some(started + SELECTED_PROJECT_INTERVAL * 2),
+            "the schedule backoff itself supplies the next actionable wake"
         );
     }
 
@@ -1063,6 +1160,89 @@ mod tests {
         assert_eq!(app.repository_load_sequence, sequence);
         assert!(app.repository_generations.is_empty());
         assert!(app.refresh_ui.projects.is_empty());
+    }
+
+    #[test]
+    fn host_backoff_moves_a_past_project_deadline_to_the_ready_instant() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let key = GitHubRepoKey::new("refresh-deadline-backoff.invalid", None, "o", "r").unwrap();
+        app.review_repositories.insert(project, key.clone());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "paused".into(),
+            PathBuf::from("/refresh-deadline-backoff"),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.sidebar_state
+            .apply(&sidebar::SidebarAction::OpenRepository {
+                project_id: project,
+                repository: PathBuf::from("/refresh-deadline-backoff"),
+            });
+        let now = Instant::now();
+        app.refresh_ui
+            .schedule
+            .started(project, now.checked_sub(SELECTED_PROJECT_INTERVAL).unwrap());
+        crate::github::polling::failed(
+            &key.authority(),
+            &crate::github::GitHubError::Inspection("offline".into()),
+        );
+
+        let ready_at = crate::github::polling::ready_at(&key.authority()).unwrap();
+        let expected =
+            now + Duration::from_secs(ready_at.saturating_sub(crate::github::polling::now()));
+        assert_eq!(
+            app.project_refresh_deadline(now, false),
+            Some(expected),
+            "a refused due read must wait for the host budget rather than keep a past timer id"
+        );
+    }
+
+    #[test]
+    fn stale_in_flight_project_does_not_block_the_next_deadline() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            PathBuf::from("/project"),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.sidebar_state
+            .apply(&sidebar::SidebarAction::OpenRepository {
+                project_id: project,
+                repository: PathBuf::from("/project"),
+            });
+        let now = Instant::now();
+        app.refresh_ui.schedule.started(project, now);
+        app.refresh_ui
+            .projects
+            .insert(ProjectId::new(), CancellationToken::new());
+
+        assert_eq!(
+            app.project_refresh_deadline(now, false),
+            Some(now + SELECTED_PROJECT_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn stale_repository_completion_releases_its_poll_fence() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.refresh_ui
+            .projects
+            .insert(project, CancellationToken::new());
+
+        drop(app.repository_loaded(false, project, 1, Err("late reply".into())));
+
+        assert!(
+            !app.refresh_ui.projects.contains_key(&project),
+            "a result for a retired generation cannot suppress later project polls"
+        );
     }
 
     #[test]

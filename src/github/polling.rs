@@ -125,6 +125,26 @@ pub fn rate_limit(host: &str) -> Option<RateLimit> {
         .and_then(|budget| budget.limit(&resource(), now()))
 }
 
+/// The next instant an automatic GraphQL read may run, including ordinary
+/// transient-failure backoff as well as rate-limit pauses. UI schedulers use
+/// this rather than repeatedly waking at a project deadline that admission
+/// will refuse.
+pub fn ready_at(host: &str) -> Option<u64> {
+    let at = now();
+    BUDGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&budget_key(host))
+        .and_then(|budget| {
+            budget
+                .limit(&resource(), at)
+                .map(|limit| limit.retry_at)
+                .into_iter()
+                .chain((budget.due > at).then_some(budget.due))
+                .max()
+        })
+}
+
 pub(crate) fn rate_limit_for(host: &str, resource: &str) -> Option<RateLimit> {
     with_resource(resource, || rate_limit(host))
 }

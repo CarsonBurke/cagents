@@ -16743,6 +16743,7 @@ impl Application for Cagents {
                 .collect();
             app.lifecycle = LifecycleManager::new(LifecycleBudget::default());
             app.pane_inspectors = pane_inspector::PaneInspectors::default();
+            app.sync_refresh_reconciliation_deadline();
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
@@ -16786,6 +16787,7 @@ impl Application for Cagents {
                 }),
         );
         let task = Task::batch(tasks);
+        app.sync_refresh_reconciliation_deadline();
         let chrome = app.sync_chrome();
         (app, Task::batch([task, chrome]))
     }
@@ -17677,6 +17679,7 @@ impl Application for Cagents {
                 oracle_message,
             },
         );
+        self.sync_refresh_reconciliation_deadline();
         self.attention_scope_changed = enclosing_scope_changed;
         task
     }
