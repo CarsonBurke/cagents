@@ -12102,6 +12102,9 @@ impl Cagents {
         focused: bool,
         splitter: bool,
     ) -> Element<'_, Message> {
+        if !crate::performance::ui_trace::enabled() {
+            return self.card_view(id, focused, splitter);
+        }
         let label = match self.cards.get(&id) {
             None => "pane absent",
             Some(CardRuntime::Loading) => "pane loading",

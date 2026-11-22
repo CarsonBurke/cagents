@@ -7600,7 +7600,7 @@ impl Cagents {
         let watched_part = part(Phase::Projection, "labels watched conversations");
         let watched = self.listed_watched_conversations();
         drop(watched_part);
-        let _stale_part = part(Phase::Projection, "labels stale chats");
+        let stale_part = part(Phase::Projection, "labels stale chats");
         let stale = self
             .cards
             .iter()
@@ -7619,6 +7619,7 @@ impl Cagents {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        drop(stale_part);
         for (card, built_from) in stale {
             self.relabel_chat(card, built_from);
         }

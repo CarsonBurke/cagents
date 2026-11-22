@@ -195,6 +195,7 @@ impl Renderer {
         self.prepare(&mut encoder, viewport, now);
         graphics::present::lap(graphics::present::Stage::Prepare);
         self.render(&mut encoder, target, clear_color, viewport);
+        graphics::present::lap(graphics::present::Stage::Render);
 
         self.quad.trim();
         self.triangle.trim();
@@ -208,7 +209,7 @@ impl Renderer {
             self.image.trim();
             self.image_cache.borrow_mut().trim();
         }
-        graphics::present::lap(graphics::present::Stage::Render);
+        graphics::present::lap(graphics::present::Stage::Trim);
 
         // Merging and trimming leave the revision alone; the trim count is
         // taken once this renderer's own trim has counted.

@@ -21,7 +21,7 @@ below.
 
 `dev-runtime` optimizes dependencies only: `[profile.dev-runtime.package."*"]`
 does not cover the workspace's own crates, so `cagents`, `cagents-ui` and the
-vendored path crates build unoptimized, and a native measurement of
+other workspace members build unoptimized, and a native measurement of
 application code roughly doubles. Build a native measurement with
 `CARGO_PROFILE_DEV_RUNTIME_OPT_LEVEL=2`, which `scripts/native-evidence` and
 the build gate forward to the build host, and check that Cargo reports
@@ -140,8 +140,8 @@ Even so, a step cost about 3-4 ms of the UI thread, which held the cadence at
 Workload: fw16 (Ryzen 7 7840HS), nested KWin at 1500x900, scale 1. The
 `realistic` seed, with four fixture Claude agents working in one channel, both
 chat panes showing long transcripts and the pointer still. Every build is
-`dev-runtime` with the application crates raised to opt-level 2, as
-described at the top of this page, and with frame pointers. Each row is one run: 30 s of
+`dev-runtime` at opt-level 2 with frame pointers; how the application crates
+were raised to it is not recorded (see the top of this page). Each row is one run: 30 s of
 `/proc` CPU time for the UI's main thread, plus the ranges of the
 `CAGENTS_UI_TRACE` frame lines (5 s windows) from the same run. fw16 was
 shared and loaded (load average 13-21 on 16 threads), so compare rows taken
@@ -233,8 +233,8 @@ widget operations, accessibility tree and overlay collection. Beneath each
 total, the sidebar's and the workspace's shares are broken out, and within
 the workspace each pane's share by kind, such as `pane chat` or
 `pane terminal`. `view` is also split into `sidebar`, `workspace`, `chrome`
-and `bars and overlays`, and `subscription` into each domain's subscription,
-such as `chat` or `conversation pull request`. Each call that
+and `bars and overlays`, and `subscription` into the application's domain
+subscriptions, such as `chat` or `conversation pull request`. Each call that
 takes 50 ms or more is logged as it returns, as `ui-trace slow PHASE LABEL MS`.
 A nested `update` counts toward the outermost one. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
@@ -269,13 +269,17 @@ Beneath the frame lines, `ui-trace   Present STAGE n=N ...` gives the same
 quantiles for presenting each frame: `total` wall time, the UI thread's `cpu`
 time over it, and its stages, `acquire` (waiting for a surface image),
 `prepare` (uploading layer data), `render` (recording the render pass, which
-wgpu only queues), `finish` (wgpu validating and encoding the queued passes
+wgpu only queues), `trim` (releasing caches and atlas space the frame no
+longer uses, on a full draw), `finish` (wgpu validating and encoding the queued passes
 into a command buffer), `submit` (handing it to the GPU queue) and `swap`
 (handing the image back), and `Present layers` how many layers each frame
-drew. Where `cpu` falls short of `total`, the thread waited on the
-GPU or the compositor; see `vendor/iced-graphics/README.cagents.md`.
-Each key press logs `ui-trace latency key press MS`, the time from the shell
-handing the key to the window until the next frame is presented.
+drew. Where `cpu` falls short of `total`, the thread was blocked, as on the
+GPU or the compositor, or preempted on a loaded host; see
+`vendor/iced-graphics/README.cagents.md`.
+Each key press, not counting repeats, logs `ui-trace latency key press MS`,
+the time from the shell handing the key to the window until the next frame
+is presented. A key that changes nothing visible reports the wait for
+whatever frame comes next, so read it for keys that type or move.
 `scripts/native-evidence start SIDE --ui-trace` sets the variable for a session;
 the lines go to its `logs/ui-SIDE.log`. Without the variable a scope reads one
 flag, and other builds compile the trace out.

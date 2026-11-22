@@ -20,6 +20,8 @@ pub enum Stage {
     /// Recording the render passes that draw the layers. A backend that
     /// defers encoding, as wgpu does, only queues the commands here.
     Render,
+    /// Trimming the caches and atlases the frame no longer uses.
+    Trim,
     /// Finishing the command buffer, which is where wgpu validates and
     /// encodes the recorded passes.
     Finish,
@@ -38,6 +40,8 @@ pub struct Timing {
     pub prepare: Duration,
     /// See [`Stage::Render`].
     pub render: Duration,
+    /// See [`Stage::Trim`].
+    pub trim: Duration,
     /// See [`Stage::Finish`].
     pub finish: Duration,
     /// See [`Stage::Submit`].
@@ -50,7 +54,8 @@ pub struct Timing {
     pub total: Duration,
     /// CPU time the presenting thread used from [`begin`] to [`end`], where
     /// the platform reports it. Its shortfall from [`Timing::total`] is time
-    /// the thread spent blocked, such as on the GPU or the compositor.
+    /// the thread spent blocked, such as on the GPU or the compositor, or
+    /// runnable but preempted.
     pub cpu: Option<Duration>,
 }
 
@@ -99,6 +104,7 @@ pub fn lap(stage: Stage) {
         Stage::Acquire => &mut timing.acquire,
         Stage::Prepare => &mut timing.prepare,
         Stage::Render => &mut timing.render,
+        Stage::Trim => &mut timing.trim,
         Stage::Finish => &mut timing.finish,
         Stage::Submit => &mut timing.submit,
         Stage::Swap => &mut timing.swap,

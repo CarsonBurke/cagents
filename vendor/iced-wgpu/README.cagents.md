@@ -67,9 +67,10 @@ draws every frame in full.
 
 `window::compositor::present` and `Renderer::present` mark the end of each
 presentation stage with `iced_graphics::present::lap`: acquiring the surface
-texture, preparing and rendering the layers, finishing the command encoder
+texture, preparing and rendering the layers, trimming caches after a full
+draw, finishing the command encoder
 (where wgpu encodes the passes it queued), submitting, and presenting the
 texture, and `Renderer::render` reports how many layers it draws
 (vendor/iced-graphics/README.cagents.md). Outside a timed
-presentation a lap reads one thread-local flag and nothing else. Remove it with
+presentation a lap touches one thread-local cell and nothing else. Remove it with
 the iced-graphics timing.

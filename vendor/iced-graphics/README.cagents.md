@@ -50,7 +50,8 @@ all of it and the number of layers drawn. The
 shell brackets each presentation with `begin` and `end` only while the
 application traces frames (vendor/iced-winit/README.cagents.md), and the wgpu
 compositor marks each stage with `lap` (vendor/iced-wgpu/README.cagents.md).
-Until a shell enables it, each call reads one thread-local flag and no clock.
+Until a shell enables it, each call touches one thread-local cell and reads no
+clock.
 It answers whether a cheap frame's presentation is CPU encoding or waiting on
 the GPU or the compositor. `present_timing` in `crates/iced-contracts` covers
 it. Remove it when the pinned dependency offers

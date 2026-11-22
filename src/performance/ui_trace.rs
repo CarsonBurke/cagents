@@ -266,19 +266,20 @@ fn quantiles(values: &mut [Duration]) -> String {
 impl Recorder {
     /// Each presentation stage's quantiles, and the thread's CPU time over
     /// the whole presentation, whose shortfall from its wall time is time
-    /// spent waiting on the GPU or the compositor.
+    /// the thread was blocked, as on the GPU or the compositor, or preempted.
     #[cfg(feature = "development")]
     fn report_presents(&self) {
         use cosmic::iced::advanced::graphics::present::Timing;
         if self.presents.is_empty() {
             return;
         }
-        let stages: [(&str, fn(&Timing) -> Option<Duration>); 8] = [
+        let stages: [(&str, fn(&Timing) -> Option<Duration>); 9] = [
             ("total", |timing| Some(timing.total)),
             ("cpu", |timing| timing.cpu),
             ("acquire", |timing| Some(timing.acquire)),
             ("prepare", |timing| Some(timing.prepare)),
             ("render", |timing| Some(timing.render)),
+            ("trim", |timing| Some(timing.trim)),
             ("finish", |timing| Some(timing.finish)),
             ("submit", |timing| Some(timing.submit)),
             ("swap", |timing| Some(timing.swap)),
@@ -589,7 +590,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Region<'_, Message> {
         if self.label.is_empty()
             && matches!(
                 event,
-                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { .. })
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { repeat: false, .. })
             )
         {
             // From the window's handling of a key press to the frame that
