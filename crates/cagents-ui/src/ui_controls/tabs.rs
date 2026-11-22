@@ -11,7 +11,7 @@ use cosmic::{
 use crate::{
     design::{self, space},
     interaction::tooltip,
-    ui_controls::{focus_ring, hover_fill, selected_fill},
+    ui_controls::{hover_fill, selected_fill},
 };
 
 /// One entry of a [`view_tabs`] bar.
@@ -152,24 +152,26 @@ pub fn view_tab_height(compact: bool) -> f32 {
 /// fill and full-strength label even though it publishes nothing, and the
 /// rest read as quieter peers rather than as disabled controls. A hovered
 /// peer lifts by less than the selected tab, and keyboard focus rings a tab
-/// rather than filling it, so only the selected tab reads as selected.
+/// rather than filling it, so only the selected tab reads as selected. The
+/// ring is drawn inside the tab: the row clips to the tabs' height, which
+/// would cut an outline drawn outside them.
 ///
 /// [`control_style`]: crate::ui_controls::control_style
 fn view_tab_style(selected: bool) -> cosmic::theme::Button {
-    let appearance = move |focused: bool, theme: &cosmic::Theme| {
-        focus_ring(
-            widget::button::Style {
-                background: selected.then(|| iced::Background::Color(selected_fill(theme))),
-                text_color: Some(if selected {
-                    theme.current_container().component.on.into()
-                } else {
-                    design::muted_color(theme)
-                }),
-                ..design::button_style()
-            },
-            focused,
-            theme,
-        )
+    let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
+        background: selected.then(|| iced::Background::Color(selected_fill(theme))),
+        text_color: Some(if selected {
+            theme.current_container().component.on.into()
+        } else {
+            design::muted_color(theme)
+        }),
+        border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+        border_color: if focused {
+            design::accent_color(theme)
+        } else {
+            iced::Color::TRANSPARENT
+        },
+        ..design::button_style()
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
@@ -210,8 +212,10 @@ mod tests {
                 let expected = if selected { selected_fill } else { None };
                 let focused = active(true, &theme);
                 assert_eq!(focused.background, expected, "focus is not selection");
-                assert!(focused.outline_width > 0.0, "focus rings the tab");
-                assert_eq!(active(false, &theme).outline_width, 0.0);
+                // Inside the tab, where the clipping row cannot cut it.
+                assert!(focused.border_width > 0.0, "focus rings the tab");
+                assert_eq!(focused.outline_width, 0.0);
+                assert_eq!(active(false, &theme).border_width, 0.0);
                 let hover = hovered(false, &theme).background;
                 assert!(hover.is_some());
                 assert_eq!(

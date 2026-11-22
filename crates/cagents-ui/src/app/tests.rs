@@ -1753,6 +1753,19 @@ fn real_tab_header_drag_survives_repaint_and_cannot_activate_destination_close()
     );
 }
 
+/// Moving onto a neighbouring tab can deliver its entry before the old tab's
+/// exit; that exit must not end the neighbour's hover.
+#[test]
+fn a_tab_exit_ends_only_its_own_hover() {
+    let mut app = context_inspector_test_app(true);
+    let (left, right) = (CardId::new(), CardId::new());
+    drop(app.update_chrome(chrome_ui::Action::HoverTab(Some(left))));
+    drop(app.update_chrome(chrome_ui::Action::UnhoverTab(right)));
+    assert_eq!(app.chrome_ui.hovered_tab, Some(left));
+    drop(app.update_chrome(chrome_ui::Action::UnhoverTab(left)));
+    assert_eq!(app.chrome_ui.hovered_tab, None);
+}
+
 /// A pane tab hovered on its way down into the pane must not stay hovered:
 /// the strip is a scrollable that withholds the cursor once it leaves, and a
 /// stale hover drew the tab like the selected one, close button and all.

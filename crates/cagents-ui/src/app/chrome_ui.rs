@@ -2060,6 +2060,9 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
 #[derive(Debug, Clone)]
 pub enum Action {
     HoverTab(Option<CardId>),
+    /// The pointer left this tab. It ends that tab's hover only: moving onto
+    /// a neighbour can deliver the neighbour's entry first.
+    UnhoverTab(CardId),
     RenameChannel(crate::model::ChannelId),
     Rename(CardId),
     RenameChanged(String),
@@ -2592,12 +2595,15 @@ impl Cagents {
         &mut self,
         action: Action,
     ) -> (Task<Message>, Option<Projection>) {
-        let projection = matches!(action, Action::HoverTab(_)).then_some(Projection::Unchanged);
+        let projection = matches!(action, Action::HoverTab(_) | Action::UnhoverTab(_))
+            .then_some(Projection::Unchanged);
         (self.update_chrome(action), projection)
     }
 
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
-        if self.modal_is_open() && !matches!(action, Action::Close) {
+        // Ending a hover is never refused: a dialog that opens while a tab is
+        // hovered would otherwise leave it drawn hovered once it closes.
+        if self.modal_is_open() && !matches!(action, Action::Close | Action::UnhoverTab(_)) {
             return Task::none();
         }
         if let Action::ShowNoticesFor(card) = &action
@@ -2617,6 +2623,12 @@ impl Cagents {
         match action {
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
+                Task::none()
+            }
+            Action::UnhoverTab(card) => {
+                if self.chrome_ui.hovered_tab == Some(card) {
+                    self.chrome_ui.hovered_tab = None;
+                }
                 Task::none()
             }
             Action::RenameChannel(id) => {
@@ -3931,7 +3943,7 @@ impl Cagents {
         );
         let tab = iced::widget::mouse_area(tab)
             .on_enter(Message::ChromeUi(Action::HoverTab(Some(id))))
-            .on_exit(Message::ChromeUi(Action::HoverTab(None)));
+            .on_exit(Message::ChromeUi(Action::UnhoverTab(id)));
         crate::interaction::context_menu_lazy(tab, move || {
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
