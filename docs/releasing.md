@@ -67,7 +67,9 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
-- `release-metadata.json`
+- `release-metadata.json`: the version, source commit, daemon protocol,
+  release notes, and every other asset's size and SHA-256 (schema 2)
+- `release-metadata.json.sig`: its signature (see [Signing](#signing))
 
 Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
 supported build and package lane today. Windows and macOS need their own native
@@ -130,32 +132,55 @@ contract remain Linux-specific until a qualified target has its own contract.
 
 ## Publishing
 
-Verify first, then publish:
+A release goes out in five steps, each through `mise run release`
+(`scripts/release --help`):
 
-```sh
-mise run release:verify -- --version 0.1.2 --dist /var/tmp/cagents-v0.1.2
-gh auth login --hostname github.com
-./scripts/publish-release --version 0.1.2 --dist /var/tmp/cagents-v0.1.2
-```
+1. `mise run release -- bump 0.2.0` sets the product manifests and
+   `Cargo.lock` to the new version. Land that through a pull request, then tag
+   the merged commit and push the tag:
+   `git tag -a v0.2.0 -m v0.2.0 COMMIT && git push origin v0.2.0`.
+2. `mise run release -- build 0.2.0` builds the tag on the build host (`fw16`,
+   or `--build-host HOST`) with `scripts/build-release-linux` from the tag's own
+   checkout, admitted through `scripts/cargo-gate` beside other builds, and
+   brings the verified bundle back to `~/.local/state/cagents-release/0.2.0`.
+   The bundle's `release-metadata.json` carries the release notes an installed
+   cagents shows before it updates: by default the `feat`, `fix` and `perf`
+   commit subjects since the previous tag, or a file passed with
+   `--notes FILE` (at most 64 KiB). Read them with
+   `jq -r .notes ~/.local/state/cagents-release/0.2.0/release-metadata.json`.
+3. Sign the metadata with your own key (see [Signing](#signing)). No repository
+   script signs: `ssh-keygen -Y sign -n cagents-release -f KEY
+   ~/.local/state/cagents-release/0.2.0/release-metadata.json`.
+4. Rehearse the update from the previous release through a file feed (below).
+5. `mise run release -- publish 0.2.0` asks you to type the version, then runs
+   `scripts/publish-release`. It checks the signature against the keys the tag
+   lists, the metadata against every asset, the checksums, the archive layouts
+   and an offline smoke install before uploading anything. It uploads to a
+   draft it owns, downloads and compares the served bytes, then publishes. It
+   never moves tags or overwrites a published release. Authentication stays in
+   the local `gh` configuration, outside the build environment. Publishing
+   makes the release the update every installed cagents offers within six
+   hours.
 
-Both manifests and the existing tag must agree on the release version. The
-publisher verifies local and remote tag identity, uploads a private snapshot to
-its own draft, downloads and verifies the served bytes, then publishes. It
-never moves tags or overwrites a published release. Authentication stays in the
-local `gh` configuration, outside the build environment.
+`mise run release:verify -- --version 0.2.0 --dist DIR` runs the same checks
+without publishing. Both modes repeat the offline artifact smoke against a
+private snapshot of the bundle. To verify a bundle built elsewhere, prepare the
+runtime image first, or supply an existing Ubuntu 24.04 amd64 runtime image
+with `--smoke-rootfs DIR`. Missing dependencies, failed install/remove scripts,
+hanging commands, or a failed daemon handshake stop verification. No package is
+installed on the host.
 
-Both publishing modes repeat the offline artifact smoke against the verified
-private bundle snapshot before any release upload or publication. To verify a
-bundle built elsewhere, prepare the runtime image first, or supply an existing
-Ubuntu 24.04 amd64 runtime image with `--smoke-rootfs DIR`. Missing dependencies,
-failed install/remove scripts, hanging commands, or a failed daemon handshake
-stop verification. No package is installed on the host.
+### Rehearsing
+
+`mise run release -- feed 0.2.0 --feed DIR` adds the signed bundle to a file
+feed with GitHub's layout: `DIR/download/v0.2.0/` holds every asset and,
+while 0.2.0 is the newest there, `DIR/latest/download/` holds its signed
+metadata. Add the previous release the same way to rehearse an update from it.
+An installed build reads that feed only when it is a development build or was
+built with `CAGENTS_UPDATE_REHEARSAL_KEYS`, and `CAGENTS_UPDATE_FEED` is
+`file:///DIR`; see [Rehearsing an update](development.md#rehearsing-an-update).
 
 ## Signing
-
-The release scripts do not write schema 2 yet; that follows in
-[#3703](https://github.com/CarsonBurke/cagents/issues/3703), and until then no
-published release is offered as an update.
 
 An installed build offers a release only when the release's
 `release-metadata.json` (schema 2) carries a valid signature,

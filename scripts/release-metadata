@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+"""Write, check and lay out a release's signed metadata (schema 2).
+
+An installed cagents trusts a release only through `release-metadata.json`
+and its signature `release-metadata.json.sig` (`ssh-keygen -Y sign -n
+cagents-release`). The metadata names every other file of the release with
+its size and SHA-256, so the signature covers them all, the installer
+included. See docs/releasing.md#signing.
+
+  write --dir DIR --version V --source-commit SHA --protocol N [--notes FILE]
+        write DIR/release-metadata.json for the files in DIR
+  check --dir DIR [--version V] [--source-commit SHA]
+        check its schema and every listed file's size and digest, then print
+        the metadata's SHA-256
+  notes --repository PATH --to REF [--from TAG]
+        print release notes from the Conventional Commit subjects in FROM..TO:
+        features and fixes, with their pull request numbers
+  feed --dir DIR --feed FEED
+        lay out DIR as a file feed: FEED/download/vV/* and, when V is the
+        newest there, FEED/latest/download/* (copies; DIR is unchanged)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCHEMA = 2
+REPOSITORY = "CarsonBurke/cagents"
+TARGET = "x86_64-unknown-linux-gnu"
+METADATA = "release-metadata.json"
+SIGNATURE = "release-metadata.json.sig"
+VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+NAME = re.compile(r"^[-A-Za-z0-9_.]+$")
+# The newest release notes an installed build shows; GitHub's own page keeps more.
+NOTES_LIMIT = 64 * 1024
+
+
+class Refused(Exception):
+    pass
+
+
+def version_key(version: str) -> tuple[int, int, int]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def payloads(directory: Path) -> list[Path]:
+    """Every file of the release other than its metadata and signature."""
+    found = []
+    for path in sorted(directory.iterdir()):
+        if path.name in (METADATA, SIGNATURE):
+            continue
+        if path.is_symlink() or not path.is_file() or not NAME.match(path.name):
+            raise Refused(f"release file is not a plainly named regular file: {path.name}")
+        if path.stat().st_size == 0:
+            raise Refused(f"release file is empty: {path.name}")
+        found.append(path)
+    return found
+
+
+def products(version: str, names: set[str]) -> dict:
+    """The products whose archives DIR holds. A rehearsal feed may hold only
+    the full archive; a published release holds all three."""
+    archive = f"cagents-{version}-{TARGET}.tar.gz"
+    if archive not in names or "install.sh" not in names or "SHA256SUMS" not in names:
+        raise Refused(f"a release needs {archive}, install.sh and SHA256SUMS")
+    found = {"cagents": {"archive": archive, "installer": "install.sh", "checksums": "SHA256SUMS"}}
+    if f"cagents_{version}_amd64.deb" in names:
+        found["cagents"]["deb"] = f"cagents_{version}_amd64.deb"
+    browserless = f"cagents-browserless-{version}-{TARGET}.tar.gz"
+    if browserless in names:
+        found["cagents-browserless"] = {"archive": browserless, "checksums": "SHA256SUMS-browserless"}
+        if f"cagents-browserless_{version}_amd64.deb" in names:
+            found["cagents-browserless"]["deb"] = f"cagents-browserless_{version}_amd64.deb"
+    editor = f"ceditor-{version}-{TARGET}.tar.gz"
+    if editor in names:
+        found["ceditor"] = {"archive": editor, "checksums": "SHA256SUMS-ceditor"}
+    return found
+
+
+def build(directory: Path, version: str, source_commit: str, protocol: int, notes: str) -> dict:
+    if not VERSION.match(version):
+        raise Refused("version must be a stable semantic version without a leading v")
+    if not COMMIT.match(source_commit):
+        raise Refused("source commit must be a full lowercase SHA-1")
+    if not 0 < protocol < 65536:
+        raise Refused("protocol must be a daemon protocol number")
+    if len(notes.encode()) > NOTES_LIMIT:
+        raise Refused(f"release notes exceed {NOTES_LIMIT} bytes")
+    files = payloads(directory)
+    return {
+        "schema_version": SCHEMA,
+        "repository": REPOSITORY,
+        "version": version,
+        "source_commit": source_commit,
+        "protocol": protocol,
+        "notes": notes,
+        "assets": {path.name: {"size": path.stat().st_size, "sha256": digest(path)} for path in files},
+        "targets": [{
+            "target": TARGET, "os": "linux", "architecture": "x86_64", "libc": "gnu",
+            "minimum_glibc": "2.35",
+            "products": products(version, {path.name for path in files}),
+        }],
+    }
+
+
+def encode(metadata: dict) -> bytes:
+    return (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
+
+
+def check(directory: Path, version: str | None, source_commit: str | None) -> str:
+    path = directory / METADATA
+    raw = path.read_bytes()
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise Refused(f"{METADATA} is not JSON: {error}") from None
+    if not isinstance(metadata, dict) or metadata.get("schema_version") != SCHEMA:
+        raise Refused(f"{METADATA} is not schema {SCHEMA}")
+    if version is not None and metadata.get("version") != version:
+        raise Refused(f"{METADATA} names version {metadata.get('version')!r}, not {version}")
+    if source_commit is not None and metadata.get("source_commit") != source_commit:
+        raise Refused(f"{METADATA} names another source commit")
+    notes = metadata.get("notes")
+    protocol = metadata.get("protocol")
+    if (not isinstance(notes, str) or isinstance(protocol, bool) or not isinstance(protocol, int)
+            or not isinstance(metadata.get("assets"), dict)):
+        raise Refused(f"{METADATA} lacks its notes, protocol or assets")
+    expected = build(directory, metadata.get("version", ""), metadata.get("source_commit", ""), protocol, notes)
+    if metadata != expected:
+        listed, present = set(metadata.get("assets", {})), set(expected["assets"])
+        if listed != present:
+            raise Refused(f"{METADATA} lists {sorted(listed ^ present)} differently from the release files")
+        raise Refused(f"{METADATA} does not match the release files it lists")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def git(repository: Path, *args: str) -> str:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return subprocess.run(
+        ["git", "-C", str(repository), *args], check=True, text=True,
+        stdout=subprocess.PIPE, env=environment,
+    ).stdout
+
+
+SUBJECT = re.compile(r"^(feat|fix|perf)(\([^)]*\))?!?: (.+)$")
+HEADINGS = {"feat": "New", "fix": "Fixed", "perf": "Faster"}
+
+
+def notes(repository: Path, start: str | None, end: str) -> str:
+    """Features, fixes and speedups since the previous release, newest first,
+    in the words their commits used for people."""
+    revisions = f"{start}..{end}" if start else end
+    sections: dict[str, list[str]] = {kind: [] for kind in HEADINGS}
+    for subject in git(repository, "log", "--no-merges", "--format=%s", revisions).splitlines():
+        match = SUBJECT.match(subject)
+        if match:
+            text = match.group(3)
+            sections[match.group(1)].append(text[0].upper() + text[1:])
+    lines = []
+    for kind, heading in HEADINGS.items():
+        if sections[kind]:
+            lines.append(f"### {heading}")
+            lines.extend(f"- {entry}" for entry in sections[kind])
+            lines.append("")
+    return "\n".join(lines).strip() + "\n" if lines else ""
+
+
+def feed(directory: Path, destination: Path) -> None:
+    metadata = json.loads((directory / METADATA).read_bytes())
+    check(directory, None, None)
+    if not (directory / SIGNATURE).is_file():
+        raise Refused(f"{SIGNATURE} is missing; sign the metadata first")
+    version = metadata["version"]
+    downloads = destination / "download"
+    release = downloads / f"v{version}"
+    if release.exists():
+        raise Refused(f"{release} already exists; a feed never replaces a release")
+    downloads.mkdir(parents=True, exist_ok=True)
+    # Each directory appears whole, so a reader never sees half a release.
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=downloads))
+    for path in [*payloads(directory), directory / METADATA, directory / SIGNATURE]:
+        shutil.copyfile(path, staging / path.name)
+    staging.chmod(0o755)
+    staging.rename(release)
+    published = sorted(
+        (path.name[1:] for path in downloads.iterdir()
+         if path.name.startswith("v") and VERSION.match(path.name[1:])),
+        key=version_key,
+    )
+    if published[-1] == version:
+        latest = destination / "latest"
+        latest.mkdir(exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=latest))
+        for name in (METADATA, SIGNATURE):
+            shutil.copyfile(release / name, staging / name)
+        staging.chmod(0o755)
+        previous = latest / "download"
+        if previous.exists():
+            retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=latest))
+            previous.rename(retired / "download")
+            staging.rename(previous)
+            shutil.rmtree(retired)
+        else:
+            staging.rename(previous)
+    print(f"Feed {destination} now offers {published[-1]}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    write_parser = commands.add_parser("write")
+    write_parser.add_argument("--dir", type=Path, required=True)
+    write_parser.add_argument("--version", required=True)
+    write_parser.add_argument("--source-commit", required=True)
+    write_parser.add_argument("--protocol", type=int, required=True)
+    write_parser.add_argument("--notes", type=Path)
+    check_parser = commands.add_parser("check")
+    check_parser.add_argument("--dir", type=Path, required=True)
+    check_parser.add_argument("--version")
+    check_parser.add_argument("--source-commit")
+    notes_parser = commands.add_parser("notes")
+    notes_parser.add_argument("--repository", type=Path, required=True)
+    notes_parser.add_argument("--from", dest="start")
+    notes_parser.add_argument("--to", required=True)
+    feed_parser = commands.add_parser("feed")
+    feed_parser.add_argument("--dir", type=Path, required=True)
+    feed_parser.add_argument("--feed", type=Path, required=True)
+    arguments = parser.parse_args()
+    try:
+        if arguments.command == "write":
+            text = arguments.notes.read_text() if arguments.notes else ""
+            metadata = build(arguments.dir, arguments.version, arguments.source_commit, arguments.protocol, text)
+            target = arguments.dir / METADATA
+            if target.exists():
+                raise Refused(f"{target} already exists")
+            target.write_bytes(encode(metadata))
+            print(hashlib.sha256(target.read_bytes()).hexdigest())
+        elif arguments.command == "check":
+            print(check(arguments.dir, arguments.version, arguments.source_commit))
+        elif arguments.command == "notes":
+            sys.stdout.write(notes(arguments.repository, arguments.start, arguments.to))
+        else:
+            feed(arguments.dir, arguments.feed)
+    except Refused as error:
+        print(f"release-metadata: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

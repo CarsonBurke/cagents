@@ -198,32 +198,8 @@ for measurement in resolved_package_ids build_seconds installed_binary_bytes por
         "$measurement" "$full" "$measurement" "$browserless" "$reduction" "$((full - browserless))" >> "$comparison"
 done
 
-jq -n --arg version "$VERSION" --arg target "$CAGENTS_RELEASE_TARGET" \
-    --arg deb_arch "$DEB_ARCH" --arg source_commit "$SOURCE_COMMIT" '{
-    schema_version: 1,
-    repository: "CarsonBurke/cagents",
-    version: $version,
-    source_commit: $source_commit,
-    targets: [{
-        target: $target, os: "linux", architecture: "x86_64", libc: "gnu", minimum_glibc: "2.35",
-        products: {
-            cagents: {
-                archive: ("cagents-" + $version + "-" + $target + ".tar.gz"),
-                deb: ("cagents_" + $version + "_" + $deb_arch + ".deb"),
-                installer: "install.sh", checksums: "SHA256SUMS"
-            },
-            "cagents-browserless": {
-                archive: ("cagents-browserless-" + $version + "-" + $target + ".tar.gz"),
-                deb: ("cagents-browserless_" + $version + "_" + $deb_arch + ".deb"),
-                checksums: "SHA256SUMS-browserless"
-            },
-            ceditor: {
-                archive: ("ceditor-" + $version + "-" + $target + ".tar.gz"),
-                checksums: "SHA256SUMS-ceditor"
-            }
-        }
-    }]
-}' > /dist/release-metadata.json
+# The host writes and signs release-metadata.json over these files (see
+# scripts/build-release-linux), so the signature covers every one of them.
 sed -i "s|^DEFAULT_REPOSITORY='<OWNER>/<REPO>'$|DEFAULT_REPOSITORY='CarsonBurke/cagents'|" /dist/install.sh
 grep -Fqx "DEFAULT_REPOSITORY='CarsonBurke/cagents'" /dist/install.sh
 
@@ -296,12 +272,12 @@ settings_path=$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --se
         "cagents-browserless-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
         "cagents-browserless_${VERSION}_${DEB_ARCH}.deb" "cagents-browserless-$VERSION-sizes.txt" \
         "ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
-        SHA256SUMS-browserless SHA256SUMS-ceditor release-metadata.json install.sh > SHA256SUMS
+        SHA256SUMS-browserless SHA256SUMS-ceditor install.sh > SHA256SUMS
     sha256sum --check --strict SHA256SUMS
     sha256sum --check --strict SHA256SUMS-browserless
     sha256sum --check --strict SHA256SUMS-ceditor
     shopt -s nullglob dotglob
     assets=(*)
-    ((${#assets[@]} == 13)) || fail 'expected exactly 13 release assets'
+    ((${#assets[@]} == 12)) || fail 'expected exactly 12 release assets'
 )
 printf 'Verified all local release assets for %s at source %s\n' "$VERSION" "$SOURCE_COMMIT"
