@@ -8,6 +8,7 @@ description: Use when working through the cagents CLI, for separate agent sessio
 - `cagents send SESSION "…"` messages a session and `cagents reply MESSAGE_ID "…"` answers a message; run them in your shell. For a message with quotes or several lines, pass `-` and write it on standard input with a quoted heredoc, or use `--file PATH`.
 - `cagents whoami` and `cagents ls` show who else is working in the checkout. Message them rather than editing around them or guessing what they are doing.
 - Listings show session, agent and run IDs by their shortest unique prefix, which `send`, `transcript` and `agent` accept. A `hint: …` line names the commands that usually come next: last in a listing, and for a run waiting for input or one that failed or stopped, before its result (after them all for several runs).
+- `cagents channel move --to CHANNEL` moves your own pane to another channel of this project (`cagents channel list --repository .` lists them); `--new TITLE` makes one for it.
 - `cagents work` lists this project's worktrees and branches in progress, with their pull requests and sessions.
 - `cagents ls --channel` lists the sessions in your channel, including those whose provider has exited, such as from a usage limit. `cagents transcript SESSION` reads one's conversation, newest last; follow its `--before` hint for earlier messages. When a session has exited, or you need what it already did, read its transcript.
 - A spawned agent knows only its prompt.

@@ -2087,6 +2087,15 @@ fn process_admitted_request(
             crate::daemon::wake();
             Ok((ServerResponse::WorkspaceEdit(receipt), Vec::new(), false))
         }
+        ClientRequest::MovePane {
+            pane,
+            destination,
+            operation,
+        } => {
+            let moved = super::workspace::move_pane(host, client_id, pane, destination, operation)?;
+            crate::daemon::wake();
+            Ok((ServerResponse::PaneMoved(moved), Vec::new(), false))
+        }
         ClientRequest::EditWorkspaceModel { edit } => {
             let model = super::workspace::edit(host, client_id, edit)?;
             crate::daemon::wake();
