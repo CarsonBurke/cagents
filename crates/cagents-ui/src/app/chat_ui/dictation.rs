@@ -1411,6 +1411,22 @@ mod tests {
         assert!(app.chat_ui.dictation.active.is_none());
     }
 
+    /// Each utterance is a step of the draft's undo history, and so is
+    /// discarding them, so neither loses the reader's own edits.
+    #[test]
+    fn undo_brings_back_a_discard_then_takes_back_one_utterance_at_a_time() {
+        let (mut app, card, target) = dictating("Hello world", 5);
+        hear(&mut app, final_text("there"));
+        hear(&mut app, final_text("again"));
+        assert_eq!(draft(&app, card), "Hello there again world");
+        drop(app.handle_chat_ui(Action::DictationDiscard(target)));
+        assert_eq!(draft(&app, card), "Hello world");
+        assert!(app.chat_runtime_mut(target).unwrap().undo_composer(false));
+        assert_eq!(draft(&app, card), "Hello there again world");
+        assert!(app.chat_runtime_mut(target).unwrap().undo_composer(false));
+        assert_eq!(draft(&app, card), "Hello there world");
+    }
+
     #[test]
     fn a_place_edited_away_sends_the_rest_to_the_end_and_discard_keeps_the_draft() {
         let (mut app, card, target) = dictating("Hello world", 5);

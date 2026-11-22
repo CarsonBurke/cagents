@@ -1458,7 +1458,7 @@ fn dictation_group<'a>(
                     None => format!("{size} MB to download"),
                 };
                 let marker: Element<'a, Message> = if selected {
-                    settings_icon(Icon::Select).into()
+                    settings_icon(Icon::Check).into()
                 } else {
                     iced::widget::Space::new().width(16).height(16).into()
                 };

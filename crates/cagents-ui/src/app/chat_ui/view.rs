@@ -4712,7 +4712,6 @@ impl Runtime {
         )
     }
 
-
     /// The submit modes the send controls expose, in the order the keyboard
     /// reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
     /// A message just sent is about to start a turn, so what is written
