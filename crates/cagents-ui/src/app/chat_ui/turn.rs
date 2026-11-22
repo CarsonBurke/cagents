@@ -2821,4 +2821,87 @@ mod tests {
             "Sent 2 messages to main: Rebase first. · 1 not sent · 1 queued"
         );
     }
+
+    /// Agents this conversation does not list, each addressed by its own
+    /// ID, are as many agents as messages, whatever the rows call them.
+    #[test]
+    fn agents_known_only_by_id_are_each_their_own() {
+        let readings: std::collections::HashMap<&str, Coordinated> = [
+            ("m1", sent("019a3c2e", "Rebase first.")),
+            ("m2", sent("019a7f10", "Rebase first.")),
+            ("m3", sent("019b0d44", "Wait for review.")),
+            ("m4", sent("019b5e91", "Merged.")),
+        ]
+        .into_iter()
+        .map(|(id, message)| {
+            let mut reading = message.reading.clone();
+            if let crate::chat::coordination::Kind::Message(outbound) = &reading.kind {
+                reading.subagents = vec![outbound.to.clone()];
+            }
+            (id, Coordinated::new(reading))
+        })
+        .collect();
+        let coordinated = |item: &Item| readings.get(item.id.as_str());
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Succeeded),
+            command("c1", ToolStatus::Succeeded),
+            command("m3", ToolStatus::Succeeded),
+            command("m4", ToolStatus::Succeeded),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert!(
+            turns[1]
+                .summary
+                .starts_with("Messaged 2 agents: Rebase first."),
+            "{}",
+            turns[1].summary
+        );
+        assert!(
+            turns[3].summary.starts_with("Sent 2 messages to 2 agents"),
+            "{}",
+            turns[3].summary
+        );
+    }
+
+    /// A `cagents` send that failed names only what it was given; its
+    /// retry also the session it reached, which is the same agent.
+    #[test]
+    fn a_failed_cli_message_and_its_retry_are_to_one_agent() {
+        use crate::chat::coordination::{Arrival, Receipt};
+        let cli = |receipt: Option<Receipt>| {
+            let mut reading = sent("95fcd1b9", "Rebase first.").reading.clone();
+            reading.cli = true;
+            reading.outcome.delivery = None;
+            reading.outcome.receipt = receipt;
+            Coordinated::new(reading)
+        };
+        let (first, second) = (
+            cli(None),
+            cli(Some(Receipt {
+                message: "4c1e".into(),
+                recipient: "session 95fcd1b9 \"Fix the sidebar\"".into(),
+                arrival: Arrival::WhenIdle,
+            })),
+        );
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Failed),
+            command("m2", ToolStatus::Succeeded),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert!(
+            turns[1]
+                .summary
+                .starts_with("Sent 2 messages to Fix the sidebar (95fcd1b9): Rebase first."),
+            "{}",
+            turns[1].summary
+        );
+    }
 }

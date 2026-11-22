@@ -536,6 +536,28 @@ pub(super) struct MessageRun {
     state: RowStatus,
 }
 
+/// One agent a run of messages went to: every name a send to it went by,
+/// and the one the reader knows it by.
+struct Agent {
+    names: Vec<String>,
+    shown: String,
+}
+
+impl Agent {
+    /// Whether `other` is this agent by some name of theirs, a session ID
+    /// matching any of its abbreviations.
+    fn is(&self, other: &Agent) -> bool {
+        self.names.iter().any(|name| {
+            other.names.iter().any(|theirs| {
+                name == theirs
+                    || is_identifier(name)
+                        && is_identifier(theirs)
+                        && (name.starts_with(theirs.as_str()) || theirs.starts_with(name.as_str()))
+            })
+        })
+    }
+}
+
 impl MessageRun {
     /// The row `sent` folds into, `listed` naming the agents this
     /// conversation lists; `None` unless every step is a message.
@@ -544,10 +566,7 @@ impl MessageRun {
         listed: &dyn Fn(&str) -> Option<String>,
     ) -> Option<Self> {
         let mut bodies = Vec::new();
-        // Whom each went to, as the step addressed them, and as the reader
-        // knows them: two agents this conversation cannot name read alike.
-        let mut addressed: Vec<&str> = Vec::new();
-        let mut recipients: Vec<String> = Vec::new();
+        let mut agents: Vec<Agent> = Vec::new();
         let mut states = Vec::new();
         for (item, coordinated) in sent {
             let Kind::Message(message) = &coordinated.reading.kind else {
@@ -563,24 +582,38 @@ impl MessageRun {
                     .inline()
                     .map(|body| (body, coordinated.plain.said.first())),
             );
-            // The agent the provider resolved, which one addressed once by
-            // its ID and once by its name is to both, before the CLI's
-            // account of the session and the name the agent gave.
-            let address = match (
-                coordinated.reading.subagents.as_slice(),
-                &coordinated.reading.outcome.receipt,
-            ) {
-                ([agent], _) => agent.as_str(),
-                (_, Some(receipt)) => receipt.recipient.as_str(),
-                _ => message.to.as_str(),
+            // A send that failed is known only by what it was addressed to,
+            // and its retry also by the agent or session it reached: every
+            // agent sharing one of those names is one.
+            let mut names = vec![message.to.clone()];
+            for agent in &coordinated.reading.subagents {
+                names.push(agent.clone());
+                names.extend(listed(agent));
+            }
+            if let Some(receipt) = &coordinated.reading.outcome.receipt {
+                match receipt.recipient.strip_prefix("session ") {
+                    Some(rest) => {
+                        let (session, title) = rest.split_once(' ').unwrap_or((rest, ""));
+                        names.push(session.to_owned());
+                        names.push(title.trim_matches('"').to_owned());
+                    }
+                    None => names.push(receipt.recipient.clone()),
+                }
+            }
+            names.retain(|name| !name.is_empty());
+            // The latest send to an agent names it best: it reached it.
+            let mut agent = Agent {
+                names,
+                shown: recipient(message, &coordinated.reading, listed).plain(),
             };
-            if !addressed.contains(&address) {
-                addressed.push(address);
-            }
-            let to = recipient(message, &coordinated.reading, listed).plain();
-            if !recipients.contains(&to) {
-                recipients.push(to);
-            }
+            agents.retain_mut(|known| {
+                let same = known.is(&agent);
+                if same {
+                    agent.names.append(&mut known.names);
+                }
+                !same
+            });
+            agents.push(agent);
         }
         let count = bodies.len();
         // The same words to several is one message said to each of them,
@@ -591,14 +624,23 @@ impl MessageRun {
             Some((Some((first, said)), rest)) if !first.trim().is_empty() => rest
                 .iter()
                 .all(|body| body.is_some_and(|(body, _)| body == *first))
-                .then(|| said.map(|said| one_line_of(said)).unwrap_or_default()),
+                .then(|| said.map(|said| one_line_of(said)).unwrap_or_default())
+                .filter(|said| !said.is_empty()),
             _ => None,
         };
-        // Each to its own agent only where neither the agents nor the names
-        // they go by repeat: a send that failed is keyed by the name it was
-        // given and its retry by the agent it reached, which are one.
-        let each = addressed.len() == count && recipients.len() == count;
-        let to = format!("to {}", recipients.join(", "));
+        let each = agents.len() == count;
+        let mut recipients: Vec<&str> = Vec::new();
+        for agent in &agents {
+            if !recipients.contains(&agent.shown.as_str()) {
+                recipients.push(&agent.shown);
+            }
+        }
+        // Agents this conversation cannot tell apart by name are counted.
+        let to = if recipients.len() < agents.len() {
+            format!("to {} agents", agents.len())
+        } else {
+            format!("to {}", recipients.join(", "))
+        };
         let (verb, count, preview, shares) = match shared {
             Some(said) if each => ("Messaged", format!("{count} agents"), said, true),
             // The same words sent again, as a retry is, still say whom to.
