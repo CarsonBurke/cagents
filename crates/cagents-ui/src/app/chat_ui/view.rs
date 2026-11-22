@@ -1702,7 +1702,7 @@ fn delivery_report_outcome<'a>(from: &str, heading: &'a str) -> Option<(&'a str,
 }
 
 /// The inputs of one scope's selection catalog; see [`Runtime::selection_key`].
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct SelectionKey {
     scope: Option<String>,
     presentation: u64,
@@ -1714,6 +1714,38 @@ pub(super) struct SelectionKey {
     tool_groups_expanded: bool,
     failures: (u64, revised::Stamp, revised::Stamp),
     queued: Option<(u64, u64)>,
+}
+
+/// The selected scope's copy and selection catalog, built when something
+/// reads it rather than whenever its text changes.
+///
+/// A streamed chunk changes the exposed text, but nothing reads the catalog
+/// unless text is selected, a press starts a selection, or Find or Copy runs.
+/// The document still changes as soon as a view presents new text, so Find's
+/// document epoch moves exactly when it did while every view built it.
+#[derive(Default)]
+pub(super) struct SelectionDocument {
+    /// The inputs the transcript last presented.
+    presented: Option<SelectionKey>,
+    /// The last catalog built, which may be older than `presented`.
+    built: Option<(SelectionKey, Arc<selection::Catalog>)>,
+}
+
+impl SelectionDocument {
+    /// Whether this holds neither a presented document nor a catalog.
+    pub(super) fn is_empty(&self) -> bool {
+        self.presented.is_none() && self.built.is_none()
+    }
+    /// Forget the document and release its catalog.
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+    /// Present `catalog` as the document for `key`.
+    #[cfg(test)]
+    pub(super) fn install(&mut self, key: SelectionKey, catalog: Arc<selection::Catalog>) {
+        self.presented = Some(key.clone());
+        self.built = Some((key, catalog));
+    }
 }
 
 impl Runtime {
@@ -2391,8 +2423,35 @@ impl Runtime {
         }
     }
 
+    /// Note the inputs the transcript presents now. When they changed, the
+    /// selection document changed, though its catalog is built only once
+    /// something reads it.
+    pub(super) fn observe_selection_document(&self) {
+        let key = self.selection_key();
+        self.observe_selection_key(&mut self.selection_document.borrow_mut(), key);
+    }
+
+    fn observe_selection_key(&self, document: &mut SelectionDocument, key: SelectionKey) {
+        if document.presented.as_ref() != Some(&key) {
+            document.presented = Some(key);
+            self.find_navigation.changed_document();
+        }
+    }
+
+    /// The selected scope's selection, kept across views and scopes.
+    pub(super) fn selection_bookmark(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<selection::Bookmark>> {
+        self.selection_bookmarks
+            .borrow_mut()
+            .entry(self.selected_subagent.clone())
+            .or_default()
+            .clone()
+    }
+
     /// The logical copy/selection catalog is rebuilt only when exposed text
-    /// or disclosure changes, never for mouse motion, copying, find or timers.
+    /// or disclosure changes, never for mouse motion, copying, find or timers,
+    /// and only when something reads it.
     pub(super) fn selection_document(
         &self,
     ) -> (
@@ -2400,15 +2459,22 @@ impl Runtime {
         std::rc::Rc<std::cell::RefCell<selection::Bookmark>>,
     ) {
         let key = self.selection_key();
-        let selected = self
-            .selected_subagent
-            .as_ref()
-            .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
-        let items = selected.map_or(self.snapshot.items.as_slice(), |agent| {
-            agent.items.as_slice()
-        });
         let mut document = self.selection_document.borrow_mut();
-        if document.as_ref().is_none_or(|(built, _)| *built != key) {
+        self.observe_selection_key(&mut document, key);
+        let key = document.presented.as_ref().expect("an observed document");
+        if document
+            .built
+            .as_ref()
+            .is_none_or(|(built, _)| built != key)
+        {
+            let key = key.clone();
+            let selected = self
+                .selected_subagent
+                .as_ref()
+                .and_then(|id| self.snapshot.subagents.iter().find(|agent| &agent.id == id));
+            let items = selected.map_or(self.snapshot.items.as_slice(), |agent| {
+                agent.items.as_slice()
+            });
             let mut builder = selection::Catalog::builder();
             if let Some(agent) = selected {
                 for incident in self.failure_ui.incidents.iter().filter(|incident| {
@@ -2476,19 +2542,13 @@ impl Runtime {
                     );
                 }
             }
-            let catalog =
-                builder.finish_reusing(document.as_ref().map(|(_, catalog)| catalog.as_ref()));
-            *document = Some((key, catalog));
-            self.find_navigation.changed_document();
+            let catalog = builder
+                .finish_reusing(document.built.as_ref().map(|(_, catalog)| catalog.as_ref()));
+            document.built = Some((key, catalog));
         }
-        let catalog = document.as_ref().unwrap().1.clone();
-        let bookmark = self
-            .selection_bookmarks
-            .borrow_mut()
-            .entry(self.selected_subagent.clone())
-            .or_default()
-            .clone();
-        (catalog, bookmark)
+        let catalog = document.built.as_ref().unwrap().1.clone();
+        drop(document);
+        (catalog, self.selection_bookmark())
     }
 
     fn selection_failure_preview<'a>(
@@ -3250,7 +3310,8 @@ impl Runtime {
         )
         .center_x(Length::Fill);
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
-            let (catalog, bookmark) = self.selection_document();
+            self.observe_selection_document();
+            let bookmark = self.selection_bookmark();
             crate::ui_memory::gate(selection::transcript_virtualized(
                 scroll::transcript_observed(
                     transcript,
@@ -3349,7 +3410,7 @@ impl Runtime {
                 ),
                 target,
                 self.selected_subagent.as_deref(),
-                catalog,
+                || self.selection_document().0,
                 bookmark,
             ))
         } else {

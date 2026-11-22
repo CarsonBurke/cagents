@@ -7539,7 +7539,7 @@ fn forgetting_a_conversation_releases_catalog_and_selection_contexts() {
     assert!(catalog.retained_plain_bytes() > 0);
     drop(catalog);
     runtime.forget_transcript();
-    assert!(runtime.selection_document.borrow().is_none());
+    assert!(runtime.selection_document.borrow().is_empty());
     assert!(runtime.selection_bookmarks.borrow().is_empty());
     assert!(
         backing.upgrade().is_none(),
@@ -7721,7 +7721,7 @@ fn copy_web_search_native(select_all: bool) {
         &runtime.cache[&item.id],
         design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
     );
-    let mut element = selection::transcript_virtualized(content, target, None, catalog, bookmark);
+    let mut element = selection::transcript_catalogued(content, target, None, catalog, bookmark);
     let renderer = crate::app::tests::headless_renderer();
     let mut tree = Tree::new(&element);
     let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100_000.0));
@@ -8181,7 +8181,7 @@ fn queued_and_notice_widgets_copy_through_logical_catalog() {
         runtime.delivery_view(&delivery, cached, settings),
         notice_entry("Repeated failure", runtime.target, second),
     ]);
-    let mut element = selection::transcript_virtualized(
+    let mut element = selection::transcript_catalogued(
         content,
         runtime.target,
         None,
@@ -8386,7 +8386,7 @@ fn pointer_copy_across_visual_paragraph_and_code_chunks_adds_no_separators() {
                 )
             };
             let content = scroll::transcript(body, target, None, vec![], true, vec![]);
-            selection::transcript_virtualized(
+            selection::transcript_catalogued(
                 content,
                 target,
                 None,

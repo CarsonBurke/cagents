@@ -346,6 +346,60 @@ fn a_turn_gaining_a_message_builds_only_that_message() {
     }
 }
 
+/// A streamed chunk changes the selection document, so Find's document epoch
+/// moves with the frame that shows it, but nothing catalogs the transcript
+/// until something reads the catalog: a selection, a press, Copy or Find.
+#[test]
+fn a_streamed_chunk_catalogs_the_transcript_only_when_read() {
+    let mut pane = Pane::new(transcript(4));
+    pane.metadata.busy = true;
+    pane.publish();
+    pane.prepare_publication();
+    pane.frame();
+    let built = |pane: &Pane| {
+        let document = pane.runtime.selection_document.borrow();
+        document
+            .built
+            .as_ref()
+            .is_some_and(|(key, _)| document.presented.as_ref() == Some(key))
+    };
+    assert!(!built(&pane), "showing a transcript catalogs nothing");
+    let (first, _) = pane.runtime.selection_document();
+    assert!(built(&pane));
+    pane.frame();
+    assert!(
+        Arc::ptr_eq(&first, &pane.runtime.selection_document().0),
+        "an unchanged frame keeps the catalog"
+    );
+    for chunk in 0..3 {
+        let epoch = pane.runtime.find_navigation.document_epoch();
+        pane.tail().push_str(&format!(" streamed chunk {chunk}"));
+        pane.publish();
+        pane.prepare_publication();
+        pane.frame();
+        assert!(
+            pane.runtime.find_navigation.document_epoch() != epoch,
+            "the frame showing chunk {chunk} changes the document"
+        );
+        assert!(!built(&pane), "chunk {chunk} is not catalogued unread");
+        let epoch = pane.runtime.find_navigation.document_epoch();
+        pane.frame();
+        assert!(
+            pane.runtime.find_navigation.document_epoch() == epoch,
+            "a frame that shows nothing new leaves the document alone"
+        );
+    }
+    let (catalog, _) = pane.runtime.selection_document();
+    assert!(built(&pane));
+    assert!(
+        catalog
+            .search_blocks()
+            .last()
+            .is_some_and(|(_, text)| text.ends_with("streamed chunk 2")),
+        "reading it catalogs the newest text"
+    );
+}
+
 /// The reply the native frame pass streams: the repository's own
 /// documentation, with its headings, tables, lists and code fences, 24 bytes
 /// a publication. Preparing a publication lays out the new text once, so it

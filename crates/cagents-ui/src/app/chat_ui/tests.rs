@@ -10712,7 +10712,7 @@ fn a_metadata_only_disconnected_client_keeps_the_last_readable_runtime_body() {
     assert!(!runtime.visible.load(Ordering::Relaxed));
     assert!(runtime.cache.is_empty());
     assert!(runtime.child_cache.is_empty());
-    assert!(runtime.selection_document.borrow().is_none());
+    assert!(runtime.selection_document.borrow().is_empty());
     assert!(Arc::ptr_eq(
         &runtime.snapshot.items[1],
         &parent.upgrade().unwrap()
@@ -23675,10 +23675,7 @@ fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
         end_prefix: document.fingerprint(end),
     }));
     let key = runtime.selection_key();
-    runtime
-        .selection_document
-        .get_mut()
-        .replace((key, document));
+    runtime.selection_document.get_mut().install(key, document);
     runtime
         .selection_bookmarks
         .get_mut()
@@ -23706,7 +23703,7 @@ fn hidden_chat_releases_all_transcript_owners_and_rehydrates_reader_state() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("the hidden client's exact publication must retire");
     assert!(runtime.cache.is_empty());
-    assert!(runtime.selection_document.borrow().is_none());
+    assert!(runtime.selection_document.borrow().is_empty());
     assert!(
         weak_document.upgrade().is_none(),
         "the logical selection catalog must be released"

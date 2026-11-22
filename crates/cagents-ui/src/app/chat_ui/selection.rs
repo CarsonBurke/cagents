@@ -40,28 +40,59 @@ pub(super) fn transcript<'a>(
     })
 }
 
+/// `catalog` builds the transcript's logical catalog. The widget asks for it
+/// only when a selection, a press or a copy needs it, so a streamed chunk
+/// with nothing selected does not catalog the whole transcript again.
 pub(super) fn transcript_virtualized<'a>(
+    content: impl Into<Element<'a, Message>>,
+    target: Target,
+    subagent: Option<&'a str>,
+    catalog: impl Fn() -> Arc<Catalog> + 'a,
+    bookmark: Rc<RefCell<Bookmark>>,
+) -> Element<'a, Message> {
+    Element::new(Selection {
+        content: content.into(),
+        context: Some((target, subagent)),
+        catalog: Some(Deferred {
+            built: std::cell::OnceCell::new(),
+            build: Box::new(catalog),
+        }),
+        bookmark: Some(bookmark),
+        click_clock: iced::time::Instant::now,
+    })
+}
+
+/// [`transcript_virtualized`] over a catalog that is already built.
+#[cfg(test)]
+pub(super) fn transcript_catalogued<'a>(
     content: impl Into<Element<'a, Message>>,
     target: Target,
     subagent: Option<&'a str>,
     catalog: Arc<Catalog>,
     bookmark: Rc<RefCell<Bookmark>>,
 ) -> Element<'a, Message> {
-    Element::new(Selection {
-        content: content.into(),
-        context: Some((target, subagent)),
-        catalog: Some(catalog),
-        bookmark: Some(bookmark),
-        click_clock: iced::time::Instant::now,
-    })
+    transcript_virtualized(content, target, subagent, move || catalog.clone(), bookmark)
+}
+
+/// A catalog built on first use and kept for the rest of this view.
+struct Deferred<'a> {
+    built: std::cell::OnceCell<Arc<Catalog>>,
+    build: Box<dyn Fn() -> Arc<Catalog> + 'a>,
 }
 
 struct Selection<'a> {
-    catalog: Option<Arc<Catalog>>,
+    catalog: Option<Deferred<'a>>,
     bookmark: Option<Rc<RefCell<Bookmark>>>,
     content: Element<'a, Message>,
     context: Option<(Target, Option<&'a str>)>,
     click_clock: fn() -> iced::time::Instant,
+}
+
+impl Selection<'_> {
+    fn catalog(&self) -> Option<&Arc<Catalog>> {
+        let deferred = self.catalog.as_ref()?;
+        Some(deferred.built.get_or_init(|| (deferred.build)()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1112,8 +1143,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
         let state = tree.state.downcast_mut::<State>();
-        if let (Some(catalog), Some(bookmark)) = (&self.catalog, &self.bookmark) {
-            let saved = *bookmark.borrow();
+        if let Some(bookmark) = &self.bookmark
+            && let saved = *bookmark.borrow()
+            && (saved.anchor_prefix.is_some() || saved.end_prefix.is_some())
+            && let Some(catalog) = self.catalog()
+        {
             let changed = saved
                 .anchor
                 .zip(saved.anchor_prefix)
@@ -1133,7 +1167,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             }
         }
         if state.anchor.is_some() || std::mem::take(&mut state.reset) {
-            let mut read = Read::with_catalog(None, self.catalog.clone());
+            let mut read = Read::with_catalog(None, self.catalog().cloned());
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
                 Layout::new(&node),
@@ -1144,12 +1178,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none()
-                && !self
-                    .catalog
-                    .as_ref()
-                    .is_some_and(|catalog| catalog.is_empty())
-            {
+            if ranges.is_none() && !self.catalog().is_some_and(|catalog| catalog.is_empty()) {
                 state.anchor = None;
                 state.end = None;
                 state.dragging = false;
@@ -1285,7 +1314,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 } else {
                     cursor.position()
                 },
-                self.catalog.clone(),
+                self.catalog().cloned(),
             );
             read.host_clip = Some(visible);
             read.drag_pointer = (state.dragging && !press)
@@ -1386,7 +1415,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 }
                 captured = true;
             } else if command.is_some_and(|key| key.eq_ignore_ascii_case("a")) {
-                if let Some(catalog) = &self.catalog {
+                if let Some(catalog) = self.catalog() {
                     let endpoints = catalog.endpoints();
                     state.anchor = endpoints.map(|(anchor, _)| anchor);
                     state.end = endpoints.map(|(_, end)| end);
@@ -1406,12 +1435,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none()
-                && !self
-                    .catalog
-                    .as_ref()
-                    .is_some_and(|catalog| catalog.is_empty())
-            {
+            if ranges.is_none() && !self.catalog().is_some_and(|catalog| catalog.is_empty()) {
                 state.anchor = None;
                 state.end = None;
                 state.dragging = false;
@@ -1462,7 +1486,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             // in that coordinate space even when the pointer stayed still.
             let mut read = Read::with_catalog(
                 clipped_pointer(tree.state.downcast_ref::<State>().pointer, visible),
-                self.catalog.clone(),
+                self.catalog().cloned(),
             );
             read.host_clip = Some(visible);
             read.drag_pointer = tree.state.downcast_ref::<State>().pointer;
@@ -1505,10 +1529,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 end: state.end,
                 anchor_prefix: state
                     .anchor
-                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
+                    .and_then(|point| self.catalog()?.fingerprint(point)),
                 end_prefix: state
                     .end
-                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
+                    .and_then(|point| self.catalog()?.fingerprint(point)),
             };
         }
         if captured {
@@ -1771,7 +1795,7 @@ mod tests {
                 let content = scroll::transcript(inner, target, None, vec![], true, vec![]);
                 let mut catalog = Catalog::builder();
                 catalog.plain("terminal-pointer", &[0], Arc::from(current_source));
-                let element = transcript_virtualized(
+                let element = transcript_catalogued(
                     content,
                     target,
                     None,
@@ -2074,7 +2098,7 @@ mod tests {
                 let mut catalog = Catalog::builder();
                 catalog.plain("scrolled-terminal", &[0], current_source.clone());
                 let catalog = catalog.finish();
-                let mut element = transcript_virtualized(
+                let mut element = transcript_catalogued(
                     content,
                     target,
                     None,
@@ -2757,7 +2781,10 @@ mod tests {
             content: cosmic::widget::scrollable(rendered_markdown(&body, |_| {}))
                 .height(Length::Fixed(2000.0))
                 .into(),
-            catalog: Some(catalog),
+            catalog: Some(Deferred {
+                built: catalog.into(),
+                build: Box::new(|| -> Arc<Catalog> { unreachable!("a built catalog") }),
+            }),
             bookmark: None,
             context: None,
             click_clock: iced::time::Instant::now,

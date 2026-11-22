@@ -3382,7 +3382,7 @@ pub(super) struct Runtime {
     selection_bookmarks: std::cell::RefCell<
         HashMap<Option<String>, std::rc::Rc<std::cell::RefCell<selection::Bookmark>>>,
     >,
-    selection_document: std::cell::RefCell<Option<(view::SelectionKey, Arc<selection::Catalog>)>>,
+    selection_document: std::cell::RefCell<view::SelectionDocument>,
     scroll: view::Scroll,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
@@ -4620,7 +4620,7 @@ impl Runtime {
         self.scroll = view::Scroll::default();
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
-        self.selection_document.get_mut().take();
+        self.selection_document.get_mut().clear();
         self.selection_bookmarks.get_mut().clear();
         self.asked_after.clear();
         self.asked.clear();
@@ -6568,7 +6568,7 @@ impl Runtime {
         } else if self.handle().is_some()
             && (!self.cache.is_empty()
                 || !self.child_cache.is_empty()
-                || self.selection_document.borrow().is_some())
+                || !self.selection_document.borrow().is_empty())
         {
             // An unreachable daemon cannot restore its body yet. Keep that
             // last readable publication, but shed render-ready amplification.
@@ -6589,7 +6589,7 @@ impl Runtime {
         self.cache = HashMap::new();
         self.child_cache = HashMap::new();
         self.child_cache_context = None;
-        self.selection_document.get_mut().take();
+        self.selection_document.get_mut().clear();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.find_navigation.changed_document();
         self.presentation_evicted = true;
@@ -15373,7 +15373,7 @@ impl Cagents {
                         runtime.refresh_find();
                     }
                     runtime.deferred_page = None;
-                    runtime.selection_document.get_mut().take();
+                    runtime.selection_document.get_mut().clear();
                     let snapshot = runtime.snapshot.clone();
                     runtime.prepare_transcript_cache(&snapshot);
                     runtime.refresh_find();
