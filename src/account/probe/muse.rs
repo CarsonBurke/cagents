@@ -105,7 +105,7 @@ fn usage(
 
 /// Muse's data directory: `$XDG_DATA_HOME/muse`, by the base directory
 /// spec, which ignores a relative value.
-fn data_home(environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+pub(super) fn data_home(environment: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     environment("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|data| data.is_absolute())

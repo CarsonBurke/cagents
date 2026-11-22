@@ -94,6 +94,40 @@ pub fn auth_required(error: &Value) -> bool {
 /// recognises for an ACP provider.
 pub const SIGN_IN_PREFIX: &str = chat::ACP_SIGN_IN_PREFIX;
 
+/// Whether an error reply refuses the request because the login has no
+/// usage allowance. ACP has no code for it, so this reads the agent's own
+/// words for it - its message, its data's message, details, reason and code,
+/// and an HTTP status - and nothing else the data carries, such as an echoed
+/// request whose text could say anything. An allowance Muse merely has no
+/// figures for is not this.
+pub fn no_allowance(error: &Value) -> bool {
+    let data = &error["data"];
+    if [&data["reason"], &data["code"]]
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|value| value.trim().eq_ignore_ascii_case("no_allowance"))
+        || [&data["status"], &data["statusCode"]]
+            .iter()
+            .any(|status| status.as_i64() == Some(402))
+    {
+        return true;
+    }
+    [&error["message"], &data["message"], &data["details"], data]
+        .iter()
+        .filter_map(|value| value.as_str())
+        .any(|words| {
+            // Bounded: a detail can carry a whole response.
+            let words = words
+                .chars()
+                .take(2048)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            words.contains("402 payment required")
+                || words.contains("no subscription allowance")
+                || words.contains("(no_allowance)")
+        })
+}
+
 pub fn create(
     profile: &'static Profile,
     launch: &Launch,
@@ -281,16 +315,23 @@ impl Acp {
     }
 
     /// The message a reader is shown for an error reply: its own words, or
-    /// for a sign-in failure, what to do about it.
+    /// for a sign-in failure, what to do about it, or for a login with no
+    /// allowance, the agent's reason, marked as one.
     fn failure(&self, error: &Value) -> String {
-        let message = rpc::error_message(error);
         if (self.profile.sign_in_required)(error) {
             format!(
-                "{SIGN_IN_PREFIX}: sign in to {}, then try again. ({message})",
-                self.profile.label
+                "{SIGN_IN_PREFIX}: sign in to {}, then try again. ({})",
+                self.profile.label,
+                rpc::error_message(error)
+            )
+        } else if no_allowance(error) {
+            format!(
+                "{}{}",
+                chat::ACP_NO_ALLOWANCE_PREFIX,
+                rpc::error_reason(error)
             )
         } else {
-            message
+            rpc::error_message(error)
         }
     }
 

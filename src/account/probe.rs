@@ -39,6 +39,7 @@ use crate::{agent::Provider, chat::Model};
 
 mod acp;
 pub mod conversations;
+mod inputs;
 mod muse;
 mod reset_consume;
 #[cfg(test)]
@@ -143,7 +144,9 @@ pub enum Outcome {
 /// Probes `account`, sharing the answer with other windows through `cache`.
 ///
 /// Unless `force`d, a complete reading another window cached within
-/// [`STALE_AFTER`] is returned instead of probing again. Explicit refreshes
+/// [`STALE_AFTER`] is returned instead of probing again, as is one whose
+/// inputs have not changed, for a provider that reports no usage figures
+/// (see [`inputs`]). Explicit refreshes
 /// wait for an in-flight reader within [`TIMEOUT`], then take a fresh reading:
 /// a read that started before a reset cannot establish its resulting state.
 pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome {
@@ -228,9 +231,14 @@ async fn run_reading(
         })
         .await
     };
-    let (program, key, lock) = match setup {
+    let (program, key, lock, fingerprint) = match setup {
         Ok(Prepared::Done(outcome)) => return outcome,
-        Ok(Prepared::Probe { program, key, lock }) => (program, key, lock),
+        Ok(Prepared::Probe {
+            program,
+            key,
+            lock,
+            fingerprint,
+        }) => (program, key, lock, fingerprint),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
     let probed = tokio::time::timeout(
@@ -302,7 +310,7 @@ async fn run_reading(
         // post-consume refresh collide with this probe's unfinished write.
         // A cache write failure still leaves the observed answer usable.
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = cache.store(&key, entry);
+            let _ = cache.store_observed(&key, entry, fingerprint);
             if let Some(catalog) = catalog {
                 let _ = cache.store_catalog(provider, catalog);
             }
@@ -319,6 +327,9 @@ enum Prepared {
         program: PathBuf,
         key: Option<String>,
         lock: Option<crate::instance::OwnedLock>,
+        /// What the answer depends on, taken before the probe starts, so a
+        /// change during it makes the next one ask again.
+        fingerprint: Option<String>,
     },
 }
 
@@ -338,7 +349,8 @@ fn prepare(
     // An account whose home was never created was never set up. It is not a
     // login to prompt for - most people have one of the two CLIs, not both -
     // so it reports nothing rather than a "Sign in" chip.
-    if !account.resolved_home().is_some_and(|home| home.is_dir()) {
+    let set_up = account.resolved_home().is_some_and(|home| home.is_dir());
+    if !set_up && !account.provider.speaks_acp() {
         return unavailable(format!(
             "{} has not been set up",
             cli_name(account.provider)
@@ -347,12 +359,28 @@ fn prepare(
     let Some(program) = find_executable(account.provider.executable(), search_path) else {
         return unavailable(format!("{} is not installed", cli_name(account.provider)));
     };
+    // An ACP agent writes that home the first time it runs, so one
+    // installed without it has never been signed in, which is what the
+    // reader needs to do; there is nothing to start it for. A refresh the
+    // reader asked for, or the check after a sign-in, asks the agent all
+    // the same, in case it signed in without writing there.
+    if !set_up && reuse != Reuse::Never {
+        return Prepared::Done(answered(
+            None,
+            UsageSnapshot::state(
+                UsageStatus::NeedsLogin,
+                format!("Not signed in to {}", cli_name(account.provider)),
+                now,
+            ),
+        ));
+    }
     let key = account.cache_key();
     let Some(cache) = cache else {
         return Prepared::Probe {
             program,
             key,
             lock: None,
+            fingerprint: None,
         };
     };
     let lock = match cache.try_probe_lock(&account.lock_name()) {
@@ -375,7 +403,25 @@ fn prepare(
         snapshot.source = UsageSource::Cache;
         return Prepared::Done(answered(entry.identity, snapshot));
     }
-    Prepared::Probe { program, key, lock }
+    let fingerprint = inputs::fingerprint(account, &program, &|name| std::env::var(name).ok());
+    if reuse != Reuse::Never
+        && let (Some(key), Some(fingerprint)) = (&key, &fingerprint)
+        && let Some(entry) = cache.unchanged(key, fingerprint, now, inputs::UNCHANGED_FOR)
+        && inputs::vouches_for(account.provider, entry.snapshot.status)
+    {
+        // Nothing the answer depends on has changed, which is as good as
+        // asking again now, without starting the CLI.
+        let mut snapshot = entry.snapshot;
+        snapshot.source = UsageSource::Cache;
+        snapshot.observed_at = now;
+        return Prepared::Done(answered(entry.identity, snapshot));
+    }
+    Prepared::Probe {
+        program,
+        key,
+        lock,
+        fingerprint,
+    }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
@@ -2826,6 +2872,112 @@ cat >/dev/null
         // Asking only who is signed in, any recent answer serves.
         assert!(answers_from_cache(partial, Reuse::Login));
         assert!(answers_from_cache(None, Reuse::Login));
+    }
+
+    /// An ACP account's answer stands, without starting its CLI, while
+    /// nothing it depends on changed and it is young enough to trust; an
+    /// explicit refresh, a changed sign-in record or an answer it does not
+    /// vouch for is probed. An agent installed but never run is signed out
+    /// without being started.
+    #[test]
+    fn an_acp_account_is_probed_only_when_its_answer_can_have_changed() {
+        const CHILD: &str = "CAGENTS_ACP_PREPARE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            // The child reads its homes from these, never the reader's own.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "account::probe::tests::an_acp_account_is_probed_only_when_its_answer_can_have_changed",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HOME", root)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for program in ["muse", "agy"] {
+            std::fs::write(bin.join(program), "#!/bin/sh\nexit 99\n").unwrap();
+            make_executable(&bin.join(program));
+        }
+        std::fs::create_dir_all(root.join("config/muse")).unwrap();
+        std::fs::write(root.join("config/muse/auth.json"), b"{}").unwrap();
+        let cache = Cache::at(root.join("cache"));
+        let muse = Account::system(Provider::Muse);
+        let key = muse.cache_key().unwrap();
+        let path = Some(bin.as_os_str());
+        let now = crate::chat::now_ms().unwrap();
+        // Answered from the cache, as opposed to probed.
+        let reused = |reuse| match prepare(&muse, Some(&cache), reuse, now, path) {
+            Prepared::Done(Outcome::Answered { snapshot, .. }) => {
+                assert_eq!(snapshot.source, UsageSource::Cache);
+                assert_eq!(snapshot.observed_at, now);
+                Some(snapshot.status)
+            }
+            Prepared::Done(_) => panic!("neither answered nor probed"),
+            Prepared::Probe { .. } => None,
+        };
+        let Prepared::Probe { fingerprint, .. } =
+            prepare(&muse, Some(&cache), Reuse::Reading, now, path)
+        else {
+            panic!("a first look did not probe");
+        };
+        let fingerprint = fingerprint.expect("Muse's inputs are read");
+        // Older than another window's answer would be shared for.
+        let observed_at = now - STALE_AFTER - 1;
+        let store = |status| {
+            let mut snapshot = UsageSnapshot::state(status, "probed", observed_at);
+            snapshot.source = UsageSource::Probe;
+            let entry = Entry {
+                identity: None,
+                snapshot,
+                inventory_observed_at: Some(observed_at),
+            };
+            cache
+                .store_observed(&key, entry, Some(fingerprint.clone()))
+                .unwrap();
+        };
+        store(UsageStatus::Ok);
+        assert_eq!(reused(Reuse::Reading), Some(UsageStatus::Ok));
+        assert_eq!(reused(Reuse::Never), None);
+        store(UsageStatus::NeedsLogin);
+        assert_eq!(reused(Reuse::Reading), Some(UsageStatus::NeedsLogin));
+        // No allowance changes with a subscription bought elsewhere.
+        store(UsageStatus::Limited);
+        assert_eq!(reused(Reuse::Reading), None);
+        store(UsageStatus::Ok);
+        std::fs::write(
+            root.join("config/muse/auth.json"),
+            b"{\"signed\": \"again\"}",
+        )
+        .unwrap();
+        assert_eq!(reused(Reuse::Reading), None);
+
+        // Antigravity is installed, but has never run: no ~/.gemini.
+        let agy = Account::system(Provider::Antigravity);
+        match prepare(&agy, Some(&cache), Reuse::Reading, now, path) {
+            Prepared::Done(Outcome::Answered { snapshot, .. }) => {
+                assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+                assert_eq!(
+                    snapshot.detail.as_deref(),
+                    Some("Not signed in to Antigravity")
+                );
+            }
+            _ => panic!("an Antigravity that never ran was started"),
+        }
+        // The reader asking, or a sign-in's check, asks the agent anyway.
+        assert!(matches!(
+            prepare(&agy, Some(&cache), Reuse::Never, now, path),
+            Prepared::Probe { .. }
+        ));
     }
 
     /// The system Claude login's two records, as the probe reads them: the

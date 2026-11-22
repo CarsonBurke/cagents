@@ -1101,6 +1101,86 @@ fn being_signed_out_is_a_recognisable_sign_in_failure() {
 }
 
 #[test]
+fn a_turn_refused_for_no_allowance_keeps_the_provider_s_reason() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let refused = |acp: &mut Acp, error: Value| {
+        let request = prompt(acp, "allowance");
+        let step = acp
+            .receive(json!({"jsonrpc": "2.0", "id": request["id"], "error": error}))
+            .unwrap();
+        assert_eq!(finished(&step), Some(Kind::Failed));
+        step.events
+            .iter()
+            .find_map(|event| match event {
+                Event::Error {
+                    message,
+                    fatal: false,
+                } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    // The reason is the most specific words the reply has.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error", "data": {"message":
+            "model request failed: 402 Payment Required: this login has no subscription allowance"}}),
+    );
+    assert_eq!(
+        message,
+        format!(
+            "{}model request failed: 402 Payment Required: this login has no subscription allowance",
+            chat::ACP_NO_ALLOWANCE_PREFIX
+        )
+    );
+    let provider = crate::agent::Provider::Muse;
+    assert_eq!(
+        chat::no_allowance_reason(provider, &message),
+        Some(
+            "model request failed: 402 Payment Required: this login has no subscription allowance"
+        )
+    );
+    assert!(!chat::requires_sign_in(provider, &message));
+    // Muse's reason code, wherever the reply puts it.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "No subscription allowance (no_allowance)",
+            "data": {"reason": "no_allowance"}}),
+    );
+    assert_eq!(
+        chat::no_allowance_reason(provider, &message),
+        Some("No subscription allowance (no_allowance)")
+    );
+    // An allowance Muse has no figures for is not a refusal for one.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error", "data": {"message":
+            "subscription allowance unavailable: the server sent no usage data"}}),
+    );
+    assert_eq!(chat::no_allowance_reason(provider, &message), None);
+    // Words the agent only echoes, such as a request it failed to send,
+    // are not its reason.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error", "data": {
+            "message": "the tool call failed",
+            "request": {"prompt": "why does the API answer 402 Payment Required?"}}}),
+    );
+    assert_eq!(chat::no_allowance_reason(provider, &message), None);
+    // An HTTP status the agent reports is its own.
+    let message = refused(
+        &mut acp,
+        json!({"code": -32603, "message": "Internal error",
+            "data": {"status": 402, "message": "model request failed"}}),
+    );
+    assert_eq!(
+        chat::no_allowance_reason(provider, &message),
+        Some("model request failed")
+    );
+}
+
+#[test]
 fn file_terminal_and_unknown_requests_are_refused_and_unknown_frames_ignored() {
     let mut acp = adapter(&[], None);
     let session = ready(&mut acp);

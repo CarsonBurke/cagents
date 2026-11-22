@@ -219,6 +219,9 @@ pub(super) struct Incident {
     pub summary: String,
     pub guidance: &'static str,
     pub kind: Option<FailureKind>,
+    /// The provider's own reason, shown beside the summary (see
+    /// [`chat::failure::Failure::reason`]).
+    pub reason: Option<String>,
     /// Whether the summary and guidance are the whole original, as with a
     /// [`DeliveryOutcome`], so technical details would only repeat them.
     pub explained: bool,
@@ -237,6 +240,7 @@ struct Metadata {
     summary: String,
     guidance: &'static str,
     kind: Option<FailureKind>,
+    reason: Option<String>,
     explained: bool,
 }
 
@@ -300,6 +304,20 @@ pub(super) fn diagnostic_item(provider: Provider, item: &chat::Item) -> bool {
 
 fn fallback_summary(text: &str) -> String {
     Runtime::short_description(chat::failure::headline(text), 160)
+}
+
+/// A provider's reason as one bounded line beside the summary; the whole
+/// of it stays in the details.
+fn reason_line(reason: &str) -> String {
+    const LIMIT: usize = 280;
+    let line = reason.lines().next().unwrap_or_default().trim();
+    let mut chars = line.chars();
+    let mut bounded: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_some() {
+        bounded.pop();
+        bounded.push('…');
+    }
+    bounded
 }
 
 /// What an original says beyond the summary the notice already shows: a
@@ -474,7 +492,7 @@ impl State {
         if text.trim().is_empty() {
             return None;
         }
-        let (key, summary, guidance, kind, explained) =
+        let (key, summary, guidance, kind, reason, explained) =
             if chat::failure::account_switch_refusal_reason(text).is_some() {
                 // Before any provider wording: the daemon's reason after the
                 // summary is not a provider's report, and is kept for Details.
@@ -482,6 +500,7 @@ impl State {
                     diagnostic_key(text),
                     chat::failure::ACCOUNT_SWITCH_REFUSED.to_owned(),
                     chat::failure::ACCOUNT_SWITCH_REFUSED_ACTION,
+                    None,
                     None,
                     false,
                 )
@@ -491,6 +510,7 @@ impl State {
                     failure.summary,
                     failure.action,
                     Some(failure.kind),
+                    failure.reason.map(reason_line),
                     false,
                 )
             } else if let Some(outcome) = DeliveryOutcome::parse(text) {
@@ -500,6 +520,7 @@ impl State {
                     diagnostic_key(text),
                     outcome.summary.to_owned(),
                     outcome.action,
+                    None,
                     None,
                     true,
                 )
@@ -511,6 +532,7 @@ impl State {
                     fallback_summary(text),
                     "Review the details before trying again.",
                     None,
+                    None,
                     false,
                 )
             };
@@ -519,6 +541,7 @@ impl State {
             summary,
             guidance,
             kind,
+            reason,
             explained,
         };
         Some(meta)
@@ -556,6 +579,7 @@ impl State {
                 summary: meta.summary,
                 guidance: meta.guidance,
                 kind: meta.kind,
+                reason: meta.reason,
                 explained: meta.explained,
                 sources: vec![source],
                 reset_sources: Default::default(),
@@ -657,6 +681,27 @@ impl State {
             .iter()
             .filter(|(_, marker)| marker.active)
             .map(|(key, marker)| (key.clone(), marker.carrier.clone()))
+            .collect::<Vec<_>>();
+        (!episode.is_empty()).then_some(episode)
+    }
+
+    /// The current incidents a provider that reports no usage limits tells
+    /// the account's chip about: a sign-in it needs, or an allowance the
+    /// login lacks.
+    fn active_account_attention(&self) -> Option<LimitEpisode> {
+        let episode = self
+            .incidents
+            .iter()
+            .filter(|incident| {
+                matches!(
+                    incident.kind,
+                    Some(FailureKind::Authentication | FailureKind::NoAllowance)
+                ) && incident
+                    .sources
+                    .iter()
+                    .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+            })
+            .map(|incident| (incident.key.clone(), None))
             .collect::<Vec<_>>();
         (!episode.is_empty()).then_some(episode)
     }
@@ -1293,16 +1338,22 @@ impl Runtime {
         self.refresh_failure_previews();
     }
 
+    /// Asks for the account to be read again when the conversation newly
+    /// reports something the account's chip should show: a usage limit, or
+    /// for a provider that reports no usage, a sign-in it needs or an
+    /// allowance it lacks.
     pub(super) fn observe_visible_limit(&mut self) {
-        if !self.visible.load(Ordering::Relaxed)
-            || !matches!(
-                self.session.launch.provider,
-                Provider::Claude | Provider::Codex
-            )
-        {
+        if !self.visible.load(Ordering::Relaxed) {
             return;
         }
-        let episode = self.failure_ui.active_limit_episode();
+        let provider = self.session.launch.provider;
+        let episode = if matches!(provider, Provider::Claude | Provider::Codex) {
+            self.failure_ui.active_limit_episode()
+        } else if provider.speaks_acp() {
+            self.failure_ui.active_account_attention()
+        } else {
+            return;
+        };
         if episode.is_some() && episode != self.visible_limit_episode {
             self.limit_refresh_pending = true;
         }
@@ -1581,6 +1632,9 @@ impl Runtime {
             .align_y(Alignment::Start)
             .into(),
         ];
+        if let Some(reason) = incident.reason.as_ref().filter(|_| blocked_start.is_none()) {
+            rows.push(design::caption(reason.clone()).width(Length::Fill).into());
+        }
         if !cleared && blocked_start.is_none() {
             rows.push(
                 design::caption(reset_controls.as_ref().map_or_else(
@@ -1589,6 +1643,13 @@ impl Runtime {
                 ))
                 .width(Length::Fill)
                 .into(),
+            );
+        }
+        if incident.kind == Some(FailureKind::NoAllowance) && blocked_start.is_none() {
+            rows.push(
+                crate::ui_controls::button::secondary("Open accounts")
+                    .on_press(Message::AccountUi(crate::app::account_ui::Action::OpenPane))
+                    .into(),
             );
         }
         if incident.kind == Some(FailureKind::AccountLimit)
@@ -1717,6 +1778,20 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider's reason stays one readable line beside the summary.
+    #[test]
+    fn a_provider_s_reason_is_one_bounded_line() {
+        assert_eq!(
+            reason_line("  402 Payment Required\nrequest id 7 "),
+            "402 Payment Required"
+        );
+        let long = "x".repeat(400);
+        let line = reason_line(&long);
+        assert_eq!(line.chars().count(), 280);
+        assert!(line.ends_with('…'));
+        assert_eq!(reason_line(&"y".repeat(280)), "y".repeat(280));
+    }
 
     #[test]
     fn details_leave_out_the_summary_the_notice_already_shows() {
@@ -2018,6 +2093,7 @@ mod tests {
             summary: "The command failed".into(),
             guidance: "Review the details before trying again.",
             kind: None,
+            reason: None,
             explained: false,
             sources: Vec::new(),
             reset_sources: Default::default(),

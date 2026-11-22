@@ -1904,6 +1904,7 @@ impl Runtime {
         let failure_label = active.as_ref().and_then(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
             chat::failure::FailureKind::Authentication => Some("Sign-in required"),
+            chat::failure::FailureKind::NoAllowance => Some("No usage allowance"),
             chat::failure::FailureKind::Capacity => Some("Provider at capacity"),
             chat::failure::FailureKind::Connection => Some("Connection interrupted"),
             chat::failure::FailureKind::Interrupted => Some("Interrupted"),

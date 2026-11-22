@@ -1923,6 +1923,15 @@ fn chip_with_window(
 ) -> Chip {
     let Some(snapshot) = &account.snapshot else {
         return match &account.failure {
+            // Whether an ACP agent is signed in is not known, which its
+            // popover offers to settle with Sign in.
+            Some(failure) if !account::reports_usage_limits(account.account.provider) => Chip {
+                text: "Check failed".into(),
+                usage_fraction: None,
+                tone: ChipTone::Stale,
+                essential: false,
+                tooltip: format!("cagents could not check {name}: {failure}"),
+            },
             Some(failure) => Chip {
                 text: "Unavailable".into(),
                 usage_fraction: None,
@@ -1964,7 +1973,14 @@ fn chip_with_window(
                 || (snapshot.status == UsageStatus::Limited && window_of(snapshot).is_none()) =>
         {
             Chip {
-                text: "Limited".into(),
+                // A provider that reports no limits is limited only by a
+                // login with no allowance at all, not one that will reset.
+                text: if account::reports_usage_limits(account.account.provider) {
+                    "Limited"
+                } else {
+                    "No allowance"
+                }
+                .into(),
                 usage_fraction: None,
                 tone: if is_stale(snapshot, now) || account.failure.is_some() {
                     ChipTone::Stale
@@ -3037,15 +3053,14 @@ impl Cagents {
 
     /// New classified rejections invalidate partial live reports as evidence
     /// of reset inventory. One queued forced read survives an older probe.
+    /// For a provider that reports no usage, a conversation's report that its
+    /// sign-in or allowance needs attention is what the chip should show.
     pub(super) fn account_limit_reported(
         &mut self,
         provider: Provider,
         recipe: &LaunchRecipe,
     ) -> Task<Message> {
-        if !matches!(provider, Provider::Claude | Provider::Codex) {
-            return Task::none();
-        }
-        let Some(id) = self.chat_account(provider, recipe) else {
+        let Some(id) = self.reporting_account(provider, recipe) else {
             return Task::none();
         };
         let now = now_ms();
@@ -3057,6 +3072,20 @@ impl Cagents {
         }
         self.probe_account(&id, Trigger::Limit, now)
             .unwrap_or_else(Task::none)
+    }
+
+    /// The account a conversation's rejection is reported against: the one
+    /// it runs on, or for an ACP provider, whose conversations all run on
+    /// its own sign-in, the system account.
+    fn reporting_account(&self, provider: Provider, recipe: &LaunchRecipe) -> Option<AccountId> {
+        match provider {
+            Provider::Claude | Provider::Codex => self.chat_account(provider, recipe),
+            Provider::Antigravity | Provider::Muse => {
+                let id = Account::system(provider).id();
+                self.account_ui.account(&id).is_some().then_some(id)
+            }
+            Provider::Omp => None,
+        }
     }
 
     /// Account discovery can bind a previously unknown launch home. Keep the
@@ -3074,7 +3103,7 @@ impl Cagents {
                 (runtime.limit_refresh_pending
                     && runtime.is_visible()
                     && self
-                        .chat_account(
+                        .reporting_account(
                             runtime.session.launch.provider,
                             &runtime.session.launch.recipe,
                         )
@@ -6692,9 +6721,34 @@ impl Cagents {
                     .into(),
             );
         }
+        let sign_in = |label: &'static str| {
+            crate::ui_controls::button::primary(label)
+                .on_press_maybe(
+                    (!self.account_sign_in_running(&account.account))
+                        .then(|| Message::AccountUi(Action::SignIn(account.id.clone()))),
+                )
+                .into()
+        };
         match &account.snapshot {
             None if account.failure.is_none() => {
                 rows.push(design::caption("Checking usage…").into());
+            }
+            // No check of an ACP agent's sign-in has answered, so whether it
+            // is signed in is unknown, and signing in is a way forward
+            // whatever the failure was - except an agent that is not there.
+            None if account.account.provider.speaks_acp()
+                && !account.account.is_brokered()
+                && self.account_ui.installed.get(&account.account.provider) != Some(&false) =>
+            {
+                rows.push(
+                    design::caption(format!(
+                        "cagents could not check whether {} is signed in. Sign in if it is not.",
+                        account.name()
+                    ))
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                    .into(),
+                );
+                rows.push(sign_in("Sign in"));
             }
             None => {}
             Some(snapshot) => match snapshot.status {
@@ -6712,15 +6766,7 @@ impl Cagents {
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                     );
-                    rows.push(
-                        crate::ui_controls::button::primary("Sign in")
-                            .on_press_maybe(
-                                (!self.account_sign_in_running(&account.account)).then(|| {
-                                    Message::AccountUi(Action::SignIn(account.id.clone()))
-                                }),
-                            )
-                            .into(),
-                    );
+                    rows.push(sign_in("Sign in"));
                 }
                 UsageStatus::Unavailable => {
                     rows.push(
@@ -6756,10 +6802,24 @@ impl Cagents {
                         )
                     }));
                     if snapshot.windows.is_empty() {
-                        rows.push(
-                            design::caption("No usage limits are reported for this account.")
-                                .into(),
-                        );
+                        rows.push(if account::reports_usage_limits(account.account.provider) {
+                            design::caption("No usage limits are reported for this account.").into()
+                        } else {
+                            // It has limits all the same; what is known is
+                            // what its own check said, such as a login with
+                            // no allowance at all.
+                            let limited = snapshot.status == UsageStatus::Limited;
+                            design::caption(snapshot.detail.clone().unwrap_or_else(|| {
+                                format!("{} does not report its usage limits.", account.name())
+                            }))
+                            .class(if limited {
+                                cosmic::theme::Text::Custom(design::warning_text)
+                            } else {
+                                cosmic::theme::Text::Default
+                            })
+                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                            .into()
+                        });
                     }
                     if let Some(credits) = &snapshot.credits {
                         rows.push(
@@ -8287,6 +8347,25 @@ mod tests {
             AccountUsageDisplay::Left,
         );
         assert_eq!(unlimited.text, "No limits");
+
+        // As Muse's own account shows it: a login with no allowance at all,
+        // not a limit that will reset, and a check that failed before any
+        // answer, which its popover offers Sign in for.
+        let mut muse = AccountState::new(Account::system(Provider::Muse));
+        muse.present = true;
+        let mut limited = snapshot(Vec::new(), NOW);
+        limited.status = UsageStatus::Limited;
+        muse.snapshot = Some(limited);
+        assert_eq!(
+            chip(&muse, "Muse", NOW, AccountUsageDisplay::Left).text,
+            "No allowance"
+        );
+        muse.snapshot = None;
+        muse.failure = Some("Muse did not answer within 30 seconds".into());
+        assert_eq!(
+            chip(&muse, "Muse", NOW, AccountUsageDisplay::Left).text,
+            "Check failed"
+        );
     }
 
     #[test]

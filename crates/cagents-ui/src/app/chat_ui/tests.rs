@@ -23858,3 +23858,76 @@ fn a_new_thread_skips_a_turned_off_provider() {
     app.account_ui.set_turned_off(&app.settings);
     assert_eq!(app.preferred_chat_provider(), Provider::Antigravity);
 }
+
+/// An ACP conversation's current sign-in or no-allowance failure has the
+/// account's status chip read again, as a usage limit does for Claude and
+/// Codex; a notice from history alone does not.
+#[test]
+fn an_acp_chat_s_sign_in_or_allowance_failure_refreshes_its_account() {
+    let failures = [
+        (
+            Provider::Antigravity,
+            format!(
+                "{}: sign in to Antigravity, then try again. (Authentication required)",
+                chat::ACP_SIGN_IN_PREFIX
+            ),
+            chat::failure::FailureKind::Authentication,
+        ),
+        (
+            Provider::Muse,
+            format!(
+                "{}model request failed: 402 Payment Required",
+                chat::ACP_NO_ALLOWANCE_PREFIX
+            ),
+            chat::failure::FailureKind::NoAllowance,
+        ),
+    ];
+    for (provider, raw, kind) in failures {
+        for active in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.account_ui
+                .set_registry(crate::account::registry::Registry::default());
+            app.refresh_ui.focused = true;
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(1_600.0),
+            }));
+            let (card, target) = starting_chat_for_provider(&mut app, provider);
+            let handle = fixture_handle(&app, card, Some("fixture-thread"));
+            let mut snapshot = (*handle.snapshot()).clone();
+            if active {
+                snapshot.error = Some(raw.clone());
+            } else {
+                // The same failure, but only as an earlier turn's notice.
+                snapshot.items.push(Arc::new(chat::Item {
+                    id: "historical-error".into(),
+                    role: chat::Role::System,
+                    at: None,
+                    started_at: None,
+                    content: text(&raw),
+                }));
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            answer_start(&mut app, target, Ok(handle));
+            let runtime = chat_runtime(&app, card);
+            if active {
+                assert!(
+                    runtime
+                        .failure_ui
+                        .incidents
+                        .iter()
+                        .any(|incident| incident.kind == Some(kind)),
+                    "{provider:?}"
+                );
+            }
+            let id = crate::account::Account::system(provider).id();
+            assert_eq!(
+                app.account_ui.pending_probe_is_forced_for_test(&id),
+                active,
+                "{provider:?} active={active}"
+            );
+            assert!(!chat_runtime(&app, card).limit_refresh_pending);
+        }
+    }
+}
