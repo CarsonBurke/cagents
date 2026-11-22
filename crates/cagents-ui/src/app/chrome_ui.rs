@@ -3137,7 +3137,7 @@ impl Cagents {
     }
 
     fn attention_control(&self) -> Element<'_, Message> {
-        let control = crate::ui_controls::icon_button(Icon::NotificationSettings, "Attention")
+        let control = crate::ui_controls::icon_button(Icon::Inbox, "Attention")
             .id(widget::Id::new("attention.control"))
             .selected(self.attention_is_open())
             .on_press_maybe(
@@ -3983,7 +3983,7 @@ impl Cagents {
                 ),
                 widget::menu::Item::Button(
                     "Clone pane".into(),
-                    Some(Icon::Duplicate.handle()),
+                    Some(Icon::Copy.handle()),
                     PaneMenu(id, PaneMenuCommand::Clone),
                 ),
                 widget::menu::Item::Divider,

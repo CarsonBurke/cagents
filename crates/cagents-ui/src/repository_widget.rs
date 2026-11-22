@@ -11101,7 +11101,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
                 basis: DiffBasis::IndexToWorktree,
             }))
             .into(),
-        icon_button(Icon::Select, "Staged changes")
+        icon_button(Icon::Check, "Staged changes")
             .selected(staged && selected == Some(BasisChoice::Staged))
             .on_press_maybe(staged.then(|| RepositoryAction::ApplyDiffBasis {
                 card,

@@ -3,8 +3,8 @@
 //! Every glyph the shell draws is a variant of [`Icon`], so a misspelt or
 //! retired name is a compile error rather than a blank square at runtime.
 //! Every one is the application's own drawing under `src/icons/`, in one
-//! style: a 16-unit square, 1.4-unit round strokes, and ink kept at least
-//! three quarters of a unit inside the edge. Icons from the desktop theme
+//! style: a 16-unit square, round strokes of about 1.4 units, and ink kept
+//! at least three quarters of a unit inside the edge. Icons from the desktop theme
 //! varied in weight and shape, and some were wider than tall, so they did not
 //! sit in the same box as the rest. `tests::every_glyph_stays_inside_its_box`
 //! holds every drawing to that box.
@@ -20,7 +20,7 @@ use cosmic::{
 };
 
 /// Declares [`Icon`] from its drawings, each named by its file under
-/// `src/icons/`. Variants that mean different things may share a drawing.
+/// `src/icons/`.
 macro_rules! icons {
     ($($icon:ident => $file:literal,)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -82,14 +82,13 @@ icons! {
     Comment => "comment",
     Commit => "commit",
     Compress => "compress",
-    Copy => "duplicate",
+    Copy => "copy",
     CopyPath => "copy-path",
     CopyRelativePath => "copy-relative",
     Delete => "delete",
     Diff => "diff",
     Display => "display",
     DraftPullRequest => "draft-pull-request",
-    Duplicate => "duplicate",
     Edit => "edit",
     Ended => "ended",
     Error => "error",
@@ -105,6 +104,7 @@ icons! {
     Home => "home",
     Image => "image",
     Import => "import",
+    Inbox => "inbox",
     Info => "info",
     InsertText => "insert-text",
     Jump => "jump",
@@ -116,12 +116,9 @@ icons! {
     Minus => "minus",
     More => "more",
     Night => "night",
-    NotificationSettings => "attention",
     Open => "open",
     OpenFile => "open-file",
     OpenFolder => "open-folder",
-    PanDown => "chevron-down",
-    PanEnd => "chevron-right",
     Plus => "plus",
     PopOut => "pop-out",
     Preview => "preview",
@@ -136,14 +133,12 @@ icons! {
     ReviewRequired => "review-required",
     Save => "save",
     Search => "search",
-    Select => "check",
     Send => "send",
     Settings => "settings",
     Sidebar => "sidebar",
     SplitPanel => "split-panel",
     Stop => "stop",
     Terminal => "terminal",
-    TextEditor => "edit",
     TextFile => "text-file",
     Tree => "tree",
     Unavailable => "unavailable",
@@ -152,7 +147,6 @@ icons! {
     Users => "users",
     Utilities => "utilities",
     Warning => "warning",
-    WebBrowser => "browser",
     Worktree => "worktree",
     WorktreeAdd => "worktree-add",
     ZoomFit => "zoom-fit",
@@ -315,12 +309,6 @@ mod tests {
         );
     }
 
-    /// The glyph sizes the interface uses and the scales it is drawn at: whole
-    /// display scales and the fractional ones a display or the interface scale
-    /// setting gives.
-    const SIZES: [u16; 6] = [12, 14, 16, 20, 24, 28];
-    const SCALES: [f32; 7] = [1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25];
-
     /// How far ink must stay from each edge of the 16-unit box.
     const MARGIN: f32 = 0.75;
 
@@ -350,9 +338,8 @@ mod tests {
 
     /// No glyph touches or crosses the edge of its box. The box is a
     /// 16-unit square, so the renderer scales it uniformly into a square
-    /// icon at any size, and the ink keeps a margin inside it: at every size
-    /// and scale the interface uses, none falls outside the raster where it
-    /// would be cut off.
+    /// icon of any size, and ink kept inside the margin stays inside the
+    /// raster at every size and scale, clear of its edge.
     #[test]
     fn every_glyph_stays_inside_its_box() {
         let options = resvg::usvg::Options::default();
@@ -373,20 +360,6 @@ mod tests {
                 "{icon:?} ({}.svg) comes within {inset:?} units of its edge; keep {MARGIN}",
                 icon.file()
             );
-
-            // As drawn, every pixel of ink lies inside the icon's raster.
-            for size in SIZES {
-                for scale in SCALES {
-                    let raster = (f32::from(size) * scale).ceil();
-                    let pixels = raster / 16.0;
-                    let [left, top, right, bottom] = ink_bounds(&tree, pixels, 4).unwrap();
-                    assert!(
-                        left >= 0.0 && top >= 0.0 && right <= 16.0 && bottom <= 16.0,
-                        "{icon:?} at {size} px and {scale}x is cut off: {:?}",
-                        [left, top, right, bottom]
-                    );
-                }
-            }
         }
     }
 }

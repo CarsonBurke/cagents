@@ -425,7 +425,7 @@ impl Runtime {
         // The strip's marks say each child's state; the chooser's name keeps
         // the totals for children scrolled past the strip's edge.
         let trigger = widget::button::custom(crate::ui_controls::passive_icon(
-            Icon::PanDown,
+            Icon::ChevronDown,
             design::COMPACT_ICON_SIZE,
         ))
         .name(format!(
@@ -560,7 +560,11 @@ impl Runtime {
                     .spacing(space::XS)
                     .into(),
                     crate::ui_controls::passive_icon(
-                        if chosen { Icon::Check } else { Icon::PanEnd },
+                        if chosen {
+                            Icon::Check
+                        } else {
+                            Icon::ChevronRight
+                        },
                         design::COMPACT_ICON_SIZE,
                     ),
                 ])

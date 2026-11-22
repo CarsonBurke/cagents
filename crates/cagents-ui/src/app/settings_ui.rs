@@ -132,7 +132,7 @@ fn settings_choice<'a>(
         .into_iter()
         .map(|(choice, value, selected)| {
             let marker: Element<'a, Message> = if selected {
-                settings_icon(Icon::Select).into()
+                settings_icon(Icon::Check).into()
             } else {
                 iced::widget::Space::new().width(16).height(16).into()
             };
@@ -1010,15 +1010,15 @@ fn settings_category_controls<'a>(
 
 fn category_icon(category: SettingsCategory) -> Icon {
     match category {
-        SettingsCategory::Notifications => Icon::NotificationSettings,
+        SettingsCategory::Notifications => Icon::Attention,
         SettingsCategory::General => Icon::Settings,
         SettingsCategory::Appearance => Icon::Display,
         SettingsCategory::Terminal => Icon::Terminal,
-        SettingsCategory::Links => Icon::WebBrowser,
+        SettingsCategory::Links => Icon::Browser,
         SettingsCategory::Keyboard => Icon::Keyboard,
         SettingsCategory::NativeChat => Icon::Chat,
         SettingsCategory::Inspector => Icon::SplitPanel,
-        SettingsCategory::Editor => Icon::TextEditor,
+        SettingsCategory::Editor => Icon::Edit,
         SettingsCategory::Accounts => Icon::Users,
         SettingsCategory::About => Icon::Info,
     }

@@ -9765,7 +9765,7 @@ fn file_commands(
 ) -> impl Iterator<Item = (&'static str, Icon, FileCommand)> {
     [
         ("Rename…", Icon::Rename, FileCommand::Rename),
-        ("Duplicate file…", Icon::Duplicate, FileCommand::CopyFile),
+        ("Duplicate file…", Icon::Copy, FileCommand::CopyFile),
         ("Copy path", Icon::CopyPath, FileCommand::CopyPath),
         (
             "Copy relative path",

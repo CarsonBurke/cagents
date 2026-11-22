@@ -1101,7 +1101,7 @@ impl State {
             {
                 items.push(
                     popover_item(
-                        Icon::WebBrowser.handle(),
+                        Icon::Browser.handle(),
                         "Open Linear issue",
                         ticket.identifier.clone().unwrap_or_default(),
                         Action::OpenUrl(url.clone()),
