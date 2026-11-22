@@ -182,6 +182,16 @@ pub(super) struct TerminalHandoff {
 pub(super) const ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(300);
 
 impl TerminalHandoff {
+    /// The transcripts the conversation and its replacement terminal carry.
+    pub(super) fn transcript_paths(&self) -> impl Iterator<Item = &std::path::PathBuf> {
+        self.source
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.transcript_path.as_ref())
+            .into_iter()
+            .chain(self.terminal.transcript_path.as_ref())
+    }
+
     /// Where both sides of the handoff run.
     pub(super) fn working_directories(&self) -> [&std::path::Path; 2] {
         [

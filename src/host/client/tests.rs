@@ -4045,6 +4045,86 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     }
 }
 
+/// #3388: a terminal's worker creates its transcript while the spawn is still
+/// reserved, before the inventory lists it, and a terminal returned from a
+/// conversation writes its predecessor's transcript. The resident census names
+/// both, so a window keeps those files.
+#[test]
+fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
+    use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(crate::host::state::HostLock::new(
+        super::super::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("resident-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        }),
+    ));
+    host.lock().unwrap().register_client(1);
+    // A spawn still reserved, whose worker is about to open a transcript
+    // named for another terminal.
+    let spawning = TerminalId::new();
+    let opening = directory.path().join(format!("{}.log", TerminalId::new()));
+    host.lock()
+        .unwrap()
+        .reserve_spawn_writing(spawning, &opening)
+        .unwrap();
+    let inherited = directory.path().join(format!("{}.log", TerminalId::new()));
+    let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+    let returned = crate::model::TerminalSession {
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        id: TerminalId::new(),
+        launch: recipe.clone(),
+        transcript_path: Some(inherited.clone()),
+        resume_hint: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let (response, _, _) = process_request(
+        &host,
+        1,
+        ClientRequest::Spawn {
+            session: returned.clone(),
+            options: crate::terminal_ipc::TerminalSpawnOptions::default(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, ServerResponse::Spawned { .. }));
+
+    let (response, _, _) = process_request(&host, 1, ClientRequest::ListResidentTerminals).unwrap();
+
+    let mut terminals = vec![spawning, returned.id];
+    terminals.sort();
+    let mut transcripts = vec![opening, inherited];
+    transcripts.sort();
+    assert_eq!(
+        response,
+        ServerResponse::ResidentTerminals {
+            terminals,
+            transcripts,
+        }
+    );
+    let listed: Vec<_> = host
+        .lock()
+        .unwrap()
+        .list(1)
+        .into_iter()
+        .map(|terminal| terminal.session.id)
+        .collect();
+    assert_eq!(listed, [returned.id], "the inventory omits the spawn");
+    host.lock()
+        .unwrap()
+        .handle(1, returned.id)
+        .unwrap()
+        .shutdown()
+        .unwrap();
+}
+
 #[test]
 fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
