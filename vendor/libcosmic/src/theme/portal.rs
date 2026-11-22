@@ -20,17 +20,7 @@ pub fn desktop_settings() -> iced_futures::Subscription<Desktop> {
                 loop {
                     let Ok(settings) = ashpd::desktop::settings::Settings::new().await else {
                         error!("Failed to create the settings proxy");
-                        #[cfg(feature = "tokio")]
-                        ::tokio::time::sleep(::tokio::time::Duration::from_secs(
-                            2_u64.pow(attempts),
-                        ))
-                        .await;
-                        #[cfg(not(feature = "tokio"))]
-                        {
-                            futures::future::pending::<()>().await;
-                            unreachable!();
-                        }
-                        attempts += 1;
+                        retry_after(&mut attempts).await;
                         continue;
                     };
 
@@ -80,6 +70,7 @@ pub fn desktop_settings() -> iced_futures::Subscription<Desktop> {
                             s = next_color_scheme.fuse() => {
                                 if let Some(s) = s {
                                     _ = tx.send(Desktop::ColorScheme(s)).await;
+                                    attempts = 0;
                                 } else {
                                     color_scheme_stream = None;
                                 }
@@ -88,16 +79,36 @@ pub fn desktop_settings() -> iced_futures::Subscription<Desktop> {
                             c = next_contrast.fuse() => {
                                 if let Some(c) = c {
                                     _ = tx.send(Desktop::Contrast(c)).await;
+                                    attempts = 0;
                                 } else {
                                     contrast_stream = None;
                                 }
                             }
                         };
-                        // Reset the attempts counter if we successfully received a change
-                        attempts = 0;
                     }
+
+                    // Neither stream is left. When the session bus is gone,
+                    // every call above fails at once, so reconnecting without
+                    // a pause would spin and log five errors per pass.
+                    retry_after(&mut attempts).await;
                 }
             }
         })
     })
+}
+
+/// Waits before the next attempt to reach the settings portal, doubling the
+/// pause after each consecutive failure up to a minute.
+async fn retry_after(attempts: &mut u32) {
+    #[cfg(feature = "tokio")]
+    {
+        let seconds = 2_u64.saturating_pow(*attempts).min(60);
+        ::tokio::time::sleep(::tokio::time::Duration::from_secs(seconds)).await;
+        *attempts = attempts.saturating_add(1);
+    }
+    #[cfg(not(feature = "tokio"))]
+    {
+        let _ = attempts;
+        futures::future::pending::<()>().await;
+    }
 }
