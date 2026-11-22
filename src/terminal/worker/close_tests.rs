@@ -423,7 +423,7 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     );
     assert!(
         outcome.is_ok(),
-        "shutdown: {outcome:?} after {:?}; {}",
+        "shutdown: {outcome:?} after {:?}, including the capture delay this test injects; {}",
         started.elapsed(),
         shutdown_evidence(&shell)
     );
@@ -564,9 +564,9 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
                 message,
             } if message == "Terminal process cleanup remains unconfirmed"
         )),
-        "shutdown took {:?}; events: {events:?}; one process census now takes {:?}",
+        "shutdown took {:?}; events: {events:?}; one process census now: {}",
         started.elapsed(),
-        census_duration()
+        census_cost()
     );
     assert!(
         !events
@@ -648,22 +648,22 @@ fn shutdown_background_job(shell: &CloseSafetyShell) -> ShutdownJob {
     )
 }
 
-/// How long one census of this host's processes takes now. Shutdown
-/// confirms cleanup through such censuses within fixed reserves, so a host
-/// with many processes, or a loaded one, can run out of them.
-fn census_duration() -> Duration {
+/// How one census of this host's processes goes now, and how long it takes.
+/// Shutdown confirms cleanup through such censuses within fixed reserves, so
+/// a host with many processes, or a loaded one, can run out of them.
+fn census_cost() -> String {
     let started = Instant::now();
-    let _ = close_processes::session_is_empty(0, started + Duration::from_secs(30));
-    started.elapsed()
+    let result = close_processes::session_is_empty(0, started + Duration::from_secs(30));
+    format!("{result:?} in {:?}", started.elapsed())
 }
 
 /// What a failed shutdown assertion needs to tell its causes apart: the
 /// worker's reported events and the host's census cost.
 fn shutdown_evidence(shell: &CloseSafetyShell) -> String {
     format!(
-        "events: {:?}; one process census now takes {:?}",
+        "events: {:?}; one process census now: {}",
         shell.terminal.events().try_iter().collect::<Vec<_>>(),
-        census_duration()
+        census_cost()
     )
 }
 
