@@ -287,6 +287,51 @@ fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
     );
 }
 
+/// In a narrow block, a long refusal gives way to the block's Copy, which
+/// stays whole to try again, and to its caption.
+#[test]
+fn a_blocks_copy_refusal_leaves_its_copy_and_caption_room() {
+    use iced::advanced::{Layout, layout, mouse, widget::Tree};
+    let (runtime, _handle) = frame_cost::live_runtime(&[]);
+    let refusal = super::text_copy::CopyState::Refused(chat::TEXT_COPY_UNAVAILABLE.into());
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = step::code_frame(
+        design::caption("output").into(),
+        Some("Output".into()),
+        Some(Action::DismissComposerNote(runtime.target)),
+        refusal,
+    );
+    let mut tree = Tree::new(element.as_widget());
+    let width = 200.0;
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    let copy = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .find(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some("Copy again")
+        })
+        .expect("the block keeps its Copy")
+        .node()
+        .bounds()
+        .unwrap();
+    assert!(
+        copy.x1 - copy.x0 >= 16.0 && copy.x1 <= f64::from(width) + 0.1,
+        "the Copy keeps its size inside the block: {copy:?}"
+    );
+    let header = Layout::new(&node).bounds();
+    assert!(header.width <= width + 0.1, "{header:?}");
+}
+
 #[test]
 fn saved_history_composer_offers_attachment_in_its_actions_without_enabling_send() {
     use iced::advanced::{

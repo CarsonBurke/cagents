@@ -134,41 +134,50 @@ pub(super) fn code_frame<'a>(
         ))
         .width(Length::Fill)
         .into();
+    // What the last copy said is in the header, after its caption and clear
+    // of the Copy over its end, so a long refusal gives way to both: it is
+    // laid out last and ends in an ellipsis rather than taking the Copy's
+    // room or drawing over the caption.
+    let mut header = vec![design::caption(caption).into()];
+    if copy.is_some()
+        && let Some(said) = state.said()
+    {
+        header.push(
+            widget::container(said)
+                .width(Length::Fill)
+                .align_x(Alignment::End)
+                .into(),
+        );
+    }
     let block = widget::column::with_children(vec![
-        widget::container(design::caption(caption))
-            .padding(iced::Padding::ZERO.right(24))
-            .width(Length::Fill)
-            .height(24)
-            .align_y(Alignment::Center)
-            .into(),
+        widget::container(
+            widget::row::with_children(header)
+                .spacing(GAP_S)
+                .align_y(Alignment::Center),
+        )
+        .padding(iced::Padding::ZERO.right(24.0 + GAP_XS))
+        .width(Length::Fill)
+        .height(24)
+        .align_y(Alignment::Center)
+        .into(),
         body,
     ])
     .spacing(GAP_XS)
     .width(Length::Fill);
     match copy {
-        Some(copy) => {
-            let mut controls = Vec::with_capacity(2);
-            // What the copy did, beside the Copy that made it.
-            controls.extend(state.said());
-            controls.push(small_icon(
+        Some(copy) => super::hover::over_pinned(
+            block,
+            widget::container(small_icon(
                 state.icon(),
                 state.label("Copy this block"),
                 copy,
-            ));
-            super::hover::over_pinned(
-                block,
-                widget::container(
-                    widget::row::with_children(controls)
-                        .spacing(GAP_XS)
-                        .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::Start),
-                state.is_telling(),
-            )
-        }
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::Start),
+            state.is_telling(),
+        ),
         None => block.into(),
     }
 }
