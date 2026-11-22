@@ -190,7 +190,8 @@ impl Cagents {
             })
             .flatten();
         let removal = waiting.map_or_else(Task::none, |card| self.request_card_removal(card));
-        let kept = Task::batch([held, self.return_kept_panes(), removal]);
+        let returns = self.take_away_returns_after_removal();
+        let kept = Task::batch([held, self.return_kept_panes(), removal, returns]);
         if self.queued_card_closes.is_empty() {
             kept
         } else {

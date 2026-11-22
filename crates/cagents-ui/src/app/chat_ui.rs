@@ -1349,6 +1349,9 @@ pub(super) struct State {
     /// Such panes a view brought back before putting them in the strip: they
     /// go once it has.
     stopped_returns: HashSet<CardId>,
+    /// Whether one of those waited for another pane's removal to finish, and
+    /// goes once it has.
+    returns_await_removal: bool,
     /// Closed panes a shared view put back while their conversation stops,
     /// kept out of sight until the stop settles.
     hidden_returns: HashSet<CardId>,
@@ -1441,6 +1444,7 @@ impl Default for State {
             refusals_to_show: HashMap::new(),
             stopped_closes: HashMap::new(),
             stopped_returns: HashSet::new(),
+            returns_await_removal: false,
             hidden_returns: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
