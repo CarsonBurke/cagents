@@ -1280,6 +1280,7 @@ dependencies = [
  "directories",
  "dpi 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "euclid",
+ "foldhash 0.2.0",
  "glob",
  "hayro",
  "iced",

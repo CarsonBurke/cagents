@@ -682,7 +682,7 @@ impl Renderer {
                 use std::hash::{Hash, Hasher};
                 let renderer = self.child(index as u32);
                 let key = selection::logical_identity(&renderer.item, &renderer.path);
-                let mut revision = std::hash::DefaultHasher::new();
+                let mut revision = crate::fingerprint::hasher();
                 (
                     self.revision,
                     settings.text_size.0.to_bits(),
@@ -1174,14 +1174,14 @@ pub(super) fn code_text(
                 .to_absolute(size)
                 .0;
             use std::hash::{Hash, Hasher};
-            let mut key = std::hash::DefaultHasher::new();
+            let mut key = crate::fingerprint::hasher();
             (
                 logical.as_ref().map(|logical| logical.identity),
                 range.start,
             )
                 .hash(&mut key);
             let key = key.finish();
-            let mut revision = std::hash::DefaultHasher::new();
+            let mut revision = crate::fingerprint::hasher();
             (
                 Arc::as_ptr(&text) as *const u8 as usize,
                 &range,
@@ -1264,7 +1264,7 @@ fn code_line(
         // ligatures, Bidi context and tab stops; display projection may cull
         // glyphs but never introduces an artificial source boundary.
         use std::hash::{Hash, Hasher};
-        let mut key = std::hash::DefaultHasher::new();
+        let mut key = crate::fingerprint::hasher();
         (
             "code-line",
             logical.as_ref().map(|logical| logical.identity),

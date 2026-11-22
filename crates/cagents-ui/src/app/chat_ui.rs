@@ -2751,7 +2751,7 @@ fn for_each_fence<'a>(
 /// language it declares and the text it holds.
 fn fence_key(language: &str, code: &str) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
+    let mut hasher = crate::fingerprint::hasher();
     language.hash(&mut hasher);
     code.hash(&mut hasher);
     hasher.finish()
@@ -10748,7 +10748,7 @@ impl Cagents {
         };
         let fingerprint = {
             use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = crate::fingerprint::hasher();
             snapshot.models.hash(&mut hasher);
             snapshot
                 .active_model

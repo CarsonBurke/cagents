@@ -454,13 +454,13 @@ pub(super) enum ReaderAxis {
 }
 pub(super) fn reader_key(logical: u64, axis: ReaderAxis) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut key = std::hash::DefaultHasher::new();
+    let mut key = crate::fingerprint::hasher();
     ("reader-axis", logical, axis).hash(&mut key);
     key.finish()
 }
 pub(super) fn block_id(target: Target, context: Option<&str>, logical: u64) -> Id {
     use std::hash::{Hash, Hasher};
-    let mut key = std::hash::DefaultHasher::new();
+    let mut key = crate::fingerprint::hasher();
     (target.generation, context, logical).hash(&mut key);
     card_control_id(
         target.card,

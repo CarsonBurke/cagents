@@ -323,7 +323,7 @@ fn diagnostic_key(text: &str) -> String {
 // this identity or the collapsed selection catalog.
 pub(super) fn diagnostic_preview_identity(key: &str) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hash = std::hash::DefaultHasher::new();
+    let mut hash = crate::fingerprint::hasher();
     ("failure-diagnostic-preview", key).hash(&mut hash);
     hash.finish()
 }
@@ -1051,7 +1051,7 @@ impl State {
                     .sources
                     .iter()
                     .map(|source| {
-                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        let mut hash = crate::fingerprint::hasher();
                         source.hash(&mut hash);
                         if let Some((item, _, _)) = state.item_metadata.get(source) {
                             Arc::as_ptr(item).hash(&mut hash);
@@ -1075,7 +1075,7 @@ impl State {
         // of which draws reset evidence. That evidence includes the snapshot
         // generation, so hashing it would redraw every exchange on each
         // publication while a limit is active.
-        let mut hash = std::hash::DefaultHasher::new();
+        let mut hash = crate::fingerprint::hasher();
         for incident in &state.incidents {
             (
                 &incident.key,

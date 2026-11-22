@@ -69,6 +69,9 @@ crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
 euclid = { version = "=0.22.14", optional = true }
+# Fast fixed-seed hashing of what the views draw (see `src/fingerprint.rs`);
+# already in the resolved graph through hashbrown.
+foldhash = "0.2"
 glob = "0.3.4"
 # Pure-Rust PDF rendering. The editor previews a PDF the same way it previews
 # an SVG, by rasterizing to RGBA off the UI thread, so a document in a
