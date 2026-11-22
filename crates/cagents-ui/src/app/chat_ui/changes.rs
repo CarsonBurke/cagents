@@ -6,6 +6,8 @@ use crate::chat::{FileChangeKey, FileChangeSource, FilePatchCursor};
 // Tasks can outlive a Runtime replacement on the same card. A request ID
 // must therefore belong to this process, rather than restart with each State.
 static NEXT_REVIEW_REQUEST: AtomicU64 = AtomicU64::new(1);
+/// Shown when the agent's process was too busy to answer a query in time.
+const UNANSWERED: &str = "The agent was too busy to answer. Refresh again in a moment.";
 
 #[derive(Default)]
 pub(super) struct State {
@@ -149,7 +151,15 @@ impl State {
                 false
             }
             Err(error) => {
-                self.error = Some(error);
+                self.error = Some(
+                    if chat::failure::actor_transport::timed_out(&error).is_some() {
+                        // Nothing is wrong with the edits; the agent was too
+                        // busy to look them up.
+                        UNANSWERED.into()
+                    } else {
+                        error
+                    },
+                );
                 false
             }
         }
@@ -786,6 +796,29 @@ mod tests {
     fn unknown_totals_are_not_presented_as_zero() {
         assert_eq!(totals(Some(7), Some(3)), "+7 −3");
         assert_eq!(totals(None, Some(3)), "Line totals unavailable");
+    }
+
+    /// A query the agent's process did not answer in time leaves the panel
+    /// with a plain next step instead of the transport's report; other
+    /// failures keep their own words.
+    #[test]
+    fn an_unanswered_query_reads_as_a_busy_agent_in_the_panel() {
+        let mut state = State::default();
+        let request = state.request(false);
+        state.complete(
+            request,
+            Err(format!(
+                "{} during the `file_query` request",
+                chat::failure::actor_transport::DEADLINE
+            )),
+        );
+        assert_eq!(state.error.as_deref(), Some(UNANSWERED));
+        let request = state.request(true);
+        state.complete(request, Err("File identity exceeds the limit".into()));
+        assert_eq!(
+            state.error.as_deref(),
+            Some("File identity exceeds the limit")
+        );
     }
 
     #[test]

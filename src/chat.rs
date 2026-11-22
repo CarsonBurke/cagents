@@ -2127,6 +2127,38 @@ impl Command {
             | Self::ReadTextCopy { .. } => false,
         }
     }
+
+    /// Whether the command is the changed files panel's query of the cached
+    /// edit metadata, answered without involving the provider.
+    ///
+    /// Exhaustive on purpose, so that a new command has to be classified.
+    pub fn queries_file_changes(&self) -> bool {
+        match self {
+            Self::LoadFileChanges { .. } | Self::LoadFileChangePatches { .. } => true,
+            Self::ResumeAfterLogin { .. }
+            | Self::Prompt { .. }
+            | Self::Answer { .. }
+            | Self::Compact
+            | Self::Slash { .. }
+            | Self::StartQueued { .. }
+            | Self::Branch { .. }
+            | Self::Interrupt
+            | Self::StopSubagent { .. }
+            | Self::SetModel { .. }
+            | Self::SetFastMode { .. }
+            | Self::SetPermissionMode { .. }
+            | Self::RefreshPermissions
+            | Self::UpdatePermissionSettings { .. }
+            | Self::DismissPermissionDenial { .. }
+            | Self::Refresh
+            | Self::LoadEarlier
+            | Self::RemoveQueued { .. }
+            | Self::SetInterruptMode { .. }
+            | Self::ListBranches
+            | Self::LoadLater
+            | Self::ReadTextCopy { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

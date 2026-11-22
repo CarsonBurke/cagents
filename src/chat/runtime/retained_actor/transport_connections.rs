@@ -33,10 +33,21 @@ const IDLE: Duration = Duration::from_secs(30);
 pub(super) struct Call {
     request: Invocation,
     reply: Reply,
+    queued: Instant,
 }
 impl Call {
     pub(super) fn method(&self) -> &str {
         &self.request.method
+    }
+    /// Start timing the call's turn in the serve loop. Its client's deadline
+    /// covers the wait in the queue as well as the run, so a slow call is
+    /// reported with both when the returned guard is dropped.
+    pub(super) fn timing(&self) -> Timing {
+        Timing {
+            method: self.request.method.clone(),
+            queued: self.queued,
+            started: Instant::now(),
+        }
     }
     pub(super) fn into_parts(self) -> (Invocation, Reply) {
         (self.request, self.reply)
@@ -54,6 +65,32 @@ impl Reply {
     pub(super) fn send(self, answer: Answer) -> Delivery {
         let _ = self.answer.send(answer);
         Delivery(self.delivered)
+    }
+}
+
+/// A call whose wait and run together take this much of its client's
+/// `TIMEOUT` is logged, so a missed deadline can be traced to the queue or to
+/// the request itself.
+const SLOW_CALL: Duration = Duration::from_secs(1);
+
+/// Reports a slow call when dropped. See [`Call::timing`].
+pub(super) struct Timing {
+    method: String,
+    queued: Instant,
+    started: Instant,
+}
+impl Drop for Timing {
+    fn drop(&mut self) {
+        let waited = self.started.duration_since(self.queued);
+        let ran = self.started.elapsed();
+        if waited + ran >= SLOW_CALL {
+            tracing::warn!(
+                method = %self.method,
+                waited_ms = waited.as_millis() as u64,
+                ran_ms = ran.as_millis() as u64,
+                "a retained request was slow to answer"
+            );
+        }
     }
 }
 
@@ -220,6 +257,7 @@ fn connection(control: UnixStream, calls: &Sender<Call>, wakeup: &UnixStream) {
     let call = Call {
         request,
         reply: Reply { answer, delivered },
+        queued: Instant::now(),
     };
     if calls.send(call).is_err() {
         return;

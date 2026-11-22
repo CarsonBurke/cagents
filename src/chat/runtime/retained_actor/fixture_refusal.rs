@@ -13,8 +13,14 @@
 //! as it is used, so the input after it goes through as usual. With both, the
 //! input waits and is then refused. Any other home, or a home without the
 //! files, is unaffected.
+//!
+//! [`UNANSWERED_READS`] holds a number of seconds, up to
+//! [`LONGEST_SILENCE`]: for that long the helper doesn't answer transcript
+//! reads, as one held up on a heavily loaded computer doesn't. A read waits
+//! until the silence ends, then goes through, unless its deadline comes first.
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Created in the fixture's `HOME` to refuse the next input.
 const MARKER: &str = ".cagents-fixture-refuse-input";
@@ -26,6 +32,57 @@ const DELAY: &str = ".cagents-fixture-delay-input";
 /// application waits for an answer.
 const LONGEST_DELAY: Duration = Duration::from_secs(8);
 
+/// Created in the fixture's `HOME` to stop transcript reads being answered.
+const UNANSWERED_READS: &str = ".cagents-fixture-unanswered-reads";
+
+/// The longest the helper stops answering transcript reads.
+const LONGEST_SILENCE: Duration = Duration::from_secs(120);
+
+/// Until when transcript reads go unanswered.
+static SILENT_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Hold up a transcript read while the fixture in this process's `HOME` has
+/// the helper not answering, failing it as an unanswered read fails once
+/// `deadline` comes first.
+pub(super) fn hold_read(deadline: Instant) -> Result<(), String> {
+    match std::env::var_os("HOME") {
+        Some(home) => hold_read_in(Path::new(&home), &SILENT_UNTIL, deadline),
+        None => Ok(()),
+    }
+}
+
+/// [`hold_read`] for the fixture in `home`, keeping the silence in
+/// `silent_until`.
+fn hold_read_in(
+    home: &Path,
+    silent_until: &Mutex<Option<Instant>>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let until = {
+        let mut until = silent_until.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(silence) = take_seconds(home, UNANSWERED_READS) {
+            tracing::warn!(
+                ?silence,
+                "native-evidence fixture stops answering transcript reads"
+            );
+            *until = Some(Instant::now() + silence.min(LONGEST_SILENCE));
+        }
+        *until
+    };
+    let Some(until) = until.filter(|until| *until > Instant::now()) else {
+        return Ok(());
+    };
+    std::thread::sleep(
+        until
+            .min(deadline)
+            .saturating_duration_since(Instant::now()),
+    );
+    if until >= deadline {
+        return Err(crate::chat::failure::actor_transport::DEADLINE.into());
+    }
+    Ok(())
+}
+
 /// How long the fixture in this process's `HOME` holds up the next input,
 /// if it asks to.
 pub(super) fn take_delay() -> Option<Duration> {
@@ -33,25 +90,28 @@ pub(super) fn take_delay() -> Option<Duration> {
 }
 
 fn take_delay_in(home: &Path) -> Option<Duration> {
-    let seconds = take_file(home, DELAY)?;
-    let delay = seconds
+    let delay = take_seconds(home, DELAY)?;
+    tracing::warn!(?delay, "native-evidence fixture is holding up one input");
+    Some(delay.min(LONGEST_DELAY))
+}
+
+/// The number of seconds in `name` in `home`, removed as it is read, where
+/// `home` is inside a native-evidence task.
+fn take_seconds(home: &Path, name: &str) -> Option<Duration> {
+    let seconds = take_file(home, name)?;
+    let duration = seconds
         .trim()
         .parse::<f64>()
         .ok()
         .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
-    match delay {
-        Some(delay) => {
-            tracing::warn!(?delay, "native-evidence fixture is holding up one input");
-            Some(delay.min(LONGEST_DELAY))
-        }
-        None => {
-            tracing::warn!(
-                seconds = seconds.trim(),
-                "the input delay fixture holds no number of seconds"
-            );
-            None
-        }
+    if duration.is_none() {
+        tracing::warn!(
+            seconds = seconds.trim(),
+            fixture = name,
+            "the fixture holds no number of seconds"
+        );
     }
+    duration
 }
 
 /// The contents of `name` in `home`, removed as it is read, where `home` is
@@ -139,5 +199,42 @@ mod tests {
         std::fs::write(home.join(DELAY), "soon").unwrap();
         assert_eq!(take_delay_in(&home), None);
         assert!(!home.join(DELAY).exists());
+    }
+
+    #[test]
+    fn stops_answering_reads_for_a_while_only_inside_a_native_evidence_task() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("fixture");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join(UNANSWERED_READS), "60\n").unwrap();
+        // Its own silence, so the helper's reads in other tests go on.
+        let silent_until = Mutex::new(None);
+        let soon = || Instant::now() + Duration::from_millis(50);
+        assert_eq!(hold_read_in(&home, &silent_until, soon()), Ok(()));
+        assert!(home.join(UNANSWERED_READS).is_file());
+
+        std::fs::write(root.path().join(".native-evidence"), "").unwrap();
+        // Every read in the silence waits for its deadline and misses it.
+        for _ in 0..2 {
+            let started = Instant::now();
+            assert_eq!(
+                hold_read_in(&home, &silent_until, soon()),
+                Err(crate::chat::failure::actor_transport::DEADLINE.into())
+            );
+            assert!(started.elapsed() >= Duration::from_millis(50));
+        }
+        assert!(!home.join(UNANSWERED_READS).exists());
+        // A read whose deadline outlasts the silence waits for it, then goes
+        // through, as do the reads after it.
+        std::fs::write(home.join(UNANSWERED_READS), "0.05").unwrap();
+        assert_eq!(
+            hold_read_in(
+                &home,
+                &silent_until,
+                Instant::now() + Duration::from_secs(5)
+            ),
+            Ok(())
+        );
+        assert_eq!(hold_read_in(&home, &silent_until, soon()), Ok(()));
     }
 }

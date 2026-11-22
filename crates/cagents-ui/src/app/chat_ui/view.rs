@@ -2084,6 +2084,7 @@ impl Runtime {
             // The agent carried on; its notice is in the transcript.
             chat::failure::FailureKind::CommandOutOfMemory => None,
             chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
+            chat::failure::FailureKind::Unresponsive => Some("Not responding"),
         });
         let mut parts = Vec::new();
         if let Some(label) = limit_reset.as_deref().or(failure_label) {

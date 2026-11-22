@@ -3815,6 +3815,236 @@ fn a_read_refused_after_a_hide_the_chat_has_undone_is_made_again() {
     assert!(Arc::ptr_eq(&kept.items[0], &shown.items[0]));
 }
 
+/// A read the daemon could not answer, such as one a slow helper missed, is
+/// the chat's error until a read succeeds. The next read asks for everything,
+/// so the error clears even when nothing in the conversation changed.
+#[test]
+fn a_failed_read_clears_on_the_next_read_although_nothing_changed() {
+    read_fails_once(false);
+}
+
+/// A read the busy agent's process missed, and that the daemon will ask for
+/// again, leaves the conversation showing until it has missed reads for a
+/// while; the next read still asks for everything.
+#[test]
+fn a_read_the_busy_agent_missed_once_is_not_shown_as_a_failure() {
+    read_fails_once(true);
+}
+
+fn read_fails_once(retryable: bool) {
+    use super::super::{Item, ItemContent, Role};
+    use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+    let failed = format!(
+        "{} during the `presentation_binary` request",
+        crate::chat::failure::actor_transport::DEADLINE
+    );
+    let answer = Arc::new(Item {
+        id: "answer".into(),
+        role: Role::Assistant,
+        content: ItemContent::Text {
+            text: "The kept answer.".into(),
+            thinking: false,
+            phase: Default::default(),
+        },
+        started_at: None,
+        at: None,
+    });
+    let body = answer.clone();
+    let reported = failed.clone();
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+    let (advance_tx, advance_rx) = std::sync::mpsc::channel::<()>();
+    let worker = thread::spawn(move || {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let proof = host_proof("failed-read");
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+            codec
+                .write(
+                    server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+        };
+        let full = |body: Arc<Item>| {
+            Some(Snapshot {
+                generation: 2,
+                ready: true,
+                items: vec![body],
+                ..Default::default()
+            })
+        };
+        let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        respond(
+            &mut codec,
+            &mut server,
+            Some(connect.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            },
+        );
+        let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        let ClientRequest::ChatStart { session, .. } = start.request else {
+            panic!("chat start expected");
+        };
+        let chat_id = session.id;
+        respond(
+            &mut codec,
+            &mut server,
+            Some(start.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot {
+                        generation: 1,
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+        let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert!(matches!(
+            shown.request,
+            ClientRequest::ChatVisibility { visible: true, .. }
+        ));
+        respond(
+            &mut codec,
+            &mut server,
+            Some(shown.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            },
+        );
+        respond(
+            &mut codec,
+            &mut server,
+            None,
+            ServerMessage::ChatChanged { chat_id },
+        );
+        let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+        respond(
+            &mut codec,
+            &mut server,
+            Some(read.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: full(body.clone()),
+                },
+            },
+        );
+        respond(
+            &mut codec,
+            &mut server,
+            None,
+            ServerMessage::ChatChanged { chat_id },
+        );
+        let missed: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert!(matches!(
+            missed.request,
+            ClientRequest::ChatRead {
+                after_generation: Some(2),
+                ..
+            }
+        ));
+        respond(
+            &mut codec,
+            &mut server,
+            Some(missed.request_id),
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                reported,
+                retryable,
+            )),
+        );
+        // The helper answers again and its owner asks for another read.
+        if !retryable {
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        respond(
+            &mut codec,
+            &mut server,
+            None,
+            ServerMessage::ChatChanged { chat_id },
+        );
+        let again: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert!(
+            matches!(
+                again.request,
+                ClientRequest::ChatRead {
+                    after_generation: None,
+                    ..
+                }
+            ),
+            "an unchanged answer could not clear the failed read"
+        );
+        respond(
+            &mut codec,
+            &mut server,
+            Some(again.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: full(body),
+                },
+            },
+        );
+        stage_tx.send(()).unwrap();
+    });
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    let handle = ClientHandle::connect_on(
+        client,
+        omp_card(None, None),
+        Intent::Start,
+        None,
+        false,
+        None,
+        None,
+        None,
+        move |wake| {
+            let _ = wake_tx.send(wake);
+        },
+    )
+    .unwrap();
+    handle.set_interest(true, true).unwrap();
+    let shown = |handle: &ClientHandle| handle.resident_snapshot_with_clock().map(|(s, _)| s);
+    if !retryable {
+        while shown(&handle).is_none_or(|snapshot| snapshot.error.is_none()) {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let missed = shown(&handle).unwrap();
+        assert_eq!(missed.error.as_deref(), Some(failed.as_str()));
+        assert!(!missed.ready);
+        assert_eq!(
+            missed.items[0].content, answer.content,
+            "the transcript is kept"
+        );
+        advance_tx.send(()).unwrap();
+    }
+    stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    while shown(&handle).is_some_and(|snapshot| snapshot.error.is_some()) {
+        wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    worker.join().unwrap();
+    let recovered = shown(&handle).unwrap();
+    assert!(recovered.ready);
+    assert_eq!(recovered.items[0].content, answer.content);
+}
+
 #[test]
 fn hidden_control_subscribers_advance_metadata_without_rehydration_loops() {
     use super::super::{

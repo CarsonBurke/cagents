@@ -6406,6 +6406,15 @@ impl Runtime {
         }
         // Presentation refreshes below, once the snapshot is installed.
         if snapshot.error != self.snapshot.error
+            && let Some(previous) = &self.snapshot.error
+            && chat::failure::actor_transport::timed_out(previous).is_some()
+        {
+            // The agent's process didn't answer a read; it said nothing about
+            // the conversation, and a read that succeeds withdraws it.
+            self.failures.retain(|note| note.text != *previous);
+            self.unplaced_failures.retain(|notice| notice != previous);
+        }
+        if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {
             if snapshot.has_later {

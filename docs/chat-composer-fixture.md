@@ -161,6 +161,15 @@ A debug build holds the next request to Claude that long before admitting it,
 then removes the file. With `.cagents-fixture-refuse-input` as well, the
 request is held and then refused, as a send that fails after a wait is.
 
+To see how a conversation reads when Claude stops answering for a while, as
+it can on a heavily loaded computer, write a number of seconds, up to 120, to
+`.cagents-fixture-unanswered-reads` in the fixture `HOME`:
+`scripts/native-evidence env sh -c 'echo 40 >"$HOME/.cagents-fixture-unanswered-reads"'`.
+A debug build then leaves every transcript read unanswered for that long, and
+removes the file. A read made during that time waits until the time is up,
+then goes through, or fails like a read Claude never answered if its deadline
+comes first. Showing the chat again, or anything new in it, makes a read.
+
 To check where a failure is drawn after delivered work, write a diagnostic to
 `fixture-delivery-error` instead. Every prompt then gets a reply, a background
 command's completion notice, a follow-up, and that error. The notice must

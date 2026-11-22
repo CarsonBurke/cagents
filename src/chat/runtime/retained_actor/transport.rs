@@ -70,6 +70,15 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(120);
 /// longer waits for it. Each request can occupy the helper, and this pump, for up to
 /// `TIMEOUT`, so a slow helper is not kept from serving state meanwhile.
 const OVERDUE_RETRY: Duration = Duration::from_secs(60);
+/// How long one read for a person looking at the chat may take, including
+/// any retries: the transcript, or the changed files panel. The daemon holds
+/// its control gate, and the chat's connection, while it waits, so a read
+/// takes no longer than any other request; a read that misses it is asked
+/// for again instead (see [`PRESENTATION_RETRY`]).
+const READ_WAIT: Duration = TIMEOUT;
+/// How long after a read failed while the helper was alive the reader is
+/// asked to read again, so a failure clears once the helper answers.
+const PRESENTATION_RETRY: Duration = Duration::from_secs(3);
 // These reach the person through the chat pane, attached to a message, a
 // model choice or a stop. They say what happened to it and what to do; the
 // helper's own reasons stay in the logs.
@@ -352,6 +361,9 @@ struct Remote {
     spare_detached: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
+    /// When the reader is next asked to read the conversation again, after a
+    /// read failed while the helper was alive.
+    reread_at: Mutex<Option<Instant>>,
 }
 struct StartupOwner {
     control: Mutex<Option<UnixStream>>,
@@ -577,6 +589,7 @@ impl RemoteActor {
 
             worker: Mutex::new(None),
             startup: Mutex::new(None),
+            reread_at: Mutex::new(None),
         }))
     }
     /// Complete the actual proxy's pending envelope without any external
@@ -1122,7 +1135,7 @@ impl RemoteActor {
         deadline: Instant,
     ) -> Result<ActorInspection, String> {
         if Instant::now() >= deadline {
-            return Err("Retained actor deadline expired before the `inspect` request".into());
+            return Err(crate::chat::failure::actor_transport::INSPECT_DEADLINE.into());
         }
         validate_record(record)?;
         let response: Result<ActorInspection, String> = exchange(
@@ -1261,6 +1274,7 @@ impl RemoteActor {
 
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
+            reread_at: Mutex::new(None),
         }));
         let watch = remote.watch()?;
         let wake = remote.0.wake.clone();
@@ -1334,6 +1348,7 @@ impl RemoteActor {
                     }
                     actor.resolve_uncertain_input();
                     retry_housekeeping |= actor.flush_input_retirements().is_err();
+                    actor.ask_for_due_reread();
                     let retry = if watch.is_none() {
                         Some(Duration::from_millis(50))
                     } else {
@@ -1353,6 +1368,18 @@ impl RemoteActor {
         Ok(remote)
     }
     fn retry_after(&self, failed: bool) -> Option<Duration> {
+        let reread = self
+            .0
+            .reread_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|at| at.saturating_duration_since(Instant::now()));
+        match (self.housekeeping_after(failed), reread) {
+            (Some(housekeeping), Some(reread)) => Some(housekeeping.min(reread)),
+            (housekeeping, reread) => housekeeping.or(reread),
+        }
+    }
+    fn housekeeping_after(&self, failed: bool) -> Option<Duration> {
         // Accepted inputs finish through helper publication. Only work that
         // failed, or has a scheduled retransmission, needs a timer.
         if failed
@@ -3852,6 +3879,7 @@ impl Server {
                 }
             }
             while let Some(call) = connections.next() {
+                let _timing = call.timing();
                 // As before each accept: a hung-up uninstalled helper serves
                 // nothing more, so a queued `install` cannot outlive it.
                 if !self.installed && disconnected(&startup)? {

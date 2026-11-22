@@ -28,6 +28,9 @@ use std::{
 // and a busy desktop scheduler.
 mod append;
 
+/// How long the agent's process may miss transcript reads before the reader
+/// shows that it is not responding.
+const UNANSWERED_GRACE: Duration = Duration::from_secs(15);
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
 pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
@@ -3051,6 +3054,9 @@ impl ClientHandle {
             let mut sent_read = SentRead { id: 0, hidings: 0 };
             let mut read_again = false;
             let mut resync = false;
+            // Since when the agent's process has been missing reads, and when
+            // it last missed one.
+            let mut unanswered: Option<(Instant, Instant)> = None;
             let failure = loop {
                 let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
                     Ok(Some(value)) => value,
@@ -3179,6 +3185,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
+                        unanswered = None;
                         if let Some(update) = update {
                             resync = false;
                             user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
@@ -3199,6 +3206,7 @@ impl ClientHandle {
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
+                        unanswered = None;
                         let (base, revision) = publication.capture();
                         let observed_user = update.changes.iter().any(|change| {
                             let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
@@ -3248,7 +3256,27 @@ impl ClientHandle {
                     },
                     ServerMessage::Error(error) => {
                         read_pending = false;
-                        loop {
+                        // The failure is this reader's, not the daemon's:
+                        // the next read asks for everything, so an unchanged
+                        // conversation still replaces it.
+                        resync = true;
+                        // A busy agent's process misses a read now and then,
+                        // and the daemon asks for another shortly. Keep
+                        // showing the conversation until it has missed them
+                        // for a while.
+                        let quiet = error.retryable
+                            && super::failure::actor_transport::timed_out(&error.message).is_some()
+                            && {
+                                // Misses far apart, as across a while hidden,
+                                // start a new grace.
+                                let now = Instant::now();
+                                let (since, _) = unanswered
+                                    .filter(|(_, last)| now.duration_since(*last) < UNANSWERED_GRACE * 2)
+                                    .unwrap_or((now, now));
+                                unanswered = Some((since, now));
+                                now.duration_since(since) < UNANSWERED_GRACE
+                            };
+                        if !quiet { loop {
                             let (base, revision) = publication.capture();
                             let mut snapshot = (*base.snapshot).clone();
                             if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
@@ -3267,7 +3295,7 @@ impl ClientHandle {
                             let applied = old.is_some(); drop(old); drop(current);
                             if applied { break; }
                         }
-                        wake(Wake::Changed);
+                        wake(Wake::Changed); }
                     },
                     ServerMessage::HostShuttingDown => break "Chat daemon is shutting down".into(),
                     ServerMessage::Response { .. } => {},
@@ -3517,10 +3545,7 @@ impl ClientHandle {
     /// Read immutable cached edit data on this connection's own reply channel.
     /// Call off the UI thread; no watch publication or provider state is mutated.
     pub fn file_changes(&self, command: Command) -> Result<super::FileChangeReply, String> {
-        if !matches!(
-            &command,
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
-        ) {
+        if !command.queries_file_changes() {
             return Err("Expected a file changes cache query".into());
         }
         if !self.inner.alive.load(Ordering::Acquire) {

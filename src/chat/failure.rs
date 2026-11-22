@@ -98,6 +98,9 @@ pub enum FailureKind {
     CommandOutOfMemory,
     /// The provider process ended without being asked to.
     Exited,
+    /// The process that keeps the conversation didn't answer a request in
+    /// time, or its answer broke off. It is still running.
+    Unresponsive,
 }
 
 /// Opens the runtime's report of a provider that memory exhaustion ended.
@@ -109,6 +112,37 @@ pub const COMMAND_OUT_OF_MEMORY: &str =
     "The system ran out of memory, so a command the agent started was stopped.";
 /// Opens the runtime's report of a provider process that exited on its own.
 pub const PROVIDER_EXITED: &str = "Provider exited with ";
+
+/// How the retained actor's socket transport reports a request it could not
+/// complete. Each opens its message, and the request's name may follow, as in
+/// "… during the `state` request". The runtime composes these; provider text
+/// never starts with them.
+pub mod actor_transport {
+    /// The request's deadline passed before its answer arrived.
+    pub const DEADLINE: &str = "Retained actor socket deadline expired";
+    /// The deadline had passed before an inspection could be sent.
+    pub const INSPECT_DEADLINE: &str =
+        "Retained actor deadline expired before the `inspect` request";
+    /// The connection's descriptor was closed while waiting on it.
+    pub const DESCRIPTOR_CLOSED: &str = "Retained actor socket descriptor closed";
+    /// The actor stopped reading a request partway through.
+    pub const STOPPED_ACCEPTING: &str = "Retained actor socket stopped accepting data";
+    /// The actor closed the connection before its whole answer arrived.
+    pub const ENDED_EARLY: &str = "Retained actor response ended early";
+
+    /// Whether `report` is one of these, and if so, whether the actor ran
+    /// out of time rather than breaking the connection off.
+    pub fn timed_out(report: &str) -> Option<bool> {
+        let opens = |known: &str| report.starts_with(known);
+        if opens(DEADLINE) || opens(INSPECT_DEADLINE) {
+            Some(true)
+        } else if opens(DESCRIPTOR_CLOSED) || opens(STOPPED_ACCEPTING) || opens(ENDED_EARLY) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
 
 /// Whether a reported error tells of something the agent carried on past,
 /// or of one send the conversation outlived, rather than a failure of the
@@ -217,8 +251,11 @@ impl<'a> Failure<'a> {
         // never starts with them.
         let runtime_report = signal.trim_start();
         let reached = reached_limit(&signal);
+        let timed_out = actor_transport::timed_out(runtime_report);
         let kind = if let Some(kind) = structured_kind {
             kind
+        } else if timed_out.is_some() {
+            FailureKind::Unresponsive
         } else if runtime_report.starts_with(PROVIDER_OUT_OF_MEMORY) {
             FailureKind::OutOfMemory
         } else if runtime_report.starts_with(COMMAND_OUT_OF_MEMORY) {
@@ -335,6 +372,16 @@ impl<'a> Failure<'a> {
                 // The stopped chat's bar offers what fits, Resume or Try
                 // again; this only says where the cause is.
                 "Details show what the agent reported before it stopped.",
+            ),
+            FailureKind::Unresponsive => (
+                if timed_out == Some(true) {
+                    format!("{program} didn't respond in time")
+                } else {
+                    format!("{program} stopped responding partway through")
+                },
+                // The actor is still running: nothing was lost, and a read
+                // it missed is asked for again until it answers.
+                "This can happen while the computer is very busy. The conversation is kept, and this clears once it answers.",
             ),
         };
         if let Some(reset) = &reset {
@@ -1370,5 +1417,49 @@ mod tests {
             Failure::parse(Provider::Claude, quoted)
                 .is_none_or(|failure| failure.kind != FailureKind::Exited)
         );
+    }
+
+    /// Every way the retained actor's transport reports a request it could
+    /// not finish reads as an agent that didn't respond, in plain words with
+    /// a next step, and keeps the report itself, with the request it names,
+    /// for Details. Only a report that leads with it is one.
+    #[test]
+    fn retained_actor_transport_reports_read_as_an_unresponsive_agent() {
+        use actor_transport::*;
+        for (report, summary) in [
+            (DEADLINE, "Claude Code didn't respond in time"),
+            (INSPECT_DEADLINE, "Claude Code didn't respond in time"),
+            (
+                DESCRIPTOR_CLOSED,
+                "Claude Code stopped responding partway through",
+            ),
+            (
+                STOPPED_ACCEPTING,
+                "Claude Code stopped responding partway through",
+            ),
+            (
+                ENDED_EARLY,
+                "Claude Code stopped responding partway through",
+            ),
+        ] {
+            for raw in [
+                report.to_owned(),
+                format!("{report} during the `presentation_binary` request"),
+            ] {
+                let failure = Failure::parse(Provider::Claude, &raw).unwrap();
+                assert_eq!(failure.kind, FailureKind::Unresponsive, "{raw}");
+                assert_eq!(failure.summary, summary, "{raw}");
+                assert!(failure.action.contains("clears once it answers"), "{raw}");
+                assert!(!failure.summary.contains("Retained"), "{raw}");
+                assert_eq!(failure.details, raw);
+                assert_eq!(super::summary(Provider::Claude, &raw), summary);
+            }
+            let quoted = format!("The agent wrote: {report}");
+            assert!(
+                Failure::parse(Provider::Claude, &quoted)
+                    .is_none_or(|failure| failure.kind != FailureKind::Unresponsive),
+                "{quoted}"
+            );
+        }
     }
 }

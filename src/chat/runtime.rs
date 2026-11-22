@@ -28,6 +28,7 @@ pub(crate) mod courier_tests;
 mod execution;
 mod handle;
 pub use handle::Handle;
+pub(crate) use handle::ReadFailure;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
@@ -1205,11 +1206,18 @@ impl LocalHandle {
         &self,
         command: &Command,
     ) -> Result<Option<super::FileChangeReply>, String> {
-        self.0
-            .store
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .file_query(command)
+        let asked = Instant::now();
+        let store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        // The store is shared with persistence; a query that waits long for
+        // it can miss its caller's deadline.
+        let waited = asked.elapsed();
+        if waited >= Duration::from_secs(1) {
+            tracing::warn!(
+                waited_ms = waited.as_millis() as u64,
+                "a changed files query waited for the conversation store"
+            );
+        }
+        store.file_query(command)
     }
     pub(crate) fn text_copy(
         &self,
