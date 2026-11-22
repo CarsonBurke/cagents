@@ -9,9 +9,10 @@
 //! as for a note, and callers run it when the content changes, never while
 //! drawing.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path, sync::LazyLock};
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, LinkType, Options, Parser, Tag};
+use two_face::re_exports::syntect::parsing::SyntaxReference;
 
 /// A language the reader can choose for a buffer whose name does not decide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -34,6 +35,11 @@ impl DocumentLanguage {
 /// has none as far as [`Path::extension`] is concerned, but its name is its
 /// type. One that has one, such as `.notes.md`, is typed by it.
 ///
+/// So is a name the editor's highlighter already knows a grammar by, such as
+/// `Makefile`, `Vagrantfile` or `COMMIT_EDITMSG`: it keeps its own
+/// highlighting rather than being read as Markdown for a `## Section`
+/// comment.
+///
 /// A name need not be UTF-8 for its extension to decide.
 pub fn markdown_by_name(path: &Path) -> Option<bool> {
     let name = path.file_name()?;
@@ -45,7 +51,38 @@ pub fn markdown_by_name(path: &Path) -> Option<bool> {
             extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown"),
         );
     }
-    name.as_encoded_bytes().starts_with(b".").then_some(false)
+    if name.as_encoded_bytes().starts_with(b".") {
+        return Some(false);
+    }
+    grammar_named(name.to_str()?)
+}
+
+/// Whether the grammar the highlighter picks for an extensionless file
+/// called `name` is Markdown, or `None` when no grammar goes by that name.
+///
+/// Mirrors [`find_syntax_by_token`], which the highlighter resolves a
+/// nameless buffer's file name with: a grammar's file names first, then its
+/// own name, the later grammar winning each. The table is read once from
+/// the bundled grammars, on the loading worker that first asks.
+///
+/// [`find_syntax_by_token`]: two_face::re_exports::syntect::parsing::SyntaxSet::find_syntax_by_token
+fn grammar_named(name: &str) -> Option<bool> {
+    static NAMES: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
+        let syntaxes = two_face::syntax::extra_no_newlines();
+        let syntaxes = syntaxes.syntaxes();
+        let markdown = |syntax: &SyntaxReference| syntax.name.eq_ignore_ascii_case("Markdown");
+        let by_name = syntaxes
+            .iter()
+            .map(|syntax| (syntax.name.to_ascii_lowercase(), markdown(syntax)));
+        let by_file_name = syntaxes.iter().flat_map(|syntax| {
+            syntax
+                .file_extensions
+                .iter()
+                .map(move |file_name| (file_name.to_ascii_lowercase(), markdown(syntax)))
+        });
+        by_name.chain(by_file_name).collect()
+    });
+    NAMES.get(&name.to_ascii_lowercase()).copied()
 }
 
 /// How much of a buffer inference reads: enough for any reply or note to
@@ -232,10 +269,19 @@ See [the workflow](https://example.com/ci.yml) for details.
             (".notes.md", Some(true)),
             (".release.MARKDOWN", Some(true)),
             (".bashrc.local", Some(false)),
+            // Names the highlighter knows a grammar by keep it.
+            ("Makefile", Some(false)),
+            ("GNUmakefile", Some(false)),
+            ("Vagrantfile", Some(false)),
+            ("Gemfile", Some(false)),
+            ("PKGBUILD", Some(false)),
+            ("COMMIT_EDITMSG", Some(false)),
             ("Untitled", None),
             ("Untitled-2", None),
+            ("NOTES", None),
+            ("TODO", None),
             ("LICENSE", None),
-            ("Makefile", None),
+            ("CHANGELOG", None),
         ] {
             assert_eq!(markdown_by_name(Path::new(name)), markdown, "{name}");
         }

@@ -11868,6 +11868,52 @@ fn a_named_buffer_offers_no_language_and_highlights_by_its_name() {
     assert_eq!(highlight_token(&runtime), "md");
 }
 
+#[test]
+fn a_fresh_read_of_a_markdown_buffer_holds_it_as_an_edit_would() {
+    let card = CardId::new();
+    let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "NOTES", "");
+    paste(&mut runtime, card, AGENT_REPLY);
+    settle(&mut runtime, card);
+    assert!(editable(&runtime).markdown);
+    let reload = |runtime: &mut RepositoryRuntime, text: &str| {
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity: identity.clone(),
+            result: Ok(LoadedFile {
+                source: PathBuf::from("NOTES"),
+                content: FileContent::Editable {
+                    text: text.into(),
+                    content_hash: blake3::hash(text.as_bytes()),
+                    // What the worker reads from the text alone.
+                    markdown: crate::editor::language::infer_markdown(text, false),
+                },
+            }),
+        }));
+    };
+
+    // An agent rewrote the note mid-reply: read afresh it would be plain
+    // text, but the buffer it replaces was Markdown, and stays so.
+    reload(&mut runtime, "# Plan\n\nThe **ca");
+    assert!(editable(&runtime).markdown);
+    assert!(!editable(&runtime).language_stale());
+    // With no Markdown left it is plain text again, and stays so.
+    reload(&mut runtime, "Remember to call the dentist.\n");
+    assert!(!editable(&runtime).markdown);
+    reload(&mut runtime, "# Plan\n\nThe **ca");
+    assert!(!editable(&runtime).markdown);
+}
+
+#[test]
+fn a_name_a_grammar_goes_by_keeps_its_highlighting() {
+    let card = CardId::new();
+    let text = "## Build\n\nall: `cargo build`\n";
+    let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "Makefile", text);
+    assert_eq!(runtime.language_offer(), None);
+    paste(&mut runtime, card, text);
+    assert!(!editable(&runtime).language_stale());
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(highlight_token(&runtime), "Makefile");
+}
+
 /// Loads `view`'s selected file from disk into `runtime`, as the shell would.
 fn load_selected_file(runtime: &mut RepositoryRuntime, card: CardId, view: &RepositoryView) {
     let path = view.selected_file.clone().unwrap();

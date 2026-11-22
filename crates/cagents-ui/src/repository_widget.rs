@@ -1449,6 +1449,17 @@ impl EditorDocument {
         self.set_markdown(language::infer_markdown(prefix.as_str(), self.markdown));
     }
 
+    /// Reads a buffer that replaced one read as Markdown by its content,
+    /// such as the same file reloaded from disk, the way an edit to that
+    /// buffer would: it stays Markdown while any Markdown is left.
+    fn hold_markdown(&mut self) {
+        if !self.markdown && matches!(self.language, LanguageSource::Content { .. }) {
+            self.markdown = true;
+            self.language = LanguageSource::Content { stale: true };
+            self.sync_language();
+        }
+    }
+
     fn set_markdown(&mut self, markdown: bool) {
         if self.markdown != markdown {
             self.markdown = markdown;
@@ -1502,8 +1513,8 @@ impl EditorDocument {
         let token = match self.language {
             LanguageSource::Chosen(DocumentLanguage::PlainText) => "txt",
             _ if self.markdown => "md",
-            // A nameless buffer that is not Markdown keeps whatever its name
-            // highlights as: a `Makefile` is still a Makefile.
+            // A buffer read as plain text keeps whatever its name highlights
+            // as, which for a name no grammar knows is plain text.
             _ => return highlighter_settings(&self.source, theme, dark),
         };
         cosmic::iced::highlighter::Settings {
@@ -6803,6 +6814,20 @@ impl RepositoryRuntime {
                 let loaded_focus = (matches!(self.document, DocumentState::Loading { .. })
                     || self.restores_editor_navigation(&identity))
                 .then(|| identity.clone());
+                // The file the buffer this read replaces came from, when its
+                // content read as Markdown. A fresh read of the same file
+                // holds on to that the way an edit would.
+                let read_as_markdown = match &self.document {
+                    DocumentState::Editable(document)
+                    | DocumentState::Loading {
+                        predecessor: Some(document),
+                    } if document.markdown
+                        && matches!(document.language, LanguageSource::Content { .. }) =>
+                    {
+                        Some(document.source.clone())
+                    }
+                    _ => None,
+                };
                 self.document = match result {
                     Ok(LoadedFile {
                         source,
@@ -6822,6 +6847,8 @@ impl RepositoryRuntime {
                         );
                         if let Some(language) = self.language_choice(&document.source) {
                             document.choose_language(Some(language));
+                        } else if read_as_markdown.as_ref() == Some(&document.source) {
+                            document.hold_markdown();
                         }
                         DocumentState::Editable(document)
                     }
@@ -10095,22 +10122,24 @@ fn language_choice(
 ) -> Option<Element<'_, RepositoryAction>> {
     let (markdown, chosen) = runtime.language_offer()?;
     let enabled = !runtime.is_saving();
-    let detected = if markdown { "Markdown" } else { "plain text" };
+    // While a choice stands, the buffer reads as the choice rather than as
+    // what was detected, so only Automatic itself can say what that is.
+    let automatic = match chosen {
+        None if markdown => "Detect from the content (now Markdown)",
+        None => "Detect from the content (now plain text)",
+        Some(_) => "Detect from the content",
+    };
     let choices = [
-        (
-            None,
-            "Automatic",
-            format!("Detect from the content (now {detected})"),
-        ),
+        (None, "Automatic", automatic),
         (
             Some(DocumentLanguage::Markdown),
             "Markdown",
-            "Always Markdown".to_owned(),
+            "Always Markdown",
         ),
         (
             Some(DocumentLanguage::PlainText),
             "Plain text",
-            "Always plain text".to_owned(),
+            "Always plain text",
         ),
     ];
     let buttons = choices

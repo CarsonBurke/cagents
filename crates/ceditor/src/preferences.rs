@@ -24,8 +24,34 @@ pub struct Session {
     /// The language chosen for each tab's file, in [`Session::paths`] order,
     /// where its name does not type it: an untitled note read as Markdown,
     /// say. A tab past the end chose none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "chosen_languages"
+    )]
     pub languages: Vec<Option<DocumentLanguage>>,
+}
+
+/// Reads [`Session::languages`], taking a language this build does not know,
+/// as a later one may write, for no choice rather than refusing the session
+/// and every tab in it.
+fn chosen_languages<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Option<DocumentLanguage>>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Chosen {
+        Known(Option<DocumentLanguage>),
+        Unknown(serde::de::IgnoredAny),
+    }
+    let chosen: Vec<Chosen> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(chosen
+        .into_iter()
+        .map(|chosen| match chosen {
+            Chosen::Known(language) => language,
+            Chosen::Unknown(_) => None,
+        })
+        .collect())
 }
 
 /// A path to open at startup, as [`Session::startup_paths`] lists them.
@@ -393,6 +419,19 @@ mod tests {
         assert_eq!(
             serde_json::from_reader::<_, Session>(previous_reader).unwrap(),
             session
+        );
+    }
+
+    #[test]
+    fn a_language_this_build_does_not_know_keeps_the_session() {
+        let session: Session = serde_json::from_str(
+            r#"{"paths":["/a","/b","/c"],"active":0,"languages":["plain-text",null,"rst"]}"#,
+        )
+        .unwrap();
+        assert_eq!(session.paths.len(), 3);
+        assert_eq!(
+            session.languages,
+            vec![Some(DocumentLanguage::PlainText), None, None]
         );
     }
 
