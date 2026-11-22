@@ -11914,6 +11914,16 @@ fn a_fresh_read_of_a_markdown_buffer_holds_it_as_an_edit_would() {
 }
 
 #[test]
+fn a_nameless_script_is_code_rather_than_prose() {
+    let card = CardId::new();
+    let text = "#!/bin/sh\n## Deploy\nset -e\n";
+    let (runtime, _) = RepositoryRuntime::open_fixture(card, "deploy", text);
+    assert!(!editable(&runtime).markdown);
+    assert_eq!(highlight_token(&runtime), "deploy");
+    assert!(!editable(&runtime).is_prose());
+}
+
+#[test]
 fn a_name_a_grammar_goes_by_keeps_its_highlighting() {
     let card = CardId::new();
     let text = "## Build\n\nall: `cargo build`\n";

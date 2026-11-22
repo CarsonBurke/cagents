@@ -1010,7 +1010,9 @@ struct EditorDocument {
     /// The grammar the Markdown highlighter is built from, held while the
     /// buffer's language can change, so that turning to Markdown at the
     /// edit debounce or by the reader's choice never loads it on the UI
-    /// thread.
+    /// thread. The price is that the shared grammar (about 20 MiB) stays
+    /// loaded while such a buffer is open, rather than lingering only after
+    /// use.
     _markdown_grammar: Option<crate::diff_view::SyntaxLease>,
     /// How many times the content was read to infer its language.
     #[cfg(test)]
@@ -1101,8 +1103,9 @@ impl EditorDocument {
         } else {
             LanguageSource::Content { stale: false }
         };
-        // The load warmed the grammar for a buffer whose content decides, so
-        // joining it here costs nothing.
+        // The load warmed the grammar for a buffer whose content decides
+        // (see `FileRead::may_be_markdown`), and the shared cache keeps it for
+        // a while after, so joining it here takes no load.
         let markdown_grammar =
             (language != LanguageSource::Name).then(crate::diff_view::syntax_lease);
         Self {
@@ -1517,6 +1520,16 @@ impl EditorDocument {
             // A `README` is Markdown by its name, though no grammar goes by it.
             _ if self.markdown => "md".to_owned(),
             LanguageSource::Name => crate::diff_view::syntax_token(&self.source),
+            // A script names its interpreter rather than its file type, and
+            // is code: it keeps its name's token and does not wrap as prose.
+            LanguageSource::Content { .. }
+                if self
+                    .content
+                    .with_line(0, |line, _| line.starts_with("#!"))
+                    .unwrap_or(false) =>
+            {
+                crate::diff_view::syntax_token(&self.source)
+            }
             // No grammar goes by the name of a buffer whose language is not
             // its name's, so read as plain text it is plain text, and wraps
             // as prose however it came to be so.
