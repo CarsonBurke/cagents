@@ -23,7 +23,7 @@ the former exact-132-KiB rule did not.
 
 | Role | Chats | Processes | PSS | Private dirty | Notes |
 | --- | ---: | ---: | ---: | ---: | --- |
-| daemon | no controlled chat workload | 1 | 47.97 MiB | 16.61 MiB | 27 grown glibc arena reservations; 42.23 MiB arena RSS and 15.91 MiB arena private-dirty; 56.73 MiB SwapPss |
+| daemon | no controlled chat workload | 1 | 47.97 MiB | 16.61 MiB | 27 grown glibc arena reservations; 41.26 MiB arena RSS and 15.91 MiB arena private-dirty; 56.73 MiB SwapPss |
 | UI | no controlled chat workload | 0 | — | — | no `cagents-ui` process was live |
 | retained actors | no controlled chat workload | 0 | — | — | non-zombie actor census empty |
 | Claude providers | no controlled chat workload | 0 | — | — | direct actor-child census empty |
@@ -70,7 +70,7 @@ can be claimed as a memory win.
 
 The only complete live result is the daemon row above. It already shows a
 systemic allocator effect: 1.69 GiB of virtual arena reservation can coexist
-with 42.23 MiB resident arena pages. Reservation is not resident memory, so
+with 41.26 MiB resident arena pages. Reservation is not resident memory, so
 `MALLOC_ARENA_MAX=1` is not a proven RAM optimization.
 
 The retained-actor model is per-chat process overhead: its historical sample
