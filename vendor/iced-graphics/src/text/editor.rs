@@ -491,24 +491,68 @@ impl editor::Editor for Editor {
 
     fn overflow(&self) -> (f32, f32) {
         let buffer = self.buffer();
-        let (above, below) = buffer.overscan();
-
-        if above == 0.0 && below == 0.0 {
+        let Some(height) = buffer.size().1 else {
             return (0.0, 0.0);
+        };
+        let limit = buffer.metrics().line_height;
+        let scroll = buffer.scroll();
+        // A line that is not laid out, such as one the overscan does not
+        // reach, counts as a single line.
+        let line_height = |line: &cosmic_text::BufferLine| {
+            line.layout_opt().map_or(limit, |layout| {
+                layout
+                    .iter()
+                    .map(|layout_line| {
+                        layout_line.line_height_opt.unwrap_or(limit)
+                    })
+                    .sum()
+            })
+        };
+
+        let mut above = scroll.vertical.max(0.0);
+        let mut line_i = scroll.line.min(buffer.lines.len());
+        while above < limit && line_i > 0 {
+            line_i -= 1;
+            above += line_height(&buffer.lines[line_i]);
         }
 
-        let height = buffer.size().1.unwrap_or(f32::INFINITY);
-        let (top, bottom) = buffer.draw_runs().fold(
-            (0.0_f32, 0.0_f32),
-            |(top, bottom), run| {
-                (
-                    top.max(-run.line_top),
-                    bottom.max(run.line_top + run.line_height - height),
-                )
-            },
-        );
+        let mut bottom = -scroll.vertical;
+        for line in buffer.lines.iter().skip(scroll.line) {
+            if bottom >= height + limit {
+                break;
+            }
+            bottom += line_height(line);
+        }
 
-        (top.min(above), bottom.min(below))
+        (above.min(limit), (bottom - height).clamp(0.0, limit))
+    }
+
+    fn caret(&self) -> Option<Rectangle> {
+        let internal = self.internal();
+
+        if internal.editor.selection_bounds().is_some() {
+            return None;
+        }
+
+        // Only a caret on a drawn line, unlike `selection`, which estimates
+        // where a caret off every drawn line would be and can count lines
+        // that are not laid out as nothing: a caret that is not drawn is
+        // not in view.
+        let cursor = internal.editor.cursor();
+        let buffer = buffer_from_editor(&internal.editor);
+        let line_height = buffer.metrics().line_height;
+
+        buffer
+            .draw_runs()
+            .filter(|run| run.line_i == cursor.line)
+            .find_map(|run| {
+                run.cursor_position(&cursor).map(|x| {
+                    Rectangle::new(
+                        Point::new(x, run.line_top),
+                        Size::new(1.0, line_height),
+                    )
+                })
+            })
     }
 
     fn min_bounds(&self) -> Size {

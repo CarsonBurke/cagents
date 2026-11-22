@@ -4229,7 +4229,10 @@ mod tests {
 
     /// An overscan lets the native editor draw, and be clicked, past its
     /// viewport (#2824): the composer's draft runs on into its inset there.
-    /// Scrolling and the visible runs still keep to the viewport.
+    /// Scrolling and the visible runs still keep to the viewport. The editor
+    /// reports how far the text continues past each end, up to a line, even
+    /// where a whole-line scroll leaves nothing of the next line in a band,
+    /// or there is no band (#3077).
     #[test]
     fn native_overscan_draws_text_past_the_viewport_and_reports_how_far() {
         use cosmic::iced::advanced::text::editor::Selection;
@@ -4260,13 +4263,13 @@ mod tests {
         let mut editor = NativeEditor::with_text(&text);
         editor.set_overscan(8.0, 8.0);
         lay_out(&mut editor);
-        assert_eq!(editor.overflow(), (0.0, 8.0));
+        assert_eq!(editor.overflow(), (0.0, 20.0));
         assert_eq!(lines(editor.buffer().layout_runs()), [0, 1, 2, 3, 4]);
         assert_eq!(lines(editor.buffer().draw_runs()), [0, 1, 2, 3, 4, 5]);
 
         editor.perform(Action::Scroll { lines: 10 });
         lay_out(&mut editor);
-        assert_eq!(editor.overflow(), (8.0, 8.0));
+        assert_eq!(editor.overflow(), (20.0, 20.0));
         assert_eq!(lines(editor.buffer().layout_runs()), [10, 11, 12, 13, 14]);
         assert_eq!(
             lines(editor.buffer().draw_runs()),
@@ -4308,17 +4311,45 @@ mod tests {
         lay_out(&mut editor);
         editor.perform(Action::Move(Motion::DocumentEnd));
         lay_out(&mut editor);
-        assert_eq!(editor.overflow(), (8.0, 0.0));
+        assert_eq!(editor.overflow(), (20.0, 0.0));
         assert_eq!(lines(editor.buffer().draw_runs())[0], 34);
 
-        // Without an overscan nothing past the viewport is drawn.
+        // Without an overscan nothing past the viewport is drawn, though the
+        // text still continues above it.
         editor.set_overscan(0.0, 0.0);
         lay_out(&mut editor);
-        assert_eq!(editor.overflow(), (0.0, 0.0));
+        assert_eq!(editor.overflow(), (20.0, 0.0));
         assert_eq!(
             lines(editor.buffer().draw_runs()),
             lines(editor.buffer().layout_runs())
         );
+
+        // Text that fits continues past neither end.
+        let mut editor = NativeEditor::with_text("one\ntwo");
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        assert_eq!(editor.overflow(), (0.0, 0.0));
+
+        // The caret is reported on its line, relative to the scrolled text
+        // area, only while it is drawn and nothing is selected (#3077).
+        let mut editor = NativeEditor::with_text(&text);
+        editor.set_overscan(8.0, 8.0);
+        lay_out(&mut editor);
+        editor.perform(Action::Click(Point::new(5.0, 45.0)));
+        lay_out(&mut editor);
+        let caret = editor.caret().expect("a caret on line 2");
+        assert_eq!((caret.y, caret.height), (40.0, 20.0));
+        // Scrolled to the line above the viewport, it is in the band.
+        editor.perform(Action::Scroll { lines: 3 });
+        lay_out(&mut editor);
+        assert_eq!(editor.caret().map(|caret| caret.y), Some(-20.0));
+        // Scrolled further, and after a new width discards every layout, it
+        // is not drawn and so not reported.
+        editor.perform(Action::Scroll { lines: 7 });
+        lay_out_at(&mut editor, 600.0);
+        assert_eq!(editor.caret(), None);
+        editor.perform(Action::SelectAll);
+        assert_eq!(editor.caret(), None);
     }
 
     /// An overscan only adds what is drawn: where the editor scrolls, where
