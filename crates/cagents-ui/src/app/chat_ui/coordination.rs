@@ -526,7 +526,8 @@ fn reported<'a>(item: &'a chat::Item, coordinated: &Coordinated) -> (ToolStatus,
 pub(super) struct MessageRun {
     verb: &'static str,
     /// How many: "11 agents" where each went to its own with the same
-    /// words, otherwise "3 messages".
+    /// words, "2 messages to main" where some went to one agent again,
+    /// otherwise "3 messages".
     count: String,
     /// The words they share, or else whom they went to.
     preview: String,
@@ -596,7 +597,12 @@ impl MessageRun {
         let shares = shared.is_some();
         let (verb, count, preview) = match shared {
             Some(said) if addressed.len() == count => ("Messaged", format!("{count} agents"), said),
-            Some(said) => ("Sent", format!("{count} messages"), said),
+            // The same words sent again, as a retry is, still say whom to.
+            Some(said) => (
+                "Sent",
+                format!("{count} messages to {}", recipients.join(", ")),
+                said,
+            ),
             None => (
                 "Sent",
                 format!("{count} messages"),

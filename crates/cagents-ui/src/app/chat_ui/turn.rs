@@ -2769,4 +2769,26 @@ mod tests {
             "Sent 2 messages to docs-review, perf-audit · Queued"
         );
     }
+
+    /// The same words sent to one agent again, as a retry is, still say
+    /// whom they went to.
+    #[test]
+    fn a_message_sent_again_names_its_agent() {
+        let (first, second) = (sent("main", "Rebase first."), sent("main", "Rebase first."));
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Succeeded),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(
+            turns[1].summary,
+            "Sent 2 messages to main: Rebase first. · Queued"
+        );
+    }
 }
