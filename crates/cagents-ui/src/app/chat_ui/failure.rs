@@ -560,6 +560,22 @@ impl State {
         Some(meta)
     }
 
+    /// Records a failure whose next step the caller knows better than its
+    /// wording does.
+    fn push_guided(
+        &mut self,
+        provider: Provider,
+        text: &str,
+        source: Source,
+        context: &str,
+        guidance: &'static str,
+    ) {
+        if let Some(mut meta) = Self::metadata(provider, text, false, context) {
+            meta.guidance = guidance;
+            self.push_metadata(meta, source);
+        }
+    }
+
     fn push_metadata(&mut self, meta: Metadata, source: Source) {
         if let Some(incident) = self
             .incidents
@@ -955,7 +971,14 @@ impl State {
                     Source::Snapshot => snapshot_context,
                     _ => context.as_str(),
                 };
-                state.push(provider, text, source, false, scope);
+                // A refused admission is answered by closing a chat, not by
+                // reading the daemon's details; the pane's Retry follows.
+                let capacity = runtime.capacity_refused && matches!(source, Source::Local(_));
+                if capacity {
+                    state.push_guided(provider, text, source, scope, CAPACITY_GUIDANCE);
+                } else {
+                    state.push(provider, text, source, false, scope);
+                }
             }
         }
         let recovering = runtime.auth_error().is_some();

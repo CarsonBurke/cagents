@@ -3211,7 +3211,8 @@ impl RestoredWaiting {
     }
 }
 
-const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
+const CAPACITY_GUIDANCE: &str =
+    "Close a chat you have finished with, then retry. Your message and conversation are kept.";
 
 struct FileCompletionMemo {
     files: Arc<Vec<String>>,

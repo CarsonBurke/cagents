@@ -12657,6 +12657,9 @@ impl Cagents {
                             }
                         } else if let Some(blocked) = self.blocked_failure(id) {
                             std::borrow::Cow::Borrowed(blocked.reopen.headline())
+                        } else if self.chat_capacity_guidance(id).is_some() {
+                            // Its guidance below says what to do next.
+                            std::borrow::Cow::Borrowed(crate::chat::failure::headline(message.message()))
                         } else { std::borrow::Cow::Borrowed(message.message()) })
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)

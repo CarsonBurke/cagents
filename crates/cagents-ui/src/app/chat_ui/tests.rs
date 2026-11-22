@@ -19578,13 +19578,14 @@ fn capacity_refusal_restores_first_message_and_retry_starts_it_once() {
     assert!(
         labels
             .iter()
-            .any(|label| label.contains("cagents chat capacity")),
+            .any(|label| label.contains("Close a chat you have finished with")),
         "{labels:?}"
     );
     assert!(
         labels
             .iter()
-            .all(|label| !label.contains("daemon may still be working")),
+            .all(|label| !label.contains("daemon may still be working")
+                && !label.contains("Review the details")),
         "{labels:?}"
     );
     let retry = runtime.target;
@@ -19644,7 +19645,7 @@ fn capacity_refusal_on_cold_restore_keeps_guidance_identity_and_stashed_draft() 
     assert!(
         labels
             .iter()
-            .any(|label| label.contains("cagents chat release ID --dry-run")),
+            .any(|label| label.contains("Close a chat you have finished with")),
         "{labels:?}"
     );
     assert_eq!(
@@ -19718,13 +19719,14 @@ fn capacity_refusal_retry_preserves_saved_identity_and_unsent_draft() {
     assert!(
         labels
             .iter()
-            .any(|label| label.contains("cagents chat capacity")),
+            .any(|label| label.contains("Close a chat you have finished with")),
         "{labels:?}"
     );
     assert!(
         labels
             .iter()
-            .all(|label| !label.contains("daemon may still be working")),
+            .all(|label| !label.contains("daemon may still be working")
+                && !label.contains("Review the details")),
         "{labels:?}"
     );
     let retry = runtime.target;

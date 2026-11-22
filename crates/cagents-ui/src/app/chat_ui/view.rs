@@ -3733,21 +3733,17 @@ impl Runtime {
                 && (!self.is_draft()
                     || !self.composer.text().trim().is_empty()
                     || !self.attachments.is_empty());
+            // The refusal's notice above says what to do; Retry follows it.
             content.push(
-                widget::column::with_children(vec![
-                    design::caption(CAPACITY_GUIDANCE).into(),
-                    crate::ui_controls::button::primary("Retry")
-                        .on_press_maybe(enabled.then(|| {
-                            action(if self.is_draft() {
-                                Action::Submit(target, PromptMode::Send)
-                            } else {
-                                Action::Reconnect(target)
-                            })
-                        }))
-                        .into(),
-                ])
-                .spacing(space::S)
-                .into(),
+                crate::ui_controls::button::primary("Retry")
+                    .on_press_maybe(enabled.then(|| {
+                        action(if self.is_draft() {
+                            Action::Submit(target, PromptMode::Send)
+                        } else {
+                            Action::Reconnect(target)
+                        })
+                    }))
+                    .into(),
             );
         } else if self.start_blocked.is_some()
             || ((self.disconnected || snapshot.exited) && self.auth_error().is_none())
