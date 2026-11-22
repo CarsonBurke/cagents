@@ -299,8 +299,10 @@ mod tests {
         tracker.observe(read(42_000, 40_000), 36 * MINUTE);
         tracker.observe(Evidence::Continued, 45 * MINUTE);
         tracker.observe(read(44_000, 0), 45 * MINUTE);
+        // Each reading reports the request before it, so the latest
+        // continuation counts once its own reading arrives.
         let activity = tracker.activity();
-        assert_eq!(activity.requested_at, Some(45 * MINUTE));
+        assert_eq!(activity.requested_at, Some(36 * MINUTE));
         assert_eq!(
             activity.observations,
             [Observation {
