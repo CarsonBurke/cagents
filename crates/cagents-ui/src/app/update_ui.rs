@@ -456,9 +456,6 @@ impl Cagents {
                         .into(),
                 );
             }
-            if let Some(handoff) = terminal_handoff(confirmation) {
-                body.push(notice_body(handoff));
-            }
             // What stands in the way leads; what merely happens follows.
             let (attention, settled): (Vec<_>, Vec<_>) = daemon
                 .sessions
@@ -478,6 +475,10 @@ impl Cagents {
                 widget::column::with_children(rows).spacing(space::M),
                 320.0,
             ));
+        }
+        // The way past a blocker that waiting won't clear follows what it is.
+        if let Some(handoff) = terminal_handoff(confirmation) {
+            body.push(notice_body(handoff));
         }
         if !terminal_confirmation
             && let Some(daemon) = &preview.daemon

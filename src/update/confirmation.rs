@@ -348,6 +348,7 @@ fn wait_for(
         None => observe(policy)?,
     };
     let mut nonce = uuid::Uuid::new_v4().to_string();
+    let mut handoff = None;
     loop {
         if Instant::now() >= deadline {
             return Err(refused(&preview, true).unwrap_or_else(|| {
@@ -360,13 +361,20 @@ fn wait_for(
             let _decisions = DecisionLease::acquire(state, &job.id)?;
             check_review_closed(state, job)?;
             // A window's review of blocked work says where it can be stopped.
-            let terminal_command = (!terminal
+            // The job's request never changes, so it is read at most once.
+            let terminal_command = if !terminal
                 && preview
                     .daemon
                     .as_ref()
-                    .is_some_and(impact::DaemonImpact::blocked))
-            .then(|| floor::terminal_command(state, job))
-            .transpose()?;
+                    .is_some_and(impact::DaemonImpact::blocked)
+            {
+                if handoff.is_none() {
+                    handoff = Some(floor::terminal_command(state, job)?);
+                }
+                handoff.clone()
+            } else {
+                None
+            };
             job.confirmation = Some(Confirmation {
                 stop: None,
                 terminal_command,
