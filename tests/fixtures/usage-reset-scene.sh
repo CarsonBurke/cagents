@@ -35,7 +35,7 @@ case $command in
         ;;
     mode)
         provider=${2:?name claude or codex}
-        mode=${3:?name success, error, disconnect, unconfirmed, depleted or limited}
+        mode=${3:?name success, error, disconnect, unconfirmed, depleted, limited or fable-unused}
         evidence env sh -c 'exec /usr/bin/python3 "$1" mode "$CAGENTS_EVIDENCE_FIXTURE" "$2" "$3"' sh \
             "$here/tests/fixtures/usage-reset-fixture.py" "$provider" "$mode"
         ;;

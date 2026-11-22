@@ -388,7 +388,7 @@ url = "{}{}"
 header = "Authorization: Bearer {}"
 header = "Content-Type: application/json"
 header = "anthropic-beta: oauth-2025-04-20"
-header = "User-Agent: claude-code/{}"
+header = "User-Agent: {}"
 write-out = "\n%{{http_code}}"
 "#,
             OUTPUT_LIMIT,
@@ -397,7 +397,7 @@ write-out = "\n%{{http_code}}"
             self.base,
             path,
             self.bearer,
-            self.version
+            user_agent(&self.version)
         );
         if self.fixture {
             config.push_str("noproxy = \"*\"\n");
@@ -444,6 +444,13 @@ write-out = "\n%{{http_code}}"
         group.finish().await;
         result
     }
+}
+
+/// Claude Code's own agent. The server offers reset grants only to the
+/// surfaces it recognizes; any other agent reads `ineligible_reason:
+/// "surface"` with no grants.
+fn user_agent(version: &str) -> String {
+    format!("claude-cli/{version} (external, cli)")
 }
 
 /// A missing or unreadable-format file-store login is an observed login
@@ -779,6 +786,11 @@ mod offer_context_tests {
                 let request = String::from_utf8(request).unwrap();
                 assert!(request.starts_with(&format!("GET {path} ")));
                 assert!(request.contains("Authorization: Bearer cagents-fixture-only\r\n"));
+                assert!(
+                    request
+                        .contains("\r\nUser-Agent: claude-cli/0.0.0-fixture (external, cli)\r\n"),
+                    "reset reads must identify as Claude Code's CLI surface"
+                );
                 let body = response.to_string();
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }

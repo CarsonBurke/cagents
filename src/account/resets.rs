@@ -51,6 +51,17 @@ pub enum ResetScope {
 }
 
 impl ResetScope {
+    /// Account-wide limits read before a model's allowance, as Claude names
+    /// a reset clearing both a "Weekly reset".
+    fn rank(&self) -> u8 {
+        match self {
+            Self::AccountSession => 0,
+            Self::AccountWeekly => 1,
+            Self::Account => 2,
+            Self::Model(_) => 3,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::AccountSession => "Session".into(),
@@ -96,17 +107,14 @@ pub struct UsageReset {
     pub scopes: Vec<ResetScope>,
     pub available_count: u64,
     pub expires_at: Option<i64>,
-    /// Inventory can include grants that are paused or not next in line.
+    /// Inventory can include grants that are paused or have nothing to
+    /// refill.
     pub usable: bool,
 }
 
 impl UsageReset {
     pub fn label(&self) -> String {
-        self.scopes
-            .iter()
-            .map(ResetScope::label)
-            .collect::<Vec<_>>()
-            .join(" + ")
+        scope_label(&self.scopes)
     }
 
     /// The reset grant being spent, distinct from its affected limit windows.
@@ -166,9 +174,11 @@ impl UsageReset {
     }
 }
 
-fn ordered_scopes(scopes: &[ResetScope]) -> Vec<ResetScope> {
+/// One reading order for a reset's scopes, shared by every label and by
+/// grouping, so a reset has the same name wherever it appears.
+pub fn ordered_scopes(scopes: &[ResetScope]) -> Vec<ResetScope> {
     let mut scopes = scopes.to_vec();
-    scopes.sort_by_key(ResetScope::label);
+    scopes.sort_by_key(|scope| (scope.rank(), scope.label()));
     scopes.dedup();
     scopes
 }
@@ -193,7 +203,7 @@ pub struct InventoryGroup {
     pub unknown_expiry: bool,
 }
 
-/// Keep paused/non-next grants separate from grants usable now, without
+/// Keep paused or held grants separate from grants usable now, without
 /// merging their counts into a misleading spendable total.
 pub fn inventory_groups(resets: &[UsageReset], now_secs: i64) -> Vec<InventoryGroup> {
     let mut groups: Vec<InventoryGroup> = Vec::new();

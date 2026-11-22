@@ -17,6 +17,8 @@ FIXTURE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURE)
 # Bounds only a hang; a passing wait returns as soon as its answer arrives.
 HANG_GUARD = 60
+# Claude's service offers reset programs only to Claude Code's CLI surface.
+CLI_AGENT = "claude-cli/0.0.0-fixture (external, cli)"
 
 
 class UsageResetFixture(unittest.TestCase):
@@ -61,6 +63,51 @@ class UsageResetFixture(unittest.TestCase):
                 self.assertTrue(json.loads(response.read()))
                 self.assertEqual(published_files(), before, "read-only request republished fixture data")
 
+    def test_reset_programs_are_offered_only_to_the_cli_surface(self):
+        server = FIXTURE.server(self.root)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
+        self.addCleanup(connection.close)
+
+        def read(agent):
+            headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}"}
+            if agent is not None:
+                headers["User-Agent"] = agent
+            connection.request("GET", "/api/oauth/usage?at_wall=1&skip_spend=1", headers=headers)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            return json.loads(response.read())
+
+        for agent in (None, "claude-code/0.0.0-fixture"):
+            with self.subTest(agent=agent):
+                usage = read(agent)
+                self.assertEqual(usage["cedar_ember"]["ineligible_reason"], "surface")
+                self.assertEqual(usage["cedar_ember"]["grants"], [])
+                self.assertFalse(usage["juniper_tide"]["eligible"])
+                self.assertEqual(usage["seven_day"]["utilization"], 96)
+        usage = read(CLI_AGENT)
+        self.assertTrue(usage["cedar_ember"]["eligible"])
+        self.assertEqual({item["id"]: item["percent_used"] for item in usage["cedar_ember"]["grants"]}, {
+            "fable-fixture": {"seven_day_overage_included": 100},
+            "account-fixture": {"five_hour": 82, "seven_day": 96}})
+        self.assertTrue(usage["juniper_tide"]["available"])
+
+    def test_fable_unused_mode_leaves_the_fable_reset_nothing_to_refill(self):
+        before = self.read(self.claude)
+        FIXTURE.configure(self.root, "claude", "fable-unused")
+        state = self.read(self.claude)
+        limits = state["usage"]["rate_limits"]
+        self.assertEqual(limits["model_scoped"][0]["utilization"], 0)
+        self.assertFalse(limits["cedar_ember"]["at_limit"])
+        self.assertEqual(limits["cedar_ember"]["grants"], before["usage"]["rate_limits"]["cedar_ember"]["grants"])
+        self.assertEqual(state["consume_count"], 0)
+        served = FIXTURE.served_usage(limits, CLI_AGENT)
+        self.assertEqual(served["cedar_ember"]["grants"][0]["percent_used"], {"seven_day_overage_included": 0})
+        with self.assertRaisesRegex(ValueError, "Claude-only"):
+            FIXTURE.configure(self.root, "codex", "fable-unused")
+
     def test_frame_publication_preserves_an_open_turn_reader(self):
         path = self.claude / "fixture-frames.jsonl"
         old = path.read_bytes()
@@ -94,9 +141,10 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(frames[-2]["subtype"], "success")
 
     def test_account_claim_preserves_fable_and_unknown_key_cannot_spend_it(self):
-        with FIXTURE.state_file(self.claude) as state:
-            state["usage"]["rate_limits"]["cedar_ember"]["next_grant_id"] = "account-fixture"
-        self.assertEqual(self.claim()[1]["result"], "ineligible")
+        # Like Claude's service, any usable grant can be claimed; the next
+        # grant is only the one Claude Code suggests first.
+        self.assertEqual(self.read(self.claude)["usage"]["rate_limits"]["cedar_ember"]["next_grant_id"],
+                         "fable-fixture")
         self.assertEqual(self.claim("account-fixture")[1]["result"], "reset")
         limits = self.read(self.claude)["usage"]["rate_limits"]
         self.assertEqual(limits["model_scoped"][0]["utilization"], 100)
@@ -104,7 +152,28 @@ class UsageResetFixture(unittest.TestCase):
         self.assertEqual(self.claim("account-fixture", "another-key")[1]["result"], "already_used")
         self.assertEqual(self.read(self.claude)["consume_count"], 1)
 
-    def test_next_grant_selection_preserves_state_and_service_rejects_the_other_scope(self):
+    def test_a_spend_from_another_surface_is_refused_without_spending(self):
+        before = self.read(self.claude)
+        server = FIXTURE.server(self.root)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        body = json.dumps({"program": "cedar_ember", "grant_id": "account-fixture", "request_id": "surface-key"})
+        for agent in ("claude-code/0.0.0-fixture", None):
+            with self.subTest(agent=agent):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
+                self.addCleanup(connection.close)
+                headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
+                if agent:
+                    headers["User-Agent"] = agent
+                connection.request("POST", f"/api/organizations/{FIXTURE.ORGANIZATION}/reset_rate_limits",
+                                   body=body, headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read()), {"result": "ineligible", "reason": "surface"})
+                self.assertEqual(self.read(self.claude), before)
+
+    def test_next_grant_selection_preserves_state_and_leaves_both_grants_claimable(self):
         before = self.read(self.claude)
         server = FIXTURE.server(self.root)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -112,7 +181,8 @@ class UsageResetFixture(unittest.TestCase):
         self.addCleanup(server.shutdown)
         connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
-        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json",
+                   "User-Agent": CLI_AGENT}
         for name, identifier, other, scopes in (
                 ("account", "account-fixture", "fable-fixture", ["five_hour", "seven_day"]),
                 ("fable", "fable-fixture", "account-fixture", ["seven_day_overage_included"])):
@@ -129,13 +199,19 @@ class UsageResetFixture(unittest.TestCase):
                 selected = next(item for item in program["grants"] if item["id"] == identifier)
                 self.assertEqual(selected["clears"], scopes)
                 self.assertEqual([item["resets_left"] for item in program["grants"]], [2, 1])
-                connection.request("POST", f"/api/organizations/{FIXTURE.ORGANIZATION}/reset_rate_limits",
-                                   json.dumps({"program": "cedar_ember", "grant_id": other,
-                                               "request_id": f"wrong-scope-{name}"}), headers=headers)
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                self.assertEqual(json.loads(response.read()), {"result": "ineligible", "reason": "not_next_grant"})
-                self.assertEqual(self.read(self.claude), expected)
+                other_grant = next(item for item in program["grants"] if item["id"] == other)
+                self.assertTrue(other_grant["usable_now"])
+
+    def test_a_paused_or_unusable_grant_is_refused_without_spending(self):
+        for change in ("paused", "unusable"):
+            with self.subTest(change=change):
+                with FIXTURE.state_file(self.claude) as state:
+                    grant = state["usage"]["rate_limits"]["cedar_ember"]["grants"][1]
+                    grant["paused"] = change == "paused"
+                    grant["usable_now"] = change != "unusable"
+                self.assertEqual(self.claim("account-fixture", f"refused-{change}")[1],
+                                 {"result": "ineligible", "reason": "not_usable"})
+                self.assertEqual(self.read(self.claude)["consume_count"], 0)
 
     def test_next_grant_selection_refuses_invalid_unmarked_or_unavailable_state(self):
         before = self.read(self.claude)
@@ -193,7 +269,8 @@ class UsageResetFixture(unittest.TestCase):
         body = json.dumps({"program": "cedar_ember", "grant_id": "fable-fixture", "request_id": "post-send"})
         connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=HANG_GUARD)
         self.addCleanup(connection.close)
-        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json",
+                   "User-Agent": CLI_AGENT}
         connection.request("POST", path, body=body, headers=headers)
         with self.assertRaises(http.client.RemoteDisconnected):
             connection.getresponse()
@@ -229,7 +306,8 @@ class UsageResetFixture(unittest.TestCase):
         self.addCleanup(connection.close)
         path = f"/api/organizations/{FIXTURE.ORGANIZATION}/reset_rate_limits"
         body = json.dumps({"program": "cedar_ember", "grant_id": "fable-fixture", "request_id": "unconfirmed-key"})
-        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {FIXTURE.FAKE_TOKEN}", "Content-Type": "application/json",
+                   "User-Agent": CLI_AGENT}
         connection.request("POST", path, body=body, headers=headers)
         first = connection.getresponse()
         self.assertEqual(first.status, 200)

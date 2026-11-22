@@ -664,8 +664,14 @@ Counts, timestamps, identities and messages are invented.
 transport recognizes that marker under the marked fixture root and sends
 only the literal fake bearer `cagents-fixture-only`; it does not read real
 credentials. The listener accepts only that bearer and the invented
-organization. Its private HOME/runtime lets native-evidence stop identify and
-end it with the rest of the task. Start the listener again after restoring a
+organization. Like Claude's service, it offers reset programs only to
+Claude Code's CLI surface: a usage read whose agent is not `claude-cli/…`
+gets `cedar_ember` and `juniper_tide` as ineligible with
+`ineligible_reason: "surface"` and no grants, and a spend from such an agent
+is refused as `{"result": "ineligible", "reason": "surface"}`. Each served
+grant reports `percent_used` for the limits it clears, from the current
+usage. Its private HOME/runtime lets native-evidence stop identify and end
+it with the rest of the task. Start the listener again after restoring a
 seed, since an old port does not identify the new session.
 
 Open Accounts and capture the usage view. Spawn a synthetic Claude chat with
@@ -691,16 +697,23 @@ turn frames are refreshed too, so the Fable card stays limited without an
 available reset. To hit the limit again while retaining the remaining resets,
 use `mode claude limited` or `mode codex limited`. This updates the relevant
 usage windows without changing reset counts, prior claims or consume counts.
+`mode claude fable-unused` sets Fable usage to 0% and clears the Fable wall
+without changing grants, so the Fable reset has nothing to refill and is shown
+as not usable while the account reset stays available.
 Codex then fails a turn only while ordinary usage is blocked; after a fake
 reset it emits an ordinary completed assistant reply, so the native flow can
 verify that work continues. Mode changes share the service's state lock.
 
-For Claude scope confirmations, `usage-reset-scene.sh next-grant fable|account`
-selects one of the two existing grants as the next eligible grant. The account
-grant clears both Session and Weekly; the Fable grant clears only its model
-window. The selector preserves usage, counts, claims and identity, and rejects
-missing, exhausted, paused or unusable grants. It does not submit a consume;
-the service continues to reject a consume for any grant that is not next.
+`usage-reset-scene.sh next-grant fable|account` selects one of the two
+existing grants as `next_grant_id`. The account grant clears both Session and
+Weekly; the Fable grant clears only its model window. The selector preserves
+usage, counts, claims and identity, and rejects missing, exhausted, paused or
+unusable grants. It does not submit a consume. As in Claude Code, the next
+grant is only the suggested one, so it changes nothing cagents shows or
+offers: the service accepts a claim for any usable grant and answers
+`ineligible` for a paused or unusable one. Use it to check that cagents
+ignores the suggestion; choose scope confirmations with `--scope` or the
+reset picker instead.
 
 For Claude plan-label evidence, `usage-reset-scene.sh plan NAME` accepts
 `pro`, `max5x`, `max20x`, `ultra` or `unknown`. It changes the fake profile's
