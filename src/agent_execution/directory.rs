@@ -198,6 +198,9 @@ pub enum TtlBasis {
     Assumed,
     /// What this account's conversations showed surviving.
     Observed,
+    /// The lifetime the provider reported for the conversation's latest
+    /// cache write.
+    Reported,
 }
 
 /// Whether a conversation's prompt cache likely still holds.
@@ -234,9 +237,14 @@ impl Member {
     }
 
     /// Whether the conversation's prompt cache likely still holds at `now`,
-    /// in Unix milliseconds. A working conversation keeps refreshing it.
+    /// in Unix milliseconds. A working conversation keeps refreshing it, and
+    /// an exited one is reopened with its system prompt rebuilt, so its cache
+    /// no longer matches.
     pub fn warmth(&self, now: u64) -> Warmth {
-        if !self.exited && self.session.state == ActivityState::Working {
+        if self.exited {
+            return Warmth::Cold;
+        }
+        if self.session.state == ActivityState::Working {
             return Warmth::Warm;
         }
         match self.cache.as_ref().map(PromptCache::expires_at) {

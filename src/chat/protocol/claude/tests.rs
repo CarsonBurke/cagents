@@ -14759,6 +14759,10 @@ fn a_main_request_reports_its_start_and_what_the_cache_served() {
                 "input_tokens": 12,
                 "cache_read_input_tokens": 90_000,
                 "cache_creation_input_tokens": 3_000,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 3_000,
+                },
             }}}),
         ))
         .unwrap();
@@ -14770,8 +14774,42 @@ fn a_main_request_reports_its_start_and_what_the_cache_served() {
                 prompt: 93_012,
                 cached: 90_000,
             },
+            Evidence::Written {
+                ttl_ms: 60 * 60 * 1000,
+            },
         ]
     );
+
+    // In overage Claude Code writes to the five-minute cache; a request that
+    // only read the cache says nothing of how long it lasts.
+    let step = adapter
+        .receive(stream(
+            json!({"type":"message_start","message":{"id":"n","usage":{
+                "input_tokens": 3,
+                "cache_read_input_tokens": 93_000,
+                "cache_creation_input_tokens": 400,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 400,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+            }}}),
+        ))
+        .unwrap();
+    assert_eq!(
+        evidence(step).last(),
+        Some(&Evidence::Written {
+            ttl_ms: 5 * 60 * 1000,
+        })
+    );
+    let step = adapter
+        .receive(stream(
+            json!({"type":"message_start","message":{"id":"o","usage":{
+                "input_tokens": 3,
+                "cache_read_input_tokens": 93_400,
+            }}}),
+        ))
+        .unwrap();
+    assert_eq!(evidence(step).len(), 2);
 
     // A subagent's request uses a cache of its own.
     let step = adapter

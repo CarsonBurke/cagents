@@ -1,12 +1,14 @@
 //! Estimates how long each provider keeps a conversation's prompt cache.
 //!
-//! A provider's documented time-to-live is only where an estimate starts.
-//! Each conversation's runtime measures whether its cache survived the long
-//! idle gaps it saw (see [`crate::chat::prompt_cache`]); the daemon collects
-//! those observations per provider account whenever it lists sessions, keeps
-//! them across restarts, and lets them correct the assumption: a hit after a
-//! longer gap raises it, and repeated misses within it lower it.
-use crate::account::{AccountId, WindowKind, info::RemainingWindow};
+//! Claude says with each request how long the cache it wrote lasts, so its
+//! estimate rests on that. Other providers keep a cache for a time they only
+//! document, and loosely: there the documented lifetime is where an estimate
+//! starts. Each conversation's runtime measures whether its cache survived
+//! the long idle gaps it saw (see [`crate::chat::prompt_cache`]); the daemon
+//! collects those observations per provider account whenever it lists
+//! sessions, keeps them across restarts, and settles on the lifetime they
+//! contradict least.
+use crate::account::AccountId;
 use crate::agent::Provider;
 use crate::agent_execution::directory::{PromptCache, SessionAccount, TtlBasis};
 use crate::chat::prompt_cache::{Activity, Observation};
@@ -20,7 +22,7 @@ use std::{
 
 const MINUTE_MS: u64 = 60 * 1000;
 const FILE_NAME: &str = "prompt-cache.json";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_BYTES: u64 = 1024 * 1024;
 /// Observations kept per account, newest last.
 const KEPT: usize = 64;
@@ -28,62 +30,54 @@ const KEPT: usize = 64;
 const ACCOUNTS: usize = 32;
 /// The shortest gap a runtime measures; below it nothing is known.
 const SHORTEST_MEASURED_MS: u64 = 2 * MINUTE_MS;
-/// Misses within the assumed TTL that it takes to lower it: one may come
-/// from something other than time, such as a changed system prompt.
-const MISSES_TO_LOWER: usize = 2;
+/// How many more observations a lifetime other than the documented one must
+/// explain: one hit or miss may come from something other than time, such as
+/// a changed system prompt or model.
+const DOCUMENTED_WEIGHT: usize = 1;
 
-/// How long `provider` documents keeping the cache for `account`, when it
-/// says. Claude Code caches for an hour on a subscription and for five
-/// minutes once an account runs into overage; Codex keeps OpenAI's in-memory
-/// retention, five to ten minutes idle.
-fn assumed_ttl(provider: Provider, account: Option<&SessionAccount>) -> Option<u64> {
+/// How long `provider` documents keeping a cache, when it says and the
+/// conversation didn't. Codex keeps OpenAI's in-memory retention, five to
+/// ten minutes idle; Claude reports its lifetime with each request.
+fn assumed_ttl(provider: Provider) -> Option<u64> {
     match provider {
-        Provider::Claude => {
-            // Running past a window the whole account shares is overage; a
-            // spent model-scoped window only stops that model.
-            let overage = account.is_some_and(|account| {
-                account.remaining.iter().any(|window: &RemainingWindow| {
-                    matches!(window.window.kind, WindowKind::Session | WindowKind::Weekly)
-                        && window.remaining_fraction <= 0.0
-                        && !window.reset_elapsed
-                })
-            });
-            Some(if overage { 5 } else { 60 } * MINUTE_MS)
-        }
         Provider::Codex => Some(5 * MINUTE_MS),
-        Provider::Omp | Provider::Antigravity | Provider::Muse => None,
+        Provider::Claude | Provider::Omp | Provider::Antigravity | Provider::Muse => None,
     }
 }
 
-/// The TTL that `observations` support, starting from `assumed`.
+/// The lifetime `observations` contradict least, starting from `assumed`.
+///
+/// A hit after a gap says the cache lasts at least that long, and a miss
+/// says it lasts less. Each candidate lifetime counts the observations it
+/// contradicts, and one other than `assumed` counts [`DOCUMENTED_WEIGHT`]
+/// more. Ties go to the documented lifetime, then to the shorter one, so an
+/// estimate never calls a cache warm on less evidence than it has.
 fn estimate(assumed: Option<u64>, observations: &[Observation]) -> Option<(u64, TtlBasis)> {
-    let longest_hit = observations
+    if observations.is_empty() {
+        return assumed.map(|assumed| (assumed, TtlBasis::Assumed));
+    }
+    let contradicted = |ttl: u64| {
+        observations
+            .iter()
+            .filter(|observation| (observation.gap_ms <= ttl) != observation.hit)
+            .count()
+    };
+    let observed = observations
         .iter()
         .filter(|observation| observation.hit)
         .map(|observation| observation.gap_ms)
-        .max();
-    if let Some(hit) = longest_hit
-        && assumed.is_none_or(|assumed| hit > assumed)
-    {
-        return Some((hit, TtlBasis::Observed));
+        .chain([SHORTEST_MEASURED_MS])
+        .filter(|ttl| Some(*ttl) != assumed)
+        .map(|ttl| (contradicted(ttl) + DOCUMENTED_WEIGHT, ttl))
+        .min();
+    match (assumed, observed) {
+        (Some(assumed), Some((cost, _))) if contradicted(assumed) <= cost => {
+            Some((assumed, TtlBasis::Assumed))
+        }
+        (_, Some((_, ttl))) => Some((ttl, TtlBasis::Observed)),
+        (Some(assumed), None) => Some((assumed, TtlBasis::Assumed)),
+        (None, None) => None,
     }
-    // A miss after a gap no hit outlasted bounds the TTL from above.
-    let misses = observations
-        .iter()
-        .filter(|observation| {
-            !observation.hit
-                && longest_hit.is_none_or(|hit| observation.gap_ms > hit)
-                && assumed.is_none_or(|assumed| observation.gap_ms < assumed)
-        })
-        .count();
-    if misses >= MISSES_TO_LOWER {
-        // Trust only what is known to have survived.
-        return Some((
-            longest_hit.unwrap_or(SHORTEST_MEASURED_MS),
-            TtlBasis::Observed,
-        ));
-    }
-    assumed.map(|assumed| (assumed, TtlBasis::Assumed))
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -98,48 +92,49 @@ struct Account {
     /// added, unlike its wire encoding.
     provider: String,
     account: Option<AccountId>,
-    /// The lifetime the provider documents for the account at the time, so
-    /// that what a Claude account showed in overage, where caches last five
-    /// minutes, doesn't skew what it shows on its subscription.
-    assumed_ttl_ms: Option<u64>,
     observations: Vec<Observation>,
+}
+
+#[derive(Default)]
+struct Accounts {
+    /// Absent until first read from the file.
+    accounts: Option<Vec<Account>>,
+    /// Something was learned that the file doesn't hold yet.
+    unsaved: bool,
 }
 
 /// Every account's observations, and where they are kept.
 pub(in crate::host) struct Calibration {
     /// Absent for a daemon that keeps them in memory only, as tests do.
     path: Option<PathBuf>,
-    accounts: Mutex<Option<Vec<Account>>>,
+    accounts: Mutex<Accounts>,
+    /// Held while saving, so saves land in the order they were taken.
+    saving: Mutex<()>,
 }
 
 impl Calibration {
     /// The running installation's calibration, kept in its cache directory.
     pub(in crate::host) fn installation() -> Self {
-        Self {
-            path: crate::instance::project_dirs().map(|dirs| dirs.cache_dir().join(FILE_NAME)),
-            accounts: Mutex::new(None),
-        }
+        Self::kept_at(crate::instance::project_dirs().map(|dirs| dirs.cache_dir().join(FILE_NAME)))
     }
 
-    #[cfg(test)]
-    fn at(path: PathBuf) -> Self {
+    fn kept_at(path: Option<PathBuf>) -> Self {
         Self {
-            path: Some(path),
-            accounts: Mutex::new(None),
+            path,
+            accounts: Mutex::default(),
+            saving: Mutex::new(()),
         }
     }
 
     pub(in crate::host) fn in_memory() -> Self {
-        Self {
-            path: None,
-            accounts: Mutex::new(Some(Vec::new())),
-        }
+        Self::kept_at(None)
     }
 
-    /// Records what `activity` observed that the calibration doesn't hold
-    /// yet, and estimates the conversation's cache from everything known
-    /// about its account. `None` when no request was observed, or nothing
-    /// says how long the provider keeps a cache.
+    /// Estimates the conversation's cache from what `activity` reports and,
+    /// where its provider doesn't say how long a cache lasts, from what is
+    /// known about its account, which first learns what `activity` observed.
+    /// `None` when no request was observed, or nothing says how long the
+    /// provider keeps a cache. Call [`Self::save`] once done estimating.
     pub(in crate::host) fn estimate(
         &self,
         provider: Provider,
@@ -148,10 +143,28 @@ impl Calibration {
         context_tokens: u64,
     ) -> Option<PromptCache> {
         let requested_at = activity.requested_at?;
+        let (ttl_ms, basis) = match activity.ttl_ms {
+            Some(ttl_ms) => (ttl_ms, TtlBasis::Reported),
+            None => self.calibrate(provider, account, activity.observations)?,
+        };
+        Some(PromptCache {
+            requested_at,
+            ttl_ms,
+            basis,
+            context_tokens,
+        })
+    }
+
+    fn calibrate(
+        &self,
+        provider: Provider,
+        account: Option<&SessionAccount>,
+        observations: Vec<Observation>,
+    ) -> Option<(u64, TtlBasis)> {
         let name = provider.executable();
         let id = account.map(|account| account.id.clone());
-        let assumed = assumed_ttl(provider, account);
-        let mut accounts = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
+        let Accounts { accounts, unsaved } = &mut *state;
         let accounts = accounts.get_or_insert_with(|| {
             self.path
                 .as_deref()
@@ -159,28 +172,20 @@ impl Calibration {
                 .map(|document| document.accounts)
                 .unwrap_or_default()
         });
-        let index = match accounts.iter().position(|known| {
-            known.provider == name && known.account == id && known.assumed_ttl_ms == assumed
-        }) {
-            Some(index) => index,
-            None => {
-                if accounts.len() == ACCOUNTS {
-                    accounts.remove(0);
-                }
-                accounts.push(Account {
-                    provider: name.to_owned(),
-                    account: id,
-                    assumed_ttl_ms: assumed,
-                    observations: Vec::new(),
-                });
-                accounts.len() - 1
-            }
+        let index = accounts
+            .iter()
+            .position(|known| known.provider == name && known.account == id);
+        let mut known = match index {
+            Some(index) => accounts.remove(index),
+            None => Account {
+                provider: name.to_owned(),
+                account: id,
+                observations: Vec::new(),
+            },
         };
-        let known = &mut accounts[index];
         let before = known.observations.clone();
         known.observations.extend(
-            activity
-                .observations
+            observations
                 .into_iter()
                 .filter(|observation| !before.contains(observation)),
         );
@@ -190,25 +195,42 @@ impl Calibration {
         // An observation already dropped as old comes back with every listing
         // while its conversation runs; it teaches nothing.
         let learned = known.observations != before;
-        let (ttl_ms, basis) = estimate(assumed, &known.observations)?;
-        if learned && let Some(path) = &self.path {
+        let estimated = estimate(assumed_ttl(provider), &known.observations);
+        match index {
             // Most recently observed last, so the oldest is dropped first.
-            let observed = accounts.remove(index);
-            accounts.push(observed);
-            let document = Document {
-                version: VERSION,
-                accounts: accounts.clone(),
-            };
-            if let Err(error) = write_document(path, &document) {
-                tracing::warn!(%error, "prompt cache observations were not saved");
+            Some(_) if learned => accounts.push(known),
+            Some(index) => accounts.insert(index, known),
+            None if known.observations.is_empty() => {}
+            None => {
+                if accounts.len() == ACCOUNTS {
+                    accounts.remove(0);
+                }
+                accounts.push(known);
             }
         }
-        Some(PromptCache {
-            requested_at,
-            ttl_ms,
-            basis,
-            context_tokens,
-        })
+        *unsaved |= learned;
+        estimated
+    }
+
+    /// Writes what was learned since the last save to the calibration file.
+    pub(in crate::host) fn save(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let _saving = self.saving.lock().unwrap_or_else(|p| p.into_inner());
+        let document = {
+            let mut state = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
+            if !std::mem::take(&mut state.unsaved) {
+                return;
+            }
+            Document {
+                version: VERSION,
+                accounts: state.accounts.clone().unwrap_or_default(),
+            }
+        };
+        if let Err(error) = write_document(path, &document) {
+            tracing::warn!(%error, "prompt cache observations were not saved");
+        }
     }
 }
 
@@ -247,7 +269,6 @@ fn write_document(path: &Path, document: &Document) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::UsageWindow;
 
     fn observation(at: u64, gap_minutes: u64, hit: bool) -> Observation {
         Observation {
@@ -257,71 +278,72 @@ mod tests {
         }
     }
 
-    fn account(remaining: f32) -> SessionAccount {
+    fn account() -> SessionAccount {
         SessionAccount {
-            id: "claude/system".parse().unwrap(),
+            id: "codex/system".parse().unwrap(),
             label: None,
             status: None,
-            remaining: vec![RemainingWindow {
-                window: UsageWindow {
-                    key: "five_hour".into(),
-                    kind: WindowKind::Session,
-                    label: "5h".into(),
-                    used: 1.0 - remaining,
-                    resets_at: None,
-                    span_secs: None,
-                    binding: false,
-                },
-                remaining_fraction: remaining,
-                reset_elapsed: false,
-            }],
+            remaining: Vec::new(),
             stale: false,
             observed_at: None,
             ordinary_usage_allowed: None,
         }
     }
 
+    fn requested(observations: Vec<Observation>) -> Activity {
+        Activity {
+            requested_at: Some(1),
+            observations,
+            ttl_ms: None,
+        }
+    }
+
     #[test]
     fn the_documented_ttl_holds_until_observations_contradict_it() {
-        let hour = Some(60 * MINUTE_MS);
+        let five = Some(5 * MINUTE_MS);
+        let assumed = Some((5 * MINUTE_MS, TtlBasis::Assumed));
+        assert_eq!(estimate(five, &[]), assumed);
+        // Hits within it, and a single hit or miss against it, change nothing.
         assert_eq!(
-            estimate(hour, &[]),
-            Some((60 * MINUTE_MS, TtlBasis::Assumed))
+            estimate(five, &[observation(1, 3, true), observation(2, 4, false)]),
+            assumed
         );
-        // Hits within it, and a single miss, change nothing.
-        assert_eq!(
-            estimate(hour, &[observation(1, 30, true), observation(2, 40, false)]),
-            Some((60 * MINUTE_MS, TtlBasis::Assumed))
-        );
-        // A hit after a longer gap proves the cache lasts longer.
-        assert_eq!(
-            estimate(hour, &[observation(1, 90, true)]),
-            Some((90 * MINUTE_MS, TtlBasis::Observed))
-        );
-        // Repeated misses beyond every hit, and within the assumption,
-        // lower it to what is known to survive.
+        assert_eq!(estimate(five, &[observation(1, 9, true)]), assumed);
+        // Repeated hits after longer gaps prove the cache lasts longer, as
+        // far as the shortest of them that most observations agree with.
         assert_eq!(
             estimate(
-                hour,
+                five,
                 &[
-                    observation(1, 4, true),
-                    observation(2, 10, false),
-                    observation(3, 20, false),
+                    observation(1, 9, true),
+                    observation(2, 12, true),
+                    observation(3, 30, false),
                 ]
             ),
-            Some((4 * MINUTE_MS, TtlBasis::Observed))
+            Some((12 * MINUTE_MS, TtlBasis::Observed))
         );
-        // Misses no longer than a hit came from something other than time.
+        // Repeated misses within it lower it to what is known to survive.
         assert_eq!(
             estimate(
-                hour,
+                five,
                 &[
-                    observation(1, 30, true),
-                    observation(2, 10, false),
-                    observation(3, 20, false),
+                    observation(1, 3, true),
+                    observation(2, 4, false),
+                    observation(3, 4, false),
                 ]
             ),
-            Some((60 * MINUTE_MS, TtlBasis::Assumed))
+            Some((3 * MINUTE_MS, TtlBasis::Observed))
+        );
+    }
+
+    #[test]
+    fn one_lucky_hit_does_not_outweigh_the_misses_around_it() {
+        let five = Some(5 * MINUTE_MS);
+        let mut observations = vec![observation(1, 9, true)];
+        observations.extend((2..6).map(|at| observation(at, 6 + at % 3, false)));
+        assert_eq!(
+            estimate(five, &observations),
+            Some((5 * MINUTE_MS, TtlBasis::Assumed))
         );
     }
 
@@ -339,97 +361,92 @@ mod tests {
     }
 
     #[test]
-    fn claude_assumes_an_hour_except_in_overage() {
-        assert_eq!(assumed_ttl(Provider::Claude, None), Some(60 * MINUTE_MS));
+    fn a_reported_lifetime_is_taken_as_reported() {
+        let calibration = Calibration::in_memory();
+        let estimated = calibration
+            .estimate(
+                Provider::Claude,
+                None,
+                Activity {
+                    requested_at: Some(7),
+                    // Whatever was observed, the provider said.
+                    observations: vec![observation(1, 3, false), observation(2, 4, false)],
+                    ttl_ms: Some(60 * MINUTE_MS),
+                },
+                120_000,
+            )
+            .unwrap();
         assert_eq!(
-            assumed_ttl(Provider::Claude, Some(&account(0.4))),
-            Some(60 * MINUTE_MS)
+            estimated,
+            PromptCache {
+                requested_at: 7,
+                ttl_ms: 60 * MINUTE_MS,
+                basis: TtlBasis::Reported,
+                context_tokens: 120_000,
+            }
         );
         assert_eq!(
-            assumed_ttl(Provider::Claude, Some(&account(0.0))),
-            Some(5 * MINUTE_MS)
+            calibration.estimate(Provider::Claude, None, requested(Vec::new()), 0),
+            None,
+            "Claude has not said how long its cache lasts"
         );
-        assert_eq!(assumed_ttl(Provider::Codex, None), Some(5 * MINUTE_MS));
-        assert_eq!(assumed_ttl(Provider::Omp, None), None);
+        assert_eq!(
+            calibration.estimate(Provider::Codex, None, Activity::default(), 0),
+            None,
+            "no request was observed"
+        );
+        assert_eq!(
+            calibration.estimate(Provider::Omp, None, requested(Vec::new()), 0),
+            None,
+            "nothing says how long the cache lasts"
+        );
     }
 
     #[test]
     fn observations_are_collected_once_and_kept_across_restarts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cache").join(FILE_NAME);
-        let activity = Activity {
-            requested_at: Some(500 * MINUTE_MS),
-            observations: vec![observation(100, 90, true)],
-        };
-        let calibration = Calibration::at(path.clone());
+        let activity = requested(vec![observation(100, 9, true), observation(200, 12, true)]);
+        let calibration = Calibration::kept_at(Some(path.clone()));
         let estimated = calibration
-            .estimate(Provider::Claude, None, activity.clone(), 120_000)
+            .estimate(Provider::Codex, None, activity.clone(), 120_000)
             .unwrap();
         assert_eq!(
-            estimated,
-            PromptCache {
-                requested_at: 500 * MINUTE_MS,
-                ttl_ms: 90 * MINUTE_MS,
-                basis: TtlBasis::Observed,
-                context_tokens: 120_000,
-            }
+            (estimated.ttl_ms, estimated.basis),
+            (12 * MINUTE_MS, TtlBasis::Observed)
         );
-        // Listing again collects nothing new.
-        calibration.estimate(Provider::Claude, None, activity, 120_000);
+        assert!(!path.exists(), "saved only once asked");
+        calibration.save();
+        let saved = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Listing again collects nothing new, so nothing is written.
+        calibration.estimate(Provider::Codex, None, activity, 120_000);
+        calibration.save();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), saved);
 
-        let restarted = Calibration::at(path);
+        let restarted = Calibration::kept_at(Some(path.clone()));
         let estimated = restarted
-            .estimate(
-                Provider::Claude,
-                None,
-                Activity {
-                    requested_at: Some(7),
-                    observations: Vec::new(),
-                },
-                1_000,
-            )
+            .estimate(Provider::Codex, None, requested(Vec::new()), 1_000)
             .unwrap();
-        assert_eq!(estimated.ttl_ms, 90 * MINUTE_MS);
-        let saved = read_document(&directory.path().join("cache").join(FILE_NAME)).unwrap();
+        assert_eq!(estimated.ttl_ms, 12 * MINUTE_MS);
+        let saved = read_document(&path).unwrap();
         assert_eq!(saved.accounts.len(), 1);
-        assert_eq!(saved.accounts[0].observations.len(), 1);
+        assert_eq!(saved.accounts[0].observations.len(), 2);
     }
 
     #[test]
-    fn each_account_and_regime_is_calibrated_on_its_own() {
+    fn each_account_is_calibrated_on_its_own() {
         let calibration = Calibration::in_memory();
-        let requested = Activity {
-            requested_at: Some(1),
-            observations: Vec::new(),
-        };
-        let observed = Activity {
-            requested_at: Some(1),
-            observations: vec![observation(1, 20, false), observation(2, 30, false)],
-        };
-        let overage = calibration
-            .estimate(Provider::Claude, Some(&account(0.0)), observed, 0)
+        let observed = requested(vec![observation(1, 9, true), observation(2, 12, true)]);
+        let longer = calibration
+            .estimate(Provider::Codex, Some(&account()), observed, 0)
             .unwrap();
-        assert_eq!(overage.ttl_ms, 5 * MINUTE_MS);
-        // Misses that overage expects would lower an hour; they don't reach
-        // the same account on its subscription, or another account.
-        for account in [Some(account(0.5)), None] {
-            let estimated = calibration
-                .estimate(Provider::Claude, account.as_ref(), requested.clone(), 0)
-                .unwrap();
-            assert_eq!(
-                (estimated.ttl_ms, estimated.basis),
-                (60 * MINUTE_MS, TtlBasis::Assumed)
-            );
-        }
+        assert_eq!(longer.ttl_ms, 12 * MINUTE_MS);
+        let other = calibration
+            .estimate(Provider::Codex, None, requested(Vec::new()), 0)
+            .unwrap();
         assert_eq!(
-            calibration.estimate(Provider::Claude, None, Activity::default(), 0),
-            None,
-            "no request was observed"
-        );
-        assert_eq!(
-            calibration.estimate(Provider::Omp, None, requested, 0),
-            None,
-            "nothing says how long the cache lasts"
+            (other.ttl_ms, other.basis),
+            (5 * MINUTE_MS, TtlBasis::Assumed)
         );
     }
 
@@ -437,20 +454,18 @@ mod tests {
     fn an_observation_dropped_as_old_is_not_learned_again() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(FILE_NAME);
-        let calibration = Calibration::at(path.clone());
-        let newer = Activity {
-            requested_at: Some(1),
-            observations: (0..KEPT as u64)
-                .map(|at| observation(1_000 + at, 10, true))
+        let calibration = Calibration::kept_at(Some(path.clone()));
+        let newer = requested(
+            (0..KEPT as u64)
+                .map(|at| observation(1_000 + at, 3, true))
                 .collect(),
-        };
-        calibration.estimate(Provider::Claude, None, newer, 0);
+        );
+        calibration.estimate(Provider::Codex, None, newer, 0);
+        calibration.save();
         std::fs::remove_file(&path).unwrap();
-        let old = Activity {
-            requested_at: Some(1),
-            observations: vec![observation(5, 10, true)],
-        };
-        calibration.estimate(Provider::Claude, None, old, 0);
+        let old = requested(vec![observation(5, 3, true)]);
+        calibration.estimate(Provider::Codex, None, old, 0);
+        calibration.save();
         assert!(!path.exists(), "nothing changed, so nothing was written");
     }
 }

@@ -474,6 +474,9 @@ pub(super) fn list(
         .map(|member| member.session.id)
         .collect::<HashSet<_>>();
     saved.retain(|id, _| listed.contains(id));
+    if let Some(calibration) = &calibration {
+        calibration.save();
+    }
     Ok(Listing {
         caller: me,
         sessions,

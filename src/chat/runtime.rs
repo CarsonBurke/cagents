@@ -251,7 +251,10 @@ struct PromptCache(Arc<Mutex<crate::chat::prompt_cache::Tracker>>);
 
 impl PromptCache {
     fn observe(&self, evidence: crate::chat::prompt_cache::Evidence) -> bool {
-        let now = observed_at().unwrap_or_default();
+        // Without a clock nothing says when the request started.
+        let Some(now) = observed_at() else {
+            return false;
+        };
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())

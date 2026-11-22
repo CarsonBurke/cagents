@@ -4,10 +4,11 @@
 //! that reads or writes it starts. A request after the cache expired reads
 //! the whole context again at full price. The adapters report two kinds of
 //! evidence from live provider activity only, never from replayed history:
-//! that a model request for the main conversation started, and how much of
-//! a request's prompt the cache served. The runtime keeps the latest request
-//! time and measures, across each long idle gap, whether the cache survived
-//! it; the daemon turns that into an estimate of when the cache expires.
+//! that a model request for the main conversation started, how much of a
+//! request's prompt the cache served, and, where the provider says, how long
+//! the cache it wrote lasts. The runtime keeps the latest request time and
+//! measures, across each long idle gap, whether the cache survived it; the
+//! daemon turns that into an estimate of when the cache expires.
 use serde::{Deserialize, Serialize};
 
 /// Live evidence an adapter reports about the main conversation's cache.
@@ -24,6 +25,9 @@ pub enum Evidence {
     /// A request's prompt was `prompt` input tokens, of which the cache
     /// served `cached`.
     Read { prompt: u64, cached: u64 },
+    /// The request wrote the prompt to a cache the provider keeps for
+    /// `ttl_ms` after its latest use, as Claude reports with each request.
+    Written { ttl_ms: u64 },
 }
 
 /// Whether the cache survived an idle gap: the first request after a gap of
@@ -40,12 +44,18 @@ pub struct Observation {
 /// What a conversation's runtime knows about its cache, as the helper that
 /// hosts a retained conversation reports it to the daemon.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Activity {
     /// Unix milliseconds at which the latest model request for the
-    /// conversation started, as the runtime observed it.
+    /// conversation started, as the runtime observed it. A request that
+    /// failed before the provider reported anything of it doesn't count, as
+    /// it may not have reached the cache.
     pub requested_at: Option<u64>,
     /// The latest observations, oldest first, at most [`Tracker::KEPT`].
     pub observations: Vec<Observation>,
+    /// How long the provider said it keeps the conversation's latest cache
+    /// write, where it says.
+    pub ttl_ms: Option<u64>,
 }
 
 /// Shorter gaps say little about how long a cache lasts, and every TTL a
@@ -63,6 +73,9 @@ const MIN_PROMPT_TOKENS: u64 = 4096;
 #[derive(Debug, Default)]
 pub(crate) struct Tracker {
     activity: Activity,
+    /// When the latest request started, until the provider reports
+    /// something of it.
+    pending: Option<u64>,
     /// The gap before the latest request, until a reading says whether the
     /// cache survived it.
     measuring: Option<(u64, u64)>,
@@ -81,30 +94,39 @@ impl Tracker {
     pub(crate) fn observe(&mut self, evidence: Evidence, now: u64) -> bool {
         match evidence {
             Evidence::Request => {
+                // A request that failed unreported, such as one a usage
+                // limit refused, neither refreshed the cache nor measured it.
                 self.measuring = self
                     .activity
                     .requested_at
                     .map(|previous| now.saturating_sub(previous))
                     .filter(|gap| *gap >= MIN_GAP_MS)
                     .map(|gap| (now, gap));
-                self.activity.requested_at = Some(now);
-                true
+                self.pending = Some(now);
+                false
             }
             Evidence::Continued => {
+                self.pending = None;
                 self.activity.requested_at = Some(now);
                 true
             }
+            Evidence::Written { ttl_ms } => {
+                let confirmed = self.confirm();
+                let changed = self.activity.ttl_ms.replace(ttl_ms) != Some(ttl_ms);
+                confirmed || changed
+            }
             Evidence::Read { prompt, cached } => {
+                let confirmed = self.confirm();
                 let before = self.prompt.replace(prompt);
                 let Some((at, gap_ms)) = self.measuring.take() else {
-                    return false;
+                    return confirmed;
                 };
                 // A conversation that shrank, as compaction does, starts a
                 // new cache; one too small may not have been cached at all.
                 let Some(before) =
                     before.filter(|before| *before >= MIN_PROMPT_TOKENS && *before <= prompt)
                 else {
-                    return false;
+                    return confirmed;
                 };
                 let observations = &mut self.activity.observations;
                 if observations.len() == Self::KEPT {
@@ -125,6 +147,16 @@ impl Tracker {
 
     pub(crate) fn activity(&self) -> Activity {
         self.activity.clone()
+    }
+
+    /// The provider reported on the pending request, so it reached the
+    /// cache. Says whether the activity changed.
+    fn confirm(&mut self) -> bool {
+        let Some(at) = self.pending.take() else {
+            return false;
+        };
+        self.activity.requested_at = Some(at);
+        true
     }
 }
 
@@ -257,6 +289,51 @@ mod tests {
                 hit: true,
             }]
         );
+    }
+
+    #[test]
+    fn a_request_that_failed_unreported_neither_refreshes_nor_measures() {
+        let mut tracker = Tracker::default();
+        let read = |prompt, cached| Evidence::Read { prompt, cached };
+        tracker.observe(Evidence::Request, 0);
+        tracker.observe(read(40_000, 39_000), 0);
+        // Refused after an hour idle, as a usage limit refuses it.
+        assert!(!tracker.observe(Evidence::Request, 60 * MINUTE));
+        assert_eq!(tracker.activity().requested_at, Some(0));
+        // The retry measures the whole hour, not the minutes since.
+        tracker.observe(Evidence::Request, 63 * MINUTE);
+        tracker.observe(read(41_000, 1_000), 63 * MINUTE);
+        let activity = tracker.activity();
+        assert_eq!(activity.requested_at, Some(63 * MINUTE));
+        assert_eq!(
+            activity.observations,
+            [Observation {
+                at: 63 * MINUTE,
+                gap_ms: 63 * MINUTE,
+                hit: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_reported_lifetime_confirms_the_request_and_is_kept() {
+        let mut tracker = Tracker::default();
+        tracker.observe(Evidence::Request, 5);
+        assert!(tracker.observe(
+            Evidence::Written {
+                ttl_ms: 60 * MINUTE
+            },
+            5
+        ));
+        assert!(!tracker.observe(
+            Evidence::Written {
+                ttl_ms: 60 * MINUTE
+            },
+            5
+        ));
+        let activity = tracker.activity();
+        assert_eq!(activity.requested_at, Some(5));
+        assert_eq!(activity.ttl_ms, Some(60 * MINUTE));
     }
 
     #[test]
