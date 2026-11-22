@@ -39,6 +39,15 @@ use std::{
     time::{Duration, Instant},
 };
 const ARGUMENT: &str = "--cagents-native-actor";
+// A retained helper has one reducer and one bounded socket-command worker.
+// glibc can otherwise add arenas while those threads allocate concurrently,
+// and keeps each arena's 64 MiB address-space reservation for
+// the helper's lifetime.  The actor is overwhelmingly I/O-bound, so one arena
+// avoids per-chat heap fragmentation without a meaningful allocation
+// contention cost.  This must be in the exec environment: glibc reads it
+// before Rust can call `mallopt`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const MALLOC_ARENA_MAX: &str = "1";
 pub(super) const PROTOCOL: u32 = 2;
 const CAPABILITY: &str = registry::RETAINED_CLAUDE_CAPABILITY;
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -89,6 +98,12 @@ fn unrun_input_outcome(refusal: QueueRefusal) -> &'static str {
 /// A helper's answer to a request it does not implement, such as an older
 /// helper asked to settle an input.
 const UNKNOWN_METHOD: &str = "Unknown retained actor method/version";
+
+fn configure_helper_allocator(command: &mut ChildCommand) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    command.env("MALLOC_ARENA_MAX", MALLOC_ARENA_MAX);
+}
+
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -1015,6 +1030,7 @@ impl RemoteActor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        configure_helper_allocator(&mut command);
         // Exec resets the process-local saved limit. Restore it before the
         // helper starts, so its provider and tools inherit the caller's limit.
         crate::host::descriptor_limit::inherit(&mut command);

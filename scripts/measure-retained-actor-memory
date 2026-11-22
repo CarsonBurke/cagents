@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Report resident retained-actor memory from Linux /proc.
+
+The output deliberately keeps RSS and PSS separate.  A helper's executable
+text is shared with the daemon and other helpers, so summing RSS makes it look
+like every chat privately owns the same pages.  PSS apportions those shared
+pages and is the useful aggregate measure for a set of actors.
+"""
+import argparse
+import os
+from collections import defaultdict
+from pathlib import Path
+
+
+FIELDS = ("Size", "Rss", "Pss", "Private_Clean", "Private_Dirty", "Shared_Clean", "Shared_Dirty", "Swap", "SwapPss")
+
+
+def kib(value):
+    return f"{value / 1024:.2f} MiB"
+
+
+def parse_smaps(pid):
+    maps = []
+    block = None
+    for line in Path(f"/proc/{pid}/smaps").read_text().splitlines():
+        parts = line.split(maxsplit=5)
+        if parts and "-" in parts[0] and len(parts) >= 5 and all(c in "0123456789abcdef" for c in parts[0].replace("-", "")):
+            if block:
+                maps.append(block)
+            block = {
+                "range": parts[0],
+                "perms": parts[1],
+                "path": parts[5] if len(parts) == 6 else "",
+                **{field: 0 for field in FIELDS},
+            }
+            continue
+        if block and parts and parts[0].rstrip(":") in FIELDS:
+            block[parts[0].rstrip(":")] = int(parts[1])
+    if block:
+        maps.append(block)
+    return maps
+
+
+def anonymous(mapping):
+    return not mapping["path"] or mapping["path"].startswith("[")
+
+
+def arena_reservations(maps):
+    """Find glibc's 132 KiB committed + 65404 KiB PROT_NONE arena pattern."""
+    arenas = []
+    for current, following in zip(maps, maps[1:]):
+        if (anonymous(current) and current["perms"].startswith("rw-p")
+                and current["Size"] == 132 and anonymous(following)
+                and following["perms"].startswith("---p")
+                and following["Size"] == 65404):
+            arenas.append(current)
+    return arenas
+
+
+def guarded_stacks(maps):
+    """Find Rust pthread stacks; exited stacks can remain in glibc's cache."""
+    stacks = []
+    for current, following in zip(maps, maps[1:]):
+        if (anonymous(current) and current["perms"].startswith("---p")
+                and current["Size"] == 4 and anonymous(following)
+                and following["perms"].startswith("rw-p")
+                and following["Size"] >= 1024):
+            stacks.append(following)
+    return stacks
+
+
+def category(mapping):
+    path = mapping["path"]
+    if path == "[heap]":
+        return "heap"
+    if path.startswith("[stack"):
+        return "main stack"
+    if path.endswith(("cagentsd", "cagents-native")) and "x" in mapping["perms"]:
+        return "actor code/text"
+    if ".so" in path or "/ld-linux" in path:
+        return "shared libraries"
+    if anonymous(mapping):
+        return "other anonymous"
+    return "other file-backed"
+
+
+def process_name(pid):
+    command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    return command or "<exited>"
+
+
+def eligible_pids(environment):
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if b"--cagents-native-actor" not in command:
+                continue
+            if environment:
+                values = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+                if environment.encode() not in values:
+                    continue
+            yield pid
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+
+
+def report(pid):
+    maps = parse_smaps(pid)
+    categories = defaultdict(lambda: defaultdict(int))
+    for mapping in maps:
+        for field in FIELDS:
+            categories[category(mapping)][field] += mapping[field]
+    rollup = {field: 0 for field in FIELDS}
+    for mapping in maps:
+        for field in FIELDS:
+            rollup[field] += mapping[field]
+    threads = len(list(Path(f"/proc/{pid}/task").iterdir()))
+    arenas = arena_reservations(maps)
+    stacks = guarded_stacks(maps)
+    main_stacks = [mapping for mapping in maps if mapping["path"].startswith("[stack")]
+    print(f"pid={pid} threads={threads} {process_name(pid)}")
+    print("  category                  virtual       RSS       PSS  private-dirty")
+    for name in ("heap", "main stack", "actor code/text", "shared libraries", "other anonymous", "other file-backed"):
+        values = categories[name]
+        print(f"  {name:<24} {kib(values['Size']):>10} {kib(values['Rss']):>10} {kib(values['Pss']):>10} {kib(values['Private_Dirty']):>14}")
+    print(f"  {'smaps total':<24} {kib(rollup['Size']):>10} {kib(rollup['Rss']):>10} {kib(rollup['Pss']):>10} {kib(rollup['Private_Dirty']):>14}")
+    print(f"  glibc arenas={len(arenas)} reserved={kib(sum(item['Size'] + 65404 for item in arenas))} committed RSS={kib(sum(item['Rss'] for item in arenas))}")
+    print(f"  stacks: named={len(main_stacks)} {kib(sum(item['Size'] for item in main_stacks))} virtual / {kib(sum(item['Rss'] for item in main_stacks))} RSS; guarded mappings={len(stacks)} {kib(sum(item['Size'] for item in stacks))} virtual / {kib(sum(item['Rss'] for item in stacks))} RSS")
+    return rollup
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pid", type=int, action="append", help="inspect this actor PID (repeatable)")
+    parser.add_argument("--environ", help="only actors with this exact NAME=value environment entry")
+    args = parser.parse_args()
+    pids = args.pid or list(eligible_pids(args.environ))
+    if not pids:
+        parser.error("no retained actors found")
+    total = defaultdict(int)
+    for pid in pids:
+        try:
+            rollup = report(pid)
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            print(f"pid={pid} exited before measurement")
+            continue
+        for field in FIELDS:
+            total[field] += rollup[field]
+    print(f"actors={len(pids)} summed RSS={kib(total['Rss'])} summed PSS={kib(total['Pss'])} private-dirty={kib(total['Private_Dirty'])} swap={kib(total['Swap'])}")
+    print("Note: RSS is not additive for shared text/libraries. PSS is additive; arena and stack reservations are virtual unless their RSS is shown.")
+
+
+if __name__ == "__main__":
+    main()

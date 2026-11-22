@@ -11,6 +11,7 @@
 - [Workspace model edits](#workspace-model-edits)
 - [Native chat viewport](#native-chat-viewport)
 - [Idle retained actors](#idle-retained-actors)
+- [Retained actor memory](#retained-actor-memory)
 - [Work board polling](#work-board-polling)
 - [Git watcher during builds](#git-watcher-during-builds)
 - [Reference results](#reference-results)
@@ -844,6 +845,34 @@ CPU across all 45 actors fell from 3.32% to 0.08% of one core.
 The remaining wakeups are that sweeper's 8 s ceiling, about one per actor every
 7.6 s: cgroup v2 has no fork notification, so the sweep is what finds a command
 started without an announcement.
+
+## Retained actor memory
+
+Measure one and twenty settled fixture actors with the same matched binaries;
+run the two commands on the same otherwise-idle workstation:
+
+```sh
+scripts/measure-idle-actors BIN_DIR 1 5
+scripts/measure-idle-actors BIN_DIR 20 5
+```
+
+Before its wakeup sample, the fixture prints each helper's `smaps` categories,
+active thread count, guarded Rust-stack mappings, and glibc arena reservations.
+It also prints both the summed RSS and PSS. RSS is intentionally not used as a
+set total: executable text and shared libraries are largely the same physical
+pages in every helper. PSS apportions those pages and is additive across the
+actor set. Arena and stack *reservation* is virtual address space; use the
+adjacent RSS/PSS figures to decide whether it is consuming RAM.
+
+For an already-running daemon, inspect only its retained Claude helpers with:
+
+```sh
+scripts/measure-retained-actor-memory
+```
+
+Pass `--environ NAME=value` to constrain it to one fixture runtime, or repeat
+`--pid PID` to make a stable before/after comparison. The tool reads `/proc`
+only and never attaches to, pauses, or signals a process.
 
 ## Work board polling
 

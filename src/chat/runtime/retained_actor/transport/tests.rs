@@ -1,5 +1,20 @@
 use super::*;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn retained_helper_caps_glibc_arenas_before_exec() {
+    let mut command = ChildCommand::new("retained-helper-fixture");
+    configure_helper_allocator(&mut command);
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "MALLOC_ARENA_MAX")
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str()),
+        Some(MALLOC_ARENA_MAX)
+    );
+}
+
 #[test]
 fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
     if crate::retained_fixture::run_isolated() {
