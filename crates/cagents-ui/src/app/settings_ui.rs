@@ -592,35 +592,43 @@ fn settings_category_controls<'a>(
                 ),
             ]
         }
-        SettingsCategory::NativeChat => vec![
-        settings_group(
-            "Native chat",
-            "Message composition and conversation presentation.",
-            vec![
-                crate::settings_widgets::toggle(
-                    "Enter sends a chat message",
-                    "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
-                    draft.chat_enter_sends,
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::ChatEnterSends,
-                        value: enabled.to_string(),
-                    },
-                )
-                .keywords("Chat send key chat_send_key"),
-                crate::settings_widgets::toggle(
-                    "Expand tool groups by default",
-                    "Choose whether new tool-call groups start expanded. Individual disclosure choices are remembered while paging.",
-                    draft.chat_expand_tool_groups,
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::ChatExpandToolGroups,
-                        value: enabled.to_string(),
-                    },
-                )
-                .keywords("tool_groups"),
-            ],
-        ),
-        dictation_group(draft, &context.dictation),
-        ],
+        SettingsCategory::NativeChat => {
+            let messages = settings_group(
+                // Alone, the group is the page and takes its name; beside
+                // Dictation it is about the messages themselves.
+                if context.dictation.available {
+                    "Messages"
+                } else {
+                    "Native chat"
+                },
+                "Message composition and conversation presentation.",
+                vec![
+                    crate::settings_widgets::toggle(
+                        "Enter sends a chat message",
+                        "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
+                        draft.chat_enter_sends,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ChatEnterSends,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("Chat send key chat_send_key"),
+                    crate::settings_widgets::toggle(
+                        "Expand tool groups by default",
+                        "Choose whether new tool-call groups start expanded. Individual disclosure choices are remembered while paging.",
+                        draft.chat_expand_tool_groups,
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::ChatExpandToolGroups,
+                            value: enabled.to_string(),
+                        },
+                    )
+                    .keywords("tool_groups"),
+                ],
+            );
+            std::iter::once(messages)
+                .chain(dictation_group(draft, &context.dictation))
+                .collect()
+        }
         SettingsCategory::Inspector => vec![
             settings_group(
                 "Inspector",
@@ -1417,18 +1425,15 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
 }
 
 /// Dictation: which speech model, downloading or removing it, and whether
-/// stopping sends.
+/// stopping sends. None where this copy of cagents cannot dictate.
 fn dictation_group<'a>(
     draft: &'a SettingsDraft,
     dictation: &DictationSettings<'a>,
-) -> Group<'a, Message> {
+) -> Option<Group<'a, Message>> {
     use cagents_dictate::catalog;
+    // A copy of cagents without the helper offers no dictation.
     if !dictation.available {
-        return settings_group(
-            "Dictation",
-            "Dictation is not part of this installation of cagents yet.",
-            Vec::new(),
-        );
+        return None;
     }
     let chosen = chat_ui::chosen_model(&draft.dictation_model);
     let rows: Vec<Element<'a, Message>> =
@@ -1528,11 +1533,11 @@ fn dictation_group<'a>(
         },
     )
     .keywords("dictation speech voice dictation_sends");
-    settings_group(
+    Some(settings_group(
         "Dictation",
         "Speak a message instead of typing it, with the microphone beside the draft or its shortcut.",
         vec![models, sends],
-    )
+    ))
 }
 
 fn shortcut_group(field: SettingsField) -> &'static str {
