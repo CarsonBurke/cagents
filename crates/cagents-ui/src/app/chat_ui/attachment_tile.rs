@@ -4,7 +4,8 @@
 //! At rest it shows only its face. While the pointer is over it, while it
 //! holds keyboard focus, or while the composer's caret is on its `[Image N]`
 //! reference, it also shows its label and its remove (×) button. Click,
-//! Enter or Space opens it; Delete or Backspace removes it. The × sits
+//! Enter or Space opens it; Delete or Backspace removes it; the message's
+//! undo and redo chords reach the message's history. The × sits
 //! inside the tile, so it never reaches over a neighbour or the tray's edge.
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
@@ -27,6 +28,10 @@ pub(super) struct Tile<'a, Message> {
     marked: bool,
     on_open: Option<Message>,
     on_remove: Option<Message>,
+    /// The message's undo and redo, which a focused tile passes on so the
+    /// removal it just made can be taken back without leaving the tray.
+    on_undo: Option<Message>,
+    on_redo: Option<Message>,
 }
 
 pub(super) fn tile<'a, Message: Clone + 'a>(
@@ -44,6 +49,8 @@ pub(super) fn tile<'a, Message: Clone + 'a>(
         marked: false,
         on_open: None,
         on_remove,
+        on_undo: None,
+        on_redo: None,
     }
 }
 
@@ -51,6 +58,14 @@ impl<'a, Message> Tile<'a, Message> {
     /// What Click, Enter and Space do; a tile without it only removes.
     pub(super) fn on_open(mut self, message: Option<Message>) -> Self {
         self.on_open = message;
+        self
+    }
+
+    /// What Ctrl+Z, and Ctrl+Shift+Z or Ctrl+Y, do while the tile has the
+    /// keyboard; a chord without one is left to the workspace.
+    pub(super) fn on_history(mut self, undo: Option<Message>, redo: Option<Message>) -> Self {
+        self.on_undo = undo;
+        self.on_redo = redo;
         self
     }
 
@@ -233,6 +248,26 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
                 } else if state.focused {
                     state.focused = false;
                     shell.request_redraw();
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if state.focused && modifiers.command() && !modifiers.alt() => {
+                let message = match key
+                    .to_latin(*physical_key)
+                    .map(|letter| letter.to_ascii_lowercase())
+                {
+                    Some('z') if modifiers.shift() => self.on_redo.clone(),
+                    Some('z') => self.on_undo.clone(),
+                    Some('y') if !modifiers.shift() => self.on_redo.clone(),
+                    _ => None,
+                };
+                if let Some(message) = message {
+                    shell.publish(message);
+                    shell.capture_event();
                 }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -449,7 +484,9 @@ mod tests {
                     format!("Image {}", index + 1),
                     Some(200 + index),
                 )
-                .on_open(Some(index)),
+                .on_open(Some(index))
+                // The message has a step to undo and none to redo.
+                .on_history(Some(300), None),
                 cosmic::widget::text("screenshot.png"),
                 cosmic::widget::tooltip::Position::Top,
             )
@@ -513,5 +550,53 @@ mod tests {
             [ids[0].clone()],
             "only the clicked tile holds focus"
         );
+    }
+
+    #[test]
+    fn a_focused_tile_passes_the_messages_undo_on_and_leaves_a_missing_redo() {
+        use keyboard::key::{Code, Physical};
+        let ids = [widget::Id::unique(), widget::Id::unique()];
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = UserInterface::build(
+            tray(&ids),
+            Size::new(400.0, 100.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let mut focus = operation::focusable::focus(ids[0].clone());
+        ui.operate(&renderer, &mut focus);
+        let chord = |letter: &str, code, modifiers| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(letter.into()),
+                modified_key: keyboard::Key::Character(letter.into()),
+                physical_key: Physical::Code(code),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            })
+        };
+        let control = keyboard::Modifiers::CTRL;
+        for (event, expected) in [
+            (chord("z", Code::KeyZ, control), vec![300]),
+            // With nothing to redo, the workspace keeps Ctrl+Shift+Z.
+            (
+                chord("z", Code::KeyZ, control | keyboard::Modifiers::SHIFT),
+                vec![],
+            ),
+            (chord("y", Code::KeyY, control), vec![]),
+        ] {
+            let mut messages = Vec::new();
+            let (_, statuses) = ui.update(
+                &[event],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let captured = statuses[0] == cosmic::iced::event::Status::Captured;
+            assert_eq!(captured, !expected.is_empty());
+            assert_eq!(messages, expected);
+        }
     }
 }

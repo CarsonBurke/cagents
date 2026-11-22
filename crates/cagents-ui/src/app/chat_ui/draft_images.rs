@@ -381,6 +381,31 @@ pub(super) fn reconcile(
     Reconciled { changed, refused }
 }
 
+/// Keeps `refused` images, whose references the draft holds as text, as
+/// detached at the end of `attachments`: like an image whose reference was
+/// taken out, one returns when an edit brings its reference back with room.
+pub(super) fn wait(
+    detached: &mut Vec<Detached>,
+    attachments: &[Attachment],
+    refused: impl IntoIterator<Item = Attachment>,
+) {
+    let id = |attachment: &Attachment| attachment.reference.as_ref().map(|r| r.id);
+    for attachment in refused {
+        if !detached
+            .iter()
+            .any(|entry| id(&entry.attachment) == id(&attachment))
+        {
+            detached.push(Detached {
+                index: attachments.len(),
+                attachment,
+            });
+        }
+    }
+    if detached.len() > MAX_DETACHED {
+        detached.drain(..detached.len() - MAX_DETACHED);
+    }
+}
+
 /// What [`reconcile`] did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct Reconciled {

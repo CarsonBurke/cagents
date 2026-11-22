@@ -4024,6 +4024,16 @@ impl Runtime {
         if !notes.is_empty() {
             self.composer_note = Some(notes.join(" "));
         }
+        // An image left out only for the limit is kept as one whose
+        // reference was taken out, so bringing the reference back once there
+        // is room, as a redo of this paste does, attaches it.
+        let mut fits = fits;
+        let over = if self.accepts_draft_attachments() {
+            fits.split_off(room.min(fits.len()))
+        } else {
+            Vec::new()
+        };
+        draft_images::wait(&mut self.detached_attachments, &self.attachments, over);
         self.merge_attachments(fits.into_iter().take(room));
         self.follow_caret_reference();
     }

@@ -402,15 +402,8 @@ fn the_focused_composer_takes_undo_and_redo_chords() {
         repeat: false,
     };
     let control = keyboard::Modifiers::CTRL;
-    for (event, redo) in [
-        (chord("z", Code::KeyZ, control), false),
-        (
-            chord("z", Code::KeyZ, control | keyboard::Modifiers::SHIFT),
-            true,
-        ),
-        (chord("y", Code::KeyY, control), true),
-    ] {
-        let messages = composer_key_messages(&app, card, 720.0, event, &renderer);
+    let takes = |app: &Cagents, event, redo: bool| {
+        let messages = composer_key_messages(app, card, 720.0, event, &renderer);
         assert!(
             messages.iter().any(|message| matches!(
                 message,
@@ -419,18 +412,19 @@ fn the_focused_composer_takes_undo_and_redo_chords() {
             )),
             "redo: {redo}"
         );
-    }
-    let messages = composer_key_messages(
-        &app,
-        card,
-        720.0,
-        chord("z", Code::KeyZ, control),
-        &renderer,
-    );
-    for message in messages {
+        messages
+    };
+    for message in takes(&app, chord("z", Code::KeyZ, control), false) {
         drop(app.update(message));
     }
     assert_eq!(chat_runtime(&app, card).composer.text(), "");
+    // With the step undone there is one to redo, on either chord.
+    takes(
+        &app,
+        chord("z", Code::KeyZ, control | keyboard::Modifiers::SHIFT),
+        true,
+    );
+    takes(&app, chord("y", Code::KeyY, control), true);
 }
 
 #[test]
@@ -755,6 +749,88 @@ fn copying_a_reference_into_another_draft_brings_its_image() {
         // The draft it came from still has it.
         assert_eq!(app.chat_runtime_mut(source).unwrap().attachments, [image]);
     });
+}
+
+#[test]
+fn an_image_a_full_draft_refused_from_a_paste_comes_with_its_redo_once_there_is_room() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|image| {
+        let limit = chat::AttachmentRules::for_provider(Provider::Claude)
+            .max_count
+            .unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let source = draft_with_images(&mut app, "Here ", &[image.clone()]);
+        let reference = token(&image);
+        let full = app.chat_runtime_mut(source).unwrap().composer.text();
+        let start = full.find(&reference).unwrap();
+        place(&mut app, source, start + reference.len(), Some(start));
+        drop(app.handle_chat_ui(Action::ComposerCopied(source)));
+
+        // A Claude draft already holding its limit of files.
+        let card = draft_chat_for_provider(&mut app, Provider::Claude);
+        let other = chat_runtime(&app, card).target;
+        let files: Vec<PathBuf> = (0..limit)
+            .map(|n| PathBuf::from(format!("/project/notes-{n}.txt")))
+            .collect();
+        app.chat_runtime_mut(other).unwrap().attach(files);
+        let ticket = app
+            .chat_runtime_mut(other)
+            .unwrap()
+            .begin_attachment_insert();
+        drop(app.handle_chat_ui(Action::PastedText(other, ticket, Some(reference.clone()))));
+        let runtime = app.chat_runtime_mut(other).unwrap();
+        assert_eq!(runtime.composer.text(), reference);
+        assert_eq!(runtime.attachments.len(), limit);
+        let note = runtime.composer_note.clone().unwrap();
+        assert!(note.contains("attachment limit"), "{note}");
+
+        // A file goes, and redoing the paste brings the image it left out.
+        drop(app.handle_chat_ui(Action::RemoveAttachment(other, 0, Removal::Pointer)));
+        let runtime = app.chat_runtime_mut(other).unwrap();
+        assert!(runtime.undo_composer(false));
+        assert_eq!(runtime.composer.text(), "");
+        assert!(runtime.undo_composer(true));
+        assert_eq!(runtime.composer.text(), reference);
+        assert_eq!(runtime.attachments.len(), limit);
+        assert!(runtime.attachments.contains(&image));
+    });
+}
+
+#[test]
+fn undo_and_redo_chords_reach_the_workspace_when_the_message_has_no_step() {
+    use iced::keyboard::{self, key::Code, key::Physical};
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let renderer = crate::app::tests::headless_renderer();
+    let chord = |shift: bool| keyboard::Event::KeyPressed {
+        key: keyboard::Key::Character("z".into()),
+        modified_key: keyboard::Key::Character(if shift { "Z" } else { "z" }.into()),
+        physical_key: Physical::Code(Code::KeyZ),
+        location: keyboard::Location::Standard,
+        modifiers: if shift {
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT
+        } else {
+            keyboard::Modifiers::CTRL
+        },
+        text: None,
+        repeat: false,
+    };
+    let undo_messages = |app: &Cagents, shift| {
+        composer_key_messages(app, card, 720.0, chord(shift), &renderer)
+            .into_iter()
+            .filter(|message| matches!(message, Message::ChatUi(Action::ComposerUndo(..))))
+            .count()
+    };
+    // A fresh message has nothing to undo or redo: Ctrl+Shift+Z stays the
+    // workspace's reopen.
+    assert_eq!(undo_messages(&app, false), 0);
+    assert_eq!(undo_messages(&app, true), 0);
+    write(&mut app, card, "typed");
+    assert_eq!(undo_messages(&app, false), 1);
+    assert_eq!(undo_messages(&app, true), 0);
+    drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+    assert_eq!(undo_messages(&app, true), 1);
 }
 
 #[test]

@@ -4157,15 +4157,18 @@ impl Runtime {
                         return Some(text_editor::Binding::Custom(action(Action::Latest(target))));
                     }
                     // The message has its own undo history, which takes these
-                    // chords ahead of the workspace's (Ctrl+Shift+Z reopens a
-                    // closed pane anywhere else).
+                    // chords ahead of the workspace's while it has a step that
+                    // way. Without one the chord falls through, so Ctrl+Shift+Z
+                    // still reopens a closed pane from a message with nothing
+                    // to redo.
                     if let Some(command) =
                         crate::repository_widget::text_editor::history_command(&press)
                     {
-                        return Some(text_editor::Binding::Custom(action(Action::ComposerUndo(
-                            target,
-                            command == crate::repository_widget::text_editor::HistoryCommand::Redo,
-                        ))));
+                        let redo =
+                            command == crate::repository_widget::text_editor::HistoryCommand::Redo;
+                        return self
+                            .composer_history(target, redo)
+                            .map(text_editor::Binding::Custom);
                     }
                     if !press.modifiers.shift()
                         && !press.modifiers.control()
@@ -4799,6 +4802,17 @@ impl Runtime {
         )
     }
 
+    /// The message's undo, or redo with `redo`, when its history has a step
+    /// that way; a chord with none is left to the workspace.
+    fn composer_history(&self, target: Target, redo: bool) -> Option<Message> {
+        let step = if redo {
+            self.composer_undo.can_redo()
+        } else {
+            self.composer_undo.can_undo()
+        };
+        step.then(|| action(Action::ComposerUndo(target, redo)))
+    }
+
     fn attachment_tile<'a>(
         &'a self,
         target: Target,
@@ -4862,6 +4876,10 @@ impl Runtime {
                     label,
                     remove,
                 )
+                .on_history(
+                    self.composer_history(target, false),
+                    self.composer_history(target, true),
+                )
                 .into(),
             );
         }
@@ -4920,6 +4938,10 @@ impl Runtime {
                 remove,
             )
             .on_open((!transitioning).then(|| action(Action::OpenAttachment(target, index))))
+            .on_history(
+                self.composer_history(target, false),
+                self.composer_history(target, true),
+            )
             .marked(marked)
             .into(),
         )
