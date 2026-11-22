@@ -1732,6 +1732,8 @@ fn perform_update(
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    // The build these windows run, to return to if the new one cannot open.
+    let previous = installation.prefix.join("current").canonicalize()?;
     {
         let inspected = crate::install_guard::preflight_source_panes(
             &guard,
@@ -1840,10 +1842,42 @@ fn perform_update(
     // Do not let a recovery UI autostart the frozen previous executable while
     // ownership or Prepared recovery is unresolved.
     recovery_result?;
+    let slots = guard.reopened_slots();
     let reopen_result = guard
         .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
+    // A build that cannot open a single window must not leave the person
+    // with none. When the daemon was kept, the previous build still matches
+    // it, so it takes the installation back and reopens the windows.
+    let restored = match &reopen_result {
+        Err(error) if install_result.is_ok() && !confirmed.replaces_daemon && !slots.is_empty() => {
+            let candidate = installation.prefix.join("versions").join(&release.version);
+            Some(
+                restore_previous_build(&installation.prefix, &candidate, &previous, &slots)
+                    .map(|()| error.to_string()),
+            )
+        }
+        _ => None,
+    };
     let handoff_kind = verify_reopened_service(&recovery, state, job)?;
+    if let Some(Ok(reason)) = restored {
+        // The phase in progress no longer describes anything.
+        job.message.clear();
+        return report_recovery_failure(
+            state,
+            job,
+            invalid(format!(
+                "cagents {} could not open its window: {reason}. cagents {} was restored and reopened your windows; your agents and terminals kept running.",
+                release.version, installation.version
+            )),
+        );
+    }
+    if let Some(Err(error)) = &restored {
+        eprintln!(
+            "Could not restore cagents {}: {error}",
+            installation.version
+        );
+    }
     if let Err(error) = reopen_result {
         return report_recovery_failure(
             state,
@@ -1854,6 +1888,23 @@ fn perform_update(
         );
     }
     install_result.map(|()| handoff_kind)
+}
+
+/// Point the installation back at `previous` and reopen `slots` with its
+/// application, unless a window of the new build did open after all.
+fn restore_previous_build(
+    prefix: &Path,
+    candidate: &Path,
+    previous: &Path,
+    slots: &[String],
+) -> Result<(), UpdateError> {
+    let guard = crate::instance::UiUpdateGuard::acquire()?;
+    if guard.has_running_windows()? {
+        return Err(invalid("a window of the new build is open"));
+    }
+    installed::restore_current(prefix, &candidate.canonicalize()?, previous)?;
+    guard.relaunch_windows(slots, &previous.join("bin/cagents-ui"))?;
+    Ok(())
 }
 
 fn verify_reopened_service(

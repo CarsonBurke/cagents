@@ -1942,6 +1942,17 @@ impl UiUpdateGuard {
         }
     }
 
+    /// The windows [`Self::relaunch_closed_windows`] reopens itself: every
+    /// closed one, unless some prepared window never closed, in which case
+    /// Drop reopens them instead.
+    pub(crate) fn reopened_slots(&self) -> Vec<String> {
+        if self.prepared.is_empty() {
+            self.closed.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Finish a staged update without reopening windows that never closed.
     /// On a partial close, Drop cancels the remaining prepared windows and waits
     /// for committed windows to exit before reopening only those slots.
