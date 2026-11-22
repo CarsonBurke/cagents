@@ -21,11 +21,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "mise.toml"
 SCRIPT = re.compile(r"\bscripts/[A-Za-z0-9_.-]+")
-LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"browser-protocol-fixture"}, "editor": set()}
+LANES = {"cli": set(), "host": {"host"}, "ui": {"ui"}, "browser": {"browser-protocol-fixture"}, "editor": set(),
+         "dictate": {"engine"}}
 # The application is its own package; the UI lanes select it, and `ui` the
 # shared library with it. No packages means the root's default member.
 PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui"}, "browser": {"cagents-ui"},
-            "editor": {"ceditor"}}
+            "editor": {"ceditor"}, "dictate": {"cagents-dictate"}}
 
 
 # Which lane task checks each lane of main's build check.
@@ -33,7 +34,8 @@ PACKAGES = {"cli": set(), "host": set(), "ui": {"cagents", "cagents-ui"}, "brows
 ALL_TARGETS = ('arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" '
                'help="Cargo arguments, after --; they replace the default --all-targets"')
 NO_ARGUMENTS = 'arg "[unexpected]..." var=#true hide=#true'
-SENTINEL_LANES = {"cli": "cli", "host": "host", "ui": "ui", "app": "ui", "browser": "browser"}
+SENTINEL_LANES = {"cli": "cli", "host": "host", "ui": "ui", "app": "ui", "browser": "browser",
+                  "dictate": "dictate"}
 
 
 def sentinel_lanes():
@@ -91,7 +93,7 @@ class Structure(unittest.TestCase):
                 self.assertIn("--locked", arguments)
                 self.assertEqual(features(arguments), expected)
                 self.assertEqual(packages(arguments), PACKAGES[lane])
-                if lane in {"cli", "host", "ui"}:
+                if lane in {"cli", "host", "ui", "dictate"}:
                     self.assertIn("--no-default-features", arguments)
 
     def test_the_check_lanes_cover_every_lane_of_mains_build_check(self):
@@ -130,7 +132,7 @@ class Structure(unittest.TestCase):
                 with self.subTest(task=name):
                     # One lane, however often the command names it.
                     self.assertLessEqual(
-                        len(set(re.findall(r"\{\{\s*vars\.(cli|host|ui|browser|editor)\b", command))), 1)
+                        len(set(re.findall(r"\{\{\s*vars\.(cli|host|ui|browser|editor|dictate)\b", command))), 1)
                     selected = features(expanded.split())
                     self.assertFalse({"host", "ui"} <= selected, command)
                     self.assertFalse({"host", "integrated-browser"} <= selected, command)
