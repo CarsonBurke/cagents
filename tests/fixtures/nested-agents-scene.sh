@@ -72,7 +72,8 @@ for _ in $(seq 15); do
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
     [ -n "$composer" ] || composer=$(printf '%s\n' "$observed" |
         sed -nE 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' | awk '{printf "%d,%d", $1 * 0.65, $2 - 67}')
-    break
+    # A read of the screen can come back empty; look again.
+    [ -z "$composer" ] || break
 done
 if [ -z "$composer" ]; then
     log "the conversation did not open; the screen read:"
