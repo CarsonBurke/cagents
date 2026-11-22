@@ -5121,8 +5121,10 @@ impl Runtime {
     fn is_draft(&self) -> bool {
         matches!(self.connection, Connection::Draft)
     }
+    /// The draft's own model and effort, once chosen or restored. A draft
+    /// still on its provider's remembered choice keeps following that.
     fn draft_model(&self) -> Option<ChatDraftModel> {
-        self.is_draft().then(|| ChatDraftModel {
+        (self.is_draft() && self.draft_model_chosen).then(|| ChatDraftModel {
             session: self.session.id,
             provider: self.session.launch.provider,
             model: self.snapshot.selected_model.clone(),

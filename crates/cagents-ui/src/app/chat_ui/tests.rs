@@ -15815,6 +15815,8 @@ fn saved_draft_model_checkpoint_reopens_after_the_workspace_save_is_refused() {
     );
     drop(restored.update(message));
     let mut refused = (*restored.persistent_workspace()).clone();
+    // As every window save does, queue the adoption ahead of the snapshot.
+    restored.record_shared_chat_identities();
     let state = refused
         .cards
         .iter_mut()
