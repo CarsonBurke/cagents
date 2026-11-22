@@ -340,7 +340,7 @@ impl Runtime {
             let models = tokio::task::spawn_blocking(move || prepare_page(&page, theme))
                 .await
                 .unwrap_or_else(|_| Arc::from([]));
-            Message::ChatUi(Action::ChangesRecoloured(target, id, models))
+            Message::ChatUi(Action::ChangesRecoloured(target, id, models, theme))
         })
     }
 

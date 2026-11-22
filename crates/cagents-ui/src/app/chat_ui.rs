@@ -527,7 +527,12 @@ pub enum Action {
         crate::settings::EditorSyntaxTheme,
     ),
     /// The shown page's patches, coloured again in a changed syntax theme.
-    ChangesRecoloured(Target, u64, Arc<[patch_view::PatchModel]>),
+    ChangesRecoloured(
+        Target,
+        u64,
+        Arc<[patch_view::PatchModel]>,
+        crate::settings::EditorSyntaxTheme,
+    ),
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
@@ -1499,10 +1504,11 @@ impl State {
         &mut self,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Task<Message> {
-        Task::batch(self.parked.values_mut().map(|runtime| {
-            runtime.set_syntax_theme(theme);
-            runtime.recolour_changes()
-        }))
+        Task::batch(
+            self.parked
+                .values_mut()
+                .map(|runtime| runtime.change_syntax_theme(theme)),
+        )
     }
 
     pub(super) fn transition_pending(&self) -> bool {
@@ -5284,6 +5290,19 @@ impl Runtime {
             // A search reads links as their labels, which have just changed.
             self.refresh_find_work();
         }
+    }
+
+    /// Highlights the transcript's code blocks and the shown patches in
+    /// `theme` from now on, recolouring the patches only when it changed.
+    pub(in crate::app) fn change_syntax_theme(
+        &mut self,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Task<Message> {
+        if self.syntax_theme == theme {
+            return Task::none();
+        }
+        self.set_syntax_theme(theme);
+        self.recolour_changes()
     }
 
     /// Highlights the transcript's code blocks in `theme` from now on.
@@ -15085,8 +15104,12 @@ impl Cagents {
                     runtime.changes.patch_view.apply(event);
                 }
             }
-            Action::ChangesRecoloured(target, id, models) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
+            Action::ChangesRecoloured(target, id, models, theme) => {
+                // A recolour for a theme chosen and then left again, which
+                // finished after the current one, is dropped.
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && theme == runtime.syntax_theme
+                {
                     runtime.changes.recoloured(id, models);
                 }
             }

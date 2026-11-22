@@ -15979,8 +15979,7 @@ impl Cagents {
                     CardRuntime::Repository(runtime) => runtime,
                     CardRuntime::PullRequests(pane) => &mut pane.runtime,
                     CardRuntime::Chat(runtime) => {
-                        runtime.set_syntax_theme(syntax_theme);
-                        tasks.push(runtime.recolour_changes());
+                        tasks.push(runtime.change_syntax_theme(syntax_theme));
                         continue;
                     }
                     _ => continue,
