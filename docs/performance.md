@@ -60,11 +60,11 @@ coalesced move per frame saves over applying every wheel notch.
 ## Activity spinner cost
 
 Each visible activity spinner asks for a whole-window redraw every
-`SPINNER_FRAME` (100 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
+`SPINNER_FRAME` (50 ms, `crates/cagents-ui/src/ui_controls/gauge.rs`) while the main window is
 focused. An unfocused window may still be in view, so its spinners keep turning,
 but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
-advance one focused step per frame. Measure the UI process with one busy agent
-on screen:
+advance the arc thirty degrees per frame, `SPINNER_BACKGROUND_STEP`. Measure
+the UI process with one busy agent on screen:
 
 1. Run `scripts/run-development --browserless` without `--debug` in a nested
    session, using the isolated environment from
@@ -79,7 +79,9 @@ on screen:
 
 Local reference: Ryzen 7 7840HS, Radeon RX 7600S, `dev-runtime` build, nested
 niri 26.04 inside a headless KWin 6.4 virtual output, 1596x929, scale 1.0.
-Each row reports 20 s samples, as a percentage of one core:
+This was measured when the focused cadence was 100 ms, before the frame-cost
+changes in the next section. Each row reports 20 s samples, as a percentage
+of one core:
 
 | State | Before (`c07b6f78e`) | After |
 | --- | --- | --- |
@@ -98,6 +100,45 @@ agent still costs about 3% of a core above idle in this build. Slowing
 unfocused spinners instead of stopping them costs little: an earlier revision
 that stopped them entirely measured 1.0-1.6% with another window focused
 (3 wakeups/s).
+
+### What a spinner frame costs
+
+A frame that only turns spinners skips the application's update, view and
+layout, but it still walks the whole widget tree for the redraw event and
+for drawing, and it presents the whole window. Two changes made such a frame
+cheaper by a quarter to nearly a half (#3564):
+
+- iced_wgpu keeps a text group's prepared glyphs while the group draws the
+  same text in the same place (#3571). Before, every frame prepared every
+  visible glyph again, which took 22% of the UI thread.
+- A sidebar row looks for focus only after an event that may move it, an
+  operation, a rebuild or a layout (#3575). Before, every row in view walked
+  its controls twice on every redraw, which took 7% of the UI thread.
+
+Workload: fw16 (Ryzen 7 7840HS), nested KWin at 1500x900, scale 1. The
+`realistic` seed, with four fixture Claude agents working in one channel, both
+chat panes showing long transcripts, the pointer still and the window
+focused. Every build is `dev-runtime` at opt-level 2 with frame pointers.
+Each row is one run: 30 s of `/proc` CPU time, plus the ranges of the
+`CAGENTS_UI_TRACE` frame lines (5 s windows) from the same run:
+
+| Build | Cadence | UI main thread | Frame work p50 | Frame work p95 |
+| --- | --- | --- | --- | --- |
+| `2f49dc2f2`, before both changes | 100 ms | 3.4% | 2.8-3.1 ms | 6.3-7.4 ms |
+| `16e894234`, after both | 100 ms | 2.4% | 1.7-2.1 ms | 4.0-7.3 ms |
+| `16e894234` with a 50 ms cadence | 50 ms | 4.5% | 1.9-2.2 ms | 4.4-8.7 ms |
+
+The cadence is now 50 ms: fifteen degrees per step instead of thirty. That
+nearly doubles a spinner's cost on the UI thread against the 100 ms cadence
+on the same build (2.4% to 4.5% here), and it costs about one percentage
+point of a core more than the 100 ms cadence did before these changes. An
+unfocused window still asks for a frame every 500 ms and still moves the arc
+thirty degrees per frame, so its cost and look are unchanged.
+
+The remaining per-frame cost is the widget-tree walks for the redraw event
+(about a third of a frame, including overlay collection) and the present
+(about a quarter). Repainting less than the whole window would need damage
+tracking that iced does not have.
 
 ## Idle UI wakeups
 
@@ -137,7 +178,7 @@ percentage of one core:
 
 The after build also has the wgpu-core change below, which makes every frame
 cheaper, so the CPU columns credit both changes. The wakeups and redraws are
-the cursor's alone. With agents working, the spinners already ask for ten
+the cursor's alone. With agents working, the spinners then asked for ten
 frames a second, so the cursor's frames made little difference there. Neither side logged a UI-thread
 call over 50 ms after startup. The remaining settled redraws follow the app's
 own updates.

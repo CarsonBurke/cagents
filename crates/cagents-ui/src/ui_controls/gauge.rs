@@ -15,35 +15,48 @@ static SPINNER_EPOCH: std::sync::LazyLock<cosmic::iced::time::Instant> =
 
 /// How often a visible spinner asks for a frame.
 ///
-/// Every frame repaints the whole window - update, layout and a full render
-/// pass - so this is the price of every working agent on screen, paid for as
-/// long as it works. Ten steps a second, thirty degrees of a
-/// [`crate::design::SPINNER_PERIOD`] turn each, still reads as a turning arc
-/// at indicator size, at a third of the cost of the thirty steps it replaced.
-const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(100);
+/// Every frame repaints the whole window, so this is the price of every
+/// working agent on screen, paid for as long as it works. A frame that only
+/// turns spinners reuses the window's prepared text and skips the sidebar's
+/// focus walks, which leaves it at about 2 ms on the reference machine
+/// (docs/performance.md, "What a spinner frame costs"). Twenty steps a second,
+/// fifteen degrees of a [`crate::design::SPINNER_PERIOD`] turn each, reads as
+/// a smoothly turning arc at indicator size.
+const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
 
 // The cadence is the whole cost of a working agent; it must not creep back
-// toward display refresh.
-const _: () = assert!(SPINNER_FRAME.as_millis() >= 100);
+// toward display refresh without measuring what a spinner frame costs.
+const _: () = assert!(SPINNER_FRAME.as_millis() >= 50);
 
 /// How often a spinner asks for a frame while its window is unfocused.
 ///
 /// An unfocused window is often still in view, on a second monitor or tiled
 /// beside a terminal, and a spinner that stopped there would read as a hung
 /// agent. It keeps moving at a fraction of the focused frame rate instead,
-/// and turns slower by the same factor, [`BACKGROUND_SLOWDOWN`], so each step
-/// is still one focused step rather than a jump of nearly half a turn.
+/// and turns slower, by [`BACKGROUND_SLOWDOWN`], so each frame advances the
+/// arc by [`SPINNER_BACKGROUND_STEP`] rather than a jump of nearly half a
+/// turn.
 const SPINNER_BACKGROUND_FRAME: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How far, in focused time, an unfocused spinner's arc moves each frame:
+/// thirty degrees, two focused steps. A smaller step would make the arc's
+/// edge on a 12 px indicator move barely a pixel and a half per frame, which
+/// reads as stalled.
+const SPINNER_BACKGROUND_STEP: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How many times slower an unfocused spinner turns.
 const BACKGROUND_SLOWDOWN: u32 =
-    (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_FRAME.as_millis()) as u32;
+    (SPINNER_BACKGROUND_FRAME.as_millis() / SPINNER_BACKGROUND_STEP.as_millis()) as u32;
 
-// A whole multiple keeps each background step exactly one focused step.
+// Whole multiples keep the slowdown exact and each background step a whole
+// number of focused steps.
 const _: () = assert!(
     SPINNER_BACKGROUND_FRAME
         .as_millis()
-        .is_multiple_of(SPINNER_FRAME.as_millis())
+        .is_multiple_of(SPINNER_BACKGROUND_STEP.as_millis())
+        && SPINNER_BACKGROUND_STEP
+            .as_millis()
+            .is_multiple_of(SPINNER_FRAME.as_millis())
         && BACKGROUND_SLOWDOWN > 1
 );
 
@@ -66,7 +79,7 @@ std::thread_local! {
 /// The application calls this for its main window's focus changes; spinners
 /// are drawn only there. While unfocused, spinners turn slowly and ask for a
 /// frame every [`SPINNER_BACKGROUND_FRAME`]. A background window with agents
-/// working still repaints, but [`BACKGROUND_SLOWDOWN`] times less often. A
+/// working still repaints, but ten times less often than a focused one. A
 /// window that is minimized, on another workspace or behind a lock screen has
 /// lost focus too, and the compositor's frame callbacks may throttle it
 /// further. Regaining focus restores the full cadence on the redraw that
@@ -680,7 +693,7 @@ mod tests {
 
     /// An unfocused window may still be in view, so its spinners keep moving,
     /// but slowly: one frame every background cadence, each advancing the arc
-    /// by one focused step. That holds whether a spinner was turning when focus
+    /// by one background step. That holds whether a spinner was turning when focus
     /// left or was mounted after it did, and the full cadence returns on the
     /// first redraw once the window has focus back.
     #[test]
@@ -718,8 +731,13 @@ mod tests {
             );
             assert_eq!(
                 stepped - slow,
-                SPINNER_FRAME,
-                "one background frame should advance the arc by one focused step"
+                SPINNER_BACKGROUND_STEP,
+                "one background frame should advance the arc by one background step"
+            );
+            assert_eq!(
+                SPINNER_BACKGROUND_STEP * 12,
+                crate::design::SPINNER_PERIOD,
+                "a background step should stay thirty degrees"
             );
         }
 
