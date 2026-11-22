@@ -4,6 +4,7 @@
 - [Artifacts](#artifacts)
 - [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
+- [Signing](#signing)
 - [Comparing package variants](#comparing-package-variants)
 
 Release builds and publication run **locally**, never in GitHub Actions.
@@ -149,6 +150,39 @@ bundle built elsewhere, prepare the runtime image first, or supply an existing
 Ubuntu 24.04 amd64 runtime image with `--smoke-rootfs DIR`. Missing dependencies,
 failed install/remove scripts, hanging commands, or a failed daemon handshake
 stop verification. No package is installed on the host.
+
+## Signing
+
+An installed build offers a release only when the release's
+`release-metadata.json` (schema 2) carries a valid signature,
+`release-metadata.json.sig`, made by a key listed in
+`src/update/release-keys.pub`:
+
+```sh
+ssh-keygen -Y sign -f KEY -n cagents-release release-metadata.json
+```
+
+Schema 2 adds `notes` (what changed, in Markdown) and `assets`, which maps
+every uploaded file name to its `size` and `sha256`. The updater reads the
+archive, `SHA256SUMS` and `install.sh` digests from it; `SHA256SUMS` must
+agree with them.
+
+The updater accepts `ssh-ed25519` keys and `sk-ssh-ed25519@openssh.com`
+security keys, and requires a security key's signature to record a touch.
+Prefer a security key: hosted agents run as the same user and can read a key
+file, but cannot touch a security key. Do not load a release key into a
+long-lived `ssh-agent`, which would sign for any process of the user.
+
+To replace a key, publish a release signed by the old key whose
+`release-keys.pub` lists the new one. To withdraw a compromised key, publish a
+release, signed by a remaining key, that no longer lists it. A build trusts
+exactly the keys it was built with.
+
+Development builds, and rehearsal builds compiled with
+`CAGENTS_UPDATE_REHEARSAL_KEYS` (extra public key lines), read releases from
+`CAGENTS_UPDATE_FEED` instead of GitHub: an `https://` URL or `file:///`
+directory with the same layout (`latest/download/…` and `download/vVERSION/…`).
+Published builds ignore that variable.
 
 ## Comparing package variants
 

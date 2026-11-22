@@ -1,8 +1,11 @@
-//! Explicit, self-managed release updates. `gh` owns authentication; discovery
-//! never writes installation state. The detached worker alone may run an installer.
+//! Explicit, self-managed release updates. Releases are read through public
+//! download URLs and trusted only through their signed metadata ([`feed`]);
+//! discovery never writes installation state. The detached worker alone may
+//! run an installer.
 mod cancellation;
 mod candidate;
 mod confirmation;
+mod feed;
 mod floor;
 mod floor_display;
 mod floor_prediction;
@@ -20,6 +23,7 @@ pub mod impact;
 mod review;
 pub mod source_inspection;
 pub use review::render_review;
+mod signature;
 #[cfg(feature = "ui")]
 pub mod startup;
 use std::{
@@ -157,7 +161,12 @@ impl From<recovery::TargetRecoveryRequired> for UpdateError {
 pub struct Release {
     pub version: String,
     pub url: String,
-    id: u64,
+    /// What changed, from the release's signed metadata (Markdown).
+    #[serde(default)]
+    pub notes: String,
+    /// SHA-256 of the signed metadata this release was read from, so the
+    /// worker installs exactly the release the person chose.
+    metadata: [u8; 32],
     archive: Asset,
     checksums: Asset,
     installer: Asset,
@@ -165,22 +174,26 @@ pub struct Release {
 
 impl Release {
     pub fn notice_identity(&self) -> String {
-        format!("release:{}:{}", self.id, self.version)
+        let metadata: String = self.metadata[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("release:{metadata}:{}", self.version)
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Asset {
-    id: u64,
     name: String,
     size: u64,
+    sha256: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum UpdateState {
     Unsupported { reason: String },
     Current { version: String },
-    Available { release: Release },
+    Available { release: Box<Release> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,15 +266,6 @@ impl UpdateJob {
         .then_some(self.confirmation.as_ref())
         .flatten()
     }
-}
-
-#[derive(Deserialize)]
-struct GitHubRelease {
-    id: u64,
-    tag_name: String,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<Asset>,
 }
 
 /// One version directory inside an installation tree, established from a path
@@ -458,101 +462,62 @@ pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateErro
     if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
         && let Some(release) = review_fixture::release(Path::new(&root))?
     {
-        return Ok(UpdateState::Available { release });
+        return Ok(UpdateState::Available {
+            release: Box::new(release),
+        });
     }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
         Err(error) => {
             return Ok(UpdateState::Unsupported {
-                reason: error.to_string(),
+                reason: unmanaged_reason(error),
             });
         }
     };
-    let mut releases = Vec::new();
-    for page in 1..=5 {
-        let endpoint = format!("repos/{REPOSITORY}/releases?per_page=100&page={page}");
-        let page_releases: Vec<GitHubRelease> =
-            serde_json::from_slice(&metadata(&endpoint, cancellation)?)?;
-        let complete = page_releases.len() < 100;
-        releases.extend(page_releases);
-        if complete {
-            return Ok(match select_release(releases, &installation.version)? {
-                // Offering it would only end in the installer's refusal. An
-                // installed newer build is offered through `current` instead.
-                UpdateState::Available { release }
-                    if holds_installed_tree(&installation.prefix, &release.version) =>
-                {
-                    UpdateState::Current {
-                        version: installation.version,
-                    }
-                }
-                state => state,
-            });
-        }
-    }
-    Err(invalid(
-        "release discovery exceeded its 500-release safety limit",
-    ))
-}
-
-fn select_release(releases: Vec<GitHubRelease>, current: &str) -> Result<UpdateState, UpdateError> {
-    let current_version = installed_version(current)?;
-    let newest = releases
-        .into_iter()
-        .filter_map(|release| {
-            if release.draft || release.prerelease {
-                return None;
-            }
-            let version = stable_version(release.tag_name.strip_prefix('v')?).ok()?;
-            Some((version, release))
-        })
-        .max_by(|left, right| left.0.cmp(&right.0));
-    match newest {
-        Some((version, release)) if version > current_version => Ok(UpdateState::Available {
-            release: applicable_release(release)?,
-        }),
-        _ => Ok(UpdateState::Current {
-            version: current.to_owned(),
-        }),
-    }
-}
-
-fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
-    if release.id == 0 || release.draft || release.prerelease {
-        return Err(invalid("release is not a published stable release"));
-    }
-    let version = release
-        .tag_name
-        .strip_prefix('v')
-        .ok_or_else(|| invalid("release must use a v-prefixed version tag"))?;
-    stable_version(version)?;
-    let archive_name = format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz");
-    let asset = |name: &str, limit: u64| -> Result<Asset, UpdateError> {
-        let mut matching = release.assets.iter().filter(|asset| asset.name == name);
-        let asset = matching
-            .next()
-            .ok_or_else(|| invalid(format!("release lacks required asset {name}")))?;
-        if matching.next().is_some() || asset.id == 0 || asset.size == 0 || asset.size > limit {
-            return Err(invalid(format!(
-                "invalid or duplicate release asset {name}"
-            )));
-        }
-        Ok(asset.clone())
+    let feed = match feed::Feed::configured() {
+        Ok(feed) => feed,
+        Err(reason) => return Ok(UpdateState::Unsupported { reason }),
     };
-    let archive = asset(&archive_name, ARCHIVE_LIMIT)?;
-    let checksums = asset("SHA256SUMS", SMALL_ASSET_LIMIT)?;
-    let installer = asset("install.sh", SMALL_ASSET_LIMIT)?;
-    if archive.id == checksums.id || archive.id == installer.id || checksums.id == installer.id {
-        return Err(invalid("release asset IDs are not distinct"));
-    }
-    Ok(Release {
-        version: version.to_owned(),
-        url: format!("https://github.com/{REPOSITORY}/releases/tag/v{version}"),
-        id: release.id,
-        archive,
-        checksums,
-        installer,
+    let release = feed.latest(
+        |version| {
+            // Offering a version already unpacked would only end in the
+            // installer's refusal. That build is offered through `current`.
+            Ok(is_newer(version, &installation.version)?
+                && !holds_installed_tree(&installation.prefix, version))
+        },
+        cancellation,
+    )?;
+    Ok(match release {
+        Some(release) => UpdateState::Available {
+            release: Box::new(release),
+        },
+        None => UpdateState::Current {
+            version: installation.version,
+        },
     })
+}
+
+/// Whether the published `release` is an upgrade from the `installed`
+/// version. A local build's metadata gives it no precedence over a release
+/// with the same base version.
+fn is_newer(release: &str, installed: &str) -> Result<bool, UpdateError> {
+    Ok(stable_version(release)? > installed_version(installed)?)
+}
+
+/// Why this build cannot update itself, in the words its About page shows.
+/// Installs another tool manages say which tool, rather than describing the
+/// layout this build looked for.
+fn unmanaged_reason(error: UpdateError) -> String {
+    let executable = std::env::current_exe().and_then(|path| path.canonicalize());
+    match executable {
+        Ok(path) if path.starts_with("/usr") || path.starts_with("/opt") => {
+            "Installed by your system's package manager; update cagents with it, for example with sudo apt upgrade.".into()
+        }
+        Ok(path) if path.components().any(|part| part.as_os_str() == "target") => {
+            "This is a build from source. Install a release to receive updates.".into()
+        }
+        _ => error.to_string(),
+    }
 }
 
 /// Explicit user authorization: this starts a detached worker, not an in-process
@@ -717,11 +682,9 @@ pub fn upgrade_release(
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
     let parsed = stable_version(version)?;
-    let tag = format!("v{parsed}");
-    let selected = applicable_release(serde_json::from_slice(&metadata(
-        &format!("repos/{REPOSITORY}/releases/tags/{tag}"),
-        &CancellationToken::for_terminal(),
-    )?)?)?;
+    let selected = feed::Feed::configured()
+        .map_err(invalid)?
+        .release(&parsed.to_string(), &CancellationToken::for_terminal())?;
     if stable_version(&selected.version)? != parsed
         || parsed <= installed_version(&installation.version)?
     {
@@ -1693,14 +1656,9 @@ fn perform_update(
         }
     };
     let cancellation = CancellationToken::for_job(state, &job.id)?;
-    let endpoint = format!("repos/{REPOSITORY}/releases/{}", selected.id);
-    let release = applicable_release(serde_json::from_slice(&metadata(
-        &endpoint,
-        &cancellation,
-    )?)?)?;
-    if release != selected
-        || stable_version(&release.version)? <= installed_version(&installation.version)?
-    {
+    let feed = feed::Feed::configured().map_err(invalid)?;
+    let release = feed.release(&selected.version, &cancellation)?;
+    if release != selected || !is_newer(&release.version, &installation.version)? {
         return Err(invalid(
             "selected release changed or is no longer an upgrade; check again",
         ));
@@ -1709,21 +1667,30 @@ fn perform_update(
         state,
         job,
         UpdatePhase::Downloading,
-        "Downloading release assets through GitHub authentication",
+        "Downloading the release",
     )?;
-    let mut checksums = download(&release.checksums, SMALL_ASSET_LIMIT, &cancellation)?;
+    // The signed metadata names every digest. The checksum file the installer
+    // reads again must agree with it, or the two would vouch for different
+    // bytes.
+    let mut checksums = feed.download(&release, &release.checksums, &cancellation)?;
     let mut manifest = String::new();
     checksums.read_to_string(&mut manifest)?;
-    let archive_hash = checksum_for(&manifest, &release.archive.name)?;
-    let installer_hash = checksum_for(&manifest, &release.installer.name)?;
-    let mut installer = download(&release.installer, SMALL_ASSET_LIMIT, &cancellation)?;
-    verify_digest(&mut installer, &installer_hash)?;
-    let mut archive = download(&release.archive, ARCHIVE_LIMIT, &cancellation)?;
+    checksums.seek(SeekFrom::Start(0))?;
+    let archive_hash = release.archive.sha256;
+    if checksum_for(&manifest, &release.archive.name)? != archive_hash
+        || checksum_for(&manifest, &release.installer.name)? != release.installer.sha256
+    {
+        return Err(invalid(
+            "the release's checksum file disagrees with its signed metadata",
+        ));
+    }
+    let installer = feed.download(&release, &release.installer, &cancellation)?;
+    let mut archive = feed.download(&release, &release.archive, &cancellation)?;
     set_phase(
         state,
         job,
         UpdatePhase::Verifying,
-        "Verifying sealed release bytes",
+        "Verifying the downloaded release",
     )?;
     verify_digest(&mut archive, &archive_hash)?;
     let daemon_digest = archive_daemon_digest(&release, &archive, &cancellation)?;
@@ -2836,77 +2803,6 @@ fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateErro
     Ok(lock)
 }
 
-fn metadata(endpoint: &str, cancellation: &CancellationToken) -> Result<Vec<u8>, UpdateError> {
-    let mut file = gh_request(
-        endpoint,
-        false,
-        METADATA_LIMIT,
-        Duration::from_secs(30),
-        cancellation,
-    )?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-fn download(
-    asset: &Asset,
-    limit: u64,
-    cancellation: &CancellationToken,
-) -> Result<File, UpdateError> {
-    let endpoint = format!("repos/{REPOSITORY}/releases/assets/{}", asset.id);
-    let file = gh_request(
-        &endpoint,
-        true,
-        limit.min(asset.size),
-        Duration::from_secs(15 * 60),
-        cancellation,
-    )?;
-    if file.metadata()?.len() != asset.size {
-        return Err(invalid(format!("download size differs for {}", asset.name)));
-    }
-    Ok(file)
-}
-
-// The existing GitHub executor is UI-gated. This small streaming runner keeps
-// the CLI dependency graph separate, bounds memory/output/time, and never
-// captures gh stderr (which could contain authentication diagnostics).
-fn gh_request(
-    endpoint: &str,
-    binary: bool,
-    limit: u64,
-    timeout: Duration,
-    cancellation: &CancellationToken,
-) -> Result<File, UpdateError> {
-    if cancellation.cancelled() {
-        return Err(UpdateError::Cancelled);
-    }
-    let mut command = Command::new("gh");
-    command
-        .args([
-            "api",
-            "--hostname",
-            "github.com",
-            "--method",
-            "GET",
-            "--header",
-            if binary {
-                "Accept: application/octet-stream"
-            } else {
-                "Accept: application/vnd.github+json"
-            },
-            endpoint,
-        ])
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_PAGER", "cat")
-        .env("NO_COLOR", "1")
-        .env("GH_SPINNER_DISABLED", "1")
-        .env_remove("GH_FORCE_TTY")
-        .env_remove("GH_REPO")
-        .env_remove("GH_HOST")
-        .env_remove("GH_DEBUG");
-    bounded_command(&mut command, "GitHub request", limit, timeout, cancellation)
-}
-
 /// Stream a subprocess into sealed storage without buffering a release binary
 /// in memory. Extraction and candidate probes share the downloader's limits.
 fn bounded_command(
@@ -3315,7 +3211,7 @@ mod tests {
     #[test]
     fn app_release_stop_instructions_select_the_same_release_without_staging() {
         let directory = tempfile::tempdir().unwrap();
-        let release = applicable_release(release("9.8.7")).unwrap();
+        let release = release("9.8.7");
         let job = UpdateJob {
             id: uuid::Uuid::new_v4().to_string(),
             version: release.version.clone(),
@@ -3337,7 +3233,7 @@ mod tests {
     #[test]
     fn recovery_daemon_digest_uses_the_exact_verified_archive_member() {
         let directory = tempfile::tempdir().unwrap();
-        let release = applicable_release(release("9.8.7")).unwrap();
+        let release = release("9.8.7");
         let package = format!("cagents-{}", release.version);
         let bin = directory.path().join(&package).join("bin");
         fs::create_dir_all(&bin).unwrap();
@@ -4495,85 +4391,32 @@ finally:
     }
     use std::os::unix::fs::PermissionsExt;
 
-    fn release(version: &str) -> GitHubRelease {
-        GitHubRelease {
-            id: 1,
-            tag_name: format!("v{version}"),
-            draft: false,
-            prerelease: false,
-            assets: vec![
-                Asset {
-                    id: 11,
-                    name: format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"),
-                    size: 100,
-                },
-                Asset {
-                    id: 12,
-                    name: "SHA256SUMS".into(),
-                    size: 200,
-                },
-                Asset {
-                    id: 13,
-                    name: "install.sh".into(),
-                    size: 100,
-                },
-            ],
+    fn release(version: &str) -> Release {
+        let asset = |name: String| Asset {
+            name,
+            size: 100,
+            sha256: [0xab; 32],
+        };
+        Release {
+            version: version.into(),
+            url: format!("https://github.com/{REPOSITORY}/releases/tag/v{version}"),
+            notes: String::new(),
+            metadata: [1; 32],
+            archive: asset(format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz")),
+            checksums: asset("SHA256SUMS".into()),
+            installer: asset("install.sh".into()),
         }
     }
 
     #[test]
-    fn stable_versions_are_ordered_numerically_and_previews_ignored() {
-        let mut draft = release("99.0.0");
-        draft.draft = true;
-        let mut preview = release("98.0.0");
-        preview.prerelease = true;
-        let state = select_release(
-            vec![
-                release("1.9.0"),
-                release("1.10.0"),
-                draft,
-                preview,
-                release("2.0.0-rc.1"),
-                release("2.0.0+local"),
-            ],
-            "1.8.0",
-        )
-        .unwrap();
-        assert!(matches!(state, UpdateState::Available { release } if release.version == "1.10.0"));
-        assert!(matches!(
-            select_release(vec![release("1.9.0")], "1.10.0").unwrap(),
-            UpdateState::Current { .. }
-        ));
-    }
-
-    #[test]
     fn local_install_updates_only_to_a_newer_stable_release() {
-        assert!(matches!(
-            select_release(vec![release("0.1.3")], "0.1.3+local.937921c").unwrap(),
-            UpdateState::Current { .. }
-        ));
-        assert!(matches!(
-            select_release(vec![release("0.1.4")], "0.1.3+local.937921c").unwrap(),
-            UpdateState::Available { release } if release.version == "0.1.4"
-        ));
-        assert!(select_release(vec![release("0.1.4")], "0.1.3-rc.1").is_err());
-        assert!(stable_version("0.1.4+local.abc").is_err());
-    }
-
-    #[test]
-    fn missing_wrong_duplicate_and_oversized_assets_never_fallback() {
-        let mut wrong = release("2.0.0");
-        wrong.assets[0].name = "cagents-2.0.0-aarch64-apple-darwin.tar.gz".into();
-        assert!(select_release(vec![release("1.5.0"), wrong], "1.0.0").is_err());
-        let mut missing = release("2.0.0");
-        missing.assets.pop();
-        assert!(applicable_release(missing).is_err());
-        let mut duplicate = release("2.0.0");
-        duplicate.assets.push(duplicate.assets[0].clone());
-        assert!(applicable_release(duplicate).is_err());
-        let mut oversized = release("2.0.0");
-        oversized.assets[0].size = ARCHIVE_LIMIT + 1;
-        assert!(applicable_release(oversized).is_err());
+        assert!(is_newer("1.10.0", "1.9.0").unwrap());
+        assert!(!is_newer("1.9.0", "1.10.0").unwrap());
+        assert!(!is_newer("0.1.3", "0.1.3+local.937921c").unwrap());
+        assert!(is_newer("0.1.4", "0.1.3+local.937921c").unwrap());
+        assert!(is_newer("0.1.4", "0.1.3-rc.1").is_err());
+        assert!(is_newer("0.1.4+local.abc", "0.1.3").is_err());
+        assert!(is_newer("2.0.0-rc.1", "1.0.0").is_err());
     }
 
     #[test]
