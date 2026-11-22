@@ -17,7 +17,6 @@
 //! rows they have. Nothing loads or polls for a section that is collapsed.
 
 use super::*;
-use crate::work::TranscriptCoverage;
 
 /// One of the context inspector's sections, in the order they stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -172,13 +171,13 @@ struct Pane<'a> {
 }
 
 impl Cagents {
-    /// Whether the workspace section is all `card`'s inspector has: no
-    /// conversation's pull requests or worktrees lead it. It is then shown
+    /// Whether the workspace section is all `card`'s inspector can have: it
+    /// follows no conversation's pull requests or worktrees. It is then shown
     /// rather than left as a lone collapsed header over an empty panel.
     /// This depends on the pane and the settings, never on what has loaded,
     /// so the section does not fold away when a list arrives.
     fn workspace_alone(&self, card: CardId) -> bool {
-        !self.work_reserved(card) && !self.mentions_reserved(card)
+        !self.tracks_work(card) && !self.tracks_mentions(card)
     }
 
     /// An estimate of the sections' height until they have been laid out:
@@ -253,6 +252,32 @@ impl Cagents {
         self.set_pane_inspector_open(card, true)
     }
 
+    /// `card`'s inspector's sections, in their fixed order. Work and
+    /// Mentioned are present only while they have something to list, so
+    /// their coming and going moves nothing else in the order.
+    fn context_panes(&self, card: CardId, width: f32) -> Vec<Pane<'_>> {
+        let mut panes = Vec::with_capacity(6);
+        let work = self.work_summary(card);
+        if self.work_shown(card, &work) {
+            panes.push(self.work_pane(card, &work));
+        }
+        if self.mentions_shown(card, &work) {
+            panes.push(self.mentioned_pane(card, &work));
+        }
+        panes.push(self.workspace_pane(card, width, work.scope.clone()));
+        panes.extend(self.language_server_panes(card));
+        panes
+    }
+
+    /// Which sections `card`'s inspector shows, in order, for tests.
+    #[cfg(test)]
+    pub(super) fn context_section_order(&self, card: CardId) -> Vec<Section> {
+        self.context_panes(card, 400.0)
+            .into_iter()
+            .map(|pane| pane.section)
+            .collect()
+    }
+
     /// `card`'s inspector's sections, the first of whose headers ends with
     /// the inspector's `toggle`.
     pub(super) fn context_sections_view<'a>(
@@ -261,16 +286,7 @@ impl Cagents {
         width: f32,
         toggle: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let mut panes = Vec::with_capacity(6);
-        let work = self.work_summary(card);
-        if self.work_reserved(card) {
-            panes.push(self.work_pane(card, &work));
-        }
-        if self.mentions_reserved(card) {
-            panes.push(self.mentioned_pane(card, &work));
-        }
-        panes.push(self.workspace_pane(card, width, work.scope.clone()));
-        panes.extend(self.language_server_panes(card));
+        let mut panes = self.context_panes(card, width);
         // What the pane's agent is doing leads, and carries the toggle; a
         // pane without it has the toggle on its first section's header.
         let activity = match self.inspector_activity(card, toggle) {
@@ -483,105 +499,51 @@ impl Cagents {
         .into()
     }
 
+    /// `card`'s Work section, which [`Self::work_shown`] includes only once
+    /// its conversation's list holds work.
     fn work_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Work);
-        let phase = self.work_phase(card);
-        let listed = phase == pull_request_ui::WorkPhase::Listed;
         let count = work.count;
         Pane {
             section: Section::Work,
             title: "Work".into(),
-            count: (listed && count > 0).then(|| (count.to_string(), design::faint_text as _)),
+            count: (count > 0).then(|| (count.to_string(), design::faint_text as _)),
             scope: None,
             description: None,
             controls: Vec::new(),
-            // The same room whether the list is on its way, empty or long.
-            // Unfolding the shown work's details is asked for, so it makes
-            // room for itself rather than pushing the rows after it out of
-            // view.
+            // The same room however long the list is. Unfolding the shown
+            // work's details is asked for, so it makes room for itself rather
+            // than pushing the rows after it out of view.
             height: Height::Content {
                 height: list_height(WORK_ROWS)
                     + work.height.expanded
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
-            body: open.then(|| match phase {
-                pull_request_ui::WorkPhase::Listed if work.lists_work => {
-                    self.work_section(card, work)
-                }
-                pull_request_ui::WorkPhase::Listed | pull_request_ui::WorkPhase::Unstarted => {
-                    self.empty_notice(card, Section::Work)
-                }
-                pull_request_ui::WorkPhase::Reading => list_notice(
-                    "Reading this chat's work…",
-                    "Its pull requests and worktrees show here.",
-                ),
-                pull_request_ui::WorkPhase::Unavailable => {
-                    list_notice("Couldn't load this chat's work", "Retrying automatically.")
-                }
-            }),
+            body: open.then(|| self.work_section(card, work)),
         }
     }
 
-    /// The height `card`'s Work section keeps for its list, for tests that
-    /// it does not follow what the list holds.
-    #[cfg(test)]
-    pub(super) fn work_section_height(&self, card: CardId) -> f32 {
-        match self.work_pane(card, &self.work_summary(card)).height {
-            Height::Content { height } => height,
-            Height::Share => f32::NAN,
-        }
-    }
-
-    /// What `card`'s empty Work or Mentioned list says, for how much of its
-    /// conversation was read.
-    fn empty_notice(&self, card: CardId, section: Section) -> Element<'_, Message> {
-        let text = empty_text(section, self.work_transcript(card));
-        let notice = list_notice(text.title, text.detail);
-        match text.reason {
-            // The reason is the system's, so it waits behind a tooltip.
-            Some(reason) => crate::interaction::tooltip(notice, reason),
-            None => notice,
-        }
-    }
-
+    /// `card`'s Mentioned section, which [`Self::mentions_shown`] includes
+    /// only once its conversation names pull requests.
     fn mentioned_pane(&self, card: CardId, work: &pull_request_ui::WorkSummary) -> Pane<'_> {
         let open = self.context_sections.is_open(Section::Mentioned);
-        let phase = self.work_phase(card);
-        let listed = phase == pull_request_ui::WorkPhase::Listed;
         let count = work.mentioned;
         Pane {
             section: Section::Mentioned,
             title: "Mentioned".into(),
-            // As Work's, absent rather than 0 when there is none.
-            count: (listed && count > 0).then(|| (count.to_string(), design::faint_text as _)),
+            count: Some((count.to_string(), design::faint_text as _)),
             scope: None,
-            description: listed.then(|| {
-                format!(
-                    "{count} mentioned pull request{}",
-                    if count == 1 { "" } else { "s" }
-                )
-            }),
+            description: Some(format!(
+                "{count} mentioned pull request{}",
+                if count == 1 { "" } else { "s" }
+            )),
             controls: Vec::new(),
             height: Height::Content {
                 height: list_height(MENTIONED_ROWS)
                     + work.mentioned_height.expanded
                     + 2.0 * pull_request_ui::WORK_LIST_PADDING,
             },
-            body: open.then(|| match phase {
-                pull_request_ui::WorkPhase::Listed if count > 0 => {
-                    self.mentioned_section(card, work)
-                }
-                pull_request_ui::WorkPhase::Listed | pull_request_ui::WorkPhase::Unstarted => {
-                    self.empty_notice(card, Section::Mentioned)
-                }
-                pull_request_ui::WorkPhase::Reading => {
-                    list_notice("Reading this chat's mentions…", "")
-                }
-                pull_request_ui::WorkPhase::Unavailable => list_notice(
-                    "Couldn't load this chat's mentions",
-                    "Retrying automatically.",
-                ),
-            }),
+            body: open.then(|| self.mentioned_section(card, work)),
         }
     }
 
@@ -932,151 +894,9 @@ impl Cagents {
     }
 }
 
-/// What an empty Work or Mentioned list says in place of rows.
-#[derive(Debug, PartialEq, Eq)]
-struct EmptyText<'a> {
-    title: &'static str,
-    detail: &'static str,
-    /// The system's own words for why the conversation couldn't be read.
-    reason: Option<&'a str>,
-}
-
-/// What `section`, listed with nothing in it, says, given how much of the
-/// conversation it was read from: never that the chat has no work when
-/// only some of it, or none, was read.
-fn empty_text(section: Section, coverage: Option<&TranscriptCoverage>) -> EmptyText<'_> {
-    let work = section == Section::Work;
-    let (title, detail, reason) = match coverage {
-        Some(TranscriptCoverage::Unsupported) => (
-            if work {
-                "Work isn't tracked for this chat"
-            } else {
-                "Mentions aren't tracked for this chat"
-            },
-            "cagents doesn't look through this provider's chats for pull requests or worktrees.",
-            None,
-        ),
-        Some(TranscriptCoverage::Unavailable { reason }) => (
-            "Couldn't read this chat's conversation",
-            "Its pull requests and worktrees show here once it can be read.",
-            Some(reason.as_str()),
-        ),
-        Some(TranscriptCoverage::Partial) => (
-            "Only the latest part of this chat was read",
-            if work {
-                "It's long, and it worked on no pull requests or worktrees in that part."
-            } else {
-                "It's long, and it named no other pull requests in that part."
-            },
-            None,
-        ),
-        Some(TranscriptCoverage::Complete | TranscriptCoverage::Pending) | None => {
-            if work {
-                (
-                    "No pull requests or worktrees yet",
-                    "Pull requests this chat creates or pushes, and worktrees it edits, show here.",
-                    None,
-                )
-            } else {
-                (
-                    "No mentions",
-                    "Pull requests this chat only names show here.",
-                    None,
-                )
-            }
-        }
-    };
-    EmptyText {
-        title,
-        detail,
-        reason,
-    }
-}
-
-/// What a reserved list says in place of rows: a line saying where the list
-/// is, and a caption saying what it will hold. It sits where the first row
-/// would, so the rows replace it without moving.
-fn list_notice<'a>(title: &'a str, detail: &'a str) -> Element<'a, Message> {
-    let mut lines: Vec<Element<'a, Message>> = vec![
-        design::body(title)
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .class(cosmic::theme::Text::Custom(design::muted_text))
-            .width(Length::Fill)
-            .into(),
-    ];
-    if !detail.is_empty() {
-        lines.push(
-            design::caption(detail)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .class(cosmic::theme::Text::Custom(design::faint_text))
-                .width(Length::Fill)
-                .into(),
-        );
-    }
-    widget::container(
-        widget::column::with_children(lines)
-            .spacing(space::XXS)
-            .width(Length::Fill),
-    )
-    .padding([
-        pull_request_ui::WORK_LIST_PADDING + space::XS,
-        design::list::GUTTER + design::list::INSET,
-    ])
-    .width(Length::Fill)
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_empty_list_says_how_much_of_the_chat_it_was_read_from() {
-        for section in [Section::Work, Section::Mentioned] {
-            let partial = empty_text(section, Some(&TranscriptCoverage::Partial));
-            assert_eq!(partial.title, "Only the latest part of this chat was read");
-            assert!(partial.detail.contains("in that part"), "{partial:?}");
-            // Each says what its own list holds, so neither contradicts the
-            // other's rows.
-            let holds = if section == Section::Work {
-                "worked on"
-            } else {
-                "named no other"
-            };
-            assert!(partial.detail.contains(holds), "{partial:?}");
-            for text in [partial.title, partial.detail] {
-                assert!(
-                    !text.contains("No pull requests"),
-                    "{section:?} claims none: {text}"
-                );
-                assert!(
-                    !text.starts_with("No mentions"),
-                    "{section:?} claims none: {text}"
-                );
-            }
-            let reason = TranscriptCoverage::Unavailable {
-                reason: "Permission denied".into(),
-            };
-            assert_eq!(
-                empty_text(section, Some(&reason)).reason,
-                Some("Permission denied")
-            );
-            assert!(
-                empty_text(section, Some(&TranscriptCoverage::Unsupported))
-                    .title
-                    .contains("tracked")
-            );
-        }
-        // Read through, it may say there is none.
-        assert_eq!(
-            empty_text(Section::Work, Some(&TranscriptCoverage::Complete)).title,
-            "No pull requests or worktrees yet"
-        );
-        assert_eq!(
-            empty_text(Section::Mentioned, Some(&TranscriptCoverage::Complete)).title,
-            "No mentions"
-        );
-    }
 
     #[test]
     fn what_the_conversation_did_leads_and_the_worktree_tree_waits_to_be_asked_for() {

@@ -327,17 +327,30 @@ impl Cagents {
         self.worktree_paths.lists(path)
     }
 
-    /// Whether `card`'s inspector keeps a Work section: a chat's, while the
-    /// settings show it, whatever its list holds, so the list arriving never
-    /// moves what is beneath it.
-    pub(super) fn work_reserved(&self, card: CardId) -> bool {
+    /// Whether `card`'s inspector follows its conversation's work: a chat's,
+    /// while the settings show the Work section.
+    pub(super) fn tracks_work(&self, card: CardId) -> bool {
         self.settings.inspector_show_work && self.pane_conversation(card).is_some()
     }
 
-    /// Whether `card`'s inspector keeps a Mentioned section, as
-    /// [`Self::work_reserved`] keeps Work.
-    pub(super) fn mentions_reserved(&self, card: CardId) -> bool {
+    /// Whether `card`'s inspector follows the pull requests its conversation
+    /// names, as [`Self::tracks_work`] follows its work.
+    pub(super) fn tracks_mentions(&self, card: CardId) -> bool {
         self.settings.show_mentioned_pull_requests && self.pane_conversation(card).is_some()
+    }
+
+    /// Whether `card`'s inspector shows a Work section: only once its
+    /// conversation's list holds work. A chat that has done none has no
+    /// section rather than one saying so; the sections around it keep their
+    /// order, and it keeps its own collapsed state, as it comes and goes.
+    pub(super) fn work_shown(&self, card: CardId, summary: &WorkSummary) -> bool {
+        self.tracks_work(card) && summary.lists_work
+    }
+
+    /// Whether `card`'s inspector shows a Mentioned section, which, as
+    /// [`Self::work_shown`] says of Work, is only once there are mentions.
+    pub(super) fn mentions_shown(&self, card: CardId, summary: &WorkSummary) -> bool {
+        self.tracks_mentions(card) && summary.mentioned > 0
     }
 
     /// Where `card`'s conversation's list is: a pane whose inspector has not
@@ -362,18 +375,12 @@ impl Cagents {
             .map_or(0, conversation::State::work_count)
     }
 
-    /// How much of `card`'s conversation's transcript its list was read
-    /// from, once one has arrived.
-    pub(super) fn work_transcript(&self, card: CardId) -> Option<&crate::work::TranscriptCoverage> {
-        self.pull_request_inspector.conversation(card)?.transcript()
-    }
-
     /// What `card`'s Work and Mentioned sections and the section beneath
     /// them need of its conversation's work, worked out once per use.
     pub(super) fn work_summary(&self, card: CardId) -> WorkSummary {
         // With neither section shown there is no work to choose, so none
         // scopes the changes and files.
-        if !self.work_reserved(card) && !self.mentions_reserved(card) {
+        if !self.tracks_work(card) && !self.tracks_mentions(card) {
             return WorkSummary::default();
         }
         let Some(conversation) = self.pull_request_inspector.conversation(card) else {
@@ -714,6 +721,7 @@ mod tests {
 
     #[test]
     fn work_lists_what_the_conversation_did_and_mentions_have_their_own_section() {
+        use context_sections::Section;
         let (
             mut app,
             Panes {
@@ -723,33 +731,45 @@ mod tests {
             },
         ) = conversation_app();
         app.sync_pull_request_inspector();
-        // The section is there before its list, saying it is reading it.
-        assert!(app.work_reserved(chat));
+        // While its list is on its way, and once it arrives empty, the chat
+        // has no Work section at all: no header and no placeholder.
+        assert!(app.tracks_work(chat));
         assert_eq!(app.work_phase(chat), WorkPhase::Reading);
-        let reserved = app.work_section_height(chat);
+        assert_eq!(app.context_section_order(chat), [Section::Workspace]);
+        drop(app.handle_pull_request_ui(listed(conversation, 1, &[], false)));
+        assert_eq!(app.work_phase(chat), WorkPhase::Listed);
+        assert!(!app.work_shown(chat, &app.work_summary(chat)));
+        assert_eq!(
+            app.context_section_order(chat),
+            [Section::Workspace],
+            "a chat that has done no work has no Work section"
+        );
+        // Collapsed while absent, it comes back collapsed, and ahead of the
+        // workspace as it always stands.
+        app.context_sections.set_open(Section::Work, false);
         drop(app.handle_pull_request_ui(listed(
             conversation,
-            1,
+            2,
             &[(4, Relation::Created), (5, Relation::Mentioned)],
             true,
         )));
+        assert_eq!(
+            app.context_section_order(chat),
+            [Section::Work, Section::Workspace]
+        );
+        assert!(!app.context_sections.is_open(Section::Work));
+        app.context_sections.set_open(Section::Work, true);
         // Mentions are left out unless the settings ask for them, and then
         // are listed in their own section rather than counted with the work.
         assert!(!app.settings.show_mentioned_pull_requests);
-        assert_eq!(app.work_phase(chat), WorkPhase::Listed);
-        assert_eq!(
-            app.work_section_height(chat),
-            reserved,
-            "the list's arrival moves nothing beneath it"
-        );
-        assert!(!app.mentions_reserved(chat));
+        assert!(!app.tracks_mentions(chat));
         let unexpanded = |height: conversation::Height| height.content - height.expanded;
         let row = design::list::TWO_LINE_HEIGHT;
         let summary = app.work_summary(chat);
         assert_eq!((summary.count, summary.mentioned), (1, 0));
         assert_eq!(unexpanded(summary.height), row);
         app.settings.show_mentioned_pull_requests = true;
-        assert!(app.mentions_reserved(chat));
+        assert!(app.tracks_mentions(chat));
         let summary = app.work_summary(chat);
         assert_eq!((summary.count, summary.mentioned), (1, 1));
         assert_eq!(
@@ -758,33 +778,41 @@ mod tests {
             "the work list is unchanged"
         );
         assert_eq!(unexpanded(summary.mentioned_height), row);
+        assert_eq!(
+            app.context_section_order(chat),
+            [Section::Work, Section::Mentioned, Section::Workspace]
+        );
 
-        // A conversation that only mentioned pull requests lists no work,
-        // but its mentions.
+        // A conversation that only mentioned pull requests lists its
+        // mentions, and no Work section.
         drop(app.handle_pull_request_ui(listed(
             conversation,
-            2,
+            3,
             &[(5, Relation::Mentioned)],
             false,
         )));
         let summary = app.work_summary(chat);
         assert_eq!((summary.count, summary.mentioned), (0, 1));
-        assert!(app.work_reserved(chat), "Work stays, saying it has none");
-        assert_eq!(app.work_section_height(chat), reserved);
+        assert_eq!(
+            app.context_section_order(chat),
+            [Section::Mentioned, Section::Workspace]
+        );
         app.settings.show_mentioned_pull_requests = false;
-        assert!(!app.mentions_reserved(chat));
+        assert!(!app.tracks_mentions(chat));
         assert_eq!(app.work_summary(chat).mentioned, 0);
+        assert_eq!(app.context_section_order(chat), [Section::Workspace]);
 
         // Focusing another pane keeps this pane's inspector on its
         // conversation, and the other pane's lists nothing of it.
         drop(app.workspace.focus(terminal));
         app.sync_pane_inspectors();
         app.sync_pull_request_inspector();
-        drop(app.handle_pull_request_ui(listed(conversation, 3, &[(6, Relation::Pushed)], false)));
+        drop(app.handle_pull_request_ui(listed(conversation, 4, &[(6, Relation::Pushed)], false)));
         assert_eq!(app.work_summary(chat).count, 1);
-        assert!(!app.work_reserved(terminal));
+        assert!(!app.tracks_work(terminal));
         app.settings.inspector_show_work = false;
-        assert!(!app.work_reserved(chat));
+        assert!(!app.tracks_work(chat));
+        assert_eq!(app.context_section_order(chat), [Section::Workspace]);
     }
 
     #[test]
