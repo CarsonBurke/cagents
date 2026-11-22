@@ -21,6 +21,8 @@ const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
 /// worktrees, reading each in turn kept a Git process running and the disk
 /// busy for as long as the window had focus.
 const SHOWN_STALE: Duration = Duration::from_secs(15 * 60);
+/// How soon a watcher that failed to start is tried again.
+const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -163,6 +165,9 @@ impl Watch {
 #[derive(Default)]
 pub(super) struct State {
     watch: Option<Watch>,
+    /// A failed watcher setup is retried by the refresh deadline rather than
+    /// a permanent clock. This is cleared as soon as a watcher is available.
+    watch_retry_at: Option<Instant>,
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
     /// The checkouts someone works in. [`Interest::Active`] for a pane on
@@ -178,15 +183,22 @@ pub(super) struct State {
 }
 
 impl State {
-    /// A healthy watch wakes the application from the filesystem event.
-    /// Keep a timer only until the watch can be retried, or while an
-    /// incomplete watch needs its coarse fallback scan.
-    pub(super) fn fallback_refresh_needed(&self) -> bool {
-        (self.watch.is_none() && !self.entries.is_empty())
-            || self
-                .entries
-                .values()
-                .any(|entry| entry.fallback.is_some() || entry.read_failure.is_some())
+    /// The next watcher-recovery or incomplete-watch scan. A healthy watch
+    /// supplies its own event, so it contributes no deadline.
+    pub(super) fn fallback_refresh_deadline(&self, now: Instant) -> Option<Instant> {
+        let watcher = (self.watch.is_none() && !self.entries.is_empty())
+            .then(|| self.watch_retry_at.unwrap_or(now));
+        let scan = self
+            .entries
+            .values()
+            .filter(|entry| entry.fallback.is_some() || entry.read_failure.is_some())
+            .map(|entry| entry.last_full_scan + FALLBACK_INTERVAL)
+            .min();
+        match (watcher, scan) {
+            (Some(watcher), Some(scan)) => Some(watcher.min(scan)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
     }
 
     pub(super) fn remember_archived(
@@ -483,9 +495,13 @@ impl Cagents {
             match Watch::start() {
                 Ok(watch) => {
                     state.watch = Some(watch);
+                    state.watch_retry_at = None;
                     None
                 }
-                Err(error) => Some(error.to_string()),
+                Err(error) => {
+                    state.watch_retry_at = Some(Instant::now() + WATCH_RETRY_INTERVAL);
+                    Some(error.to_string())
+                }
             }
         } else {
             None
@@ -586,10 +602,23 @@ impl Cagents {
     pub(super) fn git_fallback_tick(&mut self) -> Task<Message> {
         if self.refresh_ui.git.watch.is_none()
             && !self.refresh_ui.git.entries.is_empty()
-            && let Ok(watch) = Watch::start()
+            && self
+                .refresh_ui
+                .git
+                .watch_retry_at
+                .is_none_or(|retry| retry <= Instant::now())
         {
-            self.refresh_ui.git.watch = Some(watch);
-            self.refresh_ui.git.configure();
+            match Watch::start() {
+                Ok(watch) => {
+                    self.refresh_ui.git.watch = Some(watch);
+                    self.refresh_ui.git.watch_retry_at = None;
+                    self.refresh_ui.git.configure();
+                }
+                Err(_) => {
+                    self.refresh_ui.git.watch_retry_at =
+                        Some(Instant::now() + WATCH_RETRY_INTERVAL);
+                }
+            }
         }
         let open = self
             .sidebar_model
@@ -2104,6 +2133,36 @@ mod tests {
         assert!(
             app.refresh_ui.projects.is_empty(),
             "fallback never schedules gh"
+        );
+    }
+
+    #[test]
+    fn failed_watcher_arms_its_exact_retry_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let now = Instant::now();
+        let mut state = State::default();
+        state.watch_retry_at = Some(now + WATCH_RETRY_INTERVAL);
+        state.entries.insert(
+            ProjectId::new(),
+            Entry {
+                snapshot,
+                generation: 1,
+                plan: None,
+                remote_started: false,
+                cancellation: None,
+                read_failure: None,
+                read_full_scan: false,
+                catalog_requested: false,
+                pending: Default::default(),
+                fallback: Some("watch setup failed".into()),
+                last_full_scan: now,
+            },
+        );
+
+        assert_eq!(
+            state.fallback_refresh_deadline(now),
+            Some(now + WATCH_RETRY_INTERVAL)
         );
     }
 

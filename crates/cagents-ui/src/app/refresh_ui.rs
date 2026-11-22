@@ -17,6 +17,9 @@ const MIN_PROJECT_INTERVAL: Duration = Duration::from_secs(30);
 /// Reads that keep failing, a GitHub rate limit included, wait twice as long
 /// after each failure, up to this.
 const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
+/// State reconciliation that has no completion event gets a bounded retry,
+/// but never keeps a permanent application clock alive.
+const RECONCILIATION_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 pub(super) struct State {
@@ -75,9 +78,13 @@ impl ProjectSchedule {
     }
 
     fn due(&self, project: ProjectId, interval: Duration, eager: bool, now: Instant) -> bool {
+        now >= self.due_at(project, interval, eager, now)
+    }
+
+    fn due_at(&self, project: ProjectId, interval: Duration, eager: bool, now: Instant) -> Instant {
         self.read
             .get(&project)
-            .is_none_or(|&read| now.duration_since(read) >= self.wait(project, interval, eager))
+            .map_or(now, |&read| read + self.wait(project, interval, eager))
     }
 
     /// The one project a refresh tick reads, if any. The selected project
@@ -155,6 +162,21 @@ pub enum Action {
     Focused(window::Id, bool),
 }
 
+/// The exact refresh deadline is the subscription identity, so replacing it
+/// cancels the older sleep instead of leaving a periodic wake behind.
+#[derive(Hash)]
+struct RefreshDeadline(Instant);
+
+fn refresh_deadline_stream(
+    deadline: &RefreshDeadline,
+) -> impl cosmic::iced::futures::Stream<Item = Message> + use<> {
+    let deadline = tokio::time::Instant::from_std(deadline.0);
+    cosmic::iced::futures::stream::once(async move {
+        tokio::time::sleep_until(deadline).await;
+        Message::RefreshUi(Action::Tick)
+    })
+}
+
 impl Cagents {
     fn next_github_project(
         &self,
@@ -165,6 +187,9 @@ impl Cagents {
         self.refresh_ui.schedule.next(
             selected.filter(|id| {
                 self.sidebar_model.project(*id).is_some_and(|project| {
+                    // The selected row is also the recovery path for an
+                    // unreadable checkout.  It must remain eligible after a
+                    // mount or device reconnects.
                     project.kind == ProjectKind::Git && self.github_project_polling_ready(*id)
                 })
             }),
@@ -191,75 +216,114 @@ impl Cagents {
     }
 
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
-        if !self.refresh_ui.focused
-            || self.modal_is_open()
-            || self.update_prepared
-            || !self.refresh_tick_needed()
-        {
+        if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
             return Subscription::none();
         }
-        cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick))
+        self.refresh_deadline(Instant::now())
+            .map_or_else(Subscription::none, |deadline| {
+                Subscription::run_with(RefreshDeadline(deadline), refresh_deadline_stream)
+            })
     }
 
-    /// Whether the periodic refresh can currently advance any visible or
-    /// background state. Chats and terminals receive daemon wakes directly,
-    /// so a settled workspace containing only those cards must not keep an
-    /// application-wide timer alive.
-    fn refresh_tick_needed(&self) -> bool {
-        // These consumers are repaired by RefreshUi itself.  Keep this
-        // decision purely state-based: a time-due predicate here would remove
-        // the subscription during a GitHub backoff and leave nothing to wake
-        // it when the backoff expires.
-        if !self.pending_terminal_handoffs.is_empty()
-            || !self.shared_views.blocked.is_empty()
-            || self.document_tone_stale
-        {
-            return true;
+    /// The one next refresh wake.  This is deliberately a deadline instead of
+    /// an interval: a quiet workspace has no subscription at all, while a
+    /// GitHub backoff or failed watch wakes exactly when it can do work again.
+    fn refresh_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut deadline = None;
+        let mut include = |candidate: Option<Instant>| {
+            if let Some(candidate) = candidate {
+                deadline =
+                    Some(deadline.map_or(candidate, |current: Instant| current.min(candidate)));
+            }
+        };
+
+        if self.document_tone_stale {
+            include(Some(now));
+        }
+        if !self.pending_terminal_handoffs.is_empty() || !self.shared_views.blocked.is_empty() {
+            include(Some(now + RECONCILIATION_RETRY));
         }
 
         if crate::device::is_remote() {
-            return self
-                .sidebar_model
-                .projects
-                .iter()
-                .any(|project| project.unreachable.is_none());
+            include(self.project_refresh_deadline(now, true));
+            return deadline;
         }
 
-        // Reopen a failed watch and retain its coarse fallback scan. A healthy
-        // inotify watch wakes the application itself when something changes.
-        if self.refresh_ui.git.fallback_refresh_needed() {
-            return true;
-        }
+        include(self.refresh_ui.git.fallback_refresh_deadline(now));
 
-        if self.cards.iter().any(|(&card, runtime)| {
+        // File-list, review-pane, and source-control refreshes are visible
+        // work. They retain their old cadence without making sidebar-only
+        // workspaces wake every ten seconds.
+        let visible_pane = self.cards.iter().any(|(&card, runtime)| {
             self.workspace.visibility(card) == Some(VisibilityClass::Visible)
                 && matches!(
                     runtime,
                     CardRuntime::Repository(_) | CardRuntime::PullRequests(_)
                 )
-        }) {
-            return true;
-        }
-
-        if self.workspace_view_shown().is_some()
+        });
+        let source_control = self.workspace_view_shown().is_some()
             && self.refresh_ui.source_cancel.is_none()
             && self
                 .sidebar_model
                 .source_control
                 .as_ref()
-                .is_some_and(|source| !source.busy())
-        {
-            return true;
+                .is_some_and(|source| !source.busy());
+        if visible_pane || source_control {
+            include(Some(now + RECONCILIATION_RETRY));
         }
 
-        // `next_github_project` is the clock-aware part: it selects at most
-        // one project only when its own cadence/backoff permits a read.  The
-        // subscription must remain present throughout that wait, otherwise a
-        // failed read can permanently suppress its own retry.
-        self.sidebar_model
-            .projects
-            .iter()
-            .any(|project| project.kind == ProjectKind::Git && project.unreachable.is_none())
+        include(self.project_refresh_deadline(now, false));
+        deadline
+    }
+
+    /// Compute the next selected/other project poll without turning a
+    /// not-yet-due project into a fixed app tick. Local windows poll GitHub;
+    /// device windows use the same scheduler to reload their daemon catalog.
+    fn project_refresh_deadline(&self, now: Instant, remote: bool) -> Option<Instant> {
+        if !self.refresh_ui.projects.is_empty() {
+            // A result message re-arms the subscription. Starting another
+            // read while one is in flight was never useful.
+            return None;
+        }
+        let selected = sidebar::selected_project(&self.sidebar_model, &self.sidebar_state)
+            .filter(|project| remote || project.kind == ProjectKind::Git)
+            .map(|project| project.id);
+        let project_deadline = |project: &SidebarProject, interval| {
+            let due = self
+                .refresh_ui
+                .schedule
+                .due_at(project.id, interval, false, now);
+            if remote {
+                return due;
+            }
+            self.review_repositories
+                .get(&project.id)
+                .and_then(|repository| crate::github::polling::rate_limit(&repository.authority()))
+                .map(|limit| {
+                    let wall_now = crate::github::polling::now();
+                    due.max(now + Duration::from_secs(limit.retry_at.saturating_sub(wall_now)))
+                })
+                .unwrap_or(due)
+        };
+        let mut earliest = selected.and_then(|id| {
+            self.sidebar_model
+                .project(id)
+                .map(|project| project_deadline(project, SELECTED_PROJECT_INTERVAL))
+        });
+        for project in self.sidebar_model.projects.iter().filter(|project| {
+            Some(project.id) != selected
+                && project.unreachable.is_none()
+                && (remote || project.kind == ProjectKind::Git)
+        }) {
+            let interval = if remote || project.has_open_pull_request() {
+                ACTIVE_PROJECT_INTERVAL
+            } else {
+                IDLE_PROJECT_INTERVAL
+            };
+            let due = project_deadline(project, interval);
+            earliest = Some(earliest.map_or(due, |current| current.min(due)));
+        }
+        earliest
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
@@ -554,6 +618,57 @@ mod tests {
     }
 
     #[test]
+    fn visible_pull_request_pane_gets_its_own_refresh_deadline() {
+        let (mut app, project) = super::super::tests::pull_request_test_app(&[]);
+        app.active_workspace = Some("/repo".into());
+        let (browser, _) = app.add_pull_requests_card("/repo".into());
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some("/repo".into())));
+        app.workspace.resize_viewport(2_400.0);
+        app.workspace.native_scroll(0.0, 2_400.0);
+        assert_eq!(
+            app.workspace.visibility(browser),
+            Some(VisibilityClass::Visible)
+        );
+        app.refresh_ui.focused = true;
+        let now = Instant::now();
+        app.refresh_ui.schedule.started(project, now);
+
+        assert!(
+            app.refresh_deadline(now)
+                .is_some_and(|deadline| deadline <= now + RECONCILIATION_RETRY)
+        );
+    }
+
+    #[test]
+    fn shown_source_control_gets_its_own_refresh_deadline() {
+        use super::super::context_sections::{Action as ContextAction, WorkspaceView};
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().expect("fixture has a focused card");
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        app.open_pane_inspector_now(card);
+        drop(app.handle_context_section(ContextAction::Show(WorkspaceView::SourceControl)));
+        assert!(app.workspace_view_shown().is_some());
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .is_some_and(|source| !source.busy())
+        );
+        app.refresh_ui.focused = true;
+        let now = Instant::now();
+        for project in &app.sidebar_model.projects {
+            app.refresh_ui.schedule.started(project.id, now);
+        }
+
+        assert!(
+            app.refresh_deadline(now)
+                .is_some_and(|deadline| deadline <= now + RECONCILIATION_RETRY)
+        );
+    }
+
+    #[test]
     fn failed_github_project_keeps_its_retry_subscription_during_backoff() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.refresh_ui.focused = true;
@@ -566,13 +681,50 @@ mod tests {
             Vec::new(),
             Vec::new(),
         ));
-        app.refresh_ui.schedule.started(project, Instant::now());
+        let started = Instant::now();
+        app.refresh_ui.schedule.started(project, started);
         app.refresh_ui.schedule.finished(project, false);
 
         // The scheduling clock correctly defers the failed read, while the
         // subscription remains armed to reach the later retry.
         assert_eq!(app.next_github_project(None, false, Instant::now()), None);
         assert_ne!(app.refresh_subscription().units(), 0);
+        let now = Instant::now();
+        assert!(
+            app.refresh_deadline(now)
+                .is_some_and(|deadline| { deadline >= started + SELECTED_PROJECT_INTERVAL * 2 }),
+            "the backoff contributes a future wake; GitHub's shared budget may defer it further"
+        );
+    }
+
+    #[test]
+    fn selected_unreadable_project_keeps_its_recovery_deadline() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/unavailable-mount");
+        let mut row = SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Unavailable".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        row.unreachable = Some("mount unavailable".into());
+        app.sidebar_model.projects.push(row);
+        app.sidebar_state
+            .apply(&sidebar::SidebarAction::OpenRepository {
+                project_id: project,
+                repository,
+            });
+
+        let now = Instant::now();
+        assert_eq!(
+            app.next_github_project(Some(project), false, now),
+            Some(project)
+        );
+        assert_eq!(app.project_refresh_deadline(now, false), Some(now));
     }
 
     #[test]
@@ -796,17 +948,41 @@ mod tests {
         .unwrap();
         crate::device::select(Some("focus-test")).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let mut row = SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "remote".into(),
+            PathBuf::from("/remote"),
+            Vec::new(),
+            Vec::new(),
+        );
+        row.unreachable = Some("device disconnected".into());
+        app.sidebar_model.projects.push(row);
+        app.sidebar_state
+            .apply(&sidebar::SidebarAction::OpenRepository {
+                project_id: project,
+                repository: PathBuf::from("/remote"),
+            });
         let window = window::Id::RESERVED;
         app.core.set_main_window_id(Some(window));
         let source_generation = app.refresh_ui.source_generation;
-        let projects = app.refresh_ui.projects.len();
+        app.refresh_ui.focused = true;
+        let now = Instant::now();
+        assert_ne!(
+            app.refresh_subscription().units(),
+            0,
+            "the selected disconnected device project arms its own scheduled wake"
+        );
+        assert_eq!(app.project_refresh_deadline(now, true), Some(now));
+        app.refresh_ui.focused = false;
         drop(app.update(Message::RefreshUi(Action::Focused(window, true))));
         assert!(app.refresh_ui.focused);
         assert_eq!(app.refresh_ui.source_generation, source_generation);
-        assert_eq!(app.refresh_ui.projects.len(), projects);
+        assert!(app.refresh_ui.projects.contains_key(&project));
         drop(app.update(Message::RefreshUi(Action::Tick)));
         assert_eq!(app.refresh_ui.source_generation, source_generation);
-        assert_eq!(app.refresh_ui.projects.len(), projects);
+        assert!(app.refresh_ui.projects.contains_key(&project));
         drop(app.update(Message::RefreshUi(Action::Focused(window, false))));
         assert!(!app.refresh_ui.focused);
     }
