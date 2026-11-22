@@ -6884,6 +6884,71 @@ fn inspector_toggle_clearance_keeps_transcript_rows_out_of_its_footprint() {
     }
 }
 
+/// A rail takes the toggle's place, so a railed chat keeps no clearance for
+/// a toggle it no longer floats: its rows run to the rail's edge.
+#[test]
+fn a_railed_chat_reserves_no_toggle_clearance() {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree, operation::Focusable},
+    };
+    struct Bounds {
+        rail_id: widget::Id,
+        row: Option<iced::Rectangle>,
+        rail: Option<iced::Rectangle>,
+    }
+    impl Operation for Bounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+            if id == Some(&scroll::item_id("0-prompt")) {
+                self.row = Some(bounds);
+            }
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _: &mut dyn Focusable,
+        ) {
+            if id == Some(&self.rail_id) {
+                self.rail = Some(bounds);
+            }
+        }
+    }
+    let renderer = crate::app::tests::headless_renderer();
+    let width = 600.0;
+    let (mut app, card) = inspector_chat_fixture(1600.0);
+    app.open_pane_inspector_now(card);
+    drop(app.workspace.resize_viewport(width));
+    app.sync_pane_inspectors();
+    assert!(app.pane_inspectors.is_railed(card));
+    assert!(!app.pane_shows_inspector_toggle(card));
+    let mut element = app.card_view(card, true, false);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+    );
+    let mut bounds = Bounds {
+        rail_id: app.pane_inspector_rail_id(card),
+        row: None,
+        rail: None,
+    };
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+    let row = bounds.row.expect("rendered first user row");
+    let rail = bounds.rail.expect("the rail");
+    let gap = rail.x - (row.x + row.width);
+    assert!(
+        (step::GAP_S - 0.1..crate::app::pane_inspector::TOGGLE_CLEARANCE).contains(&gap),
+        "{row:?} / {rail:?}"
+    );
+}
+
 #[test]
 fn inspector_open_header_reserves_a_standard_gap_before_its_toggle() {
     use iced::advanced::{

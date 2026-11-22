@@ -8,6 +8,9 @@
 //! pane's content instead of squeezing it. A pane closed only for being too
 //! narrow remembers that its inspector was open, so the inspector comes back
 //! when the pane widens and a restart in a smaller window loses nothing.
+//! Until then, the open inspector collapses to a rail along the pane's edge
+//! that keeps its agent's status and work in view, and expands over the
+//! pane's content when pressed; Escape collapses it again.
 //!
 //! The window binds source control and files to one worktree at a time, so
 //! only one open inspector draws them: the focused pane's, or, while the
@@ -80,12 +83,23 @@ struct PaneState {
     /// Opened while the pane was too narrow for it, so it covers the pane's
     /// content, and narrowness does not close it again.
     opened_narrow: bool,
+    /// Over the content because its rail was pressed, so Escape collapses
+    /// it to the rail again rather than closing it.
+    expanded: bool,
 }
 
 impl PaneState {
     /// Whether the inspector is open on screen.
     fn shown(&self) -> bool {
         self.open && !self.narrowed && !self.unavailable
+    }
+
+    /// Whether the pane docks the inspector's rail: open, in a pane too
+    /// narrow to dock it, whether collapsed or expanded over the content.
+    /// One opened over the content from a closed pane has no rail beneath
+    /// it, so the content keeps its width while it slides in and out.
+    fn railed(&self) -> bool {
+        self.open && !self.unavailable && (self.narrowed || self.expanded)
     }
 }
 
@@ -305,11 +319,34 @@ impl PaneInspectors {
             .is_some_and(|pane| pane.shown() || pane.transition.is_some())
     }
 
+    #[cfg(test)]
     pub(super) fn visible(&self) -> impl Iterator<Item = CardId> + '_ {
         self.panes
             .iter()
             .filter(|(_, pane)| pane.shown() || pane.transition.is_some())
             .map(|(card, _)| *card)
+    }
+
+    /// Whether the pane docks its open inspector's rail; see
+    /// [`PaneState::railed`]. Read from the state the last sync left, so a
+    /// frame never measures a pane to draw it.
+    pub(super) fn is_railed(&self, card: CardId) -> bool {
+        self.panes.get(&card).is_some_and(PaneState::railed)
+    }
+
+    /// The panes whose inspectors show their work: drawn, or collapsed to a
+    /// rail that counts it.
+    pub(super) fn watching(&self) -> impl Iterator<Item = CardId> + '_ {
+        self.panes
+            .iter()
+            .filter(|(_, pane)| pane.shown() || pane.transition.is_some() || pane.railed())
+            .map(|(card, _)| *card)
+    }
+
+    /// Whether the pane's inspector covers its content because its rail
+    /// was pressed, rather than because it was opened there.
+    pub(super) fn is_expanded(&self, card: CardId) -> bool {
+        self.panes.get(&card).is_some_and(|pane| pane.expanded)
     }
 
     pub(super) fn opened_narrow(&self, card: CardId) -> bool {
@@ -350,6 +387,7 @@ impl PaneInspectors {
         pane.open = open;
         pane.chosen = true;
         pane.narrowed = false;
+        pane.expanded = false;
         if open {
             pane.opened_narrow = narrow;
         }
@@ -364,6 +402,57 @@ impl PaneInspectors {
         true
     }
 
+    /// Expands a pane's collapsed rail over its content, sliding from where
+    /// it is drawn now. The pane's open or closed choice stays as it was, so
+    /// widening the pane docks the inspector as before. Returns whether
+    /// anything changed.
+    pub(super) fn expand(&mut self, card: CardId, frame: Option<Instant>, now: Instant) -> bool {
+        let from = self.progress(card, frame);
+        let Some(pane) = self.panes.get_mut(&card) else {
+            return false;
+        };
+        if !pane.railed() || pane.shown() {
+            return false;
+        }
+        pane.narrowed = false;
+        pane.opened_narrow = true;
+        pane.expanded = true;
+        pane.transition = Some(InspectorTransition {
+            started_at: now,
+            from,
+            to: 1.0,
+        });
+        self.constrained.insert(card);
+        self.synced = None;
+        true
+    }
+
+    /// Collapses an inspector its rail expanded over a narrow pane's
+    /// content back to the rail, sliding from where it is drawn now. It
+    /// stays open, as it was before the rail was pressed; one opened over
+    /// the content from a closed pane is not collapsed, as Escape closes it
+    /// again instead. Returns whether anything changed.
+    pub(super) fn collapse(&mut self, card: CardId, frame: Option<Instant>, now: Instant) -> bool {
+        let from = self.progress(card, frame);
+        let Some(pane) = self.panes.get_mut(&card) else {
+            return false;
+        };
+        if !pane.shown() || !pane.opened_narrow || !pane.expanded {
+            return false;
+        }
+        // Covering the content until the slide ends, as a closing overlay
+        // does; `advance` then lets it dock again once the pane widens.
+        pane.narrowed = true;
+        pane.transition = Some(InspectorTransition {
+            started_at: now,
+            from,
+            to: 0.0,
+        });
+        self.constrained.insert(card);
+        self.synced = None;
+        true
+    }
+
     /// Ends every slide that is complete at `now`; returns whether any did.
     pub(super) fn advance(&mut self, now: Instant) -> bool {
         let mut finished = false;
@@ -373,8 +462,9 @@ impl PaneInspectors {
                 .is_some_and(|transition| transition.is_complete(now))
             {
                 pane.transition = None;
-                if !pane.open {
+                if !pane.open || pane.narrowed {
                     pane.opened_narrow = false;
+                    pane.expanded = false;
                 }
                 finished = true;
             }
@@ -588,6 +678,15 @@ impl PaneInspectors {
             if !narrow(card) {
                 pane.narrowed = false;
                 pane.opened_narrow = false;
+                pane.expanded = false;
+                // A rail collapsing as the pane widens docks the inspector
+                // at once rather than sliding it shut and back open.
+                if pane
+                    .transition
+                    .is_some_and(|transition| transition.to < 1.0)
+                {
+                    pane.transition = None;
+                }
             } else if !pane.opened_narrow && !pane.narrowed {
                 // At once, without a slide.
                 pane.narrowed = true;
@@ -699,6 +798,15 @@ impl Cagents {
         kind_availability(kind, self.active_workspace.is_some())
     }
 
+    /// Whether the pane floats its inspector's toggle over its content: it
+    /// has an inspector, does not draw it, and no rail stands in for it.
+    /// Content keeps clear of the toggle only then.
+    pub(super) fn pane_shows_inspector_toggle(&self, card: CardId) -> bool {
+        self.pane_has_inspector(card)
+            && self.pane_inspector_layout(card).is_none()
+            && !self.pane_inspectors.is_railed(card)
+    }
+
     /// Whether the pane has an inspector to open and show now.
     pub(super) fn pane_has_inspector(&self, card: CardId) -> bool {
         self.inspector_availability(card) == Availability::Available
@@ -734,6 +842,11 @@ impl Cagents {
         if open && !self.pane_has_inspector(card) {
             return Task::none();
         }
+        // A rail is an inspector already open, so opening it expands it
+        // without making the pane's choice, and Escape collapses it again.
+        if open && self.pane_inspectors.is_railed(card) && !self.pane_inspectors.is_open(card) {
+            return self.expand_pane_inspector(card);
+        }
         let closing_overlay =
             !open && self.pane_inspector_layout(card) == Some(InspectorLayout::Overlay);
         let narrow = self.pane_too_narrow(card);
@@ -760,11 +873,38 @@ impl Cagents {
         }
     }
 
+    /// Opens or closes the pane's inspector. A rail is an open inspector
+    /// collapsed for want of room, so toggling it shows the inspector over
+    /// the pane rather than closing it.
     pub(super) fn toggle_pane_inspector(&mut self, card: CardId) -> Task<Message> {
         let open = !self.pane_inspectors.is_open(card);
         self.set_pane_inspector_open(card, open)
     }
 
+    /// Expands the pane's rail over its content, without changing whether
+    /// the pane keeps its inspector open, and gives the inspector the
+    /// keyboard, as one opened over the content takes it.
+    pub(super) fn expand_pane_inspector(&mut self, card: CardId) -> Task<Message> {
+        if !self.pane_has_inspector(card)
+            || !self
+                .pane_inspectors
+                .expand(card, self.frame_clock.frame(), Instant::now())
+        {
+            return Task::none();
+        }
+        self.frame_clock.reset();
+        self.sync_pane_inspectors();
+        let binding = self.rebind_source_control();
+        let focus = iced::widget::operation::focus(self.pane_inspector_toggle_id(card))
+            .map(cosmic::Action::App);
+        Task::batch([binding, focus])
+    }
+
+    /// Returns the inspector covering a narrow pane's content to what it
+    /// was before it covered it: one its rail expanded collapses to the
+    /// rail, which takes the keyboard back and keeps the inspector open, so
+    /// widening the pane docks it again; one opened there from a closed
+    /// pane closes again. Escape never leaves a closed inspector open.
     pub(super) fn close_pane_inspector_overlay(&mut self, card: CardId) -> Task<Message> {
         if !self.pane_inspectors.is_open(card)
             || self.pane_inspector_layout(card) != Some(InspectorLayout::Overlay)
@@ -779,13 +919,28 @@ impl Cagents {
             .unwrap_or_else(|_| ViewportUpdate::unchanged());
         self.workspace.take_widget_focus_request();
         let viewport = self.apply_viewport(update, false, DurableChange::None);
-        Task::batch([viewport, self.set_pane_inspector_open(card, false)])
+        if !self.pane_inspectors.is_expanded(card) {
+            return Task::batch([viewport, self.set_pane_inspector_open(card, false)]);
+        }
+        if !self
+            .pane_inspectors
+            .collapse(card, self.frame_clock.frame(), Instant::now())
+        {
+            return viewport;
+        }
+        self.frame_clock.reset();
+        self.sync_pane_inspectors();
+        // The rail beneath takes the keyboard once the panel has slid away,
+        // as the toggle does after a close.
+        Task::batch([viewport, self.rebind_source_control()])
     }
 
     pub(super) fn advance_pane_inspector_transitions(&mut self, now: Instant) -> Task<Message> {
-        // The floating toggle replaces the outgoing panel's toggle once the
-        // slide ends. Focus that newly mounted control, unless the user has
-        // moved to another pane or opened a modal in the meantime.
+        // The floating toggle, or the rail of an inspector that stays open,
+        // replaces the outgoing panel's toggle once the slide ends. Focus
+        // that control, unless the user has moved to another pane or opened
+        // a modal in the meantime. An overlay collapsing to its rail counts
+        // as closing: it is no longer shown either.
         let closing_overlay = self.workspace.focused().filter(|card| {
             !self.modal_is_open()
                 && !self.pane_inspectors.is_open(*card)
@@ -800,8 +955,12 @@ impl Cagents {
         let focus = closing_overlay
             .filter(|card| self.pane_inspector_layout(*card).is_none())
             .map_or_else(Task::none, |card| {
-                workspace_widget::focus_if_unheld(self.pane_inspector_toggle_id(card))
-                    .map(cosmic::Action::App)
+                let id = if self.pane_inspectors.is_railed(card) {
+                    self.pane_inspector_rail_id(card)
+                } else {
+                    self.pane_inspector_toggle_id(card)
+                };
+                workspace_widget::focus_if_unheld(id).map(cosmic::Action::App)
             });
         Task::batch([self.rebind_source_control(), focus])
     }
@@ -879,6 +1038,13 @@ impl Cagents {
         )
     }
 
+    pub(super) fn pane_inspector_rail_id(&self, card: CardId) -> widget::Id {
+        self.card_chrome.get(&card).map_or_else(
+            || card_control_id(card, "inspector.rail"),
+            |chrome| chrome.inspector_rail_id.clone(),
+        )
+    }
+
     /// The toggle of the pane's inspector. It is mounted once per pane, so
     /// it keeps its identity, its focus and its tooltip whether it floats
     /// over the pane's content or sits in the open inspector.
@@ -901,7 +1067,10 @@ impl Cagents {
     /// The pane's content with its inspector: the toggle floating over the
     /// content's top-right corner while the inspector is closed, unless
     /// `toolbar_hosts_toggle` says the content's own toolbar ends with it,
-    /// and the inspector beside or over the content while it is open.
+    /// and the inspector beside or over the content while it is open. An
+    /// open inspector in a pane too narrow to dock it docks its rail
+    /// instead, which stays beneath the inspector expanded over the content,
+    /// so expanding it never reflows the content.
     ///
     /// The tree keeps one shape whatever the inspector does, so opening or
     /// closing it never remounts the pane's content and loses its scroll
@@ -916,6 +1085,7 @@ impl Cagents {
         let width = self.pane_inspector_width(card);
         let progress = self.pane_inspector_progress(card);
         let open = self.pane_inspectors.is_open(card);
+        let railed = self.pane_inspectors.is_railed(card);
         let space = || -> Element<'a, Message> { iced::widget::Space::new().into() };
         // The splitter's layer sizes the layer in front of it, so where
         // there is no splitter it still spans the pane.
@@ -930,6 +1100,7 @@ impl Cagents {
             Element<'a, Message>,
             Element<'a, Message>,
         ) = match layout {
+            None if railed => (self.inspector_rail(card), no_splitter(), space()),
             None if toolbar_hosts_toggle => (space(), no_splitter(), space()),
             None => {
                 let toggle = widget::container(
@@ -967,7 +1138,12 @@ impl Cagents {
                     .align_x(Alignment::End)
                     .width(Length::Fill)
                     .height(Length::Fill);
-                (space(), no_splitter(), panel.into())
+                let rail = if railed {
+                    self.inspector_rail(card)
+                } else {
+                    space()
+                };
+                (rail, no_splitter(), panel.into())
             }
         };
         let row = widget::row::with_children(vec![content, docked])
@@ -1214,7 +1390,7 @@ mod tests {
             let mut full = PaneInspectors::restore(open, legacy).with_default(by_default);
             let now = Instant::now();
             for step in 0..200 {
-                match next(13) {
+                match next(14) {
                     0 => {
                         let card = CardId::new();
                         let source = window.cards[next(window.cards.len())].0;
@@ -1297,6 +1473,19 @@ mod tests {
                         let open = !incremental.open_by_default;
                         incremental.set_open_by_default(open, |card| window.availability(card));
                         full.set_open_by_default(open, |card| window.availability(card));
+                    }
+                    // A rail is pressed, or Escape collapses what it
+                    // expanded.
+                    12 => {
+                        let card = window.cards[next(window.cards.len())].0;
+                        let at = now + Duration::from_millis(step);
+                        if next(2) == 0 {
+                            incremental.expand(card, None, at);
+                            full.expand(card, None, at);
+                        } else {
+                            incremental.collapse(card, None, at);
+                            full.collapse(card, None, at);
+                        }
                     }
                     // A card changes kind under the same card list.
                     10 => {
@@ -1676,6 +1865,109 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_pane_collapses_its_open_inspector_to_a_rail_that_expands_over_it() {
+        let panes = cards(2);
+        let (pane, closed) = (panes[0], panes[1]);
+        // Open by default, so nothing the user chose is saved, and nothing
+        // the rail does may make it a choice.
+        let mut inspectors = PaneInspectors::default().with_default(true);
+        let sync = |inspectors: &mut PaneInspectors, narrow: bool| {
+            inspectors.sync(
+                &panes,
+                Some(pane),
+                |_| Availability::Available,
+                |_| narrow,
+                |_| true,
+            );
+        };
+        sync(&mut inspectors, false);
+        close(&mut inspectors, closed);
+        let choices = inspectors.choices(|_| true);
+        assert!(inspectors.is_open(pane) && !inspectors.is_railed(pane));
+
+        // Too narrow to dock, the open inspector becomes a rail; the one
+        // the user closed stays closed, with no rail.
+        sync(&mut inspectors, true);
+        assert!(!inspectors.is_open(pane) && inspectors.is_railed(pane));
+        assert!(!inspectors.is_visible(pane), "at once, without a slide");
+        assert!(!inspectors.is_railed(closed));
+        assert!(
+            inspectors.watching().any(|card| card == pane),
+            "the rail still counts its work"
+        );
+        assert!(!inspectors.expand(closed, None, Instant::now()));
+
+        // Pressed, it expands over the content, keeping its rail.
+        let now = Instant::now();
+        assert!(inspectors.expand(pane, None, now));
+        assert!(!inspectors.expand(pane, None, now), "already expanded");
+        sync(&mut inspectors, true);
+        assert!(inspectors.is_open(pane) && inspectors.opened_narrow(pane));
+        assert!(inspectors.is_railed(pane));
+        inspectors.advance(now + DIALOG_TRANSITION_DURATION);
+        assert_eq!(inspectors.choices(|_| true), choices);
+
+        // Escape collapses it back to the rail, sliding away over the
+        // content first.
+        let now = Instant::now();
+        assert!(inspectors.collapse(pane, None, now));
+        sync(&mut inspectors, true);
+        assert!(!inspectors.is_open(pane) && inspectors.is_visible(pane));
+        assert!(inspectors.opened_narrow(pane), "it covers the content");
+        assert!(inspectors.is_railed(pane));
+        inspectors.advance(now + DIALOG_TRANSITION_DURATION);
+        assert!(!inspectors.is_visible(pane) && !inspectors.opened_narrow(pane));
+        assert!(inspectors.is_railed(pane));
+        assert!(!inspectors.collapse(pane, None, now), "already collapsed");
+        assert_eq!(inspectors.choices(|_| true), choices);
+
+        // Widening docks it as it was, with nothing chosen.
+        sync(&mut inspectors, false);
+        assert!(inspectors.is_open(pane) && !inspectors.is_railed(pane));
+        assert_eq!(inspectors.progress(pane, None), 1.0);
+        assert_eq!(inspectors.choices(|_| true), choices);
+
+        // Widened while collapsing, it docks at once rather than sliding
+        // shut and open again.
+        sync(&mut inspectors, true);
+        let now = Instant::now();
+        assert!(inspectors.expand(pane, None, now));
+        inspectors.advance(now + DIALOG_TRANSITION_DURATION);
+        assert!(inspectors.collapse(pane, None, now));
+        sync(&mut inspectors, false);
+        assert!(inspectors.is_open(pane) && !inspectors.is_animating());
+        assert_eq!(inspectors.progress(pane, None), 1.0);
+
+        // Closed by choice from over the content, the rail goes too.
+        sync(&mut inspectors, true);
+        assert!(inspectors.expand(pane, None, now));
+        assert!(inspectors.set_open(pane, false, true, None, now));
+        assert!(!inspectors.is_railed(pane));
+        inspectors.advance(now + DIALOG_TRANSITION_DURATION);
+        assert!(!inspectors.is_railed(pane) && !inspectors.opened_narrow(pane));
+
+        // Opened over the content from closed, it was never the rail's, so
+        // Escape's collapse leaves it for closing instead.
+        assert!(inspectors.set_open(pane, true, true, None, now));
+        assert!(inspectors.is_open(pane) && !inspectors.is_expanded(pane));
+        assert!(!inspectors.is_railed(pane), "no rail beneath it");
+        assert!(!inspectors.collapse(pane, None, now));
+        assert!(inspectors.is_open(pane));
+
+        // An inspector with nothing to show here has no rail either.
+        let mut inspectors = PaneInspectors::default().with_default(true);
+        inspectors.sync(
+            &panes,
+            Some(pane),
+            |_| Availability::Unavailable,
+            |_| true,
+            |_| true,
+        );
+        assert!(!inspectors.is_railed(pane));
+        assert!(!inspectors.expand(pane, None, Instant::now()));
+    }
+
+    #[test]
     fn a_wider_inspector_narrows_itself_to_its_pane_rather_than_closing() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
@@ -1712,6 +2004,22 @@ mod tests {
 
     /// Where the pane's view lays out its inspector toggle, if it mounts one.
     fn mounted_toggle(app: &Cagents, card: CardId, size: iced::Size) -> Option<iced::Rectangle> {
+        mounted_control(app, card, size, app.pane_inspector_toggle_id(card))
+    }
+
+    /// Where the pane's view lays out its inspector rail, if it mounts one.
+    fn mounted_rail(app: &Cagents, card: CardId, size: iced::Size) -> Option<iced::Rectangle> {
+        mounted_control(app, card, size, app.pane_inspector_rail_id(card))
+    }
+
+    /// Where the pane's view lays out the focusable control `id`, if it
+    /// mounts one.
+    fn mounted_control(
+        app: &Cagents,
+        card: CardId,
+        size: iced::Size,
+        id: widget::Id,
+    ) -> Option<iced::Rectangle> {
         use cosmic::iced::advanced::widget::{Operation, Tree, operation::Focusable};
         use cosmic::iced::advanced::{Layout, layout};
 
@@ -1740,11 +2048,198 @@ mod tests {
             &renderer,
             &layout::Limits::new(iced::Size::ZERO, size),
         );
-        let mut find = Find(app.pane_inspector_toggle_id(card), None);
+        let mut find = Find(id, None);
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut find);
         find.1
+    }
+
+    /// Runs `task`'s focus changes against the pane's mounted view, then
+    /// delivers `events` to it, as the native runtime does, keeping widget
+    /// state in `cache` from one call to the next. Returns what the view
+    /// published and the control left with focus.
+    fn pane_keyboard(
+        app: &Cagents,
+        card: CardId,
+        size: iced::Size,
+        cache: &mut cosmic::iced::runtime::user_interface::Cache,
+        task: Task<Message>,
+        events: &[iced::Event],
+    ) -> (Vec<Message>, Option<widget::Id>) {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::futures::StreamExt;
+        use cosmic::iced::runtime::user_interface::{Cache, UserInterface};
+
+        struct Focused(Option<widget::Id>);
+        impl Operation for Focused {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0 = id.cloned();
+                }
+            }
+        }
+
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            app.card_view(card, true, false),
+            size,
+            std::mem::replace(cache, Cache::new()),
+            &mut renderer,
+        );
+        iced::futures::executor::block_on(async {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return;
+            };
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    loop {
+                        ui.operate(&renderer, operation.as_mut());
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        });
+        let mut messages = Vec::new();
+        let mut clipboard = iced::advanced::clipboard::Null;
+        drop(ui.update(
+            events,
+            iced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut messages,
+        ));
+        let mut focused = Focused(None);
+        ui.operate(&renderer, &mut focused);
+        *cache = ui.into_cache();
+        (messages, focused.0)
+    }
+
+    #[test]
+    fn escape_returns_focus_to_the_rail_which_enter_and_space_press() {
+        use cosmic::iced::keyboard::{self, Key, Modifiers, key::Named};
+        let narrow = iced::Size::new(600.0, 800.0);
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let resize = |app: &mut Cagents, width: f32| {
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(width),
+            }));
+        };
+        let press = |key: Key, modifiers: Modifiers, repeat: bool| {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat,
+            })
+        };
+        // One window's widget state, kept through the whole sequence.
+        let mut cache = cosmic::iced::runtime::user_interface::Cache::new();
+
+        // Open where it docks, then collapsed to its rail by a narrower pane.
+        resize(&mut app, 1200.0);
+        app.open_pane_inspector_now(card);
+        resize(&mut app, narrow.width);
+        assert!(app.pane_inspectors.is_railed(card));
+        drop(pane_keyboard(
+            &app,
+            card,
+            narrow,
+            &mut cache,
+            Task::none(),
+            &[],
+        ));
+
+        // Expanded, the overlay's toggle takes the keyboard from the rail.
+        let expand = app.update(Message::ExpandPaneInspector(card));
+        app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_expanded(card));
+        let (_, focused) = pane_keyboard(&app, card, narrow, &mut cache, expand, &[]);
+        assert_eq!(focused, Some(app.pane_inspector_toggle_id(card)));
+
+        // Escape there slides the panel away, and the rail it leaves takes
+        // the keyboard, as the toggle does once a panel closes.
+        let (messages, _) = pane_keyboard(
+            &app,
+            card,
+            narrow,
+            &mut cache,
+            Task::none(),
+            &[press(Key::Named(Named::Escape), Modifiers::empty(), false)],
+        );
+        let escape = messages
+            .into_iter()
+            .find(|message| matches!(message, Message::ClosePaneInspector(id) if *id == card))
+            .expect("Escape in the overlay closes it");
+        let sliding = app.update(escape);
+        drop(pane_keyboard(&app, card, narrow, &mut cache, sliding, &[]));
+        let settled =
+            app.advance_pane_inspector_transitions(Instant::now() + DIALOG_TRANSITION_DURATION);
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.pane_inspector_layout(card), None);
+        let (_, focused) = pane_keyboard(&app, card, narrow, &mut cache, settled, &[]);
+        assert_eq!(focused, Some(app.pane_inspector_rail_id(card)));
+
+        let space = || Key::Character(" ".into());
+        let focus_rail = || widget::button::focus(app.pane_inspector_rail_id(card));
+        for (event, expands) in [
+            (
+                press(Key::Named(Named::Enter), Modifiers::empty(), false),
+                true,
+            ),
+            (press(space(), Modifiers::empty(), false), true),
+            (press(space(), Modifiers::SHIFT, false), false),
+            (press(space(), Modifiers::CTRL, false), false),
+            (press(space(), Modifiers::empty(), true), false),
+        ] {
+            let (messages, _) = pane_keyboard(
+                &app,
+                card,
+                narrow,
+                &mut cache,
+                focus_rail(),
+                &[event.clone()],
+            );
+            let pressed = messages
+                .iter()
+                .filter(
+                    |message| matches!(message, Message::ExpandPaneInspector(id) if *id == card),
+                )
+                .count();
+            assert_eq!(pressed, usize::from(expands), "{event:?}");
+        }
+        // Unfocused, the rail leaves Space to whatever has the keyboard.
+        let (messages, _) = pane_keyboard(
+            &app,
+            card,
+            narrow,
+            &mut cosmic::iced::runtime::user_interface::Cache::new(),
+            Task::none(),
+            &[press(space(), Modifiers::empty(), false)],
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ExpandPaneInspector(_)))
+        );
     }
 
     #[test]
@@ -1784,6 +2279,129 @@ mod tests {
             Some(InspectorLayout::Docked)
         );
         in_corner(toggle_bounds(&app, card, size), "docked");
+    }
+
+    #[test]
+    fn the_rail_stands_in_for_an_open_inspector_exactly_where_it_cannot_dock() {
+        let narrow = iced::Size::new(600.0, 800.0);
+        let wide = iced::Size::new(1200.0, 800.0);
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let resize = |app: &mut Cagents, size: iced::Size| {
+            drop(app.update(Message::Viewport {
+                generation: app.workspace_view_generation,
+                event: WorkspaceViewportEvent::Resized(size.width),
+            }));
+        };
+        resize(&mut app, wide);
+        app.open_pane_inspector_now(card);
+        let choices = app.saved_inspector_choices();
+        assert!(mounted_rail(&app, card, wide).is_none(), "docked");
+
+        // Too narrow to dock: the rail runs down the pane's right edge, in
+        // place of the floating toggle.
+        resize(&mut app, narrow);
+        assert!(app.pane_inspectors.is_railed(card));
+        let rail = mounted_rail(&app, card, narrow).expect("the rail is drawn");
+        assert!(
+            (narrow.width - (rail.x + rail.width)) <= space::XXS + 0.5,
+            "at the pane's right edge: {rail:?}"
+        );
+        assert!(rail.width <= inspector_rail::RAIL_WIDTH, "{rail:?}");
+        assert!(
+            rail.height > narrow.height / 2.0,
+            "the pane's height: {rail:?}"
+        );
+        assert!(mounted_toggle(&app, card, narrow).is_none());
+        assert_eq!(app.pane_inspector_layout(card), None);
+        assert!(!app.pane_content_inputs_blocked(card));
+
+        // Pressed, it expands the inspector over the content, which owns
+        // the keyboard while the rail stays laid out beneath it.
+        drop(app.update(Message::ExpandPaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay)
+        );
+        assert!(mounted_toggle(&app, card, narrow).is_some());
+        assert!(
+            mounted_rail(&app, card, narrow).is_none(),
+            "covered, as the content is, the rail takes no focus"
+        );
+        assert_eq!(app.saved_inspector_choices(), choices);
+
+        // Escape collapses it to the rail again.
+        drop(app.update(Message::ClosePaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert_eq!(app.pane_inspector_layout(card), None);
+        assert!(mounted_rail(&app, card, narrow).is_some());
+        assert!(mounted_toggle(&app, card, narrow).is_none());
+        assert_eq!(app.saved_inspector_choices(), choices);
+
+        // The inspector shortcut expands it too, as the rail is an open
+        // inspector, and pressed again collapses it as Escape does.
+        drop(app.update(Message::ToggleContextInspector));
+        app.settle_pane_inspectors();
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay)
+        );
+        drop(app.update(Message::ToggleContextInspector));
+        app.settle_pane_inspectors();
+        assert_eq!(app.pane_inspector_layout(card), None);
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.saved_inspector_choices(), choices);
+
+        // A command that reveals a section there expands the rail, and
+        // leaves the pane's choice alone too.
+        drop(app.reveal_context_section(card, context_sections::Section::Problems));
+        app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_expanded(card));
+        drop(app.update(Message::ClosePaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert!(app.pane_inspectors.is_railed(card));
+        assert_eq!(app.saved_inspector_choices(), choices);
+
+        // Widening docks the inspector as it was.
+        resize(&mut app, wide);
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Docked)
+        );
+        assert!(mounted_rail(&app, card, wide).is_none());
+        assert_eq!(app.saved_inspector_choices(), choices);
+
+        // Closed from over the content, it is closed: the floating toggle
+        // returns, and nothing docks once the pane widens.
+        resize(&mut app, narrow);
+        drop(app.update(Message::ExpandPaneInspector(card)));
+        app.settle_pane_inspectors();
+        drop(app.update(Message::TogglePaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert!(!app.pane_inspectors.is_railed(card));
+        assert!(mounted_rail(&app, card, narrow).is_none());
+        assert!(mounted_toggle(&app, card, narrow).is_some());
+
+        // Opened over the content from closed, Escape closes it again, as
+        // it was: no rail, and still closed once the pane widens. No rail
+        // lies beneath it either, so the content keeps its width.
+        drop(app.update(Message::TogglePaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert_eq!(
+            app.pane_inspector_layout(card),
+            Some(InspectorLayout::Overlay)
+        );
+        assert!(!app.pane_inspectors.is_railed(card));
+        drop(app.update(Message::ClosePaneInspector(card)));
+        app.settle_pane_inspectors();
+        assert!(!app.pane_inspectors.is_open(card));
+        assert!(!app.pane_inspectors.is_railed(card));
+        assert!(mounted_rail(&app, card, narrow).is_none());
+        assert!(mounted_toggle(&app, card, narrow).is_some());
+        assert!(app.saved_inspector_choices().closed.contains(&card));
+        resize(&mut app, wide);
+        assert_eq!(app.pane_inspector_layout(card), None);
     }
 
     #[test]
