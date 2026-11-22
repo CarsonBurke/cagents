@@ -77,6 +77,10 @@ pub(crate) struct Tracker {
     /// When the latest request started, until the provider reports
     /// something of it.
     pending: Option<u64>,
+    /// When a continuation started while a reading was still owed for an
+    /// earlier request; it is pending once that reading arrives. Tools that
+    /// finish together continue in one request, so only the latest is kept.
+    continuation: Option<u64>,
     /// The gap before the latest request, until a reading says whether the
     /// cache survived it.
     measuring: Option<(u64, u64)>,
@@ -104,6 +108,14 @@ impl Tracker {
                     .filter(|gap| *gap >= MIN_GAP_MS)
                     .map(|gap| (now, gap));
                 self.pending = Some(now);
+                self.continuation = None;
+                false
+            }
+            // Codex reports a request's usage only after its tools finish, so
+            // a continuation can start before the request it continues is
+            // reported.
+            Evidence::Continued if self.pending.is_some() => {
+                self.continuation = Some(now);
                 false
             }
             Evidence::Continued => {
@@ -149,6 +161,13 @@ impl Tracker {
         self.activity.clone()
     }
 
+    /// The conversation moved to another model, which keeps a cache of its
+    /// own, so the next request measures nothing about this one's.
+    pub(crate) fn forget_prompt(&mut self) {
+        self.prompt = None;
+        self.measuring = None;
+    }
+
     /// The provider reported on the pending request, so it reached the
     /// cache. Says whether the activity changed.
     fn confirm(&mut self) -> bool {
@@ -156,6 +175,7 @@ impl Tracker {
             return false;
         };
         self.activity.requested_at = Some(at);
+        self.pending = self.continuation.take();
         true
     }
 }
@@ -326,9 +346,38 @@ mod tests {
         tracker.observe(read(41_000, 40_000), 10 * MINUTE);
         tracker.observe(Evidence::Continued, 30 * MINUTE);
         assert_eq!(tracker.activity().requested_at, Some(10 * MINUTE));
-        tracker.observe(Evidence::Continued, 31 * MINUTE);
         tracker.observe(read(43_000, 41_000), 31 * MINUTE);
+        assert_eq!(tracker.activity().requested_at, Some(30 * MINUTE));
+    }
+
+    #[test]
+    fn a_continuation_waits_for_its_own_reading_after_the_one_it_continues() {
+        let mut tracker = Tracker::default();
+        let read = |prompt, cached| Evidence::Read { prompt, cached };
+        tracker.observe(Evidence::Request, 0);
+        tracker.observe(read(40_000, 39_000), 0);
+        // Codex's order: two tools finish, then the reading of the request
+        // that called them arrives; the turn is stopped before more follows.
+        tracker.observe(Evidence::Request, 10 * MINUTE);
+        tracker.observe(Evidence::Continued, 30 * MINUTE);
+        tracker.observe(Evidence::Continued, 31 * MINUTE);
+        tracker.observe(read(41_000, 40_000), 31 * MINUTE);
+        assert_eq!(tracker.activity().requested_at, Some(10 * MINUTE));
+        // Had it continued, its own reading would have counted it.
+        tracker.observe(read(42_000, 41_000), 32 * MINUTE);
         assert_eq!(tracker.activity().requested_at, Some(31 * MINUTE));
+    }
+
+    #[test]
+    fn a_new_model_measures_nothing_about_the_old_cache() {
+        let mut tracker = Tracker::default();
+        let read = |prompt, cached| Evidence::Read { prompt, cached };
+        tracker.observe(Evidence::Request, 0);
+        tracker.observe(read(40_000, 39_000), 0);
+        tracker.observe(Evidence::Request, 3 * MINUTE);
+        tracker.forget_prompt();
+        tracker.observe(read(41_000, 2_000), 3 * MINUTE);
+        assert!(tracker.activity().observations.is_empty());
     }
 
     #[test]

@@ -91,7 +91,7 @@ struct Account {
     /// The provider's executable name, which stays stable as providers are
     /// added, unlike its wire encoding.
     provider: String,
-    account: Option<AccountId>,
+    account: AccountId,
     observations: Vec<Observation>,
 }
 
@@ -148,9 +148,11 @@ impl Calibration {
             // Claude reports how long each cache write lasts; what it hasn't
             // reported, such as for a prompt too short to cache, is unknown.
             (None, Provider::Claude) => return None,
-            // Observations filed under no account would mix accounts.
-            (None, _) if account.is_none() => estimate(assumed_ttl(provider), &[])?,
-            (None, _) => self.calibrate(provider, account, activity.observations)?,
+            (None, _) => match account {
+                Some(account) => self.calibrate(provider, account, activity.observations)?,
+                // Observations filed under no account would mix accounts.
+                None => estimate(assumed_ttl(provider), &[])?,
+            },
         };
         Some(PromptCache {
             requested_at,
@@ -163,11 +165,11 @@ impl Calibration {
     fn calibrate(
         &self,
         provider: Provider,
-        account: Option<&SessionAccount>,
+        account: &SessionAccount,
         observations: Vec<Observation>,
     ) -> Option<(u64, TtlBasis)> {
         let name = provider.executable();
-        let id = account.map(|account| account.id.clone());
+        let id = account.id.clone();
         let mut state = self.accounts.lock().unwrap_or_else(|p| p.into_inner());
         let Accounts { accounts, unsaved } = &mut *state;
         let accounts = accounts.get_or_insert_with(|| {
