@@ -11764,6 +11764,10 @@ impl Cagents {
                 queued.model = None;
             } else if let Some(listed) = snapshot.models.iter().find(|listed| listed.id == model) {
                 let reasoning = reasoning.filter(|reasoning| listed.reasoning.contains(reasoning));
+                // A draft this message goes back to offers the effort it used.
+                if queued.chosen.0.as_ref() == Some(&model) {
+                    queued.chosen.1.clone_from(&reasoning);
+                }
                 return self.chat_send_step(
                     target,
                     Command::SetModel { model, reasoning },

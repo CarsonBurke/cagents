@@ -16504,6 +16504,14 @@ fn an_undelivered_model_switch_is_reported_and_the_model_kept() {
             app.chat_ui.last_models.get(&Provider::Codex).cloned(),
             remembered
         );
+        // The model may be fine, so a draft this returns to keeps offering it.
+        assert_eq!(
+            chat_runtime(&app, card)
+                .queued
+                .as_ref()
+                .map(|queued| queued.chosen.0.clone()),
+            Some(Some("gpt-b".into()))
+        );
     }
     // Any other refusal gives the model up, and its reason goes to the
     // log rather than the transcript.
@@ -16529,6 +16537,14 @@ fn an_undelivered_model_switch_is_reported_and_the_model_kept() {
         "{notes:?}"
     );
     assert!(!app.chat_ui.last_models.contains_key(&Provider::Codex));
+    // A draft this returns to shows the default the message went out on.
+    assert_eq!(
+        chat_runtime(&app, card)
+            .queued
+            .as_ref()
+            .map(|queued| queued.chosen.clone()),
+        Some((None, None))
+    );
 }
 
 /// A conversation that has not listed its models yet is given time to,
