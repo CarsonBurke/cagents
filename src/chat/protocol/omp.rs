@@ -1883,6 +1883,7 @@ fn change(result: &Value) -> Option<FileChange> {
     let diff = result["diff"].as_str().filter(|diff| !diff.is_empty())?;
     let path = result["path"].as_str().filter(|path| !path.is_empty())?;
     Some(FileChange {
+        lines: crate::chat::LineOrigin::File,
         path: path.into(),
         // A moved file reports the path it moved to, so the path it came from is
         // the one the result keeps aside.

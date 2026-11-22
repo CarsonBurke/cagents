@@ -1017,6 +1017,7 @@ fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_
                         path: "/w/app/.worktrees/feat/src/lib.rs".into(),
                         kind: ChangeKind::Updated,
                         diff: String::new(),
+                        lines: crate::chat::LineOrigin::File,
                     }],
                     status: ToolStatus::Succeeded,
                 },

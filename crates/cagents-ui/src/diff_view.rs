@@ -554,7 +554,7 @@ fn highlight_lines(
 /// Reuse common text only when the complete lexical states also agree.
 /// Bounded checkpoints suffice; a changed multiline string/comment must reparse
 /// the suffix, even when every subsequent source line is byte-identical.
-fn highlight_comparison(
+pub(crate) fn highlight_comparison(
     before: &str,
     after: &str,
     path: &Path,
@@ -651,7 +651,7 @@ fn highlight_comparison(
 }
 
 #[derive(Debug)]
-struct Cancelled;
+pub(crate) struct Cancelled;
 
 fn check_cancelled(cancellation: &CancellationToken) -> Result<(), Cancelled> {
     if cancellation.is_cancelled() {
@@ -791,6 +791,39 @@ impl<'a> ShapeKey<'a> {
     }
 }
 
+/// Native widths of many lines at [`DIFF_FONT_SIZE`], sharing the shaping of
+/// every repeated line and word.
+///
+/// Worker-local and bounded, borrowing the text it measures: no retained
+/// native paragraphs or copies of source text, and no cache shared between
+/// documents.
+#[derive(Default)]
+pub(crate) struct LineMeasurer<'a> {
+    measured: HashMap<ShapeKey<'a>, f32>,
+    words: HashMap<ShapeKey<'a>, f32>,
+}
+
+impl<'a> LineMeasurer<'a> {
+    /// The width `text` draws at under `syntax`, every span in `font`'s
+    /// family.
+    pub(crate) fn width(
+        &mut self,
+        text: &'a str,
+        syntax: &[SyntaxSpan],
+        font: cosmic::iced::Font,
+    ) -> f32 {
+        let key = ShapeKey::new(text, syntax, font);
+        if let Some(width) = self.measured.get(&key) {
+            return *width;
+        }
+        let width = key.width(&mut self.words);
+        if self.measured.len() < 32768 {
+            self.measured.insert(key, width);
+        }
+        width
+    }
+}
+
 fn plain_line_width(line: &str, font: cosmic::iced::Font) -> f32 {
     use cosmic::iced::{
         Pixels, Size,
@@ -828,10 +861,7 @@ fn measure_diff(
         2
     };
     let mut widths = [0.0_f32; 2];
-    // Worker-local, bounded, borrowing the existing model: no retained native
-    // paragraphs or copies of source text, and no cross-repository cache.
-    let mut measured = HashMap::new();
-    let mut words = HashMap::new();
+    let mut measurer = LineMeasurer::default();
     for row in &model.split_rows {
         for (old, line, text) in [
             (true, row.old_line, row.old_text.as_deref()),
@@ -841,17 +871,8 @@ fn measure_diff(
                 for (palette, width) in widths.iter_mut().enumerate().take(palettes) {
                     check_cancelled(cancellation)?;
                     let syntax = model.syntax.line(old, line, palette == 1);
-                    let key = ShapeKey::new(text, syntax, font);
-                    let shaped = if let Some(width) = measured.get(&key) {
-                        *width
-                    } else {
-                        let width = key.width(&mut words);
-                        check_cancelled(cancellation)?;
-                        if measured.len() < 32768 {
-                            measured.insert(key, width);
-                        }
-                        width
-                    };
+                    let shaped = measurer.width(text, syntax, font);
+                    check_cancelled(cancellation)?;
                     *width = width.max(shaped);
                 }
             }
@@ -1319,6 +1340,12 @@ fn build_diff_rows(
     })
 }
 
+/// Unchanged rows kept beside every change, as `git diff` does by default.
+pub(crate) const FOLD_CONTEXT: usize = 3;
+/// A fold stands in for its rows with one row of its own, so hiding only a
+/// handful would cost nearly as much height as it saves.
+pub(crate) const FOLD_MIN_HIDDEN: usize = 4;
+
 /// The reference size widths are measured at: the default editor font size.
 /// The surface scales them to the editor's actual size, since glyph advances
 /// scale with it; a different family is measured again instead.
@@ -1362,12 +1389,12 @@ fn shaped_spans_width(spans: &[cosmic::iced::widget::text::Span<'_>]) -> f32 {
 
 /// Span boundaries also participate in native shaping, so measurement and
 /// drawing must partition intraline highlights identically.
-pub(crate) fn line_spans<'a>(
+pub(crate) fn line_spans<'a, Link>(
     text: &'a str,
     changed: &[Range<usize>],
     syntax: &[SyntaxSpan],
     background: cosmic::iced::Color,
-) -> Vec<cosmic::iced::widget::text::Span<'a>> {
+) -> Vec<cosmic::iced::widget::text::Span<'a, Link>> {
     use cosmic::iced::widget::text::Span;
 
     let mut spans = Vec::with_capacity(changed.len() * 2 + syntax.len() + 1);
@@ -1423,11 +1450,223 @@ pub(crate) fn line_spans<'a>(
     spans
 }
 
+/// The colours diff rows draw with, resolved from the theme once for a whole
+/// view rather than once per row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DiffPalette {
+    context: cosmic::iced::Color,
+    added: cosmic::iced::Color,
+    removed: cosmic::iced::Color,
+    /// Word emphasis, already mixed over its row's tint.
+    added_emphasis: cosmic::iced::Color,
+    removed_emphasis: cosmic::iced::Color,
+    foreground: cosmic::iced::Color,
+    pub(crate) dark: bool,
+}
+
+impl DiffPalette {
+    pub(crate) fn new(theme: &cosmic::Theme) -> Self {
+        let dark = theme.theme_type.is_dark();
+        // Keep additions and deletions distinct without obscuring their text.
+        let alpha = if dark { 0.24 } else { 0.18 };
+        let added = diff_row_background(theme, DiffRowKind::Addition);
+        let removed = diff_row_background(theme, DiffRowKind::Deletion);
+        Self {
+            context: diff_row_background(theme, DiffRowKind::Context),
+            added,
+            removed,
+            added_emphasis: diff_tint(
+                diff_highlight_color(theme, DiffRowKind::Addition, alpha),
+                added,
+            ),
+            removed_emphasis: diff_tint(
+                diff_highlight_color(theme, DiffRowKind::Deletion, alpha),
+                removed,
+            ),
+            foreground: theme.cosmic().on_bg_color().into(),
+            dark,
+        }
+    }
+
+    pub(crate) fn row_background(&self, kind: DiffRowKind) -> cosmic::iced::Color {
+        match kind {
+            DiffRowKind::Addition => self.added,
+            DiffRowKind::Deletion => self.removed,
+            DiffRowKind::Context | DiffRowKind::Modification => self.context,
+        }
+    }
+
+    fn emphasis(&self, kind: DiffRowKind) -> cosmic::iced::Color {
+        match kind {
+            DiffRowKind::Addition => self.added_emphasis,
+            DiffRowKind::Deletion => self.removed_emphasis,
+            DiffRowKind::Context | DiffRowKind::Modification => self.context,
+        }
+    }
+}
+
+/// One diff row's text as drawn: syntax colour corrected to stay readable on
+/// the row's tint, and the words that changed emphasised.
+///
+/// `family`, when given, is the family every span is drawn in; syntax keeps
+/// its weight and style in it, as the row was measured.
+pub(crate) fn styled_line_spans<'a, Link>(
+    text: &'a str,
+    changed: &[Range<usize>],
+    syntax: &[SyntaxSpan],
+    kind: DiffRowKind,
+    palette: &DiffPalette,
+    family: Option<cosmic::iced::font::Family>,
+) -> Vec<cosmic::iced::widget::text::Span<'a, Link>> {
+    let row_background = palette.row_background(kind);
+    // A wholly added/deleted line already has a line tint. Word emphasis is
+    // useful only when it distinguishes an edit within otherwise shared text.
+    let changed = if changed == [0..text.len()] {
+        &[]
+    } else {
+        changed
+    };
+    let emphasis = palette.emphasis(kind);
+    let mut spans = line_spans(text, changed, syntax, emphasis);
+    for span in &mut spans {
+        if let (Some(font), Some(family)) = (&mut span.font, family) {
+            font.family = family;
+        }
+        let background = if span.highlight.is_some() {
+            emphasis
+        } else {
+            row_background
+        };
+        let foreground = span.color.unwrap_or(palette.foreground);
+        span.color = Some(readable_diff_color(foreground, background));
+    }
+    spans
+}
+
+pub(crate) fn diff_highlight_color(
+    theme: &cosmic::Theme,
+    kind: DiffRowKind,
+    alpha: f32,
+) -> cosmic::iced::Color {
+    let mut color = match kind {
+        DiffRowKind::Addition => crate::design::success_color(theme),
+        DiffRowKind::Deletion => crate::design::destructive_color(theme),
+        DiffRowKind::Context | DiffRowKind::Modification => {
+            return cosmic::iced::Color::TRANSPARENT;
+        }
+    };
+    color.a = alpha;
+    color
+}
+
+fn color_over(
+    foreground: cosmic::iced::Color,
+    background: cosmic::iced::Color,
+) -> cosmic::iced::Color {
+    if foreground.a == 1.0 {
+        return foreground;
+    }
+    if foreground.a == 0.0 {
+        return background;
+    }
+    let foreground = foreground.into_linear();
+    let background = background.into_linear();
+    let alpha = foreground[3];
+    cosmic::iced::Color::from_linear_rgba(
+        foreground[0] * alpha + background[0] * (1.0 - alpha),
+        foreground[1] * alpha + background[1] * (1.0 - alpha),
+        foreground[2] * alpha + background[2] * (1.0 - alpha),
+        1.0,
+    )
+}
+
+/// `foreground` as drawn over `background`, moved toward black or white only
+/// as far as it takes to reach a 4.5:1 contrast.
+pub(crate) fn readable_diff_color(
+    foreground: cosmic::iced::Color,
+    background: cosmic::iced::Color,
+) -> cosmic::iced::Color {
+    use cosmic::iced::Color;
+    let foreground = color_over(foreground, background);
+    if foreground.relative_contrast(background) >= 4.5 {
+        return foreground;
+    }
+    let target = if Color::BLACK.relative_contrast(background)
+        >= Color::WHITE.relative_contrast(background)
+    {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    };
+    // Correct only as much luminance as necessary. Replacing a syntax color
+    // outright with black/white erased the distinction between token kinds.
+    let mix = |amount: f32| {
+        Color::from_rgb(
+            foreground.r + (target.r - foreground.r) * amount,
+            foreground.g + (target.g - foreground.g) * amount,
+            foreground.b + (target.b - foreground.b) * amount,
+        )
+    };
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..12 {
+        let mid = (low + high) * 0.5;
+        if mix(mid).relative_contrast(background) >= 4.5 {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    mix(high)
+}
+
+/// Mix diff tints in display color space, then draw an opaque background.
+/// Linear-light mixing made small alpha values much brighter than expected.
+pub(crate) fn diff_tint(
+    tint: cosmic::iced::Color,
+    background: cosmic::iced::Color,
+) -> cosmic::iced::Color {
+    cosmic::iced::Color::from_rgb(
+        background.r + (tint.r - background.r) * tint.a,
+        background.g + (tint.g - background.g) * tint.a,
+        background.b + (tint.b - background.b) * tint.a,
+    )
+}
+
+/// A row that stands in for unchanged lines: a fold, or the lines between
+/// two hunks.
+pub(crate) fn diff_fold_background(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let mut accent = crate::design::accent_color(theme);
+    accent.a = if theme.theme_type.is_dark() {
+        0.10
+    } else {
+        0.07
+    };
+    diff_tint(accent, theme.cosmic().bg_color().into())
+}
+
+/// A line number in a diff's gutter: the text colour, faded.
+pub(crate) fn diff_gutter_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    let mut color: cosmic::iced::Color = theme.current_container().on.into();
+    color.a = crate::design::DIFF_GUTTER_ALPHA;
+    cosmic::iced::widget::text::Style {
+        color: Some(color),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn diff_row_background(theme: &cosmic::Theme, kind: DiffRowKind) -> cosmic::iced::Color {
+    match kind {
+        DiffRowKind::Addition => crate::design::diff_added_color(theme),
+        DiffRowKind::Deletion => crate::design::diff_removed_color(theme),
+        _ => theme.cosmic().bg_color().into(),
+    }
+}
+
 /// Find corresponding changed lines without using indentation or punctuation
 /// as evidence. A bounded weighted sequence alignment keeps matches monotonic,
 /// allowing leading insertions/deletions without shifting every intraline pair.
 /// Oversized or exhausted hunks conservatively remain whole-line changes.
-fn replacement_matches(
+pub(crate) fn replacement_matches(
     before: &[DisplayLine<'_>],
     after: &[DisplayLine<'_>],
     budget: &mut usize,
@@ -1541,7 +1780,7 @@ fn substantive_similarity(before: &[&str], after: &[&str]) -> u32 {
     }
 }
 
-fn whole_line_change(text: &str) -> Vec<Range<usize>> {
+pub(crate) fn whole_line_change(text: &str) -> Vec<Range<usize>> {
     if text.is_empty() {
         Vec::new()
     } else {
@@ -1552,7 +1791,7 @@ fn whole_line_change(text: &str) -> Vec<Range<usize>> {
 /// Word/whitespace/punctuation tokens preserve the original UTF-8 slices. The
 /// byte, token-product and whole-file budgets bound pathological replacement
 /// hunks; when exhausted the actual entire changed line remains highlighted.
-fn intraline_changes(
+pub(crate) fn intraline_changes(
     before: &str,
     after: &str,
     budget: &mut usize,
@@ -1679,7 +1918,7 @@ impl LineEnding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DisplayLine<'a> {
+pub(crate) struct DisplayLine<'a> {
     text: &'a str,
     ending: LineEnding,
 }
@@ -1701,7 +1940,7 @@ impl DisplayLine<'_> {
     }
 }
 
-fn display_line(line: &str) -> DisplayLine<'_> {
+pub(crate) fn display_line(line: &str) -> DisplayLine<'_> {
     if let Some(text) = line.strip_suffix("\r\n") {
         DisplayLine {
             text,
@@ -2350,7 +2589,7 @@ mod tests {
                         .syntax
                         .line(row.new_line.is_none(), row.new_line.or(row.old_line), dark);
                 let background = cosmic::iced::Color::from_rgba(0.2, 0.8, 0.3, 0.46);
-                let spans = line_spans(&row.text, &row.changed, syntax, background);
+                let spans = line_spans::<()>(&row.text, &row.changed, syntax, background);
                 let mut offset = 0;
                 for span in spans {
                     let length = span.text.len();
@@ -2487,6 +2726,37 @@ mod tests {
 
     fn highlighted<'a>(text: &'a str, ranges: &[Range<usize>]) -> Vec<&'a str> {
         ranges.iter().map(|range| &text[range.clone()]).collect()
+    }
+
+    #[test]
+    fn faint_diff_syntax_remains_readable_over_both_highlight_layers() {
+        for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
+            for kind in [DiffRowKind::Addition, DiffRowKind::Deletion] {
+                let row = diff_row_background(&theme, kind);
+                let highlight = color_over(diff_highlight_color(&theme, kind, 0.18), row);
+                let faint = cosmic::iced::Color::from_rgba(0.6, 0.6, 0.6, 0.7);
+                for background in [row, highlight] {
+                    let foreground = readable_diff_color(faint, background);
+                    assert!(foreground.relative_contrast(background) >= 4.5);
+                    assert_eq!(readable_diff_color(foreground, background), foreground);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_correction_retains_syntax_hue_instead_of_replacing_it() {
+        for background in [
+            cosmic::iced::Color::from_rgb8(42, 29, 31),
+            cosmic::iced::Color::from_rgb8(251, 231, 233),
+        ] {
+            let syntax = cosmic::iced::Color::from_rgb8(110, 75, 170);
+            let adjusted = readable_diff_color(syntax, background);
+            assert!(adjusted.relative_contrast(background) >= 4.5);
+            assert_ne!(adjusted, cosmic::iced::Color::WHITE);
+            assert_ne!(adjusted, cosmic::iced::Color::BLACK);
+            assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
+        }
     }
 
     #[test]

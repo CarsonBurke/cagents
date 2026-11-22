@@ -111,6 +111,7 @@ mod markdown;
 mod markdown_source;
 mod monospace;
 mod opening_name;
+mod patch_view;
 mod pending_admission;
 mod permissions;
 mod preparation;
@@ -514,7 +515,24 @@ pub enum Action {
     ChangeListScrolled(Target, u64, u64, bool, f32),
     ChangePatches(Target, Option<chat::FilePatchCursor>),
     ChangePatch(Target, usize),
-    ChangesLoaded(Target, u64, Result<chat::FileChangeReply, String>),
+    /// A fold opened, or more of the patch asked for, in the selected patch.
+    ChangePatchView(Target, patch_view::Event),
+    /// A reply, with a page's patches read for drawing in the syntax theme
+    /// the request was sent in.
+    ChangesLoaded(
+        Target,
+        u64,
+        Result<chat::FileChangeReply, String>,
+        Arc<[patch_view::PatchModel]>,
+        crate::settings::EditorSyntaxTheme,
+    ),
+    /// The shown page's patches, coloured again in a changed syntax theme.
+    ChangesRecoloured(
+        Target,
+        u64,
+        Arc<[patch_view::PatchModel]>,
+        crate::settings::EditorSyntaxTheme,
+    ),
     Files(Target, PathBuf, Arc<Vec<String>>),
     Find(Target, String),
     FindNext(Target, bool),
@@ -951,7 +969,9 @@ impl Action {
             Self::ChangeListScrolled(..) => "ChangeListScrolled",
             Self::ChangePatches(..) => "ChangePatches",
             Self::ChangePatch(..) => "ChangePatch",
+            Self::ChangePatchView(..) => "ChangePatchView",
             Self::ChangesLoaded(..) => "ChangesLoaded",
+            Self::ChangesRecoloured(..) => "ChangesRecoloured",
             Self::Files(..) => "Files",
             Self::Find(..) => "Find",
             Self::FindNext(..) => "FindNext",
@@ -1031,6 +1051,7 @@ impl Action {
                 | Self::CommandFinished(..)
                 | Self::CommandsDue(..)
                 | Self::ChangesLoaded(..)
+                | Self::ChangesRecoloured(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
                 | Self::LogicalProseRead(..)
@@ -1479,10 +1500,15 @@ impl State {
 impl State {
     /// Give parked chats a changed syntax theme: one can still be warm, and is
     /// shown again as it is.
-    pub(super) fn set_parked_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
-        for runtime in self.parked.values_mut() {
-            runtime.set_syntax_theme(theme);
-        }
+    pub(super) fn set_parked_syntax_theme(
+        &mut self,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Task<Message> {
+        Task::batch(
+            self.parked
+                .values_mut()
+                .map(|runtime| runtime.change_syntax_theme(theme)),
+        )
     }
 
     pub(super) fn transition_pending(&self) -> bool {
@@ -5264,6 +5290,19 @@ impl Runtime {
             // A search reads links as their labels, which have just changed.
             self.refresh_find_work();
         }
+    }
+
+    /// Highlights the transcript's code blocks and the shown patches in
+    /// `theme` from now on, recolouring the patches only when it changed.
+    pub(in crate::app) fn change_syntax_theme(
+        &mut self,
+        theme: crate::settings::EditorSyntaxTheme,
+    ) -> Task<Message> {
+        if self.syntax_theme == theme {
+            return Task::none();
+        }
+        self.set_syntax_theme(theme);
+        self.recolour_changes()
     }
 
     /// Highlights the transcript's code blocks in `theme` from now on.
@@ -15060,26 +15099,49 @@ impl Cagents {
                     runtime.changes.sync();
                 }
             }
-            Action::ChangesLoaded(target, id, result) => {
+            Action::ChangePatchView(target, event) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.changes.patch_view.apply(event);
+                }
+            }
+            Action::ChangesRecoloured(target, id, models, theme) => {
+                // A recolour for a theme chosen and then left again, which
+                // finished after the current one, is dropped.
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && theme == runtime.syntax_theme
+                {
+                    runtime.changes.recoloured(id, models);
+                }
+            }
+            Action::ChangesLoaded(target, id, result, models, theme) => {
                 let files = matches!(&result, Ok(chat::FileChangeReply::Files(_)));
                 if let Some(runtime) = self.chat_runtime_mut(target)
-                    && runtime.changes.complete(id, result)
+                    && runtime.changes.complete(id, result, models)
                 {
-                    return iced::widget::scrollable::scroll_to(
-                        card_control_id(
-                            target.card,
-                            if files {
-                                "chat-changes-files"
-                            } else {
-                                "chat-changes-detail"
+                    // The theme changed while the page was on its way.
+                    let recolour = if files || theme == runtime.syntax_theme {
+                        Task::none()
+                    } else {
+                        runtime.recolour_changes()
+                    };
+                    return Task::batch([
+                        recolour,
+                        iced::widget::scrollable::scroll_to(
+                            card_control_id(
+                                target.card,
+                                if files {
+                                    "chat-changes-files"
+                                } else {
+                                    "chat-changes-detail"
+                                },
+                            ),
+                            iced::widget::scrollable::AbsoluteOffset {
+                                x: Some(0.0),
+                                y: Some(0.0),
                             },
-                        ),
-                        iced::widget::scrollable::AbsoluteOffset {
-                            x: Some(0.0),
-                            y: Some(0.0),
-                        },
-                    )
-                    .map(cosmic::Action::App);
+                        )
+                        .map(cosmic::Action::App),
+                    ]);
                 }
             }
             Action::ComposerActions(target, open) => {

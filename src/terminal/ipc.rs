@@ -290,7 +290,12 @@ use crate::{
 /// reply, which name every terminal the daemon holds or is starting, and the
 /// transcripts they write, so a window never prunes a transcript whose writer
 /// may still append. An older client never sends it.
-pub const PROTOCOL_VERSION: u16 = 194;
+///
+/// Version 195 adds `lines` to `FileChange` and `FileChangePatch`: whether a
+/// patch's line numbers are positions in the file, or count from an excerpt
+/// such as the text a Claude `Edit` replaces. An older client is sent both
+/// without it; one read from an older update source is taken as an excerpt.
+pub const PROTOCOL_VERSION: u16 = 195;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -321,8 +326,8 @@ mod older_clients;
 #[cfg(test)]
 pub(crate) use older_clients::encoding_for;
 pub(crate) use older_clients::{
-    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PLAN_AND_RESET_READINGS, WAITING_TOOL_STATUS,
-    encoding_before,
+    ANTIGRAVITY_AND_MUSE, ENDED_TOOL_STATUS, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
+    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -3045,6 +3050,7 @@ mod tests {
                     },
                     revision: 5,
                     patches: vec![FileChangePatch {
+                        lines: crate::chat::LineOrigin::File,
                         ownership_unverified: false,
                         item_id: "edit".into(),
                         kind: ChangeKind::Updated,
@@ -3452,6 +3458,7 @@ mod tests {
                     key,
                     revision: 5,
                     patches: vec![FileChangePatch {
+                        lines: crate::chat::LineOrigin::File,
                         ownership_unverified: true,
                         item_id: "edit".into(),
                         kind: ChangeKind::Updated,

@@ -23,7 +23,13 @@ pub(super) struct State {
     patch_request: Option<u64>,
     waiting: HashSet<u64>,
     pub(super) patch_index: usize,
+    /// The page's patches, read for drawing where the page was received.
+    models: Arc<[patch_view::PatchModel]>,
+    /// The selected patch as plain text, for one that is not rows.
     patch: Option<tool_text::ToolText>,
+    /// Which of the selected patch's folds are open and whether it is shown
+    /// whole.
+    pub(super) patch_view: patch_view::ViewState,
     loaded_patch: Option<(u64, usize)>,
     error: Option<String>,
 }
@@ -43,6 +49,7 @@ impl State {
         self.resolved_path = None;
         self.list = None;
         self.page = None;
+        self.models = Arc::new([]);
         self.patch = None;
         self.loaded_patch = None;
         self.patch_request = None;
@@ -80,6 +87,7 @@ impl State {
         self.selected = None;
         self.resolved_path = None;
         self.page = None;
+        self.models = Arc::new([]);
         self.patch = None;
         self.loaded_patch = None;
         self.patch_index = 0;
@@ -94,6 +102,7 @@ impl State {
         self.selected = Some(key);
         self.resolved_path = None;
         self.page = None;
+        self.models = Arc::new([]);
         self.loaded_patch = None;
         self.patch = None;
         self.patch_index = 0;
@@ -107,6 +116,7 @@ impl State {
             self.patch_index = 0;
             self.patch = None;
             self.page = None;
+            self.models = Arc::new([]);
             self.loaded_patch = None;
             self.patch_request.replace(id)
         } else {
@@ -120,10 +130,12 @@ impl State {
         id
     }
 
+    /// `models` are the patches of a page reply, read by [`prepare`].
     pub(super) fn complete(
         &mut self,
         id: u64,
         result: Result<chat::FileChangeReply, String>,
+        models: Arc<[patch_view::PatchModel]>,
     ) -> bool {
         if !self.waiting.remove(&id) {
             return false;
@@ -142,6 +154,7 @@ impl State {
                     && self.selected.as_ref() == Some(&page.key) =>
             {
                 self.page = Some(Arc::new(page));
+                self.models = models;
                 self.sync();
                 true
             }
@@ -179,11 +192,73 @@ impl State {
         if self.loaded_patch == Some((id, self.patch_index)) {
             return;
         }
-        self.patch = page.patches.get(self.patch_index).map(|patch| {
-            tool_text::ToolText::update(self.patch.take(), &patch.diff, tool_text::Language::Diff)
-        });
+        let raw = self
+            .models
+            .get(self.patch_index)
+            .is_none_or(patch_view::PatchModel::is_raw);
+        self.patch = page
+            .patches
+            .get(self.patch_index)
+            .filter(|_| raw)
+            .map(|patch| {
+                tool_text::ToolText::update(
+                    self.patch.take(),
+                    &patch.diff,
+                    tool_text::Language::Diff,
+                )
+            });
+        self.patch_view = patch_view::ViewState::default();
         self.loaded_patch = Some((id, self.patch_index));
     }
+
+    /// Takes `models`, the shown page's patches coloured again, unless the
+    /// page has changed since they were read. Folds stay as they were: the
+    /// rows are the same.
+    pub(super) fn recoloured(&mut self, id: u64, models: Arc<[patch_view::PatchModel]>) {
+        if self
+            .page()
+            .is_some_and(|page| page.request_id == id && page.patches.len() == models.len())
+        {
+            self.models = models;
+        }
+    }
+
+    /// The selected patch, read as rows.
+    fn model(&self) -> Option<&patch_view::PatchModel> {
+        self.page()?;
+        self.models.get(self.patch_index)
+    }
+}
+
+/// Reads a reply's patches for drawing, as [`prepare_page`] does.
+pub(super) fn prepare(
+    reply: &chat::FileChangeReply,
+    theme: crate::settings::EditorSyntaxTheme,
+) -> Arc<[patch_view::PatchModel]> {
+    match reply {
+        chat::FileChangeReply::Patches(page) => prepare_page(page, theme),
+        _ => Arc::new([]),
+    }
+}
+
+/// Reads a page's patches for drawing, as rows where they are patches this
+/// can read, with their syntax coloured in `theme`. Done where the page is
+/// received, not where it is drawn.
+fn prepare_page(
+    page: &chat::FileChangePage,
+    theme: crate::settings::EditorSyntaxTheme,
+) -> Arc<[patch_view::PatchModel]> {
+    page.patches
+        .iter()
+        .map(|patch| {
+            patch_view::PatchModel::new(
+                patch.diff.as_str().into(),
+                Path::new(&page.key.path),
+                patch.lines,
+                (patch.diff.len() <= CachedItem::HIGHLIGHT_LIMIT).then_some(theme),
+            )
+        })
+        .collect()
 }
 
 fn kind(kind: &chat::ChangeKind) -> &'static str {
@@ -248,6 +323,27 @@ impl Runtime {
         }
     }
 
+    /// Colours the shown page's patches again in the syntax theme, off the
+    /// UI thread as the page itself was, after the theme changed.
+    pub(in crate::app) fn recolour_changes(&self) -> Task<Message> {
+        let Some(page) = self
+            .changes
+            .page
+            .clone()
+            .filter(|_| self.changes.page().is_some())
+        else {
+            return Task::none();
+        };
+        let (target, theme) = (self.target, self.syntax_theme);
+        cosmic::task::future(async move {
+            let id = page.request_id;
+            let models = tokio::task::spawn_blocking(move || prepare_page(&page, theme))
+                .await
+                .unwrap_or_else(|_| Arc::from([]));
+            Message::ChatUi(Action::ChangesRecoloured(target, id, models, theme))
+        })
+    }
+
     pub(super) fn changes_view(&self, width: f32) -> Element<'_, Message> {
         let target = self.target;
         let summary = self
@@ -257,6 +353,14 @@ impl Runtime {
             .unwrap_or(self.snapshot.file_changes.as_ref());
         let readable = self.handle().is_some() && !self.disconnected;
         let narrow = width < 560.0;
+        // The patch's width inside the card's padding, the two panes' gap and
+        // the detail pane's scrollbar rail.
+        let inner = width - 2.0 * space::S;
+        let detail_width = if narrow {
+            inner
+        } else {
+            (inner - space::S) * 3.0 / 5.0
+        } - design::SCROLLBAR_GUTTER;
         let mut heading: Vec<Element<'_, Message>> = Vec::new();
         if narrow && self.changes.selected.is_some() {
             heading.push(
@@ -451,7 +555,7 @@ impl Runtime {
         );
         let body: Element<'_, Message> = if narrow {
             if self.changes.selected.is_some() {
-                self.change_detail(readable)
+                self.change_detail(readable, detail_width)
             } else {
                 list
             }
@@ -461,7 +565,7 @@ impl Runtime {
                     .width(Length::FillPortion(2))
                     .height(Length::Fill)
                     .into(),
-                widget::container(self.change_detail(readable))
+                widget::container(self.change_detail(readable, detail_width))
                     .width(Length::FillPortion(3))
                     .height(Length::Fill)
                     .into(),
@@ -490,7 +594,7 @@ impl Runtime {
         )
     }
 
-    fn change_detail(&self, readable: bool) -> Element<'_, Message> {
+    fn change_detail(&self, readable: bool, width: f32) -> Element<'_, Message> {
         let target = self.target;
         let Some(key) = &self.changes.selected else {
             return design::caption("Choose a file to review its reported edits.").into();
@@ -544,36 +648,54 @@ impl Runtime {
                         if let chat::ChangeKind::Renamed { from } = &patch.kind {
                             rows.push(design::caption(format!("from {from}")).into());
                         }
-                        if let Some(block) = &self.changes.patch {
-                            if block.text.is_empty() {
-                                rows.push(
-                                    design::caption(
-                                        "The provider reported this edit without a text patch.",
-                                    )
-                                    .into(),
-                                );
-                            } else {
+                        if patch.diff.is_empty() {
+                            rows.push(
+                                design::caption(
+                                    "The provider reported this edit without a text patch.",
+                                )
+                                .into(),
+                            );
+                        } else {
+                            let view = self.changes.model().and_then(|model| {
+                                model.view(
+                                    &self.changes.patch_view,
+                                    patch_view::Options {
+                                        width,
+                                        theme: self.syntax_theme,
+                                    },
+                                    move |event| action(Action::ChangePatchView(target, event)),
+                                    patch_view::plain,
+                                )
+                            });
+                            if let Some(view) = view {
+                                rows.push(view);
+                            } else if let Some(block) = &self.changes.patch {
                                 rows.push(block.view_from_start(
                                     self.syntax_theme,
                                     120.0,
                                     target,
                                     None,
                                 ));
-                                let excerpt = patch.offset > 0
-                                    || patch.offset.saturating_add(patch.diff.len())
-                                        < patch.total_bytes;
+                            }
+                            let excerpt = patch.offset > 0
+                                || patch.offset.saturating_add(patch.diff.len())
+                                    < patch.total_bytes;
+                            rows.push(
+                                crate::ui_controls::button::quiet(if excerpt {
+                                    "Copy patch excerpt"
+                                } else {
+                                    "Copy patch"
+                                })
+                                .on_press(action(Action::CopyLiteral(patch.diff.clone())))
+                                .into(),
+                            );
+                            if excerpt {
                                 rows.push(
-                                    crate::ui_controls::button::quiet(if excerpt {
-                                        "Copy patch excerpt"
-                                    } else {
-                                        "Copy patch"
-                                    })
-                                    .on_press(action(Action::CopyLiteral(block.text.to_string())))
+                                    design::caption(
+                                        "This is part of a larger patch. More edits continues it.",
+                                    )
                                     .into(),
                                 );
-                                if excerpt {
-                                    rows.push(design::caption("This is part of a larger patch. More edits continues it.").into());
-                                }
                             }
                         }
                     }
@@ -704,6 +826,7 @@ impl Cagents {
                 request_id: id,
                 after,
             },
+            runtime.syntax_theme,
         )
     }
 
@@ -748,18 +871,58 @@ impl Cagents {
                 cursor,
                 revision,
             },
+            runtime.syntax_theme,
         )
     }
 }
 
-fn send(target: Target, handle: Arc<ClientHandle>, id: u64, command: Command) -> Task<Message> {
+fn send(
+    target: Target,
+    handle: Arc<ClientHandle>,
+    id: u64,
+    command: Command,
+    theme: crate::settings::EditorSyntaxTheme,
+) -> Task<Message> {
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || handle.file_changes(command))
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
-        Message::ChatUi(Action::ChangesLoaded(target, id, result))
+        let loaded = tokio::task::spawn_blocking(move || {
+            handle.file_changes(command).map(|reply| {
+                let models = prepare(&reply, theme);
+                (reply, models)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        let (result, models) = match loaded {
+            Ok((reply, models)) => (Ok(reply), models),
+            Err(error) => (Err(error), Arc::from([])),
+        };
+        Message::ChatUi(Action::ChangesLoaded(target, id, result, models, theme))
     })
+}
+
+#[cfg(test)]
+impl State {
+    /// Accepts a reply as [`send`] delivers it.
+    pub(super) fn receive(
+        &mut self,
+        id: u64,
+        result: Result<chat::FileChangeReply, String>,
+    ) -> bool {
+        let models = result.as_ref().map_or_else(
+            |_| Arc::from([]),
+            |reply| prepare(reply, crate::settings::EditorSyntaxTheme::default()),
+        );
+        self.complete(id, result, models)
+    }
+
+    /// Opens `page`'s file with the page loaded, as a reply to its request.
+    pub(super) fn show_page(&mut self, mut page: chat::FileChangePage) {
+        self.open = true;
+        self.select(page.key.clone());
+        page.request_id = self.request(true);
+        assert!(self.receive(page.request_id, Ok(chat::FileChangeReply::Patches(page))));
+    }
 }
 
 #[cfg(test)]
@@ -778,6 +941,7 @@ mod tests {
             key,
             revision: 9,
             patches: vec![chat::FileChangePatch {
+                lines: crate::chat::LineOrigin::File,
                 item_id: "edit-1".into(),
                 kind: chat::ChangeKind::Updated,
                 status: chat::ToolStatus::Succeeded,
@@ -790,6 +954,58 @@ mod tests {
             next: None,
             error: None,
         })
+    }
+
+    #[test]
+    fn a_patch_is_read_as_rows_and_each_patch_opens_folded() {
+        let mut state = State {
+            open: true,
+            ..State::default()
+        };
+        state.select(key("src/lib.rs"));
+        let id = state.request(true);
+        let diff = "@@ -1,2 +1,2 @@\n-old\n+new\n keep\n";
+        let chat::FileChangeReply::Patches(mut reply) = page(id, key("src/lib.rs"), diff, 0) else {
+            unreachable!()
+        };
+        reply.patches.push(reply.patches[0].clone());
+        assert!(state.receive(id, Ok(chat::FileChangeReply::Patches(reply))));
+        let model = state.model().expect("the selected patch is read");
+        assert!(!model.is_raw());
+        assert_eq!(model.counts(), Some((1, 1)));
+        assert!(
+            state.patch.is_none(),
+            "a patch shown as rows is not also laid out as text"
+        );
+        state.patch_view.apply(patch_view::Event::ShowMore);
+        state.patch_index = 1;
+        state.sync();
+        assert_eq!(state.patch_view, patch_view::ViewState::default());
+    }
+
+    #[test]
+    fn a_page_coloured_again_replaces_its_patches_only_while_it_is_shown() {
+        let mut state = State {
+            open: true,
+            ..State::default()
+        };
+        state.select(key("src/lib.rs"));
+        let id = state.request(true);
+        let reply = page(id, key("src/lib.rs"), "@@ -1 +1 @@\n-old\n+new\n", 0);
+        assert!(state.receive(id, Ok(reply)));
+        state.patch_view.apply(patch_view::Event::ShowMore);
+        let recoloured = prepare_page(
+            state.page().unwrap(),
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        state.recoloured(id + 1, recoloured.clone());
+        assert!(!Arc::ptr_eq(&state.models, &recoloured), "another page's");
+        state.recoloured(id, recoloured.clone());
+        assert!(Arc::ptr_eq(&state.models, &recoloured));
+        assert!(
+            state.patch_view != patch_view::ViewState::default(),
+            "what the reader opened stays open"
+        );
     }
 
     #[test]
@@ -811,10 +1027,15 @@ mod tests {
                 "{} during the `file_query` request",
                 chat::failure::actor_transport::DEADLINE
             )),
+            Arc::from([]),
         );
         assert_eq!(state.error.as_deref(), Some(UNANSWERED));
         let request = state.request(true);
-        state.complete(request, Err("File identity exceeds the limit".into()));
+        state.complete(
+            request,
+            Err("File identity exceeds the limit".into()),
+            Arc::from([]),
+        );
         assert_eq!(
             state.error.as_deref(),
             Some("File identity exceeds the limit")
@@ -826,11 +1047,11 @@ mod tests {
         let mut state = State::default();
         let old = state.request(true);
         let current = state.request(true);
-        state.complete(old, Err("stale".into()));
+        state.receive(old, Err("stale".into()));
         assert!(state.error.is_none());
         assert!(state.waiting.contains(&current));
         state.close();
-        state.complete(current, Err("closed".into()));
+        state.receive(current, Err("closed".into()));
         assert!(state.error.is_none());
         assert!(state.patch.is_none());
     }
@@ -849,12 +1070,12 @@ mod tests {
             assert_eq!(state.waiting.len(), 1);
         }
         let current = state.patch_request.unwrap();
-        state.complete(old, Ok(page(old, key("first.rs"), "-old\n+stale\n", 0)));
+        state.receive(old, Ok(page(old, key("first.rs"), "-old\n+stale\n", 0)));
         assert!(
             state.patch.is_none(),
             "a late old selection must not become visible"
         );
-        state.complete(
+        state.receive(
             current,
             Ok(page(
                 current,
@@ -897,14 +1118,14 @@ mod tests {
             revision: 20,
             ..chat::FileChangesSummary::default()
         };
-        second.complete(b, Ok(chat::FileChangeReply::Files(second_list)));
-        first.complete(a, Ok(chat::FileChangeReply::Files(first_list)));
+        second.receive(b, Ok(chat::FileChangeReply::Files(second_list)));
+        first.receive(a, Ok(chat::FileChangeReply::Files(first_list)));
         first.select(key("same.rs"));
         second.select(key("same.rs"));
         let a = first.request(true);
         let b = second.request(true);
-        second.complete(b, Ok(page(b, key("same.rs"), "+continued\n", 8192)));
-        first.complete(a, Ok(page(a, key("same.rs"), "+first\n", 0)));
+        second.receive(b, Ok(page(b, key("same.rs"), "+continued\n", 8192)));
+        first.receive(a, Ok(page(a, key("same.rs"), "+first\n", 0)));
         assert_eq!(first.page().unwrap().patches[0].offset, 0);
         assert_eq!(second.page().unwrap().patches[0].offset, 8192);
         assert_eq!(first.patch.as_ref().unwrap().text.as_ref(), "+first\n");
@@ -922,10 +1143,10 @@ mod tests {
         replacement.select(key("same.rs"));
         let current = replacement.request(true);
         assert_ne!(old, current);
-        replacement.complete(old, Ok(page(old, key("same.rs"), "+retired\n", 0)));
+        replacement.receive(old, Ok(page(old, key("same.rs"), "+retired\n", 0)));
         assert!(replacement.page.is_none());
         assert!(replacement.waiting.contains(&current));
-        replacement.complete(current, Ok(page(current, key("same.rs"), "+current\n", 0)));
+        replacement.receive(current, Ok(page(current, key("same.rs"), "+current\n", 0)));
         assert_eq!(
             replacement.patch.as_ref().unwrap().text.as_ref(),
             "+current\n"
@@ -941,7 +1162,7 @@ mod tests {
             request_id: old,
             ..Default::default()
         };
-        assert!(!state.complete(old, Ok(chat::FileChangeReply::Files(old_reply))));
+        assert!(!state.receive(old, Ok(chat::FileChangeReply::Files(old_reply))));
         assert_eq!(
             state.list_scroll, 800.0,
             "a late page cannot scroll the current list"
@@ -950,7 +1171,7 @@ mod tests {
             request_id: current,
             ..Default::default()
         };
-        assert!(state.complete(current, Ok(chat::FileChangeReply::Files(current_reply))));
+        assert!(state.receive(current, Ok(chat::FileChangeReply::Files(current_reply))));
         assert_eq!(
             state.list_scroll, 0.0,
             "the accepted next page starts at its first file"
@@ -958,7 +1179,7 @@ mod tests {
         state.list_scroll = 80.0;
         state.select(key("file.rs"));
         let id = state.request(true);
-        assert!(state.complete(id, Ok(page(id, key("file.rs"), "+new\n", 0))));
+        assert!(state.receive(id, Ok(page(id, key("file.rs"), "+new\n", 0))));
         state.back();
         assert!(state.selected.is_none());
         assert!(state.patch.is_none());

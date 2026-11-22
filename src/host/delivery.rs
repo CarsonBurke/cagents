@@ -841,6 +841,7 @@ mod tests {
                         },
                         revision: 5,
                         patches: vec![FileChangePatch {
+                            lines: crate::chat::LineOrigin::File,
                             ownership_unverified: false,
                             item_id: "edit".into(),
                             kind: ChangeKind::Updated,

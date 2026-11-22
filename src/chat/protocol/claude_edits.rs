@@ -8,7 +8,7 @@
 //! own once the edit has been applied - that one is made against the file,
 //! so it has the file's line numbers and the lines around the change.
 
-use crate::chat::{ChangeKind, FileChange};
+use crate::chat::{ChangeKind, FileChange, LineOrigin};
 use imara_diff::{Algorithm, Diff, InternedInput};
 use serde_json::Value;
 
@@ -29,19 +29,22 @@ pub(super) fn changes(name: &str, input: &Value) -> Option<Vec<FileChange>> {
     let path = input["file_path"]
         .as_str()
         .filter(|path| !path.is_empty())?;
-    let (kind, diff) = match name {
+    // An edit is numbered from the start of the text it finds, which can be
+    // anywhere in the file; a whole file's content is numbered from its start.
+    let (kind, diff, lines) = match name {
         "Edit" => {
             let old = input["old_string"].as_str()?;
-            (
-                // An edit that replaces nothing is how Claude creates a file
-                // with this tool.
-                if old.is_empty() {
-                    ChangeKind::Added
-                } else {
-                    ChangeKind::Updated
-                },
-                replacement(input)?,
-            )
+            // An edit that replaces nothing is how Claude creates a file
+            // with this tool, so its lines are the file's.
+            if old.is_empty() {
+                (ChangeKind::Added, replacement(input)?, LineOrigin::File)
+            } else {
+                (
+                    ChangeKind::Updated,
+                    replacement(input)?,
+                    LineOrigin::Excerpt,
+                )
+            }
         }
         "MultiEdit" => {
             let edits = input["edits"]
@@ -54,12 +57,14 @@ pub(super) fn changes(name: &str, input: &Value) -> Option<Vec<FileChange>> {
                     .map(replacement)
                     .collect::<Option<Vec<_>>>()?
                     .concat(),
+                LineOrigin::Excerpt,
             )
         }
         // Whether the file existed is only known once it has been written.
         "Write" => (
             ChangeKind::Added,
             unified("", input["content"].as_str()?, ""),
+            LineOrigin::File,
         ),
         _ => return None,
     };
@@ -67,6 +72,7 @@ pub(super) fn changes(name: &str, input: &Value) -> Option<Vec<FileChange>> {
         path: path.to_owned(),
         kind,
         diff,
+        lines,
     }])
 }
 
@@ -224,8 +230,11 @@ pub(super) fn applied(changes: &mut [FileChange], structured: &Value) {
     if structured["type"] == "update" {
         change.kind = ChangeKind::Updated;
     }
+    // Claude Code's patch is made against the file, so its numbers are the
+    // file's wherever the call's were.
     if let Some(patch) = structured_patch(&structured["structuredPatch"]) {
         change.diff = patch;
+        change.lines = LineOrigin::File;
     }
 }
 
@@ -348,12 +357,35 @@ mod tests {
         );
         assert_eq!(written.kind, ChangeKind::Added);
         assert_eq!(written.diff, "@@ -0,0 +1,2 @@\n+first\n+second\n");
+        assert_eq!(
+            written.lines,
+            LineOrigin::File,
+            "a whole file starts at its line 1"
+        );
         let created = only(
             "Edit",
             json!({"file_path": "new.txt", "old_string": "", "new_string": "only"}),
         );
         assert_eq!(created.kind, ChangeKind::Added);
         assert_eq!(created.diff, "@@ -0,0 +1,1 @@\n+only\n");
+        assert_eq!(created.lines, LineOrigin::File);
+    }
+
+    /// An edit's patch is numbered from the text it finds, wherever that is
+    /// in the file, and so is every edit of a multi-edit.
+    #[test]
+    fn an_edit_made_from_its_call_is_numbered_from_its_snippet() {
+        let edit = only(
+            "Edit",
+            json!({"file_path": "a.rs", "old_string": "foo\nbar", "new_string": "foo\nbaz"}),
+        );
+        assert_eq!(edit.diff, "@@ -1,2 +1,2 @@\n foo\n-bar\n+baz\n");
+        assert_eq!(edit.lines, LineOrigin::Excerpt);
+        let multi = only(
+            "MultiEdit",
+            json!({"file_path": "a.rs", "edits": [{"old_string": "x", "new_string": "y"}]}),
+        );
+        assert_eq!(multi.lines, LineOrigin::Excerpt);
     }
 
     /// A call that has not said everything it would do is not yet a change,
@@ -426,9 +458,19 @@ mod tests {
             edit[0].diff,
             "@@ -114,3 +114,3 @@\n before\n-foo\n+bar\n after\n@@ -200,1 +200,2 @@\n x\n+y\n"
         );
+        assert_eq!(
+            edit[0].lines,
+            LineOrigin::File,
+            "the applied patch has the file's numbers"
+        );
         // A result without a patch, or with one in another form, changes
         // nothing.
         let made = edit[0].diff.clone();
+        let mut pending = changes(
+            "Edit",
+            &json!({"file_path": "a.rs", "old_string": "foo", "new_string": "bar"}),
+        )
+        .unwrap();
         for structured in [
             Value::Null,
             json!({"structuredPatch": []}),
@@ -437,6 +479,9 @@ mod tests {
         ] {
             applied(&mut edit, &structured);
             assert_eq!(edit[0].diff, made, "{structured}");
+            // Nor does it place a patch still numbered from its snippet.
+            applied(&mut pending, &structured);
+            assert_eq!(pending[0].lines, LineOrigin::Excerpt, "{structured}");
         }
     }
 
