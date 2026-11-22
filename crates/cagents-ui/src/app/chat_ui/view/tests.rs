@@ -241,6 +241,52 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
     );
 }
 
+/// A copy's refusal stays on its control's one line in a narrow pane, so it
+/// never draws over the text it was copying; the tooltip has all of it.
+#[test]
+fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+    type TextState = iced::advanced::widget::text::State<Paragraph>;
+    fn paragraph(tree: &Tree) -> Option<&TextState> {
+        if tree.tag == iced::advanced::widget::tree::Tag::of::<TextState>() {
+            return Some(tree.state.downcast_ref::<TextState>());
+        }
+        tree.children.iter().find_map(paragraph)
+    }
+
+    let (runtime, _handle) = frame_cost::live_runtime(&[]);
+    let refusal = super::text_copy::CopyState::Refused(chat::TEXT_COPY_UNAVAILABLE.into());
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element: Element<'_, Message> = widget::row::with_children(vec![
+        small_icon(
+            Icon::Warning,
+            "Copy again",
+            Action::DismissComposerNote(runtime.target),
+        ),
+        refusal.said().unwrap(),
+    ])
+    .spacing(step::GAP_XS)
+    .into();
+    let mut tree = Tree::new(element.as_widget());
+    let width = 160.0;
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+    );
+    let row = Layout::new(&node).bounds();
+    let shaped = paragraph(&tree).expect("the refusal's text").min_bounds();
+    assert!(
+        row.height <= super::MESSAGE_ACTION_HEIGHT,
+        "the refusal fits the action row: {row:?}, text {shaped:?}"
+    );
+    assert!(
+        row.width <= width + 0.1 && shaped.width <= width,
+        "the refusal stays inside the pane: {row:?}, text {shaped:?}"
+    );
+}
+
 #[test]
 fn saved_history_composer_offers_attachment_in_its_actions_without_enabling_send() {
     use iced::advanced::{

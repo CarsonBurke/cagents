@@ -2049,9 +2049,10 @@ pub const TEXT_COPY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 /// clipboard. The store refuses with it, and the UI shows it.
 pub const TEXT_COPY_CHANGED: &str = "This text changed while copying. Copy it again.";
 /// Why a copy whose text the local cache no longer holds put nothing on the
-/// clipboard. The stores refuse with it, and the UI shows it with where the
-/// text can still be found: the provider's own transcript.
-pub const TEXT_COPY_UNAVAILABLE: &str = "The full text of this message is no longer saved here.";
+/// clipboard. The stores refuse with it, and the UI shows it. It names no
+/// kind of text: it answers a message's Copy, a step's output and a
+/// subagent's text alike.
+pub const TEXT_COPY_UNAVAILABLE: &str = "This text is no longer saved here, so it can't be copied.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextCopyPage {
