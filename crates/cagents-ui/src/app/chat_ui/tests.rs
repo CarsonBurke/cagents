@@ -16445,6 +16445,48 @@ fn a_first_message_goes_out_on_the_model_chosen_for_it() {
     assert!(runtime.failures.is_empty(), "{:?}", runtime.failures);
 }
 
+/// An effort the conversation does not list for the model is not sent, and
+/// a draft the message returns to does not show it either.
+#[test]
+fn a_first_message_drops_an_effort_its_conversation_lacks_from_the_draft() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let _ = app.observe_listed_models(
+        Provider::Codex,
+        vec![fixture_model("gpt-b", &["low", "high"])],
+        None,
+    );
+    let card = draft_chat(&mut app);
+    let target = chat_runtime(&app, card).target;
+    let _ = app.update(Message::ChatUi(Action::DraftModel(
+        target,
+        Provider::Codex,
+        Some("gpt-b".into()),
+    )));
+    let _ = app.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "gpt-b".into(),
+        Some("high".into()),
+    )));
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+    let attempt = chat_runtime_attempt(&app, card);
+    let handle = fixture_handle(&app, card, None);
+    handle.replace_snapshot_for_test(Snapshot {
+        models: vec![fixture_model("gpt-b", &["low"])],
+        ready: true,
+        ..Snapshot::default()
+    });
+    answer_start(&mut app, attempt, Ok(handle));
+    assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+    assert_eq!(
+        chat_runtime(&app, card)
+            .queued
+            .as_ref()
+            .map(|queued| queued.chosen.clone()),
+        Some((Some("gpt-b".into()), None))
+    );
+}
+
 /// A model the conversation turns out not to offer is not waited for:
 /// the message goes to its default, and the transcript says so.
 #[test]
