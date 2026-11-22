@@ -1447,6 +1447,7 @@ pub(super) fn execute_with_context(
             // The daemon refuses an agent stopped until a known reset, after
             // answering a retry of an accepted submission with its acceptance.
             let now = super::sessions::now_ms();
+            let waited = wait.wait;
             let mut output = submitted(
                 &mut session,
                 "agent.send",
@@ -1464,7 +1465,11 @@ pub(super) fn execute_with_context(
                 output.human = format!("{}\n{notice}", output.human);
                 output.data["notice"] = json!(notice);
             }
-            if let Some((tokens, cache)) = cold {
+            // A run that waited and left the cache cold says so in its
+            // standing already, and read nothing again.
+            if let Some((tokens, cache)) =
+                cold.filter(|_| !(waited && output.data.get("cache").is_some()))
+            {
                 // After the first line, which names the agent, rather than
                 // after whatever the run printed.
                 let line = super::sessions::cold_wake("Its", tokens);

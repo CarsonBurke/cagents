@@ -217,8 +217,7 @@ fn converse(
                 .join("\n\n");
             Ok(CommandOutput {
                 command,
-                // No sent line precedes the replies to say whom it means.
-                human: match cold_notice(&handed.delivery, true) {
+                human: match cold_notice(&handed.delivery) {
                     Some(cold) => format!("{cold}\n\n{replies}"),
                     None => replies,
                 },
@@ -293,7 +292,7 @@ fn delivery_lines(handed: &Handed) -> String {
     if let Some(notice) = notice(handed) {
         lines.push(format!("But {notice}"));
     }
-    lines.extend(cold_notice(&handed.delivery, false));
+    lines.extend(cold_notice(&handed.delivery));
     lines.join("\n")
 }
 
@@ -344,18 +343,13 @@ fn recipient_notice(delivery: &Delivery) -> Option<String> {
 /// judged as the daemon listed the recipient when it took the message, not
 /// when the sender reads this, which may be after waiting for a reply. A
 /// recipient a usage limit stops reads nothing until the limit lifts.
-/// `named` names the recipient, where no sent line before it does.
-fn cold_notice(delivery: &Delivery, named: bool) -> Option<String> {
+fn cold_notice(delivery: &Delivery) -> Option<String> {
     let recipient = delivery.recipient.as_ref()?;
     if recipient.limit.is_some() {
         return None;
     }
     let tokens = recipient.cold_context(delivery.sent.message.created_ms)?;
-    let whose = if named {
-        format!("Session {}'s", short(recipient.session.id))
-    } else {
-        "Its".to_owned()
-    };
+    let whose = format!("Session {}'s", short(recipient.session.id));
     Some(super::sessions::cold_wake(&whose, tokens))
 }
 
@@ -885,22 +879,16 @@ mod tests {
         delivery.recipient.as_mut().unwrap().cache = Some(cache);
         delivery.sent.message.created_ms = 60_000;
         assert_eq!(
-            cold_notice(&delivery, false),
+            cold_notice(&delivery),
             None,
             "limited, so nothing reads it yet"
         );
         delivery.recipient.as_mut().unwrap().limit = None;
         delivery.sent.message.created_ms = 30_000;
-        assert_eq!(cold_notice(&delivery, false), None, "still warm");
+        assert_eq!(cold_notice(&delivery), None, "still warm");
         delivery.sent.message.created_ms = 60_000;
         assert_eq!(
-            cold_notice(&delivery, false).as_deref(),
-            Some(
-                "Its prompt cache had likely expired, so its provider reads all 1.2M tokens of its context again."
-            )
-        );
-        assert_eq!(
-            cold_notice(&delivery, true),
+            cold_notice(&delivery),
             Some(format!(
                 "Session {}'s prompt cache had likely expired, so its provider reads all 1.2M tokens of its context again.",
                 short(id)
