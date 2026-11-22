@@ -335,7 +335,7 @@ NOTES=$WORK_DIR/release-notes.txt
 {
     printf '%s\n%s\n\n' "$RELEASE_MARKER" "$BUNDLE_MARKER"
     # Commit subjects can name people; quoted, a name notifies no one.
-    jq -r '.notes' "$DIST_DIR/release-metadata.json" | sed 's/@\([A-Za-z0-9][-A-Za-z0-9]*\)/`@\1`/g'
+    jq -r '.notes' "$DIST_DIR/release-metadata.json" | sed -E 's/(^|[[:space:](])@([A-Za-z0-9][-A-Za-z0-9]*)/\1`@\2`/g'
     cat <<EOF
 
 ## Install

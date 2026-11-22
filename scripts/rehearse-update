@@ -39,7 +39,7 @@ DIR holds one private user. Its path must be short (sockets live below it).
                        See run --help.
   feed DIR             Serve updates from the file feed DIR (see
                        scripts/release feed): CAGENTS_UPDATE_FEED names it,
-                       and the private user's curl refuses other URLs.
+                       and the private user's curl refuses most other URLs.
                        Only rehearsal builds (CAGENTS_UPDATE_REHEARSAL_KEYS)
                        and development builds read that variable.
   compare A B          Compare record names, directories or snapshot JSON.
