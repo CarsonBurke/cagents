@@ -13,12 +13,16 @@ last message, so when the main thread fell behind, listeners such as
 only after an event is queued, so an application could not avoid it.
 
 `src/subscription/tracker/queue.rs` replaces that channel with a queue that
-never drops an event. It grows only while its stream waits on the runtime,
-and it replaces a queued redraw or cursor move with a newer one of the same
-kind, window and status when nothing came between them, since a listener only
-needs the latest. It logs once its backlog passes 1024 events, and again each
-time the backlog doubles. A subscription whose stream drops its event input
-still receives nothing, as before.
+never drops an event. It grows while its stream is not reading, which in
+practice means while the stream waits for the shell's proxy to free a slot;
+it relies on the proxy's slot accounting to resume. A new redraw or cursor
+move replaces a queued one of the same kind, window and status if only other
+redraws and cursor moves were queued after it, so those stay bounded during a
+stall and the backlog grows only with real input such as keys and clicks.
+Every listener in cagents and libcosmic needs only the latest redraw and
+cursor position. The queue logs when its backlog passes 1024 events and each
+time it doubles after that, until it drains. A subscription whose stream
+drops its event input still receives nothing, as before.
 
 The vendored `iced_winit` also stops broadcasting the resize request it adds
 to every window's batch; see `vendor/iced-winit/README.cagents.md`.

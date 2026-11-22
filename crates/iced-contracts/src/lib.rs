@@ -618,7 +618,7 @@ mod subscription_events {
         listener.tracker.broadcast(press(window, 0));
         listener.stall();
 
-        // The upstream tracker held 100 events here and dropped the rest.
+        // The upstream tracker held 101 events here and dropped the rest.
         for index in 1..=300 {
             listener.tracker.broadcast(press(window, index));
             listener
@@ -642,7 +642,7 @@ mod subscription_events {
     }
 
     #[test]
-    fn only_adjacent_redraws_and_cursor_moves_of_one_window_and_status_coalesce() {
+    fn redraws_and_cursor_moves_coalesce_only_across_each_other() {
         let window = window::Id::unique();
         let other = window::Id::unique();
         let start = Instant::now();
@@ -652,13 +652,14 @@ mod subscription_events {
         listener.tracker.broadcast(press(window, 0));
         listener.stall();
 
+        // A pointer moving during an animation alternates the two kinds.
         let queued = [
-            redraw(window, start),
-            redraw(window, later),
-            redraw(other, start),
             cursor(window, 1.0, Status::Ignored),
+            redraw(window, start),
             cursor(window, 2.0, Status::Ignored),
+            redraw(other, start),
             cursor(window, 3.0, Status::Captured),
+            redraw(window, later),
             press(window, 1),
             cursor(window, 4.0, Status::Captured),
             Event::SystemThemeChanged(iced_core::theme::Mode::Dark),
@@ -673,10 +674,10 @@ mod subscription_events {
             listener.drain(),
             [
                 press(window, 0),
-                redraw(window, later),
-                redraw(other, start),
                 cursor(window, 2.0, Status::Ignored),
+                redraw(other, start),
                 cursor(window, 3.0, Status::Captured),
+                redraw(window, later),
                 press(window, 1),
                 cursor(window, 4.0, Status::Captured),
                 Event::SystemThemeChanged(iced_core::theme::Mode::Dark),

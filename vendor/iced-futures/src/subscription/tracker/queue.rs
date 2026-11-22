@@ -6,10 +6,12 @@
 //! while it waits for the runtime to accept its last message, so a busy
 //! main thread made it lose key presses and window events (cagents #3644).
 //!
-//! This queue never drops an event. It only grows while a stream is stalled
-//! that way, and it replaces a queued redraw or cursor move with a newer one
-//! of the same kind, window and status when nothing came between them, since
-//! a listener only needs the latest of each.
+//! This queue never drops an event; it grows while its stream is not
+//! reading. Redraws and cursor moves are coalesced: a new one replaces a
+//! queued one of the same kind, window and status if only other redraws and
+//! cursor moves were queued after it. Every listener in cagents and
+//! libcosmic needs only the latest of each, and no other kind of event
+//! passes one.
 //!
 //! [`Tracker`]: super::Tracker
 
@@ -61,17 +63,28 @@ pub struct Sender(Arc<Mutex<Shared>>);
 impl Sender {
     /// Queues an event for the stream, unless the stream has dropped its
     /// end.
-    pub fn send(&mut self, event: Event) {
+    pub fn send(&self, event: Event) {
         let mut shared = lock(&self.0);
 
         if !shared.receiving {
             return;
         }
 
-        match shared.events.back_mut() {
-            Some(last) if supersedes(&event, last) => *last = event,
-            _ => shared.events.push_back(event),
+        if let Some(key) = Coalesce::of(&event) {
+            let superseded = shared
+                .events
+                .iter()
+                .rev()
+                .map_while(Coalesce::of)
+                .position(|queued| queued == key);
+
+            if let Some(from_back) = superseded {
+                let index = shared.events.len() - 1 - from_back;
+                let _ = shared.events.remove(index);
+            }
         }
+
+        shared.events.push_back(event);
 
         let queued = shared.events.len();
 
@@ -80,10 +93,8 @@ impl Sender {
 
             log::warn!(
                 "A subscription has {queued} runtime events waiting; \
-                 its stream is waiting on the runtime"
+                 its stream has not read them"
             );
-        } else if queued == 1 {
-            shared.warn_at = BACKLOG_WARNING;
         }
 
         let waker = shared.waker.take();
@@ -137,6 +148,10 @@ impl Stream for Receiver {
         let mut shared = lock(&self.0);
 
         if let Some(event) = shared.events.pop_front() {
+            if shared.events.is_empty() {
+                shared.warn_at = BACKLOG_WARNING;
+            }
+
             return Poll::Ready(Some(event));
         }
 
@@ -161,35 +176,35 @@ impl Drop for Receiver {
     }
 }
 
-/// Whether `next` makes the `queued` event before it redundant: both are
-/// redraws, or both cursor moves, in the same window with the same status.
-fn supersedes(next: &Event, queued: &Event) -> bool {
-    let (
-        Event::Interaction {
-            window: next_window,
-            event: next_event,
-            status: next_status,
-        },
-        Event::Interaction {
-            window: queued_window,
-            event: queued_event,
-            status: queued_status,
-        },
-    ) = (next, queued)
-    else {
-        return false;
-    };
+/// What identifies a redraw or cursor move that a newer one replaces.
+#[derive(Clone, Copy, PartialEq)]
+struct Coalesce {
+    window: window::Id,
+    status: event::Status,
+    redraw: bool,
+}
 
-    next_window == queued_window
-        && next_status == queued_status
-        && matches!(
-            (next_event, queued_event),
-            (
-                event::Event::Window(window::Event::RedrawRequested(_)),
-                event::Event::Window(window::Event::RedrawRequested(_)),
-            ) | (
-                event::Event::Mouse(mouse::Event::CursorMoved { .. }),
-                event::Event::Mouse(mouse::Event::CursorMoved { .. }),
-            )
-        )
+impl Coalesce {
+    fn of(event: &Event) -> Option<Self> {
+        let Event::Interaction {
+            window,
+            event,
+            status,
+        } = event
+        else {
+            return None;
+        };
+
+        let redraw = match event {
+            event::Event::Window(window::Event::RedrawRequested(_)) => true,
+            event::Event::Mouse(mouse::Event::CursorMoved { .. }) => false,
+            _ => return None,
+        };
+
+        Some(Self {
+            window: *window,
+            status: *status,
+            redraw,
+        })
+    }
 }

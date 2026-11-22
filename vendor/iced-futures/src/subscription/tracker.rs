@@ -140,8 +140,8 @@ impl Tracker {
     /// [`Recipe::stream`]: crate::subscription::Recipe::stream
     pub fn broadcast(&mut self, event: Event) {
         self.subscriptions
-            .values_mut()
-            .filter_map(|connection| connection.listener.as_mut())
+            .values()
+            .filter_map(|connection| connection.listener.as_ref())
             .for_each(|listener| listener.send(event.clone()));
     }
 }
