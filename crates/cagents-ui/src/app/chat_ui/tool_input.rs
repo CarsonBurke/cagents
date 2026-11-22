@@ -340,7 +340,7 @@ mod tests {
         }
         let large = json!({ "content": "x".repeat(LIMIT) }).to_string();
         assert_eq!(readable(&large), None);
-        let nested = |depth| format!("{}\"a\nb\"{}", "[".repeat(depth), "]".repeat(depth));
+        let nested = |depth| format!("{}\"a\\nb\"{}", "[".repeat(depth), "]".repeat(depth));
         assert!(readable(&nested(DEPTH)).is_some());
         assert_eq!(readable(&nested(DEPTH + 1)), None);
     }
