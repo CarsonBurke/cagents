@@ -44,6 +44,15 @@ pub(in crate::host) fn usage(state: &HostState) -> usize {
             .count()
 }
 
+fn pending(state: &HostState) -> usize {
+    state.chat_spawning.len()
+        + state
+            .native_actor_startups
+            .keys()
+            .filter(|id| !state.chat_spawning.contains_key(id))
+            .count()
+}
+
 pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> {
     let used = usage(state);
     if used >= state.native_chat_capacity {
@@ -2210,19 +2219,13 @@ exit 0
                 state.native_chat_capacity = 1;
                 state.chat_spawning.insert(pending.id, pending.clone());
             }
-            let (full, server) = restore_client(&host, source.clone(), 43);
-            let failure = match full {
-                Err(failure) => failure,
-                Ok(_) => panic!("full capacity restored a new resident"),
-            };
-            assert!(failure.message.contains("capacity reached"));
-            server.join().unwrap();
-            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
-            host.lock().unwrap().chat_spawning.remove(&pending.id);
-
+            // A full daemon still shows saved history: the reader runs no
+            // provider and holds no slot.
             let (restored, server) = restore_client(&host, source.clone(), 44);
             let restored = restored.unwrap();
             wait_for_client_history(&restored, true);
+            assert_eq!(usage(&host.lock().unwrap()), 1);
+            host.lock().unwrap().chat_spawning.remove(&pending.id);
             assert_eq!(restored.session(), source);
             assert!(restored.snapshot().read_only_reason.is_some());
             assert!(restored.snapshot().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
