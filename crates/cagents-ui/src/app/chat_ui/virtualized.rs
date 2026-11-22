@@ -28,8 +28,9 @@ pub(super) struct Viewport {
 }
 pub(super) type Window = Rc<Cell<Option<Viewport>>>;
 
-/// Sparse input operations opt out of placeholder enumeration. Offscreen
-/// aliases exist for explicit navigation operations, never pointer hit tests.
+/// Offscreen aliases are expensive in a long transcript. Operations enumerate
+/// them only when they explicitly need history-anchor geometry; pointer,
+/// scroll and layout bookkeeping never do.
 pub(super) struct PlaceholderPolicy {
     pub visit: bool,
 }
@@ -633,7 +634,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         operation.custom(None, layout.bounds(), state);
         // Placeholder bounds make unloaded items addressable by find/history
         // anchoring without constructing their text or widget trees.
-        let mut placeholders = PlaceholderPolicy { visit: true };
+        // Most operations only need the mounted tree. A history-restoration
+        // operation opts in from its `custom` callback below; that keeps the
+        // steady wheel/resize path proportional to the mounted window rather
+        // than every alias in a loaded history page.
+        let mut placeholders = PlaceholderPolicy { visit: false };
         operation.custom(None, layout.bounds(), &mut placeholders);
         if placeholders.visit {
             for &index in &state.aliased {
@@ -1311,6 +1316,11 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
+                    policy.visit = true;
+                }
+            }
             fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
                 if let Some(id) = id {
                     self.0.insert(id.clone(), bounds);
@@ -1394,6 +1404,11 @@ mod tests {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
             }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
+                    policy.visit = true;
+                }
+            }
             fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
                 if let Some(id) = id {
                     self.0.insert(id.clone(), bounds);
@@ -1455,6 +1470,133 @@ mod tests {
         let indexed = REINDEXES.with(Cell::get);
         assert_eq!(placed(2, 26.0), (56.0, 96.0, 199.0 * 20.0 + 56.0));
         assert_eq!(REINDEXES.with(Cell::get), indexed);
+    }
+
+    #[test]
+    fn offscreen_aliases_are_explicitly_opted_into() {
+        struct Count {
+            aliases: usize,
+            need_aliases: bool,
+        }
+        impl Operation for Count {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                if self.need_aliases
+                    && let Some(policy) = state.downcast_mut::<PlaceholderPolicy>()
+                {
+                    policy.visit = true;
+                }
+            }
+            fn container(&mut self, _: Option<&Id>, _: Rectangle) {
+                self.aliases += 1;
+            }
+        }
+
+        const ROWS: u64 = 10_000;
+        let renderer = crate::app::tests::headless_renderer();
+        let window = Rc::new(Cell::new(Some(Viewport {
+            top: 100_000.0,
+            height: 600.0,
+            bottom: false,
+        })));
+        let mut element = column(
+            (0..ROWS)
+                .map(|key| {
+                    Row::new(key, 0, 20.0, Some(Id::from(format!("row-{key}"))), || {
+                        widget::Space::new().height(20).into()
+                    })
+                })
+                .collect(),
+            window,
+        );
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+
+        let mut ordinary = Count {
+            aliases: 0,
+            need_aliases: false,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut ordinary);
+        assert_eq!(
+            ordinary.aliases, 0,
+            "ordinary operations skip all history aliases"
+        );
+
+        let mut anchored = Count {
+            aliases: 0,
+            need_aliases: true,
+        };
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut anchored);
+        assert_eq!(anchored.aliases, ROWS as usize);
+    }
+
+    /// Records the UI-thread cost of an operation over a long transcript.
+    ///
+    /// Run with `--ignored --nocapture`; the count makes it clear whether the
+    /// operation enumerated offscreen aliases, independent of host speed.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn generic_operation_cost_for_ten_thousand_history_rows() {
+        struct Count(usize);
+        impl Operation for Count {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn container(&mut self, _: Option<&Id>, _: Rectangle) {
+                self.0 += 1;
+            }
+        }
+
+        const ROWS: u64 = 10_000;
+        const OPERATIONS: usize = 120;
+        let renderer = crate::app::tests::headless_renderer();
+        let window = Rc::new(Cell::new(Some(Viewport {
+            top: 100_000.0,
+            height: 600.0,
+            bottom: false,
+        })));
+        let mut element = column(
+            (0..ROWS)
+                .map(|key| {
+                    Row::new(key, 0, 20.0, Some(Id::from(format!("row-{key}"))), || {
+                        widget::Space::new().height(20).into()
+                    })
+                })
+                .collect(),
+            window,
+        );
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(720.0, f32::INFINITY));
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+
+        let started = std::time::Instant::now();
+        let aliases = (0..OPERATIONS)
+            .map(|_| {
+                let mut operation = Count(0);
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation,
+                );
+                operation.0
+            })
+            .sum::<usize>();
+        println!(
+            "{ROWS} rows, {OPERATIONS} generic operations: {aliases} aliases in {:.3} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     #[test]

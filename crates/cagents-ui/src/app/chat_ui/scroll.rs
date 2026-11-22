@@ -944,7 +944,10 @@ impl Operation for ItemBounds<'_> {
         self.in_placeholders = false;
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if state.is::<virtualized::PlaceholderPolicy>() {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            // Restoring a reader's position compares rows across layouts, so
+            // it is the one operation that needs every offscreen alias.
+            policy.visit = true;
             self.in_placeholders = true;
             return;
         }
