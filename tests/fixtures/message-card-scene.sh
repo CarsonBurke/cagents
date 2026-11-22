@@ -53,11 +53,20 @@
 #           its tool call - opening and closing while the row keeps focus)
 #           and keyboard-enter (Enter on the started agent, which opens it)
 #
+#   runs    message-runs and message-runs-open: the conversation of
+#           message-card-scene/runs.jsonl instead, which tells seven agents
+#           the same thing in two runs, a Bash call between them, one
+#           refused; then two different messages, and one alone. The second
+#           shot opens the run with the refused message.
+#
+# The cards, narrow, long and keys scenes open the four messages' group, which
+# they fold into, before reaching their rows.
+#
 # A state that does not appear within 30 seconds is logged and the scene goes
 # on, so a missing state is visible in the log and the shot.
 set -u
 
-scene=${1:?usage: message-card-scene.sh cards|narrow|long|keys}
+scene=${1:?usage: message-card-scene.sh cards|narrow|long|keys|runs}
 here=$(cd "$(dirname "$0")" && pwd)
 ne=$here/../../scripts/native-evidence
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
@@ -112,18 +121,26 @@ elif [ "$scene" = keys ]; then
     # The same long name, every message confirmed.
     sed -e 's/"Relocate the repo"/"Relocate the t3code checkout and every worktree"/g' \
         "$here/message-card-scene/frames.jsonl" >"$config/fixture-frames.jsonl"
+elif [ "$scene" = runs ]; then
+    cp "$here/message-card-scene/runs.jsonl" "$config/fixture-frames.jsonl"
 else
     cp "$here/message-card-scene/frames.jsonl" "$config/fixture-frames.jsonl"
 fi
+prompt='The t3code repo moved; tell the agent working in it.'
 printf '%s\n' 'I told the relocation agent where the repo went.' >"$config/fixture-reply.md"
 # The reply as the screen reading finds it: it splits a line into runs at
 # whichever spaces it likes, so any of the reply's distinctive runs will do.
 reply='where the repo|repo went|relocation agent|told the relocation'
+if [ "$scene" = runs ]; then
+    prompt="Tell the other agents main's ui lane is broken, and when it is green."
+    printf '%s\n' 'Every agent knows main is green again.' >"$config/fixture-reply.md"
+    reply='Every agent|agent knows|is green again'
+fi
 # A fresh fixture has no project open yet; opening one again is harmless.
 "$ne" cli project open "$fixture/project" >/dev/null 2>&1 || log "project open failed"
 sleep 2
 "$ne" cli --json agent spawn --provider claude --model haiku --surface chat \
-    --repository "$fixture/project" --prompt 'The t3code repo moved; tell the agent working in it.' >/dev/null ||
+    --repository "$fixture/project" --prompt "$prompt" >/dev/null ||
     log "spawn failed"
 # The conversation opens from its channel's row in the sidebar once its turn
 # has answered.
@@ -133,7 +150,7 @@ for _ in $(seq 20); do
     sleep 4
     "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
-    row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code repo moved' | head -1 |
+    row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code repo moved|lane is broken' | head -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
     [ -n "$row" ] || continue
@@ -154,11 +171,20 @@ prefix=
 [ "$scene" = narrow ] && prefix=narrow-
 [ "$scene" = long ] && prefix=long-
 case $scene in
-    cards | narrow | long | keys) ;;
+    cards | narrow | long | keys | runs) ;;
     *) log "unknown scene"; exit 2 ;;
 esac
 # The transcript opens at its end; the first message is above it.
 transcript=$(locate "$reply")
+if [ "$scene" = runs ]; then
+    scroll "$transcript" -6
+    shot message-runs
+    # The run with the refused message, by its status.
+    click 'not sent' || click 'Messaged 3 agents'
+    shot message-runs-open
+    log done
+    exit 0
+fi
 if [ "$scene" = keys ]; then
     key() {
         "$ne" drive key "$1" >/dev/null 2>&1 || log "key failed: $1"
@@ -168,6 +194,9 @@ if [ "$scene" = keys ]; then
     # window's traversal starts again: one step back is the tab strip's new
     # tab button, and the rows follow it after the conversation's tab and
     # its terminal button.
+    # The messages fold into one group, which a click opens; its row comes
+    # between the started agent's and the messages' in the traversal.
+    click 'Sent 4 messages' || :
     # The first message's tooltip names the agent its row cuts short. The
     # screen reading may split its text into runs anywhere, so its status,
     # the topmost "Queued", stands in for it.
@@ -184,7 +213,7 @@ if [ "$scene" = keys ]; then
     "$ne" drive click "$transcript" >/dev/null 2>&1
     sleep 1
     key shift+Tab
-    for _ in 1 2 3 4 5; do key Tab; done
+    for _ in 1 2 3 4 5 6; do key Tab; done
     shot keyboard-focus
     key Menu
     shot keyboard-menu
@@ -194,7 +223,7 @@ if [ "$scene" = keys ]; then
     shot keyboard-refused-open
     key Return
     shot keyboard-refused-closed
-    for _ in 1 2 3; do key shift+Tab; done
+    for _ in 1 2 3 4; do key shift+Tab; done
     key Return
     sleep 2
     shot keyboard-enter
@@ -202,6 +231,8 @@ if [ "$scene" = keys ]; then
     exit 0
 fi
 scroll "$transcript" -6
+# The messages fold into one group, by its line's start.
+click 'Sent 4 messages' || :
 shot "${prefix}message-cards"
 if [ "$scene" = cards ]; then
     # The long message, by the start of its text.

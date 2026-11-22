@@ -15,7 +15,7 @@
 //! back - it says something to the reader, or asks them something - and the
 //! work that follows belongs to the next group.
 
-use super::coordination::Coordinated;
+use super::coordination::{Coordinated, MessageRun};
 use super::tool_title::{Title, verb};
 use crate::chat::{self, Item, ItemContent, Phase, Role, ToolStatus};
 use std::{
@@ -103,6 +103,10 @@ pub(super) struct Turn {
     /// so adding more prose never moves an existing tool strip's identity.
     pub(super) key: String,
     pub(super) summary: String,
+    /// Whether the group's steps are messages to other agents and nothing
+    /// else: several sent one after another, which fold into one row as
+    /// other steps do. One message alone is a card among the prose.
+    pub(super) messages: bool,
 }
 
 impl Turn {
@@ -122,6 +126,7 @@ impl Turn {
             span: item.map(Span::of).unwrap_or_default(),
             key: item.map(|item| item.id.clone()).unwrap_or_default(),
             summary: String::new(),
+            messages: false,
         }
     }
 
@@ -163,6 +168,18 @@ impl Turn {
 
     /// Fills in the summary once the group's membership is final.
     fn describe<'c, T: Borrow<Item>>(&mut self, items: &[T], presented: &impl Presented<'c>) {
+        // Messages say whom they went to, what they said, and how they
+        // stand together, which counts what did not go first.
+        if self.messages {
+            let sent = self.steps.iter().filter_map(|placed| {
+                let item = items.get(placed.index)?.borrow();
+                Some((item, presented.coordinated(item)?))
+            });
+            if let Some(run) = MessageRun::of(sent, &|_| None) {
+                self.summary = run.line();
+                return;
+            }
+        }
         // A single step names itself, because "1 step" tells the reader
         // nothing they could not see from the row's absence. Several steps are
         // counted, with a failure called out, because that is the one thing a
@@ -510,6 +527,46 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         } else {
             slot_of(item)
         };
+        // Messages one after another fold into a group of their own, as the
+        // steps between two stretches of prose do. The first was drawn as a
+        // card until the second came, so it leaves the prose for that
+        // group, which it names; one that opened its group becomes that
+        // group. Anything drawn between them keeps them apart, so the
+        // timeline stays in the order it happened.
+        let message = slot == Slot::Card && coordinated(item).is_some_and(Coordinated::is_message);
+        if message
+            && state == Open::Taking
+            && let Some(turn) = turns.last_mut()
+            && turn.prose.last().is_some_and(|placed| {
+                placed.slot == Slot::Card
+                    && coordinated(items[placed.index].borrow())
+                        .is_some_and(Coordinated::is_message)
+            })
+        {
+            let first = turn.prose.pop().expect("the message drawn last");
+            let lone = turn.prompt.is_empty() && turn.steps.is_empty() && turn.prose.is_empty();
+            if !lone {
+                turns.push(Turn::opened(items, first.index, false));
+            }
+            let run = turns.last_mut().expect("a group is open");
+            run.messages = true;
+            run.steps.push(first);
+            let sent = items[first.index].borrow();
+            run.observe(
+                sent.content
+                    .status()
+                    .zip(coordinated(sent))
+                    .map(|(status, step)| step.reading.status(status)),
+            );
+        }
+        // A message joins the messages before it; anything else drawn as a
+        // step after them is other work, with a group of its own.
+        let joins_messages = turns
+            .last()
+            .is_some_and(|turn| turn.messages && turn.prose.is_empty())
+            && state == Open::Taking;
+        let leaves_messages = slot == Slot::Step && joins_messages;
+        let joins_messages = message && joins_messages;
         // Each rendered group is prompt, contiguous tools, then prose. A tool
         // arriving after any visible prose must start another group; otherwise
         // the view would move it ahead of that earlier reasoning or narration.
@@ -525,7 +582,11 @@ pub(super) fn group<'c, T: Borrow<Item>>(
                     )
                 })
             });
-        if state == Open::Closed || (state == Open::Spoke && !speech) || resumes_tools {
+        if state == Open::Closed
+            || (state == Open::Spoke && !speech)
+            || resumes_tools
+            || leaves_messages
+        {
             turns.push(Turn::opened(items, index, false));
         }
         // `turns` is non-empty: the branch above pushes when it would be, and
@@ -542,15 +603,18 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         }
         let status = item.content.status();
         match coordinated(item) {
+            // A message among messages counts toward their group. Its row
+            // says how it stands in words, as a card does, so it leaves the
+            // activity indicator to running steps.
+            Some(step) if joins_messages => {
+                turn.observe(status.map(|status| step.reading.status(status)));
+            }
             // A card shows how it went itself; the strip summarizes only the
             // steps it collapses, so a refused message beside a lookup does
             // not mark the lookup failed. Still waiting on one keeps the
-            // group working.
-            Some(_) if slot == Slot::Card => {
-                if status == Some(ToolStatus::Running) {
-                    turn.running = true;
-                }
-            }
+            // group working, which is counted once the cards have settled
+            // where they are drawn.
+            Some(_) if slot == Slot::Card => {}
             coordinated => {
                 let status = match coordinated {
                     Some(step) => status.map(|status| step.reading.status(status)),
@@ -568,6 +632,7 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         }
         match slot {
             Slot::Step => turn.steps.push(Placed { index, slot }),
+            Slot::Card if joins_messages => turn.steps.push(Placed { index, slot }),
             Slot::Thinking | Slot::Commentary | Slot::Prose | Slot::Card => {
                 turn.prose.push(Placed { index, slot })
             }
@@ -597,6 +662,11 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         turns[at].pauses.extend(run.pause());
     }
     for turn in &mut turns {
+        // A card still waiting on its answer keeps its group working.
+        turn.running |= turn.prose.iter().any(|placed| {
+            placed.slot == Slot::Card
+                && items[placed.index].borrow().content.status() == Some(ToolStatus::Running)
+        });
         turn.describe(items, &presented);
     }
     if let Some(turn) = newest_running.and_then(|at| turns.get_mut(at)) {
@@ -2530,5 +2600,147 @@ mod tests {
         assert_eq!(shown_path("/home/user/project/src/../a.rs", root), "a.rs");
         // A relative path is the agent's own, shown as it gave it.
         assert_eq!(shown_path("../other/a.rs", root), "../other/a.rs");
+    }
+
+    /// A message sent with a provider's own tool, as the step's reading
+    /// gives it: to `to`, saying `body`, queued for that agent.
+    fn sent(to: &str, body: &str) -> Coordinated {
+        use crate::chat::coordination::{
+            Coordination, Delivery, Kind, Outbound, OutboundKind, Outcome, Text,
+        };
+        Coordinated::new(Coordination {
+            kind: Kind::Message(Outbound {
+                kind: OutboundKind::Send,
+                to: to.into(),
+                body: Text::Inline(body.into()),
+                summary: String::new(),
+                waits: false,
+            }),
+            outcome: Outcome {
+                delivery: Some(Delivery::Queued),
+                ..Outcome::default()
+            },
+            subagents: Vec::new(),
+            cli: false,
+        })
+    }
+
+    /// Messages one after another fold into a group of their own, which
+    /// names the first, as the steps between two stretches of prose do. A
+    /// step between two runs keeps them apart, in the order they were sent.
+    #[test]
+    fn consecutive_messages_fold_into_their_own_group() {
+        const FYI: &str = "FYI: main's ui lane is broken.";
+        let readings: std::collections::HashMap<&str, Coordinated> = [
+            ("m1", sent("fix-switcher", FYI)),
+            ("m2", sent("main", FYI)),
+            ("m3", sent("perf-ui", FYI)),
+            ("m4", sent("fix-switcher", "Rebase over #3646.")),
+            ("m5", sent("main", "Merged.")),
+        ]
+        .into_iter()
+        .collect();
+        let coordinated = |item: &Item| readings.get(item.id.as_str());
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("c1", ToolStatus::Succeeded),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Succeeded),
+            command("m3", ToolStatus::Failed),
+            command("c2", ToolStatus::Succeeded),
+            command("m4", ToolStatus::Succeeded),
+            command("m5", ToolStatus::Succeeded),
+            text("a1", Role::Assistant, Phase::Final, false),
+        ];
+        let turns = group(&items, &unasked(), &coordinated);
+        let shape: Vec<_> = turns
+            .iter()
+            .map(|turn| (turn.key.as_str(), turn.messages, steps(turn), slots(turn)))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("u1", false, vec![1], vec![]),
+                ("m1", true, vec![2, 3, 4], vec![]),
+                ("c2", false, vec![5], vec![]),
+                ("m4", true, vec![6, 7], vec![(8, Slot::Prose)]),
+            ]
+        );
+        // The same words to each agent are one message said to all of
+        // them; what did not go leads how they stand.
+        assert_eq!(
+            turns[1].summary,
+            format!("Messaged 3 agents: {FYI} · 1 not sent · 2 queued")
+        );
+        assert_eq!(turns[1].glyph(), Some(ToolStatus::Failed));
+        // Different words are told apart by whom they went to.
+        assert_eq!(
+            turns[3].summary,
+            "Sent 2 messages to fix-switcher, main · Queued"
+        );
+    }
+
+    /// One message alone stays the card it is, and so do messages that
+    /// something drawn between keeps apart.
+    #[test]
+    fn a_message_alone_stays_a_card() {
+        let (first, second) = (sent("main", "one"), sent("perf-ui", "two"));
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            text("n1", Role::Assistant, Phase::Commentary, false),
+            command("m2", ToolStatus::Succeeded),
+            text("a1", Role::Assistant, Phase::Final, false),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].messages);
+        assert_eq!(
+            slots(&turns[0]),
+            [
+                (1, Slot::Card),
+                (2, Slot::Commentary),
+                (3, Slot::Card),
+                (4, Slot::Prose)
+            ]
+        );
+    }
+
+    /// A message that opened its group becomes the group of messages it
+    /// starts, keyed by it as it was, and a message still sending keeps that
+    /// group working without taking the activity indicator, which its row
+    /// states in words.
+    #[test]
+    fn a_run_of_messages_opened_by_its_first_keeps_its_key() {
+        let (first, second) = (sent("main", "same"), sent("perf-ui", "same"));
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            text("a1", Role::Assistant, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Running),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(slots(&turns[0]), [(1, Slot::Prose)]);
+        assert_eq!(
+            (turns[1].key.as_str(), turns[1].messages, steps(&turns[1])),
+            ("m1", true, vec![2, 3])
+        );
+        assert!(turns[1].running);
+        assert!(!turns[1].newest_running);
+        assert_eq!(
+            turns[1].summary,
+            "Messaged 2 agents: same · 1 sending · 1 queued"
+        );
     }
 }

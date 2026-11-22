@@ -6164,7 +6164,17 @@ impl Runtime {
                         let revision = cached.revision;
                         // Header elements are cheap owned metadata; only a
                         // mounted row creates their widget tree and geometry.
-                        let row = self.step_view(item, cached, settings);
+                        // A message keeps the row it has alone, its
+                        // recipient and how it stands.
+                        let row = match cached.coordination.as_deref() {
+                            Some(coordinated) if turn.messages => {
+                                let raw = self
+                                    .item_expanded(&item.id)
+                                    .then(|| self.step_detail(item, cached, settings));
+                                self.coordination_card(item, coordinated, raw)
+                            }
+                            _ => self.step_view(item, cached, settings),
+                        };
                         let id = item.id.clone();
                         let mut row = virtualized::Row::once(
                             key,

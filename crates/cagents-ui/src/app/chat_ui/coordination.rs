@@ -245,6 +245,12 @@ impl Coordinated {
         self.reading.is_card()
     }
 
+    /// Whether the step is a message to another agent, which folds with the
+    /// messages beside it.
+    pub(super) fn is_message(&self) -> bool {
+        matches!(self.reading.kind, Kind::Message(_))
+    }
+
     /// What copying the card takes: the message, or the prompt.
     pub(super) fn copy_text(&self) -> Option<String> {
         match &self.reading.kind {
@@ -502,6 +508,197 @@ fn recipient(
 
 fn is_identifier(word: &str) -> bool {
     word.len() >= 4 && word.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// How `item`'s step went, as its reading reports it, and what it printed.
+fn reported<'a>(item: &'a chat::Item, coordinated: &Coordinated) -> (ToolStatus, &'a str) {
+    let reported = item.content.status().unwrap_or(ToolStatus::Succeeded);
+    let output = match &item.content {
+        ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => output.as_str(),
+        _ => "",
+    };
+    (coordinated.reading.status(reported), output)
+}
+
+/// Messages to other agents one after another, as the one row they fold
+/// into: whom they went to, what they said, and how they stand together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MessageRun {
+    verb: &'static str,
+    /// How many: "11 agents" where each went to its own with the same
+    /// words, otherwise "3 messages".
+    count: String,
+    /// The words they share, or else whom they went to.
+    preview: String,
+    /// Whether the preview is the words they share.
+    shared: bool,
+    state: RowStatus,
+}
+
+impl MessageRun {
+    /// The row `sent` folds into, `listed` naming the agents this
+    /// conversation lists; `None` unless every step is a message.
+    pub(super) fn of<'a>(
+        sent: impl IntoIterator<Item = (&'a chat::Item, &'a Coordinated)>,
+        listed: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Self> {
+        let mut bodies = Vec::new();
+        // Whom each went to, as the step addressed them, and as the reader
+        // knows them: two agents this conversation cannot name read alike.
+        let mut addressed: Vec<&str> = Vec::new();
+        let mut recipients: Vec<String> = Vec::new();
+        let mut states = Vec::new();
+        for (item, coordinated) in sent {
+            let Kind::Message(message) = &coordinated.reading.kind else {
+                return None;
+            };
+            let (status, output) = reported(item, coordinated);
+            states.push(message_state(&coordinated.reading, message, status, output));
+            bodies.push(
+                message
+                    .body
+                    .inline()
+                    .and(coordinated.plain.said.first())
+                    .map(|said| one_line_of(said)),
+            );
+            let address = match &coordinated.reading.outcome.receipt {
+                Some(receipt) => receipt.recipient.as_str(),
+                None => message.to.as_str(),
+            };
+            if !addressed.contains(&address) {
+                addressed.push(address);
+            }
+            let to = recipient(message, &coordinated.reading, listed).plain();
+            if !recipients.contains(&to) {
+                recipients.push(to);
+            }
+        }
+        let count = bodies.len();
+        // The same words to several is one message said to each of them,
+        // which is what the reader needs from the row; different words are
+        // told apart by whom they went to, each message's own row giving
+        // its words.
+        let shared = match bodies.split_first() {
+            Some((Some(first), rest)) if !first.is_empty() => rest
+                .iter()
+                .all(|body| body.as_ref() == Some(first))
+                .then(|| first.clone()),
+            _ => None,
+        };
+        let shares = shared.is_some();
+        let (verb, count, preview) = match shared {
+            Some(said) if addressed.len() == count => ("Messaged", format!("{count} agents"), said),
+            Some(said) => ("Sent", format!("{count} messages"), said),
+            None => (
+                "Sent",
+                format!("{count} messages"),
+                format!("to {}", recipients.join(", ")),
+            ),
+        };
+        Some(Self {
+            verb,
+            count,
+            preview,
+            shared: shares,
+            state: rollup(states),
+        })
+    }
+
+    /// The row as one line of plain text.
+    pub(super) fn line(&self) -> String {
+        let joint = if self.shared { ":" } else { "" };
+        format!(
+            "{} {}{joint} {} · {}",
+            self.verb, self.count, self.preview, self.state.text
+        )
+    }
+}
+
+/// How several messages stand together. Where they all stand alike that is
+/// the one word their rows say; otherwise each state is counted, those that
+/// need the reader first - a message not sent, then one not confirmed, then
+/// one still under way - so a row too narrow for all of them keeps those.
+fn rollup(states: Vec<RowStatus>) -> RowStatus {
+    let rank = |state: &RowStatus| match (state.tone, state.live) {
+        (Tone::Error, _) => 0,
+        (Tone::Warning, _) => 1,
+        (Tone::Plain, true) => 2,
+        (Tone::Plain, false) => 3,
+    };
+    let mut counted: Vec<(RowStatus, usize)> = Vec::new();
+    for state in states {
+        match counted.iter_mut().find(|(seen, _)| seen.text == state.text) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((state, 1)),
+        }
+    }
+    // A stable sort keeps states of one rank in the order they first came.
+    counted.sort_by_key(|(state, _)| rank(state));
+    let tone = counted.first().map_or(Tone::Plain, |(state, _)| state.tone);
+    let live = counted.iter().any(|(state, _)| state.live);
+    if let [(only, _)] = counted.as_slice() {
+        return RowStatus::with(only.text.clone(), tone, live);
+    }
+    let text = counted
+        .iter()
+        .map(|(state, count)| {
+            let mut words = state.text.chars();
+            let first = words.next().map(|first| first.to_lowercase().to_string());
+            format!("{count} {}{}", first.unwrap_or_default(), words.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    RowStatus::with(text, tone, live)
+}
+
+/// How a message stands, as its row's status: sending, waiting for an
+/// answer, how it arrived, or why it was not sent.
+fn message_state(
+    reading: &Coordination,
+    message: &Outbound,
+    status: ToolStatus,
+    output: &str,
+) -> RowStatus {
+    let receipt = reading.outcome.receipt.as_ref();
+    let answered = !reading.outcome.messages.is_empty();
+    match (status, receipt) {
+        (ToolStatus::Running, _) if message.waits => RowStatus::live("Waiting for an answer"),
+        (ToolStatus::Running, _) => RowStatus::live("Sending"),
+        // An ask that timed out was still sent; only the answer is late.
+        (ToolStatus::Failed, Some(receipt)) if message.waits => RowStatus {
+            detail: Some(format!(
+                "{}. No answer yet; it will arrive as a message.",
+                arrival(receipt.arrival)
+            )),
+            ..RowStatus::warning("No answer yet")
+        },
+        // An ask prints its receipt only once its wait ends, so one
+        // stopped while waiting was sent without saying so.
+        (ToolStatus::Stopped, _) if message.waits => RowStatus::warning("Stopped waiting"),
+        (ToolStatus::Stopped, None) => RowStatus {
+            detail: Some("Stopped before it confirmed sending.".to_owned()),
+            ..RowStatus::warning("Not confirmed")
+        },
+        (ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped, _) => RowStatus {
+            detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
+            ..RowStatus::error("Not sent")
+        },
+        _ if answered => RowStatus::plain("Answered"),
+        (_, Some(receipt)) => received(receipt.arrival),
+        _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
+            (Some(delivery), _) => RowStatus {
+                detail: Some(delivered(delivery).to_owned()),
+                ..RowStatus::plain(match delivery {
+                    Delivery::Queued => "Queued",
+                    Delivery::Resumed => "Resumed",
+                    Delivery::Inbox | Delivery::Sent => "Delivered",
+                })
+            },
+            // A prompt to an agent starts a run of it.
+            (None, Some(run)) => run_status(run),
+            (None, None) => RowStatus::plain("Delivered"),
+        },
+    }
 }
 
 /// How a confirmed message reaches its recipient, in the card's status line.
@@ -909,6 +1106,7 @@ impl Row {
 
 /// A row's trailing status: a word or two, with the whole account of it in
 /// the tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RowStatus {
     text: Cow<'static, str>,
     tone: Tone,
@@ -1001,7 +1199,7 @@ fn transcript_surface(theme: &cosmic::Theme) -> iced::Color {
 }
 
 /// How a row's status reads.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tone {
     Plain,
     /// It went, but not all the way.
@@ -1063,6 +1261,71 @@ fn row_words(
     ])
     .spacing(step::GAP_S);
     (words.into(), kept.into())
+}
+
+/// A row's glyph, its words and its status, on the step list's grid: the
+/// glyph in the error colour where it failed, and the status kept whole
+/// while the words fade, down to what of them must stay.
+fn row_content(
+    glyph: Icon,
+    (words, kept): (Element<'static, Message>, Element<'static, Message>),
+    state: &RowStatus,
+) -> Element<'static, Message> {
+    let lead: Element<'static, Message> = if state.tone == Tone::Error {
+        widget::icon(Icon::Error.handle())
+            .size(design::LEADING_ICON_SIZE)
+            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
+                cosmic::iced::widget::svg::Style {
+                    color: Some(design::destructive_color(theme)),
+                }
+            })))
+            .into()
+    } else {
+        muted_glyph(glyph, design::LEADING_ICON_SIZE)
+    };
+    // Work under way is marked by a still dot beside its caption; the
+    // transcript's one activity indicator says that something moves.
+    let live = state.live && matches!(state.tone, Tone::Plain);
+    let mut status_cells = Vec::new();
+    if live {
+        status_cells.push(disclosure::state_dot(design::accent_color));
+    }
+    // A caption naming what an agent waits on is held to the bound its
+    // tab's caption is, so the row says what the tab says.
+    let status = crate::ui_controls::FadeText::transcript(state.text.clone()).limit(STATUS_CHARS);
+    let status = match state.tone {
+        Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
+        Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
+        Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
+    };
+    if !state.text.is_empty() {
+        status_cells.push(status.into());
+    }
+    // Where the agent's name and its state no longer both fit, the state
+    // keeps only its mark: the dot of work under way, or one in the
+    // warning colour. A failure keeps the row's leading glyph in the
+    // error colour, and a settled state is told by the absence of either.
+    // A warning's words stay in the row's tooltip, and every state's in
+    // its accessible name.
+    let compact = match state.tone {
+        Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
+        Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
+        Tone::Plain | Tone::Error => None,
+    };
+    let content = crate::ui_controls::yielding(
+        words,
+        kept,
+        widget::row::with_children(status_cells)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center),
+        compact,
+        step::GAP_S,
+    );
+    widget::row::with_children(vec![lead, content])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
 }
 
 /// A tracked task's state is independent of the tool that launched it.
@@ -1170,14 +1433,7 @@ impl Runtime {
         coordinated: &Coordinated,
         raw: Option<Element<'a, Message>>,
     ) -> Element<'a, Message> {
-        let reported = item.content.status().unwrap_or(ToolStatus::Succeeded);
-        let status = coordinated.reading.status(reported);
-        let output = match &item.content {
-            ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => {
-                output.as_str()
-            }
-            _ => "",
-        };
+        let (status, output) = reported(item, coordinated);
         let row = match &coordinated.reading.kind {
             Kind::Message(message) => self.message_row(coordinated, message, status, output),
             Kind::Spawn(spawn) => self.spawn_row(coordinated, spawn, status, output),
@@ -1246,46 +1502,7 @@ impl Runtime {
                 (text.clone(), text)
             }
         };
-        let receipt = reading.outcome.receipt.as_ref();
-        let answered = !reading.outcome.messages.is_empty();
-        let state = match (status, receipt) {
-            (ToolStatus::Running, _) if message.waits => RowStatus::live("Waiting for an answer"),
-            (ToolStatus::Running, _) => RowStatus::live("Sending"),
-            // An ask that timed out was still sent; only the answer is late.
-            (ToolStatus::Failed, Some(receipt)) if message.waits => RowStatus {
-                detail: Some(format!(
-                    "{}. No answer yet; it will arrive as a message.",
-                    arrival(receipt.arrival)
-                )),
-                ..RowStatus::warning("No answer yet")
-            },
-            // An ask prints its receipt only once its wait ends, so one
-            // stopped while waiting was sent without saying so.
-            (ToolStatus::Stopped, _) if message.waits => RowStatus::warning("Stopped waiting"),
-            (ToolStatus::Stopped, None) => RowStatus {
-                detail: Some("Stopped before it confirmed sending.".to_owned()),
-                ..RowStatus::warning("Not confirmed")
-            },
-            (ToolStatus::Failed | ToolStatus::Denied | ToolStatus::Stopped, _) => RowStatus {
-                detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
-                ..RowStatus::error("Not sent")
-            },
-            _ if answered => RowStatus::plain("Answered"),
-            (_, Some(receipt)) => received(receipt.arrival),
-            _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
-                (Some(delivery), _) => RowStatus {
-                    detail: Some(delivered(delivery).to_owned()),
-                    ..RowStatus::plain(match delivery {
-                        Delivery::Queued => "Queued",
-                        Delivery::Resumed => "Resumed",
-                        Delivery::Inbox | Delivery::Sent => "Delivered",
-                    })
-                },
-                // A prompt to an agent starts a run of it.
-                (None, Some(run)) => run_status(run),
-                (None, None) => RowStatus::plain("Delivered"),
-            },
-        };
+        let state = message_state(reading, message, status, output);
         // What it answered is in the open detail, and in the agent's
         // transcript; where the row cannot open one, the tooltip gives it too.
         let mut full = vec![full];
@@ -1511,70 +1728,15 @@ impl Runtime {
 
     /// One coordination row, on the step list's grid.
     fn row_view<'a>(&self, item: &chat::Item, row: Row) -> Element<'a, Message> {
-        let failed = row.state.tone == Tone::Error;
-        let lead: Element<'static, Message> = if failed {
-            widget::icon(Icon::Error.handle())
-                .size(design::LEADING_ICON_SIZE)
-                .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
-                    cosmic::iced::widget::svg::Style {
-                        color: Some(design::destructive_color(theme)),
-                    }
-                })))
-                .into()
-        } else {
-            muted_glyph(row.glyph, design::LEADING_ICON_SIZE)
-        };
         let (tip, name) = row.described();
-        let (words, kept) = row_words(
+        let words = row_words(
             row.verb,
             row.shown.clone(),
             row.tag.clone(),
             row.preview.clone(),
             row.term,
         );
-        // Work under way is marked by a still dot beside its caption; the
-        // transcript's one activity indicator says that something moves.
-        let live = row.state.live && matches!(row.state.tone, Tone::Plain);
-        let mut state = Vec::new();
-        if live {
-            state.push(disclosure::state_dot(design::accent_color));
-        }
-        // A caption naming what an agent waits on is held to the bound its
-        // tab's caption is, so the row says what the tab says.
-        let status =
-            crate::ui_controls::FadeText::transcript(row.state.text.clone()).limit(STATUS_CHARS);
-        let status = match row.state.tone {
-            Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
-            Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
-            Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
-        };
-        if !row.state.text.is_empty() {
-            state.push(status.into());
-        }
-        // Where the agent's name and its state no longer both fit, the state
-        // keeps only its mark: the dot of work under way, or one in the
-        // warning colour. A failure keeps the row's leading glyph in the
-        // error colour, and a settled state is told by the absence of either.
-        // A warning's words stay in the row's tooltip, and every state's in
-        // its accessible name.
-        let compact = match row.state.tone {
-            Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
-            Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
-            Tone::Plain | Tone::Error => None,
-        };
-        let content = crate::ui_controls::yielding(
-            words,
-            kept,
-            widget::row::with_children(state)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center),
-            compact,
-            step::GAP_S,
-        );
-        let content = widget::row::with_children(vec![lead, content])
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center)
-            .width(Length::Fill);
+        let content = row_content(row.glyph, words, &row.state);
         let open_tool = self.item_expanded(&item.id);
         // The detail holds what was said and reported in full, then the
         // command or tool call that carried it.
@@ -1653,6 +1815,63 @@ impl Runtime {
             tipped(button)
         };
         crate::interaction::context_menu_lazy(row, menu)
+    }
+
+    /// The row a group of messages folds into: how many went to whom, the
+    /// words they share or whom they went to, and how they stand, drawn as
+    /// each message's own row is with the group's disclosure arrow in place
+    /// of the way into an agent. `None` while a step is not yet read as a
+    /// message.
+    pub(super) fn message_run_row(
+        &self,
+        turn: &turn::Turn,
+        open: bool,
+        toggle: Action,
+    ) -> Option<Element<'static, Message>> {
+        let cache = self.presentation_cache();
+        let items = self.step_items();
+        let sent = turn
+            .steps
+            .iter()
+            .map(|placed| {
+                let item = items.get(placed.index)?;
+                Some((&**item, cache.get(&item.id)?.coordination.as_deref()?))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let run = MessageRun::of(sent, &|id| self.listed_agent_name(id))?;
+        let words = row_words(
+            run.verb,
+            run.count.clone(),
+            String::new(),
+            run.preview.clone(),
+            false,
+        );
+        let content = row_content(Icon::Send, words, &run.state);
+        let arrow = crate::ui_controls::passive_icon(
+            if open {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            design::COMPACT_ICON_SIZE,
+        );
+        let line = widget::row::with_children(vec![content, arrow])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+        Some(crate::interaction::a11y_target(
+            widget::button::custom(line)
+                .name(run.line())
+                .description(if open {
+                    "Collapse details"
+                } else {
+                    "Expand details"
+                })
+                .class(crate::ui_controls::control_style(false, None))
+                .width(Length::Fill)
+                .padding([step::GAP_XS as u16, step::GAP_S as u16])
+                .on_press(action(toggle)),
+        ))
     }
 
     /// How the agents a step left running in the background are doing now,
