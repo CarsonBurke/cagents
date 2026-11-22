@@ -484,7 +484,8 @@ if [ "$scene" = tool-cards ]; then
     # Open the lowest first, so the rows above it stay where they were read.
     click_row 'sleep 30|Wait for the lead$'
     click_row 'search docs|search_docs'
-    click_row 'Tried to use'
+    # OCR can split the header's words, so match the one word it keeps.
+    click_row 'Tried'
     scroll_top
     shot tool-cards-open
     scroll_bottom
