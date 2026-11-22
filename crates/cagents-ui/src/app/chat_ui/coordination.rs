@@ -1075,6 +1075,7 @@ enum BackgroundState<'a> {
     OnBackgroundWork(Option<&'a str>),
     Failed,
     Stopped,
+    Denied,
     Ended,
     Finished,
 }
@@ -1088,6 +1089,7 @@ impl BackgroundState<'_> {
             Self::OnBackgroundWork(None) => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
+            Self::Denied => "Denied",
             Self::Ended => "Ended",
             Self::Finished => "Finished",
         })
@@ -1685,8 +1687,11 @@ impl Runtime {
             Some(BackgroundState::OnBackgroundWork(work))
         } else if any(ToolStatus::Failed) {
             Some(BackgroundState::Failed)
-        } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
+        } else if any(ToolStatus::Stopped) {
             Some(BackgroundState::Stopped)
+        } else if any(ToolStatus::Denied) {
+            // As its tab and report say it.
+            Some(BackgroundState::Denied)
         } else if any(ToolStatus::Ended) {
             Some(BackgroundState::Ended)
         } else {
@@ -2177,6 +2182,15 @@ mod identity_tests {
         assert_eq!(
             state(ToolStatus::Waiting, ToolStatus::Waiting).as_deref(),
             Some("Waiting on background work")
+        );
+        // A refused agent reads as its tab says, not as a stopped one.
+        assert_eq!(
+            state(ToolStatus::Denied, ToolStatus::Succeeded).as_deref(),
+            Some("Denied")
+        );
+        assert_eq!(
+            state(ToolStatus::Denied, ToolStatus::Stopped).as_deref(),
+            Some("Stopped")
         );
     }
 

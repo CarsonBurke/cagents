@@ -6735,10 +6735,10 @@ impl Runtime {
                     || report.is_some_and(|(_, outcome)| outcome == "failed")
             }
         };
-        // Where a turn was stopped is marked as other stopped work is, by a
-        // still mark unlike the Stop control.
-        // An agent stopped, or ended without saying how it went, is marked
-        // as its row and tab mark it.
+        // Where a turn was stopped, and an agent that was stopped or ended
+        // without saying how it went, are marked as other stopped work is,
+        // by a still mark unlike the Stop control, as the agent's row and
+        // tab mark it.
         let ended = agent.is_some_and(|agent| {
             matches!(
                 agent.status,
