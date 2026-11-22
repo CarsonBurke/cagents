@@ -404,6 +404,7 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
         .lock()
         .unwrap() = Some(finished);
     let terminal = shell.terminal.clone();
+    let started = Instant::now();
     let shutdown = std::thread::spawn(move || terminal.shutdown());
     let captured_at = capture_finished.recv_timeout(WORKER_JOIN_TIMEOUT).unwrap();
     let killed_before_grace = holder::exits_within(
@@ -420,7 +421,12 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
         !killed_before_grace,
         "capture must not consume the shell's existing HUP grace"
     );
-    assert!(outcome.is_ok(), "shutdown: {outcome:?}");
+    assert!(
+        outcome.is_ok(),
+        "shutdown: {outcome:?} after {:?}; {}",
+        started.elapsed(),
+        shutdown_evidence(&shell)
+    );
     assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
     assert_eq!(
         fs::read(shell.home.path().join("delayed-capture-hup")).unwrap(),
@@ -550,13 +556,18 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     assert!(!shell.terminal.is_completed());
     assert!(shell.terminal.worker_joined_for_test());
     let events = shell.terminal.events().try_iter().collect::<Vec<_>>();
-    assert!(events.iter().any(|event| matches!(
-        event,
-        TerminalEvent::Error {
-            operation: "wait for child",
-            message,
-        } if message == "Terminal process cleanup remains unconfirmed"
-    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TerminalEvent::Error {
+                operation: "wait for child",
+                message,
+            } if message == "Terminal process cleanup remains unconfirmed"
+        )),
+        "shutdown took {:?}; events: {events:?}; one process census now takes {:?}",
+        started.elapsed(),
+        census_duration()
+    );
     assert!(
         !events
             .iter()
@@ -634,6 +645,25 @@ fn shutdown_background_job(shell: &CloseSafetyShell) -> ShutdownJob {
         shell,
         b"trap 'exit 3' HUP; sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60' &\n",
         "sleep",
+    )
+}
+
+/// How long one census of this host's processes takes now. Shutdown
+/// confirms cleanup through such censuses within fixed reserves, so a host
+/// with many processes, or a loaded one, can run out of them.
+fn census_duration() -> Duration {
+    let started = Instant::now();
+    let _ = close_processes::session_is_empty(0, started + Duration::from_secs(30));
+    started.elapsed()
+}
+
+/// What a failed shutdown assertion needs to tell its causes apart: the
+/// worker's reported events and the host's census cost.
+fn shutdown_evidence(shell: &CloseSafetyShell) -> String {
+    format!(
+        "events: {:?}; one process census now takes {:?}",
+        shell.terminal.events().try_iter().collect::<Vec<_>>(),
+        census_duration()
     )
 }
 
