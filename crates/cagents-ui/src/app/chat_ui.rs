@@ -284,6 +284,10 @@ pub enum ReturnRefused {
 /// provider's attachment limit.
 const ATTACHMENT_LIMIT_REACHED: &str = "this chat has reached its attachment limit.";
 
+/// Why an image a draft's text names could not join a chat whose current
+/// model takes none.
+const IMAGES_NOT_ACCEPTED: &str = "the current model cannot accept images.";
+
 /// The composer note for images whose references stay as text because
 /// they could not be attached, or `None` when every one was.
 fn not_attached(labels: Vec<String>, why: &str) -> Option<String> {
@@ -4009,7 +4013,7 @@ impl Runtime {
                 if self.accepts_draft_attachments() {
                     ATTACHMENT_LIMIT_REACHED
                 } else {
-                    "the current model cannot accept images."
+                    IMAGES_NOT_ACCEPTED
                 },
             ),
             not_attached(labels(&too_large), "too large for this chat's provider."),
@@ -4044,7 +4048,10 @@ impl Runtime {
             return;
         };
         // An image a reference brings back counts toward the provider's
-        // limit as a new one would, with the pastes still being saved.
+        // limit as a new one would, with the pastes still being saved. It is
+        // not refused for the current model, as the images the draft holds
+        // are not dropped when the model changes: undo restores the draft as
+        // it was, which may be before the provider has said what it takes.
         let capacity = chat::AttachmentRules::for_provider(self.session.launch.provider)
             .max_count
             .map_or(usize::MAX, |limit| {

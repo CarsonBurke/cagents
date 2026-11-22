@@ -1,6 +1,8 @@
 //! A draft's `[Image N]` references and its attachments stay one object
 //! through the composer's real edit, undo, paste and tray paths (#3259).
-use super::tests::{chat_runtime, composer_key_messages, draft_chat, task_focuses, write};
+use super::tests::{
+    chat_runtime, composer_key_messages, draft_chat, draft_chat_for_provider, task_focuses, write,
+};
 use super::*;
 
 /// A draft chat holding `images` pasted at the end of `prefix`, through the
@@ -167,6 +169,56 @@ fn a_key_keeps_the_keyboard_in_the_tray_and_the_x_returns_it_to_the_message() {
         // Emptying the tray by key returns the keyboard to the message too.
         let task = app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key));
         assert_eq!(task_focuses(task, &composer), (true, false));
+    });
+}
+
+#[test]
+fn undoing_a_removal_at_the_attachment_limit_brings_back_the_image_it_removed() {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::with_test_image(|first| {
+        let limit = chat::AttachmentRules::for_provider(Provider::Claude)
+            .max_count
+            .unwrap();
+        let mut images = vec![first];
+        images
+            .extend((2..=limit).map(|n| chat::attachment_assets::test_image(&format!("{n}.png"))));
+        let waiting = chat::attachment_assets::test_image("waiting.png");
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat_for_provider(&mut app, Provider::Claude);
+        let target = chat_runtime(&app, card).target;
+        write(&mut app, card, "Look ");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let insert = |runtime: &mut Runtime, image: &Attachment| {
+            let ticket = runtime.begin_attachment_insert();
+            assert!(runtime.finish_attachment_insert(ticket.id, "", vec![image.clone()]));
+        };
+        insert(runtime, &waiting);
+        for image in &images[..limit - 1] {
+            insert(runtime, image);
+        }
+        // The reader deletes one reference, and another image fills the
+        // chat to its limit.
+        caret_after(runtime, &token(&waiting));
+        edit(runtime, text_editor::Edit::Backspace);
+        let draft = runtime.composer.text();
+        caret_after(runtime, &draft);
+        insert(runtime, &images[limit - 1]);
+        assert_eq!(runtime.attachments, images);
+
+        // Pasting the deleted reference back leaves it text, and says why.
+        let draft = runtime.composer.text();
+        caret_after(runtime, &draft);
+        edit(runtime, text_editor::Edit::Paste(Arc::new(token(&waiting))));
+        assert_eq!(runtime.attachments, images);
+        let note = runtime.composer_note.clone().unwrap();
+        assert!(note.contains(&waiting.label()), "{note}");
+
+        // Removing a tile doesn't let the refused image in, so undoing the
+        // removal brings back exactly the image it removed.
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Pointer)));
+        assert_eq!(chat_runtime(&app, card).attachments, images[1..]);
+        drop(app.handle_chat_ui(Action::ComposerUndo(target, false)));
+        assert_eq!(chat_runtime(&app, card).attachments, images);
     });
 }
 

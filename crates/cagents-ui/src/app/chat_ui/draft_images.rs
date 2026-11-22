@@ -294,10 +294,12 @@ pub(super) fn tracked(attachments: &[Attachment], detached: &[Detached]) -> bool
 /// leaves; a detached image whose reference is back returns. An image whose
 /// reference was never in the draft, such as an image-only message brought
 /// back from history, stays: no edit removed anything of it. No image comes
-/// back past `capacity` attachments; one that would waits, detached, while
-/// its reference stays as text, and returns once there is room. `before`
-/// also holds the detached images whose references the text held, so a
-/// waiting image is reported only when its reference first comes back.
+/// back past `capacity` attachments; one that would stays detached, and its
+/// reference stays text. `before` also holds the detached images whose
+/// references the text held, and only an edit that brings a reference back
+/// returns its image. So an image refused once is reported once, and does
+/// not slip in later through an unrelated edit, such as removing another
+/// tile, which an undo of that edit would then fail to reverse.
 pub(super) fn reconcile(
     text: &str,
     before: &HashSet<uuid::Uuid>,
@@ -333,7 +335,12 @@ pub(super) fn reconcile(
     // they left in one edit or over several an undo step joins.
     let mut returning = Vec::new();
     detached.retain(|entry| {
-        let back = holds(&entry.attachment);
+        let back = holds(&entry.attachment)
+            && entry
+                .attachment
+                .reference
+                .as_ref()
+                .is_some_and(|reference| !before.contains(&reference.id));
         if back {
             returning.push(entry.clone());
         }
@@ -353,10 +360,7 @@ pub(super) fn reconcile(
             continue;
         }
         if attachments.len() >= capacity {
-            // Only a reference this edit brought back is news; one already
-            // in the text before it was refused, and said so, then.
-            let returned = id.is_some_and(|id| !before.contains(&id));
-            refused.push((entry, returned));
+            refused.push(entry);
             continue;
         }
         attachments.insert(entry.index.min(attachments.len()), entry.attachment);
@@ -365,8 +369,8 @@ pub(super) fn reconcile(
     let refused = refused
         .into_iter()
         .rev()
-        .filter_map(|(entry, returned)| {
-            let label = returned.then(|| entry.attachment.label());
+        .map(|entry| {
+            let label = entry.attachment.label();
             detached.push(entry);
             label
         })
@@ -570,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_brought_back_to_a_full_draft_waits_for_room() {
+    fn a_reference_brought_back_to_a_full_draft_stays_text_until_brought_back_with_room() {
         attachment_assets::with_test_image(|first| {
             let second = attachment_assets::test_image("second.png");
             let third = attachment_assets::test_image("third.png");
@@ -607,9 +611,15 @@ mod tests {
                 "a later edit says nothing new"
             );
 
-            // Once a place frees up, the waiting image returns.
+            // Freeing a place doesn't slip it in through an unrelated edit,
+            // which the edit's undo could not then reverse; bringing the
+            // reference back again does return it.
             attachments.pop();
-            assert!(reconciled(&typed, &typed, &mut attachments, &mut detached).changed);
+            let freed = reconciled(&typed, &typed, &mut attachments, &mut detached);
+            assert_eq!(freed, Reconciled::default());
+            let deleted = typed.replacen(&token(&second), "", 1);
+            assert!(!reconciled(&deleted, &typed, &mut attachments, &mut detached).changed);
+            assert!(reconciled(&typed, &deleted, &mut attachments, &mut detached).changed);
             assert_eq!(attachments, [first.clone(), second.clone()]);
             assert!(detached.is_empty());
         });
