@@ -188,12 +188,21 @@ fn capacity_output(capacity: ChatCapacity, persistence_warning: Option<String>) 
     } else {
         String::new()
     };
+    // Every resident is listed; those beyond the slot holders page saved
+    // history without a provider.
+    let readers = (capacity.residents.len() as u32 + capacity.omitted_residents)
+        .saturating_sub(capacity.resident);
+    let readers = match readers {
+        0 => String::new(),
+        1 => "; 1 read-only history reader holds no slot".to_owned(),
+        n => format!("; {n} read-only history readers hold no slot"),
+    };
     let mut data = json!(capacity);
     data["persistence_warning"] = json!(persistence_warning);
     CommandOutput {
         command: "chat.capacity",
         human: format!(
-            "Native chats: {} used / {} limit ({} resident, {} spawning){suffix}{warning}\n\n{inventory}{truncation}",
+            "Native chats: {} used / {} limit ({} resident, {} spawning{readers}){suffix}{warning}\n\n{inventory}{truncation}",
             capacity.used, capacity.limit, capacity.resident, capacity.spawning
         ),
         data,
@@ -442,6 +451,34 @@ mod tests {
         assert!(output.human.contains("4096 omitted"));
         assert_eq!(output.data["residents"][0]["chat_id"], id.to_string());
         assert_eq!(output.data["omitted_residents"], 4096);
+    }
+
+    #[test]
+    fn listed_history_readers_are_reported_as_holding_no_slot() {
+        let row = |status: &str| crate::terminal_ipc::ChatCapacityResident {
+            chat_id: TerminalId::new(),
+            provider: crate::agent::Provider::Claude,
+            status: status.into(),
+            release_blocked: None,
+        };
+        let output = capacity_output(
+            ChatCapacity {
+                used: 1,
+                resident: 1,
+                spawning: 0,
+                limit: 128,
+                residents: vec![
+                    row("Idle"),
+                    row("read-only history"),
+                    row("read-only history"),
+                ],
+                omitted_residents: 0,
+            },
+            None,
+        );
+        assert!(output.human.starts_with(
+            "Native chats: 1 used / 128 limit (1 resident, 0 spawning; 2 read-only history readers hold no slot)"
+        ));
     }
 
     #[test]

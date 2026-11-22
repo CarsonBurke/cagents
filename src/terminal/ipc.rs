@@ -1252,6 +1252,8 @@ pub const MAX_CHAT_CAPACITY_ROWS: usize = 4096;
 pub struct ChatCapacity {
     /// Distinct admission slots; recovery can reserve an already resident ID.
     pub used: u32,
+    /// Residents that hold a slot; read-only history readers are listed in
+    /// `residents` but hold none.
     pub resident: u32,
     pub spawning: u32,
     pub limit: u32,

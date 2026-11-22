@@ -334,7 +334,7 @@ fn restore_with_policy_for_start(
         } else {
             false
         };
-        if !state.chats.contains_key(&source.id) && admission.is_none() && !retained_startup {
+        if !capacity::holding(&state, &source.id) && admission.is_none() && !retained_startup {
             capacity::require_available(&state)?;
         }
         capacity::Reservation::install(&mut admission, host, &mut state, source)?;
