@@ -1621,11 +1621,11 @@ impl LocalHandle {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         (state.active_model_revision, state.active_model.clone())
     }
-    /// How the provider addresses this conversation's subagents, where that
-    /// is not by the IDs its snapshot lists them under.
+    /// What the runtime observed of the conversation's prompt cache.
     pub(crate) fn prompt_cache(&self) -> crate::chat::prompt_cache::Activity {
         self.0.prompt_cache.activity()
     }
+    /// The conversation's context as of its latest usage reading.
     pub(crate) fn context_tokens(&self) -> u64 {
         self.0
             .state
@@ -1634,6 +1634,8 @@ impl LocalHandle {
             .usage
             .context_tokens
     }
+    /// How the provider addresses this conversation's subagents, where that
+    /// is not by the IDs its snapshot lists them under.
     pub(crate) fn agent_addresses(&self) -> Vec<AgentAddress> {
         self.0.agent_addresses.list()
     }
