@@ -661,6 +661,33 @@ enum QueueTiming {
     NextTurn,
     /// On its way to the agent, or back to the composer.
     Leaving,
+    /// Sent, without the agent confirming it got it, and whether it can be
+    /// sent again.
+    Unconfirmed(bool),
+}
+
+/// What a message of the reader's drawn ahead of the conversation is
+/// waiting on, as the line under it says.
+enum LocalStatus {
+    /// Still on its way, for the reason given.
+    Waiting(String),
+    /// Taken by the agent, which has yet to show it.
+    Sent,
+    /// Sent without the agent confirming it got it, under this key, and
+    /// whether it can be sent again.
+    Unconfirmed(chat::DeliveryKey, bool),
+}
+
+/// What the reader is told of a message the agent never confirmed.
+pub(super) const UNCONFIRMED_LABEL: &str = "Not confirmed yet";
+/// Why a message reads as not confirmed, and, where it can go again,
+/// that it still goes once.
+fn unconfirmed_detail(retry: bool) -> &'static str {
+    if retry {
+        "The agent hasn't confirmed it got this message, so it may still arrive. Sending it again won't deliver it twice."
+    } else {
+        "The agent hasn't confirmed it got this message, so it may still arrive."
+    }
 }
 
 /// One waiting message: when it goes, what it says, and what can be done
@@ -683,6 +710,10 @@ fn queue_row<'a>(
         QueueTiming::Leaving => crate::ui_controls::activity_spinner(
             f32::from(design::COMPACT_ICON_SIZE),
             design::accent_color,
+        ),
+        QueueTiming::Unconfirmed(retry) => crate::interaction::tooltip(
+            crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+            unconfirmed_detail(retry),
         ),
     };
     let names = || {
@@ -2444,14 +2475,24 @@ impl Runtime {
         self.followups_sending()
             || self
                 .commands
-                .outgoing()
+                .unsent()
                 .any(|outgoing| !outgoing.in_transcript())
     }
 
     /// Whether the conversation's status reads "Sending": a message is on
     /// its way, and the queue is not already saying so above a working agent.
     fn says_sending(&self) -> bool {
-        self.sending() && !(self.queue_sending() && self.snapshot.is_working())
+        self.on_its_way() && !(self.queue_sending() && self.snapshot.is_working())
+    }
+
+    /// Whether a message has yet to be taken by the provider. One it took
+    /// is sent, whatever the conversation has shown of it so far.
+    fn on_its_way(&self) -> bool {
+        self.commands.unsent().next().is_some()
+            || self
+                .commands
+                .iter()
+                .any(|pending| pending.sent.is_some() || !pending.sent_attachments.is_empty())
     }
 
     /// Whether a message is on its way to the provider. Other commands -
@@ -3391,12 +3432,38 @@ impl Runtime {
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
             }
+            for unconfirmed in self
+                .commands
+                .unconfirmed()
+                .iter()
+                .filter(|unconfirmed| unconfirmed.outgoing.in_transcript())
+            {
+                transcript.push(self.local_prompt_view(
+                    &unconfirmed.outgoing.prompt,
+                    LocalStatus::Unconfirmed(
+                        unconfirmed.outgoing.delivery,
+                        self.can_retry(unconfirmed),
+                    ),
+                    None,
+                ));
+            }
             for outgoing in self
                 .commands
-                .outgoing()
+                .accepted()
                 .filter(|outgoing| outgoing.in_transcript())
             {
-                transcript.push(self.local_prompt_view(&outgoing.prompt, "Sending…".into(), None));
+                transcript.push(self.local_prompt_view(&outgoing.prompt, LocalStatus::Sent, None));
+            }
+            for outgoing in self
+                .commands
+                .unsent()
+                .filter(|outgoing| outgoing.in_transcript())
+            {
+                transcript.push(self.local_prompt_view(
+                    &outgoing.prompt,
+                    LocalStatus::Waiting("Sending…".into()),
+                    None,
+                ));
             }
         }
         // What the agent is doing now closes the transcript, so it scrolls
@@ -6503,13 +6570,41 @@ impl Runtime {
         // A message on its way to the provider's queue, or to steer the
         // turn, joins the list at once; the provider's own listing replaces
         // it once it has the message.
-        for outgoing in self
+        for unconfirmed in self
             .commands
-            .outgoing()
-            .filter(|outgoing| !outgoing.in_transcript())
+            .unconfirmed()
+            .iter()
+            .filter(|unconfirmed| !unconfirmed.outgoing.in_transcript())
         {
+            let outgoing = &unconfirmed.outgoing;
+            let retry = self.can_retry(unconfirmed);
             rows.push(queue_row(
-                QueueTiming::Leaving,
+                QueueTiming::Unconfirmed(retry),
+                outgoing.preview.as_str().into(),
+                &outgoing.prompt.attachments,
+                copy(
+                    outgoing.prompt.text(),
+                    QueueCopy::Initial(Arc::downgrade(&outgoing.prompt.source)),
+                )
+                .into_iter()
+                .chain(self.unconfirmed_controls(outgoing.delivery, retry))
+                .collect(),
+            ));
+        }
+        // One the provider took goes when its own listing says; until that
+        // listing has it, when it was asked to.
+        let leaving = self
+            .commands
+            .accepted()
+            .map(|outgoing| (outgoing, true))
+            .chain(self.commands.unsent().map(|outgoing| (outgoing, false)));
+        for (outgoing, taken) in leaving.filter(|(outgoing, _)| !outgoing.in_transcript()) {
+            rows.push(queue_row(
+                match outgoing.mode {
+                    _ if !taken => QueueTiming::Leaving,
+                    PromptMode::Steer => QueueTiming::NextStep,
+                    _ => QueueTiming::NextTurn,
+                },
                 outgoing.preview.as_str().into(),
                 &outgoing.prompt.attachments,
                 copy(
@@ -6671,6 +6766,32 @@ impl Runtime {
             .into()
     }
 
+    /// What can be done about a message the agent never confirmed, sent
+    /// under `key`: send it again, which delivers it at most once, where
+    /// `retry` allows, or stop showing it.
+    fn unconfirmed_controls<'a>(
+        &self,
+        key: chat::DeliveryKey,
+        retry: bool,
+    ) -> Vec<Element<'a, Message>> {
+        let mut controls = Vec::new();
+        if retry {
+            controls.push(
+                crate::ui_controls::icon_button(Icon::Refresh, "Send again")
+                    .compact()
+                    .on_press(action(Action::RetryUnconfirmed(self.target, key)))
+                    .into(),
+            );
+        }
+        controls.push(
+            crate::ui_controls::icon_button(Icon::Close, "Dismiss")
+                .compact()
+                .on_press(action(Action::DismissUnconfirmed(self.target, key)))
+                .into(),
+        );
+        controls
+    }
+
     /// A draft's first message while its conversation starts.
     ///
     /// It is drawn where it will be once sent, as the reader's own message,
@@ -6691,7 +6812,11 @@ impl Runtime {
             .commands
             .iter()
             .any(|pending| pending.queued == Some(super::QueuedStep::Prompt));
-        self.local_prompt_view(&queued.prompt, waiting, Some(!sending))
+        self.local_prompt_view(
+            &queued.prompt,
+            LocalStatus::Waiting(waiting),
+            Some(!sending),
+        )
     }
 
     /// A message of the reader's this window holds until its conversation
@@ -6706,7 +6831,7 @@ impl Runtime {
     fn local_prompt_view<'a>(
         &'a self,
         local: &'a super::prompt::LocalPrompt,
-        waiting: String,
+        status: LocalStatus,
         take_back: Option<bool>,
     ) -> Element<'a, Message> {
         // One message is prepared at a time; another, rarely, reads plain
@@ -6768,29 +6893,52 @@ impl Runtime {
                 .into(),
             );
         }
-        let mut status: Vec<Element<'a, Message>> = vec![
-            crate::ui_controls::activity_spinner(
-                f32::from(design::COMPACT_ICON_SIZE),
-                design::accent_color,
-            ),
-            design::caption(waiting)
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
-            small_icon(
-                Icon::Copy,
-                // A message still to send is in the queue; one sent is the
-                // reader's message like any other.
-                if take_back.is_some() {
-                    "Copy queued message"
-                } else {
-                    "Copy this message"
-                },
-                Action::CopyQueued(
-                    self.target,
-                    QueueCopy::Initial(Arc::downgrade(&local.source)),
+        let mut controls = Vec::new();
+        let mut status: Vec<Element<'a, Message>> = match status {
+            LocalStatus::Waiting(waiting) => vec![
+                crate::ui_controls::activity_spinner(
+                    f32::from(design::COMPACT_ICON_SIZE),
+                    design::accent_color,
                 ),
+                design::caption(waiting)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            ],
+            LocalStatus::Sent => vec![
+                design::caption("Sent")
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            ],
+            LocalStatus::Unconfirmed(key, retry) => {
+                controls = self.unconfirmed_controls(key, retry);
+                vec![crate::interaction::tooltip(
+                    widget::row::with_children(vec![
+                        crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+                        design::caption(UNCONFIRMED_LABEL)
+                            .class(cosmic::theme::Text::Custom(design::warning_text))
+                            .into(),
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                    unconfirmed_detail(retry),
+                )]
+            }
+        };
+        status.push(small_icon(
+            Icon::Copy,
+            // A message still to send is in the queue; one sent is the
+            // reader's message like any other.
+            if take_back.is_some() {
+                "Copy queued message"
+            } else {
+                "Copy this message"
+            },
+            Action::CopyQueued(
+                self.target,
+                QueueCopy::Initial(Arc::downgrade(&local.source)),
             ),
-        ];
+        ));
+        status.extend(controls);
         if let Some(enabled) = take_back {
             status.push(
                 crate::ui_controls::icon_button(Icon::Undo, "Take the message back to edit it")

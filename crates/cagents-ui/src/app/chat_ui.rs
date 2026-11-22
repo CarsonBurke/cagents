@@ -401,6 +401,11 @@ pub enum Action {
     /// Lets a cancel waiting for its second press lapse, if it is that one.
     DisarmInterrupt(Target, Instant),
     CommandFinished(Target, u64, Result<(), String>),
+    /// Sends again the message whose outcome was never confirmed under its
+    /// key, which delivers it at most once.
+    RetryUnconfirmed(Target, chat::DeliveryKey),
+    /// Stops showing a message whose outcome was never confirmed.
+    DismissUnconfirmed(Target, chat::DeliveryKey),
     /// Looks again at a message the provider took once its turn has had
     /// time to begin, as no report may come to show it never will.
     CommandsDue(Target),
@@ -900,6 +905,8 @@ impl Action {
             Self::Interrupt(..) => "Interrupt",
             Self::DisarmInterrupt(..) => "DisarmInterrupt",
             Self::CommandFinished(..) => "CommandFinished",
+            Self::RetryUnconfirmed(..) => "RetryUnconfirmed",
+            Self::DismissUnconfirmed(..) => "DismissUnconfirmed",
             Self::CommandsDue(..) => "CommandsDue",
             Self::Toggle(..) => "Toggle",
             Self::ToggleTurn(..) => "ToggleTurn",
@@ -2960,6 +2967,18 @@ enum LatestReader {
     Preserve,
 }
 
+/// The reader's message a command carries, if any.
+enum Carrying {
+    Nothing,
+    /// What the composer holds, which leaves it now.
+    Draft,
+    /// The held follow-ups, by ID, as the one message they make.
+    Followups(Vec<u64>, commands::Outgoing),
+    /// A message whose outcome was never confirmed, sent again under its
+    /// own key.
+    Again(commands::Outgoing),
+}
+
 /// When and how the last turn ended, as the transcript's closing stamp says.
 struct FinishedStamp {
     at: u64,
@@ -2978,20 +2997,29 @@ fn commands_due(target: Target) -> Task<Message> {
     })
 }
 
-/// Sends `command` to the conversation `handle` reaches, off the UI thread,
-/// and answers with its outcome. Without one, it is answered as not sent.
+/// Sends `dispatch` to the conversation `handle` reaches, off the UI
+/// thread, and answers with its outcome. Without one, it is answered as not
+/// sent. A message goes under its key, so that sending it again delivers it
+/// at most once.
 fn run_chat_command(
     target: Target,
-    id: u64,
+    dispatch: commands::Dispatch,
     handle: Option<Arc<ClientHandle>>,
-    command: Command,
 ) -> Task<Message> {
+    let commands::Dispatch {
+        id,
+        command,
+        delivery,
+    } = dispatch;
     cosmic::task::future(async move {
         let result = match handle {
-            Some(handle) => tokio::task::spawn_blocking(move || handle.send(command))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result),
+            Some(handle) => tokio::task::spawn_blocking(move || match delivery {
+                Some(key) => handle.send_once(command, key),
+                None => handle.send(command),
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result),
             None => Err("The conversation disconnected before this was sent.".to_owned()),
         };
         Message::ChatUi(Action::CommandFinished(target, id, result))
@@ -11954,15 +11982,13 @@ impl Cagents {
                 .collect();
             let message =
                 commands::Outgoing::new(text, attachments, PromptMode::Send, &runtime.snapshot);
-            let sent = runtime.next_command;
-            let task = self.chat_send(target, command, false);
-            if let Some(runtime) = self.chat_runtime_mut(target)
-                && runtime.next_command != sent
-                && let Some(pending) = runtime.commands.newest_mut()
-            {
-                pending.carry_followups(ids, message);
-            }
-            return task;
+            return self.chat_send_step(
+                target,
+                command,
+                Carrying::Followups(ids, message),
+                None,
+                LatestReader::Follow,
+            );
         }
         let provider = runtime.session.launch.provider;
         let Some(queued) = runtime.queued.as_mut() else {
@@ -11998,7 +12024,7 @@ impl Cagents {
                 return self.chat_send_step(
                     target,
                     Command::SetModel { model, reasoning },
-                    false,
+                    Carrying::Nothing,
                     Some(QueuedStep::Model),
                     LatestReader::Follow,
                 );
@@ -12031,7 +12057,7 @@ impl Cagents {
             Ok(command) => self.chat_send_step(
                 target,
                 command,
-                false,
+                Carrying::Nothing,
                 Some(QueuedStep::Prompt),
                 LatestReader::Follow,
             ),
@@ -12246,7 +12272,7 @@ impl Cagents {
                 self.chat_send_step(
                     target,
                     Command::Refresh,
-                    false,
+                    Carrying::Nothing,
                     None,
                     LatestReader::Preserve,
                 )
@@ -12270,7 +12296,12 @@ impl Cagents {
     }
 
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
-        self.chat_send_step(target, command, clear_draft, None, LatestReader::Follow)
+        let carrying = if clear_draft {
+            Carrying::Draft
+        } else {
+            Carrying::Nothing
+        };
+        self.chat_send_step(target, command, carrying, None, LatestReader::Follow)
     }
     /// Sends `command`, which is `step` of a queued first message where that
     /// is given.
@@ -12278,7 +12309,7 @@ impl Cagents {
         &mut self,
         target: Target,
         command: Command,
-        clear_draft: bool,
+        carrying: Carrying,
         step: Option<QueuedStep>,
         latest_reader: LatestReader,
     ) -> Task<Message> {
@@ -12388,29 +12419,38 @@ impl Cagents {
                 }
             }
         }
-        if clear_draft {
-            // The message leaves the composer now, for where it is going,
-            // rather than when the provider answers: the reader can write
-            // the next one meanwhile, and one the provider refuses comes
-            // back with the reason.
-            let text = runtime.composer.text().trim_end().to_owned();
-            let attachments = runtime.take_attachments();
-            runtime.finish_history_walk_after_send(&attachments);
-            let mode = match &command {
-                Command::Prompt { mode, .. } => *mode,
-                _ => PromptMode::Send,
-            };
-            let mut outgoing = commands::Outgoing::new(text, attachments, mode, &runtime.snapshot);
-            outgoing.written = runtime.next_written;
-            runtime.next_written += 1;
-            pending.outgoing = Some(outgoing);
-            runtime.prepare_local_prompt();
+        match carrying {
+            Carrying::Nothing => {}
+            Carrying::Followups(ids, message) => pending.carry_followups(ids, message),
+            Carrying::Again(outgoing) => {
+                pending.outgoing = Some(outgoing);
+                runtime.prepare_local_prompt();
+            }
+            Carrying::Draft => {
+                // The message leaves the composer now, for where it is going,
+                // rather than when the provider answers: the reader can write
+                // the next one meanwhile, and one the provider refuses comes
+                // back with the reason.
+                let text = runtime.composer.text().trim_end().to_owned();
+                let attachments = runtime.take_attachments();
+                runtime.finish_history_walk_after_send(&attachments);
+                let mode = match &command {
+                    Command::Prompt { mode, .. } => *mode,
+                    _ => PromptMode::Send,
+                };
+                let mut outgoing =
+                    commands::Outgoing::new(text, attachments, mode, &runtime.snapshot);
+                outgoing.written = runtime.next_written;
+                runtime.next_written += 1;
+                pending.outgoing = Some(outgoing);
+                runtime.prepare_local_prompt();
+            }
         }
         runtime.error = None;
         runtime.composer_note = None;
         let snapshot = runtime.snapshot.clone();
         match runtime.commands.push(pending, command, &snapshot) {
-            Some((id, command)) => run_chat_command(target, id, Some(handle), command),
+            Some(dispatch) => run_chat_command(target, dispatch, Some(handle)),
             None => Task::none(),
         }
     }
@@ -12421,11 +12461,11 @@ impl Cagents {
             return Task::none();
         };
         let snapshot = runtime.snapshot.clone();
-        let Some((id, command)) = runtime.commands.next(&snapshot) else {
+        let Some(dispatch) = runtime.commands.next(&snapshot) else {
             return Task::none();
         };
         let handle = runtime.handle().cloned().filter(|_| !runtime.disconnected);
-        run_chat_command(target, id, handle, command)
+        run_chat_command(target, dispatch, handle)
     }
     /// [`Self::handle_chat_ui`] for the update loop, which also answers how
     /// much of the workspace projection the action changed.
@@ -15325,8 +15365,16 @@ impl Cagents {
                 };
                 let mut followups_sent = false;
                 let mut due = Task::none();
-                let first_prompt = match result {
-                    Ok(()) => {
+                // A message whose outcome is unknown, with what the
+                // provider said of it.
+                let unconfirmed = match &result {
+                    Err(error) => chat::failure::DeliveryOutcome::parse(error)
+                        .filter(|outcome| outcome.unknown)
+                        .and_then(|outcome| Some((outcome, pending.take_message()?))),
+                    Ok(()) => None,
+                };
+                let first_prompt = match (result, unconfirmed) {
+                    (Ok(()), _) => {
                         if !pending.followups.is_empty() {
                             let before = runtime.followups.len();
                             runtime
@@ -15382,7 +15430,37 @@ impl Cagents {
                         }
                         pending.first_prompt
                     }
-                    Err(error) => {
+                    (Err(error), Some((outcome, (outgoing, command)))) => {
+                        // The provider may have the message, so it does not
+                        // go back to the composer, where sending it again
+                        // could deliver it twice. It stays where it was
+                        // going, as not confirmed, and what was written
+                        // after it still goes. Held follow-ups it carried
+                        // are in it now.
+                        if !pending.followups.is_empty() {
+                            let before = runtime.followups.len();
+                            runtime
+                                .followups
+                                .retain(|followup| !pending.followups.contains(&followup.id));
+                            followups_sent = runtime.followups.len() != before;
+                            let _ = runtime.present();
+                        }
+                        let connection = runtime.handle().cloned();
+                        runtime.commands.hold_unconfirmed(
+                            outgoing,
+                            command,
+                            outcome.notice,
+                            connection.as_ref(),
+                        );
+                        runtime.prepare_local_prompt();
+                        // An outcome about the conversation is its state too.
+                        if !outcome.notice {
+                            runtime.note(error.clone());
+                            runtime.error = Some(error);
+                        }
+                        None
+                    }
+                    (Err(error), None) => {
                         if pending.page == Some(view::Page::Latest) {
                             runtime.scroll_memory.clear_latest();
                             runtime.scroll_memory.cancel_preserve(pending.id);
@@ -15432,6 +15510,39 @@ impl Cagents {
                     self.dispatch_queued(target),
                     self.resume_history_navigation(target),
                 ]);
+            }
+            Action::RetryUnconfirmed(target, key) => {
+                if self.chat_start_pending(target.card) || self.chat_closed_elsewhere(target.card) {
+                    return Task::none();
+                }
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Taken out only where it goes at once, so it is never lost.
+                if !runtime
+                    .commands
+                    .find_unconfirmed(key)
+                    .is_some_and(|unconfirmed| runtime.can_retry(unconfirmed))
+                {
+                    return Task::none();
+                }
+                let Some((outgoing, command)) = runtime.commands.take_unconfirmed(key) else {
+                    return Task::none();
+                };
+                return self.chat_send_step(
+                    target,
+                    command,
+                    Carrying::Again(outgoing),
+                    None,
+                    LatestReader::Follow,
+                );
+            }
+            Action::DismissUnconfirmed(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && runtime.commands.take_unconfirmed(key).is_some()
+                {
+                    runtime.prepare_local_prompt();
+                }
             }
             Action::CommandsDue(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {

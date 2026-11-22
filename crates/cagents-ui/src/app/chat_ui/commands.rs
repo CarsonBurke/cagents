@@ -12,6 +12,12 @@
 //! shows the change; one it refuses is undone, and a message it refused goes
 //! back to the composer with the reason, so nothing written is lost.
 //!
+//! A message whose outcome the provider never confirmed may still arrive, so
+//! it does not go back to the composer, where sending it again would deliver
+//! it twice. It stays where it was going, as not confirmed, until the
+//! conversation shows it, and the reader may send it again under the same
+//! key, which delivers it at most once, take it back, or let it go.
+//!
 //! A message sent starts a turn, but only once the provider says so. What
 //! acts on that turn - steering it, queueing behind it, stopping it - waits
 //! here until it has begun, since a provider asked about a turn it has not
@@ -68,6 +74,9 @@ pub(super) struct PendingCommand {
     /// make. Their own rows show them on their way; accepted, they show as
     /// this message until the conversation does.
     carried: Option<Outgoing>,
+    /// The command as it went, kept where it carries a message, so that one
+    /// whose outcome is unknown can be sent again as it was.
+    message: Option<Command>,
     /// Any other command, kept so that the same request given again while
     /// this one is still on its way is not sent twice.
     repeat: Option<Command>,
@@ -114,6 +123,7 @@ impl PendingCommand {
             queued: None,
             outgoing: None,
             carried: None,
+            message: None,
             repeat: (!matches!(
                 command,
                 Command::Prompt { .. } | Command::Slash { .. } | Command::Compact
@@ -136,6 +146,23 @@ impl PendingCommand {
     /// write again.
     pub(super) fn take_unsent(&mut self) -> Option<Outgoing> {
         self.outgoing.take().filter(|outgoing| !outgoing.arrived)
+    }
+
+    /// Takes the message this command carried, with the command that sent
+    /// it, unless the conversation already shows it.
+    pub(super) fn take_message(&mut self) -> Option<(Outgoing, Command)> {
+        let command = self.message.take()?;
+        let outgoing = self.take_unsent().or_else(|| self.carried.take())?;
+        Some((outgoing, command))
+    }
+
+    /// The key the message this command carries is sent under, which stays
+    /// the same each time it is sent.
+    fn delivery(&self) -> Option<chat::DeliveryKey> {
+        self.outgoing
+            .as_ref()
+            .or(self.carried.as_ref())
+            .map(|outgoing| outgoing.delivery)
     }
 
     /// The same kind of request as `command`, for telling whether `command`
@@ -249,6 +276,9 @@ pub(super) struct Outgoing {
     /// began, so that a turn which never comes gives it back rather than
     /// letting it go.
     stopped: bool,
+    /// What the provider is told this message is called, the same each time
+    /// it is sent, so that it is delivered at most once.
+    pub(super) delivery: chat::DeliveryKey,
 }
 
 impl Outgoing {
@@ -271,6 +301,7 @@ impl Outgoing {
             arrived: false,
             written: 0,
             stopped: false,
+            delivery: chat::DeliveryKey::new_v4(),
         };
         outgoing.leaves_after(snapshot);
         outgoing
@@ -339,6 +370,32 @@ impl Outgoing {
         self.never_began(snapshot)
             && snapshot.error.is_some()
             && (snapshot.error != self.error || self.busy_seen || waited)
+    }
+
+    /// Whether `snapshot` shows this very message anywhere since it went:
+    /// among the reader's messages after the newest it had then, or among
+    /// those held for later. A message whose outcome is unknown may arrive
+    /// behind others sent since.
+    fn seen_in(&self, snapshot: &Snapshot, items: bool) -> bool {
+        let text = self.prompt.text().trim();
+        if text.is_empty() {
+            return false;
+        }
+        let held = snapshot
+            .queued_messages
+            .iter()
+            .any(|message| !self.held.contains(&message.id) && message.text.trim() == text);
+        held || (items
+            && snapshot
+                .items
+                .iter()
+                .rev()
+                .take_while(|item| Some(item.id.as_str()) != self.newest_user.as_deref())
+                .any(|item| {
+                    item.role == chat::Role::User
+                        && matches!(&item.content, ItemContent::Text { text: shown, .. }
+                            if shown.trim() == text)
+                }))
     }
 
     /// Whether `snapshot` shows this very message, where it is going.
@@ -429,6 +486,30 @@ pub(super) struct Commands {
     in_flight: Option<PendingCommand>,
     waiting: VecDeque<(PendingCommand, Command)>,
     settling: Vec<Settling>,
+    /// Messages whose outcome the provider never confirmed, with the
+    /// command that sent each, until the conversation shows them or the
+    /// reader lets them go. They hold nothing else up.
+    unconfirmed: Vec<Unconfirmed>,
+}
+
+/// A message the provider may or may not have taken.
+pub(super) struct Unconfirmed {
+    pub(super) outgoing: Outgoing,
+    command: Command,
+    /// Whether the conversation can still be asked again: an outcome that
+    /// describes the conversation, such as its process stopping, leaves
+    /// nothing to ask.
+    pub(super) retry: bool,
+    /// The connection it went over. Only the daemon that sent it remembers
+    /// its key, so it is sent again over that connection alone.
+    connection: std::sync::Weak<ClientHandle>,
+}
+
+/// A command to send now, and the key its message goes under.
+pub(super) struct Dispatch {
+    pub(super) id: u64,
+    pub(super) command: Command,
+    pub(super) delivery: Option<chat::DeliveryKey>,
 }
 
 impl Commands {
@@ -515,7 +596,7 @@ impl Commands {
         mut pending: PendingCommand,
         command: Command,
         snapshot: &Snapshot,
-    ) -> Option<(u64, Command)> {
+    ) -> Option<Dispatch> {
         pending.at_once =
             command == Command::Interrupt && snapshot.busy && self.turn_coming(snapshot);
         self.waiting.push_back((pending, command));
@@ -545,7 +626,7 @@ impl Commands {
     /// of it has yet to start that turn. A message for a turn that is over
     /// by the time it goes, or never came, goes as a message of its own, and
     /// a request that waited to stop it is dropped: there is nothing to stop.
-    pub(super) fn next(&mut self, snapshot: &Snapshot) -> Option<(u64, Command)> {
+    pub(super) fn next(&mut self, snapshot: &Snapshot) -> Option<Dispatch> {
         if self.in_flight.is_some() {
             return None;
         }
@@ -578,8 +659,16 @@ impl Commands {
                 outgoing.leaves_after(snapshot);
             }
             let id = pending.id;
+            let delivery = pending.delivery();
+            if delivery.is_some() {
+                pending.message = Some(command.clone());
+            }
             self.in_flight = Some(pending);
-            return Some((id, command));
+            return Some(Dispatch {
+                id,
+                command,
+                delivery,
+            });
         }
     }
 
@@ -615,6 +704,9 @@ impl Commands {
     /// gone. Returns the messages that had not been accepted, in order.
     pub(super) fn abandon(&mut self) -> Vec<Outgoing> {
         self.settling.clear();
+        // Whether these arrived, the conversation shows once it is back;
+        // returned to the composer, they could be sent twice.
+        self.unconfirmed.clear();
         self.in_flight
             .take()
             .into_iter()
@@ -681,7 +773,10 @@ impl Commands {
                 }
             }
         }
-        settled.changed = self.settling.len() != before;
+        let unconfirmed = self.unconfirmed.len();
+        self.unconfirmed
+            .retain(|unconfirmed| !unconfirmed.outgoing.seen_in(snapshot, items));
+        settled.changed = self.settling.len() != before || self.unconfirmed.len() != unconfirmed;
         if let Some(outgoing) = self
             .in_flight
             .as_mut()
@@ -695,16 +790,66 @@ impl Commands {
         settled
     }
 
-    /// The reader's messages this window still shows as on their way, in
-    /// the order they were sent.
-    pub(super) fn outgoing(&self) -> impl Iterator<Item = &Outgoing> {
+    /// Keeps `outgoing`, sent by `command`, shown as not confirmed until the
+    /// conversation shows it, as [`Self::unconfirmed`] says.
+    pub(super) fn hold_unconfirmed(
+        &mut self,
+        outgoing: Outgoing,
+        command: Command,
+        retry: bool,
+        connection: Option<&Arc<ClientHandle>>,
+    ) {
+        self.unconfirmed.push(Unconfirmed {
+            outgoing,
+            command,
+            retry: retry && connection.is_some(),
+            connection: connection.map(Arc::downgrade).unwrap_or_default(),
+        });
+    }
+
+    /// The messages whose outcome the provider never confirmed, in the
+    /// order they were sent.
+    pub(super) fn unconfirmed(&self) -> &[Unconfirmed] {
+        &self.unconfirmed
+    }
+
+    /// The unconfirmed message sent under `key`.
+    pub(super) fn find_unconfirmed(&self, key: chat::DeliveryKey) -> Option<&Unconfirmed> {
+        self.unconfirmed
+            .iter()
+            .find(|unconfirmed| unconfirmed.outgoing.delivery == key)
+    }
+
+    /// Takes the unconfirmed message sent under `key`, with its command.
+    pub(super) fn take_unconfirmed(
+        &mut self,
+        key: chat::DeliveryKey,
+    ) -> Option<(Outgoing, Command)> {
+        let index = self
+            .unconfirmed
+            .iter()
+            .position(|unconfirmed| unconfirmed.outgoing.delivery == key)?;
+        let Unconfirmed {
+            outgoing, command, ..
+        } = self.unconfirmed.remove(index);
+        Some((outgoing, command))
+    }
+
+    /// The messages the provider took that the conversation has yet to
+    /// show, in the order they were sent.
+    pub(super) fn accepted(&self) -> impl Iterator<Item = &Outgoing> {
         self.settling
             .iter()
             .filter_map(|settling| match &settling.effect {
                 Effect::Outgoing(outgoing) => Some(outgoing),
                 Effect::Choice(_) => None,
             })
-            .chain(self.unsent())
+    }
+
+    /// The reader's messages this window still shows as on their way, in
+    /// the order they were sent.
+    pub(super) fn outgoing(&self) -> impl Iterator<Item = &Outgoing> {
+        self.accepted().chain(self.unsent())
     }
 
     pub(super) fn outgoing_mut(&mut self) -> impl Iterator<Item = &mut Outgoing> {
@@ -789,6 +934,21 @@ impl Runtime {
         self.snapshot.busy
             || self.commands.outgoing().next().is_some()
             || self.commands.carrying_followups()
+    }
+
+    /// Whether `unconfirmed` can be sent again now: its outcome leaves the
+    /// conversation able to take it, the conversation still takes messages,
+    /// and it is connected to the daemon that sent it, which alone
+    /// remembers its key.
+    pub(super) fn can_retry(&self, unconfirmed: &Unconfirmed) -> bool {
+        unconfirmed.retry
+            && !self.disconnected
+            && self.queued.is_none()
+            && !self.snapshot.exited
+            && self.snapshot.read_only_reason.is_none()
+            && self.handle().is_some_and(|handle| {
+                std::ptr::eq(Arc::as_ptr(handle), unconfirmed.connection.as_ptr())
+            })
     }
 
     /// Whether the conversation runs a turn that a message could steer or
@@ -947,6 +1107,9 @@ impl Runtime {
         for outgoing in self.commands.outgoing_mut() {
             outgoing.prompt.presentation = prompt::LocalPresentation::default();
         }
+        for unconfirmed in &mut self.commands.unconfirmed {
+            unconfirmed.outgoing.prompt.presentation = prompt::LocalPresentation::default();
+        }
     }
 
     /// The message of the reader's on its way whose text is `source`, for
@@ -960,6 +1123,12 @@ impl Runtime {
             .map(|queued| &queued.prompt)
             .into_iter()
             .chain(self.commands.outgoing().map(|outgoing| &outgoing.prompt))
+            .chain(
+                self.commands
+                    .unconfirmed()
+                    .iter()
+                    .map(|unconfirmed| &unconfirmed.outgoing.prompt),
+            )
             .find(|prompt| source.as_ptr() == Arc::as_ptr(&prompt.source))
     }
 }
@@ -1375,6 +1544,12 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert!(runtime.commands.is_idle());
         assert_eq!(runtime.commands.outgoing().count(), 1);
+        // Taken, it is sent: however long the conversation takes to show
+        // it, it no longer reads as on its way.
+        let text = visible_text(&app, card);
+        assert!(text.iter().any(|line| line == "Sent"), "{text:?}");
+        assert!(!text.iter().any(|line| line == "Sending…"), "{text:?}");
+        let runtime = chat_runtime(&app, card);
         let mut published = (*runtime.snapshot).clone();
         published.generation += 1;
         published
@@ -1408,6 +1583,164 @@ mod tests {
         assert!(!runtime.turn_under_way());
         let text = visible_text(&app, card);
         assert!(!text.iter().any(|line| line == "Sending…"), "{text:?}");
+    }
+
+    /// A message whose outcome the provider never confirmed may still
+    /// arrive, so it stays where it was going rather than returning to the
+    /// composer to be sent twice, and holds nothing written after it up.
+    /// Sent again, it goes under the key it went with first; once the
+    /// conversation shows it, even behind a later message, it is let go.
+    #[test]
+    fn an_unconfirmed_message_stays_out_of_the_composer_and_goes_again_under_its_key() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        publish(&mut app, card, |snapshot| {
+            snapshot.capabilities.queue = true
+        });
+        let target = sending(&mut app, card, "First thought");
+        let key = chat_runtime(&app, card)
+            .commands
+            .in_flight()
+            .unwrap()
+            .delivery()
+            .expect("a message goes under a key");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("Second thought"));
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Queue))));
+        assert_eq!(chat_runtime(&app, card).commands.waiting(), 1);
+        settle(
+            &mut app,
+            card,
+            Err(chat::failure::delivery::UNACKNOWLEDGED_INPUT.into()),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.composer.text().trim().is_empty());
+        assert!(runtime.error.is_none());
+        assert_eq!(runtime.commands.unconfirmed().len(), 1);
+        let second = runtime.commands.in_flight().expect("the next one goes");
+        assert_eq!(
+            second.outgoing.as_ref().unwrap().prompt.text(),
+            "Second thought"
+        );
+        assert_ne!(second.delivery(), Some(key));
+        let text = visible_text(&app, card);
+        assert!(text.iter().any(|line| line == "First thought"), "{text:?}");
+        assert!(
+            text.iter().any(|line| line == view::UNCONFIRMED_LABEL),
+            "{text:?}"
+        );
+
+        settle(&mut app, card, Ok(()));
+        drop(app.update(Message::ChatUi(Action::RetryUnconfirmed(target, key))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.commands.unconfirmed().is_empty());
+        let again = runtime.commands.in_flight().expect("sent again");
+        assert_eq!(again.delivery(), Some(key));
+        assert!(matches!(
+            &again.message,
+            Some(Command::Prompt { text, .. }) if text == "First thought"
+        ));
+        settle(
+            &mut app,
+            card,
+            Err(chat::failure::delivery::UNACKNOWLEDGED_INPUT.into()),
+        );
+        assert_eq!(chat_runtime(&app, card).commands.unconfirmed().len(), 1);
+
+        let mut published = (*chat_runtime(&app, card).snapshot).clone();
+        published.generation += 1;
+        published.items.push(user_text("first", "First thought"));
+        published.items.push(user_text("second", "Second thought"));
+        show_chat_snapshot_for_test(&mut app, card, published);
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.commands.unconfirmed().is_empty());
+        assert!(runtime.composer.text().trim().is_empty());
+    }
+
+    /// The reader may let go of a message the provider never confirmed; it
+    /// is not put back in the composer.
+    #[test]
+    fn an_unconfirmed_message_can_be_dismissed() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = sending(&mut app, card, "Only once");
+        settle(
+            &mut app,
+            card,
+            Err(chat::failure::delivery::UNACKNOWLEDGED_INPUT.into()),
+        );
+        let key = chat_runtime(&app, card).commands.unconfirmed()[0]
+            .outgoing
+            .delivery;
+        drop(app.update(Message::ChatUi(Action::DismissUnconfirmed(target, key))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.commands.unconfirmed().is_empty());
+        assert!(runtime.commands.is_idle());
+        assert!(runtime.composer.text().trim().is_empty());
+        let text = visible_text(&app, card);
+        assert!(
+            !text.iter().any(|line| line == view::UNCONFIRMED_LABEL),
+            "{text:?}"
+        );
+    }
+
+    /// Held follow-ups sent as one message go under that message's key, and
+    /// left unconfirmed, they are in it rather than held to send again.
+    #[test]
+    fn followups_left_unconfirmed_are_not_held_to_send_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        Arc::make_mut(&mut runtime.snapshot).capabilities.queue = false;
+        runtime.replace_draft(text_editor::Content::with_text("Later"));
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Queue)));
+        assert_eq!(chat_runtime(&app, card).followups.len(), 1);
+        drop(app.dispatch_queued(target));
+        let runtime = chat_runtime(&app, card);
+        let pending = runtime
+            .commands
+            .in_flight()
+            .expect("the follow-ups go once the conversation is idle");
+        assert!(!pending.followups.is_empty());
+        assert!(pending.delivery().is_some());
+        settle(
+            &mut app,
+            card,
+            Err(chat::failure::delivery::UNACKNOWLEDGED_INPUT.into()),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.followups.is_empty());
+        assert_eq!(runtime.commands.unconfirmed().len(), 1);
+        assert!(runtime.composer.text().trim().is_empty());
+    }
+
+    /// A message the provider took for its queue, or to steer the turn,
+    /// reads as going when it said rather than as still sending, until the
+    /// provider's own listing has it.
+    #[test]
+    fn a_queued_message_the_provider_took_says_when_it_goes() {
+        for mode in [PromptMode::Steer, PromptMode::Queue] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            let snapshot = Arc::make_mut(&mut runtime.snapshot);
+            snapshot.busy = true;
+            snapshot.capabilities.steer = true;
+            snapshot.capabilities.queue = true;
+            runtime.replace_draft(text_editor::Content::with_text("And the docs"));
+            drop(app.handle_chat_ui(Action::Submit(target, mode)));
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.commands.in_flight().is_some(), "{mode:?}");
+            assert!(runtime.queue_sending(), "{mode:?}");
+            settle(&mut app, card, Ok(()));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.commands.accepted().count(), 1, "{mode:?}");
+            assert!(!runtime.queue_sending(), "{mode:?}");
+        }
     }
 
     /// Commands given while one is on its way wait behind it in order and
@@ -1506,7 +1839,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["three"]
         );
-        assert_eq!(commands.next(&snapshot).map(|(id, _)| id), Some(2));
+        assert_eq!(
+            commands.next(&snapshot).map(|dispatch| dispatch.id),
+            Some(2)
+        );
     }
 
     /// Enter, where it sends, still sends while a command is on its way: a
@@ -1961,9 +2297,10 @@ mod tests {
                 reasoning: None,
             };
             let id = commands.iter().count() as u64 + 1;
-            let (id, _) = commands
+            let id = commands
                 .push(PendingCommand::new(id, &command), command, snapshot)
-                .unwrap();
+                .unwrap()
+                .id;
             let mut pending = commands.finish(id).unwrap();
             commands.accept(&mut pending, snapshot);
         };
