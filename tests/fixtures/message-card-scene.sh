@@ -150,7 +150,7 @@ for _ in $(seq 20); do
     sleep 4
     "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
-    row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code repo moved|lane is broken' | head -1 |
+    row=$("$ne" drive observe 2>/dev/null | grep -E 'New channel|t3code repo moved|Tell the other' | head -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
     [ -n "$row" ] || continue
@@ -179,8 +179,17 @@ transcript=$(locate "$reply")
 if [ "$scene" = runs ]; then
     scroll "$transcript" -6
     shot message-runs
-    # The run with the refused message, by its status.
-    click 'not sent' || click 'Messaged 3 agents'
+    # The run with the refused message, by its status, which the screen
+    # reading may split from the rest of the row.
+    refused=$(locate 'not sent')
+    [ -n "$refused" ] || refused=$(locate 'Messaged')
+    [ -n "$refused" ] || "$ne" drive observe 2>&1 | grep -iE 'agents|sent|queued' | sed 's/^/   observed: /'
+    if [ -n "$refused" ]; then
+        "$ne" drive click "$refused" >/dev/null 2>&1 || log "click failed"
+        sleep 2
+    else
+        log "not found: the run with the refused message"
+    fi
     shot message-runs-open
     log done
     exit 0
