@@ -544,17 +544,27 @@ struct Agent {
 }
 
 impl Agent {
-    /// Whether `other` is this agent by some name of theirs, a session ID
-    /// matching any of its abbreviations.
+    /// Whether `other` is this agent: by a session or agent ID, matching
+    /// any of its abbreviations, where both know one, since sessions that
+    /// share a title are not one; otherwise by any name of theirs.
     fn is(&self, other: &Agent) -> bool {
-        self.names.iter().any(|name| {
-            other.names.iter().any(|theirs| {
-                name == theirs
-                    || is_identifier(name)
-                        && is_identifier(theirs)
-                        && (name.starts_with(theirs.as_str()) || theirs.starts_with(name.as_str()))
-            })
-        })
+        let ids = |agent: &Agent| {
+            agent
+                .names
+                .iter()
+                .filter(|name| is_identifier(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (mine, theirs) = (ids(self), ids(other));
+        if !mine.is_empty() && !theirs.is_empty() {
+            return mine.iter().any(|id| {
+                theirs
+                    .iter()
+                    .any(|their| id.starts_with(their.as_str()) || their.starts_with(id.as_str()))
+            });
+        }
+        self.names.iter().any(|name| other.names.contains(name))
     }
 }
 

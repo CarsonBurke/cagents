@@ -2904,4 +2904,39 @@ mod tests {
             turns[1].summary
         );
     }
+
+    /// Sessions that share a title, as new channels do, are told apart by
+    /// their IDs.
+    #[test]
+    fn sessions_sharing_a_title_are_each_their_own() {
+        use crate::chat::coordination::{Arrival, Receipt};
+        let cli = |session: &str| {
+            let mut reading = sent(session, "Rebase.").reading.clone();
+            reading.cli = true;
+            reading.outcome.delivery = None;
+            reading.outcome.receipt = Some(Receipt {
+                message: "4c1e".into(),
+                recipient: format!("session {session} \"New channel\""),
+                arrival: Arrival::WhenIdle,
+            });
+            Coordinated::new(reading)
+        };
+        let (first, second) = (cli("aaaa1111"), cli("bbbb2222"));
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Succeeded),
+            command("m2", ToolStatus::Succeeded),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert!(
+            turns[1].summary.starts_with("Messaged 2 agents: Rebase."),
+            "{}",
+            turns[1].summary
+        );
+    }
 }
