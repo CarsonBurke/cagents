@@ -270,18 +270,21 @@ fn presentation_replica_capture_has_one_trailing_timer_and_a_continuous_cap() {
 }
 
 #[test]
-fn unchanged_replica_publication_creates_no_snapshot_debt() {
-    let (mut app, _, _, _) = presentation_fixture();
+fn unchanged_presentation_edge_creates_no_snapshot_debt() {
+    let (mut app, source, _, pane) = presentation_fixture();
     let _directory = writer_fixture(&mut app);
     let durable = Arc::clone(&app.durable);
     let captures = app.replica_capture.captures;
     let offers = app.replica_capture.offers;
+    let saved = app.card_state(pane.id).unwrap();
+    let title = saved.title.clone();
+    let width = saved.width_fraction;
 
-    // A reconnect or repeated publication can complete without changing this
-    // window's durable state. In particular, do not call
-    // `persistent_workspace`: it may build a fresh Arc for default panes even
-    // though there is nothing for this window's database to save.
-    app.save_projected_workspace(true, |_| {});
+    // Drive the real presentation reconciliation with a newer model revision
+    // whose pane is byte-for-byte the durable one. This must not create
+    // replica debt merely because it projected or published the same state.
+    let update = presentation_edge(&app, Scope::Channel(source), 21, &title, width);
+    drop(app.update(Message::WorkspaceModelObserved(update)));
 
     assert!(Arc::ptr_eq(&durable, &app.durable));
     assert!(app.replica_capture.pending.is_none());

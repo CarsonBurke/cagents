@@ -2462,6 +2462,42 @@ fn a_conversion_of_the_last_clean_snapshot_is_never_skipped() {
 }
 
 #[test]
+fn identity_replacement_invalidates_the_last_clean_snapshot() {
+    let store = FakeStore::always(FakeWrite::Succeed);
+    let attempts = Arc::clone(&store.attempts);
+    let snapshot = Arc::new(workspace());
+    let card = snapshot.cards[0].id;
+    let CardKind::Terminal(mut replacement) = snapshot.cards[0].kind.clone() else {
+        unreachable!()
+    };
+    let expected_terminal_id = replacement.id;
+    replacement.id = TerminalId::new();
+    let mut writes = empty_writes();
+
+    writes.workspace = Some(Arc::clone(&snapshot));
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+    // This row write happens outside the ordered conversion queue. The old
+    // saved pointer cannot prove that a renewed ordinary snapshot is still
+    // present after it changes the card's identity.
+    writes.identity_replacements.insert(
+        card,
+        IdentityReplacement {
+            card_id: card,
+            expected_terminal_id,
+            replacement: Replacement::Terminal(replacement),
+        },
+    );
+    assert!(writes.flush(&store).is_empty());
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+    writes.workspace = Some(snapshot);
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+}
+
+#[test]
 fn chat_recovery_io_failure_is_acknowledged_without_a_later_retry() {
     for kind in [ChatRecoveryKind::Account, ChatRecoveryKind::Upgrade] {
         let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);

@@ -1344,6 +1344,12 @@ impl Cagents {
             self.acknowledge_view_edit(scope.clone(), Some(operation));
             self.retire_settled_empty_channels();
             self.retarget_transferred_pane_updates(None);
+            // The optimistic local edit already changed durable state before
+            // its committed edge arrives. Keep replica save debt across the
+            // following projection even when that projection has nothing left
+            // to mutate (for example, when the receipt arrives before its
+            // observer echo). A later ordinary capture can absorb this debt.
+            self.mark_replica_snapshot(std::time::Instant::now());
         }
         let projected = self.reconcile_shared_presentation(std::slice::from_ref(&scope));
         // A new view proof also wakes retained automatic names. These tails

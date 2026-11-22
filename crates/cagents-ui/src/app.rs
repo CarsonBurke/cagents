@@ -8549,10 +8549,15 @@ impl Cagents {
     /// Snapshot the active strip before publishing its exact pane projection.
     /// Shared reconciliation supplies an already projected publication pass.
     fn save_workspace_with_view_publication(&mut self, publish: impl FnOnce(&mut Self)) {
-        self.save_projected_workspace(false, publish);
+        self.save_projected_workspace(false, None, publish);
     }
 
-    fn save_projected_workspace(&mut self, replica: bool, publish: impl FnOnce(&mut Self)) {
+    fn save_projected_workspace(
+        &mut self,
+        replica: bool,
+        durable_before_replica: Option<&std::sync::Weak<WorkspaceState>>,
+        publish: impl FnOnce(&mut Self),
+    ) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -8573,11 +8578,19 @@ impl Cagents {
         let mut phase = WorkspaceProjectionTiming::new(true);
         phase.mark("save_prepare");
         let scope_changed = self.snapshot_workspace_scope();
-        let durable_before_publication = Arc::clone(&self.durable);
         phase.mark("save_scope_snapshot");
         publish(self);
         phase.mark("save_publish");
-        let publication_changed = !Arc::ptr_eq(&durable_before_publication, &self.durable);
+        // Presentation projection mutates `durable` before it reaches this
+        // trailing save. The baseline therefore belongs to the start of the
+        // projection, not to this publication closure. Keeping a Weak makes
+        // `Arc::make_mut` split a changed durable revision while avoiding an
+        // unnecessary strong snapshot of its unchanged contents.
+        let replica_changed = durable_before_replica.is_some_and(|before| {
+            before
+                .upgrade()
+                .is_none_or(|previous| !Arc::ptr_eq(&previous, &self.durable))
+        });
         // Ordered identity work needs its exact complete snapshot now. Scope
         // projection alone is not authority to coalesce these checkpoints.
         tracing::debug!(target: "cagents::workspace_pipeline", stage = "replica_snapshot_policy",
@@ -8590,7 +8603,7 @@ impl Cagents {
             && self.shared_views.restorations.is_empty()
             && self.shared_views.chat_adoptions.is_empty()
         {
-            if publication_changed {
+            if replica_changed {
                 self.mark_replica_snapshot(Instant::now());
             } else if scope_changed {
                 // The active strip changed before the publication. It is not

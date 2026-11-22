@@ -3451,6 +3451,11 @@ impl Cagents {
                 }
             }
         }
+        // A presentation pass mutates durable card metadata and strip order
+        // before its trailing save. Keep this Weak alive through that save so
+        // it can distinguish a genuine projected change from an unchanged
+        // observation without guessing from a later Arc pointer.
+        let durable_before_presentation = presentation.then(|| Arc::downgrade(&self.durable));
         self.shared_views.applying = true;
         let mut tasks = Vec::new();
         // The first authoritative snapshot of an original scope still belongs
@@ -3629,7 +3634,7 @@ impl Cagents {
         // and local/default intentions still use the ordinary publisher.
         // Held reported titles stay held: publishing them on every view
         // acknowledgment would publish each title again as its own echo.
-        self.save_projected_workspace(presentation, |app| {
+        self.save_projected_workspace(presentation, durable_before_presentation.as_ref(), |app| {
             // A complete pass discovers through what the last pass kept and
             // settles the scopes whose panes it left unchanged, rather than
             // copying and comparing every scope's panes again.

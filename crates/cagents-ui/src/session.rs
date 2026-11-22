@@ -2695,6 +2695,10 @@ impl PendingWrites {
         let mut errors = Vec::new();
         for (card_id, mut replacement) in std::mem::take(&mut self.identity_replacements) {
             self.quarantine.continue_refused(&mut replacement);
+            // This writes card rows outside the ordered conversion queue. Its
+            // result can make the database differ from a previously clean
+            // workspace snapshot, including when it refuses only this card.
+            self.invalidate_saved_workspace();
             match replacement.apply(store) {
                 Ok(()) => self.quarantine.replacement_landed(card_id),
                 Err(error) if error.refuses_content() => {
