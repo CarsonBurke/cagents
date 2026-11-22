@@ -1143,8 +1143,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits);
         let state = tree.state.downcast_mut::<State>();
+        // Copied out first: a borrow taken in the condition would live
+        // through the block, which clears the bookmark.
+        let saved = self.bookmark.as_ref().map(|bookmark| *bookmark.borrow());
         if let Some(bookmark) = &self.bookmark
-            && let saved = *bookmark.borrow()
+            && let Some(saved) = saved
             && (saved.anchor_prefix.is_some() || saved.end_prefix.is_some())
             && let Some(catalog) = self.catalog()
         {
@@ -1970,6 +1973,48 @@ mod tests {
                 prefix.len()
             );
         }
+    }
+
+    #[test]
+    fn a_saved_selection_over_changed_text_is_forgotten_at_layout() {
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
+        let catalog = |text: &str| {
+            let mut catalog = Catalog::builder();
+            catalog.plain("rewritten", &[0], Arc::from(text));
+            catalog.finish()
+        };
+        let saved = catalog("the words that were selected");
+        let (anchor, end) = saved.endpoints().unwrap();
+        let bookmark = Rc::new(RefCell::new(Bookmark {
+            anchor: Some(anchor),
+            end: Some(end),
+            anchor_prefix: saved.fingerprint(anchor),
+            end_prefix: saved.fingerprint(end),
+        }));
+        // The selection's end now falls inside different words.
+        let current = catalog("other words now stand there instead");
+        assert_ne!(current.fingerprint(end), saved.fingerprint(end));
+        let content = scroll::transcript(
+            widget::text("other words now stand there instead"),
+            target,
+            None,
+            vec![],
+            true,
+            vec![],
+        );
+        let mut element = transcript_catalogued(content, target, None, current, bookmark.clone());
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(400.0, 400.0));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let forgotten = *bookmark.borrow();
+        assert!(forgotten.anchor.is_none() && forgotten.end.is_none());
+        assert!(forgotten.anchor_prefix.is_none() && forgotten.end_prefix.is_none());
     }
 
     #[test]
