@@ -513,8 +513,18 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         // Each rendered group is prompt, contiguous tools, then prose. A tool
         // arriving after any visible prose must start another group; otherwise
         // the view would move it ahead of that earlier reasoning or narration.
-        let resumes_tools =
-            slot == Slot::Step && turns.last().is_some_and(|turn| !turn.prose.is_empty());
+        // Pictures are the exception: an image is what a step produced, such
+        // as a screenshot it read, so the next step joins the same group and
+        // its picture joins the same gallery, beneath the rows that made them.
+        let resumes_tools = slot == Slot::Step
+            && turns.last().is_some_and(|turn| {
+                turn.prose.iter().any(|placed| {
+                    !matches!(
+                        items[placed.index].borrow().content,
+                        ItemContent::Image { .. }
+                    )
+                })
+            });
         if state == Open::Closed || (state == Open::Spoke && !speech) || resumes_tools {
             turns.push(Turn::opened(items, index, false));
         }
@@ -621,7 +631,7 @@ pub(super) fn same_structure(
 /// about to stream. Reasoning with nothing to read, which is most of what
 /// Claude sends, is working time rather than a row: grouping counts its
 /// time without placing it.
-fn renders(content: &ItemContent) -> bool {
+pub(super) fn renders(content: &ItemContent) -> bool {
     match content {
         ItemContent::Text { thinking: true, .. } => !super::reasoning::contentless(content),
         ItemContent::Text { text, .. } => !text.trim().is_empty(),

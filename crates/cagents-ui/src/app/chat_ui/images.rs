@@ -5,6 +5,7 @@ mod canvas;
 pub(super) mod clipboard;
 pub(super) mod figure;
 pub(super) mod preview;
+pub(super) mod tiles;
 pub(in crate::app) use clipboard::{ImageCommand, ImageRef};
 
 // Keep the pixel lease in the decoded buffer itself: cached turns, galleries,
@@ -18,7 +19,8 @@ const ENCODED_BUDGET: usize = 64 * 1024 * 1024;
 const PIXEL_BUDGET: usize = 128 * 1024 * 1024;
 const DECODE_BUDGET: usize = 512 * 1024 * 1024;
 const MAX_DECODE_BYTES: u64 = MAX_PIXELS * 16;
-const RECENT_IMAGES: usize = 8;
+// Tiles are decoded small, so a turn's gallery stays loaded as a whole.
+pub(super) const RECENT_IMAGES: usize = 16;
 
 pub(super) struct Budget {
     encoded: Arc<tokio::sync::Semaphore>,
@@ -59,6 +61,10 @@ pub struct Pressure {
     retained: bool,
 }
 impl Pressure {
+    /// How much more of the budget the deferred read needs than is free now.
+    fn missing(&self) -> usize {
+        (self.permits as usize).saturating_sub(self.resource.available_permits())
+    }
     pub(super) async fn available(&self) {
         let permit = self.resource.clone().acquire_many_owned(self.permits).await;
         drop(permit);
@@ -77,6 +83,17 @@ impl std::hash::Hash for Pressure {
         Arc::as_ptr(&self.resource).hash(state);
         self.permits.hash(state);
         self.retained.hash(state);
+    }
+}
+#[cfg(test)]
+impl Pressure {
+    /// A read deferred for `permits` bytes of pixels, none of them free.
+    pub(in crate::app) fn on_pixels(permits: u32) -> Self {
+        Self {
+            resource: Arc::new(tokio::sync::Semaphore::new(0)),
+            permits,
+            retained: true,
+        }
     }
 }
 fn reserve(
@@ -111,10 +128,50 @@ pub(super) fn bounded_handle(bytes: Vec<u8>, budget: &Budget) -> Loaded {
     bounded_handle_size(bytes, budget, None)
 }
 fn bounded_handle_size(bytes: Vec<u8>, budget: &Budget, edge: Option<u32>) -> Loaded {
-    decode_handle(&bytes, budget, edge, chat::MAX_INLINE_IMAGE_BYTES)
+    bounded_handle_within(bytes, budget, edge.map(|edge| (edge, edge)))
+}
+fn bounded_handle_within(bytes: Vec<u8>, budget: &Budget, bound: Option<(u32, u32)>) -> Loaded {
+    decode_handle(&bytes, budget, bound, chat::MAX_INLINE_IMAGE_BYTES)
 }
 
-fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: usize) -> Loaded {
+/// How large a transcript image is decoded: as large as the place it is drawn
+/// needs on a display of up to twice the logical resolution, so a preview
+/// never holds, uploads or scales down the pixels of the whole picture. The
+/// viewer and Copy image read the whole picture again when they need it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Fit {
+    /// A tile of a gallery: [`tiles::TILE_WIDTH`] by [`tiles::TILE_HEIGHT`].
+    Tile,
+    /// A picture alone: at most [`preview::MAX_HEIGHT`] tall and as wide as
+    /// the reading column.
+    Alone,
+    /// Every pixel, for the viewer and the clipboard.
+    Full,
+}
+impl Fit {
+    fn bound(self) -> Option<(u32, u32)> {
+        let doubled = |width: f32, height: f32| Some(((width * 2.0) as u32, (height * 2.0) as u32));
+        match self {
+            Self::Tile => doubled(tiles::TILE_WIDTH, tiles::TILE_HEIGHT),
+            Self::Alone => doubled(super::layout::READING_COLUMN, preview::MAX_HEIGHT),
+            Self::Full => None,
+        }
+    }
+    /// Whether pixels of `size` were read whole at this fit: a picture
+    /// smaller than the fit on both sides was not reduced, and one that meets
+    /// it on either side may have been.
+    fn holds(self, (width, height): (u32, u32)) -> bool {
+        self.bound()
+            .is_none_or(|(most_wide, most_tall)| width < most_wide && height < most_tall)
+    }
+}
+
+fn decode_handle(
+    bytes: &[u8],
+    budget: &Budget,
+    bound: Option<(u32, u32)>,
+    max_bytes: usize,
+) -> Loaded {
     if bytes.len() > max_bytes {
         return Loaded::Unavailable;
     }
@@ -135,8 +192,11 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
     };
     // Reserve before decode so temporary budget pressure can retry without
     // repeatedly spending the two workers on full-size pixel conversion. The
-    // thumbnail never upscales and fits inside edge², even after orientation.
-    let retained_pixels = edge.map_or(pixels, |edge| pixels.min(u64::from(edge).pow(2)));
+    // thumbnail never upscales and fits inside the bound's area, even after
+    // orientation.
+    let retained_pixels = bound.map_or(pixels, |(bound_width, bound_height)| {
+        pixels.min(u64::from(bound_width) * u64::from(bound_height))
+    });
     let mut pixels = match reserve(&budget.pixels, (retained_pixels * 4) as u32, true) {
         Ok(permit) => permit,
         Err(deferred) => return deferred,
@@ -183,10 +243,10 @@ fn decode_handle(bytes: &[u8], budget: &Budget, edge: Option<u32>, max_bytes: us
     // for high-depth input. Both operations remain in the bounded worker.
     let mut decoded = image::DynamicImage::ImageRgba8(decoded.into_rgba8());
     decoded.apply_orientation(orientation);
-    let rgba = if let Some(edge) = edge
-        && (decoded.width() > edge || decoded.height() > edge)
+    let rgba = if let Some((bound_width, bound_height)) = bound
+        && (decoded.width() > bound_width || decoded.height() > bound_height)
     {
-        decoded.thumbnail(edge, edge).into_rgba8()
+        decoded.thumbnail(bound_width, bound_height).into_rgba8()
     } else {
         decoded.into_rgba8()
     };
@@ -259,7 +319,7 @@ where
     opener(url).await
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct Origin {
+pub(in crate::app) struct Origin {
     root: PathBuf,
     child: bool,
     device: Option<String>,
@@ -273,12 +333,23 @@ impl Origin {
         }
     }
 }
-fn load(item: &chat::Item, origin: &Origin) -> Loaded {
-    load_with_request(item, origin, crate::device_service::request)
+fn load(item: &chat::Item, origin: &Origin, fit: Fit) -> Loaded {
+    load_fit_with_request(item, origin, fit, crate::device_service::request)
 }
+#[cfg(test)]
 fn load_with_request(
     item: &chat::Item,
     origin: &Origin,
+    request: impl FnOnce(
+        crate::device_service::Operation,
+    ) -> Result<crate::device_service::Reply, String>,
+) -> Loaded {
+    load_fit_with_request(item, origin, Fit::Full, request)
+}
+fn load_fit_with_request(
+    item: &chat::Item,
+    origin: &Origin,
+    fit: Fit,
     request: impl FnOnce(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
@@ -290,7 +361,7 @@ fn load_with_request(
         return Loaded::Unavailable;
     };
     if let Some(reference) = reference {
-        return managed_with_request(reference, origin.device.is_some(), None, request);
+        return managed_with_request(reference, origin.device.is_some(), fit.bound(), request);
     }
     if path.starts_with("data:image/") {
         let bytes = (path.len() <= chat::MAX_INLINE_IMAGE_URL_BYTES)
@@ -301,19 +372,22 @@ fn load_with_request(
                     .decode(encoded)
                     .ok()
             });
-        return bytes.map_or(Loaded::Unavailable, |bytes| bounded_handle(bytes, budget()));
+        return bytes.map_or(Loaded::Unavailable, |bytes| {
+            bounded_handle_within(bytes, budget(), fit.bound())
+        });
     }
-    load_file_with_request(Path::new(path), origin, request)
+    load_file_with_request(Path::new(path), origin, fit, request)
 }
 fn load_file_with_request(
     path: &Path,
     origin: &Origin,
+    fit: Fit,
     request: impl FnOnce(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
 ) -> Loaded {
     match file_bytes_with_request(path, origin, request) {
-        Ok(bytes) => match bounded_handle(bytes, budget()) {
+        Ok(bytes) => match bounded_handle_within(bytes, budget(), fit.bound()) {
             Loaded::Unavailable => Loaded::Failed(format!(
                 "Cannot preview {path:?} on {}: unsupported, damaged or oversized image.",
                 origin.device.as_deref().unwrap_or("this device")
@@ -407,8 +481,10 @@ pub(in crate::app) async fn file_preview(
             "Cannot preview {description}: an absolute device path is required."
         ));
     }
-    match worker(move || load_file_with_request(&path, &origin, crate::device_service::request))
-        .await
+    match worker(move || {
+        load_file_with_request(&path, &origin, Fit::Full, crate::device_service::request)
+    })
+    .await
     {
         Loaded::Ready(handle) => Ok(handle),
         Loaded::Failed(error) => Err(error),
@@ -425,7 +501,7 @@ pub(in crate::app) async fn file_preview(
 fn managed_with_request(
     reference: &chat::ImageReference,
     remote: bool,
-    edge: Option<u32>,
+    bound: Option<(u32, u32)>,
     request: impl FnOnce(
         crate::device_service::Operation,
     ) -> Result<crate::device_service::Reply, String>,
@@ -443,7 +519,7 @@ fn managed_with_request(
         chat::attachment_assets::read(reference, crate::device_service::MAX_DEVICE_IMAGE_BYTES)
     };
     match bytes {
-        Ok(bytes) => match bounded_handle_size(bytes, budget(), edge) {
+        Ok(bytes) => match bounded_handle_within(bytes, budget(), bound) {
             Loaded::Unavailable => Loaded::Failed(format!(
                 "Cannot preview {}: unsupported, damaged, or larger than the 16 MiB preview limit.",
                 reference.label()
@@ -460,7 +536,7 @@ pub(super) fn managed_thumbnail(reference: &chat::ImageReference) -> Loaded {
     managed_with_request(
         reference,
         crate::device::is_remote(),
-        Some(128),
+        Some((128, 128)),
         crate::device_service::request,
     )
 }
@@ -478,6 +554,7 @@ pub(super) struct Source {
     target: Target,
     origin: Origin,
     item: Arc<chat::Item>,
+    fit: Fit,
     attempt: u64,
     wait: Option<Pressure>,
 }
@@ -486,6 +563,7 @@ impl PartialEq for Source {
         self.target == other.target
             && self.origin == other.origin
             && Arc::ptr_eq(&self.item, &other.item)
+            && self.fit == other.fit
             && self.attempt == other.attempt
             && self.wait == other.wait
     }
@@ -497,6 +575,7 @@ impl std::hash::Hash for Source {
         self.target.hash(state);
         self.origin.hash(state);
         Arc::as_ptr(&self.item).hash(state);
+        self.fit.hash(state);
         self.attempt.hash(state);
         self.wait.hash(state);
     }
@@ -508,7 +587,7 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = Message> 
             pressure.available().await;
         }
         let item = source.item.clone();
-        let loaded = worker(move || load(&item, &source.origin)).await;
+        let loaded = worker(move || load(&item, &source.origin, source.fit)).await;
         action(Action::ImageLoaded(
             source.target,
             source.item,
@@ -567,7 +646,7 @@ pub(super) fn validate_attachment(
     match decode_handle(
         bytes,
         budget(),
-        Some(1),
+        Some((1, 1)),
         chat::attachment_assets::MAX_IMAGE_BYTES as usize,
     ) {
         Loaded::Ready(_) => Ok(format),
@@ -617,17 +696,22 @@ fn interest(runtime: &Runtime) -> Vec<&Arc<chat::Item>> {
         .preview_request
         .as_deref()
         .and_then(|id| items(runtime).iter().find(|item| item.id == id));
-    requested
+    // The requested picture's gallery comes next, in its own order.
+    let gallery = requested.into_iter().flat_map(|_| {
+        items(runtime)
+            .iter()
+            .filter(|item| runtime.preview_gallery.contains(&item.id))
+    });
+    let explicit: Vec<_> = requested.into_iter().chain(gallery).collect();
+    let recent = recent(runtime)
         .into_iter()
-        .chain(
-            recent(runtime)
-                .into_iter()
-                .filter(|item| requested.is_none_or(|requested| requested.id != item.id)),
-        )
-        .collect()
+        .filter(|item| !explicit.iter().any(|chosen| chosen.id == item.id));
+    explicit.iter().copied().chain(recent).collect()
 }
 fn retire(cached: &mut CachedItem, evicted: bool) {
     cached.image = None;
+    cached.image_fit = None;
+    cached.image_whole = false;
     cached.image_source = None;
     cached.image_wait = None;
     cached.image_evicted = evicted;
@@ -658,9 +742,12 @@ pub(super) fn sync(runtime: &mut Runtime) {
     {
         runtime.preview_request = None;
     }
-    let interested: HashSet<_> = interest(runtime)
+    if runtime.preview_request.is_none() {
+        runtime.preview_gallery.clear();
+    }
+    let fits: HashMap<_, _> = interest(runtime)
         .into_iter()
-        .map(|item| item.id.clone())
+        .map(|item| (item.id.clone(), runtime.image_fit(&item.id)))
         .collect();
     let parent = runtime.selected_subagent.is_none();
     for (active, id, cached) in runtime
@@ -677,9 +764,29 @@ pub(super) fn sync(runtime: &mut Runtime) {
         if cached.image_item.is_none() && cached.image_source.is_none() && cached.image.is_none() {
             continue;
         }
-        if !active || !interested.contains(id) {
+        let Some(&fit) = fits.get(id).filter(|_| active) else {
             retire(cached, false);
-        } else if cached.image.is_none()
+            continue;
+        };
+        // A read started before any fit was chosen is at the size of a
+        // picture alone, as `subscriptions` reads it.
+        let read_at = cached.image_fit.replace(fit).unwrap_or(Fit::Alone);
+        // A small picture already read whole is the same at any fit it fits.
+        let kept = cached.image_source.is_none()
+            && cached.image_whole
+            && cached.image_size.is_some_and(|size| fit.holds(size));
+        if read_at != fit && !kept {
+            // A picture joined by another becomes a tile, and one left alone
+            // grows back: read it again at its new size, showing the old
+            // pixels until the new ones arrive.
+            if cached.image.is_some() || cached.image_source.is_some() {
+                cached.image_source = cached.image_item.clone();
+                cached.image_wait = None;
+                cached.image_attempt = cached.image_attempt.wrapping_add(1);
+                continue;
+            }
+        }
+        if cached.image.is_none()
             && cached.image_source.is_none()
             && !cached.image_unavailable
             && !cached.image_evicted
@@ -707,6 +814,31 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
         return;
     }
     runtime.preview_request = Some(id.to_owned());
+    // At most as many beside it as the newest pictures, nearest first.
+    let gallery: Vec<String> = {
+        let run = runtime.image_run(id);
+        let at = run.iter().position(|item| item.id == id).unwrap_or(0);
+        let mut nearest: Vec<_> = run
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != at)
+            .collect();
+        nearest.sort_by_key(|(index, _)| index.abs_diff(at));
+        nearest
+            .into_iter()
+            .take(RECENT_IMAGES)
+            .map(|(_, item)| item.id.clone())
+            .collect()
+    };
+    for member in &gallery {
+        // Pictures set aside for newer ones are wanted again.
+        if let Some(cached) = runtime.presentation_cache_mut().get_mut(member)
+            && cached.image.is_none()
+        {
+            cached.image_evicted = false;
+        }
+    }
+    runtime.preview_gallery = gallery;
     if let Some(cached) = runtime.presentation_cache_mut().get_mut(id) {
         cached.image_item = Some(item.clone());
         if cached.image.is_none() {
@@ -782,8 +914,16 @@ pub(super) fn complete(
     }
     let explicit = runtime.preview_request.as_deref() == Some(item.id.as_str());
     if let Loaded::Deferred(pressure) = loaded {
-        let mut missing =
-            (pressure.permits as usize).saturating_sub(pressure.resource.available_permits());
+        if cached.image.is_some() {
+            // Reading a shown picture again at another size waits for the
+            // memory without displacing anything; the pixels it has are
+            // still the right picture meanwhile.
+            let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
+            cached.image_wait = Some(pressure);
+            cached.image_attempt = cached.image_attempt.wrapping_add(1);
+            return None;
+        }
+        let mut missing = pressure.missing();
         let mut evicted = false;
         if pressure.retained {
             for id in order[priority + 1..].iter().rev() {
@@ -828,6 +968,8 @@ pub(super) fn complete(
         _ => None,
     };
     cached.image_size = cached.image.as_ref().and_then(pixel_size);
+    let fit = cached.image_fit.unwrap_or(Fit::Alone);
+    cached.image_whole = cached.image_size.is_some_and(|size| fit.holds(size));
     sync_viewer(runtime);
     None
 }
@@ -848,6 +990,7 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
                     target: runtime.target,
                     origin: Origin::of(runtime),
                     item: source.clone(),
+                    fit: cached.image_fit.unwrap_or(Fit::Alone),
                     attempt: cached.image_attempt,
                     wait: cached.image_wait.clone(),
                 },
@@ -863,20 +1006,30 @@ struct Entry {
     managed: bool,
     path: String,
     label: String,
-    handle: iced::widget::image::Handle,
+    /// The transcript's preview, drawn until the whole picture is read.
+    preview: Option<iced::widget::image::Handle>,
+    /// Every pixel, read while the entry is shown.
+    full: Option<iced::widget::image::Handle>,
+    /// Why the whole picture could not be read.
+    error: Option<String>,
+    /// The item the whole picture is read from; a device file is opened
+    /// whole already.
+    source: Option<Arc<chat::Item>>,
 }
 impl Entry {
-    /// The viewer's entry for transcript `item`, if it is an image whose
-    /// pixels are decoded.
-    fn decoded(runtime: &Runtime, item: &chat::Item) -> Option<Self> {
+    /// The viewer's entry for `item`, the picture at `position` of its
+    /// gallery, borrowing the transcript's preview of it. A preview already
+    /// holding every pixel is not read again.
+    fn of(runtime: &Runtime, item: &Arc<chat::Item>, position: usize) -> Option<Self> {
         let ItemContent::Image {
-            path,
-            description,
-            reference,
+            path, reference, ..
         } = &item.content
         else {
             return None;
         };
+        let cached = runtime.presentation_cache().get(&item.id);
+        let preview = cached.and_then(|cached| cached.image.clone());
+        let whole = preview.is_some() && cached.is_some_and(|cached| cached.image_whole);
         Some(Self {
             id: item.id.clone(),
             managed: reference.is_some(),
@@ -892,12 +1045,11 @@ impl Entry {
                     .to_string_lossy()
                     .into_owned()
             },
-            label: if description.is_empty() {
-                "Image".into()
-            } else {
-                description.clone()
-            },
-            handle: runtime.presentation_cache().get(&item.id)?.image.clone()?,
+            label: tiles::label(&item.content, position + 1),
+            full: preview.clone().filter(|_| whole),
+            preview,
+            error: None,
+            source: (!whole).then(|| item.clone()),
         })
     }
     /// The entry's literal file path, for Copy image path. Managed snapshot
@@ -907,6 +1059,10 @@ impl Entry {
             return None;
         }
         clipboard::local_file(&self.path).map(|path| path.to_string_lossy().into_owned())
+    }
+    /// The pixels drawn for the entry now.
+    fn shown(&self) -> Option<&iced::widget::image::Handle> {
+        self.full.as_ref().or(self.preview.as_ref())
     }
 }
 pub(in crate::app) struct Gallery {
@@ -921,6 +1077,12 @@ pub(in crate::app) struct Gallery {
     /// Whether the images are the transcript's own, which [`Self::refresh`]
     /// keeps up with, rather than one file a figure or device opened.
     from_transcript: bool,
+    /// Where the conversation's pictures are read from.
+    origin: Option<Origin>,
+    /// Tells this gallery's reads from those of one opened before it.
+    serial: u64,
+    /// The read of the shown entry's whole picture, stopped with the gallery.
+    reading: Option<iced::task::Handle>,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -937,21 +1099,44 @@ impl Gallery {
                     .map(|url| url.to_string())
                     .unwrap_or_default(),
                 label: format!("{} · {}", device.unwrap_or("This device"), path.display()),
-                handle,
+                preview: None,
+                full: Some(handle),
+                error: None,
+                source: None,
             }],
             selected: 0,
             remote: device.is_some(),
             reset: 0,
             transcript: None,
             from_transcript: false,
+            origin: None,
+            serial: 0,
+            reading: None,
         }
     }
+    /// The gallery the picture `id` names is drawn in, opened at it. Its
+    /// pictures are the ones beside it in the transcript, which is what the
+    /// reader means by "the next one".
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
-        let entries: Vec<_> = Self::transcript(runtime)?
+        let pictures = runtime.image_run(id);
+        let selected = pictures.iter().position(|item| item.id == id)?;
+        Self::of(runtime, &pictures, selected)
+    }
+    /// The viewer over `pictures`, a gallery of the transcript, opened at the
+    /// one at `selected`. Every way of opening a transcript picture comes here.
+    pub(super) fn of(
+        runtime: &Runtime,
+        pictures: &[&Arc<chat::Item>],
+        selected: usize,
+    ) -> Option<Self> {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = &pictures.get(selected)?.id;
+        let entries: Vec<_> = pictures
             .iter()
-            .filter_map(|item| Entry::decoded(runtime, item))
+            .enumerate()
+            .filter_map(|(position, item)| Entry::of(runtime, item, position))
             .collect();
-        let selected = entries.iter().position(|entry| entry.id == id)?;
+        let selected = entries.iter().position(|entry| entry.id == *id)?;
         Some(Self {
             entries,
             selected,
@@ -959,6 +1144,9 @@ impl Gallery {
             reset: 0,
             transcript: runtime.selected_subagent.clone(),
             from_transcript: true,
+            origin: Some(Origin::of(runtime)),
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            reading: None,
         })
     }
     /// The items of the transcript `runtime` shows, `None` when the selected
@@ -976,66 +1164,162 @@ impl Gallery {
             None => &runtime.snapshot.items,
         })
     }
-    /// Brings a viewer of the transcript's images up to date with it, so an
-    /// image that arrives or finishes decoding while it is open, such as one
-    /// a question sent from it brought, can be browsed to.
+    /// Brings a viewer of the transcript's pictures up to date with it, so a
+    /// picture that joins the gallery while it is open, such as one more a
+    /// streaming Read returns, can be browsed to.
     ///
-    /// The other images are the transcript's decoded ones, borrowing its
-    /// pixels, so the viewer holds no more than the transcript does beyond
-    /// the image it shows. That one keeps its pixels and zoom, and stays
-    /// first once the transcript no longer holds it, as when newer items
-    /// page it out: the transcript under the viewer only moves on.
+    /// The other pictures borrow the transcript's previews, so the viewer
+    /// holds no more than the transcript does beyond the picture it shows:
+    /// one the transcript let go is read again whole when it is shown. The
+    /// shown picture keeps its pixels and zoom, and its place in its gallery
+    /// once newer items page it out of the transcript.
     fn refresh(&mut self, runtime: &Runtime) {
         if !self.from_transcript {
             return;
         }
-        let Some(items) = Self::transcript(runtime) else {
+        if Self::transcript(runtime).is_none() {
             return;
-        };
-        let mut kept: Vec<_> = std::mem::take(&mut self.entries)
+        }
+        let mut old: Vec<_> = std::mem::take(&mut self.entries)
             .into_iter()
             .map(Some)
             .collect();
-        let mut shown = kept.swap_remove(self.selected);
-        let mut entries = Vec::with_capacity(kept.len() + 1);
-        for item in items.iter() {
-            if shown.as_ref().is_some_and(|entry| entry.id == item.id) {
-                self.selected = entries.len();
-                entries.extend(shown.take());
-                continue;
+        let mut shown = old[self.selected].take();
+        let id = shown
+            .as_ref()
+            .map(|entry| entry.id.clone())
+            .unwrap_or_default();
+        let mut entries = Vec::with_capacity(old.len());
+        let run = runtime.image_run(&id);
+        if run.is_empty() {
+            // The shown picture was paged out of the transcript. It keeps its
+            // place among what remains of its gallery, which still takes the
+            // pictures that join it.
+            let rest = old
+                .iter()
+                .flatten()
+                .map(|entry| runtime.image_run(&entry.id))
+                .find(|run| !run.is_empty())
+                .unwrap_or_default();
+            let before = rest
+                .iter()
+                .filter(|item| {
+                    old[..self.selected]
+                        .iter()
+                        .flatten()
+                        .any(|entry| entry.id == item.id)
+                })
+                .count();
+            for (index, item) in rest.into_iter().enumerate() {
+                if index == before {
+                    self.selected = entries.len();
+                    entries.extend(shown.take());
+                }
+                entries.extend(Entry::of(runtime, item, entries.len()));
             }
-            let Some(pixels) = runtime
-                .presentation_cache()
-                .get(&item.id)
-                .and_then(|cached| cached.image.as_ref())
-            else {
-                continue;
-            };
-            // An unchanged image moves over as it is, rather than rebuilt
-            // with each snapshot.
-            let same = kept.iter_mut().find(|entry| {
-                entry
-                    .as_ref()
-                    .is_some_and(|entry| entry.id == item.id && entry.handle.id() == pixels.id())
-            });
-            entries.extend(
-                same.and_then(Option::take)
-                    .or_else(|| Entry::decoded(runtime, item)),
-            );
-        }
-        if let Some(shown) = shown {
-            self.selected = 0;
-            entries.insert(0, shown);
+            if let Some(entry) = shown.take() {
+                self.selected = entries.len();
+                entries.push(entry);
+            }
+        } else {
+            for (position, item) in run.into_iter().enumerate() {
+                if item.id == id {
+                    self.selected = entries.len();
+                    let mut entry = shown.take();
+                    // A picture shown while it was still decoding takes the
+                    // transcript's preview once there is one, and keeps its
+                    // place and any whole read under way.
+                    if let Some(entry) = entry.as_mut().filter(|entry| entry.preview.is_none())
+                        && let Some(fresh) = Entry::of(runtime, item, position)
+                    {
+                        entry.preview = fresh.preview;
+                        entry.full = entry.full.take().or(fresh.full);
+                    }
+                    entries.extend(entry);
+                } else {
+                    entries.extend(Entry::of(runtime, item, position));
+                }
+            }
         }
         self.entries = entries;
     }
-    pub(in crate::app) fn next(&mut self, forward: bool) {
+    /// Read the whole of the shown picture, unless it is already. The viewer
+    /// `host` shows is told when it is, or, the first time, that the read
+    /// waits for memory, so previews can make room for it.
+    pub(in crate::app) fn read(&mut self, host: ViewerHost) -> Task<Message> {
+        self.read_whole(host, false)
+    }
+    fn read_whole(&mut self, host: ViewerHost, patient: bool) -> Task<Message> {
+        let entry = &self.entries[self.selected];
+        let (Some(item), Some(origin), None, None) =
+            (&entry.source, &self.origin, &entry.full, &entry.error)
+        else {
+            return Task::none();
+        };
+        let (item, origin, serial, id) =
+            (item.clone(), origin.clone(), self.serial, entry.id.clone());
+        let (task, handle) = cosmic::task::future(async move {
+            let loaded = loop {
+                let (item, origin) = (item.clone(), origin.clone());
+                match worker(move || load(&item, &origin, Fit::Full)).await {
+                    // Once previews have made what room they can, the reader
+                    // asked for it, so it waits for the rest.
+                    Loaded::Deferred(pressure) if patient => pressure.available().await,
+                    loaded => break loaded,
+                }
+            };
+            action(Action::ViewerLoaded(host, serial, id, loaded))
+        })
+        .abortable();
+        self.reading = Some(handle.abort_on_drop());
+        task
+    }
+    /// The serial and entry a read for the shown picture reports with.
+    #[cfg(test)]
+    pub(in crate::app) fn awaiting(&self) -> (u64, String) {
+        (self.serial, self.entries[self.selected].id.clone())
+    }
+    /// Whether the read of the entry `id`, as this gallery opened `serial`,
+    /// is for the picture it shows now: one it has moved on from is not kept.
+    fn awaits(&self, serial: u64, id: &str) -> bool {
+        serial == self.serial && self.entries[self.selected].id == id
+    }
+    /// The whole picture of the entry `id`, read for this gallery.
+    pub(in crate::app) fn loaded(&mut self, serial: u64, id: &str, loaded: Loaded) {
+        if !self.awaits(serial, id) {
+            return;
+        }
+        let entry = &mut self.entries[self.selected];
+        match loaded {
+            Loaded::Ready(handle) => entry.full = Some(handle),
+            Loaded::Failed(error) => entry.error = Some(error),
+            Loaded::Unavailable | Loaded::Deferred(_) => {
+                entry.error = Some("This image could not be read at full size.".into());
+            }
+        }
+    }
+    /// The shown picture's place in the gallery and how many it holds, as
+    /// the toolbar counts them from one.
+    #[cfg(test)]
+    pub(in crate::app) fn position(&self) -> (usize, usize) {
+        (self.selected + 1, self.entries.len())
+    }
+    pub(in crate::app) fn next(&mut self, host: ViewerHost, forward: bool) -> Task<Message> {
+        // Only the shown picture is held whole, unless it is all there is.
+        let entry = &mut self.entries[self.selected];
+        if entry.source.is_some() {
+            entry.full = None;
+        }
+        self.reading = None;
         self.selected = if forward {
             (self.selected + 1) % self.entries.len()
         } else {
             (self.selected + self.entries.len() - 1) % self.entries.len()
         };
         self.reset = self.reset.wrapping_add(1);
+        // A picture that could not be read is tried again on return.
+        self.entries[self.selected].error = None;
+        self.read(host)
     }
     pub(super) fn url(&self) -> Option<Url> {
         self.entry_url(&self.entries[self.selected])
@@ -1057,21 +1341,37 @@ impl Gallery {
             })
         }
     }
-    /// The pixels the viewer shows now; Ctrl+C copies these.
-    pub(in crate::app) fn selected_image(&self, host: ViewerHost) -> ImageRef {
-        ImageRef::Viewer(host, self.entries[self.selected].handle.id())
+    /// The pixels the viewer `host` shows now, which Ctrl+C copies; none
+    /// while the picture is still being read.
+    pub(in crate::app) fn selected_image(&self, host: ViewerHost) -> Option<ImageRef> {
+        self.entries[self.selected]
+            .shown()
+            .map(|handle| ImageRef::Viewer(host, handle.id()))
     }
     /// The viewer entry drawn with `image`, if it is still the one shown. A
-    /// menu left open across navigation must not act on another image.
+    /// menu left open across navigation must not act on another image; one
+    /// opened on the preview acts on the same picture once it is whole.
     pub(in crate::app) fn resolve(
         &self,
         image: iced::advanced::image::Id,
     ) -> Option<clipboard::Resolved> {
-        let entry =
-            Some(&self.entries[self.selected]).filter(|entry| entry.handle.id() == image)?;
+        let entry = &self.entries[self.selected];
+        let drawn = [&entry.preview, &entry.full]
+            .into_iter()
+            .flatten()
+            .any(|handle| handle.id() == image);
+        if !drawn {
+            return None;
+        }
         Some(clipboard::Resolved {
             item: None,
-            handle: entry.handle.clone(),
+            handle: entry.shown()?.clone(),
+            // Copy reads the whole picture again unless it is shown whole.
+            source: entry
+                .full
+                .is_none()
+                .then(|| entry.source.clone().zip(self.origin.clone()))
+                .flatten(),
             path: entry.file_path(),
             url: self.entry_url(entry),
         })
@@ -1147,7 +1447,9 @@ impl Gallery {
     /// commands by icon and tooltip, so a narrow pane keeps all of them.
     fn parts(&self, host: ViewerHost, compact: bool) -> [Element<'_, Message>; 4] {
         let entry = &self.entries[self.selected];
-        let image = ImageRef::Viewer(host, entry.handle.id());
+        let image = entry
+            .shown()
+            .map(|handle| ImageRef::Viewer(host, handle.id()));
         let navigation = self.entries.len() > 1;
         let command = |glyph: Icon,
                        label: &'static str,
@@ -1187,7 +1489,7 @@ impl Gallery {
                 Icon::Copy,
                 "Copy",
                 "Copy image (Ctrl+C)",
-                Some(Action::Image(image, ImageCommand::Copy)),
+                image.map(|image| Action::Image(image, ImageCommand::Copy)),
             ),
             command(
                 Icon::Compress,
@@ -1210,24 +1512,43 @@ impl Gallery {
         ])
         .spacing(step::GAP_S)
         .align_y(iced::Alignment::Center);
-        let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(entry.handle.clone())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(iced::ContentFit::Contain)
-            .min_scale(0.1)
-            .max_scale(20.0)
-            .into();
-        let canvas = crate::interaction::context_menu(
-            canvas::resettable(self.reset, viewer),
-            clipboard::menu(
-                image,
-                entry.file_path().is_some(),
-                self.entry_url(entry).is_some(),
-            ),
-        );
+        let canvas: Element<'_, Message> = match (entry.shown(), image) {
+            (Some(handle), Some(image)) => {
+                let viewer: Element<'_, Message> = iced::widget::image::Viewer::new(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Contain)
+                    .min_scale(0.1)
+                    .max_scale(20.0)
+                    .into();
+                crate::interaction::context_menu(
+                    canvas::resettable(self.reset, viewer),
+                    clipboard::menu(
+                        image,
+                        entry.file_path().is_some(),
+                        self.entry_url(entry).is_some(),
+                    ),
+                )
+            }
+            _ => widget::container(design::caption(
+                entry.error.as_deref().unwrap_or("Loading image…"),
+            ))
+            .center(Length::Fill)
+            .into(),
+        };
+        let label: Element<'_, Message> = match (&entry.error, &entry.full, &entry.preview) {
+            (Some(error), _, Some(_)) => {
+                design::caption(format!("{} · {error}", entry.label)).into()
+            }
+            // The transcript's smaller preview stands in meanwhile.
+            (None, None, Some(_)) if entry.source.is_some() => {
+                design::caption(format!("{} · Loading full size…", entry.label)).into()
+            }
+            _ => design::caption(entry.label.as_str()).into(),
+        };
         [
             toolbar.into(),
-            design::caption(entry.label.as_str()).into(),
+            label,
             canvas,
             design::caption(if self.entries.len() > 1 {
                 "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
@@ -1283,13 +1604,14 @@ impl Cagents {
         match *action {
             Action::OpenImage(target, ref id) => {
                 let runtime = self.chat_runtime_mut(target)?;
-                let Some(gallery) = Gallery::new(runtime, id) else {
+                let Some(mut gallery) = Gallery::new(runtime, id) else {
                     return Some(Task::none());
                 };
+                let read = gallery.read(ViewerHost::Pane(target));
                 runtime.image_viewer = Some(gallery);
                 // The keyboard moves to the viewer, as a press on the image
                 // would leave it, unless the pane doesn't hold it.
-                Some(self.focus_image_viewer(target))
+                Some(Task::batch([read, self.focus_image_viewer(target)]))
             }
             Action::FocusImage(target) => Some(self.focus_image_viewer(target)),
             Action::CloseImage(host) => {
@@ -1313,15 +1635,58 @@ impl Cagents {
                 Some(Task::none())
             }
             Action::ImageNext(host, forward) => {
-                if let Some(gallery) = self.image_viewer_mut(host) {
-                    gallery.next(forward);
-                }
+                let read = self
+                    .image_viewer_mut(host)
+                    .map_or_else(Task::none, |gallery| gallery.next(host, forward));
                 // The image it moves off keeps its own pixels only while
                 // shown: one the transcript has let go leaves the viewer now.
                 if let ViewerHost::Pane(target) = host
                     && let Some(runtime) = self.chat_runtime_mut(target)
                 {
                     sync_viewer(runtime);
+                }
+                Some(read)
+            }
+            // The reader asked for the whole picture, so, like a preview they
+            // asked for, it outranks the previews transcripts read on their
+            // own: theirs go, the pane's own last, until it fits.
+            Action::ViewerLoaded(host, serial, ref id, Loaded::Deferred(ref pressure)) => {
+                if !self
+                    .image_viewer(host)
+                    .is_some_and(|gallery| gallery.awaits(serial, id))
+                {
+                    return Some(Task::none());
+                }
+                if pressure.retained {
+                    let own = match host {
+                        ViewerHost::Pane(target) => Some(target),
+                        ViewerHost::Dialog => None,
+                    };
+                    let mut missing = pressure.missing();
+                    let mut panes: Vec<_> = self
+                        .cards
+                        .values_mut()
+                        .filter_map(|card| match card {
+                            CardRuntime::Chat(runtime) => Some(runtime),
+                            _ => None,
+                        })
+                        .collect();
+                    panes.sort_by_key(|runtime| Some(runtime.target) == own);
+                    for runtime in panes {
+                        if missing == 0 {
+                            break;
+                        }
+                        missing = evict_ready(runtime, missing);
+                    }
+                }
+                Some(
+                    self.image_viewer_mut(host)
+                        .map_or_else(Task::none, |gallery| gallery.read_whole(host, true)),
+                )
+            }
+            Action::ViewerLoaded(host, serial, ref id, ref loaded) => {
+                if let Some(gallery) = self.image_viewer_mut(host) {
+                    gallery.loaded(serial, id, loaded.clone());
                 }
                 Some(Task::none())
             }
@@ -1331,15 +1696,17 @@ impl Cagents {
                 }
                 Some(Task::none())
             }
-            Action::ImageExternal(host) => Some(
-                match self
-                    .image_viewer(host)
-                    .map(|gallery| gallery.selected_image(host))
-                {
-                    Some(image) => self.image_command(image, ImageCommand::OpenExternally),
+            // The file opens elsewhere whether or not its pixels decoded
+            // here: one too large to show is exactly the one to open
+            // externally.
+            Action::ImageExternal(host) => {
+                Some(match self.image_viewer(host).and_then(Gallery::url) {
+                    Some(url) => cosmic::task::future(async move {
+                        Message::ExternalLinkOpened(open_external(url).await)
+                    }),
                     None => Task::none(),
-                },
-            ),
+                })
+            }
             _ => None,
         }
     }
@@ -1399,12 +1766,11 @@ impl Cagents {
                 Projection::Full,
             )),
             Key::Named(direction @ (Named::ArrowLeft | Named::ArrowRight)) if plain => {
-                drop(self.image_viewer_action(&Action::ImageNext(
-                    host,
-                    *direction == Named::ArrowRight,
-                )));
+                let read = self
+                    .image_viewer_action(&Action::ImageNext(host, *direction == Named::ArrowRight))
+                    .unwrap_or_else(Task::none);
                 // Stepping through the gallery changes only the viewer.
-                Some((Task::none(), Projection::Unchanged))
+                Some((read, Projection::Unchanged))
             }
             // Layout-independent, like the other Ctrl chords.
             Key::Character(_)
@@ -1420,10 +1786,14 @@ impl Cagents {
                 if *repeat {
                     return Some((Task::none(), Projection::Unchanged));
                 }
-                Some((
-                    self.image_command(image, ImageCommand::Copy),
-                    Projection::Full,
-                ))
+                // Nothing is copied while the picture is still being read.
+                Some(match image {
+                    Some(image) => (
+                        self.image_command(image, ImageCommand::Copy),
+                        Projection::Full,
+                    ),
+                    None => (Task::none(), Projection::Unchanged),
+                })
             }
             _ => None,
         }
@@ -1440,20 +1810,23 @@ impl Runtime {
             ItemContent::Image { description, .. } if !description.is_empty() => {
                 description.clone()
             }
-            _ => "Image".into(),
+            content => tiles::file_name(content).unwrap_or("Image").to_owned(),
         };
         let Some(handle) = &cached.image else {
-            // A preview whose pixels are being read again keeps its room, so
-            // returning to the conversation doesn't shift it as they arrive.
+            // A preview whose pixels are being read again keeps its room, and
+            // says so inside it, so returning to the conversation doesn't
+            // shift it as they arrive.
             let room = |note: &str| -> Element<'static, Message> {
-                let caption = design::caption(format!("{label} · {note}")).into();
+                let caption = design::caption(format!("{label} · {note}"));
                 match cached.image_size {
-                    Some((width, height)) => {
-                        widget::column::with_children(vec![preview::room(width, height), caption])
-                            .spacing(step::GAP_XS)
-                            .into()
-                    }
-                    None => caption,
+                    Some((width, height)) => widget::container(iced::widget::stack![
+                        preview::room(width, height),
+                        widget::container(caption).center(Length::Fill),
+                    ])
+                    // Where the loaded picture's highlight ring is.
+                    .padding(tiles::INSET)
+                    .into(),
+                    None => caption.into(),
                 }
             };
             return if cached.image_unavailable {
@@ -1486,18 +1859,19 @@ impl Runtime {
         let preview = preview::image(handle.clone());
         let image = ImageRef::Transcript(self.target, handle.id());
         let path = clipboard::has_copyable_path(self, &item.content);
-        widget::column::with_children(vec![
-            crate::interaction::context_menu_lazy(
-                widget::button::custom(preview)
-                    .class(crate::ui_controls::control_style(false, None))
-                    .padding(0)
-                    .on_press(action(Action::OpenImage(self.target, item.id.clone()))),
-                move || clipboard::menu(image, path, false),
-            ),
-            design::caption(format!("{label} · Click to enlarge")).into(),
-        ])
-        .spacing(step::GAP_XS)
-        .into()
+        // The picture is the control that opens it: it highlights under the
+        // pointer and when focused, and says what it is when lingered on.
+        let button = crate::interaction::a11y_target(
+            widget::button::custom(preview)
+                .name(label.clone())
+                .class(crate::ui_controls::control_style(false, None))
+                .padding(tiles::INSET)
+                .on_press(action(Action::OpenImage(self.target, item.id.clone()))),
+        );
+        crate::interaction::context_menu_lazy(
+            crate::interaction::tooltip(button, label),
+            move || clipboard::menu(image, path, false),
+        )
     }
 }
 
@@ -1694,13 +2068,18 @@ mod tests {
             child: false,
             device: Some("FW16 fixture".into()),
         };
-        let Loaded::Ready(handle) = load_file_with_request(&path, &origin, |operation| {
-            assert!(
-                matches!(operation, crate::device_service::Operation::ReadImage { root, path: sent }
+        let Loaded::Ready(handle) = load_file_with_request(
+            &path,
+            &origin,
+            Fit::Full,
+            |operation| {
+                assert!(
+                    matches!(operation, crate::device_service::Operation::ReadImage { root, path: sent }
                 if root == Path::new("/") && sent == path)
-            );
-            Ok(crate::device_service::Reply::Image(remote))
-        }) else {
+                );
+                Ok(crate::device_service::Reply::Image(remote))
+            },
+        ) else {
             panic!("real remote PNG should decode")
         };
         let iced::widget::image::Handle::Rgba { pixels, .. } = &handle else {
@@ -1760,12 +2139,12 @@ mod tests {
             Loaded::Failed(error) if error.contains("child conversation's working directory"))
         );
         assert!(matches!(
-            load(&image_item("../image.png".into()), &origin),
+            load(&image_item("../image.png".into()), &origin, Fit::Full),
             Loaded::Ready(_)
         ));
         for path in ["docs/image-*.png", "docs/image-{a,b}.png"] {
             assert!(matches!(
-                load(&image_item(path.into()), &origin),
+                load(&image_item(path.into()), &origin, Fit::Full),
                 Loaded::Failed(_)
             ));
         }
@@ -2142,7 +2521,14 @@ mod tests {
             managed: false,
             path: format!("/fixture/{id}.png"),
             label: id.into(),
-            handle: iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]),
+            preview: None,
+            full: Some(iced::widget::image::Handle::from_rgba(
+                1,
+                1,
+                vec![0, 0, 0, 255],
+            )),
+            error: None,
+            source: None,
         };
         let mut gallery = Gallery {
             entries: vec![entry("a"), entry("b")],
@@ -2151,11 +2537,14 @@ mod tests {
             reset: 0,
             transcript: None,
             from_transcript: false,
+            origin: None,
+            serial: 1,
+            reading: None,
         };
-        gallery.next(false);
+        drop(gallery.next(ViewerHost::Dialog, false));
         assert_eq!(gallery.selected, 1);
         assert_eq!(gallery.reset, 1);
-        gallery.next(true);
+        drop(gallery.next(ViewerHost::Dialog, true));
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
         gallery.remote = true;
@@ -2163,5 +2552,56 @@ mod tests {
             gallery.url().is_none(),
             "a remote path must never open a local file URL"
         );
+    }
+    #[test]
+    fn the_viewer_keeps_only_the_shown_pictures_whole_read() {
+        let pixels = || iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+        let entry = |id: &str| Entry {
+            id: id.into(),
+            managed: false,
+            path: format!("/fixture/{id}.png"),
+            label: id.into(),
+            preview: Some(pixels()),
+            full: None,
+            error: None,
+            source: Some(Arc::new(chat::Item {
+                id: id.into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Image {
+                    path: format!("/fixture/{id}.png"),
+                    description: String::new(),
+                    reference: None,
+                },
+                started_at: None,
+                at: None,
+            })),
+        };
+        let mut gallery = Gallery {
+            entries: vec![entry("a"), entry("b")],
+            selected: 0,
+            remote: false,
+            reset: 0,
+            transcript: None,
+            from_transcript: false,
+            origin: None,
+            serial: 7,
+            reading: None,
+        };
+        // A read the viewer has moved on from, or one for an earlier viewer,
+        // is not kept.
+        gallery.loaded(7, "b", Loaded::Ready(pixels()));
+        gallery.loaded(6, "a", Loaded::Ready(pixels()));
+        assert!(gallery.entries.iter().all(|entry| entry.full.is_none()));
+        gallery.loaded(7, "a", Loaded::Failed("gone".into()));
+        assert_eq!(gallery.entries[0].error.as_deref(), Some("gone"));
+        // Browsing away and back tries a failed picture again.
+        drop(gallery.next(ViewerHost::Dialog, true));
+        drop(gallery.next(ViewerHost::Dialog, false));
+        assert_eq!(gallery.entries[0].error, None);
+        gallery.loaded(7, "a", Loaded::Ready(pixels()));
+        assert!(gallery.entries[0].full.is_some());
+        // Only the shown picture is held whole.
+        drop(gallery.next(ViewerHost::Dialog, true));
+        assert!(gallery.entries[0].full.is_none());
     }
 }

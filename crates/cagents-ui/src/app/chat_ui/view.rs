@@ -305,6 +305,13 @@ enum TurnPart {
     /// An answer, a thought, an image or a step the grouping did not
     /// recognize, at this position of the exchange's prose.
     Prose(usize),
+    /// Pictures one after another, drawn as one gallery: `len` of them from
+    /// position `start` of the exchange's prompt, or of its prose.
+    Gallery {
+        prompt: bool,
+        start: usize,
+        len: usize,
+    },
 }
 
 /// Where one item of an exchange is drawn.
@@ -316,6 +323,19 @@ enum Placement<'a> {
     /// An item that draws no row of its own: a delivery or message still
     /// being prepared, or a step shown as a failure rather than on the strip.
     Unplaced(&'a chat::Item),
+}
+
+/// About how tall a gallery of `pictures` is in a column `content_width`
+/// wide, before it is drawn; the reader's own are within their bubble.
+fn gallery_height(pictures: &[&chat::Item], content_width: f32, from_reader: bool) -> f32 {
+    if from_reader {
+        images::tiles::height(
+            pictures,
+            content_width.min(PROMPT_MEASURE) - 2.0 * step::GAP_M,
+        ) + 2.0 * step::GAP_S
+    } else {
+        images::tiles::height(pictures, content_width)
+    }
 }
 
 /// The bubble a user's message is drawn in: the accent wash, or an outline
@@ -2724,6 +2744,17 @@ impl Runtime {
             cached.shows_figures().then(|| self.figures.version()),
         )
             .hash(&mut revision);
+        // A picture is drawn again as its pixels are read, or given up on.
+        if matches!(item.content, ItemContent::Image { .. }) {
+            (
+                cached.image.as_ref().map(iced::widget::image::Handle::id),
+                cached.image_source.is_some(),
+                cached.image_wait.is_some(),
+                cached.image_unavailable,
+                self.preview_request.as_deref() == Some(item.id.as_str()),
+            )
+                .hash(&mut revision);
+        }
         if item.content.is_step() {
             disclosure::item_duration_ms(item, now)
                 .map(|millis| millis / 1_000)
@@ -2930,7 +2961,13 @@ impl Runtime {
                         .push(self.failure_view_with_reset(incident, reset_controls.as_ref()));
                 }
             }
+            let mut gallery_rest = 0;
             for (index, item) in agent.items.iter().enumerate() {
+                // Drawn already, as a tile of the gallery before it.
+                if gallery_rest > 0 {
+                    gallery_rest -= 1;
+                    continue;
+                }
                 if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
                     if first {
                         transcript.push(
@@ -2949,6 +2986,63 @@ impl Runtime {
                 // As in the lead's transcript, a thought with nothing to
                 // read is working time, not a row.
                 if reasoning::contentless(&item.content) {
+                    continue;
+                }
+                let run = images::tiles::run_length(
+                    agent.items[index..]
+                        .iter()
+                        .map(|next| self.tiled_from(next, item.role)),
+                );
+                if run > 1 {
+                    use std::hash::{Hash, Hasher};
+                    let pictures: Vec<&chat::Item> = agent.items[index..index + run]
+                        .iter()
+                        .map(|item| &**item)
+                        .collect();
+                    let from_reader = item.role == chat::Role::User;
+                    let mut key = std::hash::DefaultHasher::new();
+                    ("selected-child-gallery", &item.id).hash(&mut key);
+                    let mut revision = std::hash::DefaultHasher::new();
+                    let mut aliases = Vec::with_capacity(2 * run);
+                    for (offset, picture) in pictures.iter().enumerate() {
+                        picture.id.hash(&mut revision);
+                        if let Some(cached) = self.child_cache.get(&picture.id) {
+                            self.child_item_revision(
+                                agent,
+                                index + offset,
+                                picture,
+                                cached,
+                                dark,
+                                None,
+                            )
+                            .hash(&mut revision);
+                        }
+                        aliases.push(scroll::item_id(&picture.id));
+                        aliases.push(self.find_anchor(&picture.id));
+                    }
+                    transcript.lazy(
+                        key.finish(),
+                        revision.finish(),
+                        gallery_height(&pictures, content_width, from_reader),
+                        aliases,
+                        // The reader's pictures open an exchange, as their
+                        // message would; the subagent's are blocks of its work.
+                        Some(if from_reader {
+                            Rhythm::Opening
+                        } else {
+                            Rhythm::Block
+                        }),
+                        0.0,
+                        move || {
+                            scroll::item(
+                                &item.id,
+                                widget::container(self.gallery_view(&pictures, from_reader))
+                                    .id(self.find_anchor(&item.id))
+                                    .width(Length::Fill),
+                            )
+                        },
+                    );
+                    gallery_rest = run - 1;
                     continue;
                 }
                 // Drawn by delivery_view, as in the main transcript.
@@ -5307,6 +5401,14 @@ impl Runtime {
                     };
                     (Some(item), footer)
                 }
+                TurnPart::Gallery { .. } => {
+                    aliases.extend(
+                        self.turn_gallery(turn, part)
+                            .iter()
+                            .map(|item| scroll::item_id(&item.id)),
+                    );
+                    (None, 0.0)
+                }
             };
             // An exchange the reader or another agent opened is set apart
             // from the one before it. Every other row is spaced by what it
@@ -5323,14 +5425,19 @@ impl Runtime {
                 _ if rows == 0 && !turn.prompt.is_empty() => Rhythm::Opening,
                 TurnPart::Prompt(_) => Rhythm::Block,
                 TurnPart::Steps | TurnPart::Card(_) => Rhythm::Line,
+                // Pictures are read as a whole, as one image is.
+                TurnPart::Gallery { .. } => Rhythm::Block,
                 TurnPart::Prose(prose) => {
                     let placed = &turn.prose[prose];
                     Rhythm::of(&items[placed.index], placed.slot, false)
                 }
             };
-            let estimate = item.map_or(TIMELINE_ROW, |item| {
-                row_estimate(item, rhythm, footer, content_width)
-            });
+            let estimate = match (part, item) {
+                // Its tiles' room is known before any picture arrives.
+                (TurnPart::Gallery { .. }, _) => self.gallery_estimate(turn, part, content_width),
+                (_, Some(item)) => row_estimate(item, rhythm, footer, content_width),
+                (_, None) => TIMELINE_ROW,
+            };
             rows += 1;
             let fingerprint = self.turn_part_fingerprint(turn, part, key, cached, &common, now);
             transcript.lazy(
@@ -5493,7 +5600,27 @@ impl Runtime {
     /// draw none of their own.
     fn for_each_turn_part<'a>(&'a self, turn: &turn::Turn, mut visit: impl FnMut(Placement<'a>)) {
         let items = &self.snapshot.items;
-        for &index in &turn.prompt {
+        let gallery = |indices: &mut dyn Iterator<Item = usize>| {
+            images::tiles::run_length(
+                indices.map(|index| items.get(index).is_some_and(|item| self.tiled(item))),
+            )
+        };
+        let mut position = 0;
+        while let Some(&index) = turn.prompt.get(position) {
+            let len = gallery(&mut turn.prompt[position..].iter().copied());
+            if len > 1 {
+                visit(Placement::Row(
+                    TurnPart::Gallery {
+                        prompt: true,
+                        start: position,
+                        len,
+                    },
+                    None,
+                ));
+                position += len;
+                continue;
+            }
+            position += 1;
             let Some(item) = items.get(index) else {
                 continue;
             };
@@ -5517,7 +5644,23 @@ impl Runtime {
         } else {
             steps().for_each(|item| visit(Placement::Unplaced(item)));
         }
-        for (position, placed) in turn.prose.iter().enumerate() {
+        let mut position = 0;
+        while let Some(placed) = turn.prose.get(position) {
+            let len = gallery(&mut turn.prose[position..].iter().map(|placed| placed.index));
+            if len > 1 {
+                visit(Placement::Row(
+                    TurnPart::Gallery {
+                        prompt: false,
+                        start: position,
+                        len,
+                    },
+                    None,
+                ));
+                position += len;
+                continue;
+            }
+            let at = position;
+            position += 1;
             let Some(item) = items.get(placed.index) else {
                 continue;
             };
@@ -5528,9 +5671,9 @@ impl Runtime {
                 Some(prepared)
                     if placed.slot == turn::Slot::Card && prepared.coordination.is_some() =>
                 {
-                    Placement::Row(TurnPart::Card(position), cached)
+                    Placement::Row(TurnPart::Card(at), cached)
                 }
-                Some(_) => Placement::Row(TurnPart::Prose(position), cached),
+                Some(_) => Placement::Row(TurnPart::Prose(at), cached),
                 None => Placement::Unplaced(item),
             });
         }
@@ -5547,6 +5690,11 @@ impl Runtime {
             TurnPart::Card(prose) | TurnPart::Prose(prose) => {
                 (3u8, &self.snapshot.items[turn.prose[prose].index].id).hash(&mut key)
             }
+            TurnPart::Gallery { .. } => (
+                4u8,
+                self.turn_gallery(turn, part).first().map(|item| &item.id),
+            )
+                .hash(&mut key),
         }
         key.finish()
     }
@@ -5643,6 +5791,17 @@ impl Runtime {
                 2u8.hash(&mut hasher);
                 let placed = &turn.prose[prose];
                 self.hash_turn_item(placed.index, cached, Some(placed.slot), now, &mut hasher)
+            }
+            TurnPart::Gallery { .. } => {
+                3u8.hash(&mut hasher);
+                for index in Self::turn_gallery_indices(turn, part) {
+                    let Some(item) = self.snapshot.items.get(index) else {
+                        continue;
+                    };
+                    item.id.hash(&mut hasher);
+                    self.hash_turn_item(index, self.cache.get(&item.id), None, now, &mut hasher);
+                }
+                false
             }
         };
         if coordinating {
@@ -5900,7 +6059,61 @@ impl Runtime {
                 };
                 scroll::item(&item.id, body)
             }
+            TurnPart::Gallery { prompt, .. } => {
+                let pictures = self.turn_gallery(turn, part);
+                scroll::item(&pictures[0].id, self.gallery_view(&pictures, prompt))
+            }
         }
+    }
+
+    /// About how tall a gallery row of `turn` is in a column `content_width`
+    /// wide, before it is drawn.
+    fn gallery_estimate(&self, turn: &turn::Turn, part: TurnPart, content_width: f32) -> f32 {
+        let from_reader = matches!(part, TurnPart::Gallery { prompt: true, .. });
+        gallery_height(&self.turn_gallery(turn, part), content_width, from_reader)
+    }
+
+    /// `pictures`, one after another from one sender, as one gallery. The
+    /// reader's own are in the bubble one alone would have, on their side.
+    fn gallery_view(
+        &self,
+        pictures: &[&chat::Item],
+        from_reader: bool,
+    ) -> Element<'static, Message> {
+        let gallery = self.image_tiles(pictures);
+        if from_reader {
+            widget::container(user_bubble(gallery, true, false))
+                .align_x(Alignment::End)
+                .width(Length::Fill)
+                .into()
+        } else {
+            gallery
+        }
+    }
+
+    /// The snapshot indices of the pictures a gallery row of `turn` draws, in
+    /// order.
+    fn turn_gallery_indices(turn: &turn::Turn, part: TurnPart) -> Vec<usize> {
+        let TurnPart::Gallery { prompt, start, len } = part else {
+            return Vec::new();
+        };
+        if prompt {
+            turn.prompt[start..start + len].to_vec()
+        } else {
+            turn.prose[start..start + len]
+                .iter()
+                .map(|placed| placed.index)
+                .collect()
+        }
+    }
+
+    /// The pictures a gallery row of `turn` draws, in order.
+    fn turn_gallery<'a>(&'a self, turn: &turn::Turn, part: TurnPart) -> Vec<&'a chat::Item> {
+        let items = &self.snapshot.items;
+        Self::turn_gallery_indices(turn, part)
+            .into_iter()
+            .filter_map(|index| items.get(index).map(|item| &**item))
+            .collect()
     }
 
     /// What to call an attachment the reader just sent.
@@ -7891,6 +8104,8 @@ mod frame_cost;
 #[cfg(test)]
 mod issue1506_tests;
 
+#[cfg(test)]
+mod gallery_tests;
 #[cfg(test)]
 mod user_image_preview_tests;
 

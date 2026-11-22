@@ -471,6 +471,9 @@ pub enum Action {
     FocusImage(Target),
     CloseImage(images::ViewerHost),
     ImageNext(images::ViewerHost, bool),
+    /// The whole picture the viewer the host shows, opened as the given
+    /// serial, read for the entry the string names.
+    ViewerLoaded(images::ViewerHost, u64, String, images::Loaded),
     ImageFit(images::ViewerHost),
     ImageExternal(images::ViewerHost),
     /// A context menu, viewer control or shortcut acting on displayed pixels.
@@ -921,6 +924,7 @@ impl Action {
             Self::FocusImage(..) => "FocusImage",
             Self::CloseImage(..) => "CloseImage",
             Self::ImageNext(..) => "ImageNext",
+            Self::ViewerLoaded(..) => "ViewerLoaded",
             Self::ImageFit(..) => "ImageFit",
             Self::ImageExternal(..) => "ImageExternal",
             Self::Image(..) => "Image",
@@ -1066,6 +1070,8 @@ impl Action {
                 | Self::ImageFit(images::ViewerHost::Dialog)
                 | Self::ImageExternal(images::ViewerHost::Dialog)
                 | Self::Image(images::ImageRef::Viewer(images::ViewerHost::Dialog, _), _)
+                // A read finishing is no input, so it lands in any viewer.
+                | Self::ViewerLoaded(..)
                 | Self::ImageCopied(..)
         )
     }
@@ -1999,6 +2005,12 @@ struct CachedItem {
     image_attempt: u64,
     image_wait: Option<images::Pressure>,
     image_evicted: bool,
+    /// The size the preview is read at, which is where it is drawn: alone,
+    /// or as a tile beside other pictures.
+    image_fit: Option<images::Fit>,
+    /// Whether the preview's pixels are the whole picture, which fitted the
+    /// size it was read at, so copying it needs no second read.
+    image_whole: bool,
     /// The decoded preview's pixel size, kept after its pixels are released
     /// so the preview's room is held while they are read again.
     image_size: Option<(u32, u32)>,
@@ -2180,6 +2192,8 @@ impl CachedItem {
             cached.image_attempt = previous.image_attempt;
             cached.image_wait = previous.image_wait.clone();
             cached.image_evicted = previous.image_evicted;
+            cached.image_fit = previous.image_fit;
+            cached.image_whole = previous.image_whole;
             cached.image_size = previous.image_size;
         }
         cached
@@ -2332,6 +2346,8 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_fit,
+            image_whole,
             image_size,
         ) = previous
             .as_ref()
@@ -2346,6 +2362,8 @@ impl CachedItem {
                     cached.image_attempt,
                     cached.image_wait.clone(),
                     cached.image_evicted,
+                    cached.image_fit,
+                    cached.image_whole,
                     cached.image_size,
                 )
             })
@@ -2494,6 +2512,8 @@ impl CachedItem {
             image_attempt,
             image_wait,
             image_evicted,
+            image_fit,
+            image_whole,
             image_size,
             coordination: coordination
                 .map(|prepared| Box::new(coordination::Coordinated::from_prepared(prepared)))
@@ -3282,6 +3302,9 @@ pub(super) struct Runtime {
     last_presented_tail: Option<(String, ChangeToken)>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
+    /// The rest of the requested preview's gallery, read with it so a tile
+    /// in an older gallery loads the gallery rather than one tile at a time.
+    preview_gallery: Vec<String>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
     /// How the conversation's pull request links read, from what the window
@@ -4565,6 +4588,7 @@ impl Runtime {
             presentation_evicted: false,
             last_presented_tail: None,
             preview_request: None,
+            preview_gallery: Vec::new(),
             syntax_theme,
             pull_request_labels: Arc::default(),
             pull_request_inspected: Default::default(),
@@ -15737,6 +15761,7 @@ impl Cagents {
             | Action::FocusImage(_)
             | Action::CloseImage(_)
             | Action::ImageNext(..)
+            | Action::ViewerLoaded(..)
             | Action::ImageFit(_)
             | Action::ImageExternal(_) => {
                 return self.image_viewer_action(&action).unwrap_or_else(Task::none);

@@ -8,8 +8,9 @@ use crate::app::dialog_ui::tests::{key_control, key_press};
 use images::{Gallery, ViewerHost, viewer_focus};
 use keyboard::key::Named;
 
-/// Shows `count` more decoded images in `runtime`'s transcript, returning
-/// their item ids and the pixels each is drawn with.
+/// Shows `count` more decoded images in `runtime`'s transcript, after any it
+/// shows already and so in the same gallery, returning their item ids and the
+/// pixels each is drawn with.
 fn show_images(runtime: &mut Runtime, count: u8) -> Vec<(String, iced::advanced::image::Id)> {
     let shown = runtime
         .snapshot
@@ -17,7 +18,7 @@ fn show_images(runtime: &mut Runtime, count: u8) -> Vec<(String, iced::advanced:
         .iter()
         .filter(|item| matches!(item.content, ItemContent::Image { .. }))
         .count() as u8;
-    (shown..shown + count)
+    let images = (shown..shown + count)
         .map(|index| {
             let id = format!("image-{index}");
             let content = ItemContent::Image {
@@ -26,21 +27,26 @@ fn show_images(runtime: &mut Runtime, count: u8) -> Vec<(String, iced::advanced:
                 reference: None,
             };
             let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![index, 0, 0, 255]);
+            let item = Arc::new(chat::Item {
+                id: id.clone(),
+                role: chat::Role::Assistant,
+                started_at: None,
+                at: None,
+                content: content.clone(),
+            });
+            // Decoded for its item, as a read leaves it, so a snapshot that
+            // carries the item over keeps its pixels.
             let mut cached = CachedItem::new(&content, runtime.syntax_theme);
             cached.image = Some(handle.clone());
+            cached.image_item = Some(item.clone());
             runtime.cache.insert(id.clone(), cached);
-            Arc::make_mut(&mut runtime.snapshot)
-                .items
-                .push(Arc::new(chat::Item {
-                    id: id.clone(),
-                    role: chat::Role::Assistant,
-                    started_at: None,
-                    at: None,
-                    content,
-                }));
+            Arc::make_mut(&mut runtime.snapshot).items.push(item);
             (id, handle.id())
         })
-        .collect()
+        .collect();
+    // As a snapshot regroups them, so a gallery holds its pictures.
+    runtime.turns = runtime.transcript_turns(&runtime.snapshot).into();
+    images
 }
 
 /// A focused live conversation, shown on screen, with two images, the first
@@ -62,7 +68,7 @@ fn viewing(app: &mut Cagents) -> (CardId, Target, Vec<(String, iced::advanced::i
 fn shown(app: &Cagents, target: Target) -> Option<images::ImageRef> {
     let host = ViewerHost::Pane(target);
     app.image_viewer(host)
-        .map(|gallery| gallery.selected_image(host))
+        .and_then(|gallery| gallery.selected_image(host))
 }
 
 fn press(
@@ -277,19 +283,20 @@ fn sending_and_new_activity_leave_the_viewer_open() {
         Some(images::ImageRef::Viewer(host, images[1].1))
     );
 
-    // An image in the reply joins the viewer once it is decoded, so it can be
-    // browsed to without closing it; the shown image stays.
+    // An image in the reply is another gallery's: the shown image stays, and
+    // the viewer still browses its own.
     let runtime = app.chat_runtime_mut(target).unwrap();
-    let arrived = show_images(runtime, 1).pop().unwrap();
+    let (_, arrived) = show_images(runtime, 1).pop().unwrap();
     images::sync(runtime);
     assert_eq!(
         shown(&app, target),
         Some(images::ImageRef::Viewer(host, images[1].1))
     );
     named(&mut app, Named::ArrowRight, false);
-    assert_eq!(
+    assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
+    assert_ne!(
         shown(&app, target),
-        Some(images::ImageRef::Viewer(host, arrived.1))
+        Some(images::ImageRef::Viewer(host, arrived))
     );
 }
 
@@ -351,7 +358,9 @@ fn step(app: &mut Cagents, target: Target, steps: usize) -> Option<images::Image
 }
 
 /// A reply's image usually finishes decoding after the snapshot that brought
-/// it, and joins the open viewer then.
+/// it. It joins the open viewer's gallery at once, so the count and the steps
+/// don't change under the reader, and shows as loading until its pixels
+/// arrive, then shows them in the same place.
 #[test]
 fn an_image_decoded_after_its_snapshot_joins_the_viewer() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -366,11 +375,14 @@ fn an_image_decoded_after_its_snapshot_joins_the_viewer() {
     cached.image_item = Some(item.clone());
     images::sync(runtime);
     let attempt = runtime.cache[&id].image_attempt;
+    let position = |app: &Cagents| app.image_viewer(host).unwrap().position();
+    assert_eq!(position(&app), (1, 3), "it joins while still decoding");
     assert_eq!(
         step(&mut app, target, 2),
-        Some(images::ImageRef::Viewer(host, images[0].1)),
-        "an image still decoding can't be shown yet"
+        None,
+        "it is browsed to, and shows as loading"
     );
+    assert_eq!(position(&app), (3, 3));
 
     let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![9, 0, 0, 255]);
     let decoded = handle.id();
@@ -382,18 +394,21 @@ fn an_image_decoded_after_its_snapshot_joins_the_viewer() {
     )));
     assert_eq!(
         shown(&app, target),
-        Some(images::ImageRef::Viewer(host, images[0].1))
+        Some(images::ImageRef::Viewer(host, decoded)),
+        "its pixels show once decoded"
     );
+    assert_eq!(position(&app), (3, 3), "in the same place");
     assert_eq!(
-        step(&mut app, target, 2),
-        Some(images::ImageRef::Viewer(host, decoded))
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, images[0].1))
     );
 }
 
 /// The viewer holds the pixels of the image it shows, even once newer items
 /// page it out of the transcript, and borrows the rest from the transcript:
-/// an image the transcript lets go leaves the viewer too, as does a paged-out
-/// one once the viewer moves off it.
+/// a paged-out image leaves the viewer once it moves off it, and one whose
+/// pixels the transcript let go holds none in the viewer either, until it is
+/// shown and read again whole.
 #[test]
 fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -404,11 +419,17 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     Arc::make_mut(&mut runtime.snapshot)
         .items
         .retain(|item| item.id != images[0].0);
+    runtime.turns = runtime.transcript_turns(&runtime.snapshot).into();
     images::sync(runtime);
     assert_eq!(
         shown(&app, target),
         Some(images::ImageRef::Viewer(host, images[0].1)),
         "the paged-out image stays shown"
+    );
+    assert_eq!(
+        app.image_viewer(host).unwrap().position(),
+        (1, 3),
+        "in its place"
     );
     assert_eq!(
         step(&mut app, target, 2),
@@ -432,9 +453,10 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     );
     assert_eq!(
         step(&mut app, target, 1),
-        Some(images::ImageRef::Viewer(host, arrived)),
-        "the image the transcript let go is gone from the viewer"
+        None,
+        "the image the transcript let go has no pixels in the viewer"
     );
+    assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
 }
 
 /// Pixels the transcript sheds, under memory pressure, once its pane is
@@ -442,16 +464,26 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
 /// only the image it shows.
 #[test]
 fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
-    let shed: [fn(&mut Runtime); 3] = [
-        |runtime| assert_eq!(images::evict_ready(runtime, usize::MAX), usize::MAX - 8),
-        Runtime::release_transcript_caches,
+    // Each shed, and the gallery the viewer steps through after it, with
+    // the place it steps to.
+    let shed: [(fn(&mut Runtime), (usize, usize)); 3] = [
+        (
+            |runtime| assert_eq!(images::evict_ready(runtime, usize::MAX), usize::MAX - 8),
+            (2, 2),
+        ),
+        // Released caches hold no grouping either, so until the pane shows
+        // again the viewer holds just the picture it shows.
+        (Runtime::release_transcript_caches, (1, 1)),
         // A hidden pane's transcript wants no images.
-        |runtime| {
-            runtime.visible.store(false, Ordering::Relaxed);
-            images::sync(runtime);
-        },
+        (
+            |runtime| {
+                runtime.visible.store(false, Ordering::Relaxed);
+                images::sync(runtime);
+            },
+            (2, 2),
+        ),
     ];
-    for shed in shed {
+    for (shed, place) in shed {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (_, target, images) = viewing(&mut app);
         let host = ViewerHost::Pane(target);
@@ -459,14 +491,52 @@ fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
         let gallery = app.image_viewer(host).unwrap();
         assert_eq!(
             gallery.selected_image(host),
-            images::ImageRef::Viewer(host, images[0].1)
+            Some(images::ImageRef::Viewer(host, images[0].1))
         );
-        assert_eq!(
-            step(&mut app, target, 1),
-            Some(images::ImageRef::Viewer(host, images[0].1)),
-            "the image the viewer doesn't show is gone from it"
-        );
+        let stepped = step(&mut app, target, 1);
+        assert_eq!(app.image_viewer(host).unwrap().position(), place);
+        // The image the viewer didn't show has no pixels in it: stepping
+        // to it shows none until it is read again, and stepping round a
+        // gallery of one keeps the one shown.
+        let expected = (place.1 == 1).then(|| images::ImageRef::Viewer(host, images[0].1));
+        assert_eq!(stepped, expected);
     }
+}
+
+/// A whole picture the reader opened outranks the previews transcripts read
+/// on their own: when memory is short, other panes' previews make room for
+/// it before the viewer's own pane's.
+#[test]
+fn a_whole_picture_waiting_for_memory_displaces_other_panes_previews_first() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let other = live_chat(&mut app, Some("other"));
+    let other_target = chat_runtime(&app, other).target;
+    let runtime = app.chat_runtime_mut(other_target).unwrap();
+    runtime.visible.store(true, Ordering::Relaxed);
+    let (elsewhere, _) = show_images(runtime, 1).pop().unwrap();
+    let (_, target, images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    let (serial, id) = app.image_viewer(host).unwrap().awaiting();
+    // One 1x1 preview's pixels.
+    drop(app.update(Message::ChatUi(Action::ViewerLoaded(
+        host,
+        serial,
+        id,
+        images::Loaded::Deferred(images::Pressure::on_pixels(4)),
+    ))));
+    assert!(
+        chat_runtime(&app, other).cache[&elsewhere].image.is_none(),
+        "the other pane's preview made room"
+    );
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    for (id, _) in &images {
+        assert!(runtime.cache[id].image.is_some(), "{id} stays in its pane");
+    }
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, images[0].1)),
+        "the preview shows while the whole picture waits"
+    );
 }
 
 /// The shown image keeps its pixels through memory pressure only while it is
@@ -492,9 +562,10 @@ fn stepping_off_an_evicted_image_lets_its_pixels_go() {
     );
     assert_eq!(
         step(&mut app, target, 1),
-        Some(images::ImageRef::Viewer(host, images[1].1)),
-        "the evicted image left as the viewer moved off it"
+        None,
+        "the evicted image's pixels left as the viewer moved off it"
     );
+    assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
 }
 
 #[test]
@@ -743,5 +814,40 @@ fn the_toolbar_clears_the_inspector_toggle() {
     assert!(
         toolbar.x + toolbar.width <= row_end + 0.5,
         "the toolbar {toolbar:?} reaches under the toggle at {row_end}"
+    );
+}
+
+/// The viewer browses the gallery the reader opened, not every picture of the
+/// transcript: one that arrives after more of the reply's text is another
+/// gallery's, and stays out of it.
+#[test]
+fn a_picture_of_another_gallery_stays_out_of_the_viewer() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    Arc::make_mut(&mut runtime.snapshot)
+        .items
+        .push(Arc::new(chat::Item {
+            id: "between".into(),
+            role: chat::Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "And here is another view:".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+        }));
+    show_images(runtime, 1);
+    images::sync(runtime);
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, images[1].1))
+    );
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, images[0].1)),
+        "the next picture after the gallery's last is its first again"
     );
 }
