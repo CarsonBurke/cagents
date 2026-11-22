@@ -1478,11 +1478,12 @@ fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting
     snapshot.finished_at = Some(42);
     assert_eq!(runtime.conversation_status(false).1, "Finished");
     // A turn the person stopped says so in the words of its stopped step
-    // and marker, with the marker's glyph.
+    // and marker, with the marker's still glyph rather than the Stop
+    // control's, since nothing failed.
     Arc::make_mut(&mut runtime.snapshot).detail = chat::TURN_INTERRUPTED.into();
     assert_eq!(
         runtime.conversation_status(false),
-        (Some(Icon::Stop), "Stopped".to_owned())
+        (Some(Icon::Ended), "Stopped".to_owned())
     );
     Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
     assert_eq!(runtime.conversation_status(false).1, "Failed");
@@ -1669,7 +1670,11 @@ fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a
     assert_eq!(picker.filter, child_navigation::Filter::Failed);
     assert_eq!(
         picker
-            .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
+            .rows(
+                &runtime.snapshot.subagents,
+                &runtime.child_ordinals,
+                &runtime.agent_work,
+            )
             .len(),
         2
     );
@@ -2233,7 +2238,7 @@ fn an_agent_on_its_background_work_is_reported_without_asking_for_the_user() {
     let mut child = native_child_fixture();
     child.status = chat::ToolStatus::Waiting;
     assert_eq!(
-        Runtime::native_child_status(&child),
+        runtime.native_child_status(&child),
         "Waiting on background work"
     );
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
@@ -2295,7 +2300,7 @@ fn native_child_identity_uses_its_reported_model_and_waiting_state() {
     assert!(report.contains("psql gave connection refused"));
     assert!(!report.contains("connection was interrupted"));
     child.status = chat::ToolStatus::Succeeded;
-    assert_eq!(Runtime::native_child_status(&child), "Finished");
+    assert_eq!(runtime.native_child_status(&child), "Finished");
 }
 
 /// A Claude agent stopped by its account's usage limit says so on its own
@@ -8201,6 +8206,258 @@ fn report_outcomes_require_a_canonical_task_heading() {
     ] {
         assert_eq!(delivery_report_outcome("", heading), None);
     }
+}
+
+/// An agent's report or notice says how the agent stands now, as its row and
+/// tab do, so that one saying it finished never sits beside a row saying it
+/// still waits; and only a failed agent's is marked as an error.
+#[test]
+fn an_agents_report_says_how_the_agent_stands_now() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let mut agent = native_child_fixture();
+    agent.id = "toolu_review".into();
+    agent.status = chat::ToolStatus::Waiting;
+    agent.items = vec![
+        chat::Item {
+            id: "check".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Command {
+                label: "Run the restart check".into(),
+                command: "scripts/restart-check".into(),
+                working_directory: String::new(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+            started_at: None,
+            at: None,
+        }
+        .into(),
+    ];
+    Arc::make_mut(&mut runtime.snapshot).subagents = vec![agent];
+    runtime.agent_work.observe(&runtime.snapshot.subagents);
+    // The notice names the agent by the task ID its provider gave it.
+    runtime.agent_addresses = Arc::new([("a-review".to_owned(), "toolu_review".to_owned())].into());
+    let heading = "Agent \"Review restart safety\" finished\nThe check is still running.";
+    let first = heading.lines().next().unwrap();
+    let read = |runtime: &Runtime, kind, sender: &str| {
+        runtime.delivery_outcome(kind, false, false, "", sender, first, heading)
+    };
+    for kind in [chat::DeliveryKind::Notice, chat::DeliveryKind::Report] {
+        let waiting = read(&runtime, kind, "a-review");
+        assert_eq!(waiting.title, "Agent \"Review restart safety\"");
+        assert_eq!(
+            waiting.outcome.as_deref(),
+            Some("waiting on scripts/restart-check")
+        );
+        assert!(!waiting.failed);
+        // Its tooltip and accessible name keep what the report said.
+        assert_eq!(
+            waiting.heading,
+            "Agent \"Review restart safety\" reported finished · now waiting on \
+             scripts/restart-check\nThe check is still running."
+        );
+    }
+    let set = |runtime: &mut Runtime, status| {
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status = status;
+        runtime.agent_work.observe(&runtime.snapshot.subagents);
+    };
+    set(&mut runtime, chat::ToolStatus::Failed);
+    let failed = read(&runtime, chat::DeliveryKind::Report, "a-review");
+    assert_eq!(failed.outcome.as_deref(), Some("failed"));
+    assert!(failed.failed);
+    assert_eq!(failed.glyph, Icon::Error);
+    // Run again and finished, its earlier failure no longer reads as its state.
+    set(&mut runtime, chat::ToolStatus::Succeeded);
+    let finished = read(&runtime, chat::DeliveryKind::Report, "a-review");
+    assert_eq!(finished.outcome.as_deref(), Some("finished"));
+    assert!(!finished.failed);
+    assert_eq!(finished.glyph, Icon::Chat);
+    // A report agreeing with how the agent stands says it once.
+    assert_eq!(
+        finished.heading,
+        "Agent \"Review restart safety\" finished\nThe check is still running."
+    );
+    // One whose agent was resumed after it failed keeps the failure in its
+    // tooltip, while its badge says how the agent stands now.
+    let failure = "Agent \"Review restart safety\" failed";
+    let resumed = runtime.delivery_outcome(
+        chat::DeliveryKind::Report,
+        false,
+        false,
+        "",
+        "a-review",
+        failure,
+        failure,
+    );
+    assert_eq!(resumed.outcome.as_deref(), Some("finished"));
+    assert!(!resumed.failed);
+    assert_eq!(
+        resumed.heading,
+        "Agent \"Review restart safety\" reported failed · now finished"
+    );
+    set(&mut runtime, chat::ToolStatus::Stopped);
+    let stop = "Agent \"Review restart safety\" was stopped";
+    let stopped = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        false,
+        "",
+        "a-review",
+        stop,
+        stop,
+    );
+    assert_eq!(stopped.outcome.as_deref(), Some("stopped"));
+    assert_eq!(stopped.heading, "Agent \"Review restart safety\" stopped");
+    // Resumed after it was stopped, the notice keeps its own words.
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].status = chat::ToolStatus::Running;
+    runtime.agent_work.observe(&runtime.snapshot.subagents);
+    let resumed = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        false,
+        "",
+        "a-review",
+        stop,
+        stop,
+    );
+    assert_eq!(resumed.outcome.as_deref(), Some("working"));
+    assert_eq!(
+        resumed.heading,
+        "Agent \"Review restart safety\" was stopped · now working"
+    );
+    // A monitor's event is not the agent's report, whatever it says.
+    let event = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        true,
+        false,
+        "",
+        "a-review",
+        stop,
+        stop,
+    );
+    assert_eq!(event.outcome, None);
+    // Where a turn was stopped is marked as other stopped work is, not with
+    // the Stop control's glyph.
+    let marker = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        true,
+        "",
+        "",
+        chat::STOPPED_NOTICE,
+        chat::STOPPED_NOTICE,
+    );
+    assert_eq!(marker.glyph, Icon::Ended);
+    assert_eq!(event.heading, stop);
+    // An agent this conversation doesn't list keeps the heading's own word.
+    let unknown = read(&runtime, chat::DeliveryKind::Report, "a-other");
+    assert_eq!(unknown.outcome.as_deref(), Some("finished"));
+    assert_eq!(unknown.heading, heading);
+    // A background command's notice keeps its own outcome.
+    let command = "Run the restart check · failed (exit 1)";
+    let notice = runtime.delivery_outcome(
+        chat::DeliveryKind::Notice,
+        false,
+        false,
+        "",
+        "brestart",
+        command,
+        command,
+    );
+    assert_eq!(notice.outcome.as_deref(), Some("failed (exit 1)"));
+    assert!(notice.failed);
+}
+
+/// A drawn report is redrawn when its agent's state, or what it waits on,
+/// changes, and when the conversation learns which agent its sender names;
+/// it stays put through changes to other agents. A command's notice tracks
+/// neither.
+#[test]
+fn a_reports_row_tracks_its_agent_and_nothing_else() {
+    let delivery = |id: &str, summary: &str, sender: &str| chat::Item {
+        id: id.into(),
+        role: chat::Role::User,
+        content: ItemContent::Delivery {
+            kind: chat::DeliveryKind::Report,
+            from: String::new(),
+            sender: sender.into(),
+            summary: summary.into(),
+            body: "The check is still running.".into(),
+        },
+        started_at: Some(1000),
+        at: Some(1000),
+    };
+    let items = vec![
+        delivery(
+            "report",
+            "Agent \"Review restart safety\" finished",
+            "a-review",
+        ),
+        delivery("command", "Run the restart check · finished", "brestart"),
+    ];
+    let (mut runtime, _handle) = frame_cost::live_runtime(&items);
+    let agent = |id: &str| chat::Subagent {
+        id: id.into(),
+        status: chat::ToolStatus::Running,
+        ..native_child_fixture()
+    };
+    Arc::make_mut(&mut runtime.snapshot).subagents = vec![agent("toolu_review"), agent("other")];
+    runtime.agent_addresses = Arc::new([("a-review".to_owned(), "toolu_review".to_owned())].into());
+    let (report, command) = (0, 1);
+    let print = |runtime: &Runtime, index: usize| {
+        use std::hash::Hasher;
+        let mut hasher = crate::fingerprint::hasher();
+        let cached = runtime.cache.get(&runtime.snapshot.items[index].id);
+        runtime.hash_turn_item(index, cached, None, None, &mut hasher);
+        hasher.finish()
+    };
+    let change = |runtime: &mut Runtime, edit: &dyn Fn(&mut Vec<chat::Subagent>)| {
+        let before = (print(runtime, report), print(runtime, command));
+        edit(&mut Arc::make_mut(&mut runtime.snapshot).subagents);
+        runtime.agent_work.observe(&runtime.snapshot.subagents);
+        let after = (print(runtime, report), print(runtime, command));
+        assert_eq!(before.1, after.1, "a command's notice tracks no agent");
+        before.0 != after.0
+    };
+    assert!(!change(&mut runtime, &|_| {}), "nothing changed");
+    assert!(
+        !change(&mut runtime, &|agents| agents[1].status =
+            chat::ToolStatus::Failed),
+        "another agent's state is not this report's"
+    );
+    assert!(change(&mut runtime, &|agents| agents[0].status =
+        chat::ToolStatus::Waiting));
+    assert!(change(&mut runtime, &|agents| {
+        agents[0].items = vec![
+            chat::Item {
+                id: "check".into(),
+                role: chat::Role::Assistant,
+                content: ItemContent::Command {
+                    label: String::new(),
+                    command: "scripts/restart-check".into(),
+                    working_directory: String::new(),
+                    action: chat::CommandAction::Run,
+                    status: chat::ToolStatus::Running,
+                    exit_code: None,
+                    duration_ms: None,
+                    output: String::new(),
+                },
+                started_at: None,
+                at: None,
+            }
+            .into(),
+        ];
+    }));
+    assert!(change(&mut runtime, &|agents| agents[0].status =
+        chat::ToolStatus::Succeeded));
+    // Learning which agent a sender names redraws only what it names.
+    let before = (print(&runtime, report), print(&runtime, command));
+    runtime.agent_addresses = Arc::new([("a-review".to_owned(), "other".to_owned())].into());
+    assert_ne!(before.0, print(&runtime, report));
+    assert_eq!(before.1, print(&runtime, command));
 }
 
 #[test]
