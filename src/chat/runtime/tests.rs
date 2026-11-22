@@ -1335,6 +1335,24 @@ use super::*;
 use serde_json::{Value, json};
 
 #[test]
+fn a_settled_actor_releases_large_json_frame_slack() {
+    let mut frame = vec![0_u8; 2 * 1024 * 1024];
+    frame.clear();
+    assert!(release_idle_frame_buffer(&mut frame));
+    assert!(
+        frame.capacity() <= IDLE_FRAME_BUFFER_CAPACITY,
+        "idle frame buffer retained {} bytes",
+        frame.capacity()
+    );
+
+    frame.extend_from_slice(b"incomplete");
+    let capacity = frame.capacity();
+    assert!(!release_idle_frame_buffer(&mut frame));
+    assert_eq!(frame, b"incomplete");
+    assert_eq!(frame.capacity(), capacity);
+}
+
+#[test]
 fn refusals_name_a_waiting_subagent_and_how_to_let_it_go() {
     let mut state = Snapshot::default();
     let subagent = |id: &str, description: &str, status| super::super::Subagent {

@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+"""Report cagents processes' RSS/PSS from /proc/PID/smaps_rollup.
+
+Use --environ to select one private development or fixture runtime without
+sampling unrelated cagents instances:
+
+    scripts/measure-cagents-memory --environ XDG_RUNTIME_DIR=/run/user/1000/demo
+"""
+import argparse
+import os
+import sys
+
+
+def processes(environment):
+    wanted = environment.encode() if environment else None
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        base = f"/proc/{name}"
+        try:
+            if wanted is not None:
+                with open(f"{base}/environ", "rb") as file:
+                    if wanted not in file.read().split(b"\0"):
+                        continue
+            with open(f"{base}/cmdline", "rb") as file:
+                command = file.read().replace(b"\0", b" ")
+        except OSError:
+            continue
+        if b"--cagents-native-actor" in command:
+            yield "actors", name
+        elif b"cagents-ui" in command:
+            yield "ui", name
+        elif b"cagentsd" in command:
+            yield "daemon", name
+        elif b"claude" in command or b"codex" in command:
+            yield "providers", name
+
+
+def rollup(pid):
+    values = {}
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as file:
+            for line in file:
+                key, _, value = line.partition(":")
+                if key in ("Rss", "Pss", "Private_Clean", "Private_Dirty"):
+                    values[key] = int(value.split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+    return values
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--environ",
+        metavar="NAME=VALUE",
+        help="only processes whose environment holds exactly this entry",
+    )
+    arguments = parser.parse_args()
+    roles = {"ui": [], "daemon": [], "actors": [], "providers": []}
+    for role, pid in processes(arguments.environ):
+        sample = rollup(pid)
+        if sample is not None:
+            roles[role].append(sample)
+
+    print("resident KiB from /proc/PID/smaps_rollup")
+    print(f"{'role':12} {'processes':>9} {'RSS':>12} {'PSS':>12} {'private':>12}")
+    totals = []
+    for role, samples in roles.items():
+        rss = sum(sample.get("Rss", 0) for sample in samples)
+        pss = sum(sample.get("Pss", 0) for sample in samples)
+        private = sum(
+            sample.get("Private_Clean", 0) + sample.get("Private_Dirty", 0)
+            for sample in samples
+        )
+        totals.extend(samples)
+        print(f"{role:12} {len(samples):9} {rss:12} {pss:12} {private:12}")
+    rss = sum(sample.get("Rss", 0) for sample in totals)
+    pss = sum(sample.get("Pss", 0) for sample in totals)
+    private = sum(
+        sample.get("Private_Clean", 0) + sample.get("Private_Dirty", 0)
+        for sample in totals
+    )
+    print(f"{'total':12} {len(totals):9} {rss:12} {pss:12} {private:12}")
+
+
+if __name__ == "__main__":
+    main()

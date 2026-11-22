@@ -65,6 +65,10 @@ fn unacknowledged_command() -> Rejection {
 }
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
+/// A settled provider has no partial frame to preserve. Keep enough space for
+/// ordinary protocol lines, but do not make every retained actor keep the
+/// largest tool result it has ever received.
+const IDLE_FRAME_BUFFER_CAPACITY: usize = 64 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3946,6 +3950,12 @@ impl Actor {
             (self.notify)(Update::Ready);
         }
         if became_available {
+            // `provider_step` follows removal of its complete JSON line from
+            // `output`, so an accepting provider has no framing bytes whose
+            // ownership we could discard here. A large tool result otherwise
+            // leaves its geometric allocation resident for the lifetime of a
+            // retained actor, one process per Claude conversation.
+            self.reclaim_idle_frame_buffer();
             (self.notify)(Update::PromptAvailable);
         }
         // apply_step has installed confirmed_session before reaching here.
@@ -3965,7 +3975,34 @@ impl Actor {
             .generation += 1;
         self.dirty = true;
     }
+
+    fn reclaim_idle_frame_buffer(&mut self) {
+        if release_idle_frame_buffer(&mut self.output) {
+            // `Vec::shrink_to` returns its allocation to Rust, but glibc can
+            // retain a freed small arena. Trim only after actually releasing
+            // a large protocol buffer, and only on the actor worker, never
+            // on the UI or daemon control thread.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            unsafe {
+                // SAFETY: `malloc_trim` takes no pointers and acts only on
+                // this process's glibc allocator state.
+                libc::malloc_trim(0);
+            }
+        }
+    }
 }
+
+/// Return idle JSON-line framing slack to the allocator. Callers must retain
+/// any incomplete frame; a complete frame has already been parsed and moved to
+/// its durable transcript/state owners before this boundary.
+fn release_idle_frame_buffer(buffer: &mut Vec<u8>) -> bool {
+    if !buffer.is_empty() || buffer.capacity() <= IDLE_FRAME_BUFFER_CAPACITY {
+        return false;
+    }
+    buffer.shrink_to(IDLE_FRAME_BUFFER_CAPACITY);
+    true
+}
+
 fn page_command(store: &Mutex<Store>, command: &Command) -> Result<bool, String> {
     let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
     match command {
