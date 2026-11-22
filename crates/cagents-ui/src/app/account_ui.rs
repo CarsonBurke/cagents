@@ -2143,8 +2143,10 @@ fn account_gauge(
     // As the status bar's chip reads it: a provider that says ordinary use is
     // not allowed, or a limit with no window to show, is limited whatever
     // the figures say.
-    let limited = snapshot.ordinary_usage_allowed == Some(false)
-        || (snapshot.status == UsageStatus::Limited && lead.is_none() && !any_refilled);
+    // A window refilled since then may have lifted either.
+    let limited = !any_refilled
+        && (snapshot.ordinary_usage_allowed == Some(false)
+            || (snapshot.status == UsageStatus::Limited && lead.is_none()));
     let old = now.saturating_sub(snapshot.observed_at) > schedule::DISPLAY_STALE_AFTER;
     // Every window refilled since the check leaves no current figure: they
     // are as good as unused, but only the next check can say so.
@@ -8494,6 +8496,18 @@ mod tests {
         assert_eq!(gauge.tone, ChipTone::Exhausted);
         assert_eq!(gauge.label, "Limited, Session usage: 70% left");
         assert!(gauge.detail.starts_with("Limited: "), "{}", gauge.detail);
+
+        // A window refilled since may have lifted the limit, as the status
+        // bar's chip reads it too.
+        let mut weekly = window(0.99, Some(now - 60));
+        weekly.kind = WindowKind::Weekly;
+        weekly.label = "Weekly".into();
+        let mut usage = snapshot(vec![window(0.3, Some(now + 3_600)), weekly], NOW - 120_000);
+        usage.ordinary_usage_allowed = Some(false);
+        let gauge =
+            account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
+        assert_ne!(gauge.tone, ChipTone::Exhausted);
+        assert!(!gauge.label.starts_with("Limited"), "{}", gauge.label);
 
         let mut usage = snapshot(vec![], NOW);
         usage.status = UsageStatus::Limited;
