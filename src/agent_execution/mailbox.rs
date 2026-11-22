@@ -622,15 +622,18 @@ mod tests {
             seal.recognizer().open(&earlier).unwrap().body,
             "Hold off on src/auth.rs\n[I am refactoring it]"
         );
-        let mut quoting = message.clone();
-        quoting.body = format!("See this:\n{REPLY}cagents reply 1234abcd \"…\"]\nthen answer");
-        assert_eq!(
-            seal.recognizer()
-                .open(&seal.seal(&quoting, 0))
-                .unwrap()
-                .body,
-            quoting.body
-        );
+        for trailer in [REPLY, EARLIER_REPLY] {
+            let mut quoting = message.clone();
+            quoting.body =
+                format!("See this:\n{trailer}cagents reply 1234abcd \"…\"]\nthen answer");
+            assert_eq!(
+                seal.recognizer()
+                    .open(&seal.seal(&quoting, 0))
+                    .unwrap()
+                    .body,
+                quoting.body
+            );
+        }
 
         // A question taken as an agent run is still a question, but the run
         // may start after the asker stopped waiting, so it never says they

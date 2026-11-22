@@ -2496,21 +2496,21 @@ fn console(
             prompt,
             idempotency_key,
         } => {
+            let request = Submit {
+                name: None,
+                destination: Destination::Existing(id),
+                prompt,
+                idempotency_key,
+            };
+            // A console is a client too: a key in the courier's namespace
+            // would claim a message's run before the courier delivers it.
+            request.validate_client()?;
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
             let accepted = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .submit_agent(
-                    &agent.origin,
-                    &Submit {
-                        name: None,
-                        destination: Destination::Existing(id),
-                        prompt,
-                        idempotency_key,
-                    },
-                    now(),
-                )?;
+                .submit_agent(&agent.origin, &request, now())?;
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
