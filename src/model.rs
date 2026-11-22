@@ -439,6 +439,12 @@ pub struct StoppingChat {
     /// to what runs it rather than starting it again.
     #[serde(default)]
     pub dismissed: bool,
+    /// Whether the daemon said it stopped. It stays saved only until the
+    /// closed pane a shared view put back has gone, which the next launch
+    /// takes away without asking again; a pane that reopened the
+    /// conversation does not wait for it.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// What a chat had not sent when its card closed: the composer's text and

@@ -8321,8 +8321,8 @@ fn closed_chat_its_view_kept_from(
 }
 
 /// The next launch, from what `app` saved: a closed pane its view kept,
-/// whose stop is still saved, stays out of sight while the launch asks again
-/// and goes once the daemon answers, rather than coming back as a chat.
+/// whose conversation was heard to stop, stays out of sight and goes, with
+/// nothing asked again, rather than coming back as a chat.
 /// Restored from its view, the pane shows its saved text until the view
 /// admits it; it stays out of sight, its stop saved, until admission lets
 /// its removal reach the view.
@@ -8345,7 +8345,10 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool, fe
     let CardKind::Chat(session) = next.card_state(pane.id).unwrap().kind.clone() else {
         panic!("a chat pane");
     };
-    assert!(next.awaits_stop(&session), "it does not attach at launch");
+    assert!(
+        next.awaits_stop(pane.id, &session),
+        "it does not attach at launch"
+    );
     if from_view {
         // As the launch restores a pane its view holds.
         next.await_shared_chat_admission(pane.id, session.clone());
@@ -8356,18 +8359,12 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool, fe
     }
     drop(next.resume_stopping_chats());
     assert!(
-        next.workspace.is_hidden(pane.id),
-        "from_view={from_view}: it stays out of sight"
+        !next.workspace.shown().any(|card| card == pane.id),
+        "from_view={from_view}: it is never in sight"
     );
-    assert!(next.closes_out_of_sight(pane.id));
-    let target = next
-        .background_close_for_test(pane.id)
-        .expect("asked again");
-    drop(
-        next.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
-            target,
-            Ok(()),
-        ))),
+    assert!(
+        next.background_close_for_test(pane.id).is_none(),
+        "from_view={from_view}: nothing is asked again of what stopped"
     );
     if from_view && !fenced {
         // Only an admitted pane's removal reaches its view: until then it
@@ -8469,7 +8466,7 @@ fn a_kept_closed_pane_whose_stop_settles_off_strip_goes_with_its_strip() {
             panic!("a chat pane");
         };
         assert!(
-            !app.awaits_stop(&session),
+            !app.awaits_stop(pane.id, &session),
             "visited={visited}: this window heard it stop"
         );
         if !visited {
@@ -8537,10 +8534,25 @@ fn a_kept_closed_pane_another_window_reuses_stays() {
 /// conversation stops or once it has stopped with the pane's strip out of
 /// sight, opens it in a new pane with what the closed one had not sent. The
 /// pane out of sight is not where the conversation is, and is not open in
-/// another window (#3620).
+/// another window (#3620). A next launch takes the closed pane away without
+/// holding the reopened one, and a refused stop leaves one pane on what
+/// still runs.
 #[test]
 fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
-    for settled in [false, true] {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Reopen {
+        WhileStopping,
+        WhileStoppingThenRefused,
+        AfterStopping,
+        AfterStoppingThenRelaunch,
+    }
+    use Reopen::*;
+    for case in [
+        WhileStopping,
+        WhileStoppingThenRefused,
+        AfterStopping,
+        AfterStoppingThenRelaunch,
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, pane, stopping) =
             closed_chat_its_view_kept_from(Some(directory.path()), "still writing");
@@ -8548,17 +8560,17 @@ fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
             panic!("a chat pane");
         };
         let strip = Cagents::rebuild_workspace(&app.durable);
-        let retire = |app: &mut Cagents| {
+        let retire = |app: &mut Cagents, result: Result<(), String>| {
             drop(
                 app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
-                    stopping,
-                    Ok(()),
+                    stopping, result,
                 ))),
             )
         };
+        let settled = matches!(case, AfterStopping | AfterStoppingThenRelaunch);
         if settled {
             app.workspace = Cagents::rebuild_workspace(&Default::default());
-            retire(&mut app);
+            retire(&mut app, Ok(()));
             assert!(app.closes_out_of_sight(pane.id), "its strip is not shown");
         }
         let entry = crate::persistence::SavedConversation {
@@ -8572,24 +8584,80 @@ fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
         drop(app.resume_saved_conversation(entry));
         assert_eq!(
             app.resume_ui.error, None,
-            "settled={settled}: it is not open elsewhere"
+            "{case:?}: it is not open elsewhere"
         );
         let reopened = app
             .workspace
             .order()
             .find(|card| !open_before.contains(card))
-            .unwrap_or_else(|| panic!("settled={settled}: a new pane reopens it"));
+            .unwrap_or_else(|| panic!("{case:?}: a new pane reopens it"));
         assert_ne!(reopened, pane.id);
+        if case == WhileStoppingThenRefused {
+            retire(&mut app, Err("the provider did not exit".into()));
+            assert!(
+                app.chat_start_pending(pane.id),
+                "the closed pane goes back to what still runs"
+            );
+            assert!(!app.workspace.is_hidden(pane.id), "in sight");
+            assert!(
+                app.reopen_superseded(reopened),
+                "the reopen gives way to it, rather than a second pane"
+            );
+            drop(app.update(Message::CommitClose(reopened)));
+            assert!(
+                !app.card_state(reopened)
+                    .is_some_and(|state| state.existence.is_open())
+            );
+            assert!(!app.chat_start_pending(reopened));
+            assert_eq!(
+                app.draft_to_keep(pane.id, None).text,
+                "still writing",
+                "it keeps what it had not sent"
+            );
+            continue;
+        }
         if !settled {
             assert!(app.holds_reopen(reopened), "it waits for the stop");
-            retire(&mut app);
+            retire(&mut app, Ok(()));
         }
         drop(app.answer_reopening(reopened, Ok(None)));
         assert_eq!(
             app.draft_to_keep(reopened, None).text,
             "still writing",
-            "settled={settled}: what the closed pane had not sent comes back"
+            "{case:?}: what the closed pane had not sent comes back"
         );
+        if case == AfterStoppingThenRelaunch {
+            let CardKind::Chat(reopened_session) = app.card_state(reopened).unwrap().kind.clone()
+            else {
+                panic!("a chat pane");
+            };
+            let mut next = crate::app::tests::context_inspector_test_app(false);
+            next.durable = app.persistent_workspace();
+            next.workspace = Cagents::rebuild_workspace(&next.durable);
+            assert!(
+                !next.awaits_stop(reopened, &reopened_session),
+                "the reopened pane attaches at launch"
+            );
+            assert!(
+                next.awaits_stop(pane.id, &session),
+                "the closed one does not"
+            );
+            drop(next.resume_stopping_chats());
+            assert!(!next.holds_reopen(reopened));
+            assert!(
+                next.background_close_for_test(pane.id).is_none()
+                    && next.background_close_for_test(reopened).is_none(),
+                "nothing is asked to stop again"
+            );
+            assert!(
+                !next
+                    .card_state(pane.id)
+                    .is_some_and(|state| state.existence.is_open()),
+                "the closed pane goes"
+            );
+            assert!(next.durable.stopping_chats.is_empty());
+            continue;
+        }
         if settled {
             app.workspace = strip;
             app.rehide_closing_panes();
@@ -8598,7 +8666,7 @@ fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
         assert!(
             !app.card_state(pane.id)
                 .is_some_and(|state| state.existence.is_open()),
-            "settled={settled}: the closed pane goes"
+            "{case:?}: the closed pane goes"
         );
         assert!(
             app.card_state(reopened)
@@ -8607,14 +8675,70 @@ fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
         assert_eq!(
             app.draft_to_keep(reopened, None).text,
             "still writing",
-            "settled={settled}: and stays with the reopened pane"
+            "{case:?}: and stays with the reopened pane"
         );
         assert!(
             !app.durable.kept_chat_drafts.contains_key(&pane.id),
-            "settled={settled}: nor is it kept twice"
+            "{case:?}: nor is it kept twice"
         );
         assert!(app.durable.stopping_chats.is_empty());
     }
+}
+
+/// A closed pane its view kept, restored at the next launch from that view
+/// after its conversation stopped, holds what it had not sent in its
+/// composer while it waits for admission. Reopening the conversation then
+/// takes that into the new pane.
+#[test]
+fn a_kept_closed_pane_awaiting_admission_gives_up_what_it_had_not_sent() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, pane, stopping) =
+        closed_chat_its_view_kept_from(Some(directory.path()), "still writing");
+    let CardKind::Chat(session) = app.card_state(pane.id).unwrap().kind.clone() else {
+        panic!("a chat pane");
+    };
+    app.workspace = Cagents::rebuild_workspace(&Default::default());
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Ok(()),
+        ))),
+    );
+    let saved = app.persistent_workspace();
+    let mut next = crate::app::tests::context_inspector_test_app(false);
+    next.chat_ui = super::super::chat_ui::State::with_drafts(saved.chat_drafts.clone());
+    next.durable = saved;
+    next.workspace = Cagents::rebuild_workspace(&next.durable);
+    next.await_shared_chat_admission(pane.id, session.clone());
+    drop(next.resume_stopping_chats());
+    assert!(next.closes_out_of_sight(pane.id), "it waits out of sight");
+    assert_eq!(next.draft_to_keep(pane.id, None).text, "still writing");
+    let entry = crate::persistence::SavedConversation {
+        card: pane.id,
+        title: "Kept".into(),
+        session: session.clone(),
+        open: true,
+        updated_at_unix_ms: 0,
+    };
+    let open_before = next.workspace.order().collect::<Vec<_>>();
+    drop(next.resume_saved_conversation(entry));
+    assert_eq!(next.resume_ui.error, None);
+    let reopened = next
+        .workspace
+        .order()
+        .find(|card| !open_before.contains(card))
+        .expect("a new pane reopens it");
+    drop(next.answer_reopening(reopened, Ok(None)));
+    assert_eq!(
+        next.draft_to_keep(reopened, None).text,
+        "still writing",
+        "it comes back"
+    );
+    assert_eq!(
+        next.draft_to_keep(pane.id, None).text,
+        "",
+        "and is not left behind to be kept twice"
+    );
 }
 
 /// What a closed chat had not sent comes back with the pane its view keeps

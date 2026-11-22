@@ -1882,18 +1882,7 @@ impl Cagents {
         // placeholder still records its reopen while it closes, so its close
         // asks nothing of the conversation the other pane holds.
         if let Some(existing) = self.existing_conversation_card(&session, Some(card)) {
-            if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
-                reopening.stage = ReopenStage::Superseded;
-            }
-            // Showing the other pane may leave this strip, which then can no
-            // longer take this pane's close from its widget.
-            let reveal = self.reveal_conversation_card(existing, &session);
-            let close = if self.workspace.order().any(|id| id == card) {
-                self.close_card_unasked(card)
-            } else {
-                self.retire_offstrip_card(card)
-            };
-            return Task::batch([reveal, close]);
+            return self.supersede_reopening(card, existing, &session);
         }
         // What may have changed while the service answered.
         if let Some(reason) = self.deleting_card_reason(card) {
@@ -1906,6 +1895,28 @@ impl Cagents {
             return self.fail_reopening(card, &error);
         }
         self.start_reopened(card, session)
+    }
+
+    /// Gives up the pane `card` put in place to reopen a conversation that
+    /// the pane `existing` holds, and shows that one instead.
+    pub(super) fn supersede_reopening(
+        &mut self,
+        card: CardId,
+        existing: CardId,
+        session: &chat::Session,
+    ) -> Task<Message> {
+        if let Some(reopening) = self.resume_ui.reopening.get_mut(&card) {
+            reopening.stage = ReopenStage::Superseded;
+        }
+        // Showing the other pane may leave this strip, which then can no
+        // longer take this pane's close from its widget.
+        let reveal = self.reveal_conversation_card(existing, session);
+        let close = if self.workspace.order().any(|id| id == card) {
+            self.close_card_unasked(card)
+        } else {
+            self.retire_offstrip_card(card)
+        };
+        Task::batch([reveal, close])
     }
 
     /// Starts the prepared `session` in the pane put in place for it, which

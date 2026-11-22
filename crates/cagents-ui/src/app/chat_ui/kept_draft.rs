@@ -121,13 +121,7 @@ impl Cagents {
     /// Whether there was one.
     pub(in crate::app) fn reclaim_kept_draft(&mut self, closed: CardId) -> bool {
         if !self.durable.kept_chat_drafts.contains_key(&closed) {
-            // A closed pane a shared view put back already holds what its
-            // close kept, where a card without a runtime does.
-            return self.returned_close_is_hidden(closed)
-                && !self.cards.contains_key(&closed)
-                && (self.chat_ui.drafts.contains_key(&closed)
-                    || self.chat_ui.draft_attachments.contains_key(&closed)
-                    || self.chat_ui.waiting.contains_key(&closed));
+            return self.reclaim_returned_unsent(closed);
         }
         let Some(draft) = Arc::make_mut(&mut self.durable)
             .kept_chat_drafts
@@ -164,6 +158,27 @@ impl Cagents {
             );
         }
         true
+    }
+
+    /// Takes what the closed pane `closed`, which a shared view put back and
+    /// keeps out of sight until it goes, holds of what its close kept, to be
+    /// moved as a kept draft is. One awaiting admission holds it in its
+    /// composer. Whether there was any.
+    fn reclaim_returned_unsent(&mut self, closed: CardId) -> bool {
+        if !self.returned_close_is_hidden(closed) {
+            return false;
+        }
+        if let Some(CardRuntime::Chat(_)) = self.cards.get(&closed) {
+            self.stash_unsent_chat(closed);
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&closed) {
+                runtime.replace_draft(text_editor::Content::new());
+                runtime.replace_attachments(Vec::new());
+            }
+        }
+        self.chat_ui.drafts.contains_key(&closed)
+            || self.chat_ui.draft_attachments.contains_key(&closed)
+            || self.chat_ui.waiting.contains_key(&closed)
+            || self.chat_ui.sending_on_close.contains_key(&closed)
     }
 
     /// Gives `card` the unsent draft `source` holds without a runtime.

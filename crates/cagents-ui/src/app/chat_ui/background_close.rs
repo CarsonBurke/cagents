@@ -119,18 +119,22 @@ impl Cagents {
             title,
             refused: None,
             dismissed: false,
+            stopped: false,
         });
         self.persist();
         ask_to_stop(target, handle, session, false)
     }
 
-    /// Whether `session` is a conversation the last window closed without
-    /// hearing that it stopped, or whose stop was refused. A pane restoring
-    /// it waits for [`Self::resume_stopping_chats`] instead of attaching.
-    pub(in crate::app) fn awaits_stop(&self, session: &chat::Session) -> bool {
+    /// Whether the pane `card`, restoring `session`, waits for
+    /// [`Self::resume_stopping_chats`] instead of attaching: its conversation
+    /// is one the last window closed without hearing that it stopped, or
+    /// whose stop was refused, or `card` is the closed pane a shared view put
+    /// back after it stopped, which is still to go.
+    pub(in crate::app) fn awaits_stop(&self, card: CardId, session: &chat::Session) -> bool {
         self.durable.stopping_chats.iter().any(|stopping| {
             shares_conversation(&stopping.session, session)
                 && !self.heard_stopped(stopping.session.id)
+                && (!stopping.stopped || stopping.card == card)
         })
     }
 
@@ -146,7 +150,9 @@ impl Cagents {
     /// Asks again to stop each chat the last window closed without hearing
     /// the daemon's answer, and puts back the refusals it had heard. A pane
     /// that reopened one before that window closed waits for the answer, as
-    /// it did then, or goes back to the conversation still running.
+    /// it did then, or goes back to the conversation still running. A closed
+    /// pane a shared view put back after its conversation stopped goes, with
+    /// nothing asked again.
     pub(in crate::app) fn resume_stopping_chats(&mut self) -> Task<Message> {
         let mut tasks = Vec::new();
         for stopping in self.durable.stopping_chats.clone() {
@@ -162,6 +168,8 @@ impl Cagents {
                 })
                 .map(|state| state.id)
                 .filter(|card| self.awaits_attachment(*card))
+                // Once stopped, only the closed pane itself is held.
+                .filter(|card| !stopping.stopped || *card == stopping.card)
                 .collect();
             // A refused stop's conversation still runs: a pane the view holds
             // goes back to it once admitted, as `attach_shared_chat` does.
@@ -210,7 +218,11 @@ impl Cagents {
                     reopens,
                 },
             );
-            tasks.push(ask_to_stop(target, None, stopping.session, true));
+            tasks.push(if stopping.stopped {
+                self.background_close_finished(target, Ok(()))
+            } else {
+                ask_to_stop(target, None, stopping.session, true)
+            });
         }
         tasks.push(self.hide_returned_closes());
         Task::batch(tasks)
@@ -238,7 +250,13 @@ impl Cagents {
                 self.chat_ui
                     .stopped_closes
                     .insert(closing.card, closing.session.clone());
-                if !returned {
+                if returned {
+                    durable
+                        .stopping_chats
+                        .iter_mut()
+                        .filter(|stopping| stopping.session.id == id)
+                        .for_each(|stopping| stopping.stopped = true);
+                } else {
                     durable
                         .stopping_chats
                         .retain(|stopping| stopping.session.id != id);
@@ -268,12 +286,25 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
-        for card in closing.reopens {
+        // The closed pane itself first: a refused stop puts it back on what
+        // still runs, which a reopen of the conversation then goes to.
+        let mut reopens = closing.reopens;
+        reopens.sort_by_key(|card| *card != closing.card);
+        for card in reopens {
             // A closed pane kept out of sight goes as it is, or comes back
             // into sight with the conversation it attaches to.
             let goes = refused.is_none() && card == closing.card && returned;
             if !goes {
                 tasks.push(self.show_returned_close(card));
+            }
+            if refused.is_some()
+                && returned
+                && card != closing.card
+                && self.reopen_awaits_stop(card)
+                && let Some(session) = self.chat_return_session(closing.card)
+            {
+                tasks.push(self.supersede_reopening(card, closing.card, &session));
+                continue;
             }
             if self.reopen_awaits_stop(card) {
                 // A refused stop leaves the conversation running: the reopen
@@ -450,7 +481,7 @@ impl Cagents {
             // The last window closed before hearing the stop: the launch asks
             // again, and the pane waits for that answer, unattached (see
             // `resume_stopping_chats`).
-            if self.awaits_stop(&session) {
+            if self.awaits_stop(card, &session) {
                 self.hold_returned_unsent(card);
                 return kept;
             }
@@ -499,12 +530,16 @@ impl Cagents {
         }
         self.chat_ui.stopped_returns.insert(card);
         self.chat_ui.hidden_returns.insert(card);
-        if self
+        if let Some(stopping) = self
             .durable
             .stopping_chats
             .iter()
-            .any(|stopping| stopping.session.id == session.id)
+            .position(|stopping| stopping.session.id == session.id)
         {
+            if !self.durable.stopping_chats[stopping].stopped {
+                Arc::make_mut(&mut self.durable).stopping_chats[stopping].stopped = true;
+                self.persist();
+            }
             return;
         }
         let title = self
@@ -519,6 +554,7 @@ impl Cagents {
                 title,
                 refused: None,
                 dismissed: false,
+                stopped: true,
             });
         self.persist();
     }

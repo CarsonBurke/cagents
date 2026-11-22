@@ -6647,7 +6647,7 @@ impl Cagents {
                     // A conversation the last window was still stopping
                     // when it closed, or failed to, attaches once the launch
                     // has asked again (see `resume_stopping_chats`).
-                    if self.awaits_stop(&session) {
+                    if self.awaits_stop(card.id, &session) {
                         continue;
                     }
                     // Whether this is an attach, a daemon-proven upgrade

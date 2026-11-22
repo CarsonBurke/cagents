@@ -8580,6 +8580,7 @@ mod tests {
             title: "Plan the release".into(),
             refused: None,
             dismissed: false,
+            stopped: false,
         };
         let refused = StoppingChat {
             refused: Some("the provider did not exit".into()),
@@ -8587,7 +8588,12 @@ mod tests {
             card: CardId::new(),
             ..pending.clone()
         };
-        workspace.stopping_chats = vec![pending, refused];
+        let stopped = StoppingChat {
+            stopped: true,
+            card: CardId::new(),
+            ..pending.clone()
+        };
+        workspace.stopping_chats = vec![pending, refused, stopped];
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
