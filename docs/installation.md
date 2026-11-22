@@ -10,9 +10,10 @@
 - [Uninstall or purge](#uninstall-or-purge)
 
 Releases are public at [CarsonBurke/cagents](https://github.com/CarsonBurke/cagents/releases).
-The installer and the commands below use an authenticated GitHub CLI account.
-You can also download release assets directly from the releases page; tagged
-builds stamp the repository into the released copy of `install.sh` automatically.
+The installer and the commands below download them over HTTPS with `curl`; no
+GitHub account is needed. You can also download release assets directly from
+the releases page; tagged builds stamp the repository into the released copy of
+`install.sh` automatically.
 
 Run the installation and removal commands below from a system terminal outside
 cagents. Terminals opened in cagents are hosted sessions; these protected commands
@@ -41,8 +42,8 @@ Interface text uses the desktop's installed fonts with Fontconfig fallbacks.
 Install Open Sans and Noto Sans Mono if they are not already available.
 
 The GitHub CLI, `gh`, is optional for local-only use but required for GitHub
-and pull-request features and for the release installer. Install it from your
-distribution and authenticate as the same desktop user:
+and pull-request features. Installing and updating cagents do not need it.
+Install it from your distribution and authenticate as the same desktop user:
 
 ```sh
 gh auth login --hostname github.com
@@ -68,9 +69,9 @@ command shown on the website:
 ```sh
 (
   set -eu
-  repository='github.com/CarsonBurke/cagents'
-  gh auth status --hostname github.com
-  tag="$(gh release view --repo "$repository" --json tagName --jq .tagName)"
+  releases='https://github.com/CarsonBurke/cagents/releases'
+  latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$releases/latest")"
+  tag="${latest##*/}"
   case "$tag" in v[0-9]*) ;; *) echo 'Expected a versioned release tag' >&2; exit 1 ;; esac
   version="${tag#v}"
   download_dir="$(mktemp -d)"
@@ -78,11 +79,11 @@ command shown on the website:
   trap 'exit 1' HUP INT TERM
   archive="cagents-${version}-x86_64-unknown-linux-gnu.tar.gz"
 
-  gh release download "$tag" --repo "$repository" \
-    --pattern install.sh --pattern SHA256SUMS --pattern "$archive" \
-    --dir "$download_dir"
   (
     cd "$download_dir"
+    curl -fsSL --proto '=https' --fail-early --remote-name-all \
+      "$releases/download/$tag/install.sh" "$releases/download/$tag/SHA256SUMS" \
+      "$releases/download/$tag/$archive"
     awk -v archive="$archive" \
       '$2 == "install.sh" { print; installer++ } $2 == archive { print; payload++ }
        END { exit(installer != 1 || payload != 1) }' \
@@ -90,7 +91,6 @@ command shown on the website:
     sha256sum --strict --check selected-checksums
   )
 
-  CAGENTS_REPOSITORY='CarsonBurke/cagents' \
   CAGENTS_ARCHIVE="$download_dir/$archive" \
   CAGENTS_CHECKSUMS="$download_dir/SHA256SUMS" \
     sh "$download_dir/install.sh" --version "$version"
@@ -98,57 +98,53 @@ command shown on the website:
 ```
 
 To inspect the installer first, add `less "$download_dir/install.sh"` just
-before the `CAGENTS_REPOSITORY` line. To pin a particular version, replace the
-`tag=` lookup with that exact tag, for example `tag=v0.1.2`.
+before the `CAGENTS_ARCHIVE` line. To pin a particular version, replace the
+`latest=` and `tag=` lines with that exact tag, for example `tag=v0.1.2`.
 
 SHA-256 confirms that the files match the release manifest. It does not protect
 against a compromised repository or release, so inspect the tag, release, and
 installer according to your own trust requirements.
 
-The installer uses your existing `gh` authentication both to select the latest
-release and to download pinned assets. It never copies tokens into its state,
-URLs, or command arguments. The released installer requires authentication for
-`CarsonBurke/cagents`, even though its releases are public, and fails before
-changing anything if authentication is missing. Supplying both
-`CAGENTS_ARCHIVE` and `CAGENTS_CHECKSUMS` keeps installation offline. Anonymous
-HTTPS downloads are only a fallback for explicitly selected public
-repositories.
+Supplying both `CAGENTS_ARCHIVE` and `CAGENTS_CHECKSUMS` keeps installation
+offline. Without them, the installer downloads the release itself with `curl`.
+For another repository set with `CAGENTS_REPOSITORY`, which may be private, it
+uses an authenticated GitHub CLI when there is one. It never copies tokens into
+its state, URLs, or command arguments.
 
 Run `sh install.sh --help` for every option.
 
 ## Convenience install
 
-This shorter flow uses the same GitHub account but runs the downloaded
-installer without inspecting it or checking its checksum yourself. Use it only
-if you trust the repository and release. It resolves the latest tag once and
-uses it for both the installer and the archive:
+This shorter flow runs the downloaded installer without inspecting it or
+checking its checksum yourself; the installer still verifies the archive it
+downloads. Use it only if you trust the repository and release:
 
 ```sh
 (
-  gh auth status --hostname github.com || exit 1
-  tag="$(gh release view --repo github.com/CarsonBurke/cagents --json tagName --jq .tagName)" || exit 1
-  case "$tag" in v*) ;; *) exit 1 ;; esac
   download_dir="$(mktemp -d)" || exit 1
   trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
-  gh release download "$tag" --repo github.com/CarsonBurke/cagents \
-    --pattern install.sh --dir "$download_dir" &&
+  releases='https://github.com/CarsonBurke/cagents/releases'
+  latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$releases/latest")" || exit 1
+  tag="${latest##*/}"
+  case "$tag" in v[0-9]*) ;; *) echo 'Expected a versioned release tag' >&2; exit 1 ;; esac
+  curl -fsSL --proto '=https' -o "$download_dir/install.sh" "$releases/download/$tag/install.sh" &&
     sh "$download_dir/install.sh" --version "${tag#v}"
 )
 ```
 
-To pin a version instead, replace the `tag=` lookup with a fixed version and
-download that tag's installer:
+It looks up the latest release once, so the installer it runs and the version
+it installs always match. To install a particular version instead, download
+that tag's installer and name the version:
 
 ```sh
 (
-  gh auth status --hostname github.com || exit 1
   VERSION=0.1.2
   download_dir="$(mktemp -d)" || exit 1
   trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
-  gh release download "v${VERSION}" --repo github.com/CarsonBurke/cagents \
-    --pattern install.sh --dir "$download_dir" &&
+  curl -fsSL --proto '=https' -o "$download_dir/install.sh" \
+    "https://github.com/CarsonBurke/cagents/releases/download/v${VERSION}/install.sh" &&
     sh "$download_dir/install.sh" --version "$VERSION"
 )
 ```
@@ -159,10 +155,9 @@ Download the package and checksum manifest, verify the package, then let APT
 resolve its shared-library dependencies:
 
 ```sh
-REPOSITORY='CarsonBurke/cagents'
 VERSION='0.1.2'
-gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
-  --pattern "cagents_${VERSION}_amd64.deb" --pattern SHA256SUMS
+base="https://github.com/CarsonBurke/cagents/releases/download/v${VERSION}"
+curl -fsSL --proto '=https' --fail-early --remote-name-all "$base/cagents_${VERSION}_amd64.deb" "$base/SHA256SUMS"
 sha256sum --ignore-missing --strict --check SHA256SUMS
 sudo apt install git "./cagents_${VERSION}_amd64.deb"
 ```
@@ -177,8 +172,8 @@ can be installed alongside the full package. It uses
 installs separately identified desktop and AppStream metadata:
 
 ```sh
-gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
-  --pattern "cagents-browserless_${VERSION}_amd64.deb" --pattern SHA256SUMS-browserless
+curl -fsSL --proto '=https' --fail-early --remote-name-all \
+  "$base/cagents-browserless_${VERSION}_amd64.deb" "$base/SHA256SUMS-browserless"
 sha256sum --ignore-missing --strict --check SHA256SUMS-browserless
 sudo apt install git "./cagents-browserless_${VERSION}_amd64.deb"
 cagents-browserless ui
@@ -202,10 +197,10 @@ executable. Keep its `bin` directory intact: `cagents`, `cagents-ui`, and
 `cagentsd` must stay together.
 
 ```sh
-REPOSITORY='CarsonBurke/cagents'
 VERSION='0.1.2'
-gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
-  --pattern "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" --pattern SHA256SUMS
+base="https://github.com/CarsonBurke/cagents/releases/download/v${VERSION}"
+curl -fsSL --proto '=https' --fail-early --remote-name-all \
+  "$base/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" "$base/SHA256SUMS"
 sha256sum --ignore-missing --strict --check SHA256SUMS
 tar -xzf "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 "./cagents-${VERSION}/bin/cagents" ui

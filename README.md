@@ -40,8 +40,8 @@ restart the UI while your agents keep working.
 ## Install
 
 cagents runs on **Linux x86_64 with Wayland**, glibc 2.35 or newer, and Git 2.36
-or newer. The release installer also requires an authenticated
-[GitHub CLI](https://cli.github.com/) account (`gh auth login`).
+or newer. The installer downloads releases with `curl`; no GitHub account is
+needed.
 
 Follow the [installation guide](docs/installation.md#install-with-the-verified-installer)
 for the checksum-verified installer. It installs as your user without root.

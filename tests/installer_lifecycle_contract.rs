@@ -845,17 +845,17 @@ case "$1 $2" in
   'auth status')
     [ "$#" -eq 4 ] && [ "$3" = --hostname ] && [ "$4" = github.com ] || exit 98
     printf '%s\n' gh:auth >> "$FIXTURE_DOWNLOADS"
-    [ "$FIXTURE_DOWNLOAD" != public ] && [ "$FIXTURE_DOWNLOAD" != auth-failure ]
+    [ "$FIXTURE_DOWNLOAD" != auth-failure ]
     ;;
   'release view')
-    [ "$#" -eq 8 ] && [ "$3" = --repo ] && [ "$4" = github.com/CarsonBurke/cagents ] &&
+    [ "$#" -eq 8 ] && [ "$3" = --repo ] && [ "$4" = github.com/fixture/private-cagents ] &&
       [ "$5" = --json ] && [ "$6" = tagName ] && [ "$7" = --jq ] && [ "$8" = .tagName ] || exit 98
     printf '%s\n' gh:latest >> "$FIXTURE_DOWNLOADS"
     printf '%s\n' v9.9.9
     ;;
   'release download')
     [ "$#" -eq 9 ] && [ "$3" = v9.9.9 ] && [ "$4" = --repo ] &&
-      [ "$5" = github.com/CarsonBurke/cagents ] && [ "$6" = --pattern ] &&
+      [ "$5" = github.com/fixture/private-cagents ] && [ "$6" = --pattern ] &&
       [ "$8" = --output ] || exit 98
     printf 'gh:%s\n' "$7" >> "$FIXTURE_DOWNLOADS"
     [ "$FIXTURE_DOWNLOAD" != gh-failure ] || exit 4
@@ -873,7 +873,7 @@ esac
         &tools.join("curl"),
         r#"#!/bin/sh
 set -eu
-[ "$FIXTURE_DOWNLOAD" = public ] || exit 98
+[ "$FIXTURE_DOWNLOAD" = public ] || [ "$FIXTURE_DOWNLOAD" = auth-failure ] || exit 98
 destination=
 url=
 while [ "$#" -gt 0 ]; do
@@ -881,14 +881,14 @@ while [ "$#" -gt 0 ]; do
     -o) destination=$2; shift 2 ;;
     --proto|-w) shift 2 ;;
     --tlsv1.2|--fail|--location|--silent|--show-error) shift ;;
-    https://github.com/fixture/public-cagents/*) url=$1; shift ;;
+    "https://github.com/$FIXTURE_CURL_REPOSITORY/"*) url=$1; shift ;;
     *) exit 98 ;;
   esac
 done
 case "$url" in
   */releases/latest)
     printf '%s\n' curl:latest >> "$FIXTURE_DOWNLOADS"
-    printf '%s' https://github.com/fixture/public-cagents/releases/tag/v9.9.9
+    printf '%s' "https://github.com/$FIXTURE_CURL_REPOSITORY/releases/tag/v9.9.9"
     ;;
   */releases/download/v9.9.9/cagents-9.9.9-x86_64-unknown-linux-gnu.tar.gz)
     printf '%s\n' curl:archive >> "$FIXTURE_DOWNLOADS"
@@ -1214,6 +1214,12 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     } else {
         command.env_remove("CAGENTS_INSTALL_CENSUS_PATH");
     }
+    // The canonical releases download over plain HTTPS; a fork may be private.
+    let repository = if download == Some("public") {
+        "CarsonBurke/cagents"
+    } else {
+        "fixture/private-cagents"
+    };
     let output = command
         .env("CAGENTS_INSTALL_OUTCOME_PATH", &outcome)
         .env("FIXTURE_TERMINAL_INVENTORY", &terminal_inventory)
@@ -1281,14 +1287,8 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             "FIXTURE_REJECT_SIGNAL",
             (publish_failure == Some("outer-signal-invalid-target")).to_string(),
         )
-        .env(
-            "CAGENTS_REPOSITORY",
-            if download == Some("public") {
-                "fixture/public-cagents"
-            } else {
-                "CarsonBurke/cagents"
-            },
-        )
+        .env("CAGENTS_REPOSITORY", repository)
+        .env("FIXTURE_CURL_REPOSITORY", repository)
         .env("FIXTURE_DOWNLOADS", &downloads)
         .env("FIXTURE_DOWNLOAD", download.unwrap_or_default())
         .env("FIXTURE_ARCHIVE", &archive)
@@ -1891,7 +1891,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         }
         return;
     }
-    let success = !matches!(download, Some("gh-failure" | "auth-failure"))
+    let success = !matches!(download, Some("gh-failure"))
         && match restart {
             Some("success" | "relaunch" | "decline" | "decline-legacy") => {
                 publish_failure.is_none()
@@ -2072,8 +2072,11 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
                 "gh:auth\ngh:cagents-9.9.9-x86_64-unknown-linux-gnu.tar.gz\ngh:SHA256SUMS\n",
             Some("gh-failure") =>
                 "gh:auth\ngh:latest\ngh:cagents-9.9.9-x86_64-unknown-linux-gnu.tar.gz\n",
-            Some("auth-failure") => "gh:auth\n",
-            Some("public") => "gh:auth\ncurl:latest\ncurl:archive\ncurl:checksums\n",
+            // A private repository's installer falls back to plain HTTPS
+            // when the GitHub CLI is signed out, as for any other.
+            Some("auth-failure") => "gh:auth\ncurl:latest\ncurl:archive\ncurl:checksums\n",
+            // The canonical releases are public: the GitHub CLI is not asked.
+            Some("public") => "curl:latest\ncurl:archive\ncurl:checksums\n",
             Some(_) => panic!("unknown fixture download mode"),
         }
     );
@@ -2230,7 +2233,7 @@ fn restart_option_rejects_uninstall_and_extra_values_without_creating_installati
 }
 
 #[test]
-fn authenticated_private_release_resolves_and_downloads_with_existing_gh_account() {
+fn authenticated_private_fork_release_resolves_and_downloads_with_existing_gh_account() {
     release_fixture(true, 7, None, None, Some("gh-latest"));
 }
 
@@ -2245,12 +2248,12 @@ fn authenticated_download_failure_preserves_installation_without_public_fallback
 }
 
 #[test]
-fn public_release_download_works_without_an_authenticated_gh_account() {
+fn canonical_public_release_downloads_without_asking_the_github_cli() {
     release_fixture(true, 7, None, None, Some("public"));
 }
 
 #[test]
-fn private_authentication_failure_preserves_installation_without_anonymous_downloads() {
+fn a_signed_out_github_cli_falls_back_to_public_downloads() {
     release_fixture(true, 7, None, None, Some("auth-failure"));
 }
 

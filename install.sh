@@ -597,14 +597,23 @@ need_command tar
 need_command readlink
 [ -z "$PREPARE_CANDIDATE" ] || need_command sync
 
+# A private repository's releases need a signed-in GitHub CLI; the canonical
+# releases are public, so that advice would mislead there.
+private_hint() {
+    [ "$REPOSITORY" = CarsonBurke/cagents ] \
+        || printf '; for a private repository, sign in with gh auth login --hostname github.com'
+}
+
 CURL_OPTIONS="--proto =https --tlsv1.2 --fail --location --silent --show-error"
 AUTHENTICATED_GH=0
 if [ -z "$VERSION" ] || [ -z "$LOCAL_ARCHIVE" ] || [ -z "$LOCAL_CHECKSUMS" ]; then
     validate_repository
-    if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+    # The canonical releases are public: plain HTTPS downloads need no
+    # account. Another repository may be private, so its releases go through
+    # an authenticated GitHub CLI when there is one.
+    if [ "$REPOSITORY" != CarsonBurke/cagents ] && command -v gh >/dev/null 2>&1 \
+        && gh auth status --hostname github.com >/dev/null 2>&1; then
         AUTHENTICATED_GH=1
-    elif [ "$REPOSITORY" = CarsonBurke/cagents ]; then
-        fail 'private release access requires an authenticated GitHub CLI account; run gh auth login --hostname github.com with access to CarsonBurke/cagents; installation was not changed'
     fi
 fi
 if [ -z "$VERSION" ]; then
@@ -618,7 +627,7 @@ if [ -z "$VERSION" ]; then
     else
         need_command curl
         latest_url=$(curl $CURL_OPTIONS -o /dev/null -w '%{url_effective}' "https://github.com/$REPOSITORY/releases/latest") \
-            || fail 'could not resolve the public release; for private repositories, authenticate with gh auth login --hostname github.com'
+            || fail "could not resolve the latest release$(private_hint)"
         case $latest_url in
             https://github.com/"$REPOSITORY"/releases/tag/v*) VERSION=${latest_url##*/v} ;;
             *) fail 'latest release did not redirect to a v* tag' ;;
@@ -1042,7 +1051,7 @@ download_release_asset() {
         need_command curl
         curl $CURL_OPTIONS -o "$asset_path" \
             "https://github.com/$REPOSITORY/releases/download/v$VERSION/$asset_name" \
-            || fail "could not download public asset $asset_name; for private repositories, authenticate with gh auth login --hostname github.com"
+            || fail "could not download $asset_name$(private_hint)"
     fi
 }
 
