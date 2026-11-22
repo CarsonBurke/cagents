@@ -199,7 +199,7 @@ fn prepare_selection(
     let reset = select_reset(resets, scope, reset_id, recovery, now)?;
     let count = resets
         .iter()
-        .filter(|candidate| candidate.scopes == reset.scopes && candidate.is_available(now))
+        .filter(|candidate| same_scopes(candidate, reset) && candidate.is_available(now))
         .fold(0_u64, |count, candidate| {
             count.saturating_add(candidate.available_count)
         });
@@ -308,7 +308,7 @@ fn select_reset<'a>(
     if let Some(first) = candidates.first()
         && candidates
             .iter()
-            .all(|candidate| candidate.scopes == first.scopes)
+            .all(|candidate| same_scopes(candidate, first))
     {
         return Ok(first);
     }
@@ -328,7 +328,6 @@ fn select_reset<'a>(
                                     Some(ScopeMatch::Broader | ScopeMatch::Wider)
                                 )
                         })
-                        .map(|reset| format!("'{}'", reset.label()))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -343,7 +342,7 @@ fn select_reset<'a>(
                 } else {
                     format!(
                         "{refusal}. To spend a reset that also clears other limits, choose --scope {}",
-                        wider.join(" or ")
+                        quoted_labels(&wider).join(" or ")
                     )
                 },
             ))
@@ -352,14 +351,29 @@ fn select_reset<'a>(
             "account_reset",
             format!(
                 "Several resets are available. Choose --scope: {}",
-                candidates
-                    .iter()
-                    .map(|reset| format!("'{}'", reset.label()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                quoted_labels(&candidates).join(", ")
             ),
         )),
     }
+}
+
+/// Grants list the limits they clear in the provider's order, so two grants
+/// clearing the same limits are one choice whatever order they list them in.
+fn same_scopes(left: &UsageReset, right: &UsageReset) -> bool {
+    crate::account::resets::ordered_scopes(&left.scopes)
+        == crate::account::resets::ordered_scopes(&right.scopes)
+}
+
+/// Each distinct reset label once, quoted, in the given order.
+fn quoted_labels(resets: &[&UsageReset]) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for reset in resets {
+        let label = format!("'{}'", reset.label());
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    labels
 }
 
 fn retry_command(request: &ConsumeRequest, scope: &str, device: &str) -> String {
@@ -539,6 +553,25 @@ mod tests {
             "Use a Weekly + Fable reset for Plan (claude/system)? This clears the Weekly limit and the Fable weekly limit now. 1 available; this can’t be undone."
         );
         assert_eq!(selection.scope, "Weekly + Fable", "one name everywhere");
+        let mut reordered = grant(
+            "cedar_ember/full-reset-2612",
+            vec![ResetScope::Model("Fable".into()), ResetScope::AccountWeekly],
+            1,
+        );
+        reordered.expires_at = weekly_and_fable().expires_at.map(|at| at + 1);
+        let resets = vec![weekly_and_fable(), reordered, held_fable.clone()];
+        let selection = prepare_selection(&resets, Some("weekly"), None, false, 100).unwrap();
+        assert_eq!(
+            (selection.id.as_str(), selection.count),
+            ("cedar_ember/full-reset-2611", Some(2)),
+            "the order a grant lists its limits in doesn't split one reset into two"
+        );
+        assert_eq!(
+            select_reset(&resets, Some("Fable"), None, false, 100)
+                .unwrap_err()
+                .message,
+            "The Fable reset can't be used right now. To spend a reset that also clears other limits, choose --scope 'Weekly + Fable'"
+        );
 
         // Without any Fable reset, `--scope Fable` still never spends the
         // Weekly reset; its full label does.
