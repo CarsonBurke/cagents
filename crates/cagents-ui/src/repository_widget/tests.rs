@@ -2182,51 +2182,104 @@ fn the_working_comparison_lays_out_its_deleted_lines_as_rows() {
     }
 }
 
-#[test]
-fn parses_status_paths_without_losing_rename_boundaries() {
-    let parsed =
-        parse_status_paths(b" M src/main.rs\0R  renamed.md\0old.md\0?? new.txt\0").unwrap();
-    assert_eq!(
-        parsed
-            .get(Path::new("src/main.rs"))
-            .map(ParsedStatus::display_code),
-        Some(" M".into())
-    );
-    assert_eq!(
-        parsed
-            .get(Path::new("renamed.md"))
-            .map(ParsedStatus::display_code),
-        Some("R ".into())
-    );
-    assert_eq!(
-        parsed
-            .get(Path::new("new.txt"))
-            .map(ParsedStatus::display_code),
-        Some("??".into())
-    );
-    assert_eq!(
-        parsed
-            .get(Path::new("renamed.md"))
-            .and_then(|status| status.staged_old_path.as_ref()),
-        Some(&OldPath::Renamed("old.md".into()))
-    );
-    assert!(!parsed.contains_key(Path::new("old.md")));
+/// The card's rows for one `git ls-files -tco -z` listing and the records of
+/// one `git status --porcelain=v2 -z` read.
+fn listed_files(files: &[u8], records: &[u8]) -> Vec<RepositoryFile> {
+    let mut status = b"# branch.oid (initial)\0# branch.head main\0".to_vec();
+    status.extend_from_slice(records);
+    repository_files(
+        &crate::repository::parse_working_files(files).unwrap(),
+        &crate::repository::parse_status(&status).unwrap(),
+    )
+}
+
+/// The rows a real Git checkout lists, read as the card reads them.
+fn load_repository_files(worktree: &Path) -> Vec<RepositoryFile> {
+    match read_repository_files(worktree, None, &CancellationToken::new()).unwrap() {
+        FileListRead::Listed(_, files) => files,
+        FileListRead::Unchanged => panic!("a read with nothing to compare against always lists"),
+    }
 }
 
 #[test]
-fn rejects_truncated_and_traversing_git_paths() {
-    assert!(parse_paths(b"src/main.rs", "fixture").is_err());
-    assert!(parse_paths(b"../outside\0", "fixture").is_err());
-    assert!(parse_status_paths(b"R  renamed\0").is_err());
+fn status_rows_keep_rename_boundaries_and_porcelain_codes() {
+    let files = listed_files(
+        b"H src/main.rs\0H renamed.md\0? new.txt\0",
+        b"1 .M N... 100644 100644 100644 a b src/main.rs\0\
+          2 R. N... 100644 100644 100644 a b R100 renamed.md\0old.md\0\
+          ? new.txt\0",
+    );
+    let status = |path: &str| {
+        files
+            .iter()
+            .find(|file| file.path == Path::new(path))
+            .and_then(|file| file.status.clone())
+    };
+    assert_eq!(status("src/main.rs").as_deref(), Some(" M"));
+    assert_eq!(status("renamed.md").as_deref(), Some("R "));
+    assert_eq!(status("new.txt").as_deref(), Some("??"));
+    let renamed = files
+        .iter()
+        .find(|file| file.path == Path::new("renamed.md"))
+        .unwrap();
+    assert_eq!(
+        renamed.staged_old_path,
+        Some(OldPath::Renamed("old.md".into()))
+    );
+    assert!(!files.iter().any(|file| file.path == Path::new("old.md")));
+}
+
+#[test]
+fn conflicts_show_both_halves_of_their_code() {
+    let files = listed_files(
+        b"M both\0M both\0M both\0M theirs\0M theirs\0",
+        b"u UU N... 100644 100644 100644 100644 a b c both\0\
+          u UD N... 100644 100644 000000 100644 a b c theirs\0",
+    );
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| (
+                file.path.to_str().unwrap(),
+                file.staged,
+                file.unstaged,
+                file.status.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("both", true, true, Some("UU")),
+            ("theirs", true, true, Some("UD"))
+        ]
+    );
+}
+
+#[test]
+fn rows_follow_path_component_order() {
+    let files = listed_files(b"H a.b\0H a/b\0H a-b\0", b"");
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.path.to_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a/b", "a-b", "a.b"]
+    );
 }
 
 #[test]
 fn merges_staged_deletion_and_untracked_replacement_for_one_path() {
-    let parsed = parse_status_paths(b"D  replacement.txt\0?? replacement.txt\0").unwrap();
-    let status = parsed.get(Path::new("replacement.txt")).unwrap();
-    assert_eq!(status.staged, Some(b'D'));
-    assert_eq!(status.unstaged, Some(b'?'));
-    assert_eq!(status.display_code(), "D?");
+    let files = listed_files(
+        b"? replacement.txt\0",
+        b"1 D. N... 100644 000000 000000 a b replacement.txt\0? replacement.txt\0",
+    );
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        (
+            files[0].staged,
+            files[0].unstaged,
+            files[0].status.as_deref()
+        ),
+        (true, true, Some("D?"))
+    );
 
     let root = tempdir().unwrap();
     run_git(root.path(), ["init", "-q"]);
@@ -2239,7 +2292,7 @@ fn merges_staged_deletion_and_untracked_replacement_for_one_path() {
     run_git(root.path(), ["add", "replacement.txt"]);
     run_git(root.path(), ["commit", "-qm", "initial"]);
     run_git(root.path(), ["rm", "--cached", "-q", "replacement.txt"]);
-    let files = load_repository_files(root.path()).unwrap();
+    let files = load_repository_files(root.path());
     let replacements = files
         .iter()
         .filter(|file| file.path == Path::new("replacement.txt"))
@@ -2252,12 +2305,10 @@ fn merges_staged_deletion_and_untracked_replacement_for_one_path() {
 
 #[test]
 fn worktree_rename_uses_the_old_baseline_and_suppresses_the_source_row() {
-    let files = assemble_repository_files(
-        b"old-name.md\0",
-        b"renamed.md\0",
-        b" R renamed.md\0old-name.md\0",
-    )
-    .unwrap();
+    let files = listed_files(
+        b"H old-name.md\0H renamed.md\0",
+        b"2 .R N... 100644 100644 100644 a b R100 renamed.md\0old-name.md\0",
+    );
     assert_eq!(
         files,
         vec![RepositoryFile {
@@ -2289,7 +2340,7 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
     std::fs::write(root.path().join("tracked.md"), "# After\n").unwrap();
     std::fs::write(root.path().join("new.txt"), "new\n").unwrap();
 
-    let files = load_repository_files(root.path()).unwrap();
+    let files = load_repository_files(root.path());
     assert_eq!(
         files,
         vec![
@@ -2344,7 +2395,7 @@ fn real_git_fixture_keeps_status_only_and_staged_plus_unstaged_deletions() {
     run_git(root.path(), ["add", "both-delete"]);
     std::fs::remove_file(root.path().join("both-delete")).unwrap();
 
-    let files = load_repository_files(root.path()).unwrap();
+    let files = load_repository_files(root.path());
     let staged = files
         .iter()
         .find(|file| file.path == Path::new("staged-delete"))
@@ -8568,7 +8619,7 @@ fn fixture_oid(seed: u8) -> Oid {
 }
 
 fn head_oid(root: &Path) -> Oid {
-    let output = Command::new("git")
+    let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--verify", "HEAD"])
@@ -8678,7 +8729,7 @@ fn git_fixture(root: &Path) {
 }
 
 fn run_git<const N: usize>(root: &Path, args: [&str; N]) {
-    let status = Command::new("git")
+    let status = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -9508,31 +9559,6 @@ fn directory_search_is_on_demand_and_capped_to_visible_rows() {
     assert!(none.is_empty());
 }
 
-/// `core.fsmonitor` names a program Git runs on every index refresh, and
-/// a repository that arrived as an archive chose it. A card lists its
-/// files on creation and every ten seconds after, so a second copy of
-/// the invocation block that forgets this is a local code-execution
-/// vector reachable without a click.
-#[test]
-fn every_git_invocation_here_disables_the_repository_chosen_fsmonitor_hook() {
-    let command = git_command(Path::new("/repo"));
-    let argv: Vec<String> = std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        argv,
-        [
-            "git",
-            "--literal-pathspecs",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-            "/repo",
-        ]
-    );
-}
-
 #[test]
 fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
     let root = tempdir().unwrap();
@@ -9540,15 +9566,16 @@ fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
     std::fs::write(root.path().join("tracked.txt"), "a").unwrap();
     run_git(root.path(), ["add", "tracked.txt"]);
 
+    let cancellation = CancellationToken::new();
     let FileListRead::Listed(Some(digest), files) =
-        read_repository_files(root.path(), None).unwrap()
+        read_repository_files(root.path(), None, &cancellation).unwrap()
     else {
         panic!("a read with nothing to compare against always lists");
     };
     assert_eq!(files.len(), 1);
     assert!(
         matches!(
-            read_repository_files(root.path(), Some(digest)).unwrap(),
+            read_repository_files(root.path(), Some(digest), &cancellation).unwrap(),
             FileListRead::Unchanged
         ),
         "an idle refresh tick must not rebuild a list nothing has moved"
@@ -9556,9 +9583,68 @@ fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
 
     std::fs::write(root.path().join("new.txt"), "b").unwrap();
     assert!(matches!(
-        read_repository_files(root.path(), Some(digest)).unwrap(),
+        read_repository_files(root.path(), Some(digest), &cancellation).unwrap(),
         FileListRead::Listed(..)
     ));
+}
+
+#[test]
+fn a_failed_file_list_read_reports_what_git_said() {
+    let root = tempdir().unwrap();
+    // A directory that does not exist fails wherever the temporary
+    // directory lives, even inside some other checkout.
+    let Err(error) = read_repository_files(
+        &root.path().join("missing"),
+        None,
+        &CancellationToken::new(),
+    ) else {
+        panic!("a missing directory has no file list");
+    };
+    let detail = error
+        .strip_prefix("Git failed while listing repository files: ")
+        .unwrap_or_else(|| panic!("{error}"));
+    // Git's own words, in whatever language it speaks, not an exit status.
+    assert!(!detail.is_empty(), "{error}");
+    assert!(!detail.contains("process exited with status"), "{error}");
+}
+
+#[test]
+fn a_superseded_or_abandoned_file_list_read_is_cancelled() {
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(RepositoryView {
+        selected_file: None,
+        project: ProjectId::new(),
+        repository: PathBuf::from("/repo"),
+        worktree: PathBuf::from("/repo"),
+    });
+    let outstanding = |runtime: &RepositoryRuntime| {
+        runtime
+            .file_list_read
+            .as_ref()
+            .expect("a file-list read is outstanding")
+            .0
+            .clone()
+    };
+
+    drop(runtime.load_files(card));
+    let first = outstanding(&runtime);
+    drop(runtime.load_files(card));
+    let second = outstanding(&runtime);
+    assert!(first.is_cancelled(), "a newer read supersedes the first");
+    assert!(!second.is_cancelled());
+
+    let abandoned = std::io::Error::from(std::io::ErrorKind::NotFound);
+    runtime.fail_file_open(card, PathBuf::from("missing.txt"), &abandoned);
+    assert!(
+        second.is_cancelled(),
+        "a card that gives up on its file abandons its read"
+    );
+    assert!(runtime.file_list_read.is_none());
+
+    drop(runtime.load_files(card));
+    let third = outstanding(&runtime);
+    drop(runtime);
+    assert!(third.is_cancelled(), "closing the card abandons its read");
 }
 
 #[test]
@@ -11459,8 +11545,10 @@ fn a_copy_compares_against_its_source_but_mutates_only_itself() {
 
 #[test]
 fn a_copy_source_keeps_its_own_row() {
-    let files = assemble_repository_files(b"source.md\0copy.md\0", b"", b"C  copy.md\0source.md\0")
-        .unwrap();
+    let files = listed_files(
+        b"H source.md\0H copy.md\0",
+        b"2 C. N... 100644 100644 100644 a b C100 copy.md\0source.md\0",
+    );
     assert_eq!(
         files
             .iter()

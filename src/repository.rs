@@ -90,6 +90,16 @@ const BINARY_SNIFF_BYTES: usize = 8000;
 const MAX_UNTRACKED_STATUS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_UNTRACKED_STATUS_FILES: usize = 4096;
 
+/// Stdout budget for each of the two reads in [`RepositoryService::file_inventory`].
+///
+/// A 100,000-file checkout with 60-byte paths lists in about 6 MiB, and its
+/// v2 status grows by roughly 175 bytes per changed path, so a checkout that
+/// size with every file changed would pass the executor's general-purpose
+/// 16 MiB default. Both reads therefore have an explicit 64 MiB budget.
+/// Exceeding either aborts the read with [`ProcessFailureKind::OutputLimit`],
+/// never a partial inventory.
+pub const MAX_FILE_INVENTORY_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RepositoryId(pub Uuid);
@@ -540,6 +550,40 @@ pub enum ConflictKind {
     BothModified,
 }
 
+impl ChangeKind {
+    /// The status letter Git reports for this kind in one half of an XY code.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Modified => b'M',
+            Self::TypeChanged => b'T',
+            Self::Added => b'A',
+            Self::Deleted => b'D',
+            Self::Renamed => b'R',
+            Self::Copied => b'C',
+            Self::Unmerged => b'U',
+            Self::Untracked => b'?',
+            Self::Ignored => b'!',
+            // `change_kind_from_code` only stores a single byte here.
+            Self::Unknown(code) => u8::try_from(code).unwrap_or(b'?'),
+        }
+    }
+}
+
+impl ConflictKind {
+    /// The XY pair Git reports for this conflict.
+    pub fn code(self) -> [u8; 2] {
+        match self {
+            Self::BothDeleted => *b"DD",
+            Self::AddedByUs => *b"AU",
+            Self::DeletedByThem => *b"UD",
+            Self::AddedByThem => *b"UA",
+            Self::DeletedByUs => *b"DU",
+            Self::BothAdded => *b"AA",
+            Self::BothModified => *b"UU",
+        }
+    }
+}
+
 /// One changed path in one area.
 ///
 /// A path that is modified in the index *and* again in the worktree produces
@@ -899,6 +943,32 @@ pub struct WorkingFiles {
     /// Failed lazy folder reads, retained until the user explicitly retries.
     #[serde(default)]
     pub ignored_directory_errors: std::collections::BTreeMap<RepoPath, String>,
+}
+
+/// The working-file listing and status behind one repository file-list read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInventory {
+    /// Indexed and untracked files, with the same contract as [`WorkingFiles`].
+    /// Status-only paths, such as staged deletions, remain in `status.entries`.
+    pub files: WorkingFiles,
+    pub status: StatusSnapshot,
+    pub digest: FileInventoryDigest,
+}
+
+/// SHA-256 of both length-prefixed, raw NUL-delimited outputs behind one
+/// [`FileInventory`]. Equal digests let a caller detect an unchanged read
+/// without parsing it, comparing lossy display paths, or conflating the
+/// listing with status records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileInventoryDigest([u8; 32]);
+
+/// What one [`RepositoryService::file_inventory`] read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileInventoryRead {
+    /// Git's raw output is byte-for-byte what the caller's digest describes,
+    /// so nothing was parsed.
+    Unchanged,
+    Changed(Box<FileInventory>),
 }
 
 /// The paths one worktree's index tracks, for watching them.
@@ -2583,6 +2653,17 @@ pub fn parse_working_files(output: &[u8]) -> Result<WorkingFiles, GitParseError>
     })
 }
 
+fn file_inventory_digest(files: &[u8], status: &[u8]) -> FileInventoryDigest {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for part in [files, status] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    FileInventoryDigest(hasher.finalize().into())
+}
+
 /// Parses `git ls-files -t -z` index records into each path and whether its
 /// entry is skip-worktree (`S`). Conflict stages repeat a path.
 fn parse_tagged_index_paths(output: &[u8]) -> Result<Vec<(RepoPath, bool)>, GitParseError> {
@@ -3894,6 +3975,64 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<StatusSnapshot, RepositoryError> {
         self.status_with_untracked(worktree, true, cancellation)
+    }
+
+    /// Reads the file list and v2 status through the bounded, cancellable executor.
+    ///
+    /// It runs only `git ls-files` and `git status` and adds no enrichment of its
+    /// own: no file contents, line counts, remote queries or ahead/behind
+    /// counts. `git status` may still hash changed files to tell whether they
+    /// were modified. Each Git command uses
+    /// [`MAX_FILE_INVENTORY_OUTPUT_BYTES`]; a process, output-limit or parse
+    /// failure returns an error rather than an incomplete inventory.
+    ///
+    /// When both outputs hash to `previous`, nothing is parsed and the read
+    /// reports [`FileInventoryRead::Unchanged`]: a periodic refresh of an idle
+    /// worktree then costs two Git reads and a hash rather than a path
+    /// allocation for every file in it.
+    pub fn file_inventory(
+        &self,
+        worktree: &Path,
+        previous: Option<FileInventoryDigest>,
+        cancellation: &CancellationToken,
+    ) -> Result<FileInventoryRead, RepositoryError> {
+        let files_output = self.run_checked(
+            &self
+                .working_files_command(worktree)
+                .output_limits(MAX_FILE_INVENTORY_OUTPUT_BYTES, DEFAULT_STDERR_LIMIT),
+            cancellation,
+        )?;
+        // `--no-ahead-behind`: a file list has no use for the walk that
+        // counts commits against the upstream, and without the counts a
+        // fetch changes the digest only when the branch starts or stops
+        // matching its upstream.
+        let status_output = self.run_checked(
+            &self
+                .git_read(
+                    worktree,
+                    [
+                        "status",
+                        "--porcelain=v2",
+                        "--branch",
+                        "--no-ahead-behind",
+                        "--untracked-files=all",
+                        "-z",
+                    ],
+                )
+                .output_limits(MAX_FILE_INVENTORY_OUTPUT_BYTES, DEFAULT_STDERR_LIMIT),
+            cancellation,
+        )?;
+        let digest = file_inventory_digest(&files_output.stdout, &status_output.stdout);
+        if previous == Some(digest) {
+            return Ok(FileInventoryRead::Unchanged);
+        }
+        let files = invalid_output(parse_working_files(&files_output.stdout), files_output)?;
+        let status = invalid_output(parse_status(&status_output.stdout), status_output)?;
+        Ok(FileInventoryRead::Changed(Box::new(FileInventory {
+            files,
+            status,
+            digest,
+        })))
     }
 
     pub fn status_with_untracked(
@@ -7341,6 +7480,335 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         })
+    }
+
+    mod file_inventory {
+        use super::*;
+
+        fn read_since(
+            files: &[u8],
+            status: &[u8],
+            previous: Option<FileInventoryDigest>,
+        ) -> FileInventoryRead {
+            fake_service(vec![success(files), success(status)])
+                .file_inventory(Path::new("/repo"), previous, &CancellationToken::new())
+                .unwrap()
+        }
+
+        fn read(files: &[u8], status: &[u8]) -> FileInventory {
+            match read_since(files, status, None) {
+                FileInventoryRead::Changed(inventory) => *inventory,
+                FileInventoryRead::Unchanged => panic!("a read without a digest always lists"),
+            }
+        }
+
+        #[test]
+        fn preserves_byte_exact_paths_and_both_change_areas() {
+            let mut status = status_headers();
+            status.extend_from_slice(
+                b"1 MM N... 100644 100644 100644 a b odd \xfe name\0? untracked \xff\t\nname\0",
+            );
+            let inventory = read(
+                b"H with spaces.txt\0? untracked \xff\t\nname\0H odd \xfe name\0",
+                &status,
+            );
+            assert_eq!(
+                inventory
+                    .files
+                    .paths
+                    .iter()
+                    .map(RepoPath::as_bytes)
+                    .collect::<Vec<_>>(),
+                vec![
+                    &b"odd \xfe name"[..],
+                    b"untracked \xff\t\nname",
+                    b"with spaces.txt"
+                ]
+            );
+            assert_eq!(inventory.files.tracked_count, 2);
+            let entries = &inventory.status.entries;
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries[0].path.as_bytes(), b"odd \xfe name");
+            assert_eq!(entries[0].area, ChangeArea::Staged);
+            assert_eq!(entries[1].path, entries[0].path);
+            assert_eq!(entries[1].area, ChangeArea::Unstaged);
+            assert_eq!(entries[0].kind, ChangeKind::Modified);
+            assert_eq!(entries[1].kind, ChangeKind::Modified);
+            assert_eq!(entries[2].path.as_bytes(), b"untracked \xff\t\nname");
+            assert_eq!(entries[2].area, ChangeArea::Untracked);
+            assert_eq!(inventory.status.dirty.staged, 1);
+            assert_eq!(inventory.status.dirty.unstaged, 1);
+            assert_eq!(inventory.status.dirty.untracked, 1);
+        }
+
+        #[test]
+        fn retains_conflicts_and_both_deletion_areas() {
+            let conflicts = [
+                ("DD", ConflictKind::BothDeleted),
+                ("AU", ConflictKind::AddedByUs),
+                ("UD", ConflictKind::DeletedByThem),
+                ("UA", ConflictKind::AddedByThem),
+                ("DU", ConflictKind::DeletedByUs),
+                ("AA", ConflictKind::BothAdded),
+                ("UU", ConflictKind::BothModified),
+            ];
+            let mut files = b"H unstaged deletion\0".to_vec();
+            let mut status = status_headers();
+            for (xy, _) in conflicts {
+                // An unmerged index can list three stages of the same path.
+                for _ in 0..3 {
+                    files.extend_from_slice(format!("M conflict {xy}\0").as_bytes());
+                }
+                status.extend_from_slice(
+                    format!("u {xy} N... 100644 100644 100644 100644 a b c conflict {xy}\0")
+                        .as_bytes(),
+                );
+            }
+            status.extend_from_slice(b"1 D. N... 100644 000000 000000 a b staged deletion\0\x31 .D N... 100644 100644 000000 a b unstaged deletion\0");
+            let inventory = read(&files, &status);
+            assert_eq!(inventory.files.paths.len(), 8);
+            assert_eq!(inventory.files.tracked_count, 8);
+            assert!(!inventory.files.paths.contains(&path("staged deletion")));
+            assert!(inventory.files.paths.contains(&path("unstaged deletion")));
+            for (entry, (xy, kind)) in inventory.status.entries.iter().zip(conflicts) {
+                assert_eq!(entry.path, path(&format!("conflict {xy}")));
+                assert_eq!(entry.area, ChangeArea::Conflict);
+                assert_eq!(entry.kind, ChangeKind::Unmerged);
+                assert_eq!(entry.conflict, Some(kind));
+            }
+            let deleted = &inventory.status.entries[7..];
+            assert_eq!(deleted.len(), 2);
+            assert_eq!(deleted[0].path, path("staged deletion"));
+            assert_eq!(deleted[0].area, ChangeArea::Staged);
+            assert_eq!(deleted[1].path, path("unstaged deletion"));
+            assert_eq!(deleted[1].area, ChangeArea::Unstaged);
+            assert!(
+                deleted
+                    .iter()
+                    .all(|entry| entry.kind == ChangeKind::Deleted)
+            );
+            assert_eq!(inventory.status.dirty.conflicted, 7);
+        }
+
+        #[test]
+        fn distinguishes_copy_and_rename_sources_in_each_area() {
+            for (xy, score, area, kind) in [
+                ("RM", "R100", ChangeArea::Staged, ChangeKind::Renamed),
+                ("CM", "C100", ChangeArea::Staged, ChangeKind::Copied),
+                (".R", "R100", ChangeArea::Unstaged, ChangeKind::Renamed),
+                (".C", "C100", ChangeArea::Unstaged, ChangeKind::Copied),
+            ] {
+                let mut files = b"H new \xfe name\0".to_vec();
+                // Copies retain their source. An unstaged rename still has
+                // its source in the index; the row converter handles that.
+                if kind == ChangeKind::Copied || area == ChangeArea::Unstaged {
+                    files.extend_from_slice(b"H old \xff name\0");
+                }
+                let mut status = status_headers();
+                status.extend_from_slice(
+                    format!("2 {xy} N... 100644 100644 100644 a b {score} ").as_bytes(),
+                );
+                status.extend_from_slice(b"new \xfe name\0old \xff name\0");
+                let inventory = read(&files, &status);
+                let entry = &inventory.status.entries[0];
+                assert_eq!(entry.path.as_bytes(), b"new \xfe name");
+                assert_eq!(
+                    entry.old_path.as_ref().unwrap().as_bytes(),
+                    b"old \xff name"
+                );
+                assert_eq!(entry.area, area);
+                assert_eq!(entry.kind, kind);
+                assert_eq!(inventory.files.paths.len(), if xy == "RM" { 1 } else { 2 });
+                if area == ChangeArea::Staged {
+                    let modified = &inventory.status.entries[1];
+                    assert_eq!(modified.path, entry.path);
+                    assert_eq!(modified.area, ChangeArea::Unstaged);
+                    assert_eq!(modified.kind, ChangeKind::Modified);
+                    assert_eq!(modified.old_path, None);
+                }
+            }
+        }
+
+        #[test]
+        fn digest_detects_unchanged_reads_and_changes_to_either_output() {
+            let status = status_headers();
+            let first = read(b"H file\0", &status);
+            let same = read(b"H file\0", &status);
+            assert_eq!(first.digest, same.digest);
+            assert_eq!(first, same);
+            assert_ne!(first.digest, read(b"H file\0? other\0", &status).digest);
+            let mut modified = status;
+            modified.extend_from_slice(b"1 .M N... 100644 100644 100644 a b file\0");
+            assert_ne!(first.digest, read(b"H file\0", &modified).digest);
+            // Both names display as the same replacement character, but the
+            // inventory identity must retain the different underlying bytes.
+            assert_ne!(
+                read(b"H \xff\0", &modified).digest,
+                read(b"H \xfe\0", &modified).digest
+            );
+            assert_ne!(
+                file_inventory_digest(b"a", b"bc"),
+                file_inventory_digest(b"ab", b"c")
+            );
+        }
+
+        #[test]
+        fn status_codes_round_trip_through_their_kinds() {
+            for code in *b"MTADRCU?!X" {
+                assert_eq!(change_kind_from_code(code).code(), code);
+            }
+            for xy in [b"DD", b"AU", b"UD", b"UA", b"DU", b"AA", b"UU"] {
+                assert_eq!(parse_conflict_kind(xy, 0).unwrap().code(), *xy);
+            }
+        }
+
+        #[test]
+        fn skips_parsing_only_when_both_outputs_match_the_previous_digest() {
+            let status = status_headers();
+            let first = read(b"H file\0", &status);
+            assert_eq!(
+                read_since(b"H file\0", &status, Some(first.digest)),
+                FileInventoryRead::Unchanged
+            );
+            assert!(matches!(
+                read_since(b"H file\0? new\0", &status, Some(first.digest)),
+                FileInventoryRead::Changed(inventory) if inventory.files.paths.len() == 2
+            ));
+            let error = fake_service(vec![success(b"H truncated"), success(&status)])
+                .file_inventory(
+                    Path::new("/repo"),
+                    Some(first.digest),
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+            assert!(matches!(error, RepositoryError::InvalidGitOutput { .. }));
+        }
+
+        #[test]
+        fn uses_two_read_only_commands_with_explicit_output_budgets() {
+            let service = fake_service(vec![success(b""), success(&status_headers())]);
+            service
+                .file_inventory(Path::new("/repo"), None, &CancellationToken::new())
+                .unwrap();
+            let commands = service.executor.commands.lock().unwrap();
+            assert_eq!(commands.len(), 2);
+            assert!(commands[0].arguments.contains(&OsString::from("-tco")));
+            assert!(
+                commands[0]
+                    .arguments
+                    .contains(&OsString::from("--exclude-standard"))
+            );
+            assert!(
+                commands[1]
+                    .arguments
+                    .contains(&OsString::from("--porcelain=v2"))
+            );
+            assert!(
+                commands[1]
+                    .arguments
+                    .contains(&OsString::from("--untracked-files=all"))
+            );
+            assert!(
+                commands[1]
+                    .arguments
+                    .contains(&OsString::from("--no-ahead-behind"))
+            );
+            for command in commands.iter() {
+                assert_eq!(command.stdout_limit, MAX_FILE_INVENTORY_OUTPUT_BYTES);
+                assert_eq!(command.stderr_limit, DEFAULT_STDERR_LIMIT);
+                assert!(command.timeout.is_some());
+                assert!(command.arguments.contains(&OsString::from("-z")));
+                assert!(
+                    command
+                        .arguments
+                        .contains(&OsString::from("--no-optional-locks"))
+                );
+                assert!(
+                    command
+                        .arguments
+                        .contains(&OsString::from("diff.autoRefreshIndex=false"))
+                );
+                assert!(
+                    command
+                        .arguments
+                        .contains(&OsString::from("core.fsmonitor=false"))
+                );
+                assert_eq!(
+                    command.environment.get(OsStr::new("GIT_OPTIONAL_LOCKS")),
+                    Some(&OsString::from("0"))
+                );
+                for name in [
+                    "GIT_DIR",
+                    "GIT_WORK_TREE",
+                    "GIT_INDEX_FILE",
+                    "GIT_COMMON_DIR",
+                ] {
+                    assert!(command.removed_environment.contains(&OsString::from(name)));
+                }
+            }
+        }
+
+        #[test]
+        fn propagates_executor_failures_without_returning_a_partial_inventory() {
+            for kind in [
+                ProcessFailureKind::OutputLimit,
+                ProcessFailureKind::TimedOut,
+                ProcessFailureKind::Cancelled,
+            ] {
+                for failing_read in 0..2 {
+                    let failure = ProcessFailure {
+                        kind,
+                        program: PathBuf::from("git"),
+                        exit_code: None,
+                        signal: None,
+                        stdout: b"truncated excerpt".to_vec(),
+                        stderr: Vec::new(),
+                        message: "inventory read failed".into(),
+                        started: true,
+                    };
+                    let mut outputs = Vec::new();
+                    if failing_read == 1 {
+                        outputs.push(success(b"H file\0"));
+                    }
+                    outputs.push(Err(failure));
+                    let service = fake_service(outputs);
+                    let error = service
+                        .file_inventory(Path::new("/repo"), None, &CancellationToken::new())
+                        .unwrap_err();
+                    assert!(
+                        matches!(error, RepositoryError::Process(failure) if failure.kind == kind)
+                    );
+                    assert_eq!(
+                        service.executor.commands.lock().unwrap().len(),
+                        failing_read + 1
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn preserves_parse_failure_diagnostics_for_either_read() {
+            for (files, status) in [
+                (&b"H truncated"[..], status_headers()),
+                (&b"H file\0"[..], b"? truncated".to_vec()),
+            ] {
+                let service = fake_service(vec![success(files), success(&status)]);
+                let error = service
+                    .file_inventory(Path::new("/repo"), None, &CancellationToken::new())
+                    .unwrap_err();
+                let RepositoryError::InvalidGitOutput { process, .. } = error else {
+                    panic!("expected parse failure, got {error:?}");
+                };
+                assert_eq!(
+                    process.stdout,
+                    if files.ends_with(&[0]) {
+                        &status
+                    } else {
+                        files
+                    }
+                );
+            }
+        }
     }
 
     #[test]
