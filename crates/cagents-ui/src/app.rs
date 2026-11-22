@@ -16337,6 +16337,11 @@ impl Application for Cagents {
         _theme: &cosmic::cosmic_theme::Theme,
     ) -> Task<Message> {
         self.document_tone_stale = self.settings.app_theme == AppTheme::System;
+        if self.document_tone_stale {
+            // This hook is outside `update()`, so it cannot rely on the
+            // normal reconciliation pass to discover the stale document.
+            self.refresh_ui.arm_reconciliation();
+        }
         Task::none()
     }
 

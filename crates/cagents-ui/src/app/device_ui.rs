@@ -244,10 +244,10 @@ impl Cagents {
         generation: u64,
         result: Result<crate::device_service::Navigation, String>,
     ) -> Task<Message> {
-        self.refresh_ui.projects.remove(&project_id);
         if self.repository_generations.get(&project_id) != Some(&generation) {
             return Task::none();
         }
+        self.refresh_ui.projects.remove(&project_id);
         let Some(project) = self
             .sidebar_model
             .projects
@@ -1607,7 +1607,10 @@ mod tests {
         app.refresh_ui.focused = true;
         app.refresh_ui.schedule_remote_started(project_id);
         drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
-        assert!(!app.refresh_ui.projects.contains_key(&closed));
+        assert!(
+            app.refresh_ui.projects.contains_key(&closed),
+            "a late result must not erase a newer remote read's fence"
+        );
         assert!(app.refresh_ui.projects.contains_key(&other));
 
         // Exercise the actual document-link entry point in the isolated remote process.

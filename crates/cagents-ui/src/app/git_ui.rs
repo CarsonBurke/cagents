@@ -190,9 +190,17 @@ impl State {
             .then(|| self.watch_retry_at.unwrap_or(now));
         let scan = self
             .entries
-            .values()
-            .filter(|entry| entry.fallback.is_some() || entry.read_failure.is_some())
-            .map(|entry| entry.last_full_scan + FALLBACK_INTERVAL)
+            .iter()
+            // A past deadline must always name work that can actually start.
+            // A queued or running entry already has its completion path; if
+            // it occupied the earliest deadline it would keep a stable past
+            // subscription id and hide every other refresh source.
+            .filter(|(project, entry)| {
+                (entry.fallback.is_some() || entry.read_failure.is_some())
+                    && entry.cancellation.is_none()
+                    && !self.queue.contains(project)
+            })
+            .map(|(_, entry)| entry.last_full_scan + FALLBACK_INTERVAL)
             .min();
         match (watcher, scan) {
             (Some(watcher), Some(scan)) => Some(watcher.min(scan)),
@@ -652,10 +660,10 @@ impl Cagents {
                 generation,
                 result,
             } => {
-                self.refresh_ui.projects.remove(&project);
                 if self.repository_generations.get(&project) != Some(&generation) {
                     return Task::none();
                 }
+                self.refresh_ui.projects.remove(&project);
                 let (availability, archived) = result
                     .unwrap_or_else(|detail| (GitHubAvailability::Failed { detail }, Vec::new()));
                 self.refresh_ui
@@ -2096,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_remote_completion_releases_its_poll_fence() {
+    fn stale_remote_completion_preserves_the_current_poll_fence() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let project = ProjectId::new();
         app.repository_generations.insert(project, 2);
@@ -2110,7 +2118,7 @@ mod tests {
             result: Err("late reply".into()),
         }));
 
-        assert!(!app.refresh_ui.projects.contains_key(&project));
+        assert!(app.refresh_ui.projects.contains_key(&project));
     }
     #[test]
     fn fallback_local_reads_are_bounded_and_do_not_schedule_remote_reads() {
@@ -2181,6 +2189,45 @@ mod tests {
         assert_eq!(
             state.fallback_refresh_deadline(now),
             Some(now + WATCH_RETRY_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn queued_or_running_fallback_scan_cannot_hold_a_past_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = fixture(&directory.path().join("repo"));
+        let now = Instant::now();
+        let project = ProjectId::new();
+        let mut state = State::default();
+        state.watch_retry_at = Some(now + WATCH_RETRY_INTERVAL);
+        state.entries.insert(
+            project,
+            Entry {
+                snapshot,
+                generation: 1,
+                plan: None,
+                remote_started: false,
+                cancellation: Some(CancellationToken::new()),
+                read_failure: Some("dead mount".into()),
+                read_full_scan: false,
+                catalog_requested: false,
+                pending: Default::default(),
+                fallback: None,
+                last_full_scan: now.checked_sub(FALLBACK_INTERVAL).unwrap(),
+            },
+        );
+
+        assert_eq!(
+            state.fallback_refresh_deadline(now),
+            Some(now + WATCH_RETRY_INTERVAL),
+            "a running fallback read must not mask another actionable deadline"
+        );
+        state.entries.get_mut(&project).unwrap().cancellation = None;
+        state.queue.push_back(project);
+        assert_eq!(
+            state.fallback_refresh_deadline(now),
+            Some(now + WATCH_RETRY_INTERVAL),
+            "a queued fallback read must likewise not retain its old past id"
         );
     }
 

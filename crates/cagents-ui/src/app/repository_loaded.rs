@@ -11,10 +11,10 @@ impl Cagents {
         generation: u64,
         result: Result<Box<LoadedRepository>, String>,
     ) -> Handled {
-        self.refresh_ui.projects.remove(&project_id);
         if self.repository_generations.get(&project_id) != Some(&generation) {
             return ControlFlow::Break(Task::none());
         }
+        self.refresh_ui.projects.remove(&project_id);
         self.refresh_ui.finished(
             project_id,
             result
