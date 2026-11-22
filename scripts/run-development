@@ -1036,8 +1036,9 @@ build_products() {
         "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development --bin cagents
         "$lane" --allow-warnings build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
         "$lane" --allow-warnings build --locked --profile dev-runtime $1 --bin cagents-ui
+        "$lane" --allow-warnings build --locked --profile dev-runtime -p cagents-dictate --features engine --bin cagents-dictate
         if [ -n "$2" ]; then
-            for executable in cagents cagentsd cagents-ui; do
+            for executable in cagents cagentsd cagents-ui cagents-dictate; do
                 stat -c "%n %i %s %.9Y" "$3/$executable"
             done >"$2"
         fi
@@ -1098,7 +1099,7 @@ build_script_watches() {
 # metadata in the shared repository), and every Cargo configuration file
 # Cargo would load from this checkout.
 outside_inputs() {
-    for executable in cagents cagentsd cagents-ui; do
+    for executable in cagents cagentsd cagents-ui cagents-dictate; do
         dependencies=$products/$executable.d
         [ -f "$dependencies" ] || return 1
         # Escaped spaces would split a path; let Cargo decide instead.
@@ -1117,7 +1118,7 @@ outside_inputs() {
     printf 'optional %s/config.toml\noptional %s/config\n' "$cargo_home" "$cargo_home"
 }
 built_executables() {
-    for executable in cagents cagentsd cagents-ui; do
+    for executable in cagents cagentsd cagents-ui cagents-dictate; do
         stat -c '%n %i %s %.9Y' "$products/$executable" || return 1
     done
 }

@@ -281,6 +281,10 @@ build_arguments() {
         ui="$common development,ui"
     fi
     printf '%s\n' "$ui --bin cagents-ui"
+    # Dictation's helper, beside the UI that starts it, once the UI does.
+    if grep -qs '^cagents-dictate *=' "$checkout/crates/cagents-ui/Cargo.toml"; then
+        printf '%s\n' '--locked --profile dev-runtime -p cagents-dictate --features engine --bin cagents-dictate'
+    fi
 }
 
 refuse_running_side() {
@@ -553,6 +557,11 @@ fixture_env() {
             passed+=("$name=${!name}")
         fi
     done
+    # Dictation hears this recording, at the pace of speech, in place of a
+    # microphone the session does not have.
+    if [ -f "$fixture/dictation-input.wav" ]; then
+        passed+=("CAGENTS_DICTATION_INPUT=wav:$fixture/dictation-input.wav")
+    fi
     env -i "${passed[@]}" \
         HOME="$fixture/home" XDG_RUNTIME_DIR="$runtime" \
         XDG_DATA_HOME="$fixture/data" XDG_CONFIG_HOME="$fixture/config" \

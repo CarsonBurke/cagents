@@ -213,6 +213,13 @@ file through the same pipeline a session uses and reports its speed; with
 place of the microphone. Models are downloaded on request into
 `$XDG_DATA_HOME/cagents-speech-models`, shared by every instance, or into
 `CAGENTS_DICTATION_MODELS`; `fixtures/dictation` has a recording to try.
+The UI runs only the helper beside its own executable, so the development
+runner and `scripts/native-evidence` build it with the other three; set both
+variables when starting the runner to dictate from the fixture, or from an
+empty model directory to see the first download. A native-evidence session
+keeps models in its fixture's `data/cagents-speech-models`, empty until one is
+downloaded or copied there with `env`, and dictates from
+`$CAGENTS_EVIDENCE_FIXTURE/dictation-input.wav` when that file exists.
 
 Without arguments, `check:cli`, `check:host`, `check:ui` and `check:browser`
 check all targets, tests included, and `check` runs the first three: what a

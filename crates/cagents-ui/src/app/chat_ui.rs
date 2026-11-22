@@ -92,6 +92,8 @@ mod completion;
 mod coordination;
 #[cfg(test)]
 mod diagnostic_chronology_tests;
+mod dictation;
+pub(in crate::app) use dictation::{chosen_model, megabytes};
 mod disclosure;
 mod failure;
 mod find;
@@ -534,6 +536,23 @@ pub enum Action {
     DismissRestoredWaiting(Target),
     /// Puts away the composer's note of something that didn't happen.
     DismissComposerNote(Target),
+    /// The microphone or its shortcut: start dictating, or stop.
+    Dictate(Target),
+    /// Stop dictating and keep what was said.
+    DictationStop(Target),
+    /// Stop dictating and take back what this dictation wrote.
+    DictationDiscard(Target),
+    /// Agree to download the speech model.
+    DictationDownload(Target),
+    /// Put away dictation's question or its note that it is ready.
+    DictationDismiss(Target),
+    DictationCancelDownload,
+    /// Download or remove a speech model from Settings.
+    DictationInstall(&'static str),
+    DictationRemove(&'static str),
+    DictationUpdate(crate::dictation::Update),
+    /// Let the dictation helper go if nothing has used it since.
+    DictationIdle(u64),
     ComposerActions(Target, bool),
     /// What the reader has typed into the `+` menu's search.
     ComposerActionsQuery(Target, String),
@@ -878,6 +897,16 @@ impl Action {
     fn name(&self) -> &'static str {
         match self {
             Self::PreparationAvailable => "PreparationAvailable",
+            Self::Dictate(..) => "Dictate",
+            Self::DictationStop(..) => "DictationStop",
+            Self::DictationDiscard(..) => "DictationDiscard",
+            Self::DictationDownload(..) => "DictationDownload",
+            Self::DictationDismiss(..) => "DictationDismiss",
+            Self::DictationCancelDownload => "DictationCancelDownload",
+            Self::DictationInstall(..) => "DictationInstall",
+            Self::DictationRemove(..) => "DictationRemove",
+            Self::DictationUpdate(..) => "DictationUpdate",
+            Self::DictationIdle(..) => "DictationIdle",
             Self::UpdateRecoveryAnswered(..) => "UpdateRecoveryAnswered",
             Self::UpdateRecoveryDue => "UpdateRecoveryDue",
             Self::UpdateRecoveryReady => "UpdateRecoveryReady",
@@ -1106,6 +1135,8 @@ impl Action {
                 | Self::PastedImage(..)
                 | Self::PastedText(..)
                 | Self::PasteRefused(..)
+                | Self::DictationUpdate(..)
+                | Self::DictationIdle(..)
                 | Self::ImageSaved(..)
                 | Self::AttachmentsPrepared(..)
                 | Self::ImageLoaded(..)
@@ -1469,6 +1500,8 @@ pub(super) struct State {
     /// What the reader last copied or cut from a composer, when it named the
     /// draft's images, which pasting it into another draft brings along.
     copied_images: Option<draft_images::Copied>,
+    /// Dictation: the helper, the pane listening, and the model download.
+    pub(super) dictation: dictation::Shared,
 }
 impl Default for State {
     fn default() -> Self {
@@ -1509,6 +1542,7 @@ impl Default for State {
             restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
             copied_images: None,
+            dictation: dictation::Shared::default(),
         }
     }
 }
@@ -3497,6 +3531,10 @@ pub(super) struct Runtime {
     /// changes or goes, the model or launch it answered changes, or a real
     /// failure of the same attachment replaces it on the error card.
     composer_note: Option<String>,
+    /// What dictation shows in this composer, and the download's progress
+    /// when that is what it shows.
+    dictation: Option<dictation::Pane>,
+    dictation_progress: Option<(u64, u64)>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
     /// A first message came back because the shared workspace refused to
@@ -3805,6 +3843,7 @@ impl Runtime {
         for bookmark in self.attachment_bookmarks.values_mut() {
             bookmark.valid = false;
         }
+        self.dictation_lost_place();
         self.attachment_jobs.clear();
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
@@ -3900,6 +3939,7 @@ impl Runtime {
                         for bookmark in self.attachment_bookmarks.values_mut() {
                             bookmark.changed(&change);
                         }
+                        self.dictation_edited(&change);
                         self.composer_undo.record(
                             change,
                             kind,
@@ -3912,6 +3952,7 @@ impl Runtime {
                         for bookmark in self.attachment_bookmarks.values_mut() {
                             bookmark.valid = false;
                         }
+                        self.dictation_lost_place();
                         // The edit could not be measured, so no step can
                         // describe it; older steps would replay over text
                         // they do not know.
@@ -4102,6 +4143,7 @@ impl Runtime {
         for bookmark in self.attachment_bookmarks.values_mut() {
             bookmark.valid = false;
         }
+        self.dictation_lost_place();
         self.cancel_invalid_attachment_jobs();
         self.reconcile_references(inline);
         self.completion.restart(true);
@@ -4230,6 +4272,7 @@ impl Runtime {
                         other.cursor.position = change.inserted_end();
                     }
                 }
+                self.dictation_edited(&change);
                 self.cancel_invalid_attachment_jobs();
                 if current != bookmark.cursor
                     && let Some(mapped) = attachment_draft::mapped(current, &change)
@@ -4332,6 +4375,7 @@ impl Runtime {
                     for bookmark in self.attachment_bookmarks.values_mut() {
                         bookmark.changed(&change);
                     }
+                    self.dictation_edited(&change);
                     if let Some(mapped) = attachment_draft::mapped(current, &change) {
                         attachment_draft::move_to(&mut self.composer, mapped);
                     }
@@ -4956,6 +5000,7 @@ impl Runtime {
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.resend = None;
+        self.dictation_draft_replaced();
     }
 
     fn new(
@@ -5069,6 +5114,8 @@ impl Runtime {
             warm: None,
             error: None,
             composer_note: None,
+            dictation: None,
+            dictation_progress: None,
             capacity_refused: false,
             view_refused: None,
             close_refusal: None,
@@ -10218,7 +10265,7 @@ impl Cagents {
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
         let wakes = Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)));
-        let mut subscriptions = vec![wakes];
+        let mut subscriptions = vec![wakes, self.dictation_subscription()];
         for card in self.cards.values() {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
@@ -14741,6 +14788,15 @@ impl Cagents {
                 }
             }
             Action::Composer(target, action) => {
+                // Typing takes over from dictation: it stops listening, and
+                // the last words still land before what was typed.
+                let stop = if action.is_edit()
+                    && let Some(id) = self.dictation_listening(target)
+                {
+                    self.dictation_stop(target, id, None)
+                } else {
+                    Task::none()
+                };
                 let mut files = None;
                 // The editor's own menu pastes here rather than through
                 // `Action::Paste`.
@@ -14774,6 +14830,7 @@ impl Cagents {
                     }
                     if rescroll {
                         return Task::batch([
+                            stop,
                             view::completion_scroll(target, 0.0),
                             files.map_or_else(Task::none, |directory| {
                                 self.load_chat_files(target, directory)
@@ -14782,8 +14839,9 @@ impl Cagents {
                     }
                 }
                 if let Some(directory) = files {
-                    return self.load_chat_files(target, directory);
+                    return Task::batch([stop, self.load_chat_files(target, directory)]);
                 }
+                return stop;
             }
             Action::Paste(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -15004,6 +15062,10 @@ impl Cagents {
                 return Task::batch([submitted, focus]);
             }
             Action::Submit(target, mode) => {
+                // Sending while dictating waits for the last words.
+                if let Some(task) = self.dictation_send(target, mode) {
+                    return task;
+                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -15460,6 +15522,34 @@ impl Cagents {
                 }
                 return self.chat_send(target, command, false);
             }
+            Action::Dictate(target) => return self.dictation_toggle(target, None),
+            Action::DictationStop(target) => {
+                return match self.dictation_listening(target) {
+                    Some(id) => self.dictation_stop(target, id, None),
+                    None => Task::none(),
+                };
+            }
+            Action::DictationDiscard(target) => return self.dictation_discard(target),
+            Action::DictationDownload(target) => return self.dictation_download(target),
+            Action::DictationDismiss(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && !runtime
+                        .dictation
+                        .as_ref()
+                        .is_some_and(dictation::Pane::is_session)
+                {
+                    runtime.dictation = None;
+                }
+            }
+            Action::DictationCancelDownload => self.dictation_cancel_install(),
+            Action::DictationInstall(model) => {
+                if let Err(message) = self.dictation_install(model) {
+                    self.chat_ui.dictation.problem = Some(message);
+                }
+            }
+            Action::DictationRemove(model) => self.dictation_remove(model),
+            Action::DictationUpdate(update) => return self.dictation_update(update),
+            Action::DictationIdle(uses) => self.dictation_idle(uses),
             Action::Interrupt(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();

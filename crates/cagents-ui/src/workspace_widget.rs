@@ -59,6 +59,7 @@ pub enum GlobalShortcut {
     ChatAccount,
     ChatModel,
     ChatPermissions,
+    Dictate,
     ToggleInspector,
     OpenSettings,
     OpenWorktrees,
@@ -178,6 +179,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::ChatAccount,
         label: "Choose chat account",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::Dictate,
+        label: "Dictate",
         repeatable: false,
         scope: ShortcutScope::Chat,
     },
@@ -416,6 +423,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::ChatPermissions => &shortcuts.chat_permissions,
         GlobalShortcut::ChatModel => &shortcuts.chat_model,
         GlobalShortcut::ChatAccount => &shortcuts.chat_account,
+        GlobalShortcut::Dictate => &shortcuts.dictate,
         GlobalShortcut::ToggleInspector => &shortcuts.toggle_inspector,
         GlobalShortcut::OpenSettings => &shortcuts.open_settings,
         GlobalShortcut::OpenWorktrees => &shortcuts.open_worktrees,
@@ -472,6 +480,7 @@ pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
         ShortcutKey::ArrowUp => Key::Named(Named::ArrowUp),
         ShortcutKey::ArrowDown => Key::Named(Named::ArrowDown),
         ShortcutKey::Tab => Key::Named(Named::Tab),
+        ShortcutKey::Space => Key::Character(" ".into()),
         ShortcutKey::PageUp => Key::Named(Named::PageUp),
         ShortcutKey::PageDown => Key::Named(Named::PageDown),
         ShortcutKey::Function(number) => Key::Named(match number {
@@ -983,6 +992,8 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
+            // The space bar arrives as the character it types.
+            ShortcutKey::Space => key.as_ref() == keyboard::Key::Character(" "),
             ShortcutKey::PageUp => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageUp)

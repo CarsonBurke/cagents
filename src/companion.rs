@@ -13,6 +13,8 @@ pub enum Product {
     Ui,
     Daemon,
     Editor,
+    /// The dictation helper the UI starts while someone dictates.
+    Dictate,
 }
 impl Product {
     pub fn file_name(self) -> OsString {
@@ -24,6 +26,7 @@ impl Product {
             Self::Ui => "cagents-ui",
             Self::Daemon => "cagentsd",
             Self::Editor => "ceditor",
+            Self::Dictate => "cagents-dictate",
         });
         name.push(suffix);
         name
@@ -63,6 +66,7 @@ mod tests {
             (Product::Ui, "cagents-ui"),
             (Product::Daemon, "cagentsd"),
             (Product::Editor, "ceditor"),
+            (Product::Dictate, "cagents-dictate"),
         ] {
             assert_eq!(product.file_name_with_suffix(""), OsString::from(stem));
             assert_eq!(

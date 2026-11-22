@@ -219,6 +219,20 @@ pub(super) struct SettingsContext<'a> {
     pub providers: Vec<(crate::agent::Provider, &'static str)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
+    pub dictation: DictationSettings<'a>,
+}
+
+/// How the speech models stand, for the Dictation settings.
+#[derive(Default)]
+pub(super) struct DictationSettings<'a> {
+    /// This copy of cagents has the dictation helper.
+    pub available: bool,
+    /// The models downloaded.
+    pub installed: &'a [&'static str],
+    /// The download under way: its model, bytes done and bytes in all.
+    pub downloading: Option<(&'static str, u64, u64)>,
+    /// Why the last download or removal failed.
+    pub problem: Option<&'a str>,
 }
 
 fn settings_category_controls<'a>(
@@ -578,7 +592,8 @@ fn settings_category_controls<'a>(
                 ),
             ]
         }
-        SettingsCategory::NativeChat => vec![settings_group(
+        SettingsCategory::NativeChat => vec![
+        settings_group(
             "Native chat",
             "Message composition and conversation presentation.",
             vec![
@@ -603,7 +618,9 @@ fn settings_category_controls<'a>(
                 )
                 .keywords("tool_groups"),
             ],
-        )],
+        ),
+        dictation_group(draft, &context.dictation),
+        ],
         SettingsCategory::Inspector => vec![
             settings_group(
                 "Inspector",
@@ -1399,12 +1416,133 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
     )
 }
 
+/// Dictation: which speech model, downloading or removing it, and whether
+/// stopping sends.
+fn dictation_group<'a>(
+    draft: &'a SettingsDraft,
+    dictation: &DictationSettings<'a>,
+) -> Group<'a, Message> {
+    use cagents_dictate::catalog;
+    if !dictation.available {
+        return settings_group(
+            "Dictation",
+            "Dictation is not part of this installation of cagents yet.",
+            Vec::new(),
+        );
+    }
+    let chosen = chat_ui::chosen_model(&draft.dictation_model);
+    let rows: Vec<Element<'a, Message>> =
+        catalog::MODELS
+            .iter()
+            .map(|model| {
+                let selected = model.id == chosen.id;
+                let installed = dictation.installed.contains(&model.id);
+                let downloading = dictation
+                    .downloading
+                    .filter(|(id, _, _)| *id == model.id)
+                    .map(|(_, done, total)| (done, total));
+                let size = chat_ui::megabytes(model.size());
+                let status = match downloading {
+                    Some((done, total)) if total > 0 => format!(
+                        "Downloading {} of {} MB",
+                        chat_ui::megabytes(done),
+                        chat_ui::megabytes(total)
+                    ),
+                    Some(_) => "Downloading…".to_owned(),
+                    None if installed => format!("Downloaded, {size} MB"),
+                    None => format!("{size} MB to download"),
+                };
+                let marker: Element<'a, Message> = if selected {
+                    settings_icon(Icon::Select).into()
+                } else {
+                    iced::widget::Space::new().width(16).height(16).into()
+                };
+                let choice = crate::interaction::hover(
+                    widget::button::custom(
+                        widget::row::with_children(vec![
+                            marker,
+                            widget::column::with_children(vec![
+                                design::body(model.name).into(),
+                                design::caption(format!("{} · {status}", model.languages))
+                                    .class(cosmic::theme::Text::Custom(design::secondary_text))
+                                    .into(),
+                            ])
+                            .into(),
+                        ])
+                        .spacing(space::S)
+                        .align_y(Alignment::Center),
+                    )
+                    .name(model.name)
+                    .class(crate::sidebar::sidebar_button_style(selected))
+                    .selected(selected)
+                    .padding([space::XS, space::S])
+                    .width(Length::Fill)
+                    .on_press(Message::SettingsChanged {
+                        field: SettingsField::DictationModel,
+                        value: model.id.to_owned(),
+                    }),
+                );
+                let command: Element<'a, Message> =
+                    if downloading.is_some() {
+                        crate::ui_controls::button::quiet("Cancel")
+                            .on_press(Message::ChatUi(chat_ui::Action::DictationCancelDownload))
+                            .into()
+                    } else if installed {
+                        crate::ui_controls::button::quiet("Remove")
+                            .on_press(Message::ChatUi(chat_ui::Action::DictationRemove(model.id)))
+                            .into()
+                    } else {
+                        crate::ui_controls::button::secondary("Download")
+                            .on_press_maybe(dictation.downloading.is_none().then(|| {
+                                Message::ChatUi(chat_ui::Action::DictationInstall(model.id))
+                            }))
+                            .into()
+                    };
+                widget::row::with_children(vec![choice, command])
+                    .spacing(space::S)
+                    .align_y(Alignment::Center)
+                    .into()
+            })
+            .collect();
+    let models = setting_field(
+        "Speech model",
+        format!(
+            "Speech is recognized on this computer; your voice is not sent anywhere. \
+             The model is downloaded once, here or when you first dictate. {}.",
+            chosen.attribution
+        ),
+        widget::column::with_children(rows)
+            .spacing(space::XS)
+            .width(Length::Fill)
+            .into(),
+    )
+    .error(dictation.problem)
+    .keywords("dictation speech voice microphone parakeet dictation_model");
+    let sends = crate::settings_widgets::toggle(
+        "Send when dictation stops",
+        "Send the message once the last words are written in. Otherwise it waits in the draft for you to read and send.",
+        draft.dictation_sends,
+        |enabled| Message::SettingsChanged {
+            field: SettingsField::DictationSends,
+            value: enabled.to_string(),
+        },
+    )
+    .keywords("dictation speech voice dictation_sends");
+    settings_group(
+        "Dictation",
+        "Speak a message instead of typing it, with the microphone beside the draft or its shortcut.",
+        vec![models, sends],
+    )
+}
+
 fn shortcut_group(field: SettingsField) -> &'static str {
     use workspace_widget::GlobalShortcut as Action;
     match field.shortcut_action().expect("shortcut field") {
-        Action::ChatPermissions | Action::ChatModel | Action::ChatAccount | Action::NewThread => {
-            "Chat"
-        }
+        Action::ChatPermissions
+        | Action::ChatModel
+        | Action::ChatAccount
+        | Action::Dictate
+        | Action::NewThread => "Chat",
         Action::ReviewToggleViewed
         | Action::ReviewNextFile
         | Action::ReviewPreviousFile
@@ -1883,6 +2021,7 @@ mod keyboard_table_tests {
                 detail: String::new(),
             },
             testing_notification: false,
+            dictation: DictationSettings::default(),
         };
         let mut element = settings_layout(category, &draft, "", &context, width);
         let mut tree = Tree::new(element.as_widget());
