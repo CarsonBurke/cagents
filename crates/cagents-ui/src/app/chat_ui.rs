@@ -4495,6 +4495,11 @@ impl Runtime {
         self.replace_attachments(attachments);
         self.history_cursor = None;
         self.replace_draft(composer);
+        // Its own undo history comes back with it.
+        if let Some((undo, detached)) = self.composer_undo_stash.take() {
+            self.composer_undo = undo;
+            self.detached_attachments = detached;
+        }
     }
 
     /// Consumes the shown prompt while preserving a draft saved by history.
@@ -4558,13 +4563,6 @@ impl Runtime {
         self.replace_attachments(attachments);
         self.history_cursor = next;
         self.replace_draft(composer);
-        // Back at the draft, its own undo history comes back with it.
-        if next.is_none()
-            && let Some((undo, detached)) = self.composer_undo_stash.take()
-        {
-            self.composer_undo = undo;
-            self.detached_attachments = detached;
-        }
     }
 
     /// Whether Up may reach history, and Down is browsing it. Logical line
