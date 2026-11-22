@@ -10,17 +10,41 @@ pub(in crate::host) struct CloseRemoval {
     pub(in crate::host) current: Session,
 }
 
+/// Whether a resident can hold provider work, and so a capacity slot. A
+/// read-only history reader pages saved data with no provider process and
+/// never owns work; counting it would let paused or saved panes, which cost
+/// a transcript page, refuse a chat that would run.
+fn holds_slot(record: &Record) -> bool {
+    !record.handle.is_read_only_history()
+}
+
+pub(super) fn holding(state: &HostState, id: &TerminalId) -> bool {
+    state.chats.get(id).is_some_and(holds_slot)
+}
+
+/// Residents that hold a slot.
+fn holders(state: &HostState) -> usize {
+    state
+        .chats
+        .values()
+        .filter(|record| holds_slot(record))
+        .count()
+}
+
+/// Distinct slots in use: residents that can hold provider work, plus each
+/// start, close or startup custody not already counted through its resident.
+/// A start that replaces a history reader counts, since it will run.
 pub(in crate::host) fn usage(state: &HostState) -> usize {
-    state.chats.len()
+    holders(state)
         + state
             .chat_spawning
             .keys()
-            .filter(|id| !state.chats.contains_key(id))
+            .filter(|id| !holding(state, id))
             .count()
         + state
             .native_actor_startups
             .keys()
-            .filter(|id| !state.chats.contains_key(id) && !state.chat_spawning.contains_key(id))
+            .filter(|id| !holding(state, id) && !state.chat_spawning.contains_key(id))
             .count()
 }
 
@@ -40,7 +64,7 @@ pub(super) fn require_available(state: &HostState) -> Result<(), ProtocolError> 
             ProtocolErrorCode::ChatCapacity,
             format!(
                 "Daemon native chat capacity reached: {} resident, {} starting, limit {} ({} distinct slots used). Release explicitly verified completed chats or change the configured capacity; idle chats may still own provider work.",
-                state.chats.len(),
+                holders(state),
                 pending(state),
                 state.native_chat_capacity,
                 used,
@@ -112,6 +136,25 @@ impl Reservation {
         host: &SharedHost,
         source: &Session,
         terminal_proof: Option<&HostSessionProof>,
+    ) -> Result<Option<Self>, ProtocolError> {
+        Self::admit(host, source, terminal_proof, true)
+    }
+
+    /// Admits a read-only history reader, which holds no slot once
+    /// installed, so a full daemon can still show saved conversations. It
+    /// keeps every other fence of an ordinary admission.
+    pub(super) fn for_history(
+        host: &SharedHost,
+        source: &Session,
+    ) -> Result<Option<Self>, ProtocolError> {
+        Self::admit(host, source, None, false)
+    }
+
+    fn admit(
+        host: &SharedHost,
+        source: &Session,
+        terminal_proof: Option<&HostSessionProof>,
+        needs_slot: bool,
     ) -> Result<Option<Self>, ProtocolError> {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
@@ -208,7 +251,9 @@ impl Reservation {
                 "This exact conversation is already starting",
             ));
         }
-        if !state.chats.contains_key(&source.id) {
+        // A resident that already holds a slot keeps it for its own
+        // recovery; replacing a history reader with a writer needs one.
+        if needs_slot && !holding(&state, &source.id) {
             require_available(&state)?;
         }
         state.chat_spawning.insert(source.id, source.clone());
@@ -278,7 +323,7 @@ pub(in crate::host) fn status(host: &SharedHost) -> crate::terminal_ipc::ChatCap
 
 pub(super) fn status_from_state(state: &HostState) -> crate::terminal_ipc::ChatCapacity {
     crate::terminal_ipc::ChatCapacity {
-        resident: state.chats.len() as u32,
+        resident: holders(state) as u32,
         spawning: pending(state) as u32,
         limit: state.native_chat_capacity as u32,
         used: usage(state) as u32,
@@ -547,7 +592,7 @@ pub(super) fn restore_saved_history(
             "Exact native chat not found; only saved read-only history can be reattached without a resident actor",
         ));
     }
-    let admission = Reservation::new_with_source(host, &session, None)?;
+    let admission = Reservation::for_history(host, &session)?;
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.chats.contains_key(&session.id) {
@@ -1325,7 +1370,57 @@ mod tests {
         assert!(host.lock().unwrap().chats.contains_key(&source.id));
     }
     #[test]
-    fn failed_exact_recovery_keeps_the_previous_resident_actor_at_capacity() {
+    fn history_readers_hold_no_slot() {
+        let host = host();
+        let (_directory, source, _handle) = closed_history(&host);
+        let mut state = host.lock().unwrap();
+        state.native_chat_capacity = 1;
+        assert_eq!(usage(&state), 0);
+        assert!(require_available(&state).is_ok());
+        let status = status_from_state(&state);
+        assert_eq!((status.used, status.resident), (0, 0));
+        assert_eq!(status.residents.len(), 1);
+        assert_eq!(status.residents[0].chat_id, source.id);
+    }
+
+    #[test]
+    fn a_writer_replacing_a_history_reader_needs_a_free_slot() {
+        let host = host();
+        let (_directory, source, _handle) = closed_history(&host);
+        {
+            let mut state = host.lock().unwrap();
+            state.native_chat_capacity = 1;
+            let occupied = session();
+            state.chat_spawning.insert(occupied.id, occupied);
+        }
+        let refused = Reservation::new(&host, &source).err().unwrap();
+        assert_eq!(refused.code, ProtocolErrorCode::ChatCapacity);
+        host.lock().unwrap().chat_spawning.clear();
+        let admitted = Reservation::new(&host, &source).unwrap();
+        assert!(admitted.is_some());
+        assert_eq!(usage(&host.lock().unwrap()), 1);
+    }
+
+    #[test]
+    fn a_full_daemon_still_admits_a_history_reader() {
+        let host = host();
+        {
+            let mut state = host.lock().unwrap();
+            state.native_chat_capacity = 1;
+            let occupied = session();
+            state.chat_spawning.insert(occupied.id, occupied);
+        }
+        let mut saved = session();
+        saved.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        assert_eq!(
+            Reservation::new(&host, &saved).err().unwrap().code,
+            ProtocolErrorCode::ChatCapacity
+        );
+        assert!(Reservation::for_history(&host, &saved).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_exact_recovery_keeps_the_previous_history_reader() {
         let host = host();
         let (_directory, source, handle) = closed_history(&host);
         // The saved directory now exists, so this exact descriptor attempts a
@@ -1348,7 +1443,7 @@ mod tests {
         let state = host.lock().unwrap();
         assert!(state.chats[&source.id].handle.same_actor(&handle));
         assert!(state.chat_spawning.is_empty());
-        assert_eq!(usage(&state), 1);
+        assert_eq!(usage(&state), 0);
     }
     #[test]
     fn release_dry_run_and_exact_nonce_preserve_history_and_successor() {
@@ -2128,19 +2223,13 @@ exit 0
                 state.native_chat_capacity = 1;
                 state.chat_spawning.insert(pending.id, pending.clone());
             }
-            let (full, server) = restore_client(&host, source.clone(), 43);
-            let failure = match full {
-                Err(failure) => failure,
-                Ok(_) => panic!("full capacity restored a new resident"),
-            };
-            assert!(failure.message.contains("capacity reached"));
-            server.join().unwrap();
-            assert!(!host.lock().unwrap().chats.contains_key(&source.id));
-            host.lock().unwrap().chat_spawning.remove(&pending.id);
-
+            // A full daemon still shows saved history: the reader runs no
+            // provider and holds no slot.
             let (restored, server) = restore_client(&host, source.clone(), 44);
             let restored = restored.unwrap();
             wait_for_client_history(&restored, true);
+            assert_eq!(usage(&host.lock().unwrap()), 1);
+            host.lock().unwrap().chat_spawning.remove(&pending.id);
             assert_eq!(restored.session(), source);
             assert!(restored.snapshot().read_only_reason.is_some());
             assert!(restored.snapshot().items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("durable history body"))));
