@@ -193,9 +193,13 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
     let row = surface.children().next().unwrap();
     let row_bounds = row.bounds();
     let text = row.children().nth(1).unwrap().bounds();
-    let paragraph = tree.children[0].children[1]
-        .state
-        .downcast_ref::<TextState>();
+    fn paragraph(tree: &Tree) -> Option<&TextState> {
+        if tree.tag == iced::advanced::widget::tree::Tag::of::<TextState>() {
+            return Some(tree.state.downcast_ref::<TextState>());
+        }
+        tree.children.iter().find_map(paragraph)
+    }
+    let paragraph = paragraph(&tree).expect("the note's text");
     assert_eq!(paragraph.content(), notice);
     // The text widget's allocated width is clamped even without wrapping;
     // check the shaped content as well to catch text drawn past that width.

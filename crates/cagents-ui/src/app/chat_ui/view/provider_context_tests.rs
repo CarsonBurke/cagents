@@ -235,10 +235,9 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
                 app.handle_chat_ui(Action::CopyMessage(target, "provider-context".into(), None)),
                 None,
             );
-            assert!(
-                super::super::tests::copy_refusal(app.chat_runtime_mut(target).unwrap())
-                    .unwrap()
-                    .contains("unavailable")
+            assert_eq!(
+                super::super::tests::copy_refusal(app.chat_runtime_mut(target).unwrap()),
+                Some(chat::TEXT_COPY_UNAVAILABLE)
             );
             let request = text_copy::Request::for_test(handle.clone(), source.clone());
             clipboard(

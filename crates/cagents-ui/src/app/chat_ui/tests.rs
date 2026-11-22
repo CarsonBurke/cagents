@@ -21089,10 +21089,9 @@ fn logical_message_copy_uses_aligned_scope_and_never_loaded_fragment_fallback() 
         task,
         "missing source must never copy the loaded fragment",
     );
-    assert!(
-        copy_refusal(chat_runtime(&app, card))
-            .unwrap()
-            .contains("unavailable")
+    assert_eq!(
+        copy_refusal(chat_runtime(&app, card)),
+        Some(chat::TEXT_COPY_UNAVAILABLE)
     );
     assert!(!shows_copied(chat_runtime(&app, card)));
 }
