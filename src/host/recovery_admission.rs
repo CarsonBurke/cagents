@@ -133,6 +133,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::ChatAttach { session } => Access::Target(session.id),
         R::ChatDetach { chat_id }
         | R::ChatCommand { chat_id, .. }
+        | R::ChatDeliver { chat_id, .. }
         | R::ChatVisibility { chat_id, .. }
         | R::ChatRead { chat_id, .. }
         | R::ChatAcknowledge { chat_id, .. }

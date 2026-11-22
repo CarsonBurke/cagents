@@ -8,6 +8,25 @@ use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
 const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
 pub(super) const MAX_INPUTS: usize = 1024;
+
+/// The journal's refusals that no later request can change, which the proxy
+/// takes as final rather than asking again.
+pub(super) const SEALED: &str = "Retained semantic journal is sealed for final retirement";
+pub(super) const REUSED_SEQUENCE: &str = "Input sequence was already used for a different command";
+pub(super) const RETIRED_RECEIPT: &str =
+    "Input receipt is retired or unavailable; never replay this command";
+pub(super) const DISCONTIGUOUS_SEQUENCE: &str =
+    "Input sequence must be the next contiguous sequence";
+/// Whether `refusal` is one of the journal's for good.
+pub(super) fn is_final_refusal(refusal: &str) -> bool {
+    [
+        SEALED,
+        REUSED_SEQUENCE,
+        RETIRED_RECEIPT,
+        DISCONTIGUOUS_SEQUENCE,
+    ]
+    .contains(&refusal)
+}
 const MAX_METADATA_ENTRY_BYTES: usize = 1024 * 1024;
 // JSON can encode each source byte as six bytes (for example, \u0000).
 // Finished outcomes carry the public result contract in addition to fixed-size
@@ -264,7 +283,7 @@ impl Journal {
             return Ok(());
         }
         if self.retirement_sealed {
-            return Err("Retained semantic journal is sealed for final retirement".into());
+            return Err(SEALED.into());
         }
         // Keep bounded supplied context byte-for-byte. Never consult a later
         // snapshot or modify evidence to repair malformed optional display data.
@@ -453,7 +472,7 @@ impl Journal {
             .map_err(|error| error.to_string())?;
         if let Some((id, hash, state)) = stored {
             if id != identity.id.to_string() || hash != identity.hash {
-                return Err("Input sequence was already used for a different command".into());
+                return Err(REUSED_SEQUENCE.into());
             }
             return Ok(Some(InputReceipt {
                 identity: identity.clone(),
@@ -461,9 +480,7 @@ impl Journal {
             }));
         }
         if identity.sequence <= self.number("input_sequence")? {
-            return Err(
-                "Input receipt is retired or unavailable; never replay this command".into(),
-            );
+            return Err(RETIRED_RECEIPT.into());
         }
         Ok(None)
     }
@@ -543,7 +560,7 @@ impl Journal {
                 .checked_add(1)
                 .ok_or("Input sequence exhausted")?
         {
-            return Err("Input sequence must be the next contiguous sequence".into());
+            return Err(DISCONTIGUOUS_SEQUENCE.into());
         }
         let count: usize = self
             .db
@@ -730,7 +747,7 @@ impl Journal {
 
     fn ensure_writable(&self) -> Result<(), String> {
         if self.retirement_sealed {
-            Err("Retained semantic journal is sealed for final retirement".into())
+            Err(SEALED.into())
         } else {
             Ok(())
         }

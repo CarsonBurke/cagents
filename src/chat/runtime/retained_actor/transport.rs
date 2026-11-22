@@ -53,10 +53,12 @@ const RETRANSMIT_DELAY: Duration = Duration::from_millis(100);
 /// How long before its caller stops waiting an unconfirmed input is settled,
 /// so a caller still waiting hears the outcome.
 const SETTLE_MARGIN: Duration = Duration::from_secs(1);
-/// How many times the helper is asked to settle an unconfirmed input before
-/// the proxy stops asking. Until the input is overdue, retries back off to
-/// `TIMEOUT`, so this spans up to about a minute: long enough for a busy journal to clear, and bounded for a
-/// helper that keeps refusing, such as one that already retired the input.
+/// How many times the helper may refuse to settle an unconfirmed input for
+/// now, as a busy or full journal does, before new input stops waiting on it.
+/// Retries back off to `TIMEOUT`, so this spans up to about a minute. The
+/// helper is still asked afterwards, every `OVERDUE_RETRY`, since nothing
+/// later reaches it in order until it settles the input. A refusal its
+/// journal gives for good ends the asking at once.
 const SETTLE_ATTEMPTS: u32 = 12;
 /// How long new input waits on a helper that does not answer requests to
 /// settle an unconfirmed input. Missed answers are not counted toward
@@ -76,6 +78,10 @@ const OVERDUE_RETRY: Duration = Duration::from_secs(60);
 /// takes no longer than any other request; a read that misses it is asked
 /// for again instead (see [`PRESENTATION_RETRY`]).
 const READ_WAIT: Duration = TIMEOUT;
+/// How long the helper may go without answering for its state before the
+/// reader is asked to read, so a reader showing what the helper last
+/// published learns that it no longer answers.
+const STATE_SILENCE: Duration = Duration::from_secs(10);
 /// How long after a read failed while the helper was alive the reader is
 /// asked to read again, so a failure clears once the helper answers.
 const PRESENTATION_RETRY: Duration = Duration::from_secs(3);
@@ -86,7 +92,7 @@ use crate::chat::failure::delivery::{
     CLOSING_INPUT, CROWDED_INPUT, DAMAGED_INPUT, DISCONTINUOUS_INPUT, HANDOVER_INPUT,
     OVERSIZED_INPUT, RECONNECTING_INPUT, RETIRING_INPUT, STOPPED_INPUT, UNACKNOWLEDGED_ANSWER,
     UNACKNOWLEDGED_INPUT, UNACKNOWLEDGED_STOP, UNAVAILABLE_INPUT, UNCONFIRMED_INPUT,
-    UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
+    UNRESOLVABLE_INPUT, UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
 };
 /// The outcome of an admitted input the actor's queue would not take.
 fn unrun_input_outcome(refusal: QueueRefusal) -> &'static str {
@@ -364,6 +370,8 @@ struct Remote {
     /// When the reader is next asked to read the conversation again, after a
     /// read failed while the helper was alive.
     reread_at: Mutex<Option<Instant>>,
+    /// What became of the messages sent under a key.
+    deliveries: super::super::delivery::Deliveries,
 }
 struct StartupOwner {
     control: Mutex<Option<UnixStream>>,
@@ -590,6 +598,7 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(None),
             reread_at: Mutex::new(None),
+            deliveries: Default::default(),
         }))
     }
     /// Complete the actual proxy's pending envelope without any external
@@ -1275,6 +1284,7 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
             reread_at: Mutex::new(None),
+            deliveries: Default::default(),
         }));
         let watch = remote.watch()?;
         let wake = remote.0.wake.clone();
@@ -1282,6 +1292,9 @@ impl RemoteActor {
         let worker = thread::Builder::new()
             .name("cagents-actor-proxy".into())
             .spawn(move || {
+                // Since when the helper has not answered for its state, and
+                // whether the reader was asked to read in that time.
+                let mut unanswered: Option<(Instant, bool)> = None;
                 loop {
                     let Some(inner) = weak.upgrade() else {
                         break;
@@ -1312,8 +1325,31 @@ impl RemoteActor {
                         actor.0.desired_observe.store(true, Ordering::Release);
                     }
                     let old = actor.state();
-                    let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
+                    #[cfg(debug_assertions)]
+                    let held = super::fixture_refusal::hold_read(Instant::now() + TIMEOUT);
+                    #[cfg(not(debug_assertions))]
+                    let held = Ok(());
+                    let response = held.and_then(|()| {
+                        actor.call::<Option<Resident>>("state", json!([old.changed]))
+                    });
                     let mut retry_housekeeping = response.is_err();
+                    // What the reader shows was published before the helper
+                    // went quiet, and may no longer be so: a turn shown
+                    // working may have finished. Once the helper has not
+                    // answered for `STATE_SILENCE`, the reader is asked to
+                    // read, so it learns that the helper is not answering
+                    // rather than showing the old state as current; until a
+                    // read succeeds it is asked again after each failure.
+                    match (&response, &mut unanswered) {
+                        (Ok(_), _) => unanswered = None,
+                        (Err(_), None) => unanswered = Some((Instant::now(), false)),
+                        (Err(_), Some((since, asked))) => {
+                            if !*asked && since.elapsed() >= STATE_SILENCE {
+                                *asked = true;
+                                actor.reread_after(Duration::ZERO);
+                            }
+                        }
+                    }
                     if actor.0.stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -1945,7 +1981,14 @@ impl RemoteActor {
                 return Err(UNAVAILABLE_INPUT.into());
             }
             if outstanding.unsettleable {
-                return Err(UNSETTLEABLE_INPUT.into());
+                // One still being asked about may yet settle; one the proxy
+                // stopped asking about never will.
+                return Err(if outstanding.retransmit.is_some() {
+                    UNSETTLEABLE_INPUT
+                } else {
+                    UNRESOLVABLE_INPUT
+                }
+                .into());
             }
             let now = Instant::now();
             if now >= deadline {
@@ -2031,39 +2074,50 @@ impl RemoteActor {
                 self.stop_settling(&identity, "the retained actor cannot settle inputs");
                 return;
             }
+            Ok(Err(refusal)) if settle && super::journal::is_final_refusal(&refusal) => {
+                // The helper's journal will never settle this input, as one
+                // it retired, sealed or sequenced differently: asking again
+                // changes nothing.
+                tracing::warn!(
+                    sequence = identity.sequence,
+                    %refusal,
+                    "the retained actor refuses to settle an unconfirmed input"
+                );
+                self.stop_settling(&identity, "the retained actor refuses to settle it");
+                return;
+            }
             Ok(Err(_)) | Err(_) if settle => {
                 // The helper refused to settle it for now, such as on a busy
                 // journal, or did not answer; it is asked again after the
-                // backoff. After a bounded number of refusals it is no longer
-                // asked. A helper that does not answer is asked without
-                // limit, as it may return and settle the input, but new input
-                // stops waiting on it after `SETTLE_LIMIT`.
-                let (exhausted, overdue) = self
+                // backoff, for as long as it takes: until it settles the
+                // input, nothing later can reach it in order. New input stops
+                // waiting on it once the helper has refused `SETTLE_ATTEMPTS`
+                // times, or not answered for `SETTLE_LIMIT`, and the helper is
+                // then asked only every `OVERDUE_RETRY`.
+                let fenced = self
                     .0
                     .uncertain_input
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .as_mut()
                     .filter(|uncertain| uncertain.identity == identity)
-                    .map_or((false, false), |uncertain| {
+                    .is_some_and(|uncertain| {
                         if refused {
                             uncertain.settle_failures += 1;
                         }
-                        let overdue = !uncertain.unsettleable
-                            && uncertain
-                                .settling_since
-                                .is_some_and(|since| since.elapsed() >= SETTLE_LIMIT);
-                        uncertain.unsettleable |= overdue;
-                        (uncertain.settle_failures >= SETTLE_ATTEMPTS, overdue)
+                        let fenced = !uncertain.unsettleable
+                            && (uncertain.settle_failures >= SETTLE_ATTEMPTS
+                                || uncertain
+                                    .settling_since
+                                    .is_some_and(|since| since.elapsed() >= SETTLE_LIMIT));
+                        uncertain.unsettleable |= fenced;
+                        fenced
                     });
-                if exhausted {
-                    self.stop_settling(&identity, "the retained actor kept failing to settle it");
-                    return;
-                }
-                if overdue {
+                if fenced {
                     tracing::warn!(
                         sequence = identity.sequence,
-                        "the retained actor has not settled an unconfirmed input in time; new input is refused"
+                        refusal = last_refusal.as_deref().unwrap_or("no answer"),
+                        "the retained actor has not settled an unconfirmed input in time; new input is refused until it does"
                     );
                     self.0.input_settled.notify_all();
                 }
@@ -2264,6 +2318,18 @@ impl RemoteActor {
             .recv_timeout(ACKNOWLEDGEMENT_WAIT)
             .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
+    /// Sends `command` once under `key`, as
+    /// [`delivery`](super::super::delivery) describes: asked again, it waits
+    /// on the input already admitted under that key rather than admitting
+    /// another, which the helper would run as well.
+    pub fn deliver(&self, command: Command, key: chat::DeliveryKey) -> Result<(), Rejection> {
+        self.0.deliveries.deliver(
+            key,
+            ACKNOWLEDGEMENT_WAIT,
+            || Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()),
+            || self.enqueue(None, command).map_err(Rejection::Refused),
+        )
+    }
     /// The courier tries again later on its own, so it does not wait behind
     /// an unconfirmed input; one waiting courier would hold every delivery.
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
@@ -2435,6 +2501,25 @@ fn close_only_terminal_projection(
         }
         _ => false,
     }
+}
+/// `reply`, passed on no sooner than `lateness` from now, as a helper held up
+/// on a loaded computer acknowledges an input it already ran. See
+/// [`super::fixture_refusal`].
+#[cfg(debug_assertions)]
+fn acknowledge_late(
+    reply: crossbeam_channel::Receiver<Result<(), Rejection>>,
+    lateness: Duration,
+) -> crossbeam_channel::Receiver<Result<(), Rejection>> {
+    let due = Instant::now() + lateness;
+    let (late, receiver) = crossbeam_channel::bounded(1);
+    thread::spawn(move || {
+        let outcome = reply.recv();
+        thread::sleep(due.saturating_duration_since(Instant::now()));
+        if let Ok(outcome) = outcome {
+            let _ = late.send(outcome);
+        }
+    });
+    receiver
 }
 fn close_only_refusal() -> String {
     "This retained actor attachment is close-only; provider input and ownership preservation are refused".into()
@@ -3461,7 +3546,14 @@ impl Server {
                 let receipt = journal.admit_with_run(&identity, run)?;
                 self.changed.fetch_add(1, Ordering::Release);
                 match self.actor.enqueue_actor(command) {
-                    Ok(reply) => self.pending.push((identity, reply, effects)),
+                    Ok(reply) => {
+                        #[cfg(debug_assertions)]
+                        let reply = match super::fixture_refusal::take_lateness() {
+                            Some(lateness) => acknowledge_late(reply, lateness),
+                            None => reply,
+                        };
+                        self.pending.push((identity, reply, effects))
+                    }
                     Err(refusal) => {
                         tracing::warn!(
                             sequence = identity.sequence,

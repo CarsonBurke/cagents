@@ -14,9 +14,16 @@
 //! input waits and is then refused. Any other home, or a home without the
 //! files, is unaffected.
 //!
+//! [`LATE_ACKNOWLEDGEMENT`] holds a number of seconds, up to
+//! [`LONGEST_LATENESS`]: the next input the helper admits runs as usual, but
+//! the helper reports it acknowledged only that long after it was admitted, as
+//! a helper held up on a heavily loaded computer can. Past the application's
+//! wait, the send's outcome is unknown though the message went through.
+//!
 //! [`UNANSWERED_READS`] holds a number of seconds, up to
 //! [`LONGEST_SILENCE`]: for that long the helper doesn't answer transcript
-//! reads, as one held up on a heavily loaded computer doesn't. A read waits
+//! reads or requests for its state, as one held up on a heavily loaded
+//! computer doesn't. A read waits
 //! until the silence ends, then goes through, unless its deadline comes first.
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,6 +38,13 @@ const DELAY: &str = ".cagents-fixture-delay-input";
 /// The longest a fixture holds an input up, well within what the
 /// application waits for an answer.
 const LONGEST_DELAY: Duration = Duration::from_secs(8);
+
+/// Created in the fixture's `HOME` to acknowledge the next input late.
+const LATE_ACKNOWLEDGEMENT: &str = ".cagents-fixture-late-acknowledgement";
+
+/// The latest the helper acknowledges an input, well past what the
+/// application waits for an acknowledgement.
+const LONGEST_LATENESS: Duration = Duration::from_secs(60);
 
 /// Created in the fixture's `HOME` to stop transcript reads being answered.
 const UNANSWERED_READS: &str = ".cagents-fixture-unanswered-reads";
@@ -93,6 +107,21 @@ fn take_delay_in(home: &Path) -> Option<Duration> {
     let delay = take_seconds(home, DELAY)?;
     tracing::warn!(?delay, "native-evidence fixture is holding up one input");
     Some(delay.min(LONGEST_DELAY))
+}
+
+/// How long after admitting it the helper with the fixture in this process's
+/// `HOME` acknowledges the next input, if it asks to.
+pub(super) fn take_lateness() -> Option<Duration> {
+    take_lateness_in(Path::new(&std::env::var_os("HOME")?))
+}
+
+fn take_lateness_in(home: &Path) -> Option<Duration> {
+    let lateness = take_seconds(home, LATE_ACKNOWLEDGEMENT)?;
+    tracing::warn!(
+        ?lateness,
+        "native-evidence fixture acknowledges one input late"
+    );
+    Some(lateness.min(LONGEST_LATENESS))
 }
 
 /// The number of seconds in `name` in `home`, removed as it is read, where
@@ -199,6 +228,23 @@ mod tests {
         std::fs::write(home.join(DELAY), "soon").unwrap();
         assert_eq!(take_delay_in(&home), None);
         assert!(!home.join(DELAY).exists());
+    }
+
+    #[test]
+    fn acknowledges_one_input_late_only_inside_a_native_evidence_task() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("fixture");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join(LATE_ACKNOWLEDGEMENT), "20\n").unwrap();
+        assert_eq!(take_lateness_in(&home), None);
+        assert!(home.join(LATE_ACKNOWLEDGEMENT).is_file());
+
+        std::fs::write(root.path().join(".native-evidence"), "").unwrap();
+        assert_eq!(take_lateness_in(&home), Some(Duration::from_secs(20)));
+        assert_eq!(take_lateness_in(&home), None);
+
+        std::fs::write(home.join(LATE_ACKNOWLEDGEMENT), "3600").unwrap();
+        assert_eq!(take_lateness_in(&home), Some(LONGEST_LATENESS));
     }
 
     #[test]
