@@ -5996,6 +5996,114 @@ fn peer_channel_deletion_retains_local_chat_work_in_worktree() {
     );
 }
 
+fn restored_model_only_shared_draft() -> (
+    Cagents,
+    ChannelId,
+    CardId,
+    crate::model::ChatDraftModel,
+    Pane,
+) {
+    let provider = crate::agent::Provider::Claude;
+    let (mut app, channel, _, _) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    drop(app.observe_listed_models(
+        provider,
+        vec![crate::chat::Model {
+            id: "haiku".into(),
+            label: "Haiku".into(),
+            reasoning: vec!["low".into(), "high".into()],
+        }],
+        None,
+    ));
+    drop(app.new_native_chat(provider, Some(PathBuf::from("/repo"))));
+    let card = app.workspace.focused().unwrap();
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("new native draft")
+    };
+    let target = runtime.target;
+    drop(app.update(Message::ChatUi(chat_ui::Action::DraftModel(
+        target,
+        provider,
+        Some("haiku".into()),
+    ))));
+    drop(app.update(Message::ChatUi(chat_ui::Action::Reasoning(
+        target,
+        "haiku".into(),
+        Some("low".into()),
+    ))));
+    Arc::make_mut(&mut app.durable).workspace_model_identity = Some(app.workspace_model.identity);
+    let saved = app.persistent_workspace();
+    let chosen = saved.chat_draft_models[&card].clone();
+    assert!(!saved.chat_drafts.contains_key(&card));
+    assert!(!saved.chat_draft_attachments.contains_key(&card));
+    let mut restored = chat_ui::tests::reload_draft_model_workspace(&saved);
+    restored.workspace_model = app.workspace_model.clone();
+    restored.active_workspace = Some(PathBuf::from("/repo"));
+    assert!(restored.chat_awaiting_admission(card));
+    let pane = Pane::from_card(restored.card_state(card).unwrap(), None).unwrap();
+    restored
+        .shared_views
+        .initialized
+        .insert(Scope::Channel(channel));
+    let mut view = View::empty(channel);
+    view.panes.push(pane.clone());
+    restored.workspace_model.views = vec![view];
+    drop(restored.reconcile_shared_views());
+    assert!(!restored.chat_awaiting_admission(card));
+    assert_eq!(
+        restored.persistent_workspace().chat_draft_models[&card],
+        chosen
+    );
+    (restored, channel, card, chosen, pane)
+}
+
+/// A model pick is not unsaved work: another window closing the pane closes
+/// it here too, with nothing to save or discard.
+#[test]
+fn peer_removal_closes_a_reopened_draft_with_only_a_model_pick() {
+    let (mut app, channel, card, _, _) = restored_model_only_shared_draft();
+    let mut view = View::empty(channel);
+    view.retired.push(card);
+    app.workspace_model.views = vec![view];
+    drop(app.reconcile_shared_views());
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert!(!app.shared_views.retained.contains(&card));
+    assert!(
+        !app.persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
+}
+
+/// A shared pane taking a new card identity is not held back by a model pick;
+/// the pick moves to the new card with its draft.
+#[test]
+fn alias_adoption_carries_a_reopened_drafts_model_pick() {
+    let (mut app, channel, alias, chosen, mut canonical) = restored_model_only_shared_draft();
+    canonical.id = CardId::new();
+    let mut view = View::empty(channel);
+    view.panes.push(canonical.clone());
+    app.workspace_model.views = vec![view];
+    drop(app.reconcile_shared_views());
+    assert!(!app.shared_views.blocked.contains(&Scope::Channel(channel)));
+    assert!(
+        !app.card_state(alias)
+            .is_some_and(|state| state.existence.is_open())
+    );
+    assert!(app.card_state(canonical.id).unwrap().existence.is_open());
+    assert!(
+        matches!(app.cards.get(&canonical.id), Some(CardRuntime::Chat(_))),
+        "the canonical pane opens its draft"
+    );
+    // Only a draft that applied the carried pick counts it as its own.
+    assert!(!app.chat_is_unused(canonical.id));
+    assert_eq!(
+        app.persistent_workspace().chat_draft_models[&canonical.id],
+        chosen
+    );
+}
+
 #[test]
 fn an_open_pane_losing_its_local_placement_does_not_publish_a_removal() {
     let (mut app, a, _, pane) = fixture();

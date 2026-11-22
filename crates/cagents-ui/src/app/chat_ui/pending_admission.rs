@@ -157,6 +157,13 @@ impl Cagents {
             copy: self.card_state(copy).expect("retained card exists").clone(),
             draft,
             attachments,
+            draft_model: runtime.draft_model().or_else(|| {
+                self.chat_ui
+                    .draft_models
+                    .get(&copy)
+                    .filter(|model| model.applies_to(&runtime.session))
+                    .cloned()
+            }),
             scope: self.durable.card_scopes.get(&copy).cloned(),
             channel: self
                 .durable
@@ -323,6 +330,9 @@ impl Cagents {
         // the current pane, with its original descriptor and content intact.
         let same_source =
             matches!(&pane.kind, CardKind::Chat(session) if session == &runtime.session);
+        // The copy can only be read and copied, so only text and attachments
+        // earn one. A model choice alone stays bound to its own draft and is
+        // not offered to the replacement.
         if !same_source
             && (!runtime.unsent_text().is_empty() || !runtime.unsent_attachments().is_empty())
         {
@@ -338,6 +348,9 @@ impl Cagents {
             state.kind = CardKind::Chat(runtime.session.clone());
             let local_card = state.clone();
             runtime.retarget(self.chat_ui.next_target(retained));
+            if let Some(model) = self.chat_ui.draft_models.remove(&pane.id) {
+                self.chat_ui.draft_models.insert(retained, model);
+            }
             let durable = Arc::make_mut(&mut self.durable);
             if let Some(scope) = durable.card_scopes.get(&pane.id).cloned() {
                 durable.card_scopes.insert(retained, scope);

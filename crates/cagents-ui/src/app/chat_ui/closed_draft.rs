@@ -312,6 +312,7 @@ mod tests {
             resolved_text: "the first message".into(),
             model: None,
             draft: sending.session.clone(),
+            chosen: (None, None),
             since: None,
             rechecking: false,
             admission: None,

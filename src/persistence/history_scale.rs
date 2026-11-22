@@ -186,6 +186,7 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
         card_scopes,
         chat_drafts,
         chat_draft_attachments: HashMap::new(),
+        chat_draft_models: HashMap::new(),
         chat_waiting_messages: HashMap::new(),
         kept_chat_drafts: HashMap::new(),
         agent_updates: BTreeMap::new(),
