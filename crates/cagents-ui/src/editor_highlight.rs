@@ -466,8 +466,15 @@ pub(crate) fn classify(scopes: &[parsing::Scope], code: &highlighting::Highlight
             || name.starts_with("meta.separator")
         {
             Some(Tone::Marker)
-        } else if name.starts_with("markup.underline.link")
-            || name.starts_with("punctuation.definition.link")
+        } else if name.starts_with("markup.underline.link") {
+            // A destination recedes behind the words that name it; a bare
+            // or angle-bracketed URL has no other words, so it is the link.
+            Some(if has("meta.link.inline") || has("meta.link.reference") {
+                Tone::Dim
+            } else {
+                Tone::Link
+            })
+        } else if name.starts_with("punctuation.definition.link")
             || name.starts_with("punctuation.definition.metadata")
             || name.starts_with("punctuation.definition.string")
             || name.starts_with("punctuation.definition.bold")
@@ -692,6 +699,23 @@ cargo clean && cargo build --locked
         // code, even where its text looks like a task.
         assert!(matches!(style(&spans, 15, "cargo").tone, Tone::Syntax(_)));
         assert_eq!(style(&spans, 19, "- [ ] not a task"), tone(Tone::Code));
+    }
+
+    #[test]
+    fn a_url_with_no_words_of_its_own_is_the_link() {
+        let spans = highlights(
+            &settings(true, "md"),
+            "See <https://example.com/a> and https://example.com/b.\n\
+             Read [the guide][guide] or [this](https://example.com/c).\n\
+             \n\
+             [guide]: https://example.com/d\n",
+        );
+        assert_eq!(style(&spans, 0, "https://example.com/a"), tone(Tone::Link));
+        assert_eq!(style(&spans, 0, "https://example.com/b"), tone(Tone::Link));
+        assert_eq!(style(&spans, 1, "the guide"), tone(Tone::Link));
+        assert_eq!(style(&spans, 1, "this"), tone(Tone::Link));
+        assert_eq!(style(&spans, 1, "https://example.com/c"), tone(Tone::Dim));
+        assert_eq!(style(&spans, 3, "https://example.com/d"), tone(Tone::Dim));
     }
 
     #[test]
