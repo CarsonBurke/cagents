@@ -2381,30 +2381,57 @@ pub(super) fn shared_preferences_stream(
         let Some(path) = path else {
             return;
         };
-        let mut previous = None;
-        let mut stamp = None;
-        loop {
-            let path = path.clone();
-            let old_stamp = stamp;
-            let loaded = tokio::task::spawn_blocking(move || {
-                use std::os::unix::fs::MetadataExt;
-                let metadata = std::fs::metadata(&path).ok()?;
-                let next_stamp = (
-                    metadata.ino(),
-                    metadata.mtime(),
-                    metadata.mtime_nsec(),
-                    metadata.len(),
-                );
-                if old_stamp == Some(next_stamp) {
-                    return None;
+        // Watch the parent rather than the file: settings saves replace the
+        // file atomically, which otherwise drops an inotify watch. One bounded
+        // signal coalesces a burst of write, rename, and close events into one
+        // off-thread read. This stream used to stat the file every second in
+        // every open UI process even when no other window had changed it.
+        let Some(parent) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let (changed, receiver) = async_channel::bounded(1);
+        let watched = path.clone();
+        let mut watcher = match notify::RecommendedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
+                let relevant = event.as_ref().map_or(true, |event| {
+                    event.need_rescan() || event.paths.iter().any(|changed| changed == &watched)
+                });
+                if relevant {
+                    let _ = changed.try_send(());
                 }
-                settings::load(path)
-                    .ok()
-                    .map(|settings| (next_stamp, settings))
-            })
-            .await;
-            if let Ok(Some((next_stamp, settings))) = loaded {
-                stamp = Some(next_stamp);
+            },
+            notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+        ) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "could not watch shared preferences");
+                // Keep the initial cross-window snapshot behavior even on a
+                // machine that has exhausted native watches. There is no
+                // periodic fallback: the next local save recreates this
+                // subscription with a fresh chance to arm one.
+                let loaded = tokio::task::spawn_blocking(move || settings::load(path).ok()).await;
+                if let Ok(Some(settings)) = loaded {
+                    let _ = output.send(settings).await;
+                }
+                return;
+            }
+        };
+        if let Err(error) =
+            notify::Watcher::watch(&mut watcher, &parent, notify::RecursiveMode::NonRecursive)
+        {
+            tracing::warn!(%error, path = %parent.display(), "could not watch shared preferences directory");
+            let loaded = tokio::task::spawn_blocking(move || settings::load(path).ok()).await;
+            if let Ok(Some(settings)) = loaded {
+                let _ = output.send(settings).await;
+            }
+            return;
+        }
+        let mut previous = None;
+        let mut load = true;
+        while load {
+            let path = path.clone();
+            let loaded = tokio::task::spawn_blocking(move || settings::load(path).ok()).await;
+            if let Ok(Some(settings)) = loaded {
                 let current = (
                     settings.sidebar_worktrees,
                     settings.sidebar_worktree_overrides.clone(),
@@ -2419,7 +2446,10 @@ pub(super) fn shared_preferences_stream(
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // `recv` sleeps until the kernel reports the one file we care
+            // about. The watcher lives across the await, so it also covers a
+            // save which races the initial read above.
+            load = receiver.recv().await.is_ok();
         }
     })
 }
