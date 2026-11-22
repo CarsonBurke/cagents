@@ -222,6 +222,14 @@ pub(crate) enum Phase {
 #[derive(Debug, Default)]
 pub struct Choices(HashMap<TerminalId, Chosen>);
 
+/// Whether `list` comes from a transcript not yet read, and so says nothing
+/// about the conversation's work.
+fn unread(list: &ConversationPullRequests) -> bool {
+    list.transcript == TranscriptCoverage::Pending
+        && list.pull_requests.is_empty()
+        && list.worktrees.is_empty()
+}
+
 /// Work the user chose, and whether its details are unfolded beneath it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Chosen {
@@ -243,8 +251,15 @@ impl State {
                     return;
                 }
                 self.revision = revision;
-                self.list = Some(list);
                 self.lost = false;
+                // A daemon that has only begun reading the conversation
+                // again, as after it restarts, names nothing yet. The list
+                // already held stays until that read says otherwise, so its
+                // Work section doesn't vanish for a read and come back.
+                if unread(&list) && self.list.is_some() {
+                    return;
+                }
+                self.list = Some(list);
                 self.work_count = self.count_work();
             }
             // The last list stays: it is what was true, and the daemon's own
@@ -521,13 +536,7 @@ impl State {
     /// nothing, is still being read, not empty.
     pub(crate) fn phase(&self) -> Phase {
         match (&self.list, self.lost) {
-            (Some(list), _)
-                if list.transcript == TranscriptCoverage::Pending
-                    && list.pull_requests.is_empty()
-                    && list.worktrees.is_empty() =>
-            {
-                Phase::Reading
-            }
+            (Some(list), _) if unread(list) => Phase::Reading,
             (Some(_), _) => Phase::Listed,
             (None, true) => Phase::Unavailable,
             (None, false) => Phase::Reading,
@@ -1405,6 +1414,41 @@ mod tests {
         // Another conversation starts reading again.
         state.retarget(Some(TerminalId::new()));
         assert_eq!(state.phase(), Phase::Reading);
+    }
+
+    #[test]
+    fn a_fresh_unread_list_keeps_the_work_already_listed() {
+        let conversation = TerminalId::new();
+        let mut state = State::default();
+        state.retarget(Some(conversation));
+        state.update(listed(
+            conversation,
+            5,
+            vec![row(4, Relation::Created)],
+            true,
+        ));
+        assert!(state.lists_work());
+        // A restarted daemon lists the conversation afresh before reading
+        // its transcript again.
+        let Watch::Listed { list, .. } = listed(conversation, 1, Vec::new(), true) else {
+            unreachable!()
+        };
+        let unread = Arc::new(ConversationPullRequests {
+            transcript: TranscriptCoverage::Pending,
+            ..(*list).clone()
+        });
+        state.update(Watch::Listed {
+            conversation,
+            revision: 1,
+            list: unread,
+            first: true,
+        });
+        assert!(state.lists_work(), "the work it listed stays");
+        assert_eq!(state.phase(), Phase::Listed);
+        // The read that follows is what replaces it, even when it finds none.
+        state.update(listed(conversation, 2, Vec::new(), false));
+        assert!(!state.lists_work());
+        assert_eq!(state.phase(), Phase::Listed);
     }
 
     #[test]

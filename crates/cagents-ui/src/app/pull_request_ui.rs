@@ -378,7 +378,7 @@ impl Cagents {
     /// What `card`'s Work and Mentioned sections and the section beneath
     /// them need of its conversation's work, worked out once per use.
     pub(super) fn work_summary(&self, card: CardId) -> WorkSummary {
-        // With neither section shown there is no work to choose, so none
+        // With neither section followed there is no work to choose, so none
         // scopes the changes and files.
         if !self.tracks_work(card) && !self.tracks_mentions(card) {
             return WorkSummary::default();

@@ -175,7 +175,10 @@ impl Cagents {
     /// follows no conversation's pull requests or worktrees. It is then shown
     /// rather than left as a lone collapsed header over an empty panel.
     /// This depends on the pane and the settings, never on what has loaded,
-    /// so the section does not fold away when a list arrives.
+    /// so the section does not fold away when a list arrives. A chat that
+    /// has listed no work yet keeps the reader's own choice for it, which
+    /// may be a lone collapsed header, rather than one that changes when
+    /// work arrives.
     fn workspace_alone(&self, card: CardId) -> bool {
         !self.tracks_work(card) && !self.tracks_mentions(card)
     }
