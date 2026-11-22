@@ -638,14 +638,14 @@ fn settings_category_controls<'a>(
                 vec![
                     crate::settings_widgets::toggle(
                         "Activity",
-                        "Lead with what the pane's agent is doing, where it works and its subagents.",
+                        "Lead with what the pane's agent is doing and where it works.",
                         draft.inspector_show_activity,
                         |enabled| Message::SettingsChanged {
                             field: SettingsField::InspectorShowActivity,
                             value: enabled.to_string(),
                         },
                     )
-                    .keywords("inspector status doing where subagents inspector_show_activity"),
+                    .keywords("inspector status doing where inspector_show_activity"),
                     crate::settings_widgets::toggle(
                         "Work",
                         "List the pull requests and worktrees a chat worked on.",

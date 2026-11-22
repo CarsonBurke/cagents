@@ -1,5 +1,6 @@
-//! The top of a chat's or terminal's inspector: what its agent is doing,
-//! where it works and, for a chat, how its subagents stand.
+//! The top of a chat's or terminal's inspector: what its agent is doing and
+//! where it works. A chat's subagents are not summed up here: the strip of
+//! agent tabs above its composer lists each one and opens its chooser.
 //!
 //! The block has the same rows whatever its pane reports, so a status that
 //! arrives, changes or has nothing to say yet never moves the sections
@@ -7,13 +8,11 @@
 
 use super::*;
 
-/// Between the block's rows, and above and below them.
+/// Above and below the block's row.
 const ROW_GAP: f32 = space::XXS;
 
-/// A chat's block: its status and place, then its subagents.
-const CHAT_HEIGHT: f32 = design::list::TWO_LINE_HEIGHT + design::DENSE_ROW_HEIGHT + 3.0 * ROW_GAP;
-/// A terminal's block: its status and place.
-const TERMINAL_HEIGHT: f32 = design::list::TWO_LINE_HEIGHT + 2.0 * ROW_GAP;
+/// The block: its pane's status and place.
+const HEIGHT: f32 = design::list::TWO_LINE_HEIGHT + 2.0 * ROW_GAP;
 
 /// What the block, and the rail an inspector collapses to, say the pane's
 /// agent is doing.
@@ -40,16 +39,6 @@ impl Cagents {
         let Some(status) = self.activity_status(card, state) else {
             return Err(toggle);
         };
-        let subagents = match (&state.kind, self.cards.get(&card)) {
-            (CardKind::Chat(_), Some(CardRuntime::Chat(runtime))) => Some(self.subagents_row(
-                runtime.subagent_tally(),
-                Some(runtime.open_subagent_picker()),
-            )),
-            // The row stays while the conversation connects, so it is not
-            // added under the reader once it has.
-            (CardKind::Chat(_), _) => Some(self.subagents_row(Default::default(), None)),
-            _ => None,
-        };
         let place = self.pane_place(state);
         let mark = status_mark(status.glyph);
         let caption = crate::ui_controls::FadeText::caption(place.label)
@@ -64,99 +53,33 @@ impl Cagents {
             caption,
         ])
         .width(Length::Fill);
-        let first = grid_row(
-            mark,
-            text.into(),
-            Some(toggle),
-            design::list::TWO_LINE_HEIGHT,
-        );
-        let mut rows: Vec<Element<'a, Message>> = vec![first];
-        let height = if let Some(subagents) = subagents {
-            rows.push(subagents);
-            CHAT_HEIGHT
-        } else {
-            TERMINAL_HEIGHT
-        };
-        let block = widget::column::with_children(rows)
-            .spacing(ROW_GAP)
-            .padding([ROW_GAP, design::list::GUTTER])
-            .width(Length::Fill)
-            .height(Length::Fixed(height));
-        Ok((block.into(), height))
-    }
-
-    /// The subagents row: how many there are and how many need the reader,
-    /// opening the pane's list of them. Without any, it says so, so the row
-    /// is there before the first one starts.
-    fn subagents_row<'a>(
-        &self,
-        tally: chat_ui::SubagentTally,
-        open: Option<Message>,
-    ) -> Element<'a, Message> {
-        if tally.total == 0 {
-            return grid_row(
-                crate::ui_controls::passive_icon(Icon::Agent, design::ROW_ICON_SIZE),
-                crate::ui_controls::fade_text("No subagents")
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
-                None,
-                design::DENSE_ROW_HEIGHT,
-            );
-        }
-        let mut parts = vec![format!(
-            "{} subagent{}",
-            tally.total,
-            if tally.total == 1 { "" } else { "s" }
-        )];
-        if tally.working > 0 {
-            parts.push(format!("{} working", tally.working));
-        }
-        if tally.attention > 0 {
-            parts.push(format!(
-                "{} {} attention",
-                tally.attention,
-                if tally.attention == 1 {
-                    "needs"
-                } else {
-                    "need"
-                }
-            ));
-        }
-        let label = parts.join(" · ");
-        let content = widget::row::with_children(vec![
-            widget::container(crate::ui_controls::passive_icon(
-                if tally.working > 0 {
-                    Icon::AgentWorking
-                } else {
-                    Icon::Agent
-                },
-                design::ROW_ICON_SIZE,
-            ))
-            .center_x(Length::Fixed(design::list::ICON))
-            .center_y(Length::Fill)
-            .into(),
-            widget::container(crate::ui_controls::fade_text(label.clone()))
+        // The mark sits in the list's icon column and the text on its label
+        // column. The toggle ends the row at the gutter, where a section
+        // header puts it, so it stays put whichever section leads.
+        let row = widget::row::with_children(vec![
+            widget::container(mark)
+                .center_x(Length::Fixed(design::list::ICON))
+                .center_y(Length::Fill)
+                .into(),
+            widget::container(text)
                 .width(Length::Fill)
                 .center_y(Length::Fill)
                 .into(),
-            widget::container(crate::ui_controls::passive_icon(
-                Icon::ChevronRight,
-                design::COMPACT_ICON_SIZE,
-            ))
-            .center_y(Length::Fill)
-            .into(),
+            widget::container(toggle)
+                .align_y(Alignment::Start)
+                .height(Length::Fill)
+                .into(),
         ])
         .spacing(design::list::GAP)
         .height(Length::Fill);
-        crate::interaction::hover(
-            widget::button::custom(content)
-                .name(format!("Show subagents: {label}"))
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([0.0, design::list::INSET])
-                .height(design::DENSE_ROW_HEIGHT)
-                .width(Length::Fill)
-                .on_press_maybe(open.filter(|_| !self.modal_is_open())),
-        )
+        let block = widget::container(row)
+            .padding(
+                Padding::from([ROW_GAP, design::list::GUTTER])
+                    .left(design::list::GUTTER + design::list::INSET),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(HEIGHT));
+        Ok((block.into(), HEIGHT))
     }
 
     /// What `card`'s agent is doing, as its chat or terminal reports it;
@@ -336,50 +259,6 @@ pub(super) fn status_mark<'a>(glyph: Icon) -> Element<'a, Message> {
     } else {
         crate::ui_controls::passive_icon(glyph, design::ROW_ICON_SIZE)
     }
-}
-
-/// A row on the list grid: `mark` in the icon column, `text` on the label
-/// column, then `trailing`.
-fn grid_row<'a>(
-    mark: Element<'a, Message>,
-    text: Element<'a, Message>,
-    trailing: Option<Element<'a, Message>>,
-    height: f32,
-) -> Element<'a, Message> {
-    // A trailing control sits where a section header puts the inspector
-    // toggle, at the gutter, so the toggle stays put whichever leads.
-    let right = if trailing.is_some() {
-        0.0
-    } else {
-        design::list::INSET
-    };
-    let mut children = vec![
-        widget::container(mark)
-            .center_x(Length::Fixed(design::list::ICON))
-            .center_y(Length::Fill)
-            .into(),
-        widget::container(text)
-            .width(Length::Fill)
-            .center_y(Length::Fill)
-            .into(),
-    ];
-    if let Some(trailing) = trailing {
-        children.push(
-            widget::container(trailing)
-                .align_y(Alignment::Start)
-                .height(Length::Fill)
-                .into(),
-        );
-    }
-    widget::container(
-        widget::row::with_children(children)
-            .spacing(design::list::GAP)
-            .height(Length::Fill),
-    )
-    .padding(Padding::ZERO.left(design::list::INSET).right(right))
-    .height(Length::Fixed(height))
-    .width(Length::Fill)
-    .into()
 }
 
 #[cfg(test)]

@@ -79,7 +79,6 @@ mod auth_recovery;
 pub(in crate::app) mod blocked_recovery_tests;
 mod changes;
 mod child_navigation;
-pub(in crate::app) use child_navigation::SubagentTally;
 mod clipboard_image;
 mod close_refusal;
 #[cfg(test)]
