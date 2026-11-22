@@ -464,16 +464,26 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
 /// only the image it shows.
 #[test]
 fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
-    let shed: [fn(&mut Runtime); 3] = [
-        |runtime| assert_eq!(images::evict_ready(runtime, usize::MAX), usize::MAX - 8),
-        Runtime::release_transcript_caches,
+    // Each shed, and the gallery the viewer steps through after it, with
+    // the place it steps to.
+    let shed: [(fn(&mut Runtime), (usize, usize)); 3] = [
+        (
+            |runtime| assert_eq!(images::evict_ready(runtime, usize::MAX), usize::MAX - 8),
+            (2, 2),
+        ),
+        // Released caches hold no grouping either, so until the pane shows
+        // again the viewer holds just the picture it shows.
+        (Runtime::release_transcript_caches, (1, 1)),
         // A hidden pane's transcript wants no images.
-        |runtime| {
-            runtime.visible.store(false, Ordering::Relaxed);
-            images::sync(runtime);
-        },
+        (
+            |runtime| {
+                runtime.visible.store(false, Ordering::Relaxed);
+                images::sync(runtime);
+            },
+            (2, 2),
+        ),
     ];
-    for shed in shed {
+    for (shed, place) in shed {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (_, target, images) = viewing(&mut app);
         let host = ViewerHost::Pane(target);
@@ -483,12 +493,50 @@ fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
             gallery.selected_image(host),
             Some(images::ImageRef::Viewer(host, images[0].1))
         );
-        assert_ne!(
-            step(&mut app, target, 1),
-            Some(images::ImageRef::Viewer(host, images[1].1)),
-            "the image the viewer didn't show has no pixels in it"
-        );
+        let stepped = step(&mut app, target, 1);
+        assert_eq!(app.image_viewer(host).unwrap().position(), place);
+        // The image the viewer didn't show has no pixels in it: stepping
+        // to it shows none until it is read again, and stepping round a
+        // gallery of one keeps the one shown.
+        let expected = (place.1 == 1).then(|| images::ImageRef::Viewer(host, images[0].1));
+        assert_eq!(stepped, expected);
     }
+}
+
+/// A whole picture the reader opened outranks the previews transcripts read
+/// on their own: when memory is short, other panes' previews make room for
+/// it before the viewer's own pane's.
+#[test]
+fn a_whole_picture_waiting_for_memory_displaces_other_panes_previews_first() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let other = live_chat(&mut app, Some("other"));
+    let other_target = chat_runtime(&app, other).target;
+    let runtime = app.chat_runtime_mut(other_target).unwrap();
+    runtime.visible.store(true, Ordering::Relaxed);
+    let (elsewhere, _) = show_images(runtime, 1).pop().unwrap();
+    let (_, target, images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    let (serial, id) = app.image_viewer(host).unwrap().awaiting();
+    // One 1x1 preview's pixels.
+    drop(app.update(Message::ChatUi(Action::ViewerLoaded(
+        host,
+        serial,
+        id,
+        images::Loaded::Deferred(images::Pressure::on_pixels(4)),
+    ))));
+    assert!(
+        chat_runtime(&app, other).cache[&elsewhere].image.is_none(),
+        "the other pane's preview made room"
+    );
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    for (id, _) in &images {
+        assert!(runtime.cache[id].image.is_some(), "{id} stays in its pane");
+    }
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, images[0].1)),
+        "the preview shows while the whole picture waits"
+    );
 }
 
 /// The shown image keeps its pixels through memory pressure only while it is

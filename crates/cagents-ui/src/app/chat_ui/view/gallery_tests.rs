@@ -277,6 +277,79 @@ fn drawn_row(items: &[chat::Item], width: f32) -> Drawn {
     }
 }
 
+/// A picture is read at the size it is drawn: a tile's in a gallery, by the
+/// same rule that draws the gallery, and a picture alone's otherwise.
+#[test]
+fn pictures_are_read_at_the_size_they_are_drawn() {
+    use chat::Role::{Assistant, User};
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[
+        said("ask", User, "Compare the layouts"),
+        read("read-slow", "slow.png"),
+        read("read-fast", "fast.png"),
+        picture("slow-image", Assistant, "slow.png"),
+        // The steps between two Reads' pictures fold into the strip above
+        // them, so they don't part the pictures.
+        read("read-other", "other.png"),
+        picture("fast-image", Assistant, "fast.png"),
+        said("answer", Assistant, "The fast one keeps the inspector."),
+        said("pasted-text", User, "Mine:"),
+        picture("pasted-1", User, "Image 1"),
+        picture("pasted-2", User, "Image 2"),
+        // A picture the agent shows straight after the reader's is on the
+        // other side of the conversation.
+        picture("reply", Assistant, ""),
+        said("then", Assistant, "And alone:"),
+        read("read-narrow", "narrow.png"),
+        picture("narrow-image", Assistant, "narrow.png"),
+    ]);
+    let fits = |runtime: &Runtime| -> Vec<(String, images::Fit)> {
+        runtime
+            .snapshot
+            .items
+            .iter()
+            .filter(|item| matches!(item.content, ItemContent::Image { .. }))
+            .map(|item| (item.id.clone(), runtime.image_fit(&item.id)))
+            .collect()
+    };
+    assert_eq!(
+        fits(&runtime),
+        [
+            ("slow-image".into(), images::Fit::Tile),
+            ("fast-image".into(), images::Fit::Tile),
+            ("pasted-1".into(), images::Fit::Tile),
+            ("pasted-2".into(), images::Fit::Tile),
+            ("reply".into(), images::Fit::Alone),
+            ("narrow-image".into(), images::Fit::Alone),
+        ]
+    );
+    // A subagent's transcript draws each step as its own row, between the
+    // pictures.
+    let child = runtime.snapshot.items.to_vec();
+    for item in &child {
+        runtime.child_cache.insert(
+            item.id.clone(),
+            CachedItem::new(&item.content, runtime.syntax_theme),
+        );
+    }
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(chat::Subagent {
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child".into(),
+            status: chat::ToolStatus::Succeeded,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: false,
+            items: child,
+        });
+    runtime.selected_subagent = Some("child".into());
+    assert_eq!(runtime.image_fit("slow-image"), images::Fit::Alone);
+    assert_eq!(runtime.image_fit("fast-image"), images::Fit::Alone);
+    assert_eq!(runtime.image_fit("pasted-2"), images::Fit::Tile);
+}
+
 #[test]
 fn a_gallery_wraps_uniform_tiles_to_its_width_and_one_picture_stays_a_capped_preview() {
     let inset = 2.0 * f32::from(images::tiles::INSET);

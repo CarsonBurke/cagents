@@ -61,6 +61,10 @@ pub struct Pressure {
     retained: bool,
 }
 impl Pressure {
+    /// How much more of the budget the deferred read needs than is free now.
+    fn missing(&self) -> usize {
+        (self.permits as usize).saturating_sub(self.resource.available_permits())
+    }
     pub(super) async fn available(&self) {
         let permit = self.resource.clone().acquire_many_owned(self.permits).await;
         drop(permit);
@@ -79,6 +83,17 @@ impl std::hash::Hash for Pressure {
         Arc::as_ptr(&self.resource).hash(state);
         self.permits.hash(state);
         self.retained.hash(state);
+    }
+}
+#[cfg(test)]
+impl Pressure {
+    /// A read deferred for `permits` bytes of pixels, none of them free.
+    pub(in crate::app) fn on_pixels(permits: u32) -> Self {
+        Self {
+            resource: Arc::new(tokio::sync::Semaphore::new(0)),
+            permits,
+            retained: true,
+        }
     }
 }
 fn reserve(
@@ -730,19 +745,9 @@ pub(super) fn sync(runtime: &mut Runtime) {
     if runtime.preview_request.is_none() {
         runtime.preview_gallery.clear();
     }
-    let interested = interest(runtime);
-    let folded = runtime.selected_subagent.is_none();
-    let fits: HashMap<_, _> = items(runtime)
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, item)| interested.iter().any(|wanted| Arc::ptr_eq(wanted, item)))
-        .map(|(index, item)| {
-            (
-                item.id.clone(),
-                tiles::fit_at(items(runtime), index, folded),
-            )
-        })
+    let fits: HashMap<_, _> = interest(runtime)
+        .into_iter()
+        .map(|item| (item.id.clone(), runtime.image_fit(&item.id)))
         .collect();
     let parent = runtime.selected_subagent.is_none();
     for (active, id, cached) in runtime
@@ -918,8 +923,7 @@ pub(super) fn complete(
             cached.image_attempt = cached.image_attempt.wrapping_add(1);
             return None;
         }
-        let mut missing =
-            (pressure.permits as usize).saturating_sub(pressure.resource.available_permits());
+        let mut missing = pressure.missing();
         let mut evicted = false;
         if pressure.retained {
             for id in order[priority + 1..].iter().rev() {
@@ -1240,8 +1244,12 @@ impl Gallery {
         self.entries = entries;
     }
     /// Read the whole of the shown picture, unless it is already. The viewer
-    /// `host` shows is told when it is.
+    /// `host` shows is told when it is, or, the first time, that the read
+    /// waits for memory, so previews can make room for it.
     pub(in crate::app) fn read(&mut self, host: ViewerHost) -> Task<Message> {
+        self.read_whole(host, false)
+    }
+    fn read_whole(&mut self, host: ViewerHost, patient: bool) -> Task<Message> {
         let entry = &self.entries[self.selected];
         let (Some(item), Some(origin), None, None) =
             (&entry.source, &self.origin, &entry.full, &entry.error)
@@ -1254,8 +1262,9 @@ impl Gallery {
             let loaded = loop {
                 let (item, origin) = (item.clone(), origin.clone());
                 match worker(move || load(&item, &origin, Fit::Full)).await {
-                    // The reader asked for it, so it waits for room.
-                    Loaded::Deferred(pressure) => pressure.available().await,
+                    // Once previews have made what room they can, the reader
+                    // asked for it, so it waits for the rest.
+                    Loaded::Deferred(pressure) if patient => pressure.available().await,
                     loaded => break loaded,
                 }
             };
@@ -1265,16 +1274,22 @@ impl Gallery {
         self.reading = Some(handle.abort_on_drop());
         task
     }
+    /// The serial and entry a read for the shown picture reports with.
+    #[cfg(test)]
+    pub(in crate::app) fn awaiting(&self) -> (u64, String) {
+        (self.serial, self.entries[self.selected].id.clone())
+    }
+    /// Whether the read of the entry `id`, as this gallery opened `serial`,
+    /// is for the picture it shows now: one it has moved on from is not kept.
+    fn awaits(&self, serial: u64, id: &str) -> bool {
+        serial == self.serial && self.entries[self.selected].id == id
+    }
     /// The whole picture of the entry `id`, read for this gallery.
     pub(in crate::app) fn loaded(&mut self, serial: u64, id: &str, loaded: Loaded) {
-        if serial != self.serial {
+        if !self.awaits(serial, id) {
             return;
         }
-        // A read the viewer has moved on from is not kept.
         let entry = &mut self.entries[self.selected];
-        if entry.id != id {
-            return;
-        }
         match loaded {
             Loaded::Ready(handle) => entry.full = Some(handle),
             Loaded::Failed(error) => entry.error = Some(error),
@@ -1631,6 +1646,43 @@ impl Cagents {
                     sync_viewer(runtime);
                 }
                 Some(read)
+            }
+            // The reader asked for the whole picture, so, like a preview they
+            // asked for, it outranks the previews transcripts read on their
+            // own: theirs go, the pane's own last, until it fits.
+            Action::ViewerLoaded(host, serial, ref id, Loaded::Deferred(ref pressure)) => {
+                if !self
+                    .image_viewer(host)
+                    .is_some_and(|gallery| gallery.awaits(serial, id))
+                {
+                    return Some(Task::none());
+                }
+                if pressure.retained {
+                    let own = match host {
+                        ViewerHost::Pane(target) => Some(target),
+                        ViewerHost::Dialog => None,
+                    };
+                    let mut missing = pressure.missing();
+                    let mut panes: Vec<_> = self
+                        .cards
+                        .values_mut()
+                        .filter_map(|card| match card {
+                            CardRuntime::Chat(runtime) => Some(runtime),
+                            _ => None,
+                        })
+                        .collect();
+                    panes.sort_by_key(|runtime| Some(runtime.target) == own);
+                    for runtime in panes {
+                        if missing == 0 {
+                            break;
+                        }
+                        missing = evict_ready(runtime, missing);
+                    }
+                }
+                Some(
+                    self.image_viewer_mut(host)
+                        .map_or_else(Task::none, |gallery| gallery.read_whole(host, true)),
+                )
             }
             Action::ViewerLoaded(host, serial, ref id, ref loaded) => {
                 if let Some(gallery) = self.image_viewer_mut(host) {
