@@ -10,12 +10,16 @@
 # WORKTREES (default 250) worktrees of DIRECTORIES (default 40) tracked
 # directories each, more than the watcher's directory budget. ACTIVE (default
 # 3) of them have a fresh edit and ten more an edit outside the active window.
+# The fixture runs no agent in those checkouts, so it measures the important
+# idle-after-edit case rather than treating a historical dirty timestamp as a
+# live session.
 # It reports the first load: how long the board took to read every worktree,
 # plan and register all of its watches and settle, and which Git commands the
 # daemon ran. Then it counts the Git commands and `git status` reads the
-# daemon starts and the CPU it and its exited children used over SECONDS
-# (default 300). Git's own trace2 records every command, so even the shortest
-# are counted; the CLI's own commands are reported apart. The fixture's
+# daemon starts, the CPU it and its exited children use, and the daemon's
+# per-thread `/proc/PID/task/*/io` deltas over SECONDS (default 300). Git's
+# own trace2 records every command, so even the shortest are counted; the
+# CLI's own commands are reported apart. The fixture's
 # processes, setup commits included, read no Git configuration outside it.
 set -euo pipefail
 
@@ -141,6 +145,44 @@ def times():
     return int(fields[11]) + int(fields[12]), int(fields[13]) + int(fields[14])
 
 
+IO_FIELDS = ("rchar", "wchar", "syscr", "syscw", "read_bytes", "write_bytes")
+
+
+def io():
+    """Aggregate the daemon's thread I/O counters by Linux thread name."""
+    threads = collections.defaultdict(lambda: collections.Counter())
+    for task in glob.glob(f"/proc/{daemon}/task/*"):
+        try:
+            with open(os.path.join(task, "comm")) as name, open(os.path.join(task, "io")) as stats:
+                values = {}
+                for line in stats:
+                    key, value = line.split(":", 1)
+                    if key in IO_FIELDS:
+                        values[key] = int(value)
+                threads[name.read().strip()].update(values)
+        except OSError:
+            # A short-lived worker may leave between listing its task directory
+            # and reading its counters; it cannot make a later delta larger.
+            pass
+    return threads
+
+
+def report_io(before, after, seconds):
+    for name in sorted(set(before) | set(after)):
+        delta = {
+            field: after[name][field] - before[name][field]
+            for field in IO_FIELDS
+        }
+        if not any(delta.values()):
+            continue
+        rate = ", ".join(
+            f"{field}={value} ({value / seconds:.1f}/s)"
+            for field, value in delta.items()
+            if value
+        )
+        print(f"thread io {name}: {rate}")
+
+
 def watches():
     """Native inotify watches the daemon holds."""
     count = 0
@@ -231,8 +273,10 @@ print("not the daemon's: " + (", ".join(
     f"{command} {count} ({parent})" for (parent, command), count in others.most_common()) or "none"))
 
 own, children = times()
+io_before = io()
 time.sleep(seconds)
 now_own, now_children = times()
+io_after = io()
 collect()
 steady = [name for name in known if name not in load]
 statuses = sum(known[name][0] == "status" for name in steady)
@@ -243,4 +287,5 @@ print(f"git processes per second {len(steady) / seconds:.2f}")
 print(f"exited children cpu % core {100 * (now_children - children) / ticks / seconds:.2f}")
 print(f"daemon cpu % core {100 * (now_own - own) / ticks / seconds:.2f}")
 print(f"native watches {watches()}")
+report_io(io_before, io_after, seconds)
 EOF

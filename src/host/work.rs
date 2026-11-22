@@ -533,7 +533,7 @@ impl Shared {
     }
 
     fn worktree_due(&self, worktree: &scan::Worktree, last_scan: Instant) -> Instant {
-        let interval = if self.worktree_active(worktree) {
+        let interval = if self.worktree_has_live_session(worktree) {
             ACTIVE_POLL
         } else {
             IDLE_POLL
@@ -541,19 +541,18 @@ impl Shared {
         worktree.status_read_at.unwrap_or(last_scan) + interval
     }
 
-    /// Whether a worktree's files or agents changed within the active window.
-    fn worktree_active(&self, worktree: &scan::Worktree) -> bool {
-        let recent = |at: u64| now_unix_ms().saturating_sub(at) <= crate::work::ACTIVE_WINDOW_MS;
-        worktree
-            .dirty
-            .as_ref()
-            .and_then(|dirty| dirty.newest_modified_at_unix_ms)
-            .is_some_and(recent)
-            || self
-                .session_activity
-                .get(&worktree.path)
-                .copied()
-                .is_some_and(recent)
+    /// Whether a running agent can be changing this checkout between native
+    /// filesystem events. A card remains Active for the longer product
+    /// activity window, but a completed edit must not keep an uncovered
+    /// worktree running `git status` every fifteen seconds for three hours.
+    fn worktree_has_live_session(&self, worktree: &scan::Worktree) -> bool {
+        self.session_activity
+            .get(&worktree.path)
+            .copied()
+            .is_some_and(|at| {
+                now_unix_ms().saturating_sub(at)
+                    <= u64::try_from(SESSION_SAMPLE.as_millis()).unwrap_or(u64::MAX) * 2
+            })
     }
 
     fn track(&mut self, repository: &Path, name: &str) -> &mut Tracked {
@@ -2558,8 +2557,10 @@ mod tests {
         let mut shared = handle.shared();
         let start = Instant::now();
         let at = |seconds| start + Duration::from_secs(seconds);
-        // An agent edits one checkout; another has a live session; the rest
-        // of a large project sits untouched, most of it read more recently.
+        // One checkout was edited recently, another still has a live session,
+        // and the rest of a large project sits untouched, most of it read
+        // more recently. Recent dirtiness affects card placement, but only a
+        // live session earns the short fallback polling cadence.
         let edited = polled_worktree("/repo/.worktrees/edited", start, Some(now_unix_ms()));
         let session = polled_worktree("/repo/.worktrees/session", start, None);
         let nearly_due = polled_worktree("/repo/.worktrees/nearly-due", start, None);
@@ -2583,10 +2584,14 @@ mod tests {
         );
         assert_eq!(shared.due_polls(tracked, at(14)), None);
         assert_eq!(
+            shared.due_polls(tracked, at(15)),
+            Some(BTreeSet::from([session.id])),
+            "a historical edit does not earn the short polling cadence"
+        );
+        assert_eq!(
             shared.due_polls(tracked, at(110)),
             Some(BTreeSet::from([edited.id, session.id, nearly_due.id])),
-            "only active worktrees poll at the active cadence; one about to \
-             come due joins them"
+            "idle worktrees due in the next active interval join one scan"
         );
         // The quiet worktrees still come due at the idle cadence.
         assert_eq!(
@@ -2658,6 +2663,9 @@ mod tests {
         let start = Instant::now();
         let edited = polled_worktree("/repo/edited", start, Some(now_unix_ms()));
         let quiet = polled_worktree("/repo/quiet", start, None);
+        shared
+            .session_activity
+            .insert(edited.path.clone(), now_unix_ms());
         track_polled(&mut shared, vec![edited.clone(), quiet], start).scanning = true;
         let due = start + ACTIVE_POLL;
 
@@ -2689,6 +2697,9 @@ mod tests {
         let mut shared = handle.shared();
         let start = Instant::now();
         let edited = polled_worktree("/repo/edited", start, Some(now_unix_ms()));
+        shared
+            .session_activity
+            .insert(edited.path.clone(), now_unix_ms());
         track_polled(&mut shared, vec![edited], start);
         assert_eq!(shared.until_scan(start), Some(ACTIVE_POLL));
 
