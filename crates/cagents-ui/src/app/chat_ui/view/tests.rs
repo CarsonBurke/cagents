@@ -1673,11 +1673,11 @@ fn status_failure_button_opens_the_exact_transcript_and_multiple_failures_open_a
     Arc::make_mut(&mut runtime.snapshot).subagents.push(second);
     drop(app.handle_chat_ui(Action::SubagentChooser(
         target,
-        child_navigation::Filter::Failed,
+        child_navigation::Section::Attention,
     )));
     let runtime = app.chat_runtime_mut(target).unwrap();
     let picker = runtime.child_picker.as_ref().unwrap();
-    assert_eq!(picker.filter, child_navigation::Filter::Failed);
+    assert_eq!(picker.opened_on, Some(child_navigation::Section::Attention));
     assert_eq!(
         picker
             .rows(
@@ -5145,7 +5145,7 @@ fn native_child_picker_selects_both_transcripts_through_real_narrow_chooser_rebu
             .find(|node| {
                 node.node().role() == iced_accessibility::accesskit::Role::Button
                     && node.node().label().is_some_and(|label| match step {
-                        0 => label.starts_with("Search and filter subagents:"),
+                        0 => label.starts_with("All subagents:"),
                         1 => {
                             label.contains("Inspect repository")
                                 && label.ends_with(" · native-child")
