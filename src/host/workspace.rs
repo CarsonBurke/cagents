@@ -177,10 +177,14 @@ fn edit_then<T>(
             .apply_delta_guarded_with(&edit, |_, sql| {
                 let expected = Registry::title_conversation_at(sql, *id, *card, *expected_revision)
                     .map_err(TitleAdmission::from)?;
-                host.lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state
                     .validate_title_conversation(expected, title, *source)
-                    .map_err(TitleAdmission)
+                    .map_err(TitleAdmission)?;
+                // Keep resident identity admission through COMMIT. A
+                // conflicting resident edit cannot slip between validation
+                // and the durable title change.
+                Ok(state)
             })
             .map_err(|error| error.0)?
     } else if matches!(

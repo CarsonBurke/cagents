@@ -15,13 +15,35 @@ use crate::{
     workspace_model::views::{Pane, Scope},
 };
 use std::{
-    sync::mpsc,
+    sync::{Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 mod delta_delivery_tests;
 mod removal_tests;
+
+type BusyGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
+// The registry connection invokes this from its actual SQLite busy loop. The
+// test below uses it to distinguish an editor blocked in BEGIN IMMEDIATE from
+// one that merely acquired the Rust writer mutex but has not reached SQLite.
+static TITLE_BUSY_GATE: OnceLock<Mutex<Option<BusyGate>>> = OnceLock::new();
+
+fn title_busy_gate(attempt: i32) -> bool {
+    let gate = TITLE_BUSY_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some((entered, proceed)) = gate
+        && (entered.send(()).is_err() || proceed.recv_timeout(Duration::from_secs(5)).is_err())
+    {
+        return false;
+    }
+    thread::sleep(Duration::from_millis(1));
+    attempt < 5_000
+}
 
 fn fixture() -> (tempfile::TempDir, SharedHost, Arc<DeliveryQueue>) {
     let directory = tempfile::tempdir().unwrap();
@@ -210,11 +232,21 @@ fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
     let blocker = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let registry = writer(&host).unwrap();
-    let (finished, completion) = mpsc::channel();
+    let (entered, busy_wait) = mpsc::channel();
+    let (continue_busy_wait, proceed) = mpsc::channel();
+    *TITLE_BUSY_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((entered, proceed));
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_busy_handler_for_test(Some(title_busy_gate))
+        .unwrap();
     let editor = {
         let host = host.clone();
         thread::spawn(move || {
-            let result = process_request(
+            process_request(
                 &host,
                 1,
                 ClientRequest::ApplyWorkspaceEdit {
@@ -226,28 +258,12 @@ fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
                         source: crate::model::ChannelTitleSource::Prompt,
                     },
                 },
-            );
-            finished.send(()).unwrap();
-            result
+            )
         })
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let entered = loop {
-        if matches!(
-            registry.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ) {
-            break true;
-        }
-        if Instant::now() >= deadline || completion.try_recv().is_ok() {
-            break false;
-        }
-        thread::sleep(Duration::from_millis(1));
-    };
-    assert!(
-        entered,
-        "title publication did not reach SQLite writer admission"
-    );
+    busy_wait
+        .recv_timeout(Duration::from_secs(5))
+        .expect("title publication did not enter SQLite's BEGIN IMMEDIATE busy wait");
     let (listed, response) = mpsc::channel();
     let inspector = {
         let host = host.clone();
@@ -258,6 +274,7 @@ fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
         })
     };
     let during_contention = response.recv_timeout(Duration::from_secs(1));
+    continue_busy_wait.send(()).unwrap();
     blocker.execute_batch("ROLLBACK").unwrap();
     let result = editor.join().unwrap();
     inspector.join().unwrap();

@@ -949,9 +949,10 @@ impl HostState {
         {
             return Err(invalid());
         }
-        // The request holds workspace writer admission as well as this
-        // resident identity guard. Read only current metadata, not Store,
-        // history or files; later edits cannot overtake this admission.
+        // The request holds workspace writer admission and keeps this
+        // resident identity guard through its SQLite commit. Read only current
+        // metadata, not Store, history or files; no later workspace edit can
+        // overtake the validated commit.
         let (session, current_title) = actual.handle.conversation_title().map_err(|reason| {
             let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
             ProtocolError::new(

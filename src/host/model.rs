@@ -415,6 +415,14 @@ impl Registry {
         self.commit_delta(edit, guard, true)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_busy_handler_for_test(
+        &self,
+        handler: Option<fn(i32) -> bool>,
+    ) -> rusqlite::Result<()> {
+        self.db.busy_handler(handler)
+    }
+
     /// [`Registry::apply_delta_guarded`], checking the store's schema and
     /// layout first unless `check_schema` is false: only for a caller that
     /// holds the store alone and checked it once already, since another
