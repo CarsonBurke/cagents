@@ -98,22 +98,36 @@ fn selected_span(content: &Content<cosmic::Renderer>, view: &Excerpt) -> Option<
     })
 }
 
-/// Perform the real composer edit, measuring its local replacement only when
-/// an attachment needs mapping. This adapter leaves native editing and Undo alone.
-pub(super) fn edit(
-    content: &mut Content<cosmic::Renderer>,
-    edit: text_editor::Edit,
-) -> Result<Option<TextChange>, ()> {
+/// The lines around the cursor that hold its selection's actual span.
+fn cursor_lines(content: &Content<cosmic::Renderer>) -> (usize, usize) {
     let cursor = content.cursor();
     let anchor = cursor.selection.unwrap_or(cursor.position);
-    let count = content.line_count();
     let first = cursor.position.line.min(anchor.line).saturating_sub(1);
     let last = cursor
         .position
         .line
         .max(anchor.line)
         .saturating_add(1)
-        .min(count.saturating_sub(1));
+        .min(content.line_count().saturating_sub(1));
+    (first, last)
+}
+
+/// The span the composer's selection covers, as a plain selection from its
+/// anchor to its caret. A word or line selection reports only where it
+/// began; `None` when its span can't be told apart from another like it.
+pub(super) fn selection_span(content: &Content<cosmic::Renderer>) -> Option<Cursor> {
+    let (first, last) = cursor_lines(content);
+    selected_span(content, &excerpt(content, first, last, false))
+}
+
+/// Perform the real composer edit, measuring its local replacement only when
+/// an attachment needs mapping. This adapter leaves native editing and Undo alone.
+pub(super) fn edit(
+    content: &mut Content<cosmic::Renderer>,
+    edit: text_editor::Edit,
+) -> Result<Option<TextChange>, ()> {
+    let count = content.line_count();
+    let (first, last) = cursor_lines(content);
     let before = excerpt(content, first, last, false);
     let selection = selected_span(content, &before);
     let changed_from = selection.and_then(|selection| {

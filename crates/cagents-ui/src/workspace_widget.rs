@@ -1025,6 +1025,49 @@ pub(crate) fn recordable_shortcut_character(
     })
 }
 
+/// Whether a chord is undo or redo (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) pressed in
+/// a chat pane, whose message editor has an undo history of its own.
+///
+/// The pane's content sees such a chord before the workspace does: the
+/// focused editor takes it, and the workspace's action bound to the same
+/// chord, such as reopening a closed pane on Ctrl+Shift+Z, runs only when
+/// nothing there took it ([`deferred_shortcut_taken`]).
+pub(crate) fn defers_to_focused_editor(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+    focused: FocusedPane,
+) -> bool {
+    focused == FocusedPane::Chat
+        && modifiers.command()
+        && !modifiers.alt()
+        && !modifiers.logo()
+        && match latin_key(key, physical_key) {
+            Some('z') => true,
+            Some('y') => !modifiers.shift(),
+            _ => false,
+        }
+}
+
+/// Whether the pane's content took a chord the workspace left to it first
+/// ([`defers_to_focused_editor`]), so the workspace's own action for that
+/// chord does not also run.
+pub(crate) fn deferred_shortcut_taken(
+    event: &keyboard::Event,
+    captured: bool,
+    focused: FocusedPane,
+) -> bool {
+    match event {
+        keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        } => captured && defers_to_focused_editor(key, *physical_key, *modifiers, focused),
+        _ => false,
+    }
+}
+
 fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
     if let keyboard::Key::Character(value) = key.as_ref() {
         let mut characters = value.chars();
@@ -2281,8 +2324,15 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         let content_layout = Self::child_layout(layout);
 
         match event {
-            Event::Keyboard(press @ keyboard::Event::KeyPressed { .. })
-                if is_global_shortcut_press(press, self.shortcuts, self.focused_pane) =>
+            Event::Keyboard(
+                press @ keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                },
+            ) if is_global_shortcut_press(press, self.shortcuts, self.focused_pane)
+                && !defers_to_focused_editor(key, *physical_key, *modifiers, self.focused_pane) =>
             {
                 shell.capture_event();
                 return;
@@ -2297,6 +2347,11 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                 *physical_key,
                 *modifiers,
                 self.shortcuts,
+                self.focused_pane,
+            ) && !defers_to_focused_editor(
+                key,
+                *physical_key,
+                *modifiers,
                 self.focused_pane,
             ) =>
             {

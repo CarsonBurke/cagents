@@ -6549,3 +6549,37 @@ fn codex_reports_each_request_and_what_the_cache_served() {
     // A failed request repeats the latest reading.
     assert!(evidence(adapter.receive(usage(80_000, 80_000, 70_000)).unwrap()).is_empty());
 }
+
+#[test]
+fn images_left_after_a_reference_is_deleted_keep_their_own_labels() {
+    // The composer drops an image whose reference was deleted and never
+    // renumbers the rest, so a prompt can name [Image N] and [Image N+2]
+    // alone, in either order.
+    crate::chat::attachment_assets::with_test_image(|first| {
+        let _removed = crate::chat::attachment_assets::test_image("removed.png");
+        let third = crate::chat::attachment_assets::test_image("third.png");
+        let label = |image: &Attachment| image.reference.clone().unwrap();
+        let text = format!(
+            "Compare {} with {}",
+            label(&third).token(),
+            label(&first).token()
+        );
+        let mut adapter = adapter();
+        adapter
+            .modalities
+            .insert("model".into(), vec!["image".into()]);
+        let input = adapter
+            .input(text.clone(), vec![first.clone(), third.clone()])
+            .unwrap();
+        assert_eq!(
+            input,
+            [
+                json!({"type":"text","text":text}),
+                json!({"type":"text","text":label(&third).token()}),
+                json!({"type":"localImage","path":third.path.to_str().unwrap()}),
+                json!({"type":"text","text":label(&first).token()}),
+                json!({"type":"localImage","path":first.path.to_str().unwrap()}),
+            ]
+        );
+    });
+}

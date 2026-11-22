@@ -74,6 +74,7 @@ macro_rules! application_atomic {
 
 mod artifacts;
 mod attachment_draft;
+mod attachment_tile;
 mod auth_recovery;
 #[cfg(test)]
 pub(in crate::app) mod blocked_recovery_tests;
@@ -81,6 +82,7 @@ mod changes;
 mod child_navigation;
 mod clipboard_image;
 mod close_refusal;
+mod draft_images;
 #[cfg(test)]
 pub(in crate::app) use close_refusal::{close_refusal_dismiss_id, close_refusal_end_id};
 mod closed_draft;
@@ -276,6 +278,36 @@ pub enum ReturnRefused {
     SourceLive,
     /// Giving the actor up could not be confirmed.
     Unconfirmed(String),
+}
+
+/// Why an image a draft's text names could not join a chat already at its
+/// provider's attachment limit.
+const ATTACHMENT_LIMIT_REACHED: &str = "this chat has reached its attachment limit.";
+
+/// Why an image a draft's text names could not join a chat whose current
+/// model takes none.
+const IMAGES_NOT_ACCEPTED: &str = "the current model cannot accept images.";
+
+/// The composer note for images whose references stay as text because
+/// they could not be attached, or `None` when every one was.
+fn not_attached(labels: Vec<String>, why: &str) -> Option<String> {
+    (!labels.is_empty()).then(|| {
+        format!(
+            "{} {} not attached: {why}",
+            labels.join(", "),
+            if labels.len() == 1 { "was" } else { "were" },
+        )
+    })
+}
+
+/// How a tile's removal was asked for, which decides where the keyboard
+/// goes after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// Delete or Backspace on the focused tile.
+    Key,
+    /// A press of the tile's ×.
+    Pointer,
 }
 
 #[derive(Clone)]
@@ -576,7 +608,15 @@ pub enum Action {
     ),
     /// Files or text dropped on the conversation.
     Dropped(Target, file_drop::Payload),
-    RemoveAttachment(Target, usize),
+    RemoveAttachment(Target, usize, Removal),
+    /// Undo in the composer, or redo when `true`.
+    ComposerUndo(Target, bool),
+    /// The composer's selection is about to be copied or cut.
+    ComposerCopied(Target),
+    /// Opens the tray's `index`th image in the image viewer.
+    OpenAttachment(Target, usize),
+    /// The full-size pixels of a draft image the tray asked to open.
+    AttachmentOpened(Target, Attachment, images::Loaded),
     Model(Target, String),
     Reasoning(Target, String, Option<String>),
     PermissionMode(Target, String),
@@ -995,6 +1035,10 @@ impl Action {
             Self::Attached(..) => "Attached",
             Self::Dropped(..) => "Dropped",
             Self::RemoveAttachment(..) => "RemoveAttachment",
+            Self::ComposerUndo(..) => "ComposerUndo",
+            Self::ComposerCopied(..) => "ComposerCopied",
+            Self::OpenAttachment(..) => "OpenAttachment",
+            Self::AttachmentOpened(..) => "AttachmentOpened",
             Self::Model(..) => "Model",
             Self::Reasoning(..) => "Reasoning",
             Self::PermissionMode(..) => "PermissionMode",
@@ -1136,7 +1180,8 @@ impl Action {
             | Self::Attach(target)
             | Self::Paste(target)
             | Self::Dropped(target, _)
-            | Self::RemoveAttachment(target, _)
+            | Self::RemoveAttachment(target, ..)
+            | Self::ComposerUndo(target, _)
             | Self::TakeBackQueued(target, _)
             | Self::RemoveQueued(target, _)
             | Self::Model(target, _)
@@ -1421,6 +1466,9 @@ pub(super) struct State {
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
+    /// What the reader last copied or cut from a composer, when it named the
+    /// draft's images, which pasting it into another draft brings along.
+    copied_images: Option<draft_images::Copied>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -1460,6 +1508,7 @@ impl Default for State {
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
+            copied_images: None,
         }
     }
 }
@@ -3391,6 +3440,21 @@ pub(super) struct Runtime {
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
+    /// Images whose `[Image N]` reference an edit took out of the draft,
+    /// which the edit that puts it back returns; see [`draft_images`].
+    detached_attachments: Vec<draft_images::Detached>,
+    /// Undo and redo for the composer's text, and with it the images its
+    /// references hold.
+    composer_undo: crate::editor_history::History,
+    /// The draft's undo history while a walk through sent messages shows
+    /// another text in the composer.
+    composer_undo_stash: Option<(crate::editor_history::History, Vec<draft_images::Detached>)>,
+    /// The tile whose image the composer's caret is on, which the tray shows
+    /// as it shows a hovered one.
+    caret_reference: Option<uuid::Uuid>,
+    /// The draft image the tray last asked to open; a slower load of an
+    /// earlier one arrives to find it is no longer wanted.
+    opening_attachment: Option<Attachment>,
     thumbnails: thumbnails::Cache,
     /// Clipboard reads and image writes still destined for this draft.
     pastes_pending: usize,
@@ -3716,13 +3780,27 @@ impl Runtime {
     /// Puts `insertion` over `token` as one edit of the draft, which ends any
     /// history browsing and invalidates attachment positions read before it.
     fn apply_completion(&mut self, token: &completion::Token, insertion: &str) {
-        completion::apply(&mut self.composer, token, insertion);
+        let before = self.composer.cursor();
+        let inline = self.inline_references();
+        match completion::apply(&mut self.composer, token, insertion) {
+            Ok(Some(change)) => self.composer_undo.record(
+                change,
+                crate::editor_history::EditKind::Other,
+                before,
+                self.composer.cursor(),
+                std::time::Instant::now(),
+            ),
+            Ok(None) => {}
+            Err(()) => self.composer_undo.clear(),
+        }
+        self.reconcile_references(inline);
         self.named_in_draft();
     }
 
     /// Settles the draft after a name was put in it: the edit moved text
-    /// under any attachment placed by position, and ends the completion and
-    /// history walk it came from.
+    /// under any attachment placed by position, ends the completion and
+    /// history walk it came from, and leaves the tray marking the image the
+    /// caret is now on.
     fn named_in_draft(&mut self) {
         for bookmark in self.attachment_bookmarks.values_mut() {
             bookmark.valid = false;
@@ -3733,6 +3811,8 @@ impl Runtime {
         self.history_cursor = None;
         self.history_stash = None;
         self.history_attachment_stash = None;
+        // The caret moved with the name, onto or off an image's reference.
+        self.follow_caret_reference();
     }
 
     /// Retain exact receipt metadata across take-back, queue edits and retry.
@@ -3751,6 +3831,7 @@ impl Runtime {
                 self.attachments.push(attachment);
             }
         }
+        draft_images::forget(&mut self.detached_attachments, &self.attachments);
         self.thumbnails.sync(&self.attachments);
         if self.attachments.len() != before {
             self.revision = self.revision.wrapping_add(1);
@@ -3791,31 +3872,262 @@ impl Runtime {
         self.attachment_jobs.get(&id).map(|lease| lease.ticket(id))
     }
 
+    /// Every edit is measured: the undo history records it, pending image
+    /// insertions follow it, and the images whose references it touched
+    /// follow the text.
     fn composer_action(&mut self, action: text_editor::Action) {
+        let scrolled = matches!(action, text_editor::Action::Scroll { .. });
         match action {
             text_editor::Action::Edit(edit) => {
-                if self.attachment_bookmarks.is_empty() {
-                    self.composer.perform(text_editor::Action::Edit(edit));
-                } else {
-                    match attachment_draft::edit(&mut self.composer, edit) {
-                        Ok(Some(change)) => {
-                            for bookmark in self.attachment_bookmarks.values_mut() {
-                                bookmark.changed(&change);
-                            }
+                // An edit takes an image's reference whole or not at all.
+                // Undo returns to the cursor as the edit found it once whole,
+                // not to the reference a Backspace beside it selects.
+                self.keep_references_whole(draft_images::Toward::Outward);
+                let before = self.composer.cursor();
+                if let Some(live) = self.live_references()
+                    && let Some(whole) = draft_images::deleted_whole(&self.composer, &live, &edit)
+                {
+                    attachment_draft::move_to(&mut self.composer, whole);
+                }
+                let selected = self
+                    .composer
+                    .selection()
+                    .is_some_and(|selection| !selection.is_empty());
+                let kind = draft_images::kind(&edit, selected);
+                let inline = self.inline_references();
+                match attachment_draft::edit(&mut self.composer, edit) {
+                    Ok(Some(change)) => {
+                        for bookmark in self.attachment_bookmarks.values_mut() {
+                            bookmark.changed(&change);
                         }
-                        Err(()) => {
-                            for bookmark in self.attachment_bookmarks.values_mut() {
-                                bookmark.valid = false;
-                            }
-                        }
-                        Ok(None) => {}
+                        self.composer_undo.record(
+                            change,
+                            kind,
+                            before,
+                            self.composer.cursor(),
+                            std::time::Instant::now(),
+                        );
                     }
+                    Err(()) => {
+                        for bookmark in self.attachment_bookmarks.values_mut() {
+                            bookmark.valid = false;
+                        }
+                        // The edit could not be measured, so no step can
+                        // describe it; older steps would replay over text
+                        // they do not know.
+                        self.composer_undo.clear();
+                    }
+                    Ok(None) => {}
+                }
+                self.reconcile_references(inline);
+            }
+            other => {
+                // A step ends where the caret leaves it.
+                if !scrolled {
+                    self.composer_undo.seal();
+                }
+                let toward = match &other {
+                    text_editor::Action::Move(motion) | text_editor::Action::Select(motion) => {
+                        Some(draft_images::Toward::of(*motion))
+                    }
+                    text_editor::Action::Click(_) | text_editor::Action::Drag(_) => {
+                        Some(draft_images::Toward::Nearer)
+                    }
+                    text_editor::Action::SelectWord
+                    | text_editor::Action::SelectLine
+                    | text_editor::Action::SelectAll => Some(draft_images::Toward::Outward),
+                    // Scrolling and clearing a selection move no end.
+                    text_editor::Action::Scroll { .. }
+                    | text_editor::Action::ClearSelection
+                    | text_editor::Action::Edit(_) => None,
+                };
+                self.composer.perform(other);
+                if let Some(toward) = toward {
+                    self.keep_references_whole(toward);
                 }
             }
-            other => self.composer.perform(other),
         }
         self.cancel_invalid_attachment_jobs();
         self.settle_restored_notice();
+        // Scrolling leaves the caret where it was.
+        if !scrolled {
+            self.follow_caret_reference();
+        }
+    }
+
+    /// The tokens of the draft's images, which the caret and selection keep
+    /// whole; `None` while it holds none.
+    fn live_references(&self) -> Option<HashSet<String>> {
+        let live = draft_images::live_tokens(&self.attachments);
+        (!live.is_empty()).then_some(live)
+    }
+
+    /// Moves the end of the cursor the reader moved out of any image's
+    /// reference it landed inside, `toward` one of its sides, and the other
+    /// end of a selection outward, so a selection holds references whole.
+    fn keep_references_whole(&mut self, toward: draft_images::Toward) {
+        if let Some(live) = self.live_references()
+            && let Some(whole) = draft_images::whole(&self.composer, &live, toward)
+        {
+            attachment_draft::move_to(&mut self.composer, whole);
+        }
+    }
+
+    /// Attaches the images a paste brought from another draft, whose
+    /// references it put in this one; see [`draft_images::Copied`]. Those
+    /// this chat can't take stay text, and the composer says why.
+    fn carry_images(&mut self, carried: &[Attachment]) {
+        let holds = |attachments: &[Attachment], image: &Attachment| {
+            attachments.iter().any(|held| {
+                held.reference.as_ref().map(|r| r.id) == image.reference.as_ref().map(|r| r.id)
+            })
+        };
+        let new: Vec<Attachment> = carried
+            .iter()
+            .filter(|image| !holds(&self.attachments, image))
+            .cloned()
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        let rules = chat::AttachmentRules::for_provider(self.session.launch.provider);
+        // A size this device can't read is left for the provider to check
+        // when the message is sent, as with any image of another device.
+        let (fits, too_large): (Vec<_>, Vec<_>) = new.into_iter().partition(|image| {
+            std::fs::metadata(&image.path)
+                .ok()
+                .is_none_or(|metadata| metadata.len() <= rules.max_image_bytes)
+        });
+        let room = if self.accepts_draft_attachments() {
+            rules.max_count.map_or(usize::MAX, |limit| {
+                limit.saturating_sub(self.attachments.len() + self.image_pastes_saving)
+            })
+        } else {
+            0
+        };
+        let labels = |images: &[Attachment]| images.iter().map(Attachment::label).collect();
+        let over = fits.get(room..).unwrap_or_default();
+        let notes: Vec<String> = [
+            not_attached(
+                labels(over),
+                if self.accepts_draft_attachments() {
+                    ATTACHMENT_LIMIT_REACHED
+                } else {
+                    IMAGES_NOT_ACCEPTED
+                },
+            ),
+            not_attached(labels(&too_large), "too large for this chat's provider."),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !notes.is_empty() {
+            self.composer_note = Some(notes.join(" "));
+        }
+        // An image left out only for the limit is kept as one whose
+        // reference was taken out, so bringing the reference back once there
+        // is room, as a redo of this paste does, attaches it.
+        let mut fits = fits;
+        let over = if self.accepts_draft_attachments() {
+            fits.split_off(room.min(fits.len()))
+        } else {
+            Vec::new()
+        };
+        draft_images::wait(&mut self.detached_attachments, &self.attachments, over);
+        self.merge_attachments(fits.into_iter().take(room));
+        self.follow_caret_reference();
+    }
+
+    /// Which of the draft's images, held or detached, its references name,
+    /// before an edit that may take one out or bring one back; `None` when
+    /// no edit can move an image.
+    fn inline_references(&self) -> Option<HashSet<uuid::Uuid>> {
+        draft_images::tracked(&self.attachments, &self.detached_attachments).then(|| {
+            draft_images::named(
+                &self.composer.text(),
+                &self.attachments,
+                &self.detached_attachments,
+            )
+        })
+    }
+
+    /// Brings the attachments in line with the text after an edit; `inline`
+    /// is what [`Self::inline_references`] read before it.
+    fn reconcile_references(&mut self, inline: Option<HashSet<uuid::Uuid>>) {
+        let Some(inline) = inline else {
+            return;
+        };
+        // An image a reference brings back counts toward the provider's
+        // limit as a new one would, with the pastes still being saved. It is
+        // not refused for the current model, as the images the draft holds
+        // are not dropped when the model changes: undo restores the draft as
+        // it was, which may be before the provider has said what it takes.
+        let capacity = chat::AttachmentRules::for_provider(self.session.launch.provider)
+            .max_count
+            .map_or(usize::MAX, |limit| {
+                limit.saturating_sub(self.image_pastes_saving)
+            });
+        let reconciled = draft_images::reconcile(
+            &self.composer.text(),
+            &inline,
+            &mut self.attachments,
+            &mut self.detached_attachments,
+            capacity,
+        );
+        if let Some(note) = not_attached(reconciled.refused, ATTACHMENT_LIMIT_REACHED) {
+            self.composer_note = Some(note);
+        }
+        if reconciled.changed {
+            self.thumbnails.sync(&self.attachments);
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// Steps the composer's undo history back, or forward with `redo`. The
+    /// images whose references the step moves go and come with them.
+    /// Answers whether there was a step.
+    fn undo_composer(&mut self, redo: bool) -> bool {
+        let inline = self.inline_references();
+        let mut buffer = draft_images::Buffer(&mut self.composer);
+        let replay = if redo {
+            self.composer_undo.redo(&mut buffer)
+        } else {
+            self.composer_undo.undo(&mut buffer)
+        };
+        if replay == crate::editor_history::Replay::Empty {
+            return false;
+        }
+        // The step moved text under any insertion still loading; it asks to
+        // be made again rather than land somewhere it was not aimed.
+        for bookmark in self.attachment_bookmarks.values_mut() {
+            bookmark.valid = false;
+        }
+        self.cancel_invalid_attachment_jobs();
+        self.reconcile_references(inline);
+        self.completion.restart(true);
+        self.revision = self.revision.wrapping_add(1);
+        self.history_cursor = None;
+        self.history_stash = None;
+        self.history_attachment_stash = None;
+        self.settle_restored_notice();
+        self.follow_caret_reference();
+        true
+    }
+
+    /// The image whose `[Image N]` reference holds the caret, which its tile
+    /// marks so the reader can tell which picture the text names.
+    fn follow_caret_reference(&mut self) {
+        let caret = self.composer.cursor().position;
+        self.caret_reference = self.composer.line(caret.line).and_then(|line| {
+            let text = line.text;
+            self.attachments.iter().find_map(|attachment| {
+                let reference = attachment.reference.as_ref()?;
+                let token = reference.token();
+                text.match_indices(&token)
+                    .any(|(at, _)| (at..=at + token.len()).contains(&caret.column))
+                    .then_some(reference.id)
+            })
+        });
     }
 
     /// The restored-messages notice describes the draft; once the reader
@@ -3898,35 +4210,51 @@ impl Runtime {
                 insertion.push(' ');
             }
         }
-        if !insertion.is_empty()
-            && let Ok(Some(change)) = attachment_draft::edit(
+        if !insertion.is_empty() {
+            let inline = self.inline_references();
+            let edited = attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(insertion)),
-            )
-        {
-            for (other_id, other) in &mut self.attachment_bookmarks {
-                // Equal collapsed anchors follow paste initiation order,
-                // independent of worker completion order. User caret
-                // mapping retains its normal left affinity.
-                let later_at_start = !earlier.contains(other_id)
-                    && other.cursor.selection.is_none()
-                    && other.cursor.position == change.start;
-                other.changed(&change);
-                if later_at_start && other.valid {
-                    other.cursor.position = change.inserted_end();
+            );
+            if let Ok(Some(change)) = edited {
+                let undo_change = change.clone();
+                for (other_id, other) in &mut self.attachment_bookmarks {
+                    // Equal collapsed anchors follow paste initiation order,
+                    // independent of worker completion order. User caret
+                    // mapping retains its normal left affinity.
+                    let later_at_start = !earlier.contains(other_id)
+                        && other.cursor.selection.is_none()
+                        && other.cursor.position == change.start;
+                    other.changed(&change);
+                    if later_at_start && other.valid {
+                        other.cursor.position = change.inserted_end();
+                    }
                 }
+                self.cancel_invalid_attachment_jobs();
+                if current != bookmark.cursor
+                    && let Some(mapped) = attachment_draft::mapped(current, &change)
+                {
+                    attachment_draft::move_to(&mut self.composer, mapped);
+                }
+                // The insertion is one step: undoing it takes its text and
+                // its images back out, and redo brings both.
+                self.composer_undo.record(
+                    undo_change,
+                    crate::editor_history::EditKind::Other,
+                    current,
+                    self.composer.cursor(),
+                    std::time::Instant::now(),
+                );
+            } else if edited.is_err() {
+                self.composer_undo.clear();
             }
-            self.cancel_invalid_attachment_jobs();
-            if current != bookmark.cursor
-                && let Some(mapped) = attachment_draft::mapped(current, &change)
-            {
-                attachment_draft::move_to(&mut self.composer, mapped);
-            }
+            self.reconcile_references(inline);
         }
         if !attachments.is_empty() {
             self.composer_note = None;
         }
         self.merge_attachments(attachments);
+        self.follow_caret_reference();
         self.revision = self.revision.wrapping_add(1);
         self.completion.restart(true);
         self.history_cursor = None;
@@ -3978,6 +4306,10 @@ impl Runtime {
             self.composer.line_count().saturating_sub(1),
             false,
         );
+        let inline = self.inline_references();
+        let started = self.composer.cursor();
+        let mut changes = Vec::new();
+        let mut measured = true;
         for (offset, _) in text
             .match_indices(token)
             .collect::<Vec<_>>()
@@ -3992,22 +4324,75 @@ impl Runtime {
                     selection: Some(excerpt.position(offset)),
                 },
             );
-            if let Ok(Some(change)) = attachment_draft::edit(
+            match attachment_draft::edit(
                 &mut self.composer,
                 text_editor::Edit::Paste(Arc::new(String::new())),
             ) {
-                for bookmark in self.attachment_bookmarks.values_mut() {
-                    bookmark.changed(&change);
+                Ok(Some(change)) => {
+                    for bookmark in self.attachment_bookmarks.values_mut() {
+                        bookmark.changed(&change);
+                    }
+                    if let Some(mapped) = attachment_draft::mapped(current, &change) {
+                        attachment_draft::move_to(&mut self.composer, mapped);
+                    }
+                    changes.push(change);
                 }
-                if let Some(mapped) = attachment_draft::mapped(current, &change) {
-                    attachment_draft::move_to(&mut self.composer, mapped);
-                }
+                Ok(None) => {}
+                Err(()) => measured = false,
             }
         }
+        // Removing a tile is one step, whose undo brings the image back with
+        // every reference to it.
+        if measured {
+            self.composer_undo.record_group(
+                changes,
+                started,
+                self.composer.cursor(),
+                std::time::Instant::now(),
+            );
+        } else {
+            self.composer_undo.clear();
+        }
+        self.reconcile_references(inline);
         self.cancel_invalid_attachment_jobs();
         self.history_cursor = None;
         self.history_stash = None;
         self.history_attachment_stash = None;
+        true
+    }
+
+    /// Removes the tray's `index`th attachment. An image goes the way its
+    /// reference does: taking every `[Image N]` for it out of the text is one
+    /// undoable step, which detaches it. Answers whether it went.
+    fn remove_attachment(&mut self, index: usize) -> bool {
+        let Some(attachment) = self.attachments.get(index) else {
+            return false;
+        };
+        let (reference, path) = (attachment.reference.clone(), attachment.path.clone());
+        if let Some(reference) = &reference
+            && !self.remove_image_token(&reference.token())
+        {
+            return false;
+        }
+        // A file has no reference, and an image whose reference was never in
+        // the text has none to take out.
+        if let Some(at) = self
+            .attachments
+            .iter()
+            .position(|attachment| match &reference {
+                Some(reference) => attachment
+                    .reference
+                    .as_ref()
+                    .is_some_and(|other| other.id == reference.id),
+                None => attachment.path == path,
+            })
+        {
+            self.attachments.remove(at);
+        }
+        self.thumbnails.sync(&self.attachments);
+        self.revision = self.revision.wrapping_add(1);
+        self.settle_restored_notice();
+        self.follow_caret_reference();
         true
     }
 
@@ -4282,6 +4667,11 @@ impl Runtime {
         self.replace_attachments(attachments);
         self.history_cursor = None;
         self.replace_draft(composer);
+        // Its own undo history comes back with it.
+        if let Some((undo, detached)) = self.composer_undo_stash.take() {
+            self.composer_undo = undo;
+            self.detached_attachments = detached;
+        }
     }
 
     /// Consumes the shown prompt while preserving a draft saved by history.
@@ -4314,6 +4704,10 @@ impl Runtime {
                 };
                 self.history_stash = Some(std::mem::take(&mut self.composer));
                 self.history_attachment_stash = Some(self.attachments.clone());
+                self.composer_undo_stash = Some((
+                    std::mem::take(&mut self.composer_undo),
+                    std::mem::take(&mut self.detached_attachments),
+                ));
                 Some(newest)
             }
             (None, false) => return,
@@ -4555,6 +4949,10 @@ impl Runtime {
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
         self.cancel_attachment_jobs();
         self.composer = composer;
+        // Its history and the images it set aside describe the old text.
+        self.composer_undo.clear();
+        self.detached_attachments.clear();
+        self.caret_reference = None;
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.resend = None;
@@ -4644,6 +5042,11 @@ impl Runtime {
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
+            detached_attachments: Vec::new(),
+            composer_undo: Default::default(),
+            composer_undo_stash: None,
+            caret_reference: None,
+            opening_attachment: None,
             thumbnails: thumbnails::Cache::default(),
             pastes_pending: 0,
             attachment_bookmarks: HashMap::new(),
@@ -5189,15 +5592,19 @@ impl Runtime {
         } else {
             at_caret
         };
-        self.composer.move_to(text_editor::Cursor {
-            position: at,
-            selection: None,
-        });
-        self.composer
-            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                Arc::new(named.clone()),
-            )));
-        self.named_in_draft();
+        let before = self.composer.cursor();
+        let inline = self.inline_references();
+        attachment_draft::move_to(
+            &mut self.composer,
+            text_editor::Cursor {
+                position: at,
+                selection: None,
+            },
+        );
+        let edited = attachment_draft::edit(
+            &mut self.composer,
+            text_editor::Edit::Paste(Arc::new(named.clone())),
+        );
         if lead {
             let column = caret.column + if caret.line == 0 { named.len() } else { 0 };
             self.composer.move_to(text_editor::Cursor {
@@ -5205,6 +5612,21 @@ impl Runtime {
                 selection: None,
             });
         }
+        // Like any other edit, the name is one undo step, and a reference it
+        // splits takes its image out with it.
+        match edited {
+            Ok(Some(change)) => self.composer_undo.record(
+                change,
+                crate::editor_history::EditKind::Other,
+                before,
+                self.composer.cursor(),
+                std::time::Instant::now(),
+            ),
+            Ok(None) => {}
+            Err(()) => self.composer_undo.clear(),
+        }
+        self.reconcile_references(inline);
+        self.named_in_draft();
     }
 
     /// `insertion` as it is put in the draft at `at`: set apart by a space
@@ -14275,7 +14697,11 @@ impl Cagents {
             }
             Action::ComposerCursor(target, cursor) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.composer.move_to(cursor);
+                    // The cursor replaces any selection, as the one it names.
+                    attachment_draft::move_to(&mut runtime.composer, cursor);
+                    runtime.keep_references_whole(draft_images::Toward::Outward);
+                    runtime.composer_undo.seal();
+                    runtime.follow_caret_reference();
                     if runtime.completion.restart(false) {
                         return view::completion_scroll(target, 0.0);
                     }
@@ -14316,6 +14742,14 @@ impl Cagents {
             }
             Action::Composer(target, action) => {
                 let mut files = None;
+                // The editor's own menu pastes here rather than through
+                // `Action::Paste`.
+                let carried = match (&action, &self.chat_ui.copied_images) {
+                    (text_editor::Action::Edit(text_editor::Edit::Paste(text)), Some(copied)) => {
+                        copied.carried(text).to_vec()
+                    }
+                    _ => Vec::new(),
+                };
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
                         // The reader has moved on from what it said.
@@ -14333,6 +14767,7 @@ impl Cagents {
                     let rescroll = !matches!(action, text_editor::Action::Scroll { .. })
                         && runtime.completion.restart(action.is_edit());
                     runtime.composer_action(action);
+                    runtime.carry_images(&carried);
                     if runtime.files.is_none() && runtime.composer.text().contains('@') {
                         runtime.files = Some(Arc::new(Vec::new()));
                         files = Some(runtime.session.launch.recipe.working_directory.clone());
@@ -14435,12 +14870,18 @@ impl Cagents {
                 });
             }
             Action::PastedText(target, id, text) => {
+                let text = text.unwrap_or_default();
+                let carried = self
+                    .chat_ui
+                    .copied_images
+                    .as_ref()
+                    .map(|copied| copied.carried(&text).to_vec())
+                    .unwrap_or_default();
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    let success = runtime.finish_attachment_insert(
-                        id.id,
-                        text.as_deref().unwrap_or_default(),
-                        Vec::new(),
-                    );
+                    let success = runtime.finish_attachment_insert(id.id, &text, Vec::new());
+                    if success {
+                        runtime.carry_images(&carried);
+                    }
                     if success
                         && runtime.pastes_pending == 0
                         && let Some(mode) = runtime.submit_after_paste.take()
@@ -16254,23 +16695,99 @@ impl Cagents {
                     cosmic::task::message(Message::FocusCard(target.card)),
                 ]);
             }
-            Action::RemoveAttachment(target, index) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && index < runtime.attachments.len()
-                {
-                    let token = runtime.attachments[index]
-                        .reference
-                        .as_ref()
-                        .map(chat::ImageReference::token);
-                    if let Some(token) = token
-                        && !runtime.remove_image_token(&token)
-                    {
-                        return Task::none();
+            Action::RemoveAttachment(target, index, removal) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if !runtime.remove_attachment(index) {
+                    return Task::none();
+                }
+                // A key pressed in the tray keeps the keyboard there, on the
+                // tile that took the removed one's place. The × returns it to
+                // the message, where the next key edits text and Ctrl+Z can
+                // take the removal back; so does a tray left empty.
+                let id = match (removal, runtime.attachments.len()) {
+                    (Removal::Key, len) if len > 0 => {
+                        view::attachment_tile_id(target.card, index.min(len - 1))
                     }
-                    runtime.attachments.remove(index);
-                    runtime.thumbnails.sync(&runtime.attachments);
-                    runtime.revision = runtime.revision.wrapping_add(1);
-                    runtime.settle_restored_notice();
+                    _ => card_control_id(target.card, "chat-composer"),
+                };
+                return iced::widget::operation::focus(id).map(cosmic::Action::App);
+            }
+            Action::ComposerCopied(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    let copied = runtime
+                        .composer
+                        .selection()
+                        .and_then(|text| draft_images::Copied::of(text, &runtime.attachments));
+                    self.chat_ui.copied_images = copied;
+                }
+            }
+            Action::ComposerUndo(target, redo) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.dismiss_suggestion();
+                    // As with any edit, the reader has moved on from what the
+                    // note said; a step that is refused again says so anew.
+                    runtime.composer_note = None;
+                    runtime.undo_composer(redo);
+                }
+            }
+            Action::OpenAttachment(target, index) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(attachment) = runtime
+                    .attachments
+                    .get(index)
+                    .filter(|attachment| view::is_image_attachment(attachment))
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                runtime.opening_attachment = Some(attachment.clone());
+                return cosmic::task::future(async move {
+                    let source = attachment.clone();
+                    let loaded = images::worker(move || images::attachment_preview(&source)).await;
+                    Message::ChatUi(Action::AttachmentOpened(target, attachment, loaded))
+                });
+            }
+            Action::AttachmentOpened(target, attachment, loaded) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // Only the image asked for last opens, and not one the reader
+                // removed while it loaded.
+                if runtime.opening_attachment.as_ref() != Some(&attachment) {
+                    return Task::none();
+                }
+                runtime.opening_attachment = None;
+                if !runtime.attachments.contains(&attachment) {
+                    return Task::none();
+                }
+                match loaded {
+                    images::Loaded::Ready(handle) => {
+                        // Over the pane's transcript, as its own images open,
+                        // so the composer stays usable while it shows.
+                        runtime.show_image(images::Gallery::attachment(
+                            runtime.selected_subagent.clone(),
+                            attachment.label(),
+                            handle,
+                        ));
+                        return self.focus_image_viewer(target);
+                    }
+                    images::Loaded::Failed(error) => runtime.error = Some(error),
+                    images::Loaded::Unavailable => {
+                        runtime.composer_note = Some(format!(
+                            "{} can't be shown: it is unsupported, damaged or too large to preview.",
+                            attachment.label()
+                        ));
+                    }
+                    images::Loaded::Deferred(_) => {
+                        runtime.composer_note = Some(
+                            "Image preview capacity is full. Close other image previews and try again."
+                                .into(),
+                        );
+                    }
                 }
             }
             Action::Model(target, id) => {
@@ -17000,6 +17517,10 @@ mod absence_tests;
 #[cfg(test)]
 #[path = "chat_ui/peer_draft_tests.rs"]
 mod peer_draft_tests;
+
+#[cfg(test)]
+#[path = "chat_ui/draft_images_tests.rs"]
+mod draft_images_tests;
 
 #[cfg(test)]
 #[path = "chat_ui/startup_restore_tests.rs"]

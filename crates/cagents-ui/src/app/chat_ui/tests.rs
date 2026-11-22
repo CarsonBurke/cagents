@@ -406,7 +406,7 @@ fn composer_thumbnail_lifecycle_tracks_attach_remove_submit_and_take_back() {
         .unwrap()
         .visible
         .store(true, Ordering::Relaxed);
-    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
     let runtime = app.chat_runtime_mut(target).unwrap();
     assert!(runtime.attachments.is_empty());
     assert!(runtime.thumbnails.subscriptions(target).is_empty());
@@ -7599,7 +7599,7 @@ fn ambiguous_native_word_selection_refuses_image_removal_without_losing_metadata
             "native boundary-expanded selection is the ambiguity fixture"
         );
         assert!(!attachment_draft::Bookmark::capture(&runtime.composer).valid);
-        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.attachments, [image.clone()]);
         assert_eq!(runtime.composer.text(), text);
@@ -7746,7 +7746,7 @@ fn managed_images_keep_caret_identity_through_out_of_order_pastes_remove_and_dra
             chat_runtime(&app, card).attachments,
             [second.clone(), first.clone()]
         );
-        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 1)));
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 1, Removal::Key)));
         let runtime = chat_runtime(&app, card);
         assert!(!runtime.composer.text().contains(&first_ref.token()));
         assert!(runtime.composer.text().contains(&second_ref.token()));
@@ -12284,7 +12284,7 @@ fn the_restored_notice_leaves_with_the_draft_it_describes() {
     runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Backspace));
     // The file is still there, and so is what the notice says about it.
     assert!(runtime.restored_waiting.is_some());
-    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
+    drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0, Removal::Key)));
     assert_eq!(chat_runtime(&app, card).restored_waiting, None);
 }
 
