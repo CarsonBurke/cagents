@@ -945,7 +945,11 @@ mod tests {
         let picker = runtime.child_picker.as_ref().unwrap();
         assert_eq!(picker.filter, Filter::Finished);
         assert_eq!(
-            ids(picker.rows(&runtime.snapshot.subagents, &runtime.child_ordinals)),
+            ids(picker.rows(
+                &runtime.snapshot.subagents,
+                &runtime.child_ordinals,
+                &runtime.agent_work,
+            )),
             ["done"]
         );
         // Pressed again, it closes the chooser, as the chooser's toggle does.
@@ -1265,7 +1269,10 @@ mod tests {
             ["second", "done"]
         );
         picker.filter = Filter::Finished;
-        assert_eq!(ids(picker.rows(&children, &Ordinals::default())), ["first"]);
+        assert_eq!(
+            ids(picker.rows(&children, &Ordinals::default(), &Default::default())),
+            ["first"]
+        );
         picker.filter = Filter::All;
         picker.query = "Agent second".into();
         assert_eq!(
