@@ -552,9 +552,9 @@ impl Cagents {
             crate::ui_controls::button::quiet("Base branch & destination")
                 .instead("Hide options", dialog.advanced)
                 .icon(if dialog.advanced {
-                    Icon::PanDown
+                    Icon::ChevronDown
                 } else {
-                    Icon::PanEnd
+                    Icon::ChevronRight
                 })
                 .id(widget::Id::new("dialog.worktree.options"))
                 .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))

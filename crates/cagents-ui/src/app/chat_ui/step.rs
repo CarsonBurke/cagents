@@ -51,7 +51,7 @@ fn kind_glyph(content: &ItemContent) -> Icon {
             chat::CommandAction::Run => Icon::Terminal,
         },
         ItemContent::Changes { .. } => Icon::Changes,
-        ItemContent::WebSearch { .. } => Icon::WebBrowser,
+        ItemContent::WebSearch { .. } => Icon::Browser,
         ItemContent::Tool { .. } => Icon::Utilities,
         ItemContent::Image { .. } => Icon::Image,
         ItemContent::Delivery {

@@ -454,7 +454,12 @@ impl Cagents {
         // of the rows beneath it.
         let disclosure: Element<'a, Message> = if collapsible {
             crate::ui_controls::passive_icon(
-                if open { Icon::PanDown } else { Icon::PanEnd }.handle(),
+                if open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                }
+                .handle(),
                 design::COMPACT_ICON_SIZE,
             )
         } else {

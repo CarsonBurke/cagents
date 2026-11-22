@@ -5060,7 +5060,7 @@ impl Runtime {
                                 permission_mode_label(self.session.launch.provider, &modes[index])
                             },
                         )),
-                        widget::icon(Icon::PanDown.handle()).size(design::COMPACT_ICON_SIZE),
+                        widget::icon(Icon::ChevronDown.handle()).size(design::COMPACT_ICON_SIZE),
                         step::GAP_XS,
                     ),
                 )
@@ -5170,7 +5170,7 @@ impl Runtime {
                 std::iter::once(glyph(false))
                     .chain(named.then(label))
                     .chain(std::iter::once(
-                        widget::icon(Icon::PanDown.handle())
+                        widget::icon(Icon::ChevronDown.handle())
                             .size(design::COMPACT_ICON_SIZE)
                             .into(),
                     )),
@@ -5349,7 +5349,7 @@ impl Runtime {
                         .into()
                 }))
                 .chain(std::iter::once(
-                    widget::icon(Icon::PanDown.handle())
+                    widget::icon(Icon::ChevronDown.handle())
                         .size(design::COMPACT_ICON_SIZE)
                         .into(),
                 )),

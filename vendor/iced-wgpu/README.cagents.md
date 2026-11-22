@@ -19,6 +19,16 @@ scripts/cargo-gate test --manifest-path vendor/iced-wgpu/Cargo.toml --features s
 
 Cargo cannot run it with `-p iced_wgpu` from the parent workspace because this vendored package is not a workspace member. Its standalone lockfile and build artifacts are local test output. The standalone manifest patches iced_core, iced_graphics, cryoglyph, cosmic-text and harfrust to their vendored copies, so the tests build against the same renderer crates as the application.
 
+# SVGs keep their whole drawing in the raster
+
+Upstream scaled an SVG to its raster's longer side, or to its height when the raster is square, and truncated the drawing's size to whole units first. A drawing wider than tall in a square icon box, such as the 17x16 `utilities-terminal-symbolic` in the COSMIC theme, came out wider than its raster and lost its right edge, and the truncation could stretch one axis. `vector::fit` now draws the tree at the largest uniform scale that keeps all of it inside the raster, centred on whole pixels so grid-aligned edges stay crisp. A square drawing in a square raster is unchanged. `a_tree_stays_inside_its_raster_at_one_scale` covers it:
+
+```sh
+scripts/cargo-gate test --manifest-path vendor/iced-wgpu/Cargo.toml --features svg image::
+```
+
+iced_tiny_skia is not vendored, so the software fallback keeps upstream's scaling.
+
 # Editor overscan (#2824)
 
 The editor's text area iterates `Buffer::draw_runs` instead of `layout_runs`, so the lines in the overscan bands reach the glyph renderer. The clip still comes from the widget. iced_tiny_skia is not vendored, and the pinned copy draws `layout_runs`, so the software fallback draws no text in the bands. The selection regions, caret and the app's fade come from iced-graphics and the widget, so they still extend into the bands there, and a click in a band lands on a line that renderer did not draw.

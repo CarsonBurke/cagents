@@ -338,7 +338,7 @@ pub fn view<Message: 'static>(
     }
     let (handle, size) = match lead {
         Member::Agent(provider, _) => (lead_handle(provider, ground, width), LEAD),
-        // A themed glyph's drawing is not ours to cut, so the badge sits on
+        // The terminal glyph has no cut-out variant, so the badge sits on
         // it; it is drawn only for a channel of terminals alone.
         Member::Terminal => (Icon::Terminal.handle(), f32::from(TERMINAL)),
     };

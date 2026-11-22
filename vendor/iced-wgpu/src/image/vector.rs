@@ -135,25 +135,7 @@ impl Cache {
                 // It would be cool to be able to smooth resize the `svg` example.
                 let mut img = tiny_skia::Pixmap::new(width, height)?;
 
-                let tree_size = tree.size().to_int_size();
-
-                let target_size = if width > height {
-                    tree_size.scale_to_width(width)
-                } else {
-                    tree_size.scale_to_height(height)
-                };
-
-                let transform = if let Some(target_size) = target_size {
-                    let tree_size = tree_size.to_size();
-                    let target_size = target_size.to_size();
-
-                    tiny_skia::Transform::from_scale(
-                        target_size.width() / tree_size.width(),
-                        target_size.height() / tree_size.height(),
-                    )
-                } else {
-                    tiny_skia::Transform::default()
-                };
+                let transform = fit(tree.size(), width, height);
 
                 // SVG rendering can panic on malformed or complex vectors.
                 // We catch panics to prevent crashes and continue gracefully.
@@ -226,6 +208,85 @@ impl std::fmt::Debug for Svg {
         match self {
             Svg::Loaded(_) => write!(f, "Svg::Loaded"),
             Svg::NotFound => write!(f, "Svg::NotFound"),
+        }
+    }
+}
+
+/// Draws a tree of `size` into a `width` x `height` raster at the largest
+/// uniform scale that keeps all of it inside, centred on whole pixels.
+///
+/// Upstream scaled by the raster's longer side, or its height when square, so
+/// a tree wider than tall, such as a 17x16 theme icon in a square icon box,
+/// overflowed the raster and lost its right edge, and truncating the tree to
+/// whole units first could stretch it unevenly.
+fn fit(size: tiny_skia::Size, width: u32, height: u32) -> tiny_skia::Transform {
+    let (width, height) = (width as f32, height as f32);
+    let scale = (width / size.width()).min(height / size.height());
+    // Whole-pixel offsets keep edges the drawing places on its grid crisp; a
+    // centre half a pixel off would blur every one of them.
+    let dx = ((width - size.width() * scale) / 2.0).round();
+    let dy = ((height - size.height() * scale) / 2.0).round();
+
+    tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+    use resvg::tiny_skia;
+
+    #[test]
+    fn a_tree_stays_inside_its_raster_at_one_scale() {
+        let sizes = [(16.0, 16.0), (17.0, 16.0), (16.0, 16.03), (16.0, 17.0)];
+        for (tree_width, tree_height) in sizes {
+            let size =
+                tiny_skia::Size::from_wh(tree_width, tree_height).unwrap();
+            for (width, height) in [
+                (12, 12),
+                (16, 16),
+                (20, 20),
+                (25, 25),
+                (35, 35),
+                (20, 18),
+                (18, 20),
+            ] {
+                let transform = fit(size, width, height);
+                assert_eq!(
+                    transform.sx, transform.sy,
+                    "{size:?} {width}x{height}"
+                );
+                let right = transform.tx + tree_width * transform.sx;
+                let bottom = transform.ty + tree_height * transform.sy;
+                assert!(
+                    transform.tx >= 0.0 && transform.ty >= 0.0,
+                    "{size:?} {width}x{height}"
+                );
+                assert!(
+                    right <= width as f32 + 1e-3,
+                    "{size:?} {width}x{height}: {right}"
+                );
+                assert!(
+                    bottom <= height as f32 + 1e-3,
+                    "{size:?} {width}x{height}: {bottom}"
+                );
+                // It fills the raster along one axis.
+                assert!(
+                    (tree_width * transform.sx - width as f32).abs() < 1e-3
+                        || (tree_height * transform.sy - height as f32).abs()
+                            < 1e-3,
+                    "{size:?} {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_square_tree_fills_a_square_raster_exactly() {
+        let size = tiny_skia::Size::from_wh(16.0, 16.0).unwrap();
+        for side in [12, 14, 16, 18, 20, 25, 28, 35] {
+            let transform = fit(size, side, side);
+            assert_eq!((transform.tx, transform.ty), (0.0, 0.0));
+            assert_eq!(transform.sx, side as f32 / 16.0);
         }
     }
 }
