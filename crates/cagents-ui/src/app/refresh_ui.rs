@@ -206,6 +206,17 @@ impl Cagents {
     /// so a settled workspace containing only those cards must not keep an
     /// application-wide timer alive.
     fn refresh_tick_needed(&self) -> bool {
+        // These consumers are repaired by RefreshUi itself.  Keep this
+        // decision purely state-based: a time-due predicate here would remove
+        // the subscription during a GitHub backoff and leave nothing to wake
+        // it when the backoff expires.
+        if !self.pending_terminal_handoffs.is_empty()
+            || !self.shared_views.blocked.is_empty()
+            || self.document_tone_stale
+        {
+            return true;
+        }
+
         if crate::device::is_remote() {
             return self
                 .sidebar_model
@@ -241,11 +252,14 @@ impl Cagents {
             return true;
         }
 
-        self.sidebar_model.projects.iter().any(|project| {
-            project.kind == ProjectKind::Git
-                && project.unreachable.is_none()
-                && self.github_project_polling_ready(project.id)
-        })
+        // `next_github_project` is the clock-aware part: it selects at most
+        // one project only when its own cadence/backoff permits a read.  The
+        // subscription must remain present throughout that wait, otherwise a
+        // failed read can permanently suppress its own retry.
+        self.sidebar_model
+            .projects
+            .iter()
+            .any(|project| project.kind == ProjectKind::Git && project.unreachable.is_none())
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
@@ -498,6 +512,67 @@ mod tests {
             0,
             "daemon wakes keep settled chats and terminals current without polling"
         );
+    }
+
+    #[test]
+    fn pending_refresh_consumers_keep_the_timer_armed() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
+
+        app.document_tone_stale = true;
+        assert_ne!(app.refresh_subscription().units(), 0);
+        app.document_tone_stale = false;
+
+        app.shared_views
+            .blocked
+            .insert(crate::workspace_model::views::Scope::Channel(
+                crate::model::ChannelId::new(),
+            ));
+        assert_ne!(app.refresh_subscription().units(), 0);
+        app.shared_views.blocked.clear();
+
+        let terminal = match super::super::tests::terminal_card_state().kind {
+            CardKind::Terminal(terminal) => terminal,
+            _ => unreachable!("test terminal card has a terminal session"),
+        };
+        app.pending_terminal_handoffs.insert(terminal.id, terminal);
+        assert_ne!(app.refresh_subscription().units(), 0);
+    }
+
+    #[test]
+    fn visible_repository_keeps_the_timer_armed() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
+        let card = app.workspace.focused().expect("fixture has a visible card");
+        app.workspace.resize_viewport(1_600.0);
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+
+        assert_ne!(app.refresh_subscription().units(), 0);
+    }
+
+    #[test]
+    fn failed_github_project_keeps_its_retry_subscription_during_backoff() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repository".into(),
+            PathBuf::from("/repository"),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.refresh_ui.schedule.started(project, Instant::now());
+        app.refresh_ui.schedule.finished(project, false);
+
+        // The scheduling clock correctly defers the failed read, while the
+        // subscription remains armed to reach the later retry.
+        assert_eq!(app.next_github_project(None, false, Instant::now()), None);
+        assert_ne!(app.refresh_subscription().units(), 0);
     }
 
     #[test]

@@ -19908,7 +19908,10 @@ impl Cagents {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
                 }
-                Task::none()
+                // A recovered writer can persist a terminal handoff right
+                // away.  Waiting for RefreshUi is only the fallback for
+                // state changes that do not publish a health event.
+                self.commit_terminal_handoffs()
             }
             Message::RetrySharedViewSeeds => {
                 self.retry_view_seeds();
