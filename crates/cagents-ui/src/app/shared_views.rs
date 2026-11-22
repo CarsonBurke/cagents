@@ -3609,6 +3609,12 @@ impl Cagents {
         });
         phase.mark("selected_save");
         tasks.push(self.run_deferred_default_pane());
+        // A closed pane a view brought back after its conversation stopped
+        // goes again, now that the views it is removed from are settled.
+        tasks.push(self.remove_stopped_returns());
+        // A closed pane's conversation stops once the registry has answered
+        // its removal; a pane the registry kept is back, and goes on with it.
+        tasks.push(self.settle_stops_after_removal());
         // Presentation-only projection preserves every notification attribution
         // input: source, membership, ownership, placement and project identity.
         // Journal snapshots attribute their own new evidence independently.
@@ -4221,8 +4227,9 @@ impl Cagents {
                     // replacing it would discard the first start's reply.
                     // A different canonical descriptor still needs attachment.
                     let starting = matches!(&pane.kind, CardKind::Chat(session) if self.chat_start_matches(pane.id, session));
-                    if resuming {
-                        // Its start attaches the card.
+                    if resuming || self.holds_reopen(pane.id) {
+                        // Its start attaches the card, or the close it waits
+                        // behind does once it has stopped its conversation.
                     } else if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
                     } else if let CardKind::Chat(session) = &pane.kind {
@@ -4497,7 +4504,7 @@ impl Cagents {
         );
         let task = match &pane.kind {
             CardKind::Chat(session) => {
-                return self.open_chat(pane.id, session.clone(), crate::chat::Intent::Restore);
+                return self.attach_shared_chat(pane.id, session.clone());
             }
             CardKind::Repository(view) => self.attach_repository_pane(pane.id, view.clone()),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(pane.id, view.clone()),

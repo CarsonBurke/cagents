@@ -2755,8 +2755,12 @@ impl Cagents {
     /// rows in place and stop, and the rest rebuild only the projects whose
     /// rows changed.
     pub(super) fn refresh_attention_card_rows(&mut self) {
+        // A pane hidden while it closes has no row, as a closed one has none,
+        // whichever workspace it is in.
         let stale = self.sidebar_model.stale_panes(&self.sidebar_state, |id| {
-            self.card_state(id).map(|card| self.pane_row_title(card))
+            self.card_state(id)
+                .filter(|_| !self.hidden_closes.contains(&id))
+                .map(|card| self.pane_row_title(card))
         });
         if stale.is_empty() {
             return;
@@ -2764,6 +2768,7 @@ impl Cagents {
         let mut titles = self
             .sidebar_state
             .pane_cards()
+            .filter(|id| !self.hidden_closes.contains(id))
             .filter_map(|id| {
                 let card = self.card_state(id)?;
                 Some((id, self.pane_row_title(card).to_owned()))
