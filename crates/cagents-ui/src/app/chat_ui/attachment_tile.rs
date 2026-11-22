@@ -421,11 +421,12 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for Tile<'_, Message> {
         let bounds = layout.bounds() - layout.virtual_offset();
         let mut node = Node::new(Role::Button);
         node.set_label(self.name.clone());
-        node.set_description(if self.on_open.is_some() {
-            "Enter opens it, Delete removes it"
-        } else {
-            "Delete removes it"
-        });
+        match (self.on_open.is_some(), self.on_remove.is_some()) {
+            (true, true) => node.set_description("Enter opens it, Delete removes it"),
+            (true, false) => node.set_description("Enter opens it"),
+            (false, true) => node.set_description("Delete removes it"),
+            (false, false) => {}
+        }
         node.add_action(A11yAction::Focus);
         if self.on_open.is_some() {
             node.add_action(A11yAction::Click);

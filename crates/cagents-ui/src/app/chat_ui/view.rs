@@ -122,8 +122,15 @@ pub(super) fn is_image_attachment(attachment: &Attachment) -> bool {
             })
 }
 
-/// The tray's small remove button, which sits inside its tile's corner.
+/// The tray's small remove button, which sits inside its tile's corner. A
+/// fixed draft's tile has none to show, rather than one that does nothing.
 fn attachment_close<'a>(remove: Option<Message>) -> Element<'a, Message> {
+    let Some(remove) = remove else {
+        return widget::Space::new()
+            .width(Length::Fixed(ATTACHMENT_CLOSE))
+            .height(Length::Fixed(ATTACHMENT_CLOSE))
+            .into();
+    };
     let style = |hovered: bool| {
         move |_focused: bool, _theme: &cosmic::Theme| widget::button::Style {
             background: Some(iced::Background::Color(iced::Color {
@@ -143,7 +150,7 @@ fn attachment_close<'a>(remove: Option<Message>) -> Element<'a, Message> {
     .padding(0)
     .width(Length::Fixed(ATTACHMENT_CLOSE))
     .height(Length::Fixed(ATTACHMENT_CLOSE))
-    .on_press_maybe(remove)
+    .on_press(remove)
     .class(cosmic::theme::Button::Custom {
         active: Box::new(style(false)),
         disabled: Box::new(move |theme| style(false)(false, theme)),
