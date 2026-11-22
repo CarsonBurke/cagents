@@ -1327,10 +1327,6 @@ mod compact_tests {
     #[test]
     fn cached_index_skips_reparsing_unchanged_records_and_reloads_on_replace_or_remove() {
         let dir = tempfile::tempdir().unwrap();
-        std::os::unix::fs::PermissionsExt::set_mode(
-            &mut std::fs::metadata(dir.path()).unwrap().permissions(),
-            0o700,
-        );
         crate::secure_file::prepare_private_directory(dir.path()).unwrap();
         let root = crate::fs_safety::Root::open(dir.path()).unwrap();
         let proof = HostSessionProof {
