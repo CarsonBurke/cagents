@@ -689,8 +689,13 @@ delivery_outcomes! {
     /// A new input while an earlier one is still unconfirmed.
     refused send UNSETTLED_INPUT: "Claude hasn't confirmed the previous request yet, so this was not sent.",
         "Try again in a moment.";
-    /// Every new input once an unconfirmed one cannot be settled.
-    refused conversation UNSETTLEABLE_INPUT: "Claude stopped confirming requests in this conversation, so this was not sent.",
+    /// Every new input while Claude has not settled an unconfirmed one for a
+    /// long while. It lifts on its own once Claude settles it.
+    refused send UNSETTLEABLE_INPUT: "Claude still hasn't confirmed an earlier request, so this was not sent.",
+        "Try again later. If this keeps happening, close and reopen the conversation.";
+    /// Every new input once Claude has refused, for good, to settle an
+    /// unconfirmed one, or cannot settle inputs at all.
+    refused conversation UNRESOLVABLE_INPUT: "Claude can't settle an earlier request, so this was not sent.",
         "Close and reopen the conversation to continue.";
     /// Pending inputs once the proxy stopped before their outcome was known.
     unknown conversation STOPPED_INPUT: "Claude's conversation process stopped before confirming this, so it may or may not have gone through.",
@@ -863,17 +868,18 @@ mod tests {
             OVERSIZED_INPUT,
             HANDOVER_INPUT,
             DAMAGED_INPUT,
+            UNSETTLEABLE_INPUT,
             ACCOUNT_SWITCH_BUSY,
             ACCOUNT_SWITCH_UNANSWERED,
             ACCOUNT_SWITCH_UNREACHED,
         ];
         let conversation = [
-            UNSETTLEABLE_INPUT,
             STOPPED_INPUT,
             CLOSING_INPUT,
             DISCONTINUOUS_INPUT,
             UNSUPPORTED_INPUT,
             UNAVAILABLE_INPUT,
+            UNRESOLVABLE_INPUT,
         ];
         // Every outcome is in exactly one of the two lists.
         assert_eq!(sends.len() + conversation.len(), ALL.len());

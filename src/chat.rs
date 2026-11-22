@@ -2170,6 +2170,11 @@ impl Command {
     }
 }
 
+/// What the sender of a message calls one send of it, the same each time it
+/// asks: asked again under the same key, the actor reports what became of the
+/// first send rather than sending it twice.
+pub type DeliveryKey = uuid::Uuid;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
     /// Verify login on the same live actor without replaying any failed prompt.

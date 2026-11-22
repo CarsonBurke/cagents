@@ -183,6 +183,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::SearchTerminal { .. }
             | ClientRequest::CopyTerminalSelection { .. }
             | ClientRequest::ChatCommand { .. }
+            | ClientRequest::ChatDeliver { .. }
             | ClientRequest::ChatVisibility { .. }
             | ClientRequest::ChatRead { .. }
             | ClientRequest::ChatAcknowledge { .. }
@@ -1927,6 +1928,7 @@ fn process_admitted_request(
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }
+        | ClientRequest::ChatDeliver { .. }
         | ClientRequest::ChatVisibility { .. }
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }

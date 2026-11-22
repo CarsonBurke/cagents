@@ -25,6 +25,8 @@ mod child_diagnostics;
 mod child_text_copy;
 #[cfg(test)]
 pub(crate) mod courier_tests;
+mod delivery;
+use crate::chat::DeliveryKey;
 mod execution;
 mod handle;
 pub use handle::Handle;
@@ -50,6 +52,17 @@ mod store;
 pub use store::Unread;
 mod websocket;
 pub(crate) use store::Store;
+
+/// How long a caller waits for the actor to acknowledge a command before its
+/// outcome is unknown.
+const COMMAND_ACKNOWLEDGEMENT: Duration = Duration::from_secs(10);
+
+/// A command the actor did not acknowledge in time, which it may still run.
+fn unacknowledged_command() -> Rejection {
+    Rejection::Unacknowledged(
+        "Provider command acknowledgement timed out; do not retry blindly".into(),
+    )
+}
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -361,6 +374,8 @@ struct Inner {
     /// file lock before accepting. See [`Handle::startup_lock_wait`].
     startup_lock_wait: Arc<AtomicU64>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
+    /// What became of the messages sent under a key.
+    deliveries: delivery::Deliveries,
 }
 
 enum NativeOwnership {
@@ -668,6 +683,7 @@ impl LocalHandle {
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
+            deliveries: delivery::Deliveries::default(),
         });
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -1050,7 +1066,26 @@ impl LocalHandle {
         })
     }
 
+    /// Sends `command` once under `key`, as [`delivery`] describes.
+    pub(crate) fn deliver(&self, command: Command, key: DeliveryKey) -> Result<(), Rejection> {
+        self.0
+            .deliveries
+            .deliver(key, COMMAND_ACKNOWLEDGEMENT, unacknowledged_command, || {
+                self.enqueue_actor_command(ActorCommand::Provider {
+                    run: None,
+                    command,
+                    decline_only: false,
+                })
+            })
+    }
+
     fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
+        self.enqueue_actor_command(command)?
+            .recv_timeout(COMMAND_ACKNOWLEDGEMENT)
+            .map_err(|_| unacknowledged_command())?
+    }
+
+    fn enqueue_actor_command(&self, command: ActorCommand) -> Result<delivery::Reply, Rejection> {
         if self.is_completed() || self.0.draining.load(Ordering::Acquire) {
             return Err(Rejection::Refused(
                 "Provider process exited; explicitly recover the exact session".into(),
@@ -1065,13 +1100,7 @@ impl LocalHandle {
             .try_send((command, reply))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
-        response
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| {
-                Rejection::Unacknowledged(
-                    "Provider command acknowledgement timed out; do not retry blindly".into(),
-                )
-            })?
+        Ok(response)
     }
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
         if self.is_completed()

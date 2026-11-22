@@ -163,7 +163,7 @@ impl RemoteActor {
     }
     /// Ask the reader to read the conversation again after `delay`, unless
     /// it is already due to sooner.
-    fn reread_after(&self, delay: Duration) {
+    pub(super) fn reread_after(&self, delay: Duration) {
         let at = Instant::now() + delay;
         let mut reread = self.0.reread_at.lock().unwrap_or_else(|p| p.into_inner());
         if reread.is_none_or(|due| due > at) {

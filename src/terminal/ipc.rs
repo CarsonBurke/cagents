@@ -295,7 +295,11 @@ use crate::{
 /// patch's line numbers are positions in the file, or count from an excerpt
 /// such as the text a Claude `Edit` replaces. An older client is sent both
 /// without it; one read from an older update source is taken as an excerpt.
-pub const PROTOCOL_VERSION: u16 = 195;
+///
+/// Version 196 appends `ChatDeliver`, a chat command sent under a key, so that
+/// sending a message again after an unknown outcome waits on the first send
+/// instead of delivering it twice. An older client cannot send it.
+pub const PROTOCOL_VERSION: u16 = 196;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -780,6 +784,15 @@ pub enum ClientRequest {
     /// it includes terminals still being spawned, whose transcript writers
     /// may already have created their files.
     ListResidentTerminals,
+    /// [`Self::ChatCommand`], sent once under `delivery`: asked again with
+    /// the same key, the daemon reports what became of the first send rather
+    /// than sending it twice, so a message whose outcome was unknown can be
+    /// sent again safely.
+    ChatDeliver {
+        chat_id: TerminalId,
+        command: crate::chat::Command,
+        delivery: crate::chat::DeliveryKey,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

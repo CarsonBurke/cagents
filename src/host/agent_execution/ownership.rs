@@ -22,7 +22,10 @@ pub(in crate::host) fn interactive(
         return apply(request);
     }
     let (id, claims) = match &request {
-        ClientRequest::ChatCommand { chat_id, command } => (
+        ClientRequest::ChatCommand { chat_id, command }
+        | ClientRequest::ChatDeliver {
+            chat_id, command, ..
+        } => (
             *chat_id,
             !matches!(command, Command::Refresh | Command::LoadEarlier),
         ),
