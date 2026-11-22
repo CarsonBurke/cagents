@@ -100,13 +100,21 @@ pub(super) fn code_surface(
         .into(),
         None => body.into(),
     };
-    code_frame(body, caption.map(str::to_owned), copy)
+    code_frame(
+        body,
+        caption.map(str::to_owned),
+        copy,
+        super::text_copy::CopyState::Ready,
+    )
 }
 
+/// `body` in its surface, under a header with its `caption` and, with `copy`,
+/// a Copy showing `state`: what its last copy said.
 pub(super) fn code_frame<'a>(
     body: Element<'a, Message>,
     caption: Option<String>,
     copy: Option<Action>,
+    state: super::text_copy::CopyState,
 ) -> Element<'a, Message> {
     let Some(caption) = caption else {
         return widget::container(body)
@@ -126,25 +134,49 @@ pub(super) fn code_frame<'a>(
         ))
         .width(Length::Fill)
         .into();
+    // What the last copy said is in the header, after its caption and clear
+    // of the Copy over its end, so a long refusal gives way to both: it is
+    // laid out last and ends in an ellipsis rather than taking the Copy's
+    // room or drawing over the caption.
+    let mut header = vec![design::caption(caption).into()];
+    if copy.is_some()
+        && let Some(said) = state.said()
+    {
+        header.push(
+            widget::container(said)
+                .width(Length::Fill)
+                .align_x(Alignment::End)
+                .into(),
+        );
+    }
     let block = widget::column::with_children(vec![
-        widget::container(design::caption(caption))
-            .padding(iced::Padding::ZERO.right(24))
-            .width(Length::Fill)
-            .height(24)
-            .align_y(Alignment::Center)
-            .into(),
+        widget::container(
+            widget::row::with_children(header)
+                .spacing(GAP_S)
+                .align_y(Alignment::Center),
+        )
+        .padding(iced::Padding::ZERO.right(24.0 + GAP_XS))
+        .width(Length::Fill)
+        .height(24)
+        .align_y(Alignment::Center)
+        .into(),
         body,
     ])
     .spacing(GAP_XS)
     .width(Length::Fill);
     match copy {
-        Some(copy) => iced::widget::hover(
+        Some(copy) => super::hover::over_pinned(
             block,
-            widget::container(small_icon(Icon::Copy, "Copy this block", copy))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::Start),
+            widget::container(small_icon(
+                state.icon(),
+                state.label("Copy this block"),
+                copy,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::Start),
+            state.is_telling(),
         ),
         None => block.into(),
     }
@@ -267,6 +299,7 @@ impl Runtime {
             ),
             Some(caption.to_owned()),
             Some(copy),
+            self.copy_state(&item.id, Some(&part)),
         )
     }
 
@@ -519,6 +552,7 @@ impl Runtime {
                     self.step_detail(item, cached, settings),
                     self.message_copy(item),
                     Alignment::Start,
+                    self.copy_note_shown(&item.id),
                 ))
                 .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
                 .width(Length::Fill)

@@ -1025,7 +1025,11 @@ fn a_frame_after_an_interaction_on_a_full_window() {
     let mut pane = Pane::new(transcript(16));
     pane.sample(|_, _| {}).row("no change");
     pane.sample(|pane, frame| {
-        pane.runtime.copied = (frame % 2 == 0).then(|| ("7-answer".to_owned(), Instant::now()));
+        pane.runtime.copy_feedback = (frame % 2 == 0).then(|| text_copy::CopyFeedback {
+            key: text_copy::CopyKey::Item("7-answer".into()),
+            refusal: None,
+            at: Instant::now(),
+        });
     })
     .row("copy pressed or cleared");
     // Both spellings match the seventh exchange alone, and both spellings of

@@ -1419,7 +1419,7 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             assert!(app.durable.local_only_cards.contains(&card));
             assert!(
                 runtime(&app, card)
-                    .error
+                    .composer_note
                     .as_deref()
                     .unwrap()
                     .contains("could not be shared")
@@ -1427,12 +1427,20 @@ fn accepted_first_prompt_keeps_default_channel_pane_across_empty_reads() {
             assert!(Arc::ptr_eq(runtime(&app, card).handle().unwrap(), &handle));
             assert_eq!(runtime(&app, card).session.id, actor);
             if disconnect_before_refusal {
+                // The lost connection stays the conversation's state, and
+                // the note about this pane says how to get back to it.
+                assert!(
+                    runtime(&app, card)
+                        .composer_note
+                        .as_deref()
+                        .unwrap()
+                        .contains("Reconnect")
+                );
                 assert!(
                     runtime(&app, card)
                         .error
                         .as_deref()
-                        .unwrap()
-                        .contains("Reconnect")
+                        .is_some_and(|error| error.contains("connection lost"))
                 );
                 assert_eq!(
                     app.chat_retry_intent(card, &runtime(&app, card).session),

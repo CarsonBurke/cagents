@@ -349,13 +349,15 @@ fn user_bubble<'a>(
 }
 
 /// Reserve an external action row so hovering never shifts the transcript.
-/// The hover also keeps its controls visible while they are keyboard-focused.
+/// The hover also keeps its controls visible while they are keyboard-focused,
+/// and while `pinned`: when they say something, such as why a copy failed.
 pub(super) fn message_actions<'a>(
     message: Element<'a, Message>,
     actions: Element<'a, Message>,
     alignment: Alignment,
+    pinned: bool,
 ) -> Element<'a, Message> {
-    super::hover::over(
+    super::hover::over_pinned(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
@@ -368,6 +370,7 @@ pub(super) fn message_actions<'a>(
             .height(Length::Fill)
             .align_x(alignment)
             .align_y(Alignment::End),
+        pinned,
     )
 }
 
@@ -4052,6 +4055,7 @@ impl Runtime {
                         self.queue_view()
                             .into_iter()
                             .chain(self.restored_waiting_notice())
+                            .chain(self.composer_note_view())
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.
                             .chain(self.stop_confirmation())
@@ -4060,8 +4064,7 @@ impl Runtime {
                                     .spacing(step::GAP_XS)
                                     .padding([0, step::GAP_M as u16])
                                     .into()
-                            }))
-                            .chain(self.attachment_notice_view()),
+                            })),
                     )
                     .spacing(step::GAP_XS)
                     .into(),
@@ -5697,11 +5700,13 @@ impl Runtime {
             )
                 .hash(hasher);
         }
-        // Only this item's badge changes on copy. Its dismissal timer does not
-        // affect what the row draws.
-        self.copied
+        // Only this item's controls change on copy: which of them its last
+        // copy answers at, and what it said there. Copying again refreshes
+        // how long that shows without changing what is drawn.
+        self.copy_feedback
             .as_ref()
-            .is_some_and(|(id, _)| *id == item.id)
+            .filter(|feedback| feedback.key.item() == item.id)
+            .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
             .hash(hasher);
         cached
             .map(|cached| {
@@ -5906,24 +5911,36 @@ impl Runtime {
         }
     }
 
-    fn attachment_notice_view(&self) -> Option<Element<'_, Message>> {
-        let notice = self.attachment_notice.as_deref()?;
+    /// Why something tried in this pane didn't happen, at the composer
+    /// where it was tried. It is a note about that try rather than about the
+    /// conversation, so it leaves the turn's outcome and the timeline alone.
+    fn composer_note_view(&self) -> Option<Element<'_, Message>> {
+        let note = self.composer_note.as_deref()?;
         Some(
-            widget::row::with_children(vec![
-                design::caption(notice)
-                    .class(cosmic::theme::Text::Custom(design::warning_text))
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .width(Length::Fill)
-                    .into(),
-                small_icon(
-                    Icon::Close,
-                    "Dismiss",
-                    Action::DismissAttachmentNotice(self.target),
-                ),
-            ])
-            .spacing(step::GAP_XS)
-            .align_y(Alignment::Start)
-            .padding([0, step::GAP_M as u16])
+            widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::Warning, design::COMPACT_ICON_SIZE),
+                    design::caption(note)
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .width(Length::Fill)
+                        .into(),
+                    small_icon(
+                        Icon::Close,
+                        "Dismiss",
+                        Action::DismissComposerNote(self.target),
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
+            ))
             .into(),
         )
     }
@@ -6189,14 +6206,16 @@ impl Runtime {
         )
     }
 
+    /// Whether item `id`'s own Copy is saying what its copy did.
+    pub(super) fn copy_note_shown(&self, id: &str) -> bool {
+        self.copy_state(id, None).is_telling()
+    }
+
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
+        let state = self.copy_state(&item.id, None);
         let mut controls = vec![small_icon(
-            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                Icon::Check
-            } else {
-                Icon::Copy
-            },
-            "Copy this message",
+            state.icon(),
+            state.label("Copy this message"),
             if item.logical_copy_body().is_some()
                 && !self
                     .presentation_cache()
@@ -6211,7 +6230,11 @@ impl Runtime {
                 Action::Copy(self.target, item.id.clone(), CopyPart::Text)
             },
         )];
-        if let Some((at, stamp, full)) = self
+        // What the copy did, beside the Copy that made it. It stands in for
+        // the timestamp until it lapses.
+        if let Some(said) = state.said() {
+            controls.push(said);
+        } else if let Some((at, stamp, full)) = self
             .presentation_cache()
             .get(&item.id)
             .and_then(|cached| cached.stamp.as_ref())
@@ -6525,6 +6548,7 @@ impl Runtime {
             message,
             self.message_copy(item),
             Alignment::End,
+            self.copy_note_shown(&item.id),
         ))
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -6743,6 +6767,7 @@ impl Runtime {
                     .into(),
                 self.message_copy(item),
                 Alignment::Start,
+                self.copy_note_shown(&item.id),
             )
         };
         widget::container(body)
@@ -6836,6 +6861,7 @@ impl Runtime {
                 prose::view(cached, settings, self.target, self.find.as_deref()),
                 self.message_copy(item),
                 Alignment::Start,
+                self.copy_note_shown(&item.id),
             ))
             .max_width(design::READABLE_MEASURE)
             .width(Length::Fill)
@@ -6906,6 +6932,7 @@ impl Runtime {
                         prose::view(cached, settings, target, self.find.as_deref()),
                         self.message_copy(item),
                         Alignment::Start,
+                        self.copy_note_shown(&item.id),
                     ))
                     .padding([step::GAP_S, step::GAP_M])
                     .max_width(design::READABLE_MEASURE)
@@ -6940,6 +6967,7 @@ impl Runtime {
             prose::view(cached, settings, self.target, self.find.as_deref()),
             self.message_copy(item),
             Alignment::Start,
+            self.copy_note_shown(&item.id),
         ))
         .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)

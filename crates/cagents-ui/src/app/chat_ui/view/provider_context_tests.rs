@@ -235,13 +235,9 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
                 app.handle_chat_ui(Action::CopyMessage(target, "provider-context".into(), None)),
                 None,
             );
-            assert!(
-                app.chat_runtime_mut(target)
-                    .unwrap()
-                    .error
-                    .as_deref()
-                    .unwrap()
-                    .contains("unavailable")
+            assert_eq!(
+                super::super::tests::copy_refusal(app.chat_runtime_mut(target).unwrap()),
+                Some(chat::TEXT_COPY_UNAVAILABLE)
             );
             let request = text_copy::Request::for_test(handle.clone(), source.clone());
             clipboard(
@@ -253,7 +249,9 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
                 )),
                 None,
             );
-            assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());
+            assert!(!super::super::tests::shows_copied(
+                app.chat_runtime_mut(target).unwrap()
+            ));
 
             let stale = text_copy::Request::for_test(handle.clone(), source.clone());
             let mut next = (*handle.snapshot()).clone();
@@ -298,8 +296,10 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
                 )),
                 Some(body),
             );
-            assert!(app.chat_runtime_mut(target).unwrap().copied.is_some());
-            app.chat_runtime_mut(target).unwrap().copied = None;
+            assert!(super::super::tests::shows_copied(
+                app.chat_runtime_mut(target).unwrap()
+            ));
+            app.chat_runtime_mut(target).unwrap().copy_feedback = None;
         }
     }
 }

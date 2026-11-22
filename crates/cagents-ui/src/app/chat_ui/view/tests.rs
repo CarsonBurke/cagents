@@ -52,7 +52,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
     }
     let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
     let notice = "Codex can attach only images";
-    runtime.attachment_notice = Some(notice.into());
+    runtime.composer_note = Some(notice.into());
     assert!(runtime.attachments.is_empty());
     assert!(runtime.error.is_none());
     let target = runtime.target;
@@ -121,7 +121,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
     drop(element);
     // The full pane also publishes the editor's focus action on a click.
     // Mount the notice itself to pin its button's exact dispatch contract.
-    let mut element = runtime.attachment_notice_view().unwrap();
+    let mut element = runtime.composer_note_view().unwrap();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
@@ -165,7 +165,7 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
         );
     }
     assert!(
-        matches!(messages.as_slice(), [Message::ChatUi(Action::DismissAttachmentNotice(found))]
+        matches!(messages.as_slice(), [Message::ChatUi(Action::DismissComposerNote(found))]
             if *found == target),
         "dismiss targets this runtime: {messages:?}"
     );
@@ -179,26 +179,34 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
 
     let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
     let notice = "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead.";
-    runtime.attachment_notice = Some(notice.into());
+    runtime.composer_note = Some(notice.into());
     let renderer = crate::app::tests::headless_renderer();
-    let mut element = runtime.attachment_notice_view().unwrap();
+    let mut element = runtime.composer_note_view().unwrap();
     let mut tree = Tree::new(element.as_widget());
     let node = element.as_widget_mut().layout(
         &mut tree,
         &renderer,
         &layout::Limits::new(iced::Size::ZERO, iced::Size::new(360.0, 800.0)),
     );
-    let row = Layout::new(&node);
+    // The note is a surface around a row of its icon, text and Dismiss.
+    let surface = Layout::new(&node);
+    let row = surface.children().next().unwrap();
     let row_bounds = row.bounds();
-    let text = row.children().next().unwrap().bounds();
-    let paragraph = tree.children[0].state.downcast_ref::<TextState>();
+    let text = row.children().nth(1).unwrap().bounds();
+    fn paragraph(tree: &Tree) -> Option<&TextState> {
+        if tree.tag == iced::advanced::widget::tree::Tag::of::<TextState>() {
+            return Some(tree.state.downcast_ref::<TextState>());
+        }
+        tree.children.iter().find_map(paragraph)
+    }
+    let paragraph = paragraph(&tree).expect("the note's text");
     assert_eq!(paragraph.content(), notice);
     // The text widget's allocated width is clamped even without wrapping;
     // check the shaped content as well to catch text drawn past that width.
     let text_bounds = iced::Rectangle::new(text.position(), paragraph.min_bounds());
     let accessible = element
         .as_widget()
-        .a11y_nodes(row, &tree, mouse::Cursor::Unavailable);
+        .a11y_nodes(surface, &tree, mouse::Cursor::Unavailable);
     let dismiss = accessible
         .root()
         .iter()
@@ -211,7 +219,7 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
         .node()
         .bounds()
         .unwrap();
-    assert!((row_bounds.width - 360.0).abs() < 0.1);
+    assert!((surface.bounds().width - 360.0).abs() < 0.1);
     assert!(
         text_bounds.x >= row_bounds.x
             && text_bounds.x + text_bounds.width <= row_bounds.x + row_bounds.width
@@ -220,21 +228,108 @@ fn the_full_attachment_refusal_wraps_clear_of_dismiss_in_a_narrow_row() {
         "full refusal stays inside the narrow row: text={text_bounds:?}, row={row_bounds:?}"
     );
     assert!(
-        f64::from(text_bounds.x + text_bounds.width + step::GAP_XS) <= dismiss.x0 + 0.1,
+        f64::from(text_bounds.x + text_bounds.width + step::GAP_S) <= dismiss.x0 + 0.1,
         "full refusal clears Dismiss: text={text_bounds:?}, dismiss={dismiss:?}"
     );
     assert!(
-        (dismiss.x1 - f64::from(row_bounds.x + row_bounds.width - step::GAP_M)).abs() < 0.1,
+        (dismiss.x1 - f64::from(row_bounds.x + row_bounds.width)).abs() < 0.1,
         "Dismiss stays at the row's end: {dismiss:?}"
-    );
-    assert!(
-        (dismiss.y0 - f64::from(row_bounds.y)).abs() < 0.1,
-        "Dismiss stays top-aligned: {dismiss:?}"
     );
     assert!(
         text_bounds.height > (dismiss.y1 - dismiss.y0) as f32,
         "the full refusal uses multiple lines at 360 px: {text_bounds:?}"
     );
+}
+
+/// A copy's refusal stays on its control's one line in a narrow pane, so it
+/// never draws over the text it was copying; the tooltip has all of it.
+#[test]
+fn a_copy_refusal_keeps_to_one_line_beside_its_control() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    type Paragraph = <cosmic::Renderer as iced::advanced::text::Renderer>::Paragraph;
+    type TextState = iced::advanced::widget::text::State<Paragraph>;
+    fn paragraph(tree: &Tree) -> Option<&TextState> {
+        if tree.tag == iced::advanced::widget::tree::Tag::of::<TextState>() {
+            return Some(tree.state.downcast_ref::<TextState>());
+        }
+        tree.children.iter().find_map(paragraph)
+    }
+
+    let (runtime, _handle) = frame_cost::live_runtime(&[]);
+    let refusal = super::text_copy::CopyState::Refused(chat::TEXT_COPY_UNAVAILABLE.into());
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element: Element<'_, Message> = widget::row::with_children(vec![
+        small_icon(
+            Icon::Warning,
+            "Copy again",
+            Action::DismissComposerNote(runtime.target),
+        ),
+        refusal.said().unwrap(),
+    ])
+    .spacing(step::GAP_XS)
+    .into();
+    let mut tree = Tree::new(element.as_widget());
+    let width = 160.0;
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+    );
+    let row = Layout::new(&node).bounds();
+    let shaped = paragraph(&tree).expect("the refusal's text").min_bounds();
+    assert!(
+        row.height <= super::MESSAGE_ACTION_HEIGHT,
+        "the refusal fits the action row: {row:?}, text {shaped:?}"
+    );
+    assert!(
+        row.width <= width + 0.1 && shaped.width <= width,
+        "the refusal stays inside the pane: {row:?}, text {shaped:?}"
+    );
+}
+
+/// In a narrow block, a long refusal gives way to the block's Copy, which
+/// stays whole to try again, and to its caption.
+#[test]
+fn a_blocks_copy_refusal_leaves_its_copy_and_caption_room() {
+    use iced::advanced::{Layout, layout, mouse, widget::Tree};
+    let (runtime, _handle) = frame_cost::live_runtime(&[]);
+    let refusal = super::text_copy::CopyState::Refused(chat::TEXT_COPY_UNAVAILABLE.into());
+    let renderer = crate::app::tests::headless_renderer();
+    let mut element = step::code_frame(
+        design::caption("output").into(),
+        Some("Output".into()),
+        Some(Action::DismissComposerNote(runtime.target)),
+        refusal,
+    );
+    let mut tree = Tree::new(element.as_widget());
+    let width = 200.0;
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+    let copy = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .find(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some("Copy again")
+        })
+        .expect("the block keeps its Copy")
+        .node()
+        .bounds()
+        .unwrap();
+    assert!(
+        copy.x1 - copy.x0 >= 16.0 && copy.x1 <= f64::from(width) + 0.1,
+        "the Copy keeps its size inside the block: {copy:?}"
+    );
+    let header = Layout::new(&node).bounds();
+    assert!(header.width <= width + 0.1, "{header:?}");
 }
 
 #[test]
@@ -9840,25 +9935,55 @@ fn copy_feedback_invalidates_only_the_messages_own_turns() {
     };
     let original = fingerprints(&runtime, true);
     let copied_at = Instant::now();
-    runtime.copied = Some(("answer-0".into(), copied_at));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: None,
+        at: copied_at,
+    });
     let first = fingerprints(&runtime, true);
     assert_eq!(changed(&original, &first), [true, false, false]);
 
     // Repeating Copy refreshes its expiry but draws the same checkmark.
-    runtime.copied = Some(("answer-0".into(), copied_at + Duration::from_millis(500)));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: None,
+        at: copied_at + Duration::from_millis(500),
+    });
     assert_eq!(first, fingerprints(&runtime, true));
 
+    // Saying why a copy didn't go through draws something else there.
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: Some(chat::TEXT_COPY_CHANGED.into()),
+        at: copied_at,
+    });
+    let refused = fingerprints(&runtime, true);
+    assert_eq!(changed(&first, &refused), [true, false, false]);
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-0".into()),
+        refusal: None,
+        at: copied_at,
+    });
+
     // Moving feedback removes one checkmark and adds the other.
-    runtime.copied = Some(("answer-1".into(), copied_at));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("answer-1".into()),
+        refusal: None,
+        at: copied_at,
+    });
     let second = fingerprints(&runtime, true);
     assert_eq!(changed(&first, &second), [true, true, false]);
-    runtime.copied = None;
+    runtime.copy_feedback = None;
     let cleared = fingerprints(&runtime, true);
     assert_eq!(changed(&second, &cleared), [false, true, false]);
     assert_eq!(original, cleared);
 
     // An item outside this transcript cannot change any visible badge.
-    runtime.copied = Some(("retired-item".into(), copied_at));
+    runtime.copy_feedback = Some(super::super::text_copy::CopyFeedback {
+        key: super::super::text_copy::CopyKey::Item("retired-item".into()),
+        refusal: None,
+        at: copied_at,
+    });
     assert_eq!(original, fingerprints(&runtime, true));
 }
 

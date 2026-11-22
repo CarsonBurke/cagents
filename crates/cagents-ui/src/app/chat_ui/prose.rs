@@ -1063,6 +1063,7 @@ impl Renderer {
                     .to_owned(),
             ),
             Some(Action::CopySharedCode(self.target, code.clone())),
+            super::text_copy::CopyState::Ready,
         )
     }
 }
