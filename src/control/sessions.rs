@@ -734,10 +734,11 @@ pub(super) fn token_count(tokens: u64) -> String {
 }
 
 /// That a message woke a session whose prompt cache had likely expired, with
-/// the `tokens` of context its provider reads again.
-pub(super) fn cold_wake(tokens: u64) -> String {
+/// the `tokens` of context its provider reads again. `whose` names the
+/// session, such as `Its` after a line that names it.
+pub(super) fn cold_wake(whose: &str, tokens: u64) -> String {
     format!(
-        "Its prompt cache had likely expired, so its provider reads all {} tokens of its context again.",
+        "{whose} prompt cache had likely expired, so its provider reads all {} tokens of its context again.",
         token_count(tokens)
     )
 }

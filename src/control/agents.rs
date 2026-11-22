@@ -1465,7 +1465,13 @@ pub(super) fn execute_with_context(
                 output.data["notice"] = json!(notice);
             }
             if let Some((tokens, cache)) = cold {
-                output.human = format!("{}\n{}", output.human, super::sessions::cold_wake(tokens));
+                // After the first line, which names the agent, rather than
+                // after whatever the run printed.
+                let line = super::sessions::cold_wake("Its", tokens);
+                output.human = match output.human.split_once('\n') {
+                    Some((head, rest)) => format!("{head}\n{line}\n{rest}"),
+                    None => format!("{}\n{line}", output.human),
+                };
                 output.data["cache"] = cache;
             }
             Ok(output)
@@ -4370,6 +4376,31 @@ mod tests {
         standing_json(&mut data, found, super::super::sessions::now_ms());
         assert_eq!(data["limit"]["reset"], "3pm");
         assert_eq!(data["account"]["id"], "claude/system");
+        assert!(data.get("cache").is_none(), "no estimate");
+
+        // A cache that likely expired gets a line among the standing, and
+        // the same `now` decides the text and the JSON.
+        let mut cold = found.unwrap().clone();
+        cold.limit = None;
+        cold.account = None;
+        cold.cache = Some(crate::agent_execution::directory::PromptCache {
+            requested_at: 0,
+            ttl_ms: 60_000,
+            basis: crate::agent_execution::directory::TtlBasis::Reported,
+            context_tokens: 120_000,
+        });
+        assert_eq!(
+            with_standing(status.into(), Some(&cold), 60_000),
+            "agent 1234 (claude) run 5678 Failed\nPrompt cache likely expired: a message makes its provider read all 120k tokens of its context again\n\nActual result"
+        );
+        assert_eq!(with_standing(status.into(), Some(&cold), 59_999), status);
+        let mut data = json!({});
+        standing_json(&mut data, Some(&cold), 60_000);
+        assert_eq!(data["cache"]["cold"], true);
+        assert_eq!(data["cache"]["basis"], "reported");
+        let mut data = json!({});
+        standing_json(&mut data, Some(&cold), 59_999);
+        assert!(data.get("cache").is_none(), "warm");
     }
 
     /// Each state suggests what follows from it, on a line the native app
