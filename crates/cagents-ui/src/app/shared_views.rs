@@ -1738,14 +1738,19 @@ impl Cagents {
                     .filter_map(|card| self.local_pane(scope, card, |id| pending.contains(&id)))
             };
             members.insert(scope.clone(), listed.iter().map(|card| card.id).collect());
-            // An unseeded scope publishes its seed whatever its baseline.
+            // An unseeded scope publishes its seed whatever its baseline. A
+            // baseline listing a chat yet to be published is no settlement:
+            // a shared projection takes that chat out of it to publish again.
             let settles = settle
                 && self.shared_views.initialized.contains(scope)
                 && self
                     .shared_views
                     .baseline
                     .get(scope)
-                    .is_some_and(|baseline| LocalPane::all_match(projected(), baseline));
+                    .is_some_and(|baseline| {
+                        LocalPane::all_match(projected(), baseline)
+                            && !baseline.iter().any(|pane| self.unpublished_chat(pane.id))
+                    });
             if settles {
                 settled.insert(scope.clone());
             } else {
@@ -2367,6 +2372,19 @@ impl Cagents {
         {
             return;
         }
+        let projected = self.kept_local_views();
+        self.publish_projected_view_changes(projected, ViewProjection::All);
+    }
+
+    /// Builds the discovery complete passes keep, as the first one would.
+    #[cfg(test)]
+    pub(super) fn prime_view_discovery(&mut self) {
+        drop(self.kept_local_views());
+    }
+
+    /// [`Self::local_views`] through the discovery kept between passes, with
+    /// each seeded scope whose panes equal its baseline settled.
+    fn kept_local_views(&mut self) -> LocalViews {
         let mut discovery = std::mem::take(&mut self.shared_views.discovery);
         let settlement = discovery::Settlement {
             initialized: self.shared_views.initialized.take_changes(),
@@ -2374,7 +2392,31 @@ impl Cagents {
         };
         let projected = self.discovered_local_views(&mut discovery, settlement);
         self.shared_views.discovery = discovery;
-        self.publish_projected_view_changes(projected, ViewProjection::All);
+        projected
+    }
+
+    /// Takes what a reconciliation projected as the registry's view of each
+    /// of `projected_scopes`, then publishes `projected` against that.
+    fn publish_reconciled_views(
+        &mut self,
+        projected: LocalViews,
+        projection: ViewProjection<'_>,
+        projected_scopes: Vec<Scope>,
+    ) {
+        for scope in projected_scopes {
+            // Its baseline already lists exactly its panes, none of them a
+            // chat yet to be published.
+            if projected.settled.contains(&scope) {
+                continue;
+            }
+            // The view this pass projected is what the registry holds. A
+            // chat yet to be published is not in it, so the publication
+            // below inserts it rather than taking it as already shared.
+            let mut panes = projected.panes.get(&scope).cloned().unwrap_or_default();
+            panes.retain(|pane| !self.unpublished_chat(pane.id));
+            self.shared_views.baseline.insert(scope, panes);
+        }
+        self.publish_projected_view_changes(projected, projection);
     }
 
     fn publish_projected_view_changes(
@@ -3588,24 +3630,17 @@ impl Cagents {
         // Held reported titles stay held: publishing them on every view
         // acknowledgment would publish each title again as its own echo.
         self.save_projected_workspace(presentation, |app| {
+            // A complete pass discovers through what the last pass kept and
+            // settles the scopes whose panes it left unchanged, rather than
+            // copying and comparing every scope's panes again.
             let projected = match (projection, topology) {
-                (ViewProjection::All, Some(topology)) => {
-                    app.local_views_with_topology(None, topology)
-                }
+                (ViewProjection::All, Some(_)) => app.kept_local_views(),
                 (ViewProjection::Structural(scopes), Some(topology)) => {
                     app.local_views_with_topology(Some(scopes), topology)
                 }
                 _ => app.local_views_for(projection),
             };
-            for scope in projected_scopes {
-                // The view this pass projected is what the registry holds. A
-                // chat yet to be published is not in it, so the publication
-                // below inserts it rather than taking it as already shared.
-                let mut panes = projected.panes.get(&scope).cloned().unwrap_or_default();
-                panes.retain(|pane| !app.unpublished_chat(pane.id));
-                app.shared_views.baseline.insert(scope.clone(), panes);
-            }
-            app.publish_projected_view_changes(projected, projection);
+            app.publish_reconciled_views(projected, projection, projected_scopes);
         });
         phase.mark("selected_save");
         tasks.push(self.run_deferred_default_pane());
@@ -3979,14 +4014,18 @@ impl Cagents {
             self.shared_views.closed_chats.remove(&shared.id);
             self.sync_closed_chat_draft(shared.id);
             self.prepare_terminal_restoration(shared);
-            let mut projected = shared.clone();
+            // Most panes project as the view lists them, so one is copied
+            // only to change it.
+            let mut projected = Cow::Borrowed(shared);
             if let Scope::Worktree { path, .. } = &view.scope {
-                projected.scope = Some(path.clone());
+                if projected.scope.as_ref() != Some(path) {
+                    projected.to_mut().scope = Some(path.clone());
+                }
                 self.worktree_owners.insert(projected.id, path.clone());
                 self.remove_shared_channel_member(projected.id);
             }
 
-            if let CardKind::Repository(repository) = &mut projected.kind {
+            if let CardKind::Repository(repository) = &projected.kind {
                 // A pane's project is window-local and never shared. When the
                 // echo describes this window's own pane, its project stands:
                 // a file pane's folder is rarely a project root, and a
@@ -4010,19 +4049,25 @@ impl Cagents {
                             .worktree_at(&repository.worktree)
                             .map(|key| key.project_id)
                     })
+                    && project != repository.project
+                    && let CardKind::Repository(repository) = &mut projected.to_mut().kind
                 {
                     repository.project = project;
                 }
             }
-            if let CardKind::Browser(browser) = &mut projected.kind
+            if let CardKind::Browser(browser) = &projected.kind
                 && let Some(CardKind::Browser(local)) =
                     self.card_state(projected.id).map(|card| &card.kind)
                 && local.current_url == browser.current_url
+                && (local.scroll_x, local.scroll_y) != (browser.scroll_x, browser.scroll_y)
             {
-                browser.scroll_x = local.scroll_x;
-                browser.scroll_y = local.scroll_y;
+                let (scroll_x, scroll_y) = (local.scroll_x, local.scroll_y);
+                if let CardKind::Browser(browser) = &mut projected.to_mut().kind {
+                    browser.scroll_x = scroll_x;
+                    browser.scroll_y = scroll_y;
+                }
             }
-            let pane = &projected;
+            let pane: &Pane = &projected;
             let accepted_default = self
                 .workspace_model
                 .views
@@ -4077,7 +4122,16 @@ impl Cagents {
                     }
                 }
             }
-            let existing = self.card_state(pane.id).cloned();
+            // The card as it stands before anything below changes it. Its
+            // kind is copied only when it differs from the pane's.
+            let existing = self.card_state(pane.id).map(|card| {
+                let kind = if card.kind == pane.kind {
+                    Cow::Borrowed(&pane.kind)
+                } else {
+                    Cow::Owned(card.kind.clone())
+                };
+                (card.existence.is_open(), kind)
+            });
             // The exit this window saw, read before a readmission below can
             // mark the card unstarted.
             let mut observed_exit = self.ended_terminal(pane.id).cloned();
@@ -4093,11 +4147,16 @@ impl Cagents {
                 && existing.is_some()
                 && matches!(self.residency(pane.id), Residency::Hydrating { .. });
             let canonical_was_ended = match &pane.kind {
-                CardKind::Terminal(source) => self
-                    .shared_views
-                    .observed_terminals
-                    .insert(pane.id, source.clone())
-                    .is_none_or(|previous| terminal_ended(&previous)),
+                CardKind::Terminal(source) => {
+                    match self.shared_views.observed_terminals.get(&pane.id) {
+                        Some(previous) if previous == source => terminal_ended(previous),
+                        _ => self
+                            .shared_views
+                            .observed_terminals
+                            .insert(pane.id, source.clone())
+                            .is_none_or(|previous| terminal_ended(&previous)),
+                    }
+                }
                 _ => {
                     self.shared_views.observed_terminals.remove(&pane.id);
                     false
@@ -4129,13 +4188,13 @@ impl Cagents {
                 self.readmit_held_terminal(pane.id, exposure);
             }
             match existing {
-                Some(card) if card.existence.is_open() => {
+                Some((true, saved)) => {
                     // The daemon can publish the conversation a resume in this
                     // window started before that start replies. The start owns
                     // the card's runtime, with its transcript and draft, and
                     // puts the conversation in the card itself once it is saved.
                     let resuming = matches!(&pane.kind, CardKind::Chat(session) if self.chat_resume_in_flight(pane.id, session));
-                    if card.kind != pane.kind
+                    if *saved != pane.kind
                         && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
                     {
                         self.status = Some(TransientNotice::warning(
@@ -4143,16 +4202,16 @@ impl Cagents {
                         ));
                         continue;
                     }
-                    if card.kind != pane.kind && !resuming {
+                    if *saved != pane.kind && !resuming {
                         // Runtime metadata can change, but an exact live actor
                         // remains attached unless the session identity changes.
-                        let same_session = match (&card.kind, &pane.kind) {
+                        let same_session = match (&*saved, &pane.kind) {
                             (CardKind::Terminal(a), CardKind::Terminal(b)) => a.id == b.id,
                             (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
                             (a, b) => a == b,
                         };
                         if let (CardKind::Chat(saved), CardKind::Chat(canonical)) =
-                            (&card.kind, &pane.kind)
+                            (&*saved, &pane.kind)
                         {
                             self.adopt_shared_chat_identity(pane.id, saved, canonical);
                         }
@@ -4189,11 +4248,13 @@ impl Cagents {
                         }
                     }
                     let mut kind = if keep_live {
-                        card.kind.clone()
+                        saved
                     } else {
-                        pane.kind.clone()
+                        Cow::Borrowed(&pane.kind)
                     };
-                    preserve_observed_terminal_exit(observed_exit.as_ref(), &mut kind);
+                    if observed_exit.is_some() {
+                        preserve_observed_terminal_exit(observed_exit.as_ref(), kind.to_mut());
+                    }
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
                     let reported = self.reported_title_save.cards.contains(&pane.id);
@@ -4202,7 +4263,7 @@ impl Cagents {
                     let changed = self.card_state(pane.id).is_some_and(|current| {
                         (!reported && !keep_live && current.title != pane.title)
                             || !keep_live && current.width_fraction != pane.width_fraction
-                            || (!resuming && current.kind != kind)
+                            || (!resuming && current.kind != *kind)
                     });
                     if changed && let Some(current) = self.card_state_mut(pane.id) {
                         if !reported && !keep_live {
@@ -4212,7 +4273,7 @@ impl Cagents {
                             current.width_fraction = pane.width_fraction;
                         }
                         if !resuming {
-                            current.kind = kind;
+                            current.kind = kind.into_owned();
                         }
                     }
                     // Publishing a locally opened chat can echo its pane
@@ -4290,9 +4351,9 @@ impl Cagents {
             .iter()
             .filter_map(|pane| {
                 if !self.shared_views.quarantined.contains(&pane.id) {
-                    Some(pane.clone())
+                    Some(Cow::Borrowed(pane))
                 } else if local_members.contains(&pane.id) {
-                    local_pane(pane.id)
+                    local_pane(pane.id).map(Cow::Owned)
                 } else {
                     None
                 }
@@ -4347,7 +4408,7 @@ impl Cagents {
                 .take(visible.iter().position(|id| *id == pane.id).unwrap_or(0))
                 .filter(|id| strip.iter().any(|placed| placed.id == **id))
                 .count();
-            strip.insert(place, pane);
+            strip.insert(place, Cow::Owned(pane));
         }
         if let Some(index) = index {
             let channel = &self.durable.channels[index];
@@ -4365,6 +4426,7 @@ impl Cagents {
         if active {
             // The strip's one edit also takes out every pane detached so far.
             let detached = std::mem::take(&mut self.shared_views.strip_detached);
+            let strip = strip.into_iter().map(Cow::into_owned).collect::<Vec<_>>();
             self.project_shared_strip(&strip, &visible, &detached);
             if !detached.is_empty() {
                 self.settle_focus();

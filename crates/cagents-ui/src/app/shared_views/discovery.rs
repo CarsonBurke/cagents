@@ -765,13 +765,15 @@ impl Cagents {
         assert_eq!(channels(projected), channels(&complete), "channel order");
         assert_eq!(projected.cards, complete.cards, "scope members");
         // A scope is settled exactly when it is seeded and its complete panes
-        // are its baseline, which then stands for them.
+        // are its baseline, which then stands for them, with no chat yet to
+        // be published among them.
         let settled = complete
             .panes
             .iter()
             .filter(|(scope, panes)| {
                 counters.initialized.contains(*scope)
                     && counters.baseline.get(*scope) == Some(panes)
+                    && !panes.iter().any(|pane| self.unpublished_chat(pane.id))
             })
             .map(|(scope, _)| scope.clone())
             .collect::<HashSet<_>>();
@@ -1576,6 +1578,103 @@ mod tests {
         );
         assert!(settled > compared, "{settled} over {compared}");
         assert!(reached > 0, "no transfer reached a settled scope");
+    }
+
+    /// A complete reconciliation takes each projected scope's panes as its
+    /// baseline and publishes against that. From the kept discovery, with
+    /// its settled scopes left alone, it publishes exactly what it does
+    /// when it projects and copies every scope, across randomized edits.
+    #[test]
+    fn reconciled_publication_agrees_with_a_complete_projection_across_random_edits() {
+        let (mut compared, mut settled, mut ambiguous) = (0, 0, 0);
+        for seed in 0..10 {
+            let (mut app, _, _directory) = large_workspace(&SMALL);
+            let (tx, requests) = crate::app::workspace_model_sync::test_model_channel();
+            app.workspace_model_tx = tx;
+            let mut rng = Rng(2_000 + seed);
+            for step in 0..120 {
+                let edit = if rng.below(2) == 0 {
+                    edit(&mut app, &mut rng)
+                } else {
+                    pane_edit(&mut app, &mut rng)
+                };
+                if rng.below(4) == 0 {
+                    settle_seeds(&mut app);
+                }
+                while requests.try_recv().is_ok() {}
+                let run = || {
+                    // The scopes a reconciliation projects: those listed
+                    // and seeded.
+                    let views = &app.shared_views;
+                    let scopes = app
+                        .workspace_model
+                        .views
+                        .iter()
+                        .map(|view| view.scope.clone())
+                        .filter(|scope| {
+                            views.initialized.contains(scope)
+                                && !views.seeding.contains(scope)
+                                && !views.seed_failures.contains_key(scope)
+                        })
+                        .collect::<Vec<_>>();
+                    // The exception the module documents: a view listed under
+                    // another repository than the topology resolves for its
+                    // path names that path with a second scope, and which of
+                    // the two takes a default card's request depends on the
+                    // order they were discovered in. Only such a pass may
+                    // publish differently.
+                    let topology = app.borrowed_view_scope_topology();
+                    let two_scopes = app.workspace_model.views.iter().any(|view| {
+                        matches!(&view.scope, Scope::Worktree { repository, path }
+                            if topology.authorities.repository_for(path)
+                                .is_some_and(|resolved| resolved != repository))
+                    });
+                    drop(topology);
+                    let copy = app.shared_views.publication_copy();
+                    let original = std::mem::replace(&mut app.shared_views, copy);
+                    let complete = app.local_views();
+                    for scope in &scopes {
+                        let mut panes = complete.panes.get(scope).cloned().unwrap_or_default();
+                        panes.retain(|pane| !app.unpublished_chat(pane.id));
+                        app.shared_views.baseline.insert(scope.clone(), panes);
+                    }
+                    app.publish_projected_view_changes(complete, ViewProjection::All);
+                    let expected = published(&requests);
+                    let complete = std::mem::replace(&mut app.shared_views, original);
+                    let before = app.shared_views.settled_publications;
+                    let kept = app.kept_local_views();
+                    app.publish_reconciled_views(kept, ViewProjection::All, scopes);
+                    let reconciled = published(&requests);
+                    let state = publication_state(&app.shared_views);
+                    if two_scopes
+                        && (reconciled != expected || state != publication_state(&complete))
+                    {
+                        return None;
+                    }
+                    assert_eq!(reconciled, expected, "published edits");
+                    assert_eq!(state, publication_state(&complete), "publication state");
+                    Some(app.shared_views.settled_publications - before)
+                };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+                    Ok(Some(count)) => settled += count,
+                    Ok(None) => ambiguous += 1,
+                    Err(panic) => {
+                        eprintln!("seed {seed}, step {step}: after {edit}");
+                        std::panic::resume_unwind(panic);
+                    }
+                }
+                compared += 1;
+            }
+        }
+        eprintln!(
+            "{settled} scopes settled over {compared} reconciled publications, \
+             {ambiguous} differing where a path two scopes name"
+        );
+        assert!(settled > compared - ambiguous, "{settled} over {compared}");
+        assert!(
+            ambiguous < compared / 10,
+            "{ambiguous} of {compared} differ"
+        );
     }
 
     /// Settles every seed as the daemon would, acknowledging it and listing
