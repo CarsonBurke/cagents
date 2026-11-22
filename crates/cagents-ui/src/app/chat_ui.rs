@@ -7822,7 +7822,7 @@ impl Cagents {
                             runtime.session.launch.provider,
                             &runtime.session.launch.recipe,
                         )
-                        .is_some() =>
+                        .is_some_and(|accounts| accounts.choosable) =>
             {
                 Action::AccountPicker(target, !runtime.account_picker)
             }
@@ -7912,10 +7912,12 @@ impl Cagents {
             _ => None,
         })?;
         let ring: Vec<_> = if runtime.account_picker {
-            let accounts = self.chat_accounts(
-                runtime.session.launch.provider,
-                &runtime.session.launch.recipe,
-            )?;
+            let accounts = self
+                .chat_accounts(
+                    runtime.session.launch.provider,
+                    &runtime.session.launch.recipe,
+                )
+                .filter(|accounts| accounts.choosable)?;
             (0..accounts.choices.len())
                 .map(|index| card_control_id(card, &format!("chat-account-choice-{index}")))
                 .chain(std::iter::once(card_control_id(
@@ -12770,11 +12772,25 @@ impl Cagents {
                 }
             }
             Action::AccountPicker(target, open) => {
+                // A sole account is shown for its usage, with no picker.
+                let choosable = open
+                    && self
+                        .chat_runtime_mut(target)
+                        .map(|runtime| {
+                            (
+                                runtime.session.launch.provider,
+                                runtime.session.launch.recipe.clone(),
+                            )
+                        })
+                        .is_some_and(|(provider, recipe)| {
+                            self.chat_accounts(provider, &recipe)
+                                .is_some_and(|accounts| accounts.choosable)
+                        });
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
-                    runtime.account_picker = open && runtime.choosing();
+                    runtime.account_picker = choosable && runtime.choosing();
                     runtime.model_picker = None;
                     runtime.permission_picker = false;
                 }

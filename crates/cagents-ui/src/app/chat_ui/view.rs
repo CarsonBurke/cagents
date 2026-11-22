@@ -5098,26 +5098,59 @@ impl Runtime {
         let label = || -> Element<'a, Message> {
             crate::ui_controls::FadeText::caption(accounts.current).into()
         };
-        let icon = Icon::Avatar.handle();
-        if transitioning || !self.choosing() {
+        // The account's usage stands where its avatar would: the allowance
+        // it has least of, a figure a reader acts on before sending, where an
+        // avatar only repeats the name beside it. An account with no current
+        // figure keeps the avatar.
+        let gauge = accounts.gauge;
+        let glyph = |passive: bool| -> Element<'a, Message> {
+            match gauge {
+                Some(gauge) => {
+                    crate::ui_controls::budget_radial_toned(gauge.fraction, gauge.tone.ring_tone())
+                }
+                None if passive => crate::ui_controls::passive_icon(
+                    Icon::Avatar.handle(),
+                    design::COMPACT_ICON_SIZE,
+                ),
+                None => widget::icon(Icon::Avatar.handle())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+            }
+        };
+        let usage = |tooltip: String| match gauge {
+            Some(gauge) => format!("{tooltip}\n\n{}", gauge.detail),
+            None => tooltip,
+        };
+        if transitioning || !self.choosing() || !accounts.choosable {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
-            let avatar = crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE);
-            // Without its caption the avatar alone says nothing to a screen
-            // reader, so it carries the account's name.
-            let avatar = if named {
-                avatar
-            } else {
-                crate::ui_controls::labelled(avatar, format!("Account: {}", accounts.current))
+            //
+            // The glyph alone says nothing to a screen reader, so it carries
+            // the figure, and without its caption the account's name too.
+            let avatar = match (named, gauge) {
+                (true, None) => glyph(true),
+                (true, Some(gauge)) => {
+                    crate::ui_controls::labelled(glyph(true), gauge.label.clone())
+                }
+                (false, None) => crate::ui_controls::labelled(
+                    glyph(true),
+                    format!("Account: {}", accounts.current),
+                ),
+                (false, Some(gauge)) => crate::ui_controls::labelled(
+                    glyph(true),
+                    format!("Account: {}, {}", accounts.current, gauge.label),
+                ),
             };
             return crate::interaction::tooltip_above(
                 widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
                     .spacing(step::GAP_XS)
                     .align_y(Alignment::Center),
-                format!(
+                usage(format!(
                     "This conversation runs on {}. {}",
                     accounts.current,
-                    if self
+                    if !accounts.choosable {
+                        "It is the only account signed in for this agent."
+                    } else if self
                         .session
                         .launch
                         .recipe
@@ -5129,12 +5162,12 @@ impl Runtime {
                     } else {
                         "This account is pinned. Start a new conversation to use another account."
                     }
-                ),
+                )),
             );
         }
         let anchor = widget::button::custom(
             widget::row::with_children(
-                std::iter::once(widget::icon(icon).size(design::COMPACT_ICON_SIZE).into())
+                std::iter::once(glyph(false))
                     .chain(named.then(label))
                     .chain(std::iter::once(
                         widget::icon(Icon::PanDown.handle())
@@ -5145,10 +5178,14 @@ impl Runtime {
             .spacing(step::GAP_XS)
             .align_y(Alignment::Center),
         )
-        .name(if named {
-            Cow::Borrowed("Choose an account")
-        } else {
-            Cow::Owned(format!("Choose an account, now {}", accounts.current))
+        .name(match (named, gauge) {
+            (true, None) => Cow::Borrowed("Choose an account"),
+            (true, Some(gauge)) => Cow::Owned(format!("Choose an account, {}", gauge.label)),
+            (false, None) => Cow::Owned(format!("Choose an account, now {}", accounts.current)),
+            (false, Some(gauge)) => Cow::Owned(format!(
+                "Choose an account, now {}, {}",
+                accounts.current, gauge.label
+            )),
         })
         .id(card_control_id(target.card, "chat-account-picker"))
         .class(crate::ui_controls::control_style(open, None))
@@ -5160,11 +5197,11 @@ impl Runtime {
         );
         let anchor = crate::interaction::tooltip_above(
             anchor,
-            if named {
+            usage(if named {
                 shortcut
             } else {
                 format!("Account: {} · {shortcut}", accounts.current)
-            },
+            }),
         );
         let choices = open.then(|| {
             widget::column::with_children(
