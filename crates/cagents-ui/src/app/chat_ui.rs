@@ -7768,7 +7768,7 @@ impl Cagents {
                             runtime.session.launch.provider,
                             &runtime.session.launch.recipe,
                         )
-                        .is_some() =>
+                        .is_some_and(|accounts| accounts.choosable) =>
             {
                 Action::AccountPicker(target, !runtime.account_picker)
             }
@@ -7858,10 +7858,12 @@ impl Cagents {
             _ => None,
         })?;
         let ring: Vec<_> = if runtime.account_picker {
-            let accounts = self.chat_accounts(
-                runtime.session.launch.provider,
-                &runtime.session.launch.recipe,
-            )?;
+            let accounts = self
+                .chat_accounts(
+                    runtime.session.launch.provider,
+                    &runtime.session.launch.recipe,
+                )
+                .filter(|accounts| accounts.choosable)?;
             (0..accounts.choices.len())
                 .map(|index| card_control_id(card, &format!("chat-account-choice-{index}")))
                 .chain(std::iter::once(card_control_id(

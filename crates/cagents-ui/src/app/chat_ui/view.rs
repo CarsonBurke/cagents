@@ -5121,7 +5121,7 @@ impl Runtime {
             Some(gauge) => format!("{tooltip}\n\n{}", gauge.detail),
             None => tooltip,
         };
-        if transitioning || !self.choosing() {
+        if transitioning || !self.choosing() || !accounts.choosable {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
             //
@@ -5148,7 +5148,9 @@ impl Runtime {
                 usage(format!(
                     "This conversation runs on {}. {}",
                     accounts.current,
-                    if self
+                    if !accounts.choosable {
+                        "It is the only account signed in for this agent."
+                    } else if self
                         .session
                         .launch
                         .recipe

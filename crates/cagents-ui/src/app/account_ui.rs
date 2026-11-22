@@ -2739,6 +2739,9 @@ pub(super) struct ChatAccounts<'a> {
     pub current: &'a str,
     /// The usage the chosen account has left, where known.
     pub gauge: Option<&'a AccountGauge>,
+    /// Whether there is another account to choose. A sole account is shown
+    /// only for its usage, and offers no picker.
+    pub choosable: bool,
     pub choices: AccountChoices<'a>,
 }
 
@@ -2825,15 +2828,13 @@ impl Cagents {
                 .any(|provider| self.account_ui.registry.automatic(provider))
     }
 
-    /// Whether a chat footer may show an account's usage: some provider
-    /// has more than one account to choose between, as the footer's
-    /// account item needs.
+    /// Whether a chat footer may show an account's usage gauge.
     fn footer_shows_account_usage(&self) -> bool {
         self.account_ui
             .choices(self.settings.account_usage_display)
             .0
             .values()
-            .any(|choices| choices.present > 1)
+            .any(|choices| choices.accounts.iter().any(|choice| choice.gauge.is_some()))
     }
 
     /// Ticks while anything shows account usage. Unfocused, a tick only
@@ -6487,12 +6488,18 @@ impl Cagents {
         let current = running.map(|index| &offered.accounts[index]);
         let shown = offered.present
             + usize::from(current.is_some_and(|current| current.listed && !current.present));
-        if shown == 0 || (shown < 2 && current.is_some_and(|current| current.system)) {
+        let choosable =
+            !(shown == 0 || (shown < 2 && current.is_some_and(|current| current.system)));
+        // A sole account has nothing to choose, but its usage still stands
+        // where the account would.
+        let gauge = current.and_then(|current| current.gauge.as_ref());
+        if !choosable && gauge.is_none() {
             return None;
         }
         Some(ChatAccounts {
             current: current.map_or("Other home", |current| current.label.as_str()),
-            gauge: current.and_then(|current| current.gauge.as_ref()),
+            gauge,
+            choosable,
             choices: AccountChoices {
                 accounts: &offered.accounts,
                 current: running,
@@ -12970,12 +12977,44 @@ mod app_tests {
                 Provider::Claude,
                 &LaunchRecipe {
                     program: "claude".into(),
-                    ..recipe
+                    ..recipe.clone()
                 }
             )
             .is_none(),
             "one system account is nothing to choose"
         );
+
+        // Its usage still stands where the account would, with no picker.
+        let claude = Account::system(Provider::Claude).id();
+        let now = app.account_ui.now_ms;
+        let state = app
+            .account_ui
+            .accounts
+            .iter_mut()
+            .find(|state| state.account.id() == claude)
+            .expect("the system Claude account is listed");
+        let mut usage = UsageSnapshot::state(UsageStatus::Ok, "", now);
+        usage.windows = vec![UsageWindow {
+            key: "session".into(),
+            kind: WindowKind::Session,
+            label: "Session".into(),
+            used: 0.4,
+            resets_at: None,
+            span_secs: None,
+            binding: false,
+        }];
+        state.snapshot = Some(usage);
+        let accounts = app
+            .chat_accounts(
+                Provider::Claude,
+                &LaunchRecipe {
+                    program: "claude".into(),
+                    ..recipe
+                },
+            )
+            .expect("a sole account with usage shows it");
+        assert!(!accounts.choosable);
+        assert_eq!(accounts.gauge.unwrap().label, "Session usage: 60% left");
     }
 
     #[test]
