@@ -111,6 +111,7 @@ icons! {
         Preview => "preview",
         PullRequest => "pull-request",
         Push => "push",
+        Reasoning => "reasoning",
         Rename => "rename",
         RevertFile => "revert-file",
         ReviewApproved => "review-approved",

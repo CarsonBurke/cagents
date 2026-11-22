@@ -43,7 +43,7 @@ const THREAD_RAIL_OFFSET: f32 =
 fn kind_glyph(content: &ItemContent) -> Icon {
     match content {
         _ if chat::is_stopped_notice(content) => Icon::Ended,
-        ItemContent::Text { .. } => Icon::Private,
+        ItemContent::Text { .. } => Icon::Reasoning,
         ItemContent::Command { action, .. } => match action {
             chat::CommandAction::Read => Icon::TextFile,
             chat::CommandAction::Search => Icon::Search,
