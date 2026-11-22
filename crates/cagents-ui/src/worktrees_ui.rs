@@ -331,12 +331,11 @@ impl<'a> View<'a> {
                 String::new(),
             )));
         }
+        // The filter has a line of its own: beside the title and controls it
+        // was the one element left to shrink, so a pane beside a chat
+        // squeezed it down to its icon.
         let toolbar = widget::row::with_children(vec![
             design::title("Worktrees").into(),
-            widget::container(search)
-                .max_width(360)
-                .width(Length::Fill)
-                .into(),
             widget::Space::new().width(Length::Fill).into(),
             crate::work_ui::layout_switch(Layout::Worktrees).map(|action| match action {
                 crate::work_ui::Action::Layout(layout) => Action::Layout(layout),
@@ -350,10 +349,12 @@ impl<'a> View<'a> {
         ])
         .spacing(space::S)
         .align_y(Alignment::Center);
-        widget::container(toolbar)
-            .padding(Padding::from([space::S, space::L]))
-            .width(Length::Fill)
-            .into()
+        widget::container(
+            widget::column::with_children(vec![toolbar.into(), search.into()]).spacing(space::S),
+        )
+        .padding(Padding::from([space::S, space::L]))
+        .width(Length::Fill)
+        .into()
     }
 
     fn body(&self) -> Element<'a, Action> {
@@ -770,7 +771,7 @@ impl<'a> View<'a> {
         let mut second = vec![
             crate::ui_controls::fade_text(crate::app::display_path(&worktree.path))
                 .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::FillPortion(2))
+                .width(Length::Fill)
                 .into(),
         ];
         match deletion {
@@ -795,13 +796,21 @@ impl<'a> View<'a> {
             }
             None => {}
         }
+        let mut details = vec![
+            widget::row::with_children(second)
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+        ];
+        // The panes get a line of their own, so a busy checkout's path keeps
+        // its width instead of shrinking to its first characters.
         let agents = self
             .state
             .agents
             .get(&(project.id, worktree.id))
             .map_or(&[][..], Vec::as_slice);
         if !agents.is_empty() {
-            second.push(
+            details.push(
                 widget::row::with_children(agents.iter().map(|agent| self.agent(agent)))
                     .spacing(space::XXS)
                     .align_y(Alignment::Center)
@@ -814,16 +823,12 @@ impl<'a> View<'a> {
                 .spacing(space::S)
                 .align_y(Alignment::Center)
                 .into(),
-            widget::container(
-                widget::row::with_children(second)
-                    .spacing(space::S)
-                    .align_y(Alignment::Center),
-            )
-            .padding(Padding {
-                left: f32::from(design::ROW_ICON_SIZE) + space::S,
-                ..Padding::ZERO
-            })
-            .into(),
+            widget::container(widget::column::with_children(details).spacing(space::XXS))
+                .padding(Padding {
+                    left: f32::from(design::ROW_ICON_SIZE) + space::S,
+                    ..Padding::ZERO
+                })
+                .into(),
         ])
         .spacing(space::XS);
         let menu = Menu::Worktree(project.id, worktree.id);
