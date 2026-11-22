@@ -5,9 +5,9 @@
 //! The rows are the window's own project model, the one the sidebar reads, and
 //! every action is the sidebar's, so deleting a worktree here passes the same
 //! checks and dialog as anywhere else. Which panes work in each checkout is
-//! derived by the application during its projection, and only while this view
-//! is on screen; [`State::refresh`] keeps the list of rows between projects
-//! changing, so a frame builds only the rows it shows.
+//! derived by the application during its projection, and only while a Work
+//! pane shows this view; [`State::refresh`] keeps the list of rows between
+//! projects changing, so a frame builds only the rows it shows.
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
@@ -195,7 +195,6 @@ impl State {
         }
     }
 
-    /// Replaces who works in each checkout, when it changed.
     /// Renames the listed panes whose titles changed since they were
     /// listed, without deriving who works where again.
     pub fn retitle(&mut self, mut title: impl FnMut(CardId) -> Option<String>) {
@@ -208,6 +207,7 @@ impl State {
         }
     }
 
+    /// Replaces who works in each checkout, when it changed.
     pub fn set_agents(&mut self, agents: Agents) {
         if self.agents != agents {
             self.homes.clear();
@@ -296,9 +296,10 @@ impl State {
     }
 }
 
-/// Every project's lines in sidebar order: its heading, the creations under
-/// way, then its checkouts, the main one first. A query keeps the checkouts it
-/// finds, and every checkout of a project whose name it finds.
+/// Every project's lines in sidebar order: its heading, its main checkout, the
+/// creations under way, then its other checkouts, newest first. A query keeps
+/// the checkouts it finds, best match first, and every checkout of a project
+/// whose name it finds.
 fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
     let folded = crate::sidebar::fold_query(query);
     let mut entries = Vec::new();
@@ -316,11 +317,30 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
         }
         worktrees.sort_by_key(|(_, worktree)| {
             (
+                // A subsequence match is kept, but below the rows that
+                // spell the query out.
+                (!whole).then(|| worktree.search_rank(&folded)),
                 !is_primary_worktree(&entity.repository, &worktree.path),
                 std::cmp::Reverse(worktree.created_at_unix_ms),
             )
         });
         entries.push(Entry::Project { project, id });
+        if worktrees.is_empty() && entity.operations.is_empty() {
+            entries.push(Entry::Empty { project, id });
+            continue;
+        }
+        let worktree_entry = |(worktree, row): (usize, &SidebarWorktree)| Entry::Worktree {
+            project,
+            id,
+            worktree,
+            worktree_id: row.id,
+        };
+        let mut worktrees = worktrees.into_iter().peekable();
+        if let Some(main) = worktrees
+            .next_if(|(_, row)| whole && is_primary_worktree(&entity.repository, &row.path))
+        {
+            entries.push(worktree_entry(main));
+        }
         if whole {
             entries.extend(
                 entity
@@ -335,21 +355,37 @@ fn list(projects: &[SidebarProject], query: &str) -> Vec<Entry> {
                     }),
             );
         }
-        if worktrees.is_empty() && entity.operations.is_empty() {
-            entries.push(Entry::Empty { project, id });
-        }
-        entries.extend(
-            worktrees
-                .into_iter()
-                .map(|(worktree, row)| Entry::Worktree {
-                    project,
-                    id,
-                    worktree,
-                    worktree_id: row.id,
-                }),
-        );
+        entries.extend(worktrees.map(worktree_entry));
     }
     entries
+}
+
+/// What a screen reader announces for a checkout row: where pressing it goes,
+/// then what the row shows beside its name.
+fn row_name(
+    worktree: &SidebarWorktree,
+    primary: bool,
+    current: bool,
+    indicators: &crate::sidebar::WorktreeIndicators<'_>,
+) -> String {
+    let mut name = format!("Open {}", worktree.label());
+    if primary {
+        name.push_str(", main checkout");
+    }
+    if current {
+        name.push_str(", current");
+    }
+    if let Some(dirty) = indicators.dirty {
+        name.push_str(", ");
+        name.push_str(dirty);
+    }
+    if let Some(pr) = indicators.pull_request {
+        name.push_str(&format!(", pull request #{}", pr.number));
+        if let Some(state) = pr.state {
+            name.push_str(&format!(" {}", state.label().to_lowercase()));
+        }
+    }
+    name
 }
 
 #[derive(Clone, Copy)]
@@ -357,7 +393,7 @@ struct View<'a> {
     state: &'a State,
     projects: &'a [SidebarProject],
     editors: &'a [SidebarEditor],
-    /// The checkout the focused pane works in.
+    /// The checkout of the pane the user was last in.
     current: Option<(ProjectId, WorktreeId)>,
     modal_open: bool,
 }
@@ -562,6 +598,7 @@ impl<'a> View<'a> {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             crate::ui_controls::fade_text(crate::app::display_path(&project.repository))
+                .edge(crate::ui_controls::FadeEdge::Start)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
@@ -817,7 +854,7 @@ impl<'a> View<'a> {
         if current {
             title.push(crate::interaction::tooltip(
                 badge("Current", Tone::Themed(design::accent_color)),
-                "The checkout the focused pane works in",
+                "The checkout of the pane you were last in",
             ));
         }
         if worktree.detached {
@@ -838,6 +875,7 @@ impl<'a> View<'a> {
 
         let mut second = vec![
             crate::ui_controls::fade_text(crate::app::display_path(&worktree.path))
+                .edge(crate::ui_controls::FadeEdge::Start)
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
@@ -909,13 +947,13 @@ impl<'a> View<'a> {
             path: worktree.path.clone(),
         });
         let button = widget::button::custom(lines)
-            .name(format!("Open {}", worktree.label()))
+            .name(row_name(worktree, primary, current, &indicators))
             .class(crate::work_ui::card_style(selected))
             .padding([space::XS + space::XXS, space::S])
             .width(Length::Fill)
             .on_press_maybe(open.and_then(|open| self.sidebar(open)));
         let row = widget::mouse_area(crate::interaction::hover(button));
-        if self.modal_open {
+        if self.modal_open || deleting {
             row.into()
         } else {
             row.on_right_press(Action::Menu(Some(menu))).into()
@@ -1240,16 +1278,33 @@ mod tests {
 
     #[test]
     fn the_main_checkout_leads_and_a_query_keeps_what_it_finds() {
+        let mut cagents = project(
+            "cagents",
+            vec![
+                worktree("/src/cagents-old", "old-fix", 1),
+                worktree("/src/cagents", "main", 0),
+                worktree("/src/cagents-new", "new-feature", 2),
+            ],
+        );
+        cagents.operations.push(WorktreeOperationRow {
+            id: crate::model::OperationId::new(),
+            label: "being-made".into(),
+            detail: "Creating the worktree".into(),
+            phase: WorktreeOperationPhase::Working,
+            cancellable: true,
+            reopenable: false,
+        });
         let projects = vec![
+            cagents,
+            project("notes", vec![worktree("/src/notes", "trunk", 0)]),
             project(
-                "cagents",
+                "tools",
                 vec![
-                    worktree("/src/cagents-old", "old-fix", 1),
-                    worktree("/src/cagents", "main", 0),
-                    worktree("/src/cagents-new", "new-feature", 2),
+                    worktree("/src/tools", "main", 0),
+                    worktree("/src/tools-a", "fix-a", 1),
+                    worktree("/src/tools-b", "feat-index", 2),
                 ],
             ),
-            project("notes", vec![worktree("/src/notes", "trunk", 0)]),
         ];
         let mut state = State::default();
         state.refresh(1, &projects);
@@ -1258,12 +1313,26 @@ mod tests {
             [
                 "# cagents",
                 "main",
+                "operation",
                 "new-feature",
                 "old-fix",
                 "# notes",
-                "trunk"
+                "trunk",
+                "# tools",
+                "main",
+                "feat-index",
+                "fix-a",
             ],
-            "each project's main checkout first, then its newest worktrees"
+            "each project's main checkout first, then what is being created, then its newest \
+             worktrees"
+        );
+
+        drop(state.update(Action::Query("fix".into())));
+        state.refresh(1, &projects);
+        assert_eq!(
+            worktree_labels(&state, &projects),
+            ["# cagents", "old-fix", "# tools", "fix-a", "feat-index"],
+            "a row spelling the query out leads one that only contains its letters"
         );
 
         drop(state.update(Action::Query("new-feat".into())));

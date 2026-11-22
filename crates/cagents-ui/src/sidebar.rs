@@ -1203,7 +1203,9 @@ impl SidebarWorktree {
         self.search_rank(folded_query).is_some()
     }
 
-    fn search_rank(&self, query: &str) -> Option<usize> {
+    /// How well a folded query finds this row, lower first; `None` when it
+    /// does not.
+    pub(crate) fn search_rank(&self, query: &str) -> Option<usize> {
         search_score(&self.chrome.folded_label, query)
             .into_iter()
             .chain(
@@ -13576,13 +13578,13 @@ pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<Sideba
     destinations
 }
 
-/// Case-folds a filter key. Entities store the result so the free-text filter
-/// never folds a candidate while rendering.
 /// A search query in the form row matchers compare it in.
 pub(crate) fn fold_query(query: &str) -> Box<str> {
     fold(query.trim())
 }
 
+/// Case-folds a filter key. Entities store the result so the free-text filter
+/// never folds a candidate while rendering.
 fn fold(value: &str) -> Box<str> {
     value.case_fold().collect::<String>().into_boxed_str()
 }

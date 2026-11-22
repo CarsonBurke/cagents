@@ -24,6 +24,20 @@ impl Cagents {
         }
     }
 
+    /// A card kind's names and mark, with the Work pane named for the
+    /// checkouts it shows while it shows them.
+    pub(super) fn card_labels(&self, kind: Option<&CardKind>) -> CardLabels {
+        match kind {
+            Some(CardKind::Work) if self.work_ui.shows_worktrees() => CardLabels {
+                type_label: "Worktrees",
+                icon: Icon::Worktree,
+                starting: "Loading worktrees…",
+                unavailable: "Worktrees unavailable",
+            },
+            _ => card_kind_labels(kind),
+        }
+    }
+
     /// Whether this window has the Work pane open on its checkouts.
     pub(super) fn worktrees_pane_open(&self) -> bool {
         self.work_ui.shows_worktrees()
@@ -35,7 +49,9 @@ impl Cagents {
     }
 
     /// Lists the checkouts again when the projects changed, and who works in
-    /// each, while the view is open. A closed view costs nothing.
+    /// each, while a Work pane shows them, on screen or not: a pane scrolled
+    /// out of view or in another channel is still current when it returns.
+    /// Without one this costs nothing.
     pub(super) fn refresh_worktrees_pane(&mut self) {
         if !self.worktrees_pane_open() {
             return;

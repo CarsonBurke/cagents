@@ -9607,7 +9607,7 @@ impl Cagents {
                 .chrome_cards_visited
                 .set(self.shared_views.chrome_cards_visited.get() + 1);
         }
-        let type_label = card_kind_labels(Some(&card.kind)).type_label;
+        let type_label = self.card_labels(Some(&card.kind)).type_label;
         let title = self.repository_chrome_with(card, || {
             self.card_display_title_with_chat_title(card, || self.chat_channel_title(card, channel))
         });
@@ -12136,7 +12136,7 @@ impl Cagents {
     ) -> Element<'a, Message> {
         let card = self.card_state(id);
         let attention = self.sidebar_state.has_card_update(id) && !focused;
-        let labels = card_kind_labels(card.map(|card| &card.kind));
+        let labels = self.card_labels(card.map(|card| &card.kind));
         // `sync_chrome` keeps an entry for every durable card the strip can
         // show; a miss can only be a card that is not durable, which renders
         // degenerate chrome.

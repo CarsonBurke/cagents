@@ -3758,13 +3758,12 @@ impl Cagents {
     /// they run in a native chat or a terminal.
     pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
         let kind = self.card_state(id).map(|card| &card.kind);
-        let generic = || card_kind_labels(kind).icon.handle();
+        let generic = || self.card_labels(kind).icon.handle();
         match kind {
             Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
             Some(CardKind::Chat(session)) => {
                 crate::ui_controls::provider_icon(session.launch.provider)
             }
-            Some(CardKind::Work) if self.work_ui.shows_worktrees() => Icon::Worktree.handle(),
             Some(CardKind::Terminal(session)) => self
                 .sidebar_state
                 .card_activity(id)
@@ -3777,7 +3776,7 @@ impl Cagents {
 
     fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
-        let labels = card_kind_labels(card.map(|card| &card.kind));
+        let labels = self.card_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
         let title = chrome.map_or_else(
             || card.map_or("Column", |card| self.card_display_title(card)),
