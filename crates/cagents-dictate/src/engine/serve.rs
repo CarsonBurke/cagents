@@ -2,6 +2,7 @@
 
 use std::{
     io::{BufRead, Write},
+    path::Path,
     sync::{Arc, atomic::Ordering, mpsc},
     thread::{self, JoinHandle},
     time::Instant,
@@ -28,6 +29,17 @@ impl Running {
     fn cancel(self) {
         self.control.cancel.store(true, Ordering::Release);
         let _ = self.thread.join();
+    }
+
+    /// Makes way for another session. One that was told to stop keeps its
+    /// speech: its capture ends promptly, its last finals are queued ahead
+    /// of the next session's work, and they are all reported.
+    fn supersede(self) {
+        if self.control.stop.load(Ordering::Acquire) {
+            let _ = self.thread.join();
+        } else {
+            self.cancel();
+        }
     }
 }
 
@@ -81,7 +93,7 @@ pub fn run() -> std::process::ExitCode {
         match command {
             Command::Start { session, model } => {
                 if let Some(previous) = running.take() {
-                    previous.cancel();
+                    previous.supersede();
                 }
                 running = start(session, &model, &work, &emit);
             }
@@ -141,17 +153,13 @@ fn start(
         thread::Builder::new()
             .name("capture".to_owned())
             .spawn(move || {
-                // Listen first: the model loads while the person speaks.
-                let source = audio::open_session_source();
-                let _ = work.send(Work::Begin {
-                    session,
-                    model,
-                    control: control.clone(),
-                    started,
-                });
-                let source = match source {
-                    Ok(source) => source,
+                // Listen first, then load the model while the person speaks.
+                let (source, mut resample, detector) = match open(&directory, model) {
+                    Ok(opened) => opened,
                     Err(error) => {
+                        // Without loading a model for nothing: the
+                        // recognizer reports the end of a session that
+                        // never began after the work queued before it.
                         let _ = work.send(Work::End {
                             session,
                             end: End::Failed {
@@ -162,21 +170,16 @@ fn start(
                         return;
                     }
                 };
-                let detector = match Silero::open(&directory, model) {
-                    Ok(detector) => detector,
-                    Err((kind, message)) => {
-                        let _ = work.send(Work::End {
-                            session,
-                            end: End::Failed { kind, message },
-                        });
-                        return;
-                    }
-                };
                 emit(Event::Listening {
                     session,
                     input: source.name(),
                 });
-                let mut resample = recognizer::resampler(source.sample_rate());
+                let _ = work.send(Work::Begin {
+                    session,
+                    model,
+                    control: control.clone(),
+                    started,
+                });
                 pipeline::capture(
                     session,
                     source,
@@ -194,4 +197,18 @@ fn start(
         control,
         thread,
     })
+}
+
+type Resample = Box<dyn FnMut(&[f32]) -> Vec<f32> + Send>;
+
+/// The input, its conversion to 16 kHz, and speech detection.
+fn open(
+    directory: &Path,
+    model: &catalog::Model,
+) -> Result<(Box<dyn audio::Source>, Resample, Silero), audio::CaptureError> {
+    let source = audio::open_session_source()?;
+    let resample = recognizer::resampler(source.sample_rate())?;
+    let detector = Silero::open(directory, model)
+        .map_err(|(kind, message)| audio::CaptureError { kind, message })?;
+    Ok((source, resample, detector))
 }

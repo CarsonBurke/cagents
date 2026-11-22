@@ -53,6 +53,14 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // A thread that panicked would leave its session without an end, and
+    // the client waiting for one; exiting instead tells the client the
+    // helper is gone.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        std::process::abort();
+    }));
     match Cli::parse().command {
         Command::Serve => serve::run(),
         Command::Transcribe {

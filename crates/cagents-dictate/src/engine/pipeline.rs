@@ -12,7 +12,8 @@
 //! of the time), and detection closes an utterance after ten seconds.
 //!
 //! Every event that ends a session goes through the recognizer thread, after
-//! the finals before it, so the client sees the finals, then the end.
+//! the finals before it, so the client sees the finals, then the end, and
+//! nothing of that session after it.
 
 use std::{
     collections::VecDeque,
@@ -300,7 +301,8 @@ impl Meter {
 pub struct Control {
     pub stop: AtomicBool,
     pub cancel: AtomicBool,
-    /// The recognizer could not load: capture should end.
+    /// The recognizer could not load: capture should end. The recognizer
+    /// thread reports why once capture has.
     pub failed: AtomicBool,
     /// A partial is queued or being transcribed.
     partial_busy: AtomicBool,
@@ -325,7 +327,7 @@ pub enum End {
     Stopped { audio_ms: u64 },
     Cancelled,
     Failed { kind: ErrorKind, message: String },
-    /// The recognizer failed and has said so.
+    /// Capture gave up because the recognizer could not load.
     Abandoned,
 }
 
@@ -424,8 +426,8 @@ struct Current {
     control: Arc<Control>,
     started: Instant,
     stats: Stats,
-    /// An error ended the session; what follows is not reported.
-    failed: bool,
+    /// Why the model could not load: the session's end, once capture ends.
+    failed: Option<(ErrorKind, String)>,
 }
 
 /// The recognizer thread: loads models and transcribes jobs in order.
@@ -447,8 +449,16 @@ impl Worker {
     /// Serves `work` until every sender is gone.
     pub fn run(mut self, work: Receiver<Work>) {
         let mut current: Option<Current> = None;
-        for work in work {
-            match work {
+        // Work already sent, so a partial can be dropped when the final of
+        // its utterance is behind it: after Stop, the last text then comes
+        // one decode sooner.
+        let mut queue = VecDeque::new();
+        loop {
+            queue.extend(work.try_iter());
+            let Some(next) = queue.pop_front().or_else(|| work.recv().ok()) else {
+                break;
+            };
+            match next {
                 Work::Begin {
                     session,
                     model,
@@ -460,7 +470,7 @@ impl Worker {
                         control,
                         started,
                         stats: Stats::default(),
-                        failed: false,
+                        failed: None,
                     };
                     match self.load(model) {
                         Ok(load_ms) => {
@@ -472,14 +482,9 @@ impl Worker {
                                 load_ms: load_ms.unwrap_or(0),
                             });
                         }
-                        Err((kind, message)) => {
-                            state.failed = true;
+                        Err(error) => {
+                            state.failed = Some(error);
                             state.control.failed.store(true, Ordering::Release);
-                            (self.emit)(Event::Error {
-                                session: Some(session),
-                                kind,
-                                message,
-                            });
                         }
                     }
                     current = Some(state);
@@ -489,24 +494,47 @@ impl Worker {
                     else {
                         continue;
                     };
-                    self.job(state, job);
+                    let superseded = matches!(job, Job::Partial { segment, .. }
+                        if queue.iter().any(|later| matches!(later, Work::Job {
+                            session: later_session,
+                            job: Job::Final { segment: final_segment, .. },
+                        } if *later_session == session && *final_segment == segment)));
+                    self.job(state, job, superseded);
                 }
                 Work::End { session, end } => {
                     let Some(state) = current.take_if(|state| state.session == session) else {
+                        // A session whose input could not open never began.
+                        if let End::Failed { kind, message } = end {
+                            (self.emit)(Event::Error {
+                                session: Some(session),
+                                kind,
+                                message,
+                            });
+                        }
                         continue;
                     };
-                    let event = match end {
-                        End::Cancelled => Some(Event::Cancelled { session }),
-                        _ if state.failed => None,
-                        End::Abandoned => None,
-                        End::Stopped { audio_ms } => Some(Event::Stopped {
+                    // Cancel wins over however capture ended: a session
+                    // stopped and then cancelled keeps nothing more.
+                    let event = match (end, state.failed) {
+                        _ if state.control.cancel.load(Ordering::Acquire) => {
+                            Some(Event::Cancelled { session })
+                        }
+                        (End::Cancelled, _) => Some(Event::Cancelled { session }),
+                        (_, Some((kind, message))) => Some(Event::Error {
+                            session: Some(session),
+                            kind,
+                            message,
+                        }),
+                        // Only a failed load abandons a session.
+                        (End::Abandoned, None) => None,
+                        (End::Stopped { audio_ms }, None) => Some(Event::Stopped {
                             session,
                             stats: Stats {
                                 audio_ms,
                                 ..state.stats
                             },
                         }),
-                        End::Failed { kind, message } => Some(Event::Error {
+                        (End::Failed { kind, message }, None) => Some(Event::Error {
                             session: Some(session),
                             kind,
                             message,
@@ -535,9 +563,11 @@ impl Worker {
         Ok(Some(started.elapsed().as_millis() as u64))
     }
 
-    fn job(&mut self, state: &mut Current, job: Job) {
+    fn job(&mut self, state: &mut Current, job: Job, superseded: bool) {
         let partial = matches!(job, Job::Partial { .. });
-        let skip = state.failed || state.control.cancel.load(Ordering::Acquire);
+        let skip = superseded
+            || state.failed.is_some()
+            || state.control.cancel.load(Ordering::Acquire);
         let (segment, samples) = match job {
             Job::Partial { segment, samples } | Job::Final { segment, samples } => {
                 (segment, samples)
@@ -778,15 +808,15 @@ mod tests {
         }
     }
 
-    fn worker(
-        heard: Arc<Mutex<Vec<usize>>>,
-        fail: bool,
-    ) -> (Sender<Work>, Arc<Mutex<Vec<Event>>>, std::thread::JoinHandle<()>) {
+    /// Runs a worker over `work`, all of it already sent, as when the
+    /// recognizer is busy while capture goes on; the events it emits.
+    fn run_worker(heard: &Arc<Mutex<Vec<usize>>>, fail: bool, work: Vec<Work>) -> Vec<Event> {
         let events = Arc::new(Mutex::new(Vec::new()));
         let emit: Emit = {
             let events = events.clone();
             Arc::new(move |event| events.lock().unwrap().push(event))
         };
+        let heard = heard.clone();
         let loader: Loader = Box::new(move |_| {
             if fail {
                 Err((ErrorKind::ModelInvalid, "bad model".to_owned()))
@@ -795,8 +825,12 @@ mod tests {
             }
         });
         let (sender, receiver) = mpsc::channel();
-        let thread = std::thread::spawn(move || Worker::new(loader, emit).run(receiver));
-        (sender, events, thread)
+        for work in work {
+            sender.send(work).unwrap();
+        }
+        drop(sender);
+        Worker::new(loader, emit).run(receiver);
+        Arc::try_unwrap(events).unwrap().into_inner().unwrap()
     }
 
     fn begin(session: SessionId, control: &Arc<Control>) -> Work {
@@ -808,49 +842,52 @@ mod tests {
         }
     }
 
+    fn job(session: SessionId, job: Job) -> Work {
+        Work::Job { session, job }
+    }
+
+    fn partial(segment: u32, samples: usize) -> Job {
+        Job::Partial {
+            segment,
+            samples: vec![0.0; samples],
+        }
+    }
+
+    fn last(segment: u32, samples: usize) -> Job {
+        Job::Final {
+            segment,
+            samples: vec![0.0; samples],
+        }
+    }
+
+    fn stopped(session: SessionId) -> Work {
+        Work::End {
+            session,
+            end: End::Stopped { audio_ms: 1000 },
+        }
+    }
+
     #[test]
     fn the_worker_reports_texts_in_order_then_the_end() {
         let heard = Arc::new(Mutex::new(Vec::new()));
-        let (work, events, thread) = worker(heard.clone(), false);
         let control = Arc::new(Control::default());
         control.partial_busy.store(true, Ordering::Release);
-        work.send(begin(5, &control)).unwrap();
-        for job in [
-            Job::Partial {
-                segment: 0,
-                samples: vec![0.0; 3],
-            },
-            Job::Final {
-                segment: 0,
-                samples: vec![0.0; 4],
-            },
-            Job::Final {
-                segment: 1,
-                samples: Vec::new(),
-            },
-        ] {
-            work.send(Work::Job { session: 5, job }).unwrap();
-        }
-        // Another session's late work is ignored.
-        work.send(Work::Job {
-            session: 4,
-            job: Job::Final {
-                segment: 9,
-                samples: vec![0.0],
-            },
-        })
-        .unwrap();
-        work.send(Work::End {
-            session: 5,
-            end: End::Stopped { audio_ms: 1000 },
-        })
-        .unwrap();
-        drop(work);
-        thread.join().unwrap();
+        let events = run_worker(
+            &heard,
+            false,
+            vec![
+                begin(5, &control),
+                job(5, partial(0, 3)),
+                job(5, last(1, 4)),
+                job(5, last(2, 0)),
+                // Another session's late work is ignored.
+                job(4, last(9, 1)),
+                stopped(5),
+            ],
+        );
         assert!(!control.partial_busy.load(Ordering::Acquire));
         // An empty final is reported without transcribing nothing.
         assert_eq!(*heard.lock().unwrap(), vec![3, 4]);
-        let events = events.lock().unwrap();
         assert!(matches!(events[0], Event::Ready { session: 5, .. }));
         assert_eq!(
             events[1..4],
@@ -862,12 +899,12 @@ mod tests {
                 },
                 Event::Final {
                     session: 5,
-                    segment: 0,
+                    segment: 1,
                     text: "4 samples".to_owned()
                 },
                 Event::Final {
                     session: 5,
-                    segment: 1,
+                    segment: 2,
                     text: String::new()
                 },
             ]
@@ -882,55 +919,166 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_with_its_final_already_queued_is_dropped() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let control = Arc::new(Control::default());
+        control.partial_busy.store(true, Ordering::Release);
+        let events = run_worker(
+            &heard,
+            false,
+            vec![
+                begin(1, &control),
+                job(1, partial(0, 3)),
+                job(1, last(0, 4)),
+                stopped(1),
+            ],
+        );
+        assert!(!control.partial_busy.load(Ordering::Acquire));
+        assert_eq!(*heard.lock().unwrap(), vec![4]);
+        assert_eq!(
+            events[1],
+            Event::Final {
+                session: 1,
+                segment: 0,
+                text: "4 samples".to_owned()
+            }
+        );
+        assert!(matches!(events[2], Event::Stopped { session: 1, .. }));
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
     fn a_cancelled_session_transcribes_nothing_more() {
         let heard = Arc::new(Mutex::new(Vec::new()));
-        let (work, events, thread) = worker(heard.clone(), false);
         let control = Arc::new(Control::default());
-        work.send(begin(1, &control)).unwrap();
         control.cancel.store(true, Ordering::Release);
-        work.send(Work::Job {
-            session: 1,
-            job: Job::Final {
-                segment: 0,
-                samples: vec![0.0; 4],
-            },
-        })
-        .unwrap();
-        work.send(Work::End {
-            session: 1,
-            end: End::Cancelled,
-        })
-        .unwrap();
-        drop(work);
-        thread.join().unwrap();
+        let events = run_worker(
+            &heard,
+            false,
+            vec![
+                begin(1, &control),
+                job(1, last(0, 4)),
+                Work::End {
+                    session: 1,
+                    end: End::Cancelled,
+                },
+            ],
+        );
         assert!(heard.lock().unwrap().is_empty());
-        let events = events.lock().unwrap();
         assert_eq!(events.last(), Some(&Event::Cancelled { session: 1 }));
         assert_eq!(events.len(), 2);
     }
 
     #[test]
-    fn a_model_that_fails_to_load_ends_the_session_once() {
-        let (work, events, thread) = worker(Arc::default(), true);
+    fn a_session_cancelled_while_it_stops_ends_cancelled() {
+        // Stop, then Cancel before capture's last finals were transcribed.
+        let heard = Arc::new(Mutex::new(Vec::new()));
         let control = Arc::new(Control::default());
-        work.send(begin(1, &control)).unwrap();
-        work.send(Work::End {
-            session: 1,
-            end: End::Abandoned,
-        })
-        .unwrap();
-        drop(work);
-        thread.join().unwrap();
-        assert!(control.failed.load(Ordering::Acquire));
-        let events = events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            Event::Error {
-                session: Some(1),
-                kind: ErrorKind::ModelInvalid,
-                ..
-            }
-        ));
+        control.stop.store(true, Ordering::Release);
+        control.cancel.store(true, Ordering::Release);
+        let events = run_worker(
+            &heard,
+            false,
+            vec![begin(1, &control), job(1, last(0, 4)), stopped(1)],
+        );
+        assert!(heard.lock().unwrap().is_empty());
+        assert_eq!(events.last(), Some(&Event::Cancelled { session: 1 }));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn a_stopping_session_finishes_before_the_next_begins() {
+        // Stop, then Start: the first session's finals and end are queued
+        // before the next session's begin, and are all reported.
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let first = Arc::new(Control::default());
+        first.stop.store(true, Ordering::Release);
+        let second = Arc::new(Control::default());
+        let events = run_worker(
+            &heard,
+            false,
+            vec![
+                begin(1, &first),
+                job(1, last(0, 4)),
+                stopped(1),
+                begin(2, &second),
+                job(2, last(0, 5)),
+                stopped(2),
+            ],
+        );
+        assert_eq!(*heard.lock().unwrap(), vec![4, 5]);
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| {
+                let line = serde_json::to_value(event).unwrap();
+                (event.session(), line["type"].as_str().unwrap().to_owned())
+            })
+            .collect();
+        let expected = [
+            (1, "ready"),
+            (1, "final"),
+            (1, "stopped"),
+            (2, "ready"),
+            (2, "final"),
+            (2, "stopped"),
+        ]
+        .map(|(session, kind)| (Some(session), kind.to_owned()));
+        assert_eq!(kinds, expected);
+    }
+
+    #[test]
+    fn a_session_whose_input_failed_is_reported_without_beginning() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let events = run_worker(
+            &heard,
+            false,
+            vec![Work::End {
+                session: 3,
+                end: End::Failed {
+                    kind: ErrorKind::NoInputDevice,
+                    message: "no microphone".to_owned(),
+                },
+            }],
+        );
+        assert_eq!(
+            events,
+            [Event::Error {
+                session: Some(3),
+                kind: ErrorKind::NoInputDevice,
+                message: "no microphone".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_model_that_fails_to_load_ends_the_session_once_capture_has() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        for end in [
+            End::Abandoned,
+            // Capture can finish before it sees the failure.
+            End::Stopped { audio_ms: 1000 },
+        ] {
+            let control = Arc::new(Control::default());
+            let events = run_worker(
+                &heard,
+                true,
+                vec![
+                    begin(1, &control),
+                    job(1, last(0, 4)),
+                    Work::End { session: 1, end },
+                ],
+            );
+            assert!(control.failed.load(Ordering::Acquire));
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert!(matches!(
+                events[0],
+                Event::Error {
+                    session: Some(1),
+                    kind: ErrorKind::ModelInvalid,
+                    ..
+                }
+            ));
+        }
+        assert!(heard.lock().unwrap().is_empty());
     }
 }

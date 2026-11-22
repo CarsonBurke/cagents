@@ -9,6 +9,7 @@ use sherpa_onnx::{
 
 use super::{
     SAMPLE_RATE,
+    audio::CaptureError,
     pipeline::{Detector, Recognizer},
 };
 use crate::{
@@ -116,14 +117,20 @@ impl Recognizer for Transducer {
 }
 
 /// Converts a source's rate to 16 kHz; a no-op at 16 kHz.
-pub fn resampler(rate: u32) -> Box<dyn FnMut(&[f32]) -> Vec<f32>> {
-    match (rate != SAMPLE_RATE)
-        .then(|| LinearResampler::create(rate as i32, SAMPLE_RATE as i32))
-        .flatten()
-    {
-        Some(resampler) => Box::new(move |samples| resampler.resample(samples, false)),
-        None => Box::new(<[f32]>::to_vec),
+pub fn resampler(
+    rate: u32,
+) -> Result<Box<dyn FnMut(&[f32]) -> Vec<f32> + Send>, CaptureError> {
+    if rate == SAMPLE_RATE {
+        return Ok(Box::new(<[f32]>::to_vec));
     }
+    let resampler = i32::try_from(rate)
+        .ok()
+        .and_then(|rate| LinearResampler::create(rate, SAMPLE_RATE as i32))
+        .ok_or_else(|| CaptureError {
+            kind: ErrorKind::InputUnavailable,
+            message: format!("cannot convert {rate} Hz audio to {SAMPLE_RATE} Hz"),
+        })?;
+    Ok(Box::new(move |samples| resampler.resample(samples, false)))
 }
 
 fn path(directory: &Path, name: &str) -> String {

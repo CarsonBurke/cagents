@@ -19,8 +19,8 @@ engine = [
     "dep:clap",
     "dep:cpal",
     "dep:hound",
-    "dep:libc",
     "dep:rtrb",
+    "dep:rustix",
     "dep:sha2",
     "dep:sherpa-onnx",
     "dep:ureq",
@@ -45,9 +45,9 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 # without linking libpulse or libpipewire. cpal falls back to ALSA itself.
 cpal = { version = "0.18.2", features = ["pulseaudio"], optional = true }
 hound = { version = "3.5", optional = true }
-libc = { version = "0.2.189", optional = true }
 # Carries samples out of the audio callback without locking or allocating.
 rtrb = { version = "0.4", optional = true }
+rustix = { version = "1.1.4", features = ["fs"], optional = true }
 sha2 = { version = "0.10", optional = true }
 # Statically links sherpa-onnx and onnxruntime: Parakeet's feature extraction,
 # TDT decoding, Silero VAD and resampling all live there.

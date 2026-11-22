@@ -61,12 +61,26 @@ pub struct Microphone {
 /// Seconds of audio the callback can get ahead of the session thread.
 const BUFFERED_SECONDS: usize = 10;
 
+/// How PulseAudio and PipeWire name the source that records an output.
+const MONITOR_SUFFIX: &str = ".monitor";
+
 impl Microphone {
     pub fn open() -> Result<Self, CaptureError> {
         let host = cpal::default_host();
         let device = host.default_input_device().ok_or_else(|| {
             CaptureError::new(ErrorKind::NoInputDevice, "no microphone is connected")
         })?;
+        // Without a capture source, PulseAudio offers the monitor of the
+        // speakers instead, which would transcribe whatever is playing.
+        if device
+            .id()
+            .is_ok_and(|id| id.id().ends_with(MONITOR_SUFFIX))
+        {
+            return Err(CaptureError::new(
+                ErrorKind::NoInputDevice,
+                "no microphone is connected",
+            ));
+        }
         let name = device.to_string();
         let supported = device
             .default_input_config()
@@ -164,8 +178,12 @@ impl Source for Microphone {
         if let Some(error) = self.failure.lock().ok().and_then(|mut failure| failure.take()) {
             match error.kind() {
                 // The stream followed the system to another default input,
-                // or briefly ran behind: capture goes on.
-                cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::Xrun => {}
+                // briefly ran behind, or the sound server was slow to answer
+                // (PulseAudio's timeouts arrive as busy): capture goes on. If
+                // the input has in fact gone quiet, the meter says so.
+                cpal::ErrorKind::DeviceChanged
+                | cpal::ErrorKind::Xrun
+                | cpal::ErrorKind::DeviceBusy => {}
                 cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => {
                     return Err(CaptureError::new(ErrorKind::InputLost, error.to_string()));
                 }

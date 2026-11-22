@@ -60,6 +60,8 @@ fn transcribe(file: &Path, id: &str, realtime: bool, json: bool) -> Result<(), S
     let source = WavFile::open(file, realtime).map_err(|error| error.message)?;
     let audio_seconds = source.duration();
     let detector = Silero::open(&store::directory(&root, model), model).map_err(|error| error.1)?;
+    let mut resample =
+        recognizer::resampler(source.sample_rate()).map_err(|error| error.message)?;
 
     let (events, received) = mpsc::channel();
     let emit: Emit = Arc::new(move |event| {
@@ -88,7 +90,6 @@ fn transcribe(file: &Path, id: &str, realtime: bool, json: bool) -> Result<(), S
     })
     .map_err(|_| "the recognizer stopped")?;
     let capture = thread::spawn(move || {
-        let mut resample = recognizer::resampler(source.sample_rate());
         // Played at the pace of speech, the file ends in silence until its
         // last utterance closes, as when someone stops talking; then stop.
         let stopper = realtime.then(|| {

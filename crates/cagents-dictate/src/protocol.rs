@@ -5,6 +5,11 @@
 //! [`Event::Hello`] first; a client that finds another [`PROTOCOL`] there
 //! stops rather than guess, since an installation can briefly hold a helper
 //! from another build. Closing standard input ends the helper.
+//!
+//! A session's events come in order: [`Event::Listening`] before
+//! [`Event::Ready`], each segment's partials before its final, and last one
+//! end, [`Event::Stopped`], [`Event::Cancelled`] or an [`Event::Error`] that
+//! names the session, with nothing of that session after it.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,13 +25,17 @@ pub type SessionId = u64;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     /// Start listening with `model`. The microphone opens at once, before
-    /// the model has loaded, so the first words are not lost; a session
-    /// already running is cancelled first.
+    /// the model has loaded, so the first words are not lost. A session
+    /// still listening is cancelled first; one that was stopped finishes
+    /// first, its last finals and [`Event::Stopped`] ahead of this one's
+    /// events.
     Start { session: SessionId, model: String },
     /// Stop listening and transcribe what was heard. [`Event::Final`]s for
     /// the rest of the speech follow, then [`Event::Stopped`].
     Stop { session: SessionId },
-    /// Stop listening and discard what has not been transcribed yet.
+    /// Stop listening and discard what has not been transcribed yet; the
+    /// session ends with [`Event::Cancelled`], even if it was stopping.
+    /// Cancelling a session that has ended does nothing.
     Cancel { session: SessionId },
 }
 

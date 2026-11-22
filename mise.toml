@@ -147,7 +147,6 @@ run = [
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.host}} --lib --bins --examples ;; esac',
 ]
 
-
 [tasks."test:dictate"]
 description = "Test the dictation helper lane"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'
@@ -155,6 +154,7 @@ run = [
   'eval "set -- $usage_cargo_args"; exec scripts/cargo-lane test {{vars.dictate}} "$@"',
   'eval "set -- $usage_cargo_args"; case " $* " in *" --all-targets "*) ;; *) exec scripts/cargo-lane clippy {{vars.dictate}} --lib --bins --examples ;; esac',
 ]
+
 [tasks."test:ui"]
 description = "Test the browserless UI lane"
 usage = 'arg "[cargo_args]..." var=#true double_dash="required" default="--all-targets" help="Cargo arguments, after --; they replace the default --all-targets"'

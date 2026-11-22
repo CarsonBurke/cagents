@@ -90,7 +90,8 @@ pub fn install(
     let finished = |file: &ModelFile| {
         fs::metadata(directory.join(file.name)).is_ok_and(|meta| meta.len() == file.size)
     };
-    let kept: u64 = model
+    // What each file already has on disk, whole or in part.
+    let kept_by_file: Vec<u64> = model
         .files
         .iter()
         .map(|file| {
@@ -101,7 +102,8 @@ pub fn install(
                     .map_or(0, |meta| meta.len().min(file.size))
             }
         })
-        .sum();
+        .collect();
+    let kept: u64 = kept_by_file.iter().sum();
     let needed = total - kept + SPARE_BYTES;
     if let Some(free) = free_space(&directory)
         && free < needed
@@ -118,22 +120,25 @@ pub fn install(
         ));
     }
 
-    let mut done = 0;
+    // Progress counts every file's kept bytes from the start, so resuming
+    // never moves it backwards.
+    let mut done = kept;
     let mut reported = Instant::now();
-    report(InstallEvent::Progress { done: kept, total });
-    for file in model.files {
+    report(InstallEvent::Progress { done, total });
+    for (file, file_kept) in model.files.iter().zip(kept_by_file) {
+        let before = done - file_kept;
         if !finished(file) {
             download(&directory, file, fetch, &mut |file_done| {
                 if reported.elapsed() >= PROGRESS_EVERY {
                     reported = Instant::now();
                     report(InstallEvent::Progress {
-                        done: done + file_done,
+                        done: before + file_done,
                         total,
                     });
                 }
             })?;
         }
-        done += file.size;
+        done = before + file.size;
         report(InstallEvent::Progress { done, total });
     }
 
@@ -259,16 +264,8 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
 
 /// Bytes an unprivileged process may still write where `path` is.
 fn free_space(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is a valid C string and `stat` is written on success.
-    let result = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
-    (result == 0).then(|| {
-        // SAFETY: statvfs succeeded.
-        let stat = unsafe { stat.assume_init() };
-        u64::from(stat.f_bavail) * u64::from(stat.f_frsize)
-    })
+    let stat = rustix::fs::statvfs(path).ok()?;
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 
 #[cfg(test)]
@@ -392,6 +389,28 @@ mod tests {
         fetch.requests.borrow_mut().clear();
         install(root.path(), model, &fetch, &mut |_| {}).unwrap();
         assert!(fetch.requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn progress_after_a_resume_never_goes_back() {
+        let b = vec![5u8; 100_000];
+        let contents: &[(&'static str, &[u8])] = &[("a", b"tokens"), ("b", &b)];
+        let model = model(contents);
+        let root = tempfile::tempdir().unwrap();
+        let mut fetch = table(model, contents);
+        fetch.cut = Some(30_000);
+        install(root.path(), model, &fetch, &mut |_| {}).unwrap_err();
+        fetch.cut = None;
+        let mut progress = Vec::new();
+        install(root.path(), model, &fetch, &mut |event| {
+            if let InstallEvent::Progress { done, .. } = event {
+                progress.push(done);
+            }
+        })
+        .unwrap();
+        assert_eq!(progress.first(), Some(&30_006));
+        assert_eq!(progress.last(), Some(&model.size()));
+        assert!(progress.is_sorted(), "{progress:?}");
     }
 
     #[test]
