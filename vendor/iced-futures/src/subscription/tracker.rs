@@ -1,6 +1,8 @@
 use crate::subscription::{Event, Hasher, Recipe};
 use crate::{BoxFuture, MaybeSend};
 
+mod queue;
+
 use futures::channel::mpsc;
 use futures::sink::{Sink, SinkExt};
 use rustc_hash::FxHashMap;
@@ -22,7 +24,7 @@ pub struct Tracker {
 #[derive(Debug)]
 pub struct Execution {
     _cancel: futures::channel::oneshot::Sender<()>,
-    listener: Option<futures::channel::mpsc::Sender<Event>>,
+    listener: Option<queue::Sender>,
 }
 
 impl Tracker {
@@ -86,9 +88,7 @@ impl Tracker {
 
             let (cancel, mut canceled) = futures::channel::oneshot::channel();
 
-            // TODO: Use bus if/when it supports async
-            let (event_sender, event_receiver) =
-                futures::channel::mpsc::channel(100);
+            let (event_sender, event_receiver) = queue::channel();
 
             let mut receiver = receiver.clone();
             let mut stream = recipe.stream(event_receiver.boxed());
@@ -142,12 +142,6 @@ impl Tracker {
         self.subscriptions
             .values_mut()
             .filter_map(|connection| connection.listener.as_mut())
-            .for_each(|listener| {
-                if let Err(error) = listener.try_send(event.clone()) {
-                    log::warn!(
-                        "Error sending event to subscription: {error:?}"
-                    );
-                }
-            });
+            .for_each(|listener| listener.send(event.clone()));
     }
 }

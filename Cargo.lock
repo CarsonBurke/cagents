@@ -1346,8 +1346,10 @@ dependencies = [
 name = "cagents-iced-contracts"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "iced_accessibility",
  "iced_core",
+ "iced_futures",
  "iced_graphics",
 ]
 

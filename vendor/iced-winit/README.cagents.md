@@ -110,3 +110,13 @@ cargo test --manifest-path vendor/iced-winit/Cargo.toml --features a11y \
 ```
 
 Its lockfile and `target/` directory are local test output.
+
+## The per-batch resize request stays out of subscriptions (#3644)
+
+On Wayland the shell appends a synthetic `RequestResize` to every window's
+event batch so autosized widgets report their size. `src/lib.rs` no longer
+broadcasts that event to subscriptions: none reads it, and it took a slot in
+every listener's queue on every batch. Widgets still receive it. Resize
+requests from a surface configure are broadcast as before. The vendored
+`iced_futures` makes those queues keep every event; see
+`vendor/iced-futures/README.cagents.md`.

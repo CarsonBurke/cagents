@@ -1658,6 +1658,13 @@ async fn run_instance<P>(
                         }
                     }
 
+                    // The resize request appended above only asks this
+                    // window's widgets to report their size. No subscription
+                    // reads it, and broadcasting it on every batch filled
+                    // listeners' queues (#3644).
+                    #[cfg(wayland_platform)]
+                    let _ = window_events.pop();
+
                     for (event, status) in
                         window_events.into_iter().zip(statuses.into_iter())
                     {
