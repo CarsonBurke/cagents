@@ -735,7 +735,8 @@ impl Renderer {
     /// The regions, in physical pixels, that change with time when these
     /// layers are presented again: turning drawings, and custom primitives,
     /// which are prepared again for every frame. `None` when they cover so
-    /// much of the window that drawing it whole costs about the same.
+    /// much of the window, or reach into so many layers, that drawing it
+    /// whole costs about the same.
     fn damage(&self, viewport: &Viewport) -> Option<Vec<Rectangle>> {
         let scale_factor = viewport.scale_factor() as f32;
         let window = Rectangle::<f32>::from(Rectangle::with_size(
@@ -772,7 +773,27 @@ impl Renderer {
         let damage = graphics::damage::group(damage, window);
         let area: f32 = damage.iter().map(Rectangle::area).sum();
 
-        (area <= window.area() * MAX_DAMAGE_SHARE).then_some(damage)
+        if area > window.area() * MAX_DAMAGE_SHARE {
+            return None;
+        }
+
+        // Each region records every layer that reaches into it, so regions
+        // that each cross a large layer, such as a transcript with spinners
+        // far apart, can record more than the whole frame would.
+        let visible = || {
+            self.layers.iter().filter_map(|layer| {
+                window.intersection(&(layer.bounds * scale_factor))
+            })
+        };
+        let whole = visible().count();
+        let recorded: usize = damage
+            .iter()
+            .map(|region| {
+                visible().filter(|bounds| bounds.intersects(region)).count()
+            })
+            .sum();
+
+        (recorded < whole).then_some(damage)
     }
 
     /// Records the layers into render passes on `frame`, and returns how
