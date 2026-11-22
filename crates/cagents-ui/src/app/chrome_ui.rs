@@ -871,13 +871,13 @@ mod tests {
     fn sidebar_toggle_keeps_the_users_choice_across_window_resizes() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         for width in [900.0, 1199.0, 1200.0, 1600.0] {
-            let _ = app.update(Message::WindowResized(width, 900.0));
+            let _ = app.resize_main_window(width, 900.0);
             assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
             let _ = app.update_chrome(Action::ToggleProjects);
             assert_eq!(app.projects_sidebar_mode(), SidebarMode::Compact);
-            let _ = app.update(Message::WindowResized(1600.0, 900.0));
+            let _ = app.resize_main_window(1600.0, 900.0);
             assert_eq!(app.projects_sidebar_mode(), SidebarMode::Compact);
-            let _ = app.update(Message::WindowResized(width, 900.0));
+            let _ = app.resize_main_window(width, 900.0);
             let _ = app.update_chrome(Action::ToggleProjects);
             assert_eq!(app.projects_sidebar_mode(), SidebarMode::Expanded);
         }
@@ -887,7 +887,7 @@ mod tests {
     fn revealing_a_card_expands_the_sidebar() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        let _ = app.update(Message::WindowResized(1000.0, 900.0));
+        let _ = app.resize_main_window(1000.0, 900.0);
         let _ = app.update_chrome(Action::ToggleProjects);
         assert_eq!(app.projects_sidebar_mode(), SidebarMode::Compact);
         let _ = app.update_chrome(Action::Reveal(card));

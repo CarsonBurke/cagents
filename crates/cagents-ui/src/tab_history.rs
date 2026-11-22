@@ -154,9 +154,13 @@ pub fn released(event: &keyboard::Event) -> bool {
     modifiers_released(event, keyboard::Modifiers::CTRL)
 }
 
+/// Whether `event` shows that `held` is no longer held. A key pressed
+/// without them shows it too, for a release delivered elsewhere, such as to a
+/// compositor that took the keyboard for a moment.
 pub fn modifiers_released(event: &keyboard::Event, held: keyboard::Modifiers) -> bool {
     match event {
-        keyboard::Event::ModifiersChanged(modifiers) => !modifiers.contains(held),
+        keyboard::Event::ModifiersChanged(modifiers)
+        | keyboard::Event::KeyPressed { modifiers, .. } => !modifiers.contains(held),
         keyboard::Event::KeyReleased {
             key: Key::Named(key),
             ..
@@ -173,6 +177,41 @@ pub fn modifiers_released(event: &keyboard::Event, held: keyboard::Modifiers) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_pressed_without_the_held_modifiers_releases_them() {
+        let pressed = |modifiers| keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Tab),
+            modified_key: Key::Named(Named::Tab),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let alt = keyboard::Modifiers::ALT;
+        assert!(!modifiers_released(&pressed(alt), alt));
+        assert!(!modifiers_released(
+            &pressed(alt | keyboard::Modifiers::SHIFT),
+            alt
+        ));
+        assert!(modifiers_released(
+            &pressed(keyboard::Modifiers::SHIFT),
+            alt
+        ));
+        assert!(modifiers_released(
+            &pressed(keyboard::Modifiers::empty()),
+            alt
+        ));
+        assert!(modifiers_released(
+            &pressed(keyboard::Modifiers::CTRL),
+            keyboard::Modifiers::CTRL | alt
+        ));
+        assert!(modifiers_released(
+            &keyboard::Event::ModifiersChanged(keyboard::Modifiers::empty()),
+            alt
+        ));
+    }
     #[test]
     fn restored_history_deduplicates_and_frozen_selection_commits_without_preview_visits() {
         let mut history = TabHistory::from_recent([3, 2, 3, 99, 1]);

@@ -908,7 +908,7 @@ fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
             app.sidebar_model = sidebar::tests::panel_model();
         }
         app.workspace.resize_viewport(seed);
-        drop(app.update(Message::WindowResized(window, 900.0)));
+        drop(app.resize_main_window(window, 900.0));
         assert!(app.workspace.cards().is_empty());
         assert_eq!(app.window_width, window);
         assert_eq!(app.workspace.viewport_width(), seed);
@@ -944,7 +944,7 @@ fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
         .set_card_width(first, CardWidth::Fraction(0.375))
         .unwrap();
     app.workspace.resize_viewport(600.0);
-    drop(app.update(Message::WindowResized(2000.0, 900.0)));
+    drop(app.resize_main_window(2000.0, 900.0));
     assert_eq!(app.workspace.viewport_width(), 600.0);
     drop(app.add_utility_card(CardKind::Settings));
     let second = app.workspace.focused().unwrap();
@@ -4909,19 +4909,26 @@ fn resizes_query_the_window_state_only_until_wayland_reports_it() {
     use iced::event::{PlatformSpecific, wayland};
 
     let mut app = context_inspector_test_app(false);
-    let resize = |app: &mut Cagents| app.update(Message::WindowResized(1600.0, 900.0)).units();
-    let without_query = resize(&mut app);
     let main = window::Id::unique();
     app.core.set_main_window_id(Some(main));
+    let resize = |app: &mut Cagents, window| {
+        app.update(Message::WindowResized {
+            window,
+            size: iced::Size::new(1600.0, 900.0),
+        })
+        .units()
+    };
+    // A popup's size asks nothing of the main window.
+    let without_query = resize(&mut app, window::Id::unique());
     // X11 sends no window states, so every resize asks the backend.
-    assert!(resize(&mut app) > without_query);
-    assert!(resize(&mut app) > without_query);
+    assert!(resize(&mut app, main) > without_query);
+    assert!(resize(&mut app, main) > without_query);
 
     let state = iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
         wayland::WindowEvent::WindowState(WindowState::ACTIVATED),
     )));
     let _ = app.update(window_edge_message(&state, main).expect("window state event"));
-    assert_eq!(resize(&mut app), without_query);
+    assert_eq!(resize(&mut app, main), without_query);
 }
 
 #[test]
@@ -4934,14 +4941,50 @@ fn initial_native_window_size_replaces_the_estimated_geometry() {
         window::Event::Resized(iced::Size::new(960.0, 600.0)),
     ] {
         let mut app = context_inspector_test_app(true);
-        let message = window_geometry_message(&event).expect("native geometry event");
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        let message = window_geometry_message(&event, main).expect("native geometry event");
         let _ = app.update(message);
         assert_eq!(app.window_width, 960.0);
         assert_eq!(app.window_height, 600.0);
         // No window-wide inspector covers the workspace any more.
         assert!(!app.workspace_inputs_blocked());
     }
-    assert!(window_geometry_message(&window::Event::Focused).is_none());
+    assert!(window_geometry_message(&window::Event::Focused, window::Id::unique()).is_none());
+}
+
+/// A release can go to another surface without the window losing focus, as
+/// when a compositor takes the keyboard for its own Alt+Tab. The next key
+/// pressed without the modifier ends the hold.
+#[test]
+fn a_key_pressed_without_the_held_modifier_ends_the_workspace_hold() {
+    let mut app = workspace_switcher_test_app(3);
+    drop(app.cycle_workspace(
+        crate::workspace::FocusDirection::Right,
+        keyboard::Modifiers::ALT,
+    ));
+    let since = app.chrome_ui.workspace_preview_since.unwrap();
+    let task = app.update(Message::KeyEvent {
+        event: keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        },
+        captured: false,
+    });
+    // The plain Tab did not step the stale hold.
+    assert_eq!(app.workspace_history.cycle_index(), Some(1));
+    assert!(task.units() > 0);
+    drop(app.update(Message::WorkspaceSwitcherReleased(since)));
+    assert!(app.chrome_ui.workspace_preview.is_none());
+    assert_eq!(
+        app.active_workspace.as_deref(),
+        Some(Path::new("/folder-1"))
+    );
 }
 
 #[test]
@@ -7167,7 +7210,19 @@ fn alt_tab_previews_workspace_history_and_commits_only_a_choice() {
     assert_eq!(app.active_workspace_destination(), Some(root));
 }
 
-fn workspace_switcher_test_app(count: usize) -> Cagents {
+impl Cagents {
+    /// The main window reporting its logical size, as its native event does.
+    pub(super) fn resize_main_window(&mut self, width: f32, height: f32) -> Task<Message> {
+        let window = self.core.main_window_id().unwrap_or(window::Id::RESERVED);
+        self.core.set_main_window_id(Some(window));
+        self.update(Message::WindowResized {
+            window,
+            size: iced::Size::new(width, height),
+        })
+    }
+}
+
+pub(super) fn workspace_switcher_test_app(count: usize) -> Cagents {
     let mut app = context_inspector_test_app(false);
     *app.sidebar_model.projects = (0..count)
         .map(|index| {

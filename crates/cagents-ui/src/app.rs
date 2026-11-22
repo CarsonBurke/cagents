@@ -3102,11 +3102,16 @@ fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
 }
 
 /// The first native size is reported as Opened, before any resize. Both
-/// events carry logical dimensions and replace the pre-map estimate.
-fn window_geometry_message(event: &window::Event) -> Option<Message> {
+/// events carry logical dimensions and replace the pre-map estimate. On
+/// Wayland every surface reports them, popups such as a text field's context
+/// menu included, so the message names the window it came from.
+fn window_geometry_message(event: &window::Event, window: window::Id) -> Option<Message> {
     match event {
         window::Event::Opened { size, .. } | window::Event::Resized(size) => {
-            Some(Message::WindowResized(size.width, size.height))
+            Some(Message::WindowResized {
+                window,
+                size: *size,
+            })
         }
         _ => None,
     }
@@ -5194,8 +5199,14 @@ pub enum Message {
         operation: uuid::Uuid,
         result: crate::browser::CapabilityProbe,
     },
-    WindowScaleFactorChanged(f32),
-    WindowResized(f32, f32),
+    /// A surface's scale changed. Only the main window's counts.
+    WindowScaleFactorChanged(window::Id, f32),
+    /// A surface's logical size. Only the main window's is the size the
+    /// application lays itself out in.
+    WindowResized {
+        window: window::Id,
+        size: iced::Size,
+    },
     WindowEdgeState {
         window: window::Id,
         filled: bool,
@@ -16665,9 +16676,9 @@ impl Application for Cagents {
                     event,
                     captured: matches!(status, event::Status::Captured),
                 }),
-                iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
-                    Some(Message::WindowScaleFactorChanged(scale_factor))
-                }
+                iced::Event::Window(window::Event::Rescaled(scale_factor)) => Some(
+                    Message::WindowScaleFactorChanged(event_window, scale_factor),
+                ),
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
                 }
@@ -16680,7 +16691,7 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, false),
                 )),
-                iced::Event::Window(event) => window_geometry_message(&event),
+                iced::Event::Window(event) => window_geometry_message(&event, event_window),
                 event @ iced::Event::PlatformSpecific(_) => {
                     window_edge_message(&event, event_window)
                 }
@@ -17649,7 +17660,7 @@ impl Cagents {
                 | Message::FocusCard(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
-                | Message::WindowResized(..)
+                | Message::WindowResized { .. }
         );
         let model_update = matches!(&message, Message::WorkspaceModelObserved(_));
         let mut projection = if repaint_tick(&message)
@@ -18880,8 +18891,11 @@ impl Cagents {
                 operation,
                 result,
             } => self.browser_factory_probed(generation, operation, result),
-            Message::WindowScaleFactorChanged(scale_factor) => {
-                if scale_factor.is_finite() && scale_factor > 0.0 {
+            Message::WindowScaleFactorChanged(window, scale_factor) => {
+                if self.core.main_window_id() == Some(window)
+                    && scale_factor.is_finite()
+                    && scale_factor > 0.0
+                {
                     self.window_scale_factor = scale_factor;
                     #[cfg(feature = "integrated-browser")]
                     for runtime in self.cards.values() {
@@ -18915,12 +18929,18 @@ impl Cagents {
                 self.window_filled = filled;
                 Task::none()
             }
-            Message::WindowResized(width, height) => {
-                if height.is_finite() && height > 0.0 {
-                    self.window_height = height;
+            Message::WindowResized { window, size } => {
+                // A popup is sized to its menu: taken for the window, it
+                // would lay out everything sized from the window, such as
+                // the workspace switcher, in the popup's few hundred pixels.
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
                 }
-                if width.is_finite() && width > 0.0 {
-                    self.window_width = width;
+                if size.height.is_finite() && size.height > 0.0 {
+                    self.window_height = size.height;
+                }
+                if size.width.is_finite() && size.width > 0.0 {
+                    self.window_width = size.width;
                 }
                 self.query_window_filled()
             }
