@@ -48,3 +48,4 @@ pub mod ui_memory;
 pub mod work_ui;
 pub mod workspace;
 pub mod workspace_widget;
+pub mod worktrees_ui;

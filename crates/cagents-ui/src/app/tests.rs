@@ -12136,6 +12136,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         sign_ins: account_ui::SignIns::default(),
         automation_ui: crate::automation_ui::State::default(),
         work_ui: crate::work_ui::State::default(),
+        worktrees_ui: crate::worktrees_ui::State::default(),
         automation_approval: automation_approval::State::default(),
         active_workspace: None,
         worktree_focus: HashMap::new(),

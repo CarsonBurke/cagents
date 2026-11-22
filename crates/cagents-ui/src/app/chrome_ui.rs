@@ -3101,10 +3101,39 @@ impl Cagents {
 
     fn attention_and_notice_controls(&self) -> Element<'_, Message> {
         widget::row::with_children(
-            std::iter::once(self.attention_control()).chain(self.notice_control()),
+            [self.worktrees_control(), self.attention_control()]
+                .into_iter()
+                .chain(self.notice_control()),
         )
         .spacing(space::XXS)
         .into()
+    }
+
+    /// Opens the project checkouts, and says so while they are the pane in
+    /// focus.
+    fn worktrees_control(&self) -> Element<'_, Message> {
+        let shown = self.work_ui.shows_worktrees()
+            && self
+                .workspace
+                .focused()
+                .and_then(|id| self.card_state(id))
+                .is_some_and(|card| card.kind == CardKind::Work);
+        let shortcut = workspace_widget::shortcut_chords(
+            workspace_widget::GlobalShortcut::OpenWorktrees,
+            &self.settings.keyboard_shortcuts,
+        );
+        let label = if shortcut.is_empty() {
+            Cow::Borrowed("Worktrees")
+        } else {
+            Cow::Owned(format!("Worktrees ({shortcut})"))
+        };
+        crate::ui_controls::icon_button(Icon::Worktree, label)
+            .id(widget::Id::new("worktrees.control"))
+            .selected(shown)
+            .on_press_maybe((!self.modal_is_open()).then_some(Message::RunCommand(
+                workspace_widget::GlobalShortcut::OpenWorktrees,
+            )))
+            .into()
     }
 
     fn attention_control(&self) -> Element<'_, Message> {
@@ -3472,7 +3501,8 @@ impl Cagents {
             0.0
         };
         let attention = design::PRIMARY_CONTROL_SIZE + 2.0;
-        let width = controls + update + notice + attention + 16.0;
+        let worktrees = design::PRIMARY_CONTROL_SIZE + 2.0;
+        let width = controls + update + notice + attention + worktrees + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -3737,7 +3767,7 @@ impl Cagents {
     /// they run in a native chat or a terminal.
     pub(super) fn card_icon(&self, id: CardId) -> widget::icon::Handle {
         let kind = self.card_state(id).map(|card| &card.kind);
-        let generic = || card_kind_labels(kind).icon.handle();
+        let generic = || self.card_labels(kind).icon.handle();
         match kind {
             Some(CardKind::Repository(_)) => crate::ui_controls::ceditor_icon(),
             Some(CardKind::Chat(session)) => {
@@ -3755,7 +3785,7 @@ impl Cagents {
 
     fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
-        let labels = card_kind_labels(card.map(|card| &card.kind));
+        let labels = self.card_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
         let title = chrome.map_or_else(
             || card.map_or("Column", |card| self.card_display_title(card)),

@@ -1415,7 +1415,8 @@ fn shortcut_group(field: SettingsField) -> &'static str {
         | Action::CommandPalette
         | Action::FocusProjectSearch
         | Action::ToggleProjects
-        | Action::OpenSettings => "Navigation",
+        | Action::OpenSettings
+        | Action::OpenWorktrees => "Navigation",
         _ => "Panes",
     }
 }

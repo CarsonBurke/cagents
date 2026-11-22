@@ -821,7 +821,10 @@ impl Cagents {
                 | CardRuntime::Accounts
                 | CardRuntime::Automations => {}
                 // A reopened board starts from the daemon's, not this one.
-                CardRuntime::Work => self.work_ui.reset(),
+                CardRuntime::Work => {
+                    self.work_ui.reset();
+                    self.worktrees_ui.reset();
+                }
             }
         }
         self.lifecycle.remove(id);
