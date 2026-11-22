@@ -294,14 +294,17 @@ built_executables() {
     build_arguments | sed 's/.* //'
 }
 
-# Whether the caller changed how Rust compiles, as a measurement does with
-# RUSTFLAGS or a CARGO_PROFILE_* setting. Main's prebuilt executables were
-# built without either, so such a build compiles its own.
+# Whether the caller changed how Rust compiles, as a measurement at another
+# optimization level does with RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS or a
+# CARGO_PROFILE_* setting, which the build gate forwards to the build host.
+# Main's prebuilt executables were built without them, so such a build
+# compiles its own.
 build_environment_changed() {
     local name
-    [ -z "${RUSTFLAGS-}${CARGO_ENCODED_RUSTFLAGS-}${CARGO_BUILD_RUSTFLAGS-}" ] || return 0
     for name in $(compgen -e); do
-        [[ $name != CARGO_PROFILE_* ]] || return 0
+        case $name in
+            RUSTFLAGS | CARGO_ENCODED_RUSTFLAGS | CARGO_PROFILE_*) return 0 ;;
+        esac
     done
     return 1
 }

@@ -355,16 +355,23 @@ build_arguments() {
     (cd -- "$1" && "$tool_source/scripts/native-evidence" __build-arguments)
 }
 
-# Whether the caller changed how Rust compiles, as a measurement does with
-# RUSTFLAGS or a CARGO_PROFILE_* setting. Main's prebuilt executables were
-# built without either, so such a build compiles its own.
-build_environment_changed() {
+# The caller's settings that change how Rust compiles, as Bash that exports
+# them: RUSTFLAGS, CARGO_ENCODED_RUSTFLAGS and CARGO_PROFILE_*, as a
+# measurement at another optimization level sets them, and as the build
+# gate forwards them to the build host.
+compiler_settings() {
     local name
-    [ -z "${RUSTFLAGS-}${CARGO_ENCODED_RUSTFLAGS-}${CARGO_BUILD_RUSTFLAGS-}" ] || return 0
     for name in $(compgen -e); do
-        [[ $name != CARGO_PROFILE_* ]] || return 0
+        case $name in
+            RUSTFLAGS | CARGO_ENCODED_RUSTFLAGS | CARGO_PROFILE_*) printf 'export %s=%q\n' "$name" "${!name}" ;;
+        esac
     done
-    return 1
+}
+
+# Whether the caller changed how Rust compiles. Main's prebuilt executables
+# were built without such settings, so a build with them compiles its own.
+build_environment_changed() {
+    [ -n "$(compiler_settings)" ]
 }
 
 # Builds what native-evidence runs from CHECKOUT's own gate, into its own
@@ -454,6 +461,17 @@ forward() {
     ' "$@"
 }
 
+# forward, with the caller's compiler settings, which a fresh login on HOST
+# would otherwise lack when it compiles a revision or the integrated lane.
+forward_compiling() {
+    on_host "$remote_prelude
+$(compiler_settings)"'
+        [ -x "$tool/scripts/native-evidence" ] ||
+            { echo "native-evidence-remote: nothing is built for this task on this host yet; run build first" >&2; exit 1; }
+        evidence "$@"
+    ' "$@"
+}
+
 record_source() {
     local side=$1 sources=$task/sources.tsv
     {
@@ -525,7 +543,7 @@ $remote_prelude"'
         printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
     fi
     local built=0
-    forward build "$side" "$checkout" "${options[@]}" "${build_options[@]}" || built=$?
+    forward_compiling build "$side" "$checkout" "${options[@]}" "${build_options[@]}" || built=$?
     if [ "$built" -ne 0 ]; then
         # What was sent for it is no use to the next build.
         [ "${#options[@]}" -eq 0 ] || on_host "$remote_prelude"'

@@ -3069,6 +3069,20 @@ class RemoteEvidence(unittest.TestCase):
         remote = self.remote_repository / ".worktrees" / "cev-mytask-before"
         self.assertEqual(self.git(remote, "rev-parse", "HEAD"), self.git(self.tool, "rev-parse", "base"))
 
+    def test_a_revision_the_host_compiles_gets_the_callers_compiler_settings(self) -> None:
+        self.git(self.tool, "tag", "base")
+        self.run_tool("build", "before", "base", cwd=self.tool,
+                      extra={"RUSTFLAGS": "-C force-frame-pointers=yes",
+                             "CARGO_PROFILE_DEV_RUNTIME_OPT_LEVEL": "2",
+                             "CARGO_TARGET_DIR": "/not/forwarded"})
+        remote_env = (self.logs / "remote-env").read_text().splitlines()
+        self.assertIn("RUSTFLAGS=-C force-frame-pointers=yes", remote_env)
+        self.assertIn("CARGO_PROFILE_DEV_RUNTIME_OPT_LEVEL=2", remote_env)
+        self.assertFalse(any(line.startswith("CARGO_TARGET_DIR=") for line in remote_env))
+        self.run_tool("build", "before", "base", cwd=self.tool)
+        remote_env = (self.logs / "remote-env").read_text()
+        self.assertNotIn("RUSTFLAGS", remote_env)
+
     def test_shots_come_back_with_their_manifest(self) -> None:
         checkout = self.checkout("after", {"src.rs": "\n"})
         self.run_tool("build", "after", str(checkout))
