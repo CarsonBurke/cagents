@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn a_multiline_field_takes_the_single_line_shape_and_an_opaque_fill_to_fade_into() {
         use iced::widget::text_editor::Status as Editor;
-        assert!(INSET_Y - design::BORDER_WIDTH >= 3.0, "a band to fade in");
+        const { assert!(INSET_Y - design::BORDER_WIDTH >= 3.0, "a band to fade in") };
         for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
             for (editor, field) in [
                 (Editor::Active, Status::Active),
