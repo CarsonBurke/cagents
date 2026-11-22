@@ -1537,6 +1537,37 @@ class PreflightCancellation(unittest.TestCase):
                 self.assert_preflight_unslotted(self.calls())
                 self.assertTrue(self.slot_is_free())
 
+    def test_pinned_cargo_runs_the_seed_metadata_and_build(self):
+        # A system Cargo can be first on PATH even though rustup, and its
+        # workspace-aware Cargo proxy, are installed later. The gate must
+        # select the proxy for both the seed preflight and build-host; mixing
+        # them leaves one toolchain unable to read the other's artifacts.
+        original = self.root / "bin/cargo"
+        fallback = self.root / "fallback"
+        rustup_bin = self.root / "rustup-bin"
+        fallback.mkdir()
+        rustup_bin.mkdir()
+        selected = self.root / "selected"
+        for directory, name in ((fallback, "system"), (rustup_bin, "pinned")):
+            wrapper = directory / "cargo"
+            wrapper.write_text(textwrap.dedent(f"""\
+                #!/bin/sh
+                printf '%s\\n' {name} >>{shlex.quote(str(selected))}
+                exec {shlex.quote(str(original))} "$@"
+            """))
+            wrapper.chmod(0o700)
+        rustup = rustup_bin / "rustup"
+        rustup.write_text("#!/bin/sh\nexit 99\n")
+        rustup.chmod(0o700)
+        (self.root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "pinned"\n')
+        self.clear()
+        process = self.start(environment=self.env | {
+            "PATH": os.pathsep.join([str(fallback), str(rustup_bin), "/usr/bin", "/bin"]),
+        })
+        _stdout, stderr = process.communicate("", timeout=HANG_GUARD)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(selected.read_text().splitlines(), ["pinned", "pinned"])
+
 
 class TestsUnderAMemoryLimit(unittest.TestCase):
     """A stand-in limit beside build-host, recording what it is asked to run."""

@@ -762,6 +762,22 @@ class StandInHost(unittest.TestCase):
         # Nothing was built here.
         self.assertFalse((self.root / "local-build").exists())
 
+    def test_a_build_host_prefers_its_rustup_cargo_proxy(self):
+        # sshd can put a distribution Cargo first on PATH. The build host's
+        # own rustup proxy must win so the copied rust-toolchain.toml selects
+        # the same compiler as the caller's seed and workspace commands.
+        bin = self.host_home / ".cargo/bin"
+        bin.mkdir(parents=True)
+        selected = self.host_home / "selected-cargo"
+        proxy = bin / "cargo"
+        proxy.write_text("#!/bin/sh\n"
+                         f"printf '%s\\n' proxy >>{shlex.quote(str(selected))}\n"
+                         f"exec {shlex.quote(str(self.cargo_bin / 'cargo'))} \"$@\"\n")
+        proxy.chmod(0o755)
+        result = self.gate_run("build", "--bin", "probe", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(selected.read_text().splitlines(), ["proxy", "proxy"])
+
     def test_host_helper_and_artifact_reader_travel_to_a_workspace_without_scripts(self):
         for name in ("cargo-host-test-helper.py", "cargo_artifacts.py"):
             shutil.copy2(ROOT / "scripts" / name, self.gate.parent / name)

@@ -32,7 +32,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=37
+gate_version=38
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -430,7 +430,40 @@ cargo_shim() {
 # there is one, and 75 when this is the build host or CAGENTS_BUILD_REMOTE is
 # `local`; anything else is a failure, never a reason to build here. Its wait
 # for that host spends the admission budget; the build there does not.
-cargo=${CAGENTS_BUILD_CARGO:-cargo}
+# Rustup's Cargo proxy reads rust-toolchain.toml from the checkout, unlike a
+# distribution Cargo that happened to come first on PATH. Use the proxy beside
+# rustup when the caller has not deliberately supplied another Cargo. This
+# keeps the preflight/seed path and build-host on the same compiler, even in a
+# minimal non-login shell such as fw16's build service.
+pinned_cargo() {
+    if [ -n "${CAGENTS_BUILD_CARGO:-}" ]; then
+        printf '%s\n' "$CAGENTS_BUILD_CARGO"
+        return
+    fi
+    if [ ! -f rust-toolchain ] && [ ! -f rust-toolchain.toml ]; then
+        printf '%s\n' cargo
+        return
+    fi
+    rustup=${RUSTUP:-}
+    if [ -z "$rustup" ]; then
+        rustup=$(command -v rustup 2>/dev/null || :)
+    fi
+    if [ -z "$rustup" ] && [ -x "$HOME/.cargo/bin/rustup" ]; then
+        rustup=$HOME/.cargo/bin/rustup
+    fi
+    [ -n "$rustup" ] || fail "rustup is required to select this checkout's pinned Rust toolchain; run mise run setup"
+    proxy=$(dirname -- "$rustup")/cargo
+    if [ -x "$proxy" ]; then
+        printf '%s\n' "$proxy"
+        return
+    fi
+    cargo=$($rustup which cargo 2>/dev/null) ||
+        fail "rustup could not find Cargo for this checkout's pinned Rust toolchain; run mise run setup"
+    [ -x "$cargo" ] || fail "rustup selected a non-executable Cargo: $cargo"
+    printf '%s\n' "$cargo"
+}
+cargo=$(pinned_cargo)
+export CAGENTS_BUILD_CARGO=$cargo
 offload=$here/cargo-offload
 if [ -x "$offload" ]; then
     where=0
@@ -598,7 +631,7 @@ if [ -x "$guard" ] || [ -x "$seed" ]; then
     supervised '' /bin/sh -c '
         guard=$1
         seed=$2
-        metadata=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
+        metadata=$("$CAGENTS_BUILD_CARGO" metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
         build_dir=$(printf "%s\n" "$metadata" |
             sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'')
         # A Cargo that reports no build directory builds in the target.

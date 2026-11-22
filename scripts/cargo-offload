@@ -1546,6 +1546,13 @@ elif command == "run":
     fcntl.flock(running, fcntl.LOCK_EX)
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
+    # An SSH service can put a distribution Cargo ahead of rustup's proxy. A
+    # checkout's rust-toolchain.toml is authoritative, so prefer the proxy in
+    # the build host account just as cargo-gate does locally. The proxy also
+    # preserves an explicit `cargo +toolchain` argument.
+    rustup_bin = os.path.join(environment.get("HOME", ""), ".cargo", "bin")
+    if os.path.isfile(os.path.join(rustup_bin, "cargo")):
+        environment["PATH"] = rustup_bin + os.pathsep + environment.get("PATH", os.defpath)
     # Temporary files go in a directory of this slot's own, rather than in
     # the host's /tmp, which others use: temporary_directory puts it in the
     # runtime directory, which is memory on a systemd host such as fw16, or
