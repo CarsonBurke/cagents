@@ -1,8 +1,8 @@
 (
   set -eu
-  repository='github.com/CarsonBurke/cagents'
-  gh auth status --hostname github.com
-  tag="$(gh release view --repo "$repository" --json tagName --jq .tagName)"
+  releases='https://github.com/CarsonBurke/cagents/releases'
+  latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$releases/latest")"
+  tag="${latest##*/}"
   case "$tag" in v[0-9]*) ;; *) echo 'Expected a versioned release tag' >&2; exit 1 ;; esac
   version="${tag#v}"
   download_dir="$(mktemp -d)"
@@ -10,11 +10,11 @@
   trap 'exit 1' HUP INT TERM
   archive="cagents-${version}-x86_64-unknown-linux-gnu.tar.gz"
 
-  gh release download "$tag" --repo "$repository" \
-    --pattern install.sh --pattern SHA256SUMS --pattern "$archive" \
-    --dir "$download_dir"
   (
     cd "$download_dir"
+    curl -fsSL --proto '=https' --remote-name-all \
+      "$releases/download/$tag/install.sh" "$releases/download/$tag/SHA256SUMS" \
+      "$releases/download/$tag/$archive"
     awk -v archive="$archive" \
       '$2 == "install.sh" { print; installer++ } $2 == archive { print; payload++ }
        END { exit(installer != 1 || payload != 1) }' \
@@ -22,7 +22,6 @@
     sha256sum --strict --check selected-checksums
   )
 
-  CAGENTS_REPOSITORY='CarsonBurke/cagents' \
   CAGENTS_ARCHIVE="$download_dir/$archive" \
   CAGENTS_CHECKSUMS="$download_dir/SHA256SUMS" \
     sh "$download_dir/install.sh" --version "$version"

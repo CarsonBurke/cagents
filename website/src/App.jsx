@@ -189,11 +189,11 @@ function App() {
         <section className="install-section" id="install" aria-labelledby="install-heading">
           <div className="install-copy">
             <p className="eyebrow"><span /> Get cagents</p>
-            <h2 id="install-heading">Install with your GitHub account.</h2>
+            <h2 id="install-heading">Install with one command.</h2>
             <p>
-              Sign in with <code>gh auth login</code> using an account with access
-              to the private repository. The command installs the latest release
-              for your user. No root required.
+              The command downloads the latest release, checks it against the
+              release's checksums, and installs it for your user. No root or
+              GitHub account required.
             </p>
           </div>
 

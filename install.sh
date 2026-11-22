@@ -601,10 +601,12 @@ CURL_OPTIONS="--proto =https --tlsv1.2 --fail --location --silent --show-error"
 AUTHENTICATED_GH=0
 if [ -z "$VERSION" ] || [ -z "$LOCAL_ARCHIVE" ] || [ -z "$LOCAL_CHECKSUMS" ]; then
     validate_repository
-    if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+    # The canonical releases are public: plain HTTPS downloads need no
+    # account. Another repository may be private, so its releases go through
+    # an authenticated GitHub CLI when there is one.
+    if [ "$REPOSITORY" != CarsonBurke/cagents ] && command -v gh >/dev/null 2>&1 \
+        && gh auth status --hostname github.com >/dev/null 2>&1; then
         AUTHENTICATED_GH=1
-    elif [ "$REPOSITORY" = CarsonBurke/cagents ]; then
-        fail 'private release access requires an authenticated GitHub CLI account; run gh auth login --hostname github.com with access to CarsonBurke/cagents; installation was not changed'
     fi
 fi
 if [ -z "$VERSION" ]; then
