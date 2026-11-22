@@ -31,6 +31,7 @@ word:
   title       names the conversation
   refuse      ends the turn with the `refusal` stop reason
   auth        refuses the prompt until the user signs in
+  allowance   refuses the prompt as a login with no usage allowance
   /compact    answers as a compaction command
 
 Anything else is answered with a short thought and a streamed reply.
@@ -59,10 +60,24 @@ Environment switches:
                             it leaves behind, and Muse's
                             $XDG_DATA_HOME/muse/sessions/YYYY/MM/DD/ID/.session.lock.
                             Only for a $HOME that is the fixture's own.
+  FAKE_ACP_AUTH_FILE=FILE   the agent's sign-in record: `login` writes it and
+                            `logout` removes it, as Muse's auth.json. Point it
+                            only at a fixture's own file.
+
+Files under FAKE_ACP_STATE switch states that last across processes:
+  signed-out      every new or loaded session and every prompt is refused as
+                  signed out; Muse's `logout` writes it and `login` removes it
+  no-allowance    every prompt is refused as a login with no usage allowance,
+                  and Muse's `usage --json` reports no allowance
+  hang-probe      a session opened by a probe (`--app-data-dir`) never answers
+
+Run with `--app-data-dir DIR`, as cagents' Antigravity probe runs `agy acp`,
+it saves each new session's files under ~/.gemini/DIR the way agy does
+(`conversations/ID.db`, `brain/ID/`, `annotations/ID.pbtxt` and
+`implicit/ID.pb`), so a probe can be checked for leaving them behind.
 
 In the Muse shape, `usage [--json]`, `login` and `logout` answer like Muse's
-account commands. Signing out lasts, as a file under FAKE_ACP_STATE, until
-`login`.
+account commands.
 """
 import fcntl
 import json
@@ -83,6 +98,9 @@ SHAPE = os.environ.get("FAKE_ACP_SHAPE") or (
 STATE = os.environ.get("FAKE_ACP_STATE") or os.path.join(
     tempfile.gettempdir(), f"fake-acp-agent-{os.getuid()}"
 )
+# The account states below, which hold for every process of the agent,
+# whatever data directory it keeps.
+MARKS = STATE
 # Antigravity's own data directory, relative to ~/.gemini, for the
 # conversations a process started with `--app-data-dir` keeps apart.
 APP_DATA = "antigravity-cli"
@@ -98,6 +116,10 @@ if APP_DATA != "antigravity-cli":
 AUTH = os.environ.get("FAKE_ACP_AUTH", "")
 LOG = os.environ.get("FAKE_ACP_LOG")
 WORK = os.environ.get("FAKE_ACP_WORK")
+# Where a process started with `--app-data-dir` keeps what it saves of each
+# session, as agy does under ~/.gemini; None for agy's own directory.
+PROBE_DATA = (os.path.join(os.path.expanduser("~/.gemini"), APP_DATA)
+              if APP_DATA != "antigravity-cli" else None)
 
 AGY_MODES = [
     ("default", "Default", "Ask before edits and commands, per your permission settings."),
@@ -175,7 +197,22 @@ def signed_out(id):
 
 def logged_out():
     """Signed out until `login`: the state's marker, written by `logout`."""
-    return os.path.exists(os.path.join(STATE, "signed-out"))
+    return marked("signed-out")
+
+
+def marked(name):
+    return os.path.exists(os.path.join(MARKS, name))
+
+
+def no_allowance(id):
+    """A prompt refused as Muse refuses one from a login with no subscription
+    allowance. Muse's own reply was not captured: its service answered 402
+    Payment Required, and this carries that reason in the error's data the
+    way ACP agents report a failed model request."""
+    send({"jsonrpc": "2.0", "id": id, "error": {
+        "code": -32603, "message": "Internal error",
+        "data": {"message": "model request failed: 402 Payment Required: "
+                            "this login has no subscription allowance"}}})
 
 
 class Session:
@@ -393,6 +430,19 @@ class Agent:
         self.sessions[session.id] = session
         session.hold_presence()
         self.remember(session)
+        if PROBE_DATA:
+            # What agy keeps of every session it opens, a probe's included.
+            os.makedirs(os.path.join(PROBE_DATA, "brain", session.id), exist_ok=True)
+            os.makedirs(os.path.join(PROBE_DATA, "conversations"), exist_ok=True)
+            open(os.path.join(PROBE_DATA, "conversations", session.id + ".db"), "w").close()
+            for store, suffix in (("annotations", ".pbtxt"), ("implicit", ".pb")):
+                os.makedirs(os.path.join(PROBE_DATA, store), exist_ok=True)
+                open(os.path.join(PROBE_DATA, store, session.id + suffix), "w").close()
+            if marked("hang-probe"):
+                # A probe that never hears back, as one that timed out.
+                while self.inbox.get() is not None:
+                    pass
+                raise SystemExit
         reply(id, session.setup())
         session.update({"sessionUpdate": "available_commands_update",
                         "availableCommands": COMMANDS}, record=False)
@@ -483,6 +533,8 @@ class Agent:
             return fail(id, -32002, "Unknown session")
         if AUTH == "prompt" or logged_out():
             return signed_out(id)
+        if marked("no-allowance"):
+            return no_allowance(id)
         self.cancelled.discard(session.id)
         blocks = params.get("prompt") or []
         text = " ".join(b.get("text", "") for b in blocks if b.get("type") == "text")
@@ -495,6 +547,8 @@ class Agent:
         stop = "end_turn"
         if "auth" in words:
             return signed_out(id)
+        if "allowance" in words:
+            return no_allowance(id)
         if text.strip().startswith("/compact"):
             self.say(session, "Compacted the conversation.")
         elif "tools" in words:
@@ -741,9 +795,12 @@ def command_line(arguments):
     if SHAPE != "muse" or not arguments or arguments[0] not in ("usage", "login", "logout"):
         return None
     marker = os.path.join(STATE, "signed-out")
+    record = os.environ.get("FAKE_ACP_AUTH_FILE")
     os.makedirs(STATE, exist_ok=True)
     if arguments[0] == "logout":
         open(marker, "w").close()
+        if record and os.path.exists(record):
+            os.remove(record)
         print("Logged out of Muse.")
         return 0
     if arguments[0] == "login":
@@ -752,16 +809,27 @@ def command_line(arguments):
         time.sleep(float(os.environ.get("FAKE_ACP_LOGIN_SECONDS") or 2))
         if os.path.exists(marker):
             os.remove(marker)
+        if record:
+            os.makedirs(os.path.dirname(record), exist_ok=True)
+            with open(record, "w") as saved:
+                json.dump({"fixture": True, "signedInAt": time.time()}, saved)
         print("Logged in to Muse.")
         return 0
     if AUTH or os.path.exists(marker):
         print("muse usage: not logged in: run `muse login` first", file=sys.stderr)
         return 1
-    if "--json" in arguments:
-        print(json.dumps({"allowance": None, "hint": None, "reason": "no_allowance",
-                          "schemaVersion": 1}))
+    if marked("no-allowance"):
+        report = {"allowance": None, "hint": None, "reason": "no_allowance", "schemaVersion": 1}
+        text = "No subscription allowance."
     else:
-        print("No subscription allowance.")
+        # The fields Muse 1.4.24's report names; their meaning is not
+        # published, so cagents reads only that an allowance is there.
+        resets = int((time.time() + 3 * 3600) * 1000)
+        report = {"allowance": {"usedPercent": 12.0, "resetsAtMs": resets,
+                                "asOfMs": int(time.time() * 1000)},
+                  "hint": None, "reason": None, "schemaVersion": 1}
+        text = "Subscription allowance: 12% used."
+    print(json.dumps(report) if "--json" in arguments else text)
     return 0
 
 

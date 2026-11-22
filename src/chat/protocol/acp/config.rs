@@ -7,7 +7,7 @@
 //! their own. Config options win where both describe the same choice, since
 //! they are the stable interface and an agent keeps them current with
 //! `config_option_update`.
-use crate::chat::{ActiveModel, Event, Model};
+use crate::chat::{ActiveModel, Event, Model, acp_levels};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -28,6 +28,14 @@ pub(super) struct Select {
     pub id: String,
     pub current: String,
     pub choices: Vec<Choice>,
+}
+
+/// A choice is known by its value, as the combined identifiers that name
+/// a model's levels join them (see [`acp_levels`]).
+impl AsRef<str> for Choice {
+    fn as_ref(&self) -> &str {
+        &self.value
+    }
 }
 
 impl Select {
@@ -172,11 +180,9 @@ impl Config {
     /// The combined identifiers in the `models` state, such as agy's
     /// `gemini-4-neon-high`, where they name models' reasoning levels.
     fn combined_models(&self) -> Option<&Select> {
+        let levels = &self.reasoning.as_ref()?.choices;
         self.legacy_models.as_ref().filter(|models| {
-            models
-                .choices
-                .iter()
-                .any(|choice| self.split_model(&choice.value).is_some())
+            acp_levels::names_levels(&models.choices, levels, |model| self.offers_model(model))
         })
     }
 
@@ -186,17 +192,9 @@ impl Config {
     /// another lists none.
     fn levels_of(&self, model: &str, combined: Option<&Select>) -> Vec<String> {
         match (&self.reasoning, combined) {
-            (Some(reasoning), Some(combined)) => reasoning
-                .choices
-                .iter()
-                .filter(|level| {
-                    combined
-                        .choices
-                        .iter()
-                        .any(|choice| joins(&choice.value, model, &level.value))
-                })
-                .map(|level| level.value.clone())
-                .collect(),
+            (Some(reasoning), Some(combined)) => {
+                acp_levels::joined(model, &reasoning.choices, &combined.choices)
+            }
             _ => self.levels_seen.get(model).cloned().unwrap_or_default(),
         }
     }
@@ -214,13 +212,9 @@ impl Config {
     /// `model` read as an offered model and an offered reasoning level
     /// joined by a hyphen, as a combined model identifier names both.
     pub fn split_model(&self, model: &str) -> Option<(String, String)> {
-        self.reasoning.as_ref()?.choices.iter().find_map(|level| {
-            let base = model
-                .strip_suffix(level.value.as_str())?
-                .strip_suffix('-')?;
-            self.offers_model(base)
-                .then(|| (base.to_owned(), level.value.clone()))
-        })
+        let levels = &self.reasoning.as_ref()?.choices;
+        acp_levels::split(model, levels, |base| self.offers_model(base))
+            .map(|(base, level)| (base.to_owned(), level.to_owned()))
     }
 
     /// The agent changed its mode itself, as `current_mode_update` reports.
@@ -383,12 +377,4 @@ fn legacy(
             })
             .collect(),
     })
-}
-
-/// Whether `combined` is `model` and `level` joined by a hyphen.
-fn joins(combined: &str, model: &str, level: &str) -> bool {
-    combined
-        .strip_suffix(level)
-        .and_then(|rest| rest.strip_suffix('-'))
-        == Some(model)
 }

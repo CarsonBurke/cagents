@@ -1322,6 +1322,9 @@ fn status(account: &AccountState) -> (&'static str, fn(&cosmic::Theme) -> iced::
     match snapshot.status {
         UsageStatus::Ok => ("Available", design::success_color),
         UsageStatus::Warning => ("Near limit", design::warning_color),
+        UsageStatus::Limited if !account::reports_usage_limits(account.account.provider) => {
+            ("No allowance", design::destructive_color)
+        }
         UsageStatus::Limited => ("Limited", design::destructive_color),
         UsageStatus::NeedsLogin => ("Signed out", design::warning_color),
         UsageStatus::Unavailable => ("Unavailable", design::muted_color),

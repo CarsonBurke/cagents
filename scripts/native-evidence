@@ -752,6 +752,10 @@ install_acp() {
     # reach `muse-upstream acp`.
     printf '#!/bin/sh\nexec muse-upstream --approval-mode never --disable-sandbox "$@"\n' >"$fixture/bin/muse"
     chmod 755 -- "$fixture/bin/muse"
+    # Signed in, as Muse records it, unless the fixture was signed out.
+    if [ ! -e "$fixture/acp/muse/signed-out" ] && [ ! -e "$fixture/config/muse/auth.json" ]; then
+        printf '{"fixture": true}\n' >"$fixture/config/muse/auth.json"
+    fi
 }
 
 # The fixture's runtime directory and HOME are the proof of ownership: nothing else
