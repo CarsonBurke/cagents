@@ -16469,6 +16469,13 @@ fn a_first_message_drops_an_effort_its_conversation_lacks_from_the_draft() {
     )));
     write(&mut app, card, "hello");
     submit(&mut app, card);
+    assert_eq!(
+        chat_runtime(&app, card)
+            .queued
+            .as_ref()
+            .and_then(|queued| queued.model.clone()),
+        Some(("gpt-b".into(), Some("high".into())))
+    );
     let attempt = chat_runtime_attempt(&app, card);
     let handle = fixture_handle(&app, card, None);
     handle.replace_snapshot_for_test(Snapshot {
@@ -16478,6 +16485,17 @@ fn a_first_message_drops_an_effort_its_conversation_lacks_from_the_draft() {
     });
     answer_start(&mut app, attempt, Ok(handle));
     assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+    assert_eq!(
+        chat_runtime(&app, card)
+            .commands
+            .in_flight()
+            .unwrap()
+            .choice,
+        Some(commands::Choice::Model {
+            model: "gpt-b".into(),
+            reasoning: None,
+        })
+    );
     assert_eq!(
         chat_runtime(&app, card)
             .queued
