@@ -985,6 +985,15 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.
 pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
+    if source.id != replacement.id
+        || source.proof == replacement.proof
+        || !replacement
+            .proof
+            .as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete)
+    {
+        return false;
+    }
     if crate::upgrade::floor::load()
         .is_ok_and(|ledger| ledger.history_replacement(source, replacement))
     {
