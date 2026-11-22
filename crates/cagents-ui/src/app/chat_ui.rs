@@ -10514,6 +10514,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.dictation_forget(card);
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         self.release_draft_start_capture(card);

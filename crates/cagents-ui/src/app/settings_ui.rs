@@ -1525,7 +1525,7 @@ fn dictation_group<'a>(
     .keywords("dictation speech voice microphone parakeet dictation_model");
     let sends = crate::settings_widgets::toggle(
         "Send when dictation stops",
-        "Send the message once the last words are written in. Otherwise it waits in the draft for you to read and send.",
+        "Stopping with the microphone or the Dictate shortcut sends the message once the last words are in. Done and Escape always leave it in the draft for you to read and send.",
         draft.dictation_sends,
         |enabled| Message::SettingsChanged {
             field: SettingsField::DictationSends,

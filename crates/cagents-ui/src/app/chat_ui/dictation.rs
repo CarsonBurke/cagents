@@ -155,6 +155,7 @@ pub(in crate::app) fn megabytes(bytes: u64) -> u64 {
 
 impl Runtime {
     /// Whether this pane is listening, as opposed to finishing or idle.
+    #[cfg(test)]
     pub(super) fn dictating(&self) -> bool {
         matches!(
             &self.dictation,
@@ -859,6 +860,35 @@ impl Cagents {
         Some(self.dictation_stop(target, id, send))
     }
 
+    /// The window lost the keyboard while the shortcut was held down, so
+    /// its release will not arrive: push-to-talk ends here, keeping what
+    /// was said without sending it.
+    pub(in crate::app) fn dictation_unfocused(&mut self) -> Task<Message> {
+        if self.chat_ui.dictation.held.take().is_none() {
+            return Task::none();
+        }
+        match self.chat_ui.dictation.active {
+            Some((target, id)) => self.dictation_stop(target, id, None),
+            None => Task::none(),
+        }
+    }
+
+    /// Chat `card` is closing or giving way to its terminal: it stops
+    /// listening at once, so the microphone never stays open for a draft
+    /// nobody can see. Each session ends when the helper confirms.
+    pub(super) fn dictation_forget(&mut self, card: CardId) {
+        let shared = &mut self.chat_ui.dictation;
+        for (&id, target) in &shared.sessions {
+            if target.card == card {
+                shared.client.cancel(id);
+            }
+        }
+        if shared.active.is_some_and(|(target, _)| target.card == card) {
+            shared.active = None;
+            shared.held = None;
+        }
+    }
+
     pub(super) fn dictation_update(&mut self, update: Update) -> Task<Message> {
         match update {
             Update::Helper { generation, event } => {
@@ -1065,10 +1095,12 @@ struct Meter {
 /// often, and a frame that changes nothing else is cheap (see the activity
 /// spinner's `SPINNER_FRAME`).
 const METER_FRAME: Duration = Duration::from_millis(50);
-/// How often a meter with no bar lit looks again: a pause draws the same
-/// frame, so it costs fewer of them, and the first word still lights a bar
-/// well within a syllable.
+/// How often a meter looks again once it has drawn the same bars for
+/// `METER_STEADY` frames: a pause or a room's steady hum draws the same
+/// frame, so it costs fewer of them, and a word still moves the bars well
+/// within a syllable.
 const METER_QUIET_FRAME: Duration = Duration::from_millis(150);
+const METER_STEADY: u8 = 4;
 const METER_BARS: usize = 5;
 const METER_SIZE: f32 = 16.0;
 
@@ -1077,6 +1109,32 @@ struct MeterState {
     /// The level drawn, eased toward the reported one so the bars fall
     /// rather than flicker between reports.
     shown: f32,
+    /// Frames in a row that lit the same bars.
+    steady: u8,
+}
+
+impl MeterState {
+    /// Moves what is shown toward `level` for a frame, and says when to
+    /// look again.
+    fn advance(&mut self, level: f32) -> Duration {
+        let before = bars_lit(self.shown);
+        // Rise at once, fall over a few frames.
+        self.shown = if level >= self.shown {
+            level
+        } else {
+            (self.shown * 0.6 + level * 0.4).max(level)
+        };
+        self.steady = if bars_lit(self.shown) == before {
+            self.steady.saturating_add(1)
+        } else {
+            0
+        };
+        if self.steady < METER_STEADY {
+            METER_FRAME
+        } else {
+            METER_QUIET_FRAME
+        }
+    }
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Meter {
@@ -1116,19 +1174,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Meter {
             return;
         }
         if let iced::Event::Window(iced::window::Event::RedrawRequested(now)) = event {
-            let state = tree.state.downcast_mut::<MeterState>();
-            let level = self.level.get();
-            // Rise at once, fall over a few frames.
-            state.shown = if level >= state.shown {
-                level
-            } else {
-                (state.shown * 0.6 + level * 0.4).max(level)
-            };
-            let next = if lit(state.shown, 0) {
-                METER_FRAME
-            } else {
-                METER_QUIET_FRAME
-            };
+            let next = tree
+                .state
+                .downcast_mut::<MeterState>()
+                .advance(self.level.get());
             shell.request_redraw_at(*now + next);
         }
     }
@@ -1178,6 +1227,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Meter {
 /// Whether `bar` is lit at the level `shown`.
 fn lit(shown: f32, bar: usize) -> bool {
     shown >= (bar as f32 + 0.5) / METER_BARS as f32 * 0.8
+}
+
+/// How many bars are lit at the level `shown`; they light from the first.
+fn bars_lit(shown: f32) -> usize {
+    (0..METER_BARS).take_while(|&bar| lit(shown, bar)).count()
 }
 
 #[cfg(test)]
@@ -1464,5 +1518,118 @@ mod tests {
             chosen_model("parakeet-tdt-0.6b-v2").id,
             "parakeet-tdt-0.6b-v2"
         );
+    }
+
+    /// A meter showing the same bars, in a pause or over a room's steady
+    /// hum, looks again less often, and goes back to every frame as soon
+    /// as the bars move.
+    #[test]
+    fn a_steady_meter_redraws_less_often_until_the_level_moves() {
+        let mut meter = MeterState::default();
+        for hum in [0.1, 0.0] {
+            let frames: Vec<_> = (0..8).map(|_| meter.advance(hum)).collect();
+            assert_eq!(frames.last(), Some(&METER_QUIET_FRAME), "{hum}");
+            assert!(frames.contains(&METER_FRAME), "{hum}");
+        }
+        assert_eq!(
+            meter.advance(0.9),
+            METER_FRAME,
+            "a word lights bars at once"
+        );
+        assert_eq!(bars_lit(meter.shown), METER_BARS);
+    }
+
+    /// Escape stops listening; pressed again while the last words arrive,
+    /// it does nothing rather than reach past dictation to stop the turn.
+    #[test]
+    fn escape_while_the_last_words_arrive_leaves_the_turn_running() {
+        use keyboard::key::Named;
+        let renderer = crate::app::tests::headless_renderer();
+        let (mut app, card, target) = dictating("Fix the build", 13);
+        let mut snapshot = (*super::super::tests::chat_runtime(&app, card).snapshot).clone();
+        snapshot.generation += 1;
+        snapshot.busy = true;
+        super::super::show_chat_snapshot_for_test(&mut app, card, snapshot);
+        let escape = |app: &Cagents| {
+            super::super::tests::composer_key_messages(
+                app,
+                card,
+                760.0,
+                super::super::tests::permission_key(Named::Escape, keyboard::Modifiers::empty()),
+                &renderer,
+            )
+        };
+        let messages = escape(&app);
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [Message::ChatUi(Action::DictationStop(_))]
+            ),
+            "{messages:?}"
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert!(!super::super::tests::chat_runtime(&app, card).dictating());
+        let messages = escape(&app);
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(_)))),
+            "{messages:?}"
+        );
+        for message in messages {
+            drop(app.update(message));
+        }
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .session_mut(SESSION)
+                .is_some()
+        );
+        // Once the last words are in, Escape is the turn's again.
+        drop(app.dictation_event(stopped(SESSION)));
+        let messages = escape(&app);
+        assert!(
+            matches!(messages.as_slice(), [Message::ChatUi(Action::Interrupt(_))]),
+            "{messages:?}"
+        );
+    }
+
+    /// A chat that closes, or gives way to its terminal, stops listening
+    /// at once; the helper's word that the session ended finds no pane.
+    #[test]
+    fn a_chat_that_closes_stops_listening() {
+        let (mut app, card, _) = dictating("Fix the build", 13);
+        app.chat_forget(card);
+        assert!(app.chat_ui.dictation.active.is_none());
+        drop(app.dictation_event(Event::Cancelled { session: SESSION }));
+        assert!(app.chat_ui.dictation.sessions.is_empty());
+    }
+
+    /// Leaving the window while holding the shortcut ends push-to-talk,
+    /// since the release never comes, and keeps the words without sending
+    /// them even when stopping sends.
+    #[test]
+    fn leaving_the_window_mid_push_to_talk_stops_without_sending() {
+        let (mut app, _, target) = dictating("Fix the build", 13);
+        app.settings.dictation_sends = true;
+        app.chat_ui.dictation.held = Some((
+            keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            std::time::Instant::now(),
+        ));
+        drop(app.dictation_unfocused());
+        assert!(app.chat_ui.dictation.held.is_none());
+        assert!(app.chat_ui.dictation.active.is_none());
+        let session = app
+            .chat_runtime_mut(target)
+            .unwrap()
+            .session_mut(SESSION)
+            .unwrap();
+        assert!(session.phase == Phase::Finishing && session.send.is_none());
+        // Without the key held, losing the window leaves dictation going.
+        let (mut app, card, _) = dictating("Fix the build", 13);
+        drop(app.dictation_unfocused());
+        assert!(super::super::tests::chat_runtime(&app, card).dictating());
     }
 }

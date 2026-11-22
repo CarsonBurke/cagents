@@ -211,16 +211,19 @@ impl Cagents {
     /// up on whatever only polls, or polls quickly, while it is focused.
     fn main_window_focus_changed(&mut self, focused: bool) -> Task<Message> {
         let regained = focused && !self.refresh_ui.focused;
+        let mut dictation = Task::none();
         if !focused {
             self.tab_history.finish(self.workspace.focused());
             // Losing the window is not a choice of workspace, and the
             // release that would have made one never arrives.
             self.cancel_workspace_preview();
+            // Nor does the release that would end push-to-talk.
+            dictation = self.dictation_unfocused();
         }
         self.refresh_ui.focused = focused;
         crate::ui_controls::animate_activity(focused);
         if !regained {
-            return self.accounts_focus_changed(focused, false);
+            return Task::batch([dictation, self.accounts_focus_changed(focused, false)]);
         }
         Task::batch([
             // A request that arrived while away is offered on return.

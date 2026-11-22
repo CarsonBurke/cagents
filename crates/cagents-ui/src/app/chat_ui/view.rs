@@ -4125,7 +4125,12 @@ impl Runtime {
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
             let viewing = self.image_viewer.is_some() && self.child_picker.is_none();
-            let dictating = self.dictating();
+            // Finishing counts too: an Escape pressed again while the last
+            // words arrive must not fall through and interrupt the turn.
+            let dictating = self
+                .dictation
+                .as_ref()
+                .is_some_and(dictation::Pane::is_session);
             editor
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
@@ -4196,7 +4201,8 @@ impl Runtime {
                         || self.permission_picker;
                     // While dictating, Escape stops listening and keeps what
                     // was said, ahead of closing an image or interrupting
-                    // the turn. Sending waits for the last words.
+                    // the turn; once it has stopped, Escape does nothing
+                    // until the last words are in. Sending waits for them.
                     if dictating
                         && !picking
                         && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
