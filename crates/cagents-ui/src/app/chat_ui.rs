@@ -76,6 +76,7 @@ mod artifacts;
 mod attachment_draft;
 mod auth_recovery;
 mod background_close;
+pub(in crate::app) use background_close::shares_conversation;
 #[cfg(test)]
 pub(in crate::app) mod blocked_recovery_tests;
 mod changes;
@@ -1352,6 +1353,9 @@ pub(super) struct State {
     /// Whether one of those waited for another pane's removal to finish, and
     /// goes once it has.
     returns_await_removal: bool,
+    /// Closed panes their view fences, which never attach, to close by
+    /// identity once another pane's removal no longer holds the strip.
+    fenced_returns: HashSet<CardId>,
     /// Closed panes a shared view put back while their conversation stops,
     /// kept out of sight until the stop settles.
     hidden_returns: HashSet<CardId>,
@@ -1445,6 +1449,7 @@ impl Default for State {
             stopped_closes: HashMap::new(),
             stopped_returns: HashSet::new(),
             returns_await_removal: false,
+            fenced_returns: HashSet::new(),
             hidden_returns: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),

@@ -56,7 +56,7 @@ pub(super) fn only_confirms(closed: &chat::Session, current: &chat::Session) -> 
 
 /// Whether two descriptors name one conversation: the same pane identity, or
 /// the same provider conversation.
-fn shares_conversation(a: &chat::Session, b: &chat::Session) -> bool {
+pub(in crate::app) fn shares_conversation(a: &chat::Session, b: &chat::Session) -> bool {
     a.id == b.id
         || (a.launch.provider == b.launch.provider
             && a.launch.session_id.is_some()
@@ -387,18 +387,70 @@ impl Cagents {
     /// Closes by identity the closed pane `card` its view fences, which
     /// never attaches: in its strip as any fenced pane closes, or from outside
     /// it, its view hearing of the close as it would from the strip.
+    /// One whose strip another pane's removal holds waits, out of sight, for
+    /// that removal to finish.
     fn close_fenced_return(&mut self, card: CardId) -> Task<Message> {
-        if self.workspace.order().any(|placed| placed == card) {
-            return self.close_fenced_card(card).unwrap_or_else(Task::none);
-        }
-        Arc::make_mut(&mut self.durable)
-            .pending_chat_admissions
-            .remove(&card);
-        self.shared_views.fenced_closes.insert(card);
-        let task = self.retire_offstrip_card(card);
-        if self
+        self.chat_ui.fenced_returns.remove(&card);
+        if !self
             .card_state(card)
-            .is_none_or(|state| state.existence.is_open())
+            .is_some_and(|state| state.existence.is_open())
+        {
+            return Task::none();
+        }
+        let task = if self.workspace.order().any(|placed| placed == card) {
+            if self
+                .workspace
+                .pending_close()
+                .is_some_and(|pending| pending.unmounting != card)
+            {
+                self.chat_ui.fenced_returns.insert(card);
+                self.chat_ui.hidden_returns.insert(card);
+                self.chat_ui.returns_await_removal = true;
+                return Task::none();
+            }
+            self.remove_returned_pane(card)
+        } else {
+            self.shared_views.fenced_closes.insert(card);
+            let task = self.retire_offstrip_card(card);
+            if self
+                .card_state(card)
+                .is_none_or(|state| state.existence.is_open())
+            {
+                self.shared_views.fenced_closes.remove(&card);
+            } else {
+                self.chat_discard(card);
+            }
+            Some(task)
+        };
+        if !self
+            .card_state(card)
+            .is_some_and(|state| state.existence.is_open())
+        {
+            self.chat_ui.hidden_returns.remove(&card);
+            if self.durable.pending_chat_admissions.contains_key(&card) {
+                Arc::make_mut(&mut self.durable)
+                    .pending_chat_admissions
+                    .remove(&card);
+                self.persist();
+            }
+        }
+        task.unwrap_or_else(Task::none)
+    }
+
+    /// Removes the closed pane `card` a shared view put back from the strip,
+    /// asking the daemon nothing. One its view fences leaves the view by
+    /// identity, as a fenced pane's close does.
+    fn remove_returned_pane(&mut self, card: CardId) -> Option<Task<Message>> {
+        let fenced = self.shared_views.quarantined.contains(&card);
+        // Recorded first: committing the removal publishes it.
+        if fenced {
+            self.shared_views.fenced_closes.insert(card);
+        }
+        let task = self.remove_chat_card(card, None);
+        if fenced
+            && self
+                .card_state(card)
+                .is_none_or(|state| state.existence.is_open())
         {
             self.shared_views.fenced_closes.remove(&card);
         }
@@ -573,7 +625,13 @@ impl Cagents {
             return Task::none();
         }
         self.chat_ui.returns_await_removal = false;
-        self.remove_stopped_returns()
+        let fenced = self.chat_ui.fenced_returns.drain().collect::<Vec<_>>();
+        let mut tasks = fenced
+            .into_iter()
+            .map(|card| self.close_fenced_return(card))
+            .collect::<Vec<_>>();
+        tasks.push(self.remove_stopped_returns());
+        Task::batch(tasks)
     }
 
     /// Takes away again a closed pane a shared view brought back after its
@@ -675,7 +733,7 @@ impl Cagents {
             return Task::none();
         }
         let task = if open(self) {
-            self.remove_chat_card(card, None)
+            self.remove_returned_pane(card)
         } else {
             None
         };
@@ -821,6 +879,7 @@ impl Cagents {
             .filter(|closing| closing.reopens.contains(&closing.card))
             .map(|closing| closing.card)
             .chain(self.chat_ui.stopped_returns.iter().copied())
+            .chain(self.chat_ui.fenced_returns.iter().copied())
             .chain(self.chat_ui.hidden_returns.iter().copied().filter(|card| {
                 (self.chat_awaiting_admission(*card)
                     && self.chat_ui.stopped_closes.contains_key(card))

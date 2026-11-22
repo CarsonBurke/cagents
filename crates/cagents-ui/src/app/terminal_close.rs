@@ -959,9 +959,18 @@ impl Cagents {
         if let Some(card) = closed_descriptor
             .filter(|_| !self.proven_gone_cards.remove(&id) && !self.reopen_superseded(id))
         {
-            // A pane closed again, as one a shared view put back is, is
-            // listed once, where it closed last.
-            self.recently_closed.retain(|(closed, _)| closed.id != id);
+            // A pane closed again holding the same conversation, as one a
+            // shared view put back is, is listed once, where it closed last.
+            let again = |closed: &CardState| {
+                closed.id == id
+                    && match (&closed.kind, &card.kind) {
+                        (CardKind::Chat(earlier), CardKind::Chat(now)) => {
+                            super::chat_ui::shares_conversation(earlier, now)
+                        }
+                        (earlier, now) => earlier == now,
+                    }
+            };
+            self.recently_closed.retain(|(closed, _)| !again(closed));
             self.recently_closed
                 .push((card, self.active_workspace_destination()));
             if self.recently_closed.len() > 32 {
