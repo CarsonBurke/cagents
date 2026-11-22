@@ -2356,6 +2356,33 @@ fn empty_writes() -> PendingWrites {
 }
 
 #[test]
+fn autosave_skips_a_snapshot_that_already_landed_unchanged() {
+    let store = FakeStore::always(FakeWrite::Succeed);
+    let attempts = Arc::clone(&store.attempts);
+    let snapshot = Arc::new(workspace());
+    let mut writes = empty_writes();
+
+    writes.workspace = Some(Arc::clone(&snapshot));
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+    // An ordinary publication can prepare the same immutable state after the
+    // preceding debounce/flush completed. It must not rewrite its workspace
+    // row only to advance its generation and timestamp.
+    writes.workspace = Some(Arc::clone(&snapshot));
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+    // The saved weak reference makes copy-on-write detach before mutation, so
+    // a real persistent change always reaches storage.
+    let mut changed = snapshot;
+    Arc::make_mut(&mut changed).cards[0].title = "changed after save".into();
+    writes.workspace = Some(changed);
+    writes.flush_checkpoints(&store).unwrap();
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn chat_recovery_io_failure_is_acknowledged_without_a_later_retry() {
     for kind in [ChatRecoveryKind::Account, ChatRecoveryKind::Upgrade] {
         let store = FakeStore::new([FakeWrite::FailDiskFull, FakeWrite::Succeed]);

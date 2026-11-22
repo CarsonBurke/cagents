@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -720,7 +720,8 @@ impl SessionRuntime {
     /// the `Arc` and never mutates it, which is why the storage generations it
     /// writes against live in the writer thread rather than in the snapshot.
     /// Navigation-only changes are complete snapshots too: card fingerprints
-    /// may skip card writes, but must never skip the workspace metadata update.
+    /// may skip card writes, but a changed snapshot must still update the
+    /// workspace metadata.
     pub fn snapshot(&self, state: Arc<WorkspaceState>) {
         let _ = self.offer_snapshot(state.into());
     }
@@ -1271,6 +1272,12 @@ impl Drop for SessionRuntime {
 #[derive(Debug)]
 struct PendingWrites {
     workspace: Option<Arc<WorkspaceState>>,
+    /// The last complete snapshot that landed. `WorkspaceState` is
+    /// copy-on-write, so a weak reference both avoids retaining its card
+    /// payloads and makes a later `Arc::make_mut` detach before changing it.
+    /// That lets an ordinary autosave of the exact same immutable snapshot
+    /// avoid another SQLite transaction and WAL write.
+    saved_workspace: Weak<WorkspaceState>,
     conversions: VecDeque<ConversionCheckpoint>,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
@@ -2162,6 +2169,7 @@ impl PendingWrites {
     ) -> Self {
         Self {
             workspace: None,
+            saved_workspace: Weak::new(),
             conversions: VecDeque::new(),
             projects: HashMap::new(),
             worktrees: HashMap::new(),
@@ -2586,6 +2594,20 @@ impl PendingWrites {
                         self.quarantine.refuse_workspace(snapshot, &error);
                         continue;
                     }
+                    // Conversion checkpoints and pane handoffs carry ordering
+                    // authority even if their materialized state happens to
+                    // match an earlier snapshot. Only a coalesced autosave
+                    // without those side effects may be a true duplicate.
+                    if autosave
+                        && adoptions.is_empty()
+                        && restorations.is_empty()
+                        && self
+                            .saved_workspace
+                            .upgrade()
+                            .is_some_and(|saved| Arc::ptr_eq(&saved, &snapshot))
+                    {
+                        continue;
+                    }
                     match store.save_workspace_with_terminal_panes(
                         &snapshot,
                         SnapshotBase {
@@ -2600,6 +2622,9 @@ impl PendingWrites {
                             self.card_generations = commit.card_generations;
                             self.quarantine.snapshot_landed(&snapshot, &commit.refused);
                             self.acknowledge_retained_copy_closures(&snapshot);
+                            if commit.refused.is_empty() {
+                                self.saved_workspace = Arc::downgrade(&snapshot);
+                            }
                         }
                         Err(error) if error.refuses_content() => {
                             self.quarantine.refuse_workspace(snapshot, &error);
