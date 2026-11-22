@@ -400,16 +400,34 @@ impl Registry {
         self.commit_delta(edit, guard, true)
     }
 
+    /// Like [`Registry::apply_delta_guarded`], but preserves a caller's
+    /// structured resident-admission refusal.  The workspace writer uses this
+    /// for title inference, whose chat guard runs only after SQLite admitted
+    /// the transaction.
+    pub(crate) fn apply_delta_guarded_with<G, E>(
+        &mut self,
+        edit: &ModelEdit,
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, E>,
+    ) -> Result<DeltaApplied, E>
+    where
+        E: From<String>,
+    {
+        self.commit_delta(edit, guard, true)
+    }
+
     /// [`Registry::apply_delta_guarded`], checking the store's schema and
     /// layout first unless `check_schema` is false: only for a caller that
     /// holds the store alone and checked it once already, since another
     /// process could otherwise have migrated it between edits.
-    fn commit_delta<G>(
+    fn commit_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
-        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, E>,
         check_schema: bool,
-    ) -> Result<DeltaApplied, String> {
+    ) -> Result<DeltaApplied, E>
+    where
+        E: From<String>,
+    {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -430,10 +448,12 @@ impl Registry {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply_recorded(&transaction, edit, &mut recorder)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged => {
-                return Err("Agent model changes are committed by the execution service".into());
+                return Err("Agent model changes are committed by the execution service"
+                    .to_owned()
+                    .into());
             }
             ModelEdit::RetiredChannelWorkChanged => {
-                return Err(crate::terminal_ipc::RETIRED_CHANNEL_WORK.into());
+                return Err(crate::terminal_ipc::RETIRED_CHANNEL_WORK.to_owned().into());
             }
             ModelEdit::OpenProject {
                 repository,
@@ -554,7 +574,7 @@ impl Registry {
                         return Err(format!(
                             "no project owns `{key}`; open the project before creating a channel \
                              in it"
-                        ));
+                        ).into());
                     }
                     let ordinal = take_ordinal(&transaction, "next_channel_ordinal")?;
                     transaction
@@ -582,7 +602,9 @@ impl Registry {
             }
             ModelEdit::SuggestChannelTitle { id, title, source } => {
                 if *source == ChannelTitleSource::Manual || title.is_empty() {
-                    return Err("channel title suggestions require a nonempty inferred title".into());
+                    return Err("channel title suggestions require a nonempty inferred title"
+                        .to_owned()
+                        .into());
                 }
                 transaction.execute(
                     "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source < ?3)",
@@ -591,11 +613,17 @@ impl Registry {
             }
             ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } => {
                 if *source == ChannelTitleSource::Manual || title.is_empty() {
-                    return Err("channel title suggestions require a nonempty inferred title".into());
+                    return Err("channel title suggestions require a nonempty inferred title"
+                        .to_owned()
+                        .into());
                 }
                 let view = views::read(&transaction, &crate::workspace_model::views::Scope::Channel(*id))?;
                 if view.revision != *expected_revision || view.primary_chat() != Some(*card) {
-                    return Err("The channel's primary conversation changed; title suggestion refused".into());
+                    return Err(
+                        "The channel's primary conversation changed; title suggestion refused"
+                            .to_owned()
+                            .into(),
+                    );
                 }
                 let retitled = transaction.execute(
                     "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source <= ?3) AND (title <> ?2 OR title_source <> ?3)",

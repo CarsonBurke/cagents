@@ -867,6 +867,7 @@ impl HostState {
         self.registry()?.model().map_err(model_unavailable)
     }
 
+    #[cfg(test)]
     pub(crate) fn edit_model_delta(
         &mut self,
         origin: ClientId,
@@ -888,61 +889,7 @@ impl HostState {
                 .registry()?
                 .title_conversation(*id, *card, *expected_revision)
                 .map_err(model_unavailable)?;
-            let invalid = || {
-                ProtocolError::new(
-                    ProtocolErrorCode::InvalidRequest,
-                    "The conversation's current name or source changed; refresh before suggesting a title",
-                    false,
-                )
-            };
-            let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
-            if expected.proof.as_ref() != Some(self.proof())
-                || actual.session.launch.provider != expected.launch.provider
-                || actual.session.launch.recipe != expected.launch.recipe
-            {
-                return Err(invalid());
-            }
-            // The request holds workspace writer admission as well as this
-            // resident identity guard. Read only current metadata, not Store,
-            // history or files; later edits cannot overtake this admission.
-            let (session, current_title) =
-                actual.handle.conversation_title().map_err(|reason| {
-                    let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
-                    ProtocolError::new(
-                        if busy {
-                            ProtocolErrorCode::QueueFull
-                        } else {
-                            ProtocolErrorCode::Internal
-                        },
-                        if busy {
-                            "Conversation metadata is busy; retry the original title suggestion"
-                        } else {
-                            "Conversation metadata is unavailable"
-                        },
-                        busy,
-                    )
-                })?;
-            // A pane that has not recorded its conversation is identified by
-            // its resident chat, as the view writer identifies it, whether or
-            // not the provider has reported the conversation yet: Claude
-            // reports it only after it reads the first prompt, and a chat
-            // shown in no window reads no snapshot, so its pane learns the
-            // conversation only when someone opens it. A pane that recorded
-            // one names only that conversation.
-            if let Some(recorded) = &expected.launch.session_id
-                && session.as_ref() != Some(recorded)
-            {
-                return Err(invalid());
-            }
-            let current_title = current_title
-                .as_deref()
-                .and_then(crate::workspace_model::channel_title);
-            match source {
-                crate::model::ChannelTitleSource::Provider
-                    if current_title.as_ref() == Some(title) => {}
-                crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
-                _ => return Err(invalid()),
-            }
+            self.validate_title_conversation(expected, title, *source)?;
         }
         if matches!(
             &edit,
@@ -976,6 +923,75 @@ impl HostState {
         Ok(applied.receipt)
     }
 
+    /// Checks the resident chat metadata that authorizes an inferred title.
+    ///
+    /// The workspace writer calls this while it holds SQL writer admission,
+    /// after it acquired that admission off the host lock. Keep it free of
+    /// registry access: an SQLite wait while HostState is held would stall
+    /// terminal delivery and every other daemon request.
+    pub(super) fn validate_title_conversation(
+        &self,
+        expected: crate::chat::Session,
+        title: &str,
+        source: crate::model::ChannelTitleSource,
+    ) -> Result<(), ProtocolError> {
+        let invalid = || {
+            ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The conversation's current name or source changed; refresh before suggesting a title",
+                false,
+            )
+        };
+        let actual = self.chats.get(&expected.id).ok_or_else(invalid)?;
+        if expected.proof.as_ref() != Some(self.proof())
+            || actual.session.launch.provider != expected.launch.provider
+            || actual.session.launch.recipe != expected.launch.recipe
+        {
+            return Err(invalid());
+        }
+        // The request holds workspace writer admission as well as this
+        // resident identity guard. Read only current metadata, not Store,
+        // history or files; later edits cannot overtake this admission.
+        let (session, current_title) = actual.handle.conversation_title().map_err(|reason| {
+            let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
+            ProtocolError::new(
+                if busy {
+                    ProtocolErrorCode::QueueFull
+                } else {
+                    ProtocolErrorCode::Internal
+                },
+                if busy {
+                    "Conversation metadata is busy; retry the original title suggestion"
+                } else {
+                    "Conversation metadata is unavailable"
+                },
+                busy,
+            )
+        })?;
+        // A pane that has not recorded its conversation is identified by its
+        // resident chat, as the view writer identifies it, whether or not the
+        // provider has reported the conversation yet: Claude reports it only
+        // after it reads the first prompt, and a chat shown in no window reads
+        // no snapshot, so its pane learns the conversation only when someone
+        // opens it. A pane that recorded one names only that conversation.
+        if let Some(recorded) = &expected.launch.session_id
+            && session.as_ref() != Some(recorded)
+        {
+            return Err(invalid());
+        }
+        let current_title = current_title
+            .as_deref()
+            .and_then(crate::workspace_model::channel_title);
+        match source {
+            crate::model::ChannelTitleSource::Provider
+                if current_title.as_deref() == Some(title) => {}
+            crate::model::ChannelTitleSource::Prompt if current_title.is_none() => {}
+            _ => return Err(invalid()),
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
         self.model.as_mut().ok_or_else(missing_registry)
     }

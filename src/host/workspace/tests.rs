@@ -85,9 +85,198 @@ fn open_project(root: &std::path::Path) -> ModelEdit {
     }
 }
 
+/// A title suggestion has to authenticate against a resident conversation,
+/// rather than trusting a pane's stale serialized launch recipe.
+fn title_chat(host: &SharedHost, root: &std::path::Path) -> crate::chat::Session {
+    use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+
+    struct Quiet;
+    impl Adapter for Quiet {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+
+        fn command(&mut self, _: crate::chat::Command) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+
+    let recipe = LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: root.to_owned(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    let mut spec = ProcessSpec::from(&recipe);
+    spec.transport = TransportSpec::History;
+    let mut initial = Step::default();
+    let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle =
+        crate::chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {})
+            .unwrap();
+    let session = crate::chat::Session {
+        id: TerminalId::new(),
+        proof: Some(host.lock().unwrap().proof().clone()),
+        terminal: None,
+        native_continuity: Default::default(),
+        owned_codex_listener: None,
+        launch: crate::chat::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe,
+            session_id: None,
+        },
+    };
+    host.lock().unwrap().chats.insert(
+        session.id,
+        crate::host::chat::Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: session.clone(),
+            handle,
+            source_process: None,
+            subscribers: Default::default(),
+            observations: Default::default(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    session
+}
+
 #[test]
 fn sqlite_writer_contention_keeps_terminal_input_and_inventory_responsive() {
     assert_sqlite_progress(false);
+}
+
+#[test]
+fn title_suggestion_sqlite_contention_keeps_the_host_lock_available() {
+    let (directory, host, _) = fixture();
+    let session = title_chat(&host, directory.path());
+    let channel = crate::model::ChannelId::new();
+    process_request(
+        &host,
+        1,
+        ClientRequest::ApplyWorkspaceEdit {
+            edit: open_project(directory.path()),
+        },
+    )
+    .unwrap();
+    process_request(
+        &host,
+        1,
+        ClientRequest::ApplyWorkspaceEdit {
+            edit: ModelEdit::CreateChannel {
+                id: channel,
+                repository: directory.path().to_owned(),
+                title: String::new(),
+                title_source: Default::default(),
+            },
+        },
+    )
+    .unwrap();
+    let card = CardId::new();
+    let response = process_request(
+        &host,
+        1,
+        ClientRequest::ApplyWorkspaceEdit {
+            edit: ModelEdit::SeedView {
+                scope: Scope::Channel(channel),
+                panes: vec![Pane {
+                    id: card,
+                    title: "Chat".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.,
+                    scope: Some(directory.path().to_owned()),
+                    kind: CardKind::Chat(session.clone()),
+                }],
+                closed: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let ServerResponse::WorkspaceEdit(receipt) = response.0 else {
+        panic!("seeding the conversation pane must return its delta receipt")
+    };
+    let revision = receipt.effects.views[0]
+        .after
+        .expect("newly seeded view has a revision");
+    let blocker = rusqlite::Connection::open(directory.path().join("model.sqlite3")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let registry = writer(&host).unwrap();
+    let (finished, completion) = mpsc::channel();
+    let editor = {
+        let host = host.clone();
+        thread::spawn(move || {
+            let result = process_request(
+                &host,
+                1,
+                ClientRequest::ApplyWorkspaceEdit {
+                    edit: ModelEdit::SuggestConversationTitle {
+                        id: channel,
+                        card,
+                        expected_revision: revision,
+                        title: "A prompt title".into(),
+                        source: crate::model::ChannelTitleSource::Prompt,
+                    },
+                },
+            );
+            finished.send(()).unwrap();
+            result
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let entered = loop {
+        if matches!(
+            registry.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            break true;
+        }
+        if Instant::now() >= deadline || completion.try_recv().is_ok() {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(
+        entered,
+        "title publication did not reach SQLite writer admission"
+    );
+    let (listed, response) = mpsc::channel();
+    let inspector = {
+        let host = host.clone();
+        thread::spawn(move || {
+            listed
+                .send(process_request(&host, 2, ClientRequest::List))
+                .unwrap();
+        })
+    };
+    let during_contention = response.recv_timeout(Duration::from_secs(1));
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let result = editor.join().unwrap();
+    inspector.join().unwrap();
+    let (reply, _, _) = during_contention
+        .expect("terminal inventory blocked behind a title suggestion's SQLite wait")
+        .unwrap();
+    assert!(matches!(reply, ServerResponse::Listed { .. }));
+    assert!(matches!(
+        result.unwrap().0,
+        ServerResponse::WorkspaceEdit(_)
+    ));
+    host.lock()
+        .unwrap()
+        .chats
+        .remove(&session.id)
+        .unwrap()
+        .handle
+        .close()
+        .unwrap();
 }
 
 #[test]
