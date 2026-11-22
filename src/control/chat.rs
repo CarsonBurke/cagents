@@ -539,6 +539,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.data["resident"], 128);
-        assert!(output.human.contains("Existing work is unchanged"));
+        assert!(output.human.contains("Open chats keep working"));
     }
 }
