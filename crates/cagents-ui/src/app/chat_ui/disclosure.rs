@@ -355,7 +355,7 @@ mod tests {
             let mut element = row(
                 "Thinking".to_owned(),
                 "Reasoning".into(),
-                Icon::Agent,
+                Icon::Reasoning,
                 None,
                 Some("12s".into()),
                 expanded,

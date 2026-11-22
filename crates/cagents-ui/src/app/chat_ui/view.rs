@@ -7380,7 +7380,7 @@ impl Runtime {
             let header = disclosure::row(
                 label,
                 name,
-                Icon::Agent,
+                Icon::Reasoning,
                 (!finished).then_some(chat::ToolStatus::Running),
                 elapsed,
                 has_text.then_some(expanded),
@@ -7466,7 +7466,7 @@ fn pause_row<'a>(id: &str, millis: u64) -> virtualized::Row<'a> {
         None,
         move || {
             let name = format!("Reasoning: {label}");
-            let line = disclosure::row(label, name, Icon::Agent, None, None, None, None);
+            let line = disclosure::row(label, name, Icon::Reasoning, None, None, None, None);
             widget::container(line)
                 .width(Length::Fill)
                 .padding(iced::Padding::ZERO.top(step::GAP_XS))
