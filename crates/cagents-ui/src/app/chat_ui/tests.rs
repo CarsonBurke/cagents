@@ -14611,6 +14611,33 @@ fn resume_command_opens_the_picker_for_this_conversation() {
     );
 }
 
+/// A model pick alone is a click to redo, so it does not keep the draft from
+/// giving its place to the conversation `/resume` chose.
+#[test]
+fn a_draft_with_only_a_model_pick_gives_its_place_to_a_resume() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let project = tempfile::tempdir().unwrap();
+    let card = draft_in(&mut app, project.path());
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("draft runtime")
+    };
+    runtime.draft_model_chosen = true;
+    assert!(
+        !app.chat_is_unused(card),
+        "the pick keeps an automatic draft"
+    );
+    write(&mut app, card, "/resume");
+    submit(&mut app, card);
+    assert_eq!(app.resume_ui.replace, Some(card));
+    let _ = app.resume_saved_conversation(earlier(&app, card));
+    assert_eq!(
+        app.workspace
+            .pending_close()
+            .map(|handoff| handoff.unmounting),
+        Some(card),
+    );
+}
+
 /// A draft is replaced only while the picker it asked for is open.
 #[test]
 fn a_draft_outlives_a_cancelled_resume() {

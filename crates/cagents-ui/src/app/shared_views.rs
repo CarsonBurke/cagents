@@ -3700,6 +3700,9 @@ impl Cagents {
             {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
+            if matches!(shared.kind, CardKind::Chat(_)) {
+                self.carry_draft_model(alias, shared.id);
+            }
             self.detach_shared_pane(alias);
             self.remove_shared_channel_member(alias);
         }

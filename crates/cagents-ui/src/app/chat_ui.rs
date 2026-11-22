@@ -3535,12 +3535,6 @@ fn known_append(
         || prose.proves(previous, current)
 }
 
-/// Text, attachments and an explicit or restored model/effort choice are
-/// local draft work. Lifecycle and transition guards stay with their callers.
-fn draft_has_local_work(has_text: bool, attachments: &[Attachment], model_chosen: bool) -> bool {
-    has_text || !attachments.is_empty() || model_chosen
-}
-
 impl Runtime {
     /// The word the caret is naming something with and the rows offered for
     /// it, or `None` while there is nothing to offer.
@@ -4245,15 +4239,6 @@ impl Runtime {
             .as_deref()
             .filter(|_| self.history_cursor.is_some())
             .unwrap_or(&self.attachments)
-    }
-
-    fn has_local_draft_work(&self, saved_model: Option<&ChatDraftModel>) -> bool {
-        draft_has_local_work(
-            self.has_unsent_text(),
-            self.unsent_attachments(),
-            (self.draft_model_chosen && self.session.is_unstarted())
-                || saved_model.is_some_and(|model| model.applies_to(&self.session)),
-        )
     }
 
     /// Checks carried-over unsent text against the message `echo` names,
@@ -8616,7 +8601,9 @@ impl Cagents {
             || previous.launch.recipe.environment != session.launch.recipe.environment
             || previous.launch.recipe.working_directory != session.launch.recipe.working_directory;
         if let Some(fresh) = fresh {
-            // Pickers listed the earlier provider's choices.
+            // Pickers listed the earlier provider's choices, and this window
+            // picked none of the new provider's.
+            runtime.draft_model_chosen = false;
             runtime.model_picker = None;
             runtime.account_picker = false;
             runtime.permission_picker = false;
@@ -8946,15 +8933,22 @@ impl Cagents {
         self.chat_ui.default_chats.contains(&card) && self.chat_is_unused(card)
     }
 
+    /// An empty draft that has not been made this card's own: nothing typed
+    /// or attached, and no model or effort picked for it.
     pub(super) fn chat_is_unused(&self, card: CardId) -> bool {
+        self.chat_draft_is_empty(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
+                if !runtime.draft_model_chosen)
+    }
+
+    /// A draft with nothing to send yet. A model or effort pick alone is a
+    /// click to redo, so it does not stop the pane giving way to another.
+    pub(super) fn chat_draft_is_empty(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
             if runtime.session.is_unstarted()
                 && runtime.choosing()
-                && !draft_has_local_work(
-                    !runtime.composer.is_empty(),
-                    &runtime.attachments,
-                    runtime.draft_model_chosen,
-                )
+                && runtime.composer.is_empty()
+                && runtime.attachments.is_empty()
                 && runtime.commands.is_idle())
             && !self.chat_start_pending(card)
     }
@@ -9771,26 +9765,40 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
             _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
         };
+        // A model or effort pick is not unsaved work: it does not keep a pane
+        // another window closed, or hold back a shared identity change.
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
-                || runtime.has_local_draft_work(self.chat_ui.draft_models.get(&card))
+                || runtime.has_unsent_text()
+                || !runtime.unsent_attachments().is_empty()
                 || runtime.transition_blocker().is_some()
-        }) || draft_has_local_work(
-            self.chat_ui
-                .drafts
-                .get(&card)
-                .is_some_and(|draft| !draft.is_empty()),
-            self.chat_ui
+        }) || self
+            .chat_ui
+            .drafts
+            .get(&card)
+            .is_some_and(|draft| !draft.is_empty())
+            || self
+                .chat_ui
                 .draft_attachments
                 .get(&card)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            self.chat_ui.draft_models.get(&card).is_some_and(|model| {
-                self.card_state(card).is_some_and(|state| {
-                    matches!(&state.kind, CardKind::Chat(session) if model.applies_to(session))
-                })
-            }),
-        )
+                .is_some_and(|images| !images.is_empty())
+    }
+
+    /// Gives `to` the model and effort picked in `from`'s draft, when a shared
+    /// pane takes a new card identity. It applies only if `to` opens on the
+    /// same draft.
+    pub(super) fn carry_draft_model(&mut self, from: CardId, to: CardId) {
+        let live = match self.cards.get(&from) {
+            Some(CardRuntime::Chat(runtime)) => runtime.draft_model(),
+            _ => self
+                .chat_ui
+                .parked
+                .get(&from)
+                .and_then(|runtime| runtime.draft_model()),
+        };
+        if let Some(model) = live.or_else(|| self.chat_ui.draft_models.remove(&from)) {
+            self.chat_ui.draft_models.insert(to, model);
+        }
     }
 
     /// A live or starting conversation no authoritative view has ever listed.
@@ -14397,7 +14405,7 @@ impl Cagents {
                         runtime.error = None;
                     }
                     self.resume_ui.replace =
-                        self.chat_is_unused(target.card).then_some(target.card);
+                        self.chat_draft_is_empty(target.card).then_some(target.card);
                     return task;
                 }
                 if runtime.is_draft() {

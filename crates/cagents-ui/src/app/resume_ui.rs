@@ -1941,7 +1941,7 @@ impl Cagents {
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.
         let replace = replace.filter(|card| {
-            self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
+            self.chat_draft_is_empty(*card) && self.workspace.order().any(|id| id == *card)
         });
         // What it had not sent when its card closed comes back with it, once
         // it starts.

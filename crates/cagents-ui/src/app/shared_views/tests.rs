@@ -6057,30 +6057,49 @@ fn restored_model_only_shared_draft() -> (
     (restored, channel, card, chosen, pane)
 }
 
+/// A model pick is not unsaved work: another window closing the pane closes
+/// it here too, with nothing to save or discard.
 #[test]
-fn peer_removal_retains_a_reopened_drafts_model_only_work() {
-    let (mut app, channel, card, chosen, _) = restored_model_only_shared_draft();
+fn peer_removal_closes_a_reopened_draft_with_only_a_model_pick() {
+    let (mut app, channel, card, _, _) = restored_model_only_shared_draft();
     let mut view = View::empty(channel);
     view.retired.push(card);
     app.workspace_model.views = vec![view];
     drop(app.reconcile_shared_views());
-    assert!(app.card_state(card).unwrap().existence.is_open());
-    assert!(app.shared_views.retained.contains(&card));
-    assert_eq!(app.persistent_workspace().chat_draft_models[&card], chosen);
+    assert!(!app.card_state(card).unwrap().existence.is_open());
+    assert!(!app.shared_views.retained.contains(&card));
+    assert!(
+        !app.persistent_workspace()
+            .chat_draft_models
+            .contains_key(&card)
+    );
 }
 
+/// A shared pane taking a new card identity is not held back by a model pick;
+/// the pick moves to the new card with its draft.
 #[test]
-fn alias_adoption_preserves_a_reopened_drafts_model_only_work() {
+fn alias_adoption_carries_a_reopened_drafts_model_pick() {
     let (mut app, channel, alias, chosen, mut canonical) = restored_model_only_shared_draft();
     canonical.id = CardId::new();
     let mut view = View::empty(channel);
     view.panes.push(canonical.clone());
     app.workspace_model.views = vec![view];
     drop(app.reconcile_shared_views());
-    assert!(app.shared_views.blocked.contains(&Scope::Channel(channel)));
-    assert!(app.card_state(alias).unwrap().existence.is_open());
-    assert!(app.card_state(canonical.id).is_none());
-    assert_eq!(app.persistent_workspace().chat_draft_models[&alias], chosen);
+    assert!(!app.shared_views.blocked.contains(&Scope::Channel(channel)));
+    assert!(
+        !app.card_state(alias)
+            .is_some_and(|state| state.existence.is_open())
+    );
+    assert!(app.card_state(canonical.id).unwrap().existence.is_open());
+    assert!(
+        matches!(app.cards.get(&canonical.id), Some(CardRuntime::Chat(_))),
+        "the canonical pane opens its draft"
+    );
+    // Saved from the open draft only because it took the pick as its own.
+    assert_eq!(
+        app.persistent_workspace().chat_draft_models[&canonical.id],
+        chosen
+    );
 }
 
 #[test]
