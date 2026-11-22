@@ -154,7 +154,16 @@ fn start(
             .name("capture".to_owned())
             .spawn(move || {
                 // Listen first, then load the model while the person speaks.
-                let (source, mut resample, detector) = match open(&directory, model) {
+                let opened = open(&directory, model);
+                // Cancelled while the input opened: there is nothing to load
+                // a model for, and the session ends as cancelled however
+                // the opening went.
+                if control.cancel.load(Ordering::Acquire) {
+                    drop(opened);
+                    emit(Event::Cancelled { session });
+                    return;
+                }
+                let (source, mut resample, detector) = match opened {
                     Ok(opened) => opened,
                     Err(error) => {
                         // Without loading a model for nothing: the
