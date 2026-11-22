@@ -4205,6 +4205,18 @@ fn a_harness_error_is_shown_without_its_framing() {
             "<tool_use_error>InputValidationError: Invalid URL</tool_use_error>",
             "InputValidationError: Invalid URL",
         ),
+        (
+            "mcp__docs__search",
+            json!({"query":"seal"}),
+            "<tool_use_error>Error: No such tool available: mcp__docs__search</tool_use_error>",
+            "Claude called mcp__docs__search, which isn't available. Its MCP server may not be connected.",
+        ),
+        (
+            "Tasks",
+            json!({}),
+            "\n<tool_use_error>Error: No such tool available: Tasks. Did you mean Task?</tool_use_error>\n",
+            "No such tool available: Tasks. Did you mean Task?",
+        ),
     ];
     for (name, input, result, shown) in cases {
         let mut adapter = Claude::default();

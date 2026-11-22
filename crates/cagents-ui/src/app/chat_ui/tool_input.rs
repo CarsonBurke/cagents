@@ -26,6 +26,9 @@ use std::fmt;
 /// scans.
 const LIMIT: usize = 256 * 1024;
 
+/// Inputs nested deeper than this are shown as they came.
+const DEPTH: usize = 16;
+
 /// How an input is drawn: the lines of its readable form, and whether they
 /// are a shell command to highlight as one.
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +53,11 @@ pub(super) fn readable(input: &str) -> Option<Readable> {
         return None;
     }
     let node: Node = serde_json::from_str(trimmed).ok()?;
+    // Each level indents its lines further, so deep nesting would multiply
+    // the input's size; arguments nested that deep are not read as lines.
+    if node.depth() > DEPTH {
+        return None;
+    }
     if let Node::Map(members) = &node
         && let [(key, Node::Text(command))] = members.as_slice()
         && matches!(key.as_str(), "command" | "cmd")
@@ -100,6 +108,21 @@ enum Node {
 }
 
 impl Node {
+    /// How many lists and objects deep the value nests.
+    fn depth(&self) -> usize {
+        match self {
+            Node::List(items) => 1 + items.iter().map(Node::depth).max().unwrap_or(0),
+            Node::Map(members) => {
+                1 + members
+                    .iter()
+                    .map(|(_, value)| value.depth())
+                    .max()
+                    .unwrap_or(0)
+            }
+            Node::Text(_) | Node::Scalar(_) => 0,
+        }
+    }
+
     /// The value on its key's line, when it fits there.
     fn inline(&self) -> Option<&str> {
         match self {
@@ -317,5 +340,8 @@ mod tests {
         }
         let large = json!({ "content": "x".repeat(LIMIT) }).to_string();
         assert_eq!(readable(&large), None);
+        let nested = |depth| format!("{}\"a\nb\"{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(readable(&nested(DEPTH)).is_some());
+        assert_eq!(readable(&nested(DEPTH + 1)), None);
     }
 }

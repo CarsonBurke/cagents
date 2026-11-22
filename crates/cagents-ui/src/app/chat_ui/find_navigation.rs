@@ -1345,9 +1345,6 @@ fn contains_checked(
     pattern: &find::Pattern,
     current: &impl Fn() -> bool,
 ) -> Option<bool> {
-    // A tool's input is matched as its detail shows it, which is what a
-    // match is revealed in.
-    let shown_input;
     let mut texts: Vec<&str> = Vec::new();
     match content {
         ItemContent::Text { text, .. } => texts.push(text),
@@ -1369,8 +1366,18 @@ fn contains_checked(
             output,
             ..
         } => {
-            shown_input = tool_text::tool_input(input).0;
-            texts.extend([name.as_str(), &shown_input, output.as_str()])
+            for text in [name, output] {
+                if matches_checked(text, pattern, current)? {
+                    return Some(true);
+                }
+            }
+            // The input is matched as its detail shows it, which is what a
+            // match is revealed in. Reading it is the costly part, so it
+            // waits until nothing cheaper has matched.
+            if !current() {
+                return None;
+            }
+            return matches_checked(&tool_text::tool_input(input).0, pattern, current);
         }
         ItemContent::Changes { changes, .. } => {
             for change in changes {
@@ -2064,6 +2071,26 @@ impl Drop for MetadataBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Find matches a call's input as its detail reads, not as the JSON the
+    /// provider sent: the command's quotes match, their escapes don't.
+    #[test]
+    fn a_tool_input_is_found_as_its_detail_reads() {
+        let tool = ItemContent::Tool {
+            name: "cagents".into(),
+            input: r#"{"command":"reply 67218a1b \"lead: noted\""}"#.into(),
+            output: String::new(),
+            status: chat::ToolStatus::Failed,
+        };
+        let found = |query: &str| {
+            let pattern = find::Pattern::prepare(query, &|| true).unwrap();
+            contains_checked(&tool, &pattern, &|| true).unwrap()
+        };
+        assert!(found(r#"67218a1b "lead"#));
+        assert!(!found(r#"\"lead"#));
+        assert!(!found(r#"{"command""#));
+        assert!(found("cagents"));
+    }
     fn runtime(body: &str) -> (Cagents, Target, Arc<ClientHandle>) {
         let account = Account::system(Provider::Claude);
         let session = fresh_chat_session(

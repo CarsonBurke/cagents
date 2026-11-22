@@ -6677,7 +6677,9 @@ fn apply_result(
 /// wraps around an error its harness raised, rather than the tool, such as
 /// a refused input or a blocked command. The tags and the `Error: ` they
 /// often hold are framing for the model; the reader is shown the sentence.
-/// A call to a tool Claude Code doesn't have says so plainly.
+/// A call to a tool Claude Code doesn't have says so plainly. An MCP tool
+/// is missing the same way when its server failed to start or dropped, so
+/// that case points at the server rather than at the model.
 fn harness_error(text: String) -> String {
     let Some(inner) = text
         .trim()
@@ -6688,9 +6690,16 @@ fn harness_error(text: String) -> String {
     };
     let inner = inner.trim();
     let inner = inner.strip_prefix("Error: ").unwrap_or(inner);
-    match inner.strip_prefix("No such tool available: ") {
-        Some(tool) if !tool.trim().is_empty() => super::unknown_tool("Claude", tool.trim()),
-        _ => inner.to_owned(),
+    match inner
+        .strip_prefix("No such tool available: ")
+        .map(str::trim)
+        .filter(|tool| !tool.is_empty() && !tool.contains(char::is_whitespace))
+    {
+        Some(tool) if tool.starts_with("mcp__") => {
+            format!("Claude called {tool}, which isn't available. Its MCP server may not be connected.")
+        }
+        Some(tool) => super::unknown_tool("Claude", tool),
+        None => inner.to_owned(),
     }
 }
 
