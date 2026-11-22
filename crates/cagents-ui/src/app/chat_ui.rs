@@ -7580,6 +7580,8 @@ impl Cagents {
     /// repositories or the worktree rows changed, it compares a revision per
     /// project and a stamp per chat and does nothing else.
     pub(super) fn sync_pull_request_labels(&mut self) {
+        use crate::performance::ui_trace::{Phase, part};
+        let board_part = part(Phase::Projection, "labels board refresh");
         let github = &self.github_availability;
         self.pull_request_board
             .refresh(&self.sidebar_model.projects, |project| {
@@ -7594,7 +7596,11 @@ impl Cagents {
         // A conversation counts as watched once the shown inspector holds a
         // list taken since it last turned to it, not merely while it is shown:
         // until then what a chat took earlier may no longer be true.
+        drop(board_part);
+        let watched_part = part(Phase::Projection, "labels watched conversations");
         let watched = self.listed_watched_conversations();
+        drop(watched_part);
+        let _stale_part = part(Phase::Projection, "labels stale chats");
         let stale = self
             .cards
             .iter()
@@ -7621,6 +7627,10 @@ impl Cagents {
     /// Builds one chat's labels from the window's index and what the
     /// inspector listed for its conversation.
     fn relabel_chat(&mut self, card: CardId, built_from: LabelSources) {
+        let _part = crate::performance::ui_trace::part(
+            crate::performance::ui_trace::Phase::Projection,
+            "labels relabel chat",
+        );
         // The project whose repository the chat works in, whatever channel it
         // is filed under: the sidebar's channel filing is not where it works.
         let project = self.card_state(card).and_then(|state| {

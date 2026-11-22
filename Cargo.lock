@@ -4667,6 +4667,7 @@ dependencies = [
  "iced_futures",
  "image",
  "kamadak-exif",
+ "libc",
  "log",
  "lyon_path",
  "raw-window-handle",

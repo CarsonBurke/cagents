@@ -40,3 +40,16 @@ between layers with different clips. iced_wgpu presents
 unchanged layers again without preparing them while it holds
 (vendor/iced-wgpu/README.cagents.md). `layer_revision` in
 `crates/iced-contracts` covers it.
+
+# Presentation timing
+
+`present` (`src/present.rs`) times one presentation by stage: acquiring the
+surface image, preparing and rendering the layers, submitting the command
+buffer and swapping, with the presenting thread's CPU time over all of it. The
+shell brackets each presentation with `begin` and `end` only while the
+application traces frames (vendor/iced-winit/README.cagents.md), and the wgpu
+compositor marks each stage with `lap` (vendor/iced-wgpu/README.cagents.md).
+Until a shell enables it, each call reads one thread-local flag and no clock.
+It answers whether a cheap frame's presentation is CPU encoding or waiting on
+the GPU or the compositor. Remove it when the pinned dependency offers
+equivalent timing.

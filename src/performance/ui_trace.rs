@@ -104,6 +104,13 @@ impl Entry {
     }
 }
 
+/// Times one labeled share of a phase, such as the sidebar's part of
+/// `view` or the chat's part of `subscription`, reported beneath the phase's
+/// total without adding to it.
+pub fn part(phase: Phase, label: &'static str) -> Scope {
+    Scope(enabled().then(|| Entry::new(phase, Box::from(label), false)))
+}
+
 /// Times one `update`, named by its message's variants, such as
 /// `ChatUi(Stream`. A nested update is part of the outermost one.
 pub fn update(message: &dyn Debug) -> Scope {
@@ -216,6 +223,9 @@ struct Recorder {
     frames: Vec<Duration>,
     /// The time between consecutive presented frames.
     intervals: Vec<Duration>,
+    /// How presenting each frame went, where the compositor reports it.
+    #[cfg(feature = "development")]
+    presents: Vec<cosmic::iced::advanced::graphics::present::Timing>,
 }
 
 /// Records a frame the shell presented.
@@ -230,6 +240,9 @@ fn frame(frame: cosmic::iced::runtime::frame::Frame) {
     RECORDER.with_borrow_mut(|recorder| {
         recorder.frames.push(frame.work);
         recorder.intervals.extend(frame.interval);
+        recorder
+            .presents
+            .extend(cosmic::iced::advanced::graphics::present::take());
         recorder.roll();
     });
 }
@@ -251,6 +264,36 @@ fn quantiles(values: &mut [Duration]) -> String {
 }
 
 impl Recorder {
+    /// Each presentation stage's quantiles, and the thread's CPU time over
+    /// the whole presentation, whose shortfall from its wall time is time
+    /// spent waiting on the GPU or the compositor.
+    #[cfg(feature = "development")]
+    fn report_presents(&self) {
+        use cosmic::iced::advanced::graphics::present::Timing;
+        if self.presents.is_empty() {
+            return;
+        }
+        let stages: [(&str, fn(&Timing) -> Option<Duration>); 7] = [
+            ("total", |timing| Some(timing.total)),
+            ("cpu", |timing| timing.cpu),
+            ("acquire", |timing| Some(timing.acquire)),
+            ("prepare", |timing| Some(timing.prepare)),
+            ("render", |timing| Some(timing.render)),
+            ("submit", |timing| Some(timing.submit)),
+            ("swap", |timing| Some(timing.swap)),
+        ];
+        for (stage, read) in stages {
+            let mut values: Vec<_> = self.presents.iter().filter_map(read).collect();
+            if !values.is_empty() {
+                eprintln!(
+                    "ui-trace   Present {stage} n={} {}",
+                    values.len(),
+                    quantiles(&mut values)
+                );
+            }
+        }
+    }
+
     fn new() -> Self {
         Self {
             started: Instant::now(),
@@ -258,6 +301,8 @@ impl Recorder {
             labels: HashMap::new(),
             frames: Vec::new(),
             intervals: Vec::new(),
+            #[cfg(feature = "development")]
+            presents: Vec::new(),
         }
     }
 
@@ -319,13 +364,15 @@ impl Recorder {
                 quantiles(&mut self.intervals)
             );
         }
+        #[cfg(feature = "development")]
+        self.report_presents();
         let mut labels: Vec<_> = self.labels.iter().collect();
         labels.sort_by_key(|((phase, _), stat)| (*phase, std::cmp::Reverse(stat.total)));
         let mut shown = HashMap::<Phase, usize>::new();
         for ((phase, label), stat) in labels {
             let limit = match phase {
-                Phase::Update => Some(8),
-                Phase::Projection => Some(24),
+                Phase::Update => Some(16),
+                Phase::Projection => Some(40),
                 _ => None,
             };
             let count = shown.entry(*phase).or_default();
@@ -519,6 +566,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Region<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.label.is_empty()
+            && matches!(
+                event,
+                Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed { .. })
+            )
+        {
+            // From the window's handling of a key press to the frame that
+            // follows it, which shows its effect if it had one.
+            latency_to_next_frame("key press", Instant::now());
+        }
         let _scope = self.event_scope(event);
         self.content.as_widget_mut().update(
             &mut tree.children[0],

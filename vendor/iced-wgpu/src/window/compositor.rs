@@ -342,7 +342,9 @@ pub fn present(
     background_color: Color,
     on_pre_present: impl FnOnce(),
 ) -> Result<(), compositor::SurfaceError> {
-    match surface.get_current_texture() {
+    let acquired = surface.get_current_texture();
+    graphics::present::lap(graphics::present::Stage::Acquire);
+    match acquired {
         Ok(frame) => {
             if frame.texture.width() != viewport.physical_width()
                 || frame.texture.height() != viewport.physical_height()
@@ -366,6 +368,7 @@ pub fn present(
             // Present the frame
             on_pre_present();
             frame.present();
+            graphics::present::lap(graphics::present::Stage::Swap);
 
             if suboptimal {
                 return Err(compositor::SurfaceError::Outdated);

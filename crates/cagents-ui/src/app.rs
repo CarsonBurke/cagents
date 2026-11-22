@@ -12102,7 +12102,25 @@ impl Cagents {
         focused: bool,
         splitter: bool,
     ) -> Element<'_, Message> {
-        self.card_view(id, focused, splitter)
+        let label = match self.cards.get(&id) {
+            None => "pane absent",
+            Some(CardRuntime::Loading) => "pane loading",
+            Some(CardRuntime::Failed(_)) => "pane failed",
+            Some(CardRuntime::Completed) => "pane completed",
+            Some(CardRuntime::Terminal(_)) => "pane terminal",
+            Some(CardRuntime::Chat(_)) => "pane chat",
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(_)) => "pane browser",
+            Some(CardRuntime::Repository(_)) => "pane repository",
+            Some(CardRuntime::PullRequests(_)) => "pane pull requests",
+            Some(CardRuntime::Settings) => "pane settings",
+            Some(CardRuntime::Accounts) => "pane accounts",
+            Some(CardRuntime::Automations) => "pane automations",
+            Some(CardRuntime::Work) => "pane work",
+        };
+        let _part =
+            crate::performance::ui_trace::part(crate::performance::ui_trace::Phase::View, label);
+        crate::performance::ui_trace::region(label, self.card_view(id, focused, splitter))
     }
 
     fn card_view<'a>(
@@ -16609,23 +16627,40 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let _trace =
             crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::Subscription);
-        let operation_subscriptions = self.worktree_progress_subscriptions();
+        // Times each part beneath the phase's total, to find the costly ones.
+        macro_rules! part {
+            ($label:literal, $subscription:expr) => {{
+                let _part = crate::performance::ui_trace::part(
+                    crate::performance::ui_trace::Phase::Subscription,
+                    $label,
+                );
+                $subscription
+            }};
+        }
+        let operation_subscriptions =
+            part!("worktree progress", self.worktree_progress_subscriptions());
         let mut subscriptions = vec![
-            self.chat_subscription(),
-            self.notification_subscription(),
-            self.notice_expiry_subscription(),
+            part!("chat", self.chat_subscription()),
+            part!("notification", self.notification_subscription()),
+            part!("notice expiry", self.notice_expiry_subscription()),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
             Subscription::run(crate::desktop_cursor_blink::stream).map(Message::CursorBlink),
-            self.refresh_subscription(),
-            self.review_request_subscription(),
-            self.git_subscription(),
-            self.account_subscription(),
-            self.automation_subscription(),
-            self.work_subscription(),
-            self.conversation_pull_request_subscription(),
-            self.automation_approval_subscription(),
-            self.document_tone_subscription(),
-            self.update_subscription(),
+            part!("refresh", self.refresh_subscription()),
+            part!("review request", self.review_request_subscription()),
+            part!("git", self.git_subscription()),
+            part!("account", self.account_subscription()),
+            part!("automation", self.automation_subscription()),
+            part!("work", self.work_subscription()),
+            part!(
+                "conversation pull request",
+                self.conversation_pull_request_subscription()
+            ),
+            part!(
+                "automation approval",
+                self.automation_approval_subscription()
+            ),
+            part!("document tone", self.document_tone_subscription()),
+            part!("update", self.update_subscription()),
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
                 terminal_wake_stream,
@@ -17132,6 +17167,10 @@ impl Application for Cagents {
     fn view(&self) -> Element<'_, Message> {
         let _trace = crate::performance::ui_trace::scope(crate::performance::ui_trace::Phase::View);
         let sidebar_mode = self.projects_sidebar_mode();
+        let sidebar_part = crate::performance::ui_trace::part(
+            crate::performance::ui_trace::Phase::View,
+            "sidebar",
+        );
         let sidebar = sidebar::view_cached(
             &self.sidebar_model,
             &self.sidebar_state,
@@ -17143,7 +17182,12 @@ impl Application for Cagents {
             !self.core.window.sharp_corners,
         )
         .map(Message::Sidebar);
+        drop(sidebar_part);
         let sidebar = crate::performance::ui_trace::region("sidebar", sidebar);
+        let workspace_part = crate::performance::ui_trace::part(
+            crate::performance::ui_trace::Phase::View,
+            "workspace",
+        );
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
@@ -17326,8 +17370,16 @@ impl Application for Cagents {
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
+        drop(workspace_part);
         let workspace = crate::performance::ui_trace::region("workspace", workspace);
+        let chrome_part =
+            crate::performance::ui_trace::part(crate::performance::ui_trace::Phase::View, "chrome");
         let main_content = self.workspace_chrome(workspace);
+        drop(chrome_part);
+        let bars_part = crate::performance::ui_trace::part(
+            crate::performance::ui_trace::Phase::View,
+            "bars and overlays",
+        );
         let surface: Element<'_, Message> = widget::row::with_children(vec![sidebar, main_content])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -17367,6 +17419,7 @@ impl Application for Cagents {
             .or_else(|| self.workspace_switcher())
             .unwrap_or_else(|| iced::widget::Space::new().into());
         let surface = crate::interaction::layer(surface, switcher);
+        drop(bars_part);
         let surface = crate::interaction::drive_animation(
             surface,
             self.workspace.is_animating() || self.pane_inspectors.is_animating(),
