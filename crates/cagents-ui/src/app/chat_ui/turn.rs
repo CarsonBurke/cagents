@@ -2791,4 +2791,34 @@ mod tests {
             "Sent 2 messages to main: Rebase first. · Queued"
         );
     }
+
+    /// A send that failed is known by the name it was given and its retry
+    /// by the agent it reached; one agent sent the words twice is not two.
+    #[test]
+    fn a_failed_message_and_its_retry_are_to_one_agent() {
+        let pinned = |message: Coordinated, agent: &str| {
+            let mut reading = message.reading.clone();
+            reading.subagents = vec![agent.to_owned()];
+            Coordinated::new(reading)
+        };
+        let (first, second) = (
+            pinned(sent("main", "Rebase first."), "main"),
+            pinned(sent("main", "Rebase first."), "a0aac0bb3f21"),
+        );
+        let coordinated = |item: &Item| match item.id.as_str() {
+            "m1" => Some(&first),
+            "m2" => Some(&second),
+            _ => None,
+        };
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("m1", ToolStatus::Failed),
+            command("m2", ToolStatus::Succeeded),
+        ];
+        let turns = group(&items, &unasked(), coordinated);
+        assert_eq!(
+            turns[1].summary,
+            "Sent 2 messages to main: Rebase first. · 1 not sent · 1 queued"
+        );
+    }
 }

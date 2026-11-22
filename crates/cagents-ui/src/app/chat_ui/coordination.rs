@@ -526,12 +526,12 @@ fn reported<'a>(item: &'a chat::Item, coordinated: &Coordinated) -> (ToolStatus,
 pub(super) struct MessageRun {
     verb: &'static str,
     /// How many: "11 agents" where each went to its own with the same
-    /// words, "2 messages to main" where some went to one agent again,
-    /// otherwise "3 messages".
+    /// words, otherwise "3 messages".
     count: String,
-    /// The words they share, or else whom they went to.
+    /// The words they share, or else whom they went to, and the words when
+    /// one agent was sent them again.
     preview: String,
-    /// Whether the preview is the words they share.
+    /// Whether the preview is the words each agent was sent.
     shared: bool,
     state: RowStatus,
 }
@@ -594,20 +594,21 @@ impl MessageRun {
                 .then(|| said.map(|said| one_line_of(said)).unwrap_or_default()),
             _ => None,
         };
-        let shares = shared.is_some();
-        let (verb, count, preview) = match shared {
-            Some(said) if addressed.len() == count => ("Messaged", format!("{count} agents"), said),
+        // Each to its own agent only where neither the agents nor the names
+        // they go by repeat: a send that failed is keyed by the name it was
+        // given and its retry by the agent it reached, which are one.
+        let each = addressed.len() == count && recipients.len() == count;
+        let to = format!("to {}", recipients.join(", "));
+        let (verb, count, preview, shares) = match shared {
+            Some(said) if each => ("Messaged", format!("{count} agents"), said, true),
             // The same words sent again, as a retry is, still say whom to.
             Some(said) => (
                 "Sent",
-                format!("{count} messages to {}", recipients.join(", ")),
-                said,
-            ),
-            None => (
-                "Sent",
                 format!("{count} messages"),
-                format!("to {}", recipients.join(", ")),
+                format!("{to}: {said}"),
+                false,
             ),
+            None => ("Sent", format!("{count} messages"), to, false),
         };
         Some(Self {
             verb,
