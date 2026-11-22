@@ -451,8 +451,7 @@ impl Cagents {
             // again, and the pane waits for that answer, unattached (see
             // `resume_stopping_chats`).
             if self.awaits_stop(&session) {
-                self.stash_unsent_chat(card);
-                self.cards.remove(&card);
+                self.hold_returned_unsent(card);
                 return kept;
             }
             return Task::batch([kept, self.open_chat(card, session, chat::Intent::Restore)]);
@@ -847,7 +846,8 @@ impl Cagents {
     /// conversation already open is brought into view instead.
     pub(in crate::app) fn reopen_refused_close(&mut self, id: TerminalId) -> Task<Message> {
         // A pane its view holds goes back to the conversation once admitted,
-        // which takes the record then: Reopen goes to that pane.
+        // which takes the record then: Reopen goes to that pane. A fenced
+        // one is never admitted, so Reopen opens the conversation as usual.
         let awaiting = self
             .durable
             .stopping_chats
@@ -857,6 +857,7 @@ impl Cagents {
                 self.durable.cards.iter().find(|state| {
                     state.existence.is_open()
                         && self.chat_awaiting_admission(state.id)
+                        && !self.shared_views.quarantined.contains(&state.id)
                         && matches!(&state.kind, CardKind::Chat(session)
                             if shares_conversation(&failure.session, session))
                 })

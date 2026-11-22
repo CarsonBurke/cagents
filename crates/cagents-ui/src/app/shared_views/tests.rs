@@ -8299,13 +8299,14 @@ fn closed_chat_its_view_kept() -> (Cagents, Pane, super::super::chat_ui::Target)
 /// Restored from its view, the pane shows its saved text until the view
 /// admits it; it stays out of sight, its stop saved, until admission lets
 /// its removal reach the view.
+/// A pane its view fences is never admitted, so it goes by identity at once.
 fn next_launch_takes_away(app: &mut Cagents, pane: &Pane) {
-    for from_view in [false, true] {
-        next_launch_takes_away_as(app, pane, from_view);
+    for (from_view, fenced) in [(false, false), (true, false), (true, true)] {
+        next_launch_takes_away_as(app, pane, from_view, fenced);
     }
 }
 
-fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
+fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool, fenced: bool) {
     let mut next = crate::app::tests::context_inspector_test_app(false);
     next.durable = app.persistent_workspace();
     next.workspace = Cagents::rebuild_workspace(&next.durable);
@@ -8322,6 +8323,9 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
         // As the launch restores a pane its view holds.
         next.await_shared_chat_admission(pane.id, session.clone());
         assert!(next.chat_awaiting_admission(pane.id));
+        if fenced {
+            next.shared_views.quarantined.insert(pane.id);
+        }
     }
     drop(next.resume_stopping_chats());
     assert!(
@@ -8338,7 +8342,7 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
             Ok(()),
         ))),
     );
-    if from_view {
+    if from_view && !fenced {
         // Only an admitted pane's removal reaches its view: until then it
         // stays out of sight, its stop saved for a launch that comes first.
         assert!(
@@ -8362,7 +8366,7 @@ fn next_launch_takes_away_as(app: &mut Cagents, pane: &Pane, from_view: bool) {
         !next
             .card_state(pane.id)
             .is_some_and(|state| state.existence.is_open()),
-        "from_view={from_view}: it goes"
+        "from_view={from_view} fenced={fenced}: it goes"
     );
     assert!(!next.chat_start_pending(pane.id));
     assert!(
