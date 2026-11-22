@@ -1,12 +1,14 @@
 //! Hashing what a view draws, so a frame can tell what changed since the last.
 //!
 //! Transcript rows, blocks and selection identities are fingerprinted for
-//! every row of every visible chat on every frame. Those values are compared
-//! only within this process and are never keyed by input someone else
-//! chooses, so they need a fast hash that spreads its input well, not
-//! SipHash's resistance to chosen collisions, which cost more than the rest
-//! of building the rows. The seed is fixed, so a value is the same for the
-//! same input in every run.
+//! every row of every visible chat on every frame, so this hash must be fast
+//! and spread its input well. The values never leave the process. Their
+//! input includes what agents write, and the seed is fixed and public, as
+//! `DefaultHasher`'s key was, so a collision could be crafted. What one would
+//! cost is a row of that same transcript not drawn again, or its selection
+//! confused, which does not justify SipHash's cost, more than the rest of
+//! building the rows. The fixed seed also gives the same value for the same
+//! input in every run.
 
 use std::hash::BuildHasher;
 
