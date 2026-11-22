@@ -1352,7 +1352,10 @@ impl Cagents {
         // seen longest ago when the budget is full.
         let residency = self.lifecycle_sweep();
         let source_control = self.rebind_source_control();
-        Task::batch([viewport, residency, source_control])
+        // Closed panes whose conversation stopped while this strip was not
+        // shown go now that it is.
+        let stopped_returns = self.remove_stopped_returns();
+        Task::batch([viewport, residency, source_control, stopped_returns])
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
@@ -1552,7 +1555,8 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).focused = self.workspace.focused();
             self.persist();
         }
-        self.rebind_source_control()
+        let stopped_returns = self.remove_stopped_returns();
+        Task::batch([stopped_returns, self.rebind_source_control()])
     }
 
     pub(super) fn terminal_insertion_indices(&self) -> (usize, usize) {

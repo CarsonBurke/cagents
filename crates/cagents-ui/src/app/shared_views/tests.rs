@@ -8262,6 +8262,94 @@ fn a_closed_chat_its_view_keeps_waits_for_its_conversation_to_stop() {
     }
 }
 
+/// Closes the retained chat of [`retained_chat_move_fixture`] and has its
+/// view refuse the removal, so the closed pane is back, out of sight, while
+/// its conversation stops. Returns the app, the pane and the stop.
+fn closed_chat_its_view_kept() -> (Cagents, Pane, super::super::chat_ui::Target) {
+    let (mut app, _source, _destination, pane) = retained_chat_move_fixture();
+    let (tx, rx) = test_model_channel();
+    app.workspace_model_tx = tx;
+    drop(app.begin_chat_close(pane.id));
+    let stopping = app
+        .background_close_for_test(pane.id)
+        .expect("the conversation stops in the background");
+    let (operation, scope, change) = app
+        .shared_views
+        .pending
+        .iter()
+        .find(|(_, _, change)| {
+            matches!(change, Change::RemoveSource { before, .. } if before.id == pane.id)
+        })
+        .cloned()
+        .expect("its removal is published");
+    while rx.try_recv().is_ok() {}
+    drop(app.refuse_conflicting_view_change(
+        scope,
+        operation,
+        change,
+        crate::workspace_model::views::REMOVAL_SOURCE_CONFLICT.into(),
+    ));
+    assert!(app.workspace.is_hidden(pane.id), "back, out of sight");
+    (app, pane, stopping)
+}
+
+/// A window on its way out when the stop of a closed pane its view kept
+/// succeeds goes before it can take the pane away again. The stop stays
+/// saved, so the next launch asks again and takes the pane away then,
+/// rather than restoring the closed chat from the view.
+#[test]
+fn a_kept_closed_pane_whose_stop_settles_at_exit_stays_saved() {
+    let (mut app, pane, stopping) = closed_chat_its_view_kept();
+    let CardKind::Chat(session) = app.card_state(pane.id).unwrap().kind.clone() else {
+        panic!("a chat pane");
+    };
+    app.exit = Some(ApplicationExit {
+        closing: None,
+        servers_reaped: false,
+        chats_closed: false,
+    });
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Ok(()),
+        ))),
+    );
+    assert!(
+        app.durable
+            .stopping_chats
+            .iter()
+            .any(|stopping| stopping.session.id == session.id && stopping.refused.is_none()),
+        "the next launch asks again"
+    );
+    assert!(app.exit.is_some_and(|exit| exit.chats_closed));
+}
+
+/// A closed pane its view kept, whose conversation stops while another
+/// strip is shown, goes once its own strip is shown again, with no error.
+#[test]
+fn a_kept_closed_pane_whose_stop_settles_off_strip_goes_with_its_strip() {
+    let (mut app, pane, stopping) = closed_chat_its_view_kept();
+    let strip = Cagents::rebuild_workspace(&app.durable);
+    app.workspace = Cagents::rebuild_workspace(&Default::default());
+    app.status = None;
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Ok(()),
+        ))),
+    );
+    assert!(app.status.is_none(), "nothing went wrong: {:?}", app.status);
+    app.workspace = strip;
+    app.rehide_closing_panes();
+    drop(app.remove_stopped_returns());
+    assert!(
+        !app.card_state(pane.id)
+            .is_some_and(|state| state.existence.is_open()),
+        "it goes with its strip"
+    );
+    assert!(!app.chat_start_pending(pane.id));
+}
+
 /// Closing a retained native chat never opens a modal, and its cleanup is
 /// never overtaken by a channel move (#2327, #2593). The first close takes
 /// the pane away at once, so there is nothing left to move while the daemon
